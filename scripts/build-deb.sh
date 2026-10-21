@@ -27,7 +27,7 @@ chmod 0755 "$STAGE_DIR/usr/bin/proton-drive-ubuntu"
 ln -sf proton-drive-ubuntu "$STAGE_DIR/usr/bin/protondrive"
 
 cp "$ROOT_DIR/linux/systemd/proton-drive-ubuntu.service" "$STAGE_DIR/usr/lib/systemd/user/proton-drive-ubuntu.service"
-cp "$ROOT_DIR/linux/desktop/proton-drive-ubuntu.desktop" "$STAGE_DIR/usr/share/applications/proton-drive-ubuntu.desktop"
+cp "$ROOT_DIR/linux/desktop/proton-drive.desktop" "$STAGE_DIR/usr/share/applications/proton-drive.desktop"
 cp "$ROOT_DIR/linux/icons/proton-drive-ubuntu.svg" "$STAGE_DIR/usr/share/icons/hicolor/scalable/apps/proton-drive-ubuntu.svg"
 cp "$ROOT_DIR/linux/icons/proton-drive-ubuntu.svg" "$STAGE_DIR/usr/share/icons/hicolor/scalable/apps/protondrive.svg"
 cp "$ROOT_DIR/linux/nautilus/proton_drive_nautilus.py" "$STAGE_DIR/usr/share/nautilus-python/extensions/proton_drive_nautilus.py"
@@ -47,6 +47,15 @@ Description: Unofficial Proton Drive two-way sync & desktop client for Ubuntu
  event-based two-way local folder synchronization, OS Keyring storage,
  conflict resolution, selective sync, and Ubuntu Nautilus integration.
 EOF
+
+cat > "$STAGE_DIR/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+rm -f /usr/share/applications/proton-drive-ubuntu.desktop
+update-desktop-database /usr/share/applications 2>/dev/null || true
+gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
+EOF
+chmod 0755 "$STAGE_DIR/DEBIAN/postinst"
 
 DEB_OUT="$ROOT_DIR/release/${PKG_NAME}_${VERSION}_${ARCH}.deb"
 dpkg-deb --build --root-owner-group "$STAGE_DIR" "$DEB_OUT"
