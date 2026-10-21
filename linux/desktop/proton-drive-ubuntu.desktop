@@ -1,12 +1,12 @@
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=Ubuntu Cloud Sync (Unofficial for Proton Drive)
-GenericName=Cloud Drive Sync
-Comment=Third-party two-way folder sync client powered by Proton Drive SDK (Not officially supported by Proton)
-Exec=/usr/bin/proton-drive-ubuntu gui
-Icon=proton-drive-ubuntu
+Name=Proton Drive
+GenericName=Proton Drive
+Comment=Proton Drive desktop sync client for Ubuntu
+Exec=/home/gautam-chauhan/projects/proton-drive/release/protondrive gui
+Icon=protondrive
 Terminal=false
 Categories=Network;FileTransfer;Utility;
-Keywords=cloud;drive;sync;backup;
+Keywords=proton;protondrive;cloud;drive;sync;backup;
 StartupNotify=true

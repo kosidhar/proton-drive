@@ -24,10 +24,12 @@ mkdir -p \
 
 cp "$ROOT_DIR/release/proton-drive-ubuntu" "$STAGE_DIR/usr/bin/proton-drive-ubuntu"
 chmod 0755 "$STAGE_DIR/usr/bin/proton-drive-ubuntu"
+ln -sf proton-drive-ubuntu "$STAGE_DIR/usr/bin/protondrive"
 
 cp "$ROOT_DIR/linux/systemd/proton-drive-ubuntu.service" "$STAGE_DIR/usr/lib/systemd/user/proton-drive-ubuntu.service"
 cp "$ROOT_DIR/linux/desktop/proton-drive-ubuntu.desktop" "$STAGE_DIR/usr/share/applications/proton-drive-ubuntu.desktop"
 cp "$ROOT_DIR/linux/icons/proton-drive-ubuntu.svg" "$STAGE_DIR/usr/share/icons/hicolor/scalable/apps/proton-drive-ubuntu.svg"
+cp "$ROOT_DIR/linux/icons/proton-drive-ubuntu.svg" "$STAGE_DIR/usr/share/icons/hicolor/scalable/apps/protondrive.svg"
 cp "$ROOT_DIR/linux/nautilus/proton_drive_nautilus.py" "$STAGE_DIR/usr/share/nautilus-python/extensions/proton_drive_nautilus.py"
 
 cat > "$STAGE_DIR/DEBIAN/control" <<EOF

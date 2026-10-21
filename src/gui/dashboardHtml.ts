@@ -6,7 +6,7 @@ export function getDashboardHtml(): string {
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Ubuntu Cloud Drive Sync (Unofficial Client for Proton Drive)</title>
+<title>Proton Drive</title>
 <style>
   :root {
     --bg: #1e1e24;
@@ -274,13 +274,28 @@ export function getDashboardHtml(): string {
 
   <header>
     <div class="brand">
-      <div class="brand-icon">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2">
-          <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/>
+      <div class="brand-icon" style="background: transparent;">
+        <svg width="38" height="38" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M0 10C0 4.47715 4.47715 0 10 0H26C31.5228 0 36 4.47715 36 10V26C36 31.5228 31.5228 36 26 36H10C4.47715 36 0 31.5228 0 26V10Z" fill="white"/>
+          <g transform="translate(2.7, 2.7) scale(0.85)">
+            <path fill="url(#pd_grad_a)" d="m4 9 4-2 7 4h12v17l-1 1H7a3 3 0 0 1-3-3V9Z" />
+            <path fill="url(#pd_grad_b)" fill-rule="evenodd" clip-rule="evenodd" d="M14.961 7.426A3 3 0 0 0 16.726 8H29a3 3 0 0 1 3 3v15a3 3 0 0 1-3 3h-3V14.5a2.5 2.5 0 0 0-2.5-2.5H13a3 3 0 0 1-1.8-.6L8.8 9.6A3 3 0 0 0 7 9H4a3 3 0 0 1 3-3h5.024a3 3 0 0 1 1.765.574l1.172.852Z" />
+          </g>
+          <defs>
+            <radialGradient id="pd_grad_a" cx="0" cy="0" r="1" gradientTransform="matrix(42.9176 0 0 45.5519 28.926 -8.114)" gradientUnits="userSpaceOnUse">
+              <stop offset=".556" stop-color="#6D4AFF" />
+              <stop offset="1" stop-color="#FF50C3" />
+            </radialGradient>
+            <linearGradient id="pd_grad_b" x1="3.631" x2="38.345" y1="-6.003" y2="32.431" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#7341FF" />
+              <stop offset=".359" stop-color="#B487FF" />
+              <stop offset="1" stop-color="#FFC8FF" />
+            </linearGradient>
+          </defs>
         </svg>
       </div>
       <div>
-        <h1>Ubuntu Cloud Sync</h1>
+        <h1>Proton Drive</h1>
         <p id="syncDirSubtitle">~/ProtonDrive</p>
       </div>
     </div>

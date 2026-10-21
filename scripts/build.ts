@@ -40,3 +40,7 @@ if (exitCode !== 0) {
     process.exit(exitCode);
 }
 console.log(`Successfully built ${outfile}`);
+const aliasFile = path.join(outDir, 'protondrive');
+await Bun.write(aliasFile, Bun.file(outfile));
+await Bun.spawn(['chmod', '0755', aliasFile]).exited;
+console.log(`Created executable alias ${aliasFile}`);
