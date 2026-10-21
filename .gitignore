@@ -2,6 +2,7 @@ node_modules/
 dist/
 release/
 build/
+native-gui/target/
 *.deb
 *.sqlite
 *.sqlite-shm

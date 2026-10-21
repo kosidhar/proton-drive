@@ -1,0 +1,14 @@
+[package]
+name = "protondrive-gui"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust desktop GUI for Proton Drive on Ubuntu"
+
+[dependencies]
+eframe = { version = "0.31", default-features = true, features = ["glow", "x11", "wayland"] }
+egui = "0.31"
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = { version = "2.12", features = ["json"] }
+winit = { version = "0.30", default-features = false, features = ["x11"] }

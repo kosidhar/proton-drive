@@ -1,5 +1,3 @@
-import { DEFAULT_APP_VERSION, THIRD_PARTY_DISCLOSURE } from '../sdk/fileOps';
-
 export function getDashboardHtml(): string {
     return `<!DOCTYPE html>
 <html lang="en">
@@ -9,50 +7,33 @@ export function getDashboardHtml(): string {
 <title>Proton Drive</title>
 <style>
   :root {
-    --bg: #1e1e24;
-    --surface: #282830;
-    --surface-2: #32323c;
-    --border: #3f3f4c;
-    --text: #f4f4f7;
-    --muted: #a3a3b5;
-    --accent: #3584e4;
-    --accent-hover: #4a96f3;
-    --success: #2ec27e;
-    --warning: #e5a50a;
-    --danger: #e01b24;
+    --bg: #16141c;
+    --sidebar: #1b1824;
+    --surface: #201d2b;
+    --surface-2: #292538;
+    --border: #342f47;
+    --text: #ffffff;
+    --muted: #a7a4b5;
+    --accent: #6d4aff;
+    --accent-hover: #7c5cff;
+    --success: #1ea885;
+    --warning: #ff9900;
+    --danger: #dc3251;
     --radius: 12px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    font-family: 'Ubuntu', 'Cantarell', system-ui, -apple-system, sans-serif;
+    font-family: 'Inter', 'Ubuntu', 'Cantarell', system-ui, -apple-system, sans-serif;
     background: var(--bg);
     color: var(--text);
     min-height: 100vh;
     display: flex;
     flex-direction: column;
   }
-  .disclosure-banner {
-    background: #2b2412;
-    border-bottom: 1px solid #634d12;
-    color: #f8e45c;
-    padding: 8px 20px;
-    font-size: 13px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-  }
-  .disclosure-banner code {
-    color: #cbd5e1;
-    background: rgba(255,255,255,0.08);
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-size: 11px;
-  }
   header {
-    background: var(--surface);
+    background: var(--sidebar);
     border-bottom: 1px solid var(--border);
-    padding: 16px 24px;
+    padding: 14px 24px;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -67,15 +48,15 @@ export function getDashboardHtml(): string {
     width: 38px;
     height: 38px;
     border-radius: 10px;
-    background: linear-gradient(135deg, #3584e4, #1c71d8);
     display: flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
   }
   .brand h1 {
-    font-size: 17px;
-    font-weight: 600;
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
   }
   .brand p {
     font-size: 12px;
@@ -90,7 +71,7 @@ export function getDashboardHtml(): string {
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    padding: 6px 12px;
+    padding: 6px 14px;
     border-radius: 999px;
     font-size: 13px;
     font-weight: 500;
@@ -112,14 +93,14 @@ export function getDashboardHtml(): string {
     background: var(--surface-2);
     color: var(--text);
     border: 1px solid var(--border);
-    padding: 8px 14px;
+    padding: 8px 16px;
     border-radius: 8px;
     font-size: 13px;
-    font-weight: 500;
+    font-weight: 600;
     cursor: pointer;
     transition: all 0.15s ease;
   }
-  button:hover { background: #3c3c48; }
+  button:hover { background: #353048; }
   button.primary {
     background: var(--accent);
     border-color: var(--accent);
@@ -127,20 +108,20 @@ export function getDashboardHtml(): string {
   }
   button.primary:hover { background: var(--accent-hover); }
   button.danger {
-    background: rgba(224, 27, 36, 0.16);
+    background: rgba(220, 50, 81, 0.16);
     border-color: var(--danger);
-    color: #ff7b82;
+    color: #ff7b92;
   }
 
   .layout {
     display: grid;
-    grid-template-columns: 230px 1fr;
+    grid-template-columns: 240px 1fr;
     flex: 1;
   }
   nav {
-    background: var(--surface);
+    background: var(--sidebar);
     border-right: 1px solid var(--border);
-    padding: 16px 12px;
+    padding: 18px 12px;
     display: flex;
     flex-direction: column;
     gap: 6px;
@@ -160,8 +141,8 @@ export function getDashboardHtml(): string {
   }
   .nav-btn:hover { background: var(--surface-2); color: var(--text); }
   .nav-btn.active {
-    background: rgba(53, 132, 228, 0.18);
-    color: #78aeed;
+    background: rgba(109, 74, 255, 0.22);
+    color: #c4b5fd;
     font-weight: 600;
   }
   .badge {
@@ -173,23 +154,23 @@ export function getDashboardHtml(): string {
   }
 
   main {
-    padding: 24px;
+    padding: 28px;
     overflow-y: auto;
-    max-width: 1100px;
+    max-width: 1200px;
   }
   .tab-panel { display: none; flex-direction: column; gap: 20px; }
   .tab-panel.active { display: flex; }
 
   .stats-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
     gap: 14px;
   }
   .card {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    padding: 18px;
+    padding: 20px;
   }
   .card h3 {
     font-size: 13px;
@@ -198,7 +179,7 @@ export function getDashboardHtml(): string {
     margin-bottom: 8px;
   }
   .card .metric {
-    font-size: 24px;
+    font-size: 26px;
     font-weight: 700;
   }
   .card h2 {
@@ -267,15 +248,10 @@ export function getDashboardHtml(): string {
 </style>
 </head>
 <body>
-  <div class="disclosure-banner">
-    <span><strong>Notice:</strong> ${THIRD_PARTY_DISCLOSURE}</span>
-    <code>x-pm-appversion: ${DEFAULT_APP_VERSION}</code>
-  </div>
-
   <header>
     <div class="brand">
-      <div class="brand-icon" style="background: transparent;">
-        <svg width="38" height="38" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <div class="brand-icon">
+        <svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
           <path d="M0 10C0 4.47715 4.47715 0 10 0H26C31.5228 0 36 4.47715 36 10V26C36 31.5228 31.5228 36 26 36H10C4.47715 36 0 31.5228 0 26V10Z" fill="white"/>
           <g transform="translate(2.7, 2.7) scale(0.85)">
             <path fill="url(#pd_grad_a)" d="m4 9 4-2 7 4h12v17l-1 1H7a3 3 0 0 1-3-3V9Z" />
@@ -312,32 +288,30 @@ export function getDashboardHtml(): string {
 
   <div class="layout">
     <nav>
-      <button class="nav-btn active" onclick="switchTab('overview', this)">Overview & Activity</button>
-      <button class="nav-btn" onclick="switchTab('browser', this)">Cloud File Browser</button>
+      <button class="nav-btn active" onclick="switchTab('overview', this)">My Files & Activity</button>
+      <button class="nav-btn" onclick="switchTab('browser', this)">Cloud Browser</button>
       <button class="nav-btn" onclick="switchTab('selective', this)">Selective Sync</button>
       <button class="nav-btn" onclick="switchTab('conflicts', this)">
         <span>Conflicts</span>
         <span class="badge" id="conflictBadge" style="display:none">0</span>
       </button>
-      <button class="nav-btn" onclick="switchTab('settings', this)">Settings & Linux</button>
+      <button class="nav-btn" onclick="switchTab('settings', this)">Settings</button>
     </nav>
 
     <main>
-      <!-- Overview Tab -->
       <section id="tab-overview" class="tab-panel active">
         <div class="card" id="authCard">
-          <h2>Proton Account Session</h2>
-          <p style="font-size: 13px; color: var(--muted); margin-bottom: 12px;">
-            ${THIRD_PARTY_DISCLOSURE} Sign-in uses official Proton web authentication and stores session tokens in your Ubuntu OS Keyring (libsecret).
-          </p>
-          <div style="display:flex; align-items:center; gap: 12px; flex-wrap: wrap;">
+          <h2>Proton Account</h2>
+          <div style="display:flex; align-items:center; justify-content:space-between; gap: 12px; flex-wrap: wrap;">
             <span id="authStatusText" style="font-weight: 600;">Checking session...</span>
-            <button class="primary" id="loginBtn" onclick="startWebLogin()">Sign In via Browser</button>
-            <button class="danger" id="logoutBtn" onclick="logoutAccount()" style="display:none">Sign Out</button>
+            <div>
+              <button class="primary" id="loginBtn" onclick="startWebLogin()">Sign In</button>
+              <button class="danger" id="logoutBtn" onclick="logoutAccount()" style="display:none">Sign Out</button>
+            </div>
           </div>
           <div id="loginUrlBox" style="display:none; margin-top: 12px; padding: 10px; background: var(--bg); border-radius: 8px; font-size: 12px;">
             Browser opened. If it did not open automatically, visit:<br/>
-            <a id="loginUrlLink" href="#" target="_blank" style="color: #78aeed; word-break: break-all;"></a>
+            <a id="loginUrlLink" href="#" target="_blank" style="color: #c4b5fd; word-break: break-all;"></a>
           </div>
         </div>
 
@@ -355,7 +329,7 @@ export function getDashboardHtml(): string {
             <div class="metric" id="statBytes">0 B</div>
           </div>
           <div class="card">
-            <h3>Unresolved Conflicts</h3>
+            <h3>Conflicts</h3>
             <div class="metric" id="statConflicts">0</div>
           </div>
         </div>
@@ -366,7 +340,7 @@ export function getDashboardHtml(): string {
         </div>
 
         <div class="card">
-          <h2>Recent Sync Activity</h2>
+          <h2>Recent Activity</h2>
           <table>
             <thead>
               <tr>
@@ -383,7 +357,6 @@ export function getDashboardHtml(): string {
         </div>
       </section>
 
-      <!-- Cloud Browser Tab -->
       <section id="tab-browser" class="tab-panel">
         <div class="card">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; gap:10px;">
@@ -412,12 +385,11 @@ export function getDashboardHtml(): string {
         </div>
       </section>
 
-      <!-- Selective Sync Tab -->
       <section id="tab-selective" class="tab-panel">
         <div class="card">
           <h2>Selective Folder Sync (/my-files)</h2>
           <p style="font-size:13px; color:var(--muted); margin-bottom:14px;">
-            Uncheck remote top-level folders you want to exclude from syncing to your local Ubuntu drive.
+            Choose which remote top-level folders to sync to your Ubuntu computer.
           </p>
           <div id="selectiveFoldersList" class="folder-list">
             <div style="color:var(--muted); font-size:13px;">Loading remote folders...</div>
@@ -434,10 +406,9 @@ export function getDashboardHtml(): string {
         </div>
       </section>
 
-      <!-- Conflicts Tab -->
       <section id="tab-conflicts" class="tab-panel">
         <div class="card">
-          <h2>Conflict Resolution Center</h2>
+          <h2>Conflicts</h2>
           <p style="font-size:13px; color:var(--muted); margin-bottom:14px;">
             Resolve files modified simultaneously on Ubuntu and Proton Drive.
           </p>
@@ -446,7 +417,7 @@ export function getDashboardHtml(): string {
               <tr>
                 <th>File Path</th>
                 <th>Detected</th>
-                <th>Status / Resolution</th>
+                <th>Status</th>
                 <th>Actions</th>
               </tr>
             </thead>
@@ -457,49 +428,28 @@ export function getDashboardHtml(): string {
         </div>
       </section>
 
-      <!-- Settings Tab -->
       <section id="tab-settings" class="tab-panel">
         <div class="card">
-          <h2>Synchronization Preferences</h2>
+          <h2>Preferences</h2>
           <div class="input-row">
-            <label>Local Sync Folder on Ubuntu</label>
+            <label>Local Sync Folder</label>
             <input type="text" id="settingSyncDir" />
           </div>
           <div class="input-row">
-            <label>Conflict Resolution Strategy</label>
+            <label>Conflict Resolution</label>
             <select id="settingConflictStrategy">
-              <option value="keep-both">Keep Both (create conflict copy with timestamp & hostname)</option>
+              <option value="keep-both">Keep Both (create conflict copy)</option>
               <option value="keep-local">Keep Local (overwrite remote revision)</option>
               <option value="keep-remote">Keep Remote (overwrite local file)</option>
-              <option value="prompt">Ask / Queue in Conflict Center</option>
+              <option value="prompt">Ask in Conflicts tab</option>
             </select>
           </div>
           <div class="input-row">
             <label>
-              <input type="checkbox" id="settingNotifications" /> Enable Ubuntu Desktop Notifications (notify-send)
+              <input type="checkbox" id="settingNotifications" /> Enable Desktop Notifications
             </label>
           </div>
-          <button class="primary" onclick="saveSettings()">Save Settings</button>
-        </div>
-
-        <div class="card">
-          <h2>Ubuntu Desktop Integration</h2>
-          <div class="folder-list">
-            <div class="folder-item">
-              <div>
-                <strong>Systemd User Service</strong>
-                <div style="font-size:12px; color:var(--muted)"><code>systemctl --user enable --now proton-drive-ubuntu.service</code></div>
-              </div>
-              <span id="systemdStatusBadge" class="status-pill">Checking...</span>
-            </div>
-            <div class="folder-item">
-              <div>
-                <strong>Nautilus (GNOME Files) Extension</strong>
-                <div style="font-size:12px; color:var(--muted)">Provides sync emblems & right-click menu in Ubuntu Files</div>
-              </div>
-              <span class="status-pill">Installed in <code>linux/nautilus/</code></span>
-            </div>
-          </div>
+          <button class="primary" onclick="saveSettings()">Save Preferences</button>
         </div>
       </section>
     </main>
@@ -538,8 +488,8 @@ export function getDashboardHtml(): string {
       const dot = document.getElementById('stateDot');
       dot.className = 'dot ' + data.state;
       const labels = {
-        idle: 'Up to date (Event Stream Active)',
-        syncing: data.currentAction ? ('Syncing: ' + data.currentAction) : 'Syncing...',
+        idle: 'Synced',
+        syncing: data.currentAction ? data.currentAction : 'Syncing...',
         paused: 'Paused',
         unauthenticated: 'Sign in required',
         error: 'Sync Error'
@@ -564,7 +514,7 @@ export function getDashboardHtml(): string {
       const loginBtn = document.getElementById('loginBtn');
       const logoutBtn = document.getElementById('logoutBtn');
       if (data.loggedIn) {
-        authText.textContent = 'Connected to Proton Drive (OS Keyring Session Active)';
+        authText.textContent = 'Connected to Proton Drive';
         authText.style.color = 'var(--success)';
         loginBtn.style.display = 'none';
         logoutBtn.style.display = 'inline-block';
@@ -576,7 +526,6 @@ export function getDashboardHtml(): string {
         logoutBtn.style.display = 'none';
       }
 
-      // Active transfers
       const transfersCard = document.getElementById('activeTransfersCard');
       const transfersList = document.getElementById('activeTransfersList');
       if (data.activeTransfers && data.activeTransfers.length > 0) {
@@ -595,11 +544,6 @@ export function getDashboardHtml(): string {
         transfersCard.style.display = 'none';
       }
 
-      if (data.systemd) {
-        document.getElementById('systemdStatusBadge').textContent =
-          data.systemd.active ? 'Active (Running)' : (data.systemd.enabled ? 'Enabled' : 'Inactive');
-      }
-
       if (document.activeElement.tagName !== 'INPUT' && document.activeElement.tagName !== 'TEXTAREA' && document.activeElement.tagName !== 'SELECT') {
         document.getElementById('settingSyncDir').value = data.settings.syncDir;
         document.getElementById('settingConflictStrategy').value = data.settings.conflictStrategy;
@@ -607,7 +551,6 @@ export function getDashboardHtml(): string {
         document.getElementById('ignorePatternsInput').value = (data.settings.ignorePatterns || []).join('\\n');
       }
 
-      // Activity table
       const actRes = await fetch('/api/activity');
       const activities = await actRes.json();
       const tbody = document.getElementById('activityTableBody');
@@ -625,7 +568,7 @@ export function getDashboardHtml(): string {
         }).join('');
       }
     } catch (e) {
-      document.getElementById('stateLabel').textContent = 'Daemon Offline';
+      document.getElementById('stateLabel').textContent = 'Offline';
     }
   }
 
@@ -680,7 +623,7 @@ export function getDashboardHtml(): string {
     tbody.innerHTML = data.items.map(item => {
       const nextPath = currentRemotePath.replace(/\\/$/, '') + '/' + item.name;
       const nameCell = item.type === 'folder'
-        ? '<a href="#" style="color:#78aeed; text-decoration:none; font-weight:600;" onclick="loadRemoteBrowser(\\'' + nextPath.replace(/'/g, "\\\\'") + '\\'); return false;">📁 ' + item.name + '</a>'
+        ? '<a href="#" style="color:#c4b5fd; text-decoration:none; font-weight:600;" onclick="loadRemoteBrowser(\\'' + nextPath.replace(/'/g, "\\\\'") + '\\'); return false;">📁 ' + item.name + '</a>'
         : '📄 ' + item.name;
       return '<tr>' +
         '<td>' + nameCell + '</td>' +
@@ -715,7 +658,7 @@ export function getDashboardHtml(): string {
     const res = await fetch('/api/selective-sync/folders');
     const data = await res.json();
     if (!data.folders || data.folders.length === 0) {
-      container.innerHTML = '<div style="color:var(--muted); font-size:13px;">No top-level folders found (or not signed in).</div>';
+      container.innerHTML = '<div style="color:var(--muted); font-size:13px;">No top-level folders found.</div>';
       return;
     }
     container.innerHTML = data.folders.map(f => {
@@ -763,7 +706,7 @@ export function getDashboardHtml(): string {
       const actions = c.resolved
         ? '<span style="color:var(--success)">Resolved (' + c.resolution + ')</span>'
         : '<div style="display:flex; gap:6px;">' +
-            '<button onclick="resolveConflict(' + c.id + ', \\'keep-both\\')">Keep Both</button>' +
+            '<button onclick="resolveConflict(' +C.id + ', \\'keep-both\\')">Keep Both</button>' +
             '<button onclick="resolveConflict(' + c.id + ', \\'keep-local\\')">Keep Local</button>' +
             '<button onclick="resolveConflict(' + c.id + ', \\'keep-remote\\')">Keep Remote</button>' +
           '</div>';
@@ -799,7 +742,7 @@ export function getDashboardHtml(): string {
   }
 
   refreshStatus();
-  setInterval(refreshStatus, 2500);
+  setInterval(refreshStatus, 2000);
 </script>
 </body>
 </html>`;

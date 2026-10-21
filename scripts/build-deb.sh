@@ -12,6 +12,12 @@ STAGE_DIR="$ROOT_DIR/build/deb/${PKG_NAME}_${VERSION}_${ARCH}"
 echo "==> Compiling standalone binary with Bun..."
 bun "$ROOT_DIR/scripts/build.ts"
 
+echo "==> Compiling native Rust GUI (protondrive-gui)..."
+export PATH="$HOME/.cargo/bin:$PATH"
+(cd "$ROOT_DIR/native-gui" && cargo build --release)
+cp "$ROOT_DIR/native-gui/target/release/protondrive-gui" "$ROOT_DIR/release/protondrive-gui"
+chmod 0755 "$ROOT_DIR/release/protondrive-gui"
+
 echo "==> Staging Debian package layout in $STAGE_DIR..."
 rm -rf "$STAGE_DIR"
 mkdir -p \
@@ -20,16 +26,19 @@ mkdir -p \
   "$STAGE_DIR/usr/lib/systemd/user" \
   "$STAGE_DIR/usr/share/applications" \
   "$STAGE_DIR/usr/share/icons/hicolor/scalable/apps" \
+  "$STAGE_DIR/usr/share/icons/hicolor/256x256/apps" \
   "$STAGE_DIR/usr/share/nautilus-python/extensions"
 
 cp "$ROOT_DIR/release/proton-drive-ubuntu" "$STAGE_DIR/usr/bin/proton-drive-ubuntu"
-chmod 0755 "$STAGE_DIR/usr/bin/proton-drive-ubuntu"
+cp "$ROOT_DIR/release/protondrive-gui" "$STAGE_DIR/usr/bin/protondrive-gui"
+chmod 0755 "$STAGE_DIR/usr/bin/proton-drive-ubuntu" "$STAGE_DIR/usr/bin/protondrive-gui"
 ln -sf proton-drive-ubuntu "$STAGE_DIR/usr/bin/protondrive"
 
 cp "$ROOT_DIR/linux/systemd/proton-drive-ubuntu.service" "$STAGE_DIR/usr/lib/systemd/user/proton-drive-ubuntu.service"
 cp "$ROOT_DIR/linux/desktop/proton-drive.desktop" "$STAGE_DIR/usr/share/applications/proton-drive.desktop"
 cp "$ROOT_DIR/linux/icons/proton-drive-ubuntu.svg" "$STAGE_DIR/usr/share/icons/hicolor/scalable/apps/proton-drive-ubuntu.svg"
 cp "$ROOT_DIR/linux/icons/proton-drive-ubuntu.svg" "$STAGE_DIR/usr/share/icons/hicolor/scalable/apps/protondrive.svg"
+cp "$ROOT_DIR/linux/icons/protondrive-256.png" "$STAGE_DIR/usr/share/icons/hicolor/256x256/apps/protondrive.png"
 cp "$ROOT_DIR/linux/nautilus/proton_drive_nautilus.py" "$STAGE_DIR/usr/share/nautilus-python/extensions/proton_drive_nautilus.py"
 
 cat > "$STAGE_DIR/DEBIAN/control" <<EOF
