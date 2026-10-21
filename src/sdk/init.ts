@@ -73,7 +73,7 @@ export async function init(configOptions: InitConfig) {
     const photosSdk = new ProtonDrivePhotosClient(sdkDependencies);
     const sdkDiagnostic = initDiagnostic(sdkDependencies);
 
-    const eventsManager = await Manager.create(logger, sdk, photosSdk, eventsProvider, auth.isLoggedIn());
+    const eventsManager = await Manager.create(logger, sdk, photosSdk, eventsProvider, false);
 
     const paths = new Paths(sdk, photosSdk, auth, eventsManager);
 

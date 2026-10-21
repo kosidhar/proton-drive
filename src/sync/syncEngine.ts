@@ -103,6 +103,9 @@ export class ProtonDriveSyncEngine {
         }
 
         await this.watcher.start();
+        void this.eventsManager.startSubscriptions().catch((err) => {
+            this.logger.warn(`Failed starting event subscriptions: ${err}`);
+        });
 
         if (!settings.paused) {
             if (options.backgroundInitialReconcile) {
@@ -190,40 +193,10 @@ export class ProtonDriveSyncEngine {
             const root = await this.getRootFolder();
             await this.eventsManager.subscribeDriveScope(root.treeEventScopeId);
 
-            // 1. Collect remote tree map: relPath -> NodeEntity
+            // Sync folder-by-folder incrementally so files & folders appear in ~/ProtonDrive
+            // and in the GUI dashboard immediately instead of waiting for a full tree scan.
             const remoteMap = new Map<string, NodeEntity>();
-            await this.walkRemoteTree(root, '', remoteMap, settings);
-
-            // 2. Collect local tree map: relPath -> { isDirectory, size, mtimeMs }
-            this.currentAction = 'Scanning local folder...';
-            const localMap = new Map<string, { isDirectory: boolean; size: number; mtimeMs: number }>();
-            await this.walkLocalTree(settings.syncDir, '', localMap, settings);
-
-            // 3. Collect known DB state: relPath -> SyncedItemRecord
-            const dbItems = new Map<string, SyncedItemRecord>(
-                this.stateDb.getAllItems().map((item) => [item.localRelPath, item]),
-            );
-
-            // Combine all relative paths sorted shallowest-first
-            const allPaths = Array.from(
-                new Set([...remoteMap.keys(), ...localMap.keys(), ...dbItems.keys()]),
-            ).sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b));
-
-            for (const relPath of allPaths) {
-                if (this.stateDb.getSettings().paused) {
-                    break;
-                }
-                if (matchesIgnorePatterns(relPath, settings.ignorePatterns, settings.excludedFolders)) {
-                    continue;
-                }
-
-                this.currentAction = `Syncing ${relPath}`;
-                const remoteNode = remoteMap.get(relPath);
-                const localInfo = localMap.get(relPath);
-                const dbRecord = dbItems.get(relPath);
-
-                await this.reconcileSinglePath(relPath, remoteNode, localInfo, dbRecord, remoteMap, settings);
-            }
+            await this.reconcileDirectoryIncremental(root, '', remoteMap, settings);
 
             this.lastSyncAt = Date.now();
             this.currentAction = null;
@@ -884,64 +857,97 @@ export class ProtonDriveSyncEngine {
         return currentParent;
     }
 
-    private async walkRemoteTree(
+    private async reconcileDirectoryIncremental(
         folderNode: NodeEntity,
         prefix: string,
-        out: Map<string, NodeEntity>,
+        remoteMap: Map<string, NodeEntity>,
         settings: SyncSettings,
     ): Promise<void> {
         if (this.stateDb.getSettings().paused) {
             return;
         }
-        this.currentAction = `Scanning /my-files/${prefix || ''}`;
-        const children = await listFolderChildren(this.sdk, folderNode);
-        for (const child of children) {
-            if (this.stateDb.getSettings().paused) {
-                return;
-            }
+
+        const localDirFullPath = prefix ? path.join(settings.syncDir, prefix) : settings.syncDir;
+        this.watcher.suppressPath(prefix || '.');
+        await mkdir(localDirFullPath, { recursive: true });
+
+        this.currentAction = `Listing /my-files/${prefix || ''}`;
+        const remoteChildren = await listFolderChildren(this.sdk, folderNode);
+        const remoteChildByName = new Map<string, NodeEntity>();
+        for (const child of remoteChildren) {
             const name = getName(child);
             const relPath = prefix ? `${prefix}/${name}` : name;
-
-            if (matchesIgnorePatterns(relPath, settings.ignorePatterns, settings.excludedFolders)) {
-                continue;
-            }
-
-            out.set(relPath, child);
-            if (child.type === NodeType.Folder) {
-                // Create the local directory immediately as we discover it so the user sees folders populate in real time
-                const localFolderFullPath = path.join(settings.syncDir, relPath);
-                this.watcher.suppressPath(relPath);
-                await mkdir(localFolderFullPath, { recursive: true }).catch(() => {});
-                await this.walkRemoteTree(child, relPath, out, settings);
+            if (!matchesIgnorePatterns(relPath, settings.ignorePatterns, settings.excludedFolders)) {
+                remoteChildByName.set(name, child);
+                remoteMap.set(relPath, child);
             }
         }
-    }
 
-    private async walkLocalTree(
-        absDir: string,
-        prefix: string,
-        out: Map<string, { isDirectory: boolean; size: number; mtimeMs: number }>,
-        settings: SyncSettings,
-    ): Promise<void> {
-        const entries = await readdir(absDir, { withFileTypes: true }).catch(() => []);
-        for (const entry of entries) {
+        const localEntries = await readdir(localDirFullPath, { withFileTypes: true }).catch(() => []);
+        const localChildByName = new Map<string, { isDirectory: boolean; size: number; mtimeMs: number }>();
+        for (const entry of localEntries) {
             const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
             if (matchesIgnorePatterns(relPath, settings.ignorePatterns, settings.excludedFolders)) {
                 continue;
             }
-
-            const fullPath = path.join(absDir, entry.name);
+            const fullPath = path.join(localDirFullPath, entry.name);
             const st = await stat(fullPath).catch(() => null);
-            if (!st) {
+            if (st && (st.isDirectory() || st.isFile())) {
+                localChildByName.set(entry.name, {
+                    isDirectory: st.isDirectory(),
+                    size: st.isDirectory() ? 0 : st.size,
+                    mtimeMs: st.mtimeMs,
+                });
+            }
+        }
+
+        // Direct children previously tracked in DB under this prefix
+        const allDbItems = this.stateDb.getAllItems();
+        const dbChildByName = new Map<string, SyncedItemRecord>();
+        for (const item of allDbItems) {
+            const itemDir = path.posix.dirname(item.localRelPath);
+            const expectedDir = prefix || '.';
+            if (itemDir === expectedDir) {
+                dbChildByName.set(path.posix.basename(item.localRelPath), item);
+            }
+        }
+
+        const childNames = Array.from(
+            new Set([...remoteChildByName.keys(), ...localChildByName.keys(), ...dbChildByName.keys()]),
+        ).sort((a, b) => a.localeCompare(b));
+
+        const subFoldersToRecurse: Array<{ node: NodeEntity; relPath: string }> = [];
+
+        for (const name of childNames) {
+            if (this.stateDb.getSettings().paused) {
+                return;
+            }
+            const relPath = prefix ? `${prefix}/${name}` : name;
+            if (matchesIgnorePatterns(relPath, settings.ignorePatterns, settings.excludedFolders)) {
                 continue;
             }
 
-            if (st.isDirectory()) {
-                out.set(relPath, { isDirectory: true, size: 0, mtimeMs: st.mtimeMs });
-                await this.walkLocalTree(fullPath, relPath, out, settings);
-            } else if (st.isFile()) {
-                out.set(relPath, { isDirectory: false, size: st.size, mtimeMs: st.mtimeMs });
+            this.currentAction = `Syncing ${relPath}`;
+            const remoteChild = remoteChildByName.get(name);
+            const localChild = localChildByName.get(name);
+            const dbRecord = dbChildByName.get(name);
+
+            await this.reconcileSinglePath(relPath, remoteChild, localChild, dbRecord, remoteMap, settings);
+
+            const resolvedFolderNode = remoteMap.get(relPath) ?? remoteChild;
+            const localStillExists = await stat(path.join(settings.syncDir, relPath))
+                .then((s) => s.isDirectory())
+                .catch(() => false);
+            if (resolvedFolderNode && resolvedFolderNode.type === NodeType.Folder && localStillExists) {
+                subFoldersToRecurse.push({ node: resolvedFolderNode, relPath });
             }
+        }
+
+        for (const sub of subFoldersToRecurse) {
+            if (this.stateDb.getSettings().paused) {
+                return;
+            }
+            await this.reconcileDirectoryIncremental(sub.node, sub.relPath, remoteMap, settings);
         }
     }
 }
