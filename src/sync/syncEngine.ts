@@ -103,7 +103,7 @@ export class ProtonDriveSyncEngine {
         }
 
         await this.watcher.start();
-        void this.eventsManager.startSubscriptions().catch((err) => {
+        void this.eventsManager.startSubscriptions?.()?.catch((err) => {
             this.logger.warn(`Failed starting event subscriptions: ${err}`);
         });
 
