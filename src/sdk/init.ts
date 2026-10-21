@@ -82,6 +82,7 @@ export async function init(configOptions: InitConfig) {
         logger: logger as Logger,
         auth,
         addresses,
+        apiClient,
         sdk,
         photosSdk,
         sdkDiagnostic,

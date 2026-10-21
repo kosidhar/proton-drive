@@ -11,19 +11,19 @@ use serde::{Deserialize, Serialize};
 
 const DAEMON_URL: &str = "http://127.0.0.1:49152";
 
-// Official Proton Carbon Dark Palette
-const BG_CANVAS: Color32 = Color32::from_rgb(22, 20, 28); // #16141C
-const BG_SIDEBAR: Color32 = Color32::from_rgb(27, 24, 36); // #1B1824
-const BG_CARD: Color32 = Color32::from_rgb(33, 30, 44); // #211E2C
-const BG_CARD_ALT: Color32 = Color32::from_rgb(41, 37, 56); // #292538
-const BG_INPUT: Color32 = Color32::from_rgb(18, 16, 24); // #121018
-const BORDER_SUBTLE: Color32 = Color32::from_rgb(52, 47, 71); // #342F47
+// Official Proton Carbon Dark Palette (matching Proton Mail & Proton Drive Desktop)
+const BG_CANVAS: Color32 = Color32::from_rgb(26, 24, 35); // #1A1823
+const BG_SIDEBAR: Color32 = Color32::from_rgb(20, 18, 27); // #14121B
+const BG_CARD: Color32 = Color32::from_rgb(33, 29, 44); // #211D2C
+const BG_CARD_ALT: Color32 = Color32::from_rgb(42, 37, 56); // #2A2538
+const BG_INPUT: Color32 = Color32::from_rgb(35, 31, 48); // #231F30
+const BORDER_SUBTLE: Color32 = Color32::from_rgb(48, 43, 64); // #302B40
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(247, 246, 252);
-const TEXT_MUTED: Color32 = Color32::from_rgb(167, 164, 181);
+const TEXT_MUTED: Color32 = Color32::from_rgb(162, 158, 178);
 const PROTON_PURPLE: Color32 = Color32::from_rgb(109, 74, 255); // #6D4AFF
 const PROTON_PURPLE_HOVER: Color32 = Color32::from_rgb(126, 94, 255); // #7E5EFF
-const PROTON_PURPLE_SOFT: Color32 = Color32::from_rgb(45, 34, 88); // Active nav pill
-const PROTON_PURPLE_TEXT: Color32 = Color32::from_rgb(206, 194, 255);
+const PROTON_PURPLE_SOFT: Color32 = Color32::from_rgb(44, 37, 69); // #2C2545 Active nav pill
+const PROTON_PURPLE_TEXT: Color32 = Color32::from_rgb(214, 204, 255);
 const STATUS_SUCCESS: Color32 = Color32::from_rgb(30, 168, 133); // #1EA885
 const STATUS_WARNING: Color32 = Color32::from_rgb(255, 153, 0); // #FF9900
 const STATUS_DANGER: Color32 = Color32::from_rgb(220, 50, 81); // #DC3251
@@ -72,6 +72,19 @@ struct ActiveTransfer {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct AccountInfo {
+    #[allow(dead_code)]
+    name: String,
+    display_name: String,
+    email: String,
+    initials: String,
+    used_space: u64,
+    max_space: u64,
+    used_drive_space: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DaemonStatus {
     state: String,
@@ -81,6 +94,8 @@ struct DaemonStatus {
     active_transfers: Vec<ActiveTransfer>,
     stats: SummaryStats,
     settings: SyncSettings,
+    #[serde(default)]
+    account: Option<AccountInfo>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -227,6 +242,8 @@ struct ProtonDriveNativeApp {
     status: DaemonStatus,
     activities: Vec<ActivityRecord>,
     login_url: Option<String>,
+    search_query: String,
+    show_account_menu: bool,
 
     // Cloud Browser state
     remote_path: String,
@@ -266,6 +283,7 @@ impl ProtonDriveNativeApp {
         cc: &eframe::CreationContext<'_>,
         screenshot_target: Option<String>,
         initial_tab: NavTab,
+        initial_account_menu: bool,
         window_geometry: WindowGeometry,
     ) -> Self {
         configure_proton_theme(&cc.egui_ctx);
@@ -298,6 +316,8 @@ impl ProtonDriveNativeApp {
             status: DaemonStatus::default(),
             activities: Vec::new(),
             login_url: None,
+            search_query: String::new(),
+            show_account_menu: initial_account_menu,
             remote_path: "/my-files".to_string(),
             remote_items: Vec::new(),
             remote_loading: false,
@@ -374,72 +394,83 @@ impl ProtonDriveNativeApp {
     fn render_sidebar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("proton_sidebar")
             .resizable(false)
-            .exact_width(248.0)
+            .exact_width(252.0)
             .frame(
                 Frame::NONE
                     .fill(BG_SIDEBAR)
-                    .inner_margin(Margin::symmetric(16, 20))
+                    .inner_margin(Margin::symmetric(16, 18))
                     .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE)),
             )
             .show(ctx, |ui| {
-                // Brand Header
+                // Brand Header (matching official Proton desktop header)
                 ui.horizontal(|ui| {
                     if let Some(tex) = &self.logo_texture {
                         ui.add(
                             egui::Image::new(tex)
-                                .fit_to_exact_size(Vec2::new(36.0, 36.0))
-                                .corner_radius(CornerRadius::same(8)),
+                                .fit_to_exact_size(Vec2::new(30.0, 30.0))
+                                .corner_radius(CornerRadius::same(7)),
                         );
                     }
                     ui.add_space(6.0);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("Proton Drive")
-                                .size(18.0)
-                                .strong()
-                                .color(TEXT_PRIMARY),
-                        );
-                        ui.label(
-                            RichText::new("Encrypted Cloud Sync")
-                                .size(11.5)
-                                .color(TEXT_MUTED),
-                        );
-                    });
+                    ui.label(
+                        RichText::new("Proton Drive")
+                            .size(18.5)
+                            .strong()
+                            .color(TEXT_PRIMARY),
+                    );
                 });
-
-                ui.add_space(20.0);
-
-                // Primary CTA button ("Sync Now")
-                let sync_btn = egui::Button::new(
-                    RichText::new("↻  Sync Now")
-                        .size(14.0)
-                        .strong()
-                        .color(Color32::WHITE),
-                )
-                .fill(PROTON_PURPLE)
-                .corner_radius(CornerRadius::same(8))
-                .min_size(Vec2::new(ui.available_width(), 38.0));
-
-                if ui.add(sync_btn).clicked() {
-                    let _ = self.tx.send(WorkerCommand::TriggerSync);
-                }
 
                 ui.add_space(18.0);
 
-                // Navigation Links
-                let nav_items = [
-                    (NavTab::Overview, "My Files & Activity", 0u64),
-                    (NavTab::CloudBrowser, "Cloud Browser", 0u64),
-                    (NavTab::SelectiveSync, "Selective Sync", 0u64),
-                    (
-                        NavTab::Conflicts,
-                        "Conflicts",
-                        self.status.stats.unresolved_conflicts,
-                    ),
-                    (NavTab::Settings, "Settings", 0u64),
+                // Primary CTA button (Proton Purple #6d4aff — perfectly centered text, no border stroke, matching Proton Mail)
+                let sync_label = if self.status.state == "syncing" {
+                    "Syncing..."
+                } else {
+                    "Sync now"
+                };
+                if proton_button(
+                    ui,
+                    Vec2::new(ui.available_width(), 38.0),
+                    sync_label,
+                    PROTON_PURPLE,
+                    PROTON_PURPLE_HOVER,
+                    None,
+                    Color32::WHITE,
+                    14.0,
+                )
+                .clicked()
+                {
+                    let _ = self.tx.send(WorkerCommand::TriggerSync);
+                }
+
+                ui.add_space(16.0);
+
+                // Navigation Links with crisp vector icons
+                let selective_badge = if !self.selective_folders.is_empty() {
+                    let inc = self
+                        .selective_folders
+                        .iter()
+                        .filter(|f| !f.excluded)
+                        .count();
+                    Some(format!("{inc}/{}", self.selective_folders.len()))
+                } else {
+                    None
+                };
+                let conflict_badge = if self.status.stats.unresolved_conflicts > 0 {
+                    Some(self.status.stats.unresolved_conflicts.to_string())
+                } else {
+                    None
+                };
+
+                let nav_items: [(NavTab, &str, Option<String>, bool); 5] = [
+                    (NavTab::Overview, "My Files & Activity", None, false),
+                    (NavTab::CloudBrowser, "Cloud Browser", None, false),
+                    (NavTab::SelectiveSync, "Selective Sync", selective_badge, false),
+                    (NavTab::Conflicts, "Conflicts", conflict_badge, true),
+                    (NavTab::Settings, "Settings", None, false),
                 ];
 
-                for (tab, label, badge) in nav_items {
+                for (tab, label, badge, is_danger_badge) in nav_items {
                     let active = self.tab == tab;
                     let fill = if active {
                         PROTON_PURPLE_SOFT
@@ -447,6 +478,11 @@ impl ProtonDriveNativeApp {
                         Color32::TRANSPARENT
                     };
                     let text_color = if active {
+                        TEXT_PRIMARY
+                    } else {
+                        TEXT_MUTED
+                    };
+                    let icon_color = if active {
                         PROTON_PURPLE_TEXT
                     } else {
                         TEXT_MUTED
@@ -459,24 +495,40 @@ impl ProtonDriveNativeApp {
                         .show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
                             ui.horizontal(|ui| {
+                                let (icon_rect, _) =
+                                    ui.allocate_exact_size(Vec2::new(16.0, 16.0), Sense::hover());
+                                draw_nav_icon(ui.painter(), icon_rect, tab, icon_color);
+                                ui.add_space(6.0);
+
                                 let text = if active {
-                                    RichText::new(label).size(14.0).strong().color(text_color)
+                                    RichText::new(label).size(13.5).strong().color(text_color)
                                 } else {
-                                    RichText::new(label).size(14.0).color(text_color)
+                                    RichText::new(label).size(13.5).color(text_color)
                                 };
                                 ui.label(text);
-                                if badge > 0 {
+
+                                if let Some(b_text) = badge {
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        let badge_fill = if is_danger_badge {
+                                            STATUS_DANGER
+                                        } else {
+                                            BG_CARD_ALT
+                                        };
+                                        let badge_fg = if is_danger_badge {
+                                            Color32::WHITE
+                                        } else {
+                                            TEXT_MUTED
+                                        };
                                         Frame::NONE
-                                            .fill(STATUS_DANGER)
-                                            .corner_radius(CornerRadius::same(10))
+                                            .fill(badge_fill)
+                                            .corner_radius(CornerRadius::same(8))
                                             .inner_margin(Margin::symmetric(7, 2))
                                             .show(ui, |ui| {
                                                 ui.label(
-                                                    RichText::new(badge.to_string())
+                                                    RichText::new(b_text)
                                                         .size(11.0)
                                                         .strong()
-                                                        .color(Color32::WHITE),
+                                                        .color(badge_fg),
                                                 );
                                             });
                                     });
@@ -507,95 +559,289 @@ impl ProtonDriveNativeApp {
                             _ => {}
                         }
                     }
-                    ui.add_space(4.0);
+                    ui.add_space(3.0);
                 }
 
-                // Bottom Status & Storage Summary Card in Sidebar
-                let remaining_h = (ui.available_height() - 108.0).max(12.0);
+                // Push footer to the bottom of the sidebar (matching Proton Mail storage bar)
+                let footer_height = 114.0;
+                let remaining_h = (ui.available_height() - footer_height).max(12.0);
                 ui.add_space(remaining_h);
-                Frame::NONE
-                    .fill(BG_CARD)
-                    .corner_radius(CornerRadius::same(10))
-                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
-                    .inner_margin(Margin::same(12))
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.label(
-                            RichText::new("Local Sync Folder")
-                                .size(12.0)
-                                .strong()
-                                .color(TEXT_PRIMARY),
-                        );
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(format!(
-                                "{} synced  •  {} files",
-                                format_bytes(self.status.stats.total_bytes),
-                                self.status.stats.total_files
-                            ))
+
+                // Quick Open ~/ProtonDrive button (centered text)
+                if proton_button(
+                    ui,
+                    Vec2::new(ui.available_width(), 34.0),
+                    "Open ~/ProtonDrive folder",
+                    BG_CARD,
+                    BG_CARD_ALT,
+                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
+                    TEXT_PRIMARY,
+                    12.5,
+                )
+                .clicked()
+                {
+                    let folder = if self.status.sync_dir.is_empty() {
+                        "~/ProtonDrive"
+                    } else {
+                        &self.status.sync_dir
+                    };
+                    let _ = Command::new("xdg-open").arg(folder).spawn();
+                }
+
+                ui.add_space(14.0);
+
+                // Official Proton Bottom-Left Storage Quota Meter + App Version
+                let (used_bytes, max_bytes) = if let Some(acct) = &self.status.account {
+                    if acct.max_space > 0 {
+                        (acct.used_space, acct.max_space)
+                    } else {
+                        (self.status.stats.total_bytes, 0)
+                    }
+                } else {
+                    (self.status.stats.total_bytes, 0)
+                };
+
+                let ratio = if max_bytes > 0 {
+                    (used_bytes as f32 / max_bytes as f32).clamp(0.015, 1.0)
+                } else {
+                    0.12
+                };
+
+                // Thin 4px progress bar matching Proton Mail
+                let bar_w = ui.available_width();
+                let (bar_rect, _) = ui.allocate_exact_size(Vec2::new(bar_w, 4.0), Sense::hover());
+                ui.painter().rect_filled(
+                    bar_rect,
+                    CornerRadius::same(2),
+                    Color32::from_rgb(46, 41, 62),
+                );
+                let mut fill_rect = bar_rect;
+                fill_rect.set_width((bar_w * ratio).max(4.0));
+                let bar_color = if ratio > 0.90 {
+                    STATUS_DANGER
+                } else if ratio > 0.75 {
+                    STATUS_WARNING
+                } else {
+                    STATUS_SUCCESS
+                };
+                ui.painter()
+                    .rect_filled(fill_rect, CornerRadius::same(2), bar_color);
+
+                ui.add_space(7.0);
+
+                ui.horizontal(|ui| {
+                    let quota_label = if max_bytes > 0 {
+                        format!(
+                            "{} / {}",
+                            format_bytes_precise(used_bytes),
+                            format_bytes_precise(max_bytes)
+                        )
+                    } else {
+                        format!("{} synced", format_bytes_precise(used_bytes))
+                    };
+                    ui.label(
+                        RichText::new(quota_label)
                             .size(11.5)
-                            .color(TEXT_MUTED),
+                            .strong()
+                            .color(TEXT_PRIMARY),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(env!("CARGO_PKG_VERSION"))
+                                .size(11.5)
+                                .color(TEXT_MUTED),
                         );
-                        ui.add_space(8.0);
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("Open ~/ProtonDrive")
-                                        .size(12.0)
-                                        .strong()
-                                        .color(TEXT_PRIMARY),
-                                )
-                                .fill(BG_CARD_ALT)
-                                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
-                                .corner_radius(CornerRadius::same(6))
-                                .min_size(Vec2::new(ui.available_width(), 30.0)),
-                            )
-                            .clicked()
-                        {
-                            let folder = if self.status.sync_dir.is_empty() {
-                                "~/ProtonDrive"
-                            } else {
-                                &self.status.sync_dir
-                            };
-                            let _ = Command::new("xdg-open").arg(folder).spawn();
-                        }
                     });
+                });
+
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Local folder: {} ({} files)",
+                        format_bytes(self.status.stats.total_bytes),
+                        self.status.stats.total_files
+                    ))
+                    .size(11.0)
+                    .color(TEXT_MUTED),
+                );
             });
     }
 
     fn render_top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let title = match self.tab {
-                NavTab::Overview => "My Files & Activity",
-                NavTab::CloudBrowser => "Cloud Browser",
-                NavTab::SelectiveSync => "Selective Sync",
-                NavTab::Conflicts => "Conflict Resolution",
-                NavTab::Settings => "Settings",
-            };
-            ui.label(
-                RichText::new(title)
-                    .size(22.0)
-                    .strong()
-                    .color(TEXT_PRIMARY),
-            );
+            // Search / filter input on the left (matching Proton Mail top bar)
+            Frame::NONE
+                .fill(BG_INPUT)
+                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(12, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (s_rect, _) =
+                            ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
+                        draw_search_icon(ui.painter(), s_rect, TEXT_MUTED);
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.search_query)
+                                .hint_text("Search files and sync activity")
+                                .frame(false)
+                                .desired_width(280.0),
+                        );
+                        if !self.search_query.is_empty()
+                            && ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("×").size(14.0).color(TEXT_MUTED),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                        {
+                            self.search_query.clear();
+                        }
+                    });
+                });
 
+            // Right side: Proton User Profile (Name + Email + Initials Avatar) + Settings Gear + Sync Status
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let paused = self.status.settings.paused;
-                let pause_label = if paused { "Resume Sync" } else { "Pause Sync" };
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new(pause_label).size(13.0).color(TEXT_PRIMARY))
-                            .fill(BG_CARD_ALT)
-                            .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
-                            .corner_radius(CornerRadius::same(8))
-                            .min_size(Vec2::new(105.0, 32.0)),
+                let (display_name, email, initials) = if let Some(acct) = &self.status.account {
+                    (
+                        if acct.display_name.is_empty() {
+                            "Proton Account".to_string()
+                        } else {
+                            acct.display_name.clone()
+                        },
+                        acct.email.clone(),
+                        if acct.initials.is_empty() {
+                            "PD".to_string()
+                        } else {
+                            acct.initials.clone()
+                        },
                     )
-                    .clicked()
+                } else if self.status.logged_in {
+                    (
+                        "Proton Account".to_string(),
+                        "Connected".to_string(),
+                        "PD".to_string(),
+                    )
+                } else {
+                    (
+                        "Not Signed In".to_string(),
+                        "Click Sign In below".to_string(),
+                        "PD".to_string(),
+                    )
+                };
+
+                // Initials Avatar Badge (34x34 rounded square matching Proton Mail's "GC" badge)
+                let (avatar_rect, avatar_resp) =
+                    ui.allocate_exact_size(Vec2::new(34.0, 34.0), Sense::click());
+                let avatar_fill = if self.show_account_menu || avatar_resp.hovered() {
+                    Color32::from_rgb(66, 53, 108)
+                } else {
+                    Color32::from_rgb(50, 41, 82)
+                };
+                ui.painter().rect_filled(
+                    avatar_rect,
+                    CornerRadius::same(8),
+                    avatar_fill,
+                );
+                ui.painter().rect_stroke(
+                    avatar_rect,
+                    CornerRadius::same(8),
+                    Stroke::new(
+                        1.0_f32,
+                        if self.show_account_menu {
+                            PROTON_PURPLE
+                        } else {
+                            Color32::from_rgb(92, 74, 156)
+                        },
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+                ui.painter().text(
+                    avatar_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &initials,
+                    FontId::new(13.0, FontFamily::Proportional),
+                    TEXT_PRIMARY,
+                );
+                if avatar_resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if avatar_resp.clicked() {
+                    self.show_account_menu = !self.show_account_menu;
+                }
+
+                ui.add_space(8.0);
+
+                // Stacked Display Name + Email (right-aligned next to avatar, clickable to open account menu)
+                let name_resp = ui
+                    .allocate_ui_with_layout(
+                        Vec2::new(195.0, 34.0),
+                        Layout::top_down(Align::Max),
+                        |ui| {
+                            ui.label(
+                                RichText::new(&display_name)
+                                    .size(13.0)
+                                    .strong()
+                                    .color(TEXT_PRIMARY),
+                            );
+                            ui.label(RichText::new(&email).size(11.5).color(TEXT_MUTED));
+                        },
+                    )
+                    .response
+                    .interact(Sense::click());
+                if name_resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if name_resp.clicked() {
+                    self.show_account_menu = !self.show_account_menu;
+                }
+
+                ui.add_space(10.0);
+
+                // Subtle vertical divider
+                let (div_rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 24.0), Sense::hover());
+                ui.painter().rect_filled(div_rect, 0, BORDER_SUBTLE);
+
+                ui.add_space(10.0);
+
+                // Settings Icon Button
+                let (gear_rect, gear_resp) =
+                    ui.allocate_exact_size(Vec2::new(32.0, 32.0), Sense::click());
+                if gear_resp.hovered() || self.tab == NavTab::Settings {
+                    ui.painter().rect_filled(
+                        gear_rect,
+                        CornerRadius::same(8),
+                        BG_CARD_ALT,
+                    );
+                }
+                draw_gear_icon(ui.painter(), gear_rect.shrink(8.0), TEXT_MUTED);
+                if gear_resp.on_hover_text("Synchronization Settings").clicked() {
+                    self.tab = NavTab::Settings;
+                }
+
+                ui.add_space(6.0);
+
+                // Pause / Resume Button (centered text)
+                let paused = self.status.settings.paused;
+                let pause_label = if paused { "Resume" } else { "Pause" };
+                if proton_button(
+                    ui,
+                    Vec2::new(76.0, 30.0),
+                    pause_label,
+                    BG_CARD,
+                    BG_CARD_ALT,
+                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
+                    TEXT_PRIMARY,
+                    12.5,
+                )
+                .clicked()
                 {
                     let _ = self.tx.send(WorkerCommand::SetPaused(!paused));
                 }
 
-                ui.add_space(8.0);
+                ui.add_space(6.0);
 
                 // Status Pill
                 let (dot_color, status_text) = if !self.daemon_online {
@@ -610,7 +856,7 @@ impl ProtonDriveNativeApp {
                         .current_action
                         .as_deref()
                         .unwrap_or("Syncing...");
-                    (PROTON_PURPLE_HOVER, truncate_middle(act, 42))
+                    (PROTON_PURPLE_HOVER, truncate_middle(act, 36))
                 } else if self.status.state == "error" {
                     (STATUS_DANGER, "Sync Error".to_string())
                 } else {
@@ -620,10 +866,10 @@ impl ProtonDriveNativeApp {
                 Frame::NONE
                     .fill(BG_CARD)
                     .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
-                    .corner_radius(CornerRadius::same(99))
-                    .inner_margin(Margin::symmetric(14, 6))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(Margin::symmetric(12, 6))
                     .show(ui, |ui| {
-                        ui.label(RichText::new(status_text).size(12.5).color(TEXT_PRIMARY));
+                        ui.label(RichText::new(status_text).size(12.0).color(TEXT_PRIMARY));
                         ui.add_space(4.0);
                         let (rect, _) =
                             ui.allocate_exact_size(Vec2::new(8.0, 8.0), Sense::hover());
@@ -633,106 +879,287 @@ impl ProtonDriveNativeApp {
         });
     }
 
-    fn render_overview_tab(&mut self, ui: &mut egui::Ui) {
-        // Account Card
-        card_frame().show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("Proton Account")
-                            .size(15.0)
-                            .strong()
-                            .color(TEXT_PRIMARY),
-                    );
-                    ui.add_space(4.0);
-                    if self.status.logged_in {
-                        ui.horizontal(|ui| {
-                            let (rect, _) =
-                                ui.allocate_exact_size(Vec2::new(8.0, 8.0), Sense::hover());
-                            ui.painter()
-                                .circle_filled(rect.center(), 4.0, STATUS_SUCCESS);
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new("Connected to Proton Drive  •  Syncing ~/ProtonDrive")
-                                    .size(13.0)
-                                    .color(STATUS_SUCCESS),
-                            );
-                        });
-                    } else {
-                        ui.label(
-                            RichText::new("Sign in with your Proton account in the browser to begin syncing.")
-                                .size(13.0)
-                                .color(TEXT_MUTED),
-                        );
-                    }
-                });
+    fn render_account_popover(&mut self, ctx: &egui::Context) {
+        if !self.show_account_menu {
+            return;
+        }
 
+        let screen_rect = ctx.screen_rect();
+        let pop_w = 264.0;
+        let pop_pos = egui::pos2((screen_rect.max.x - pop_w - 18.0).max(260.0), 54.0);
+
+        let (display_name, email, initials, plan_badge) = if let Some(acct) = &self.status.account {
+            let plan = if acct.max_space >= 400 * 1024 * 1024 * 1024 {
+                "Proton Unlimited"
+            } else if acct.max_space >= 15 * 1024 * 1024 * 1024 {
+                "Proton Drive Plus"
+            } else {
+                "Proton Free"
+            };
+            (
+                if acct.display_name.is_empty() {
+                    "Proton Account".to_string()
+                } else {
+                    acct.display_name.clone()
+                },
+                acct.email.clone(),
+                if acct.initials.is_empty() {
+                    "PD".to_string()
+                } else {
+                    acct.initials.clone()
+                },
+                plan.to_string(),
+            )
+        } else {
+            (
+                "Proton Account".to_string(),
+                "Not Signed In".to_string(),
+                "PD".to_string(),
+                "Proton Drive".to_string(),
+            )
+        };
+
+        let area_resp = egui::Area::new(egui::Id::new("proton_account_popover"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pop_pos)
+            .show(ctx, |ui| {
+                Frame::NONE
+                    .fill(Color32::from_rgb(28, 25, 38)) // #1C1926 matching Proton Mail popover
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(60, 53, 82)))
+                    .corner_radius(CornerRadius::same(12))
+                    .show(ui, |ui| {
+                        ui.set_min_width(pop_w);
+                        ui.set_max_width(pop_w);
+
+                        // Top header strip ("End-to-end encrypted sync  ›")
+                        Frame::NONE
+                            .inner_margin(Margin::symmetric(16, 12))
+                            .show(ui, |ui| {
+                                ui.set_min_width(pop_w - 32.0);
+                                ui.vertical_centered(|ui| {
+                                    ui.label(
+                                        RichText::new("✓  End-to-end encrypted sync   ›")
+                                            .size(12.5)
+                                            .color(Color32::from_rgb(206, 202, 222)),
+                                    );
+                                });
+                            });
+
+                        let (sep_rect, _) =
+                            ui.allocate_exact_size(Vec2::new(pop_w, 1.0), Sense::hover());
+                        ui.painter()
+                            .rect_filled(sep_rect, 0, Color32::from_rgb(48, 43, 66));
+
+                        // Main Popover Body
+                        Frame::NONE
+                            .inner_margin(Margin::symmetric(18, 18))
+                            .show(ui, |ui| {
+                                ui.set_min_width(pop_w - 36.0);
+                                ui.vertical_centered(|ui| {
+                                    // Centered 44x44 Initials Avatar
+                                    let (av_rect, _) = ui.allocate_exact_size(
+                                        Vec2::new(44.0, 44.0),
+                                        Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        av_rect,
+                                        CornerRadius::same(10),
+                                        Color32::from_rgb(61, 46, 110),
+                                    );
+                                    ui.painter().text(
+                                        av_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        &initials,
+                                        FontId::new(16.0, FontFamily::Proportional),
+                                        Color32::WHITE,
+                                    );
+
+                                    ui.add_space(12.0);
+
+                                    // Display Name
+                                    ui.label(
+                                        RichText::new(&display_name)
+                                            .size(14.5)
+                                            .strong()
+                                            .color(TEXT_PRIMARY),
+                                    );
+
+                                    ui.add_space(2.0);
+
+                                    // Email
+                                    ui.label(
+                                        RichText::new(&email).size(12.5).color(TEXT_MUTED),
+                                    );
+
+                                    ui.add_space(8.0);
+
+                                    // Compact Plan Pill Badge ("Proton Unlimited") matching Proton Mail
+                                    let (pill_rect, _) = ui.allocate_exact_size(
+                                        Vec2::new(112.0, 20.0),
+                                        Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        pill_rect,
+                                        CornerRadius::same(5),
+                                        Color32::from_rgb(47, 36, 84),
+                                    );
+                                    ui.painter().text(
+                                        pill_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        &plan_badge,
+                                        FontId::new(11.0, FontFamily::Proportional),
+                                        Color32::from_rgb(198, 180, 255),
+                                    );
+
+                                    ui.add_space(16.0);
+
+                                    // Button 1: Open local folder (outlined button matching Proton Mail)
+                                    let btn_w = pop_w - 36.0;
+                                    if proton_button(
+                                        ui,
+                                        Vec2::new(btn_w, 34.0),
+                                        "Open local sync folder",
+                                        Color32::from_rgb(28, 25, 38),
+                                        Color32::from_rgb(42, 37, 56),
+                                        Some(Stroke::new(1.0_f32, Color32::from_rgb(76, 69, 100))),
+                                        TEXT_PRIMARY,
+                                        13.0,
+                                    )
+                                    .clicked()
+                                    {
+                                        let folder = if self.status.sync_dir.is_empty() {
+                                            "~/ProtonDrive"
+                                        } else {
+                                            &self.status.sync_dir
+                                        };
+                                        let _ = Command::new("xdg-open").arg(folder).spawn();
+                                        self.show_account_menu = false;
+                                    }
+
+                                    ui.add_space(8.0);
+
+                                    // Button 2: Sign out / Sign in (outlined with Proton purple border matching Proton Mail)
+                                    if self.status.logged_in {
+                                        if proton_button(
+                                            ui,
+                                            Vec2::new(btn_w, 34.0),
+                                            "Sign out",
+                                            Color32::from_rgb(28, 25, 38),
+                                            Color32::from_rgb(46, 36, 82),
+                                            Some(Stroke::new(1.2_f32, PROTON_PURPLE)),
+                                            TEXT_PRIMARY,
+                                            13.0,
+                                        )
+                                        .clicked()
+                                        {
+                                            let _ = self.tx.send(WorkerCommand::Logout);
+                                            self.show_account_menu = false;
+                                        }
+                                    } else if proton_button(
+                                        ui,
+                                        Vec2::new(btn_w, 34.0),
+                                        "Sign in",
+                                        PROTON_PURPLE,
+                                        PROTON_PURPLE_HOVER,
+                                        None,
+                                        Color32::WHITE,
+                                        13.0,
+                                    )
+                                    .clicked()
+                                    {
+                                        let _ = self.tx.send(WorkerCommand::StartLogin);
+                                        self.show_account_menu = false;
+                                    }
+                                });
+                            });
+                    });
+            });
+
+        // Close popover if user clicks outside of it (and outside top bar)
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                if !area_resp.response.rect.contains(pos) && pos.y > 56.0 {
+                    self.show_account_menu = false;
+                }
+            }
+        }
+    }
+
+    fn render_overview_tab(&mut self, ui: &mut egui::Ui) {
+        // Section Title Bar
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("My Files & Sync Activity")
+                    .size(20.0)
+                    .strong()
+                    .color(TEXT_PRIMARY),
+            );
+            if !self.status.logged_in {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if self.status.logged_in {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("Sign Out").size(12.5).color(STATUS_DANGER),
-                                )
-                                .fill(Color32::from_rgba_unmultiplied(220, 50, 81, 28))
-                                .stroke(Stroke::new(1.0_f32, STATUS_DANGER))
-                                .corner_radius(CornerRadius::same(8))
-                                .min_size(Vec2::new(90.0, 32.0)),
-                            )
-                            .clicked()
-                        {
-                            let _ = self.tx.send(WorkerCommand::Logout);
-                        }
-                    } else if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("Sign In").size(13.0).strong().color(Color32::WHITE),
-                            )
-                            .fill(PROTON_PURPLE)
-                            .corner_radius(CornerRadius::same(8))
-                            .min_size(Vec2::new(100.0, 34.0)),
-                        )
-                        .clicked()
+                    if proton_button(
+                        ui,
+                        Vec2::new(165.0, 34.0),
+                        "Sign in to Proton Drive",
+                        PROTON_PURPLE,
+                        PROTON_PURPLE_HOVER,
+                        None,
+                        Color32::WHITE,
+                        13.0,
+                    )
+                    .clicked()
                     {
                         let _ = self.tx.send(WorkerCommand::StartLogin);
                     }
                 });
-            });
-
-            if let Some(url) = &self.login_url {
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(format!("Sign-in URL opened in browser: {url}"))
-                        .size(12.0)
-                        .color(PROTON_PURPLE_TEXT),
-                );
             }
         });
 
-        ui.add_space(14.0);
+        if let Some(url) = &self.login_url {
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!("Sign-in URL opened in browser: {url}"))
+                    .size(12.0)
+                    .color(PROTON_PURPLE_TEXT),
+            );
+        }
 
-        // 4 Stat Metric Cards
+        ui.add_space(12.0);
+
+        // 4 Stat Metric Cards (including Proton Cloud Storage Quota!)
+        let cloud_quota_str = if let Some(acct) = &self.status.account {
+            if acct.max_space > 0 {
+                format!(
+                    "{} / {}",
+                    format_bytes_precise(acct.used_space),
+                    format_bytes_precise(acct.max_space)
+                )
+            } else {
+                format_bytes(self.status.stats.total_bytes)
+            }
+        } else {
+            format_bytes(self.status.stats.total_bytes)
+        };
+
         ui.columns(4, |cols| {
             render_stat_card(
                 &mut cols[0],
+                "Proton Cloud Storage",
+                &cloud_quota_str,
+            );
+            render_stat_card(
+                &mut cols[1],
+                "Local Synced Size",
+                &format_bytes_precise(self.status.stats.total_bytes),
+            );
+            render_stat_card(
+                &mut cols[2],
                 "Synced Files",
                 &self.status.stats.total_files.to_string(),
             );
             render_stat_card(
-                &mut cols[1],
+                &mut cols[3],
                 "Synced Folders",
                 &self.status.stats.total_folders.to_string(),
-            );
-            render_stat_card(
-                &mut cols[2],
-                "Local Synced Size",
-                &format_bytes(self.status.stats.total_bytes),
-            );
-            render_stat_card(
-                &mut cols[3],
-                "Conflicts",
-                &self.status.stats.unresolved_conflicts.to_string(),
             );
         });
 
@@ -788,15 +1215,33 @@ impl ProtonDriveNativeApp {
 
         ui.add_space(14.0);
 
-        // Recent Sync Activity Card
+        // Recent Sync Activity Card (filtered by top search box)
+        let query_lower = self.search_query.trim().to_lowercase();
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.label(
-                RichText::new("Recent Activity")
-                    .size(15.5)
-                    .strong()
-                    .color(TEXT_PRIMARY),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Recent Sync Activity")
+                        .size(15.5)
+                        .strong()
+                        .color(TEXT_PRIMARY),
+                );
+                if let Some(acct) = &self.status.account {
+                    if acct.used_drive_space > 0 {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Drive Cloud Usage: {}  •  Syncing {}",
+                                    format_bytes_precise(acct.used_drive_space),
+                                    self.status.sync_dir
+                                ))
+                                .size(12.0)
+                                .color(TEXT_MUTED),
+                            );
+                        });
+                    }
+                }
+            });
             ui.add_space(12.0);
 
             ScrollArea::vertical()
@@ -834,7 +1279,19 @@ impl ProtonDriveNativeApp {
                                 );
                                 ui.end_row();
 
-                                for act in self.activities.iter().take(40) {
+                                for act in self
+                                    .activities
+                                    .iter()
+                                    .filter(|a| {
+                                        query_lower.is_empty()
+                                            || a.local_rel_path
+                                                .to_lowercase()
+                                                .contains(&query_lower)
+                                            || a.details.to_lowercase().contains(&query_lower)
+                                            || a.action.to_lowercase().contains(&query_lower)
+                                    })
+                                    .take(40)
+                                {
                                     let pill_color = match act.action.as_str() {
                                         "upload" => PROTON_PURPLE,
                                         "download" => STATUS_SUCCESS,
@@ -1605,16 +2062,25 @@ impl eframe::App for ProtonDriveNativeApp {
 
         self.render_sidebar(ctx);
 
+        egui::TopBottomPanel::top("proton_top_header")
+            .exact_height(56.0)
+            .frame(
+                Frame::NONE
+                    .fill(BG_SIDEBAR)
+                    .inner_margin(Margin::symmetric(24, 11))
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE)),
+            )
+            .show(ctx, |ui| {
+                self.render_top_bar(ui);
+            });
+
         egui::CentralPanel::default()
             .frame(
                 Frame::NONE
                     .fill(BG_CANVAS)
-                    .inner_margin(Margin::symmetric(28, 22)),
+                    .inner_margin(Margin::symmetric(26, 20)),
             )
             .show(ctx, |ui| {
-                self.render_top_bar(ui);
-                ui.add_space(18.0);
-
                 match self.tab {
                     NavTab::Overview => self.render_overview_tab(ui),
                     NavTab::CloudBrowser => self.render_browser_tab(ui),
@@ -1623,6 +2089,8 @@ impl eframe::App for ProtonDriveNativeApp {
                     NavTab::Settings => self.render_settings_tab(ui),
                 }
             });
+
+        self.render_account_popover(ctx);
 
         // Handle --screenshot <path> for automated visual inspection
         if let Some(target_path) = self.screenshot_target.clone() {
@@ -1668,6 +2136,36 @@ fn card_frame() -> Frame {
         .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
         .corner_radius(CornerRadius::same(12))
         .inner_margin(Margin::same(18))
+}
+
+fn proton_button(
+    ui: &mut egui::Ui,
+    size: Vec2,
+    label: &str,
+    fill: Color32,
+    hover_fill: Color32,
+    stroke: Option<Stroke>,
+    text_color: Color32,
+    font_size: f32,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let bg = if resp.hovered() { hover_fill } else { fill };
+    ui.painter().rect_filled(rect, CornerRadius::same(8), bg);
+    if let Some(s) = stroke {
+        ui.painter()
+            .rect_stroke(rect, CornerRadius::same(8), s, egui::StrokeKind::Inside);
+    }
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        FontId::new(font_size, FontFamily::Proportional),
+        text_color,
+    );
+    resp
 }
 
 fn render_stat_card(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -1776,6 +2274,108 @@ fn format_bytes(bytes: u64) -> String {
         idx += 1;
     }
     format!("{val:.1} {}", units[idx])
+}
+
+fn format_bytes_precise(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let units = ["KB", "MB", "GB", "TB"];
+    let mut val = bytes as f64 / 1024.0;
+    let mut idx = 0;
+    while val >= 1024.0 && idx < units.len() - 1 {
+        val /= 1024.0;
+        idx += 1;
+    }
+    if idx >= 2 {
+        format!("{val:.2} {}", units[idx])
+    } else {
+        format!("{val:.1} {}", units[idx])
+    }
+}
+
+fn draw_nav_icon(painter: &egui::Painter, rect: egui::Rect, tab: NavTab, color: Color32) {
+    let stroke = Stroke::new(1.5_f32, color);
+    let r = rect.shrink(1.5);
+    match tab {
+        NavTab::Overview => {
+            // Folder outline icon
+            let tab_rect = egui::Rect::from_min_size(r.min, Vec2::new(r.width() * 0.45, 3.0));
+            let body_rect = egui::Rect::from_min_max(
+                egui::pos2(r.min.x, r.min.y + 2.5),
+                r.max,
+            );
+            painter.rect_filled(tab_rect, CornerRadius::same(1), color);
+            painter.rect_stroke(body_rect, CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+        }
+        NavTab::CloudBrowser => {
+            // 2x2 grid icon
+            let w = (r.width() - 3.0) * 0.5;
+            let h = (r.height() - 3.0) * 0.5;
+            for row in 0..2 {
+                for col in 0..2 {
+                    let min = egui::pos2(
+                        r.min.x + col as f32 * (w + 3.0),
+                        r.min.y + row as f32 * (h + 3.0),
+                    );
+                    let cell = egui::Rect::from_min_size(min, Vec2::new(w, h));
+                    painter.rect_stroke(cell, CornerRadius::same(1), stroke, egui::StrokeKind::Inside);
+                }
+            }
+        }
+        NavTab::SelectiveSync => {
+            // Checklist / filter bars icon
+            for i in 0..3 {
+                let y = r.min.y + 2.0 + i as f32 * 4.5;
+                painter.circle_filled(egui::pos2(r.min.x + 2.0, y), 1.4, color);
+                painter.line_segment(
+                    [egui::pos2(r.min.x + 5.5, y), egui::pos2(r.max.x, y)],
+                    stroke,
+                );
+            }
+        }
+        NavTab::Conflicts => {
+            // Warning badge icon
+            painter.circle_stroke(r.center(), r.width() * 0.46, stroke);
+            let c = r.center();
+            painter.line_segment(
+                [egui::pos2(c.x, c.y - 3.2), egui::pos2(c.x, c.y + 0.8)],
+                stroke,
+            );
+            painter.circle_filled(egui::pos2(c.x, c.y + 3.2), 1.0, color);
+        }
+        NavTab::Settings => {
+            draw_gear_icon(painter, rect.shrink(1.0), color);
+        }
+    }
+}
+
+fn draw_search_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
+    let stroke = Stroke::new(1.5_f32, color);
+    let center = egui::pos2(rect.min.x + rect.width() * 0.42, rect.min.y + rect.height() * 0.42);
+    let radius = rect.width() * 0.32;
+    painter.circle_stroke(center, radius, stroke);
+    let start = egui::pos2(center.x + radius * 0.72, center.y + radius * 0.72);
+    let end = egui::pos2(rect.max.x - 1.2, rect.max.y - 1.2);
+    painter.line_segment([start, end], stroke);
+}
+
+fn draw_gear_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
+    let stroke = Stroke::new(1.5_f32, color);
+    let c = rect.center();
+    let r_outer = rect.width() * 0.44;
+    let r_inner = rect.width() * 0.20;
+    painter.circle_stroke(c, r_outer * 0.75, stroke);
+    painter.circle_filled(c, r_inner, color);
+    for i in 0..4 {
+        let angle = i as f32 * std::f32::consts::FRAC_PI_4;
+        let dx = angle.cos() * r_outer;
+        let dy = angle.sin() * r_outer;
+        painter.line_segment(
+            [egui::pos2(c.x - dx, c.y - dy), egui::pos2(c.x + dx, c.y + dy)],
+            Stroke::new(1.3_f32, color),
+        );
+    }
 }
 
 fn truncate_middle(s: &str, max_chars: usize) -> String {
@@ -2014,11 +2614,15 @@ OPTIONS:
 fn main() -> eframe::Result {
     let mut screenshot_target: Option<String> = None;
     let mut initial_tab = NavTab::Overview;
+    let mut initial_account_menu = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--screenshot" => {
                 screenshot_target = args.next();
+            }
+            "--account-menu" => {
+                initial_account_menu = true;
             }
             "--tab" => {
                 if let Some(t) = args.next() {
@@ -2096,6 +2700,7 @@ fn main() -> eframe::Result {
                 cc,
                 screenshot_target,
                 initial_tab,
+                initial_account_menu,
                 saved_geom,
             )))
         }),

@@ -3,6 +3,7 @@
 import path from 'node:path';
 
 import { launchDesktopWindow } from '../gui/launcher';
+import { ensureSystemTrayIndicator } from '../linux/notifications';
 import { DEFAULT_DAEMON_HOST, DEFAULT_DAEMON_PORT, startSyncDaemon } from '../daemon/daemonServer';
 import {
     DEFAULT_APP_VERSION,
@@ -132,6 +133,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     if (cmd === 'gui') {
         if (await isDaemonRunning()) {
             console.log(`[proton-drive-ubuntu] Opening desktop GUI (${DAEMON_BASE_URL})...`);
+            ensureSystemTrayIndicator();
             launchDesktopWindow(DAEMON_BASE_URL);
             await new Promise((r) => setTimeout(r, 200));
             return;

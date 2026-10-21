@@ -50,9 +50,9 @@ def format_bytes(b: int) -> str:
     val = float(b) / 1024.0
     for unit in ["KB", "MB", "GB", "TB"]:
         if val < 1024.0 or unit == "TB":
-            return f"{val:.1f} {unit}"
+            return f"{val:.2f} {unit}" if unit in ("GB", "TB") else f"{val:.1f} {unit}"
         val /= 1024.0
-    return f"{val:.1f} TB"
+    return f"{val:.2f} TB"
 
 
 class ProtonDriveTrayIndicator:
@@ -73,7 +73,17 @@ class ProtonDriveTrayIndicator:
 
         self.menu = Gtk.Menu()
 
-        self.status_item = Gtk.MenuItem(label="Proton Drive: Starting...")
+        self.account_item = Gtk.MenuItem(label="Proton Drive")
+        self.account_item.set_sensitive(False)
+        self.menu.append(self.account_item)
+
+        self.storage_item = Gtk.MenuItem(label="Storage: Calculating...")
+        self.storage_item.set_sensitive(False)
+        self.menu.append(self.storage_item)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        self.status_item = Gtk.MenuItem(label="Status: Starting...")
         self.status_item.set_sensitive(False)
         self.menu.append(self.status_item)
 
@@ -101,6 +111,12 @@ class ProtonDriveTrayIndicator:
         self.pause_item.connect("activate", self.on_toggle_pause)
         self.menu.append(self.pause_item)
 
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        quit_item = Gtk.MenuItem(label="Quit Proton Drive")
+        quit_item.connect("activate", self.on_quit)
+        self.menu.append(quit_item)
+
         self.menu.show_all()
         self.indicator.set_menu(self.menu)
 
@@ -117,12 +133,35 @@ class ProtonDriveTrayIndicator:
             logged_in = data.get("loggedIn", False)
             settings = data.get("settings", {})
             stats = data.get("stats", {})
+            account = data.get("account") or {}
             self.paused = bool(settings.get("paused", False))
             self.sync_dir = data.get("syncDir") or os.path.expanduser("~/ProtonDrive")
 
+            display_name = account.get("displayName") or ""
+            email = account.get("email") or ""
+            used_space = int(account.get("usedSpace") or 0)
+            max_space = int(account.get("maxSpace") or 0)
+
+            if display_name and email:
+                self.account_item.set_label(f"{display_name} ({email})")
+            elif email:
+                self.account_item.set_label(email)
+            elif logged_in:
+                self.account_item.set_label("Proton Account Connected")
+            else:
+                self.account_item.set_label("Proton Drive (Not Signed In)")
+
+            if max_space > 0:
+                pct = (used_space / max_space) * 100.0
+                self.storage_item.set_label(
+                    f"Storage: {format_bytes(used_space)} / {format_bytes(max_space)} ({pct:.1f}%)"
+                )
+            else:
+                self.storage_item.set_label("Storage: —")
+
             total_files = int(stats.get("totalFiles", 0))
             total_bytes = int(stats.get("totalBytes", 0))
-            self.stats_item.set_label(f"{format_bytes(total_bytes)} synced  •  {total_files} files")
+            self.stats_item.set_label(f"Local Sync: {format_bytes(total_bytes)}  •  {total_files} files")
 
             if not logged_in:
                 self.indicator.set_icon_full("protondrive-tray-error", "Sign in required")
@@ -198,6 +237,23 @@ class ProtonDriveTrayIndicator:
         except Exception:
             pass
         self.poll_status()
+
+    def on_quit(self, _widget):
+        try:
+            subprocess.run(
+                ["pkill", "-f", "protondrive-gui"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+        try:
+            req = urllib.request.Request(f"{DAEMON_URL}/api/quit", method="POST")
+            urllib.request.urlopen(req, timeout=1.0)
+        except Exception:
+            pass
+        Gtk.main_quit()
 
 
 def main():

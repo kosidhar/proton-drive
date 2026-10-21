@@ -19,6 +19,38 @@ import { SyncStateDatabase } from '../sync/syncStateDb';
 export const DEFAULT_DAEMON_PORT = Number(process.env.PROTON_DRIVE_DAEMON_PORT || 49152);
 export const DEFAULT_DAEMON_HOST = '127.0.0.1';
 
+export interface ProtonAccountInfo {
+    name: string;
+    displayName: string;
+    email: string;
+    initials: string;
+    usedSpace: number;
+    maxSpace: number;
+    usedDriveSpace: number;
+}
+
+function computeInitials(displayName: string, email: string): string {
+    const source = (displayName || email.split('@')[0] || 'PD').trim();
+    const parts = source.split(/[\s._-]+/).filter(Boolean);
+    if (parts.length >= 2) {
+        return `${parts[0]![0] ?? ''}${parts[parts.length - 1]![0] ?? ''}`.toUpperCase();
+    }
+    return source.slice(0, 2).toUpperCase();
+}
+
+function prettifyName(rawName: string, email: string): string {
+    const trimmed = rawName.trim();
+    if (trimmed && trimmed.includes(' ')) {
+        return trimmed;
+    }
+    const candidate = trimmed || email.split('@')[0] || 'Proton User';
+    return candidate
+        .split(/[\s._-]+/)
+        .filter(Boolean)
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(' ');
+}
+
 export async function startSyncDaemon(options: {
     port?: number;
     host?: string;
@@ -50,11 +82,87 @@ export async function startSyncDaemon(options: {
     await engine.start({ backgroundInitialReconcile: true });
     ensureSystemTrayIndicator();
 
+    let cachedAccount: ProtonAccountInfo | null = null;
+    let lastAccountFetchMs = 0;
+    let accountFetchPromise: Promise<ProtonAccountInfo | null> | null = null;
+
+    const refreshAccountInfo = async (force = false): Promise<ProtonAccountInfo | null> => {
+        if (!runtime.auth.isLoggedIn()) {
+            cachedAccount = null;
+            return null;
+        }
+        const now = Date.now();
+        if (!force && cachedAccount && now - lastAccountFetchMs < 60_000) {
+            return cachedAccount;
+        }
+        if (accountFetchPromise) {
+            return accountFetchPromise;
+        }
+        accountFetchPromise = (async () => {
+            try {
+                const res = (await runtime.apiClient.authenticatedRequest
+                    .get(`${runtime.apiClient.baseUrlWithProtocol}/core/v4/users`)
+                    .json()) as {
+                    User?: {
+                        Name?: string | null;
+                        DisplayName?: string | null;
+                        Email?: string | null;
+                        UsedSpace?: number;
+                        MaxSpace?: number;
+                        ProductUsedSpace?: { Drive?: number };
+                    };
+                };
+                const user = res.User;
+                if (!user) {
+                    return cachedAccount;
+                }
+                let email = (user.Email ?? '').trim();
+                let rawDisplayName = (user.DisplayName ?? '').trim();
+                const name = (user.Name ?? '').trim();
+                if (!email) {
+                    try {
+                        const primary = await runtime.addresses.getOwnPrimaryAddress();
+                        email = primary.email;
+                    } catch {
+                        // ignore
+                    }
+                }
+                const displayName = rawDisplayName || prettifyName(name, email);
+                const initials = computeInitials(displayName, email);
+                const usedSpace = Number(user.UsedSpace ?? 0);
+                const maxSpace = Number(user.MaxSpace ?? 0);
+                const usedDriveSpace = Number(user.ProductUsedSpace?.Drive ?? usedSpace);
+                cachedAccount = {
+                    name: name || email.split('@')[0] || 'user',
+                    displayName,
+                    email,
+                    initials,
+                    usedSpace,
+                    maxSpace,
+                    usedDriveSpace,
+                };
+                lastAccountFetchMs = Date.now();
+                return cachedAccount;
+            } catch (err) {
+                runtime.logger.debug(`Failed to fetch user quota info: ${String(err)}`);
+                return cachedAccount;
+            } finally {
+                accountFetchPromise = null;
+            }
+        })();
+        return accountFetchPromise;
+    };
+
+    void refreshAccountInfo(true);
+
     const settings = stateDb.getSettings();
     const reconcileTimer = setInterval(() => {
         const s = stateDb.getSettings();
-        if (!s.paused && runtime.auth.isLoggedIn()) {
-            void engine.reconcileNow();
+        if (runtime.auth.isLoggedIn()) {
+            void refreshAccountInfo();
+            if (!s.paused) {
+                void engine.reconcileNow();
+            }
         }
     }, Math.max(30, settings.reconcileIntervalSec) * 1000);
 
@@ -74,14 +182,32 @@ export async function startSyncDaemon(options: {
                 }
 
                 if (req.method === 'GET' && pathname === '/api/status') {
+                    if (!cachedAccount && runtime.auth.isLoggedIn()) {
+                        await Promise.race([
+                            refreshAccountInfo(),
+                            new Promise((resolve) => setTimeout(resolve, 600)),
+                        ]);
+                    } else if (runtime.auth.isLoggedIn()) {
+                        void refreshAccountInfo();
+                    }
                     const systemd = await getSystemdServiceStatus();
                     return Response.json({
                         ...engine.getStatus(),
+                        account: cachedAccount,
                         appVersion: runtime.config.appVersion,
                         sdkVersion: runtime.config.sdkVersion,
                         disclosure: THIRD_PARTY_DISCLOSURE,
                         systemd,
                     });
+                }
+
+                if (req.method === 'POST' && pathname === '/api/quit') {
+                    setTimeout(() => {
+                        void stop().finally(() => {
+                            process.exit(0);
+                        });
+                    }, 150);
+                    return Response.json({ ok: true });
                 }
 
                 if (req.method === 'GET' && pathname === '/api/activity') {
@@ -125,7 +251,8 @@ export async function startSyncDaemon(options: {
                                 enabled: stateDb.getSettings().notificationsEnabled,
                             });
                             await engine.start({ backgroundInitialReconcile: true });
-    ensureSystemTrayIndicator();
+                            void refreshAccountInfo(true);
+                            ensureSystemTrayIndicator();
                         })
                         .catch((err: unknown) => {
                             runtime.logger.error('Web authentication failed', err);
@@ -143,6 +270,7 @@ export async function startSyncDaemon(options: {
                     await engine.stop();
                     await runtime.auth.logout();
                     await runtime.clearCaches();
+                    cachedAccount = null;
                     stateDb.logActivity({
                         action: 'auth',
                         localRelPath: '/',
