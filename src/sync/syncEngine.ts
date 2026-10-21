@@ -1,4 +1,5 @@
-import { mkdir, readdir, rm, stat } from 'node:fs/promises';
+import { cp, mkdir, readdir, rename, rm, stat } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 
 import {
@@ -166,6 +167,71 @@ export class ProtonDriveSyncEngine {
                 };
             })
             .sort((a, b) => a.name.localeCompare(b.name));
+    }
+
+    async relocateSyncFolder(oldSyncDir: string, newSyncDirRaw: string): Promise<string> {
+        const home = os.homedir();
+        const expanded = newSyncDirRaw.startsWith('~/')
+            ? path.join(home, newSyncDirRaw.slice(2))
+            : newSyncDirRaw === '~'
+              ? home
+              : newSyncDirRaw;
+        const resolvedNew = path.resolve(expanded);
+        const resolvedOld = path.resolve(oldSyncDir);
+
+        if (resolvedNew === '/' || resolvedNew === home) {
+            throw new Error('Cannot use root (/) or home (~) directory directly as the Proton Drive sync folder.');
+        }
+
+        if (resolvedNew === resolvedOld) {
+            return resolvedNew;
+        }
+
+        // Stop watcher on old directory before moving files so we never interpret relocation as local deletion
+        this.watcher.stop();
+        await mkdir(resolvedNew, { recursive: true });
+
+        // Move existing synced files/folders from oldSyncDir -> newSyncDir (instant rename on same filesystem, or copy+rm across disks)
+        const oldEntries = await readdir(resolvedOld).catch(() => [] as string[]);
+        for (const entryName of oldEntries) {
+            const srcPath = path.join(resolvedOld, entryName);
+            const destPath = path.join(resolvedNew, entryName);
+            if (srcPath === resolvedNew || resolvedNew.startsWith(`${srcPath}${path.sep}`)) {
+                continue;
+            }
+            try {
+                await rename(srcPath, destPath);
+            } catch {
+                try {
+                    await cp(srcPath, destPath, { recursive: true, force: true });
+                    await rm(srcPath, { recursive: true, force: true });
+                } catch (err) {
+                    this.logger.warn(`Failed relocating ${srcPath} -> ${destPath}: ${String(err)}`);
+                }
+            }
+        }
+
+        // Persist the normalized new syncDir in SQLite
+        this.stateDb.updateSettings({ syncDir: resolvedNew });
+
+        // Safety check: any DB record whose file is not present in resolvedNew must have its DB record cleared
+        // so reconcileSinglePath downloads it from Proton Drive rather than treating it as locally deleted!
+        for (const item of this.stateDb.getAllItems()) {
+            const targetPath = path.join(resolvedNew, item.localRelPath);
+            const st = await stat(targetPath).catch(() => null);
+            if (!st) {
+                this.stateDb.removeItemByPath(item.localRelPath);
+            }
+        }
+
+        this.stateDb.logActivity({
+            action: 'sync',
+            localRelPath: '/',
+            details: `Relocated local sync folder from ${resolvedOld} to ${resolvedNew}`,
+        });
+
+        await this.watcher.start();
+        return resolvedNew;
     }
 
     async applySelectiveSyncExclusions(): Promise<void> {

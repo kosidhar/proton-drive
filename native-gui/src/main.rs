@@ -567,11 +567,25 @@ impl ProtonDriveNativeApp {
                 let remaining_h = (ui.available_height() - footer_height).max(12.0);
                 ui.add_space(remaining_h);
 
-                // Quick Open ~/ProtonDrive button (centered text)
+                // Quick Open sync folder button (centered text, reflects configured sync_dir)
+                let short_sync_folder = {
+                    let raw = if self.status.sync_dir.is_empty() {
+                        "~/ProtonDrive".to_string()
+                    } else if let Ok(home) = std::env::var("HOME") {
+                        if let Some(rest) = self.status.sync_dir.strip_prefix(&home) {
+                            format!("~{rest}")
+                        } else {
+                            self.status.sync_dir.clone()
+                        }
+                    } else {
+                        self.status.sync_dir.clone()
+                    };
+                    truncate_middle(&raw, 20)
+                };
                 if proton_button(
                     ui,
                     Vec2::new(ui.available_width(), 34.0),
-                    "Open ~/ProtonDrive folder",
+                    &format!("Open {short_sync_folder} folder"),
                     BG_CARD,
                     BG_CARD_ALT,
                     Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
@@ -2219,31 +2233,73 @@ impl ProtonDriveNativeApp {
             ui.set_min_width(ui.available_width());
             ui.label(
                 RichText::new("Synchronization Settings")
-                    .size(15.5)
+                    .size(16.0)
                     .strong()
                     .color(TEXT_PRIMARY),
             );
-            ui.add_space(14.0);
+            ui.add_space(16.0);
 
             ui.label(RichText::new("Local Sync Folder").size(13.0).color(TEXT_MUTED));
-            ui.add_space(4.0);
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.edit_sync_dir)
-                        .desired_width(f32::INFINITY),
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let input_w = (ui.available_width() - 104.0).max(240.0);
+                if ui
+                    .add_sized(
+                        [input_w, 34.0],
+                        egui::TextEdit::singleline(&mut self.edit_sync_dir)
+                            .vertical_align(Align::Center),
+                    )
+                    .changed()
+                {
+                    self.settings_dirty = true;
+                }
+                ui.add_space(6.0);
+                if proton_button(
+                    ui,
+                    Vec2::new(92.0, 34.0),
+                    "Browse...",
+                    BG_CARD_ALT,
+                    Color32::from_rgb(56, 50, 76),
+                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
+                    TEXT_PRIMARY,
+                    12.5,
                 )
-                .changed()
-            {
-                self.settings_dirty = true;
-            }
+                .clicked()
+                {
+                    if let Ok(out) = Command::new("zenity")
+                        .args([
+                            "--file-selection",
+                            "--directory",
+                            "--title=Choose Proton Drive Local Sync Folder",
+                        ])
+                        .output()
+                    {
+                        if out.status.success() {
+                            let chosen = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            if !chosen.is_empty() && chosen != self.edit_sync_dir {
+                                self.edit_sync_dir = chosen;
+                                self.settings_dirty = true;
+                            }
+                        }
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "Changing the sync location safely moves your existing synced files to the new folder, switches the real-time file watcher, and preserves all cloud files without re-uploading or deleting them.",
+                )
+                .size(11.5)
+                .color(TEXT_MUTED),
+            );
 
-            ui.add_space(12.0);
+            ui.add_space(16.0);
             ui.label(
                 RichText::new("Conflict Resolution Strategy")
                     .size(13.0)
                     .color(TEXT_MUTED),
             );
-            ui.add_space(4.0);
+            ui.add_space(6.0);
             egui::ComboBox::from_id_salt("conflict_strategy_combo")
                 .selected_text(match self.edit_conflict_strategy.as_str() {
                     "keep-local" => "Keep Local (Overwrite remote revision)",
@@ -2272,7 +2328,7 @@ impl ProtonDriveNativeApp {
                     }
                 });
 
-            ui.add_space(12.0);
+            ui.add_space(16.0);
             if ui
                 .checkbox(
                     &mut self.edit_notifications,
@@ -2285,20 +2341,18 @@ impl ProtonDriveNativeApp {
                 self.settings_dirty = true;
             }
 
-            ui.add_space(16.0);
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new("Save Preferences")
-                            .size(13.5)
-                            .strong()
-                            .color(Color32::WHITE),
-                    )
-                    .fill(PROTON_PURPLE)
-                    .corner_radius(CornerRadius::same(8))
-                    .min_size(Vec2::new(150.0, 36.0)),
-                )
-                .clicked()
+            ui.add_space(18.0);
+            if proton_button(
+                ui,
+                Vec2::new(156.0, 36.0),
+                "Save Preferences",
+                PROTON_PURPLE,
+                PROTON_PURPLE_HOVER,
+                None,
+                Color32::WHITE,
+                13.5,
+            )
+            .clicked()
             {
                 self.settings_dirty = false;
                 let _ = self.tx.send(WorkerCommand::SaveSettings(serde_json::json!({

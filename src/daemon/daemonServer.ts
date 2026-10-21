@@ -301,9 +301,14 @@ export async function startSyncDaemon(options: {
                 if (req.method === 'POST' && pathname === '/api/settings') {
                     const prev = stateDb.getSettings();
                     const body = (await req.json()) as Record<string, unknown>;
+                    if (typeof body.syncDir === 'string' && body.syncDir.trim() && body.syncDir.trim() !== prev.syncDir) {
+                        const relocated = await engine.relocateSyncFolder(prev.syncDir, body.syncDir.trim());
+                        body.syncDir = relocated;
+                    }
                     const updated = stateDb.updateSettings(body);
                     await engine.applySelectiveSyncExclusions();
                     if (
+                        prev.syncDir !== updated.syncDir ||
                         JSON.stringify(prev.excludedFolders) !== JSON.stringify(updated.excludedFolders) ||
                         JSON.stringify(prev.ignorePatterns) !== JSON.stringify(updated.ignorePatterns)
                     ) {
