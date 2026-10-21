@@ -187,7 +187,7 @@ enum NavTab {
     Settings,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SummaryStats {
     total_files: u64,
@@ -210,7 +210,7 @@ struct SyncSettings {
     ignore_patterns: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ActiveTransfer {
     #[allow(dead_code)]
@@ -221,7 +221,7 @@ struct ActiveTransfer {
     total_bytes: u64,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 struct AccountInfo {
     #[allow(dead_code)]
@@ -234,7 +234,7 @@ struct AccountInfo {
     used_drive_space: u64,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DaemonStatus {
     state: String,
@@ -248,7 +248,7 @@ struct DaemonStatus {
     account: Option<AccountInfo>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ActivityRecord {
     #[allow(dead_code)]
@@ -258,7 +258,7 @@ struct ActivityRecord {
     details: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RemoteItem {
     #[allow(dead_code)]
@@ -384,6 +384,69 @@ fn save_window_geometry(geom: &WindowGeometry) {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct StartupCache {
+    status: Option<DaemonStatus>,
+    root_items: Vec<RemoteItem>,
+    activities: Vec<ActivityRecord>,
+}
+
+fn startup_cache_path() -> Option<std::path::PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.trim().is_empty() {
+            return Some(std::path::PathBuf::from(xdg).join("protondrive/startup-cache.json"));
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    Some(std::path::PathBuf::from(home).join(".config/protondrive/startup-cache.json"))
+}
+
+fn load_startup_cache() -> StartupCache {
+    if let Some(p) = startup_cache_path() {
+        if let Ok(bytes) = std::fs::read(&p) {
+            if let Ok(cache) = serde_json::from_slice::<StartupCache>(&bytes) {
+                return cache;
+            }
+        }
+    }
+    StartupCache::default()
+}
+
+fn save_startup_cache(status: &DaemonStatus, root_items: &[RemoteItem], activities: &[ActivityRecord]) {
+    if !status.logged_in {
+        return;
+    }
+    let Some(p) = startup_cache_path() else { return };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let cache = StartupCache {
+        status: Some(status.clone()),
+        root_items: root_items.to_vec(),
+        activities: activities.to_vec(),
+    };
+    if let Ok(bytes) = serde_json::to_vec(&cache) {
+        let tmp = p.with_file_name(format!(".startup-cache.json.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &p)).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
+fn format_remote_error(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    if lower.contains("connection refused") || lower.contains("connection failed") {
+        return "Connecting to Proton Drive background service...".to_string();
+    }
+    if let Some(idx) = raw.find(": ") {
+        if raw[..idx].starts_with("http://") || raw[..idx].starts_with("https://") {
+            return raw[idx + 2..].to_string();
+        }
+    }
+    raw.to_string()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum CloudOnlyConfirm {
     SingleFolder(String),
@@ -397,8 +460,10 @@ struct ProtonDriveNativeApp {
     logo_texture: Option<TextureHandle>,
 
     daemon_online: bool,
+    initial_connecting: bool,
     status: DaemonStatus,
     activities: Vec<ActivityRecord>,
+    cached_root_items: Vec<RemoteItem>,
     login_url: Option<String>,
     search_query: String,
     show_account_menu: bool,
@@ -459,6 +524,15 @@ impl ProtonDriveNativeApp {
         apply_proton_visuals(&cc.egui_ctx, initial_light);
 
         let logo_texture = load_glyph_texture(&cc.egui_ctx);
+        let startup_cache = load_startup_cache();
+        let mut initial_status = startup_cache.status.unwrap_or_default();
+        if initial_status.state == "syncing" {
+            initial_status.state = "idle".to_string();
+            initial_status.current_action = None;
+        }
+        let initial_root_items = startup_cache.root_items;
+        let initial_activities = startup_cache.activities;
+        let has_cached_items = !initial_root_items.is_empty();
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCommand>();
         let (evt_tx, evt_rx) = mpsc::channel::<WorkerEvent>();
@@ -468,38 +542,50 @@ impl ProtonDriveNativeApp {
             worker_loop(cmd_rx, evt_tx, egui_ctx);
         });
 
-        let _ = cmd_tx.send(WorkerCommand::LoadRemotePath("/my-files".to_string()));
+        // Ensure RefreshAll (which autostarts the daemon if needed) runs BEFORE LoadRemotePath
         let _ = cmd_tx.send(WorkerCommand::RefreshAll);
+        let _ = cmd_tx.send(WorkerCommand::LoadRemotePath("/my-files".to_string()));
         if initial_tab == NavTab::Conflicts {
             let _ = cmd_tx.send(WorkerCommand::LoadConflicts);
         }
+
+        let edit_sync_dir = initial_status.settings.sync_dir.clone();
+        let edit_conflict_strategy = if initial_status.settings.conflict_strategy.is_empty() {
+            "keep-both".to_string()
+        } else {
+            initial_status.settings.conflict_strategy.clone()
+        };
+        let edit_notifications = initial_status.settings.notifications_enabled;
+        let ignore_patterns_text = initial_status.settings.ignore_patterns.join("\n");
 
         Self {
             tab: initial_tab,
             tx: cmd_tx,
             rx: evt_rx,
             logo_texture,
-            daemon_online: false,
-            status: DaemonStatus::default(),
-            activities: Vec::new(),
+            daemon_online: initial_status.logged_in,
+            initial_connecting: true,
+            status: initial_status,
+            activities: initial_activities,
+            cached_root_items: initial_root_items.clone(),
             login_url: None,
             search_query: String::new(),
             show_account_menu: initial_account_menu,
             pending_cloud_only_confirm: initial_confirm_folder.map(CloudOnlyConfirm::SingleFolder),
             remote_path: "/my-files".to_string(),
-            remote_items: Vec::new(),
-            remote_loading: true,
+            remote_items: initial_root_items,
+            remote_loading: !has_cached_items,
             remote_error: None,
             new_folder_name: String::new(),
             show_new_folder_modal: false,
             selective_folders: Vec::new(),
             selective_filter: String::new(),
-            ignore_patterns_text: String::new(),
+            ignore_patterns_text,
             settings_dirty: false,
             conflicts: Vec::new(),
-            edit_sync_dir: String::new(),
-            edit_conflict_strategy: "keep-both".to_string(),
-            edit_notifications: true,
+            edit_sync_dir,
+            edit_conflict_strategy,
+            edit_notifications,
             window_geometry,
             maximize_applied_on_open: false,
             applied_light_mode: initial_light,
@@ -515,7 +601,9 @@ impl ProtonDriveNativeApp {
             match evt {
                 WorkerEvent::StatusAndActivity { status, activity } => match status {
                     Ok(s) => {
+                        let was_offline = !self.daemon_online;
                         self.daemon_online = true;
+                        self.initial_connecting = false;
                         if !self.settings_dirty {
                             self.edit_sync_dir = s.settings.sync_dir.clone();
                             self.edit_conflict_strategy = s.settings.conflict_strategy.clone();
@@ -527,9 +615,20 @@ impl ProtonDriveNativeApp {
                         }
                         self.status = s;
                         self.activities = activity;
+                        save_startup_cache(&self.status, &self.cached_root_items, &self.activities);
+
+                        // If the daemon just came online or an earlier remote fetch failed, automatically reload
+                        if was_offline || self.remote_error.is_some() || (self.remote_items.is_empty() && !self.remote_loading) {
+                            self.remote_error = None;
+                            if self.remote_items.is_empty() {
+                                self.remote_loading = true;
+                            }
+                            let _ = self.tx.send(WorkerCommand::LoadRemotePath(self.remote_path.clone()));
+                        }
                     }
                     Err(_) => {
                         self.daemon_online = false;
+                        self.initial_connecting = false;
                     }
                 },
                 WorkerEvent::LoginStarted(url) => {
@@ -541,12 +640,26 @@ impl ProtonDriveNativeApp {
                     self.remote_loading = false;
                     match res {
                         Ok(list) => {
+                            if list.path == "/my-files" || list.path == "/" {
+                                self.cached_root_items = list.items.clone();
+                                save_startup_cache(&self.status, &self.cached_root_items, &self.activities);
+                            }
                             self.remote_path = list.path;
                             self.remote_items = list.items;
                             self.remote_error = None;
                         }
                         Err(e) => {
-                            self.remote_error = Some(e);
+                            let is_conn_err = e.to_lowercase().contains("connection refused")
+                                || e.to_lowercase().contains("connection failed");
+                            if is_conn_err {
+                                // Keep showing cached items if available, or show loading state while daemon starts
+                                if self.remote_items.is_empty() {
+                                    self.remote_loading = true;
+                                }
+                                self.remote_error = None;
+                            } else {
+                                self.remote_error = Some(format_remote_error(&e));
+                            }
                         }
                     }
                 }
@@ -930,6 +1043,12 @@ impl ProtonDriveNativeApp {
                         "Connected".to_string(),
                         "PD".to_string(),
                     )
+                } else if self.initial_connecting {
+                    (
+                        "Proton Drive".to_string(),
+                        "Connecting...".to_string(),
+                        "PD".to_string(),
+                    )
                 } else {
                     (
                         "Not Signed In".to_string(),
@@ -1057,7 +1176,11 @@ impl ProtonDriveNativeApp {
 
                 // Status Pill
                 let (dot_color, status_text) = if !self.daemon_online {
-                    (STATUS_DANGER, "Daemon Offline".to_string())
+                    if self.initial_connecting {
+                        (PROTON_PURPLE_HOVER, "Connecting...".to_string())
+                    } else {
+                        (STATUS_DANGER, "Daemon Offline".to_string())
+                    }
                 } else if !self.status.logged_in {
                     (STATUS_WARNING, "Sign in required".to_string())
                 } else if self.status.settings.paused {
@@ -3619,7 +3742,13 @@ fn try_autostart_daemon() {
             .spawn()
             .is_ok()
         {
-            thread::sleep(Duration::from_millis(900));
+            // Poll up to ~3.6s so we return as soon as the daemon HTTP listener is ready
+            for _ in 0..30 {
+                thread::sleep(Duration::from_millis(120));
+                if fetch_status().is_ok() {
+                    break;
+                }
+            }
             break;
         }
     }
@@ -3684,12 +3813,21 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                 let ctx_clone = ctx.clone();
                 thread::spawn(move || {
                     let url = format!("{DAEMON_URL}/api/remote/list?path={path}");
-                    let res = ureq::get(&url)
+                    let mut res = ureq::get(&url)
                         .call()
                         .map_err(|e| e.to_string())
                         .and_then(|r| {
                             r.into_json::<RemoteListResponse>().map_err(|e| e.to_string())
                         });
+                    if res.is_err() {
+                        try_autostart_daemon();
+                        res = ureq::get(&url)
+                            .call()
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| {
+                                r.into_json::<RemoteListResponse>().map_err(|e| e.to_string())
+                            });
+                    }
                     let _ = tx_clone.send(WorkerEvent::RemoteLoaded(res));
                     ctx_clone.request_repaint();
                 });
