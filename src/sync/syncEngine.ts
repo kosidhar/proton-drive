@@ -38,6 +38,7 @@ export type EngineState = 'idle' | 'syncing' | 'paused' | 'unauthenticated' | 'e
 
 export class ProtonDriveSyncEngine {
     private state: EngineState = 'idle';
+    private currentAction: string | null = null;
     private lastSyncAt: number | null = null;
     private lastError: string | null = null;
     private rootNode: NodeEntity | null = null;
@@ -73,6 +74,7 @@ export class ProtonDriveSyncEngine {
         const loggedIn = this.auth.isLoggedIn();
         return {
             state: !loggedIn ? ('unauthenticated' as EngineState) : settings.paused ? ('paused' as EngineState) : this.state,
+            currentAction: this.currentAction,
             loggedIn,
             syncDir: settings.syncDir,
             lastSyncAt: this.lastSyncAt,
@@ -83,7 +85,7 @@ export class ProtonDriveSyncEngine {
         };
     }
 
-    async start(): Promise<void> {
+    async start(options: { backgroundInitialReconcile?: boolean } = {}): Promise<void> {
         const settings = this.stateDb.getSettings();
         await mkdir(settings.syncDir, { recursive: true });
 
@@ -103,7 +105,11 @@ export class ProtonDriveSyncEngine {
         await this.watcher.start();
 
         if (!settings.paused) {
-            await this.reconcileNow();
+            if (options.backgroundInitialReconcile) {
+                void this.reconcileNow();
+            } else {
+                await this.reconcileNow();
+            }
         } else {
             this.state = 'paused';
         }
@@ -176,6 +182,7 @@ export class ProtonDriveSyncEngine {
 
         this.reconcileRunning = true;
         this.state = 'syncing';
+        this.currentAction = 'Scanning remote Proton Drive folders...';
         this.lastError = null;
 
         try {
@@ -188,6 +195,7 @@ export class ProtonDriveSyncEngine {
             await this.walkRemoteTree(root, '', remoteMap, settings);
 
             // 2. Collect local tree map: relPath -> { isDirectory, size, mtimeMs }
+            this.currentAction = 'Scanning local folder...';
             const localMap = new Map<string, { isDirectory: boolean; size: number; mtimeMs: number }>();
             await this.walkLocalTree(settings.syncDir, '', localMap, settings);
 
@@ -209,6 +217,7 @@ export class ProtonDriveSyncEngine {
                     continue;
                 }
 
+                this.currentAction = `Syncing ${relPath}`;
                 const remoteNode = remoteMap.get(relPath);
                 const localInfo = localMap.get(relPath);
                 const dbRecord = dbItems.get(relPath);
@@ -217,10 +226,12 @@ export class ProtonDriveSyncEngine {
             }
 
             this.lastSyncAt = Date.now();
+            this.currentAction = null;
             this.state = this.stateDb.getSettings().paused ? 'paused' : 'idle';
         } catch (error: unknown) {
             const msg = error instanceof Error ? error.message : String(error);
             this.lastError = msg;
+            this.currentAction = null;
             this.state = 'error';
             this.logger.error('Reconcile failed', error);
             this.stateDb.logActivity({
@@ -879,8 +890,15 @@ export class ProtonDriveSyncEngine {
         out: Map<string, NodeEntity>,
         settings: SyncSettings,
     ): Promise<void> {
+        if (this.stateDb.getSettings().paused) {
+            return;
+        }
+        this.currentAction = `Scanning /my-files/${prefix || ''}`;
         const children = await listFolderChildren(this.sdk, folderNode);
         for (const child of children) {
+            if (this.stateDb.getSettings().paused) {
+                return;
+            }
             const name = getName(child);
             const relPath = prefix ? `${prefix}/${name}` : name;
 
@@ -890,6 +908,10 @@ export class ProtonDriveSyncEngine {
 
             out.set(relPath, child);
             if (child.type === NodeType.Folder) {
+                // Create the local directory immediately as we discover it so the user sees folders populate in real time
+                const localFolderFullPath = path.join(settings.syncDir, relPath);
+                this.watcher.suppressPath(relPath);
+                await mkdir(localFolderFullPath, { recursive: true }).catch(() => {});
                 await this.walkRemoteTree(child, relPath, out, settings);
             }
         }

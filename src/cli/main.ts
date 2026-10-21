@@ -140,6 +140,8 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
         console.log(`[proton-drive-ubuntu] Starting sync daemon and opening desktop GUI...`);
         const daemon = await startSyncDaemon({ enableConsoleLog: verboseFlag });
         launchDesktopWindow(daemon.url);
+        console.log(`[proton-drive-ubuntu] Desktop GUI opened at ${daemon.url}`);
+        console.log(`[proton-drive-ubuntu] Syncing ${daemon.stateDb.getSettings().syncDir} in the background (keep open or install systemd service).`);
         const shutdown = async () => {
             await daemon.stop();
             process.exit(0);

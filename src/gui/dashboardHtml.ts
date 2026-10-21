@@ -524,7 +524,7 @@ export function getDashboardHtml(): string {
       dot.className = 'dot ' + data.state;
       const labels = {
         idle: 'Up to date (Event Stream Active)',
-        syncing: 'Syncing...',
+        syncing: data.currentAction ? ('Syncing: ' + data.currentAction) : 'Syncing...',
         paused: 'Paused',
         unauthenticated: 'Sign in required',
         error: 'Sync Error'

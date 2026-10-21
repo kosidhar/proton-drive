@@ -48,7 +48,7 @@ export async function startSyncDaemon(options: {
         runtime.logger,
     );
 
-    await engine.start();
+    await engine.start({ backgroundInitialReconcile: true });
 
     const settings = stateDb.getSettings();
     const reconcileTimer = setInterval(() => {
@@ -123,7 +123,7 @@ export async function startSyncDaemon(options: {
                                 body: 'Successfully signed in and started two-way folder sync.',
                                 enabled: stateDb.getSettings().notificationsEnabled,
                             });
-                            await engine.start();
+                            await engine.start({ backgroundInitialReconcile: true });
                         })
                         .catch((err: unknown) => {
                             runtime.logger.error('Web authentication failed', err);
