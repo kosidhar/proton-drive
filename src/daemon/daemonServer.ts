@@ -155,6 +155,89 @@ export async function startSyncDaemon(options: {
 
     void refreshAccountInfo(true);
 
+    interface CachedRemoteItem {
+        uid: string;
+        name: string;
+        type: string;
+        size: number;
+        modificationTime: string;
+    }
+    const remoteListCache = new Map<string, { items: CachedRemoteItem[]; updatedAt: number }>();
+
+    const fetchRemotePathItems = async (remotePath: string): Promise<CachedRemoteItem[]> => {
+        const node = await runtime.paths.getNode(remotePath, [
+            PathType.MyFiles,
+            PathType.SharedWithMe,
+            PathType.Devices,
+        ]);
+        const children = await listFolderChildren(runtime.sdk, node);
+        const items = children.map((child) => ({
+            uid: child.uid,
+            name: getName(child),
+            type: child.type,
+            size: getClaimedSize(child) ?? 0,
+            modificationTime: (
+                child.activeRevision?.claimedModificationTime ?? child.modificationTime
+            ).toISOString(),
+        }));
+        remoteListCache.set(remotePath, { items, updatedAt: Date.now() });
+        return items;
+    };
+
+    const buildFallbackFromStateDb = (remotePath: string): CachedRemoteItem[] => {
+        const relDir = remotePath.replace(/^\/my-files\/?/, '').replace(/^\/+|\/+$/g, '');
+        const allItems = stateDb.getAllItems();
+        const excluded = stateDb.getSettings().excludedFolders;
+        const result = new Map<string, CachedRemoteItem>();
+
+        if (!relDir) {
+            for (const exName of excluded) {
+                result.set(exName, {
+                    uid: `excluded-${exName}`,
+                    name: exName,
+                    type: 'folder',
+                    size: 0,
+                    modificationTime: '',
+                });
+            }
+        }
+
+        const prefix = relDir ? `${relDir}/` : '';
+        for (const item of allItems) {
+            if (relDir && !item.localRelPath.startsWith(prefix)) {
+                continue;
+            }
+            const rest = relDir ? item.localRelPath.slice(prefix.length) : item.localRelPath;
+            if (!rest) continue;
+            const slashIdx = rest.indexOf('/');
+            if (slashIdx === -1) {
+                result.set(rest, {
+                    uid: item.nodeUid,
+                    name: rest,
+                    type: item.type,
+                    size: item.size,
+                    modificationTime: item.localMtimeMs > 0 ? new Date(item.localMtimeMs).toISOString() : '',
+                });
+            } else {
+                const topChild = rest.slice(0, slashIdx);
+                if (!result.has(topChild)) {
+                    result.set(topChild, {
+                        uid: `folder-${topChild}`,
+                        name: topChild,
+                        type: 'folder',
+                        size: 0,
+                        modificationTime: item.localMtimeMs > 0 ? new Date(item.localMtimeMs).toISOString() : '',
+                    });
+                }
+            }
+        }
+        return Array.from(result.values());
+    };
+
+    if (runtime.auth.isLoggedIn()) {
+        void fetchRemotePathItems('/my-files').catch(() => {});
+    }
+
     const settings = stateDb.getSettings();
     const reconcileTimer = setInterval(() => {
         const s = stateDb.getSettings();
@@ -252,6 +335,7 @@ export async function startSyncDaemon(options: {
                             });
                             await engine.start({ backgroundInitialReconcile: true });
                             void refreshAccountInfo(true);
+                            void fetchRemotePathItems('/my-files').catch(() => {});
                             ensureSystemTrayIndicator();
                         })
                         .catch((err: unknown) => {
@@ -323,32 +407,40 @@ export async function startSyncDaemon(options: {
                         return Response.json({ error: 'Not signed in' }, { status: 401 });
                     }
                     const remotePath = url.searchParams.get('path') || '/my-files';
-                    const node = await runtime.paths.getNode(remotePath, [
-                        PathType.MyFiles,
-                        PathType.SharedWithMe,
-                        PathType.Devices,
-                    ]);
-                    const children = await listFolderChildren(runtime.sdk, node);
-                    const items = children.map((child) => ({
-                        uid: child.uid,
-                        name: getName(child),
-                        type: child.type,
-                        size: getClaimedSize(child) ?? 0,
-                        modificationTime: (
-                            child.activeRevision?.claimedModificationTime ?? child.modificationTime
-                        ).toISOString(),
-                    }));
+                    const forceRefresh = url.searchParams.get('refresh') === '1';
+                    const cached = remoteListCache.get(remotePath);
+                    if (cached && !forceRefresh) {
+                        if (Date.now() - cached.updatedAt > 15_000) {
+                            void fetchRemotePathItems(remotePath).catch(() => {});
+                        }
+                        return Response.json({ path: remotePath, items: cached.items });
+                    }
+                    const livePromise = fetchRemotePathItems(remotePath);
+                    const fallbackItems = buildFallbackFromStateDb(remotePath);
+                    if (fallbackItems.length > 0 && !forceRefresh) {
+                        const items = await Promise.race([
+                            livePromise.catch(() => fallbackItems),
+                            new Promise<CachedRemoteItem[]>((resolve) =>
+                                setTimeout(() => resolve(fallbackItems), 900),
+                            ),
+                        ]);
+                        return Response.json({ path: remotePath, items });
+                    }
+                    const items = await livePromise;
                     return Response.json({ path: remotePath, items });
                 }
 
                 if (req.method === 'POST' && pathname === '/api/remote/mkdir') {
                     const body = (await req.json()) as { parentPath: string; name: string };
-                    const parentNode = await runtime.paths.getNode(body.parentPath || '/my-files', [
+                    const targetParent = body.parentPath || '/my-files';
+                    const parentNode = await runtime.paths.getNode(targetParent, [
                         PathType.MyFiles,
                         PathType.SharedWithMe,
                         PathType.Devices,
                     ]);
                     const created = await runtime.sdk.createFolder(parentNode, body.name);
+                    remoteListCache.delete(targetParent);
+                    void fetchRemotePathItems(targetParent).catch(() => {});
                     return Response.json({
                         ok: true,
                         folder: { uid: created.uid, name: getName(created) },

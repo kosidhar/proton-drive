@@ -299,11 +299,9 @@ impl ProtonDriveNativeApp {
         });
 
         let _ = cmd_tx.send(WorkerCommand::RefreshAll);
-        if initial_tab == NavTab::SelectiveSync {
-            let _ = cmd_tx.send(WorkerCommand::LoadSelectiveFolders);
-        } else if initial_tab == NavTab::CloudBrowser {
-            let _ = cmd_tx.send(WorkerCommand::LoadRemotePath("/my-files".to_string()));
-        } else if initial_tab == NavTab::Conflicts {
+        let _ = cmd_tx.send(WorkerCommand::LoadRemotePath("/my-files".to_string()));
+        let _ = cmd_tx.send(WorkerCommand::LoadSelectiveFolders);
+        if initial_tab == NavTab::Conflicts {
             let _ = cmd_tx.send(WorkerCommand::LoadConflicts);
         }
 
@@ -320,7 +318,7 @@ impl ProtonDriveNativeApp {
             show_account_menu: initial_account_menu,
             remote_path: "/my-files".to_string(),
             remote_items: Vec::new(),
-            remote_loading: false,
+            remote_loading: true,
             remote_error: None,
             new_folder_name: String::new(),
             show_new_folder_modal: false,
@@ -463,8 +461,8 @@ impl ProtonDriveNativeApp {
                 };
 
                 let nav_items: [(NavTab, &str, Option<String>, bool); 5] = [
-                    (NavTab::Overview, "My Files & Activity", None, false),
-                    (NavTab::CloudBrowser, "Cloud Browser", None, false),
+                    (NavTab::CloudBrowser, "My files", None, false),
+                    (NavTab::Overview, "Sync Activity", None, false),
                     (NavTab::SelectiveSync, "Selective Sync", selective_badge, false),
                     (NavTab::Conflicts, "Conflicts", conflict_badge, true),
                     (NavTab::Settings, "Settings", None, false),
@@ -1103,7 +1101,7 @@ impl ProtonDriveNativeApp {
         // Section Title Bar
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("My Files & Sync Activity")
+                RichText::new("Sync Activity & Storage")
                     .size(20.0)
                     .strong()
                     .color(TEXT_PRIMARY),
@@ -1260,20 +1258,21 @@ impl ProtonDriveNativeApp {
 
             // Full-width Column Header Bar for Recent Sync Activity
             let (hdr_rect, _) =
-                ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::hover());
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::hover());
             ui.painter().rect_filled(
                 hdr_rect,
                 CornerRadius::same(7),
                 Color32::from_rgb(26, 23, 36),
             );
             let hdr_y = hdr_rect.center().y;
-            let file_col_x = hdr_rect.min.x + 124.0;
-            let details_col_x = (hdr_rect.min.x + hdr_rect.width() * 0.54).max(file_col_x + 220.0);
+            let file_col_x = hdr_rect.min.x + 152.0;
+            let details_col_x = (hdr_rect.min.x + hdr_rect.width() * 0.44).max(file_col_x + 210.0);
+            let time_right_x = hdr_rect.max.x - 16.0;
 
             ui.painter().text(
                 egui::pos2(hdr_rect.min.x + 14.0, hdr_y),
                 egui::Align2::LEFT_CENTER,
-                "Action",
+                "Status",
                 FontId::new(12.0, FontFamily::Proportional),
                 TEXT_MUTED,
             );
@@ -1288,6 +1287,13 @@ impl ProtonDriveNativeApp {
                 egui::pos2(details_col_x, hdr_y),
                 egui::Align2::LEFT_CENTER,
                 "Details",
+                FontId::new(12.0, FontFamily::Proportional),
+                TEXT_MUTED,
+            );
+            ui.painter().text(
+                egui::pos2(time_right_x, hdr_y),
+                egui::Align2::RIGHT_CENTER,
+                "Time",
                 FontId::new(12.0, FontFamily::Proportional),
                 TEXT_MUTED,
             );
@@ -1319,10 +1325,10 @@ impl ProtonDriveNativeApp {
                                     || a.details.to_lowercase().contains(&query_lower)
                                     || a.action.to_lowercase().contains(&query_lower)
                             })
-                            .take(40)
+                            .take(50)
                         {
                             let (row_rect, row_resp) = ui.allocate_exact_size(
-                                Vec2::new(ui.available_width(), 36.0),
+                                Vec2::new(ui.available_width(), 38.0),
                                 Sense::hover(),
                             );
                             if row_resp.hovered() {
@@ -1341,42 +1347,58 @@ impl ProtonDriveNativeApp {
                             );
 
                             let cy = row_rect.center().y;
-                            let r_file_x = row_rect.min.x + 124.0;
+                            let r_file_x = row_rect.min.x + 152.0;
                             let r_details_x =
-                                (row_rect.min.x + row_rect.width() * 0.54).max(r_file_x + 220.0);
+                                (row_rect.min.x + row_rect.width() * 0.44).max(r_file_x + 210.0);
+                            let r_time_right_x = row_rect.max.x - 16.0;
 
-                            let pill_color = match act.action.as_str() {
-                                "upload" => PROTON_PURPLE,
-                                "download" => STATUS_SUCCESS,
-                                "error" | "conflict" => STATUS_DANGER,
-                                _ => BG_CARD_ALT,
-                            };
+                            let (pill_label, pill_bg, pill_fg) = humanize_activity_action(&act.action);
                             let pill_rect = egui::Rect::from_min_size(
-                                egui::pos2(row_rect.min.x + 12.0, cy - 10.0),
-                                Vec2::new(88.0, 20.0),
+                                egui::pos2(row_rect.min.x + 12.0, cy - 11.0),
+                                Vec2::new(124.0, 22.0),
                             );
                             ui.painter()
-                                .rect_filled(pill_rect, CornerRadius::same(5), pill_color);
+                                .rect_filled(pill_rect, CornerRadius::same(99), pill_bg);
                             ui.painter().text(
                                 pill_rect.center(),
                                 egui::Align2::CENTER_CENTER,
-                                &act.action,
+                                pill_label,
                                 FontId::new(11.0, FontFamily::Proportional),
-                                Color32::WHITE,
+                                pill_fg,
                             );
 
+                            // File / Folder icon + name
+                            let is_folder_act = act.action == "mkdir"
+                                || act.action == "delete-local" && !act.local_rel_path.contains('.');
+                            let ic_rect = egui::Rect::from_center_size(
+                                egui::pos2(r_file_x + 9.0, cy),
+                                Vec2::new(17.0, 14.5),
+                            );
+                            if is_folder_act {
+                                draw_folder_icon(ui.painter(), ic_rect, act.action != "delete-local");
+                            } else {
+                                draw_file_icon(ui.painter(), ic_rect, &act.local_rel_path);
+                            }
+
                             ui.painter().text(
-                                egui::pos2(r_file_x, cy),
+                                egui::pos2(r_file_x + 25.0, cy),
                                 egui::Align2::LEFT_CENTER,
-                                truncate_middle(&act.local_rel_path, 52),
+                                truncate_middle(&act.local_rel_path, 42),
                                 FontId::new(13.0, FontFamily::Proportional),
                                 TEXT_PRIMARY,
                             );
                             ui.painter().text(
                                 egui::pos2(r_details_x, cy),
                                 egui::Align2::LEFT_CENTER,
-                                truncate_middle(&act.details, 64),
-                                FontId::new(12.5, FontFamily::Proportional),
+                                truncate_middle(&act.details, 92),
+                                FontId::new(12.0, FontFamily::Proportional),
+                                TEXT_MUTED,
+                            );
+                            ui.painter().text(
+                                egui::pos2(r_time_right_x, cy),
+                                egui::Align2::RIGHT_CENTER,
+                                format_relative_timestamp(act.timestamp),
+                                FontId::new(11.5, FontFamily::Proportional),
                                 TEXT_MUTED,
                             );
                         }
@@ -1386,6 +1408,56 @@ impl ProtonDriveNativeApp {
     }
 
     fn render_browser_tab(&mut self, ui: &mut egui::Ui) {
+        // If there is an active transfer, show a compact live sync banner above My files
+        if let Some(t) = self.status.active_transfers.first() {
+            let frac = if t.total_bytes > 0 {
+                (t.bytes_transferred as f32 / t.total_bytes as f32).clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
+            Frame::NONE
+                .fill(BG_CARD)
+                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                .corner_radius(CornerRadius::same(10))
+                .inner_margin(Margin::symmetric(14, 10))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        let badge = if t.direction == "upload" {
+                            "↑ Uploading"
+                        } else {
+                            "↓ Downloading"
+                        };
+                        ui.label(
+                            RichText::new(badge)
+                                .size(12.5)
+                                .strong()
+                                .color(PROTON_PURPLE_TEXT),
+                        );
+                        ui.label(RichText::new(&t.rel_path).size(12.5).color(TEXT_PRIMARY));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} / {}",
+                                    format_bytes(t.bytes_transferred),
+                                    format_bytes(t.total_bytes)
+                                ))
+                                .size(12.0)
+                                .color(TEXT_MUTED),
+                            );
+                        });
+                    });
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .fill(PROTON_PURPLE)
+                            .desired_height(5.0)
+                            .corner_radius(CornerRadius::same(4)),
+                    );
+                });
+            ui.add_space(10.0);
+        }
+
         let avail_h = (ui.available_height() - 4.0).max(400.0);
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -1708,7 +1780,7 @@ impl ProtonDriveNativeApp {
                             );
 
                             if row_resp.hovered() {
-                                if is_folder {
+                                if is_folder || !is_excluded {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                 }
                                 ui.painter().rect_filled(
@@ -1819,6 +1891,18 @@ impl ProtonDriveNativeApp {
                                     self.remote_path.trim_end_matches('/'),
                                     item.name
                                 ));
+                            } else if !is_folder && !is_excluded && row_resp.clicked() {
+                                let rel_sub = self
+                                    .remote_path
+                                    .strip_prefix("/my-files")
+                                    .unwrap_or(&self.remote_path)
+                                    .trim_matches('/');
+                                let local_target = if rel_sub.is_empty() {
+                                    format!("{}/{}", self.status.sync_dir, item.name)
+                                } else {
+                                    format!("{}/{}/{}", self.status.sync_dir, rel_sub, item.name)
+                                };
+                                let _ = Command::new("xdg-open").arg(local_target).spawn();
                             }
                         }
 
@@ -2422,6 +2506,12 @@ impl eframe::App for ProtonDriveNativeApp {
         if self.last_poll.elapsed() >= Duration::from_millis(1500) {
             self.last_poll = Instant::now();
             let _ = self.tx.send(WorkerCommand::RefreshAll);
+            if self.tab == NavTab::CloudBrowser && self.remote_items.is_empty() && !self.remote_loading {
+                self.remote_loading = true;
+                let _ = self
+                    .tx
+                    .send(WorkerCommand::LoadRemotePath(self.remote_path.clone()));
+            }
         }
 
         if ctx.input(|i| i.key_pressed(Key::F5)) {
@@ -2464,10 +2554,10 @@ impl eframe::App for ProtonDriveNativeApp {
         if let Some(target_path) = self.screenshot_target.clone() {
             let ready = if self.tab == NavTab::SelectiveSync {
                 (!self.selective_folders.is_empty() && self.frames_rendered >= 6)
-                    || self.frames_rendered >= 45
+                    || self.frames_rendered >= 60
             } else if self.tab == NavTab::CloudBrowser {
                 (!self.remote_items.is_empty() && self.frames_rendered >= 6)
-                    || self.frames_rendered >= 45
+                    || self.frames_rendered >= 60
             } else {
                 self.frames_rendered >= 6
             };
@@ -2669,8 +2759,8 @@ fn draw_nav_icon(painter: &egui::Painter, rect: egui::Rect, tab: NavTab, color: 
     let stroke = Stroke::new(1.5_f32, color);
     let r = rect.shrink(1.5);
     match tab {
-        NavTab::Overview => {
-            // Folder outline icon
+        NavTab::CloudBrowser => {
+            // Official Proton Drive "My files" folder outline icon
             let tab_rect = egui::Rect::from_min_size(r.min, Vec2::new(r.width() * 0.45, 3.0));
             let body_rect = egui::Rect::from_min_max(
                 egui::pos2(r.min.x, r.min.y + 2.5),
@@ -2679,20 +2769,19 @@ fn draw_nav_icon(painter: &egui::Painter, rect: egui::Rect, tab: NavTab, color: 
             painter.rect_filled(tab_rect, CornerRadius::same(1), color);
             painter.rect_stroke(body_rect, CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
         }
-        NavTab::CloudBrowser => {
-            // 2x2 grid icon
-            let w = (r.width() - 3.0) * 0.5;
-            let h = (r.height() - 3.0) * 0.5;
-            for row in 0..2 {
-                for col in 0..2 {
-                    let min = egui::pos2(
-                        r.min.x + col as f32 * (w + 3.0),
-                        r.min.y + row as f32 * (h + 3.0),
-                    );
-                    let cell = egui::Rect::from_min_size(min, Vec2::new(w, h));
-                    painter.rect_stroke(cell, CornerRadius::same(1), stroke, egui::StrokeKind::Inside);
-                }
-            }
+        NavTab::Overview => {
+            // Sync Activity pulse / waveform icon
+            let cy = r.center().y;
+            let w = r.width();
+            let pts = vec![
+                egui::pos2(r.min.x, cy),
+                egui::pos2(r.min.x + w * 0.25, cy),
+                egui::pos2(r.min.x + w * 0.40, r.min.y + 1.0),
+                egui::pos2(r.min.x + w * 0.60, r.max.y - 1.0),
+                egui::pos2(r.min.x + w * 0.75, cy),
+                egui::pos2(r.max.x, cy),
+            ];
+            painter.add(egui::Shape::line(pts, stroke));
         }
         NavTab::SelectiveSync => {
             // Checklist / filter bars icon
@@ -2830,6 +2919,72 @@ fn draw_file_icon(painter: &egui::Painter, rect: egui::Rect, filename: &str) {
         ],
         Stroke::new(1.2_f32, accent),
     );
+}
+
+fn humanize_activity_action(action: &str) -> (&'static str, Color32, Color32) {
+    match action {
+        "download" => (
+            "↓ Downloaded",
+            Color32::from_rgba_unmultiplied(30, 168, 133, 34),
+            STATUS_SUCCESS,
+        ),
+        "upload" => (
+            "↑ Uploaded",
+            Color32::from_rgba_unmultiplied(109, 74, 255, 42),
+            PROTON_PURPLE_TEXT,
+        ),
+        "mkdir" => (
+            "+ Folder created",
+            Color32::from_rgb(42, 37, 60),
+            Color32::from_rgb(214, 208, 235),
+        ),
+        "delete-local" => (
+            "− Removed locally",
+            Color32::from_rgb(44, 38, 56),
+            TEXT_MUTED,
+        ),
+        "delete-remote" | "trash-remote" => (
+            "Trash (Cloud)",
+            Color32::from_rgba_unmultiplied(245, 158, 11, 34),
+            STATUS_WARNING,
+        ),
+        "conflict" => (
+            "! Conflict",
+            Color32::from_rgba_unmultiplied(239, 68, 68, 38),
+            STATUS_DANGER,
+        ),
+        "error" => (
+            "✕ Failed",
+            Color32::from_rgba_unmultiplied(239, 68, 68, 38),
+            STATUS_DANGER,
+        ),
+        _ => ("• Synced", BG_CARD_ALT, TEXT_PRIMARY),
+    }
+}
+
+fn format_relative_timestamp(ts_ms: u64) -> String {
+    if ts_ms == 0 {
+        return "—".to_string();
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if now_ms <= ts_ms {
+        return "Just now".to_string();
+    }
+    let diff_secs = (now_ms - ts_ms) / 1000;
+    if diff_secs < 45 {
+        "Just now".to_string()
+    } else if diff_secs < 3600 {
+        format!("{}m ago", diff_secs / 60)
+    } else if diff_secs < 86_400 {
+        format!("{}h ago", diff_secs / 3600)
+    } else if diff_secs < 172_800 {
+        "Yesterday".to_string()
+    } else {
+        format!("{}d ago", diff_secs / 86_400)
+    }
 }
 
 fn format_iso_date(iso: &str) -> String {
@@ -3080,7 +3235,7 @@ OPTIONS:
 
 fn main() -> eframe::Result {
     let mut screenshot_target: Option<String> = None;
-    let mut initial_tab = NavTab::Overview;
+    let mut initial_tab = NavTab::CloudBrowser;
     let mut initial_account_menu = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -3094,11 +3249,12 @@ fn main() -> eframe::Result {
             "--tab" => {
                 if let Some(t) = args.next() {
                     initial_tab = match t.as_str() {
-                        "browser" | "cloud" => NavTab::CloudBrowser,
+                        "browser" | "cloud" | "files" => NavTab::CloudBrowser,
+                        "overview" | "activity" => NavTab::Overview,
                         "selective" => NavTab::SelectiveSync,
                         "conflicts" => NavTab::Conflicts,
                         "settings" => NavTab::Settings,
-                        _ => NavTab::Overview,
+                        _ => NavTab::CloudBrowser,
                     };
                 }
             }
