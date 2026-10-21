@@ -298,9 +298,8 @@ impl ProtonDriveNativeApp {
             worker_loop(cmd_rx, evt_tx, egui_ctx);
         });
 
-        let _ = cmd_tx.send(WorkerCommand::RefreshAll);
         let _ = cmd_tx.send(WorkerCommand::LoadRemotePath("/my-files".to_string()));
-        let _ = cmd_tx.send(WorkerCommand::LoadSelectiveFolders);
+        let _ = cmd_tx.send(WorkerCommand::RefreshAll);
         if initial_tab == NavTab::Conflicts {
             let _ = cmd_tx.send(WorkerCommand::LoadConflicts);
         }
@@ -444,7 +443,31 @@ impl ProtonDriveNativeApp {
                 ui.add_space(16.0);
 
                 // Navigation Links with crisp vector icons
-                let selective_badge = if !self.selective_folders.is_empty() {
+                let selective_badge = if (self.remote_path == "/my-files" || self.remote_path == "/")
+                    && !self.remote_items.is_empty()
+                {
+                    let root_folders: Vec<&RemoteItem> = self
+                        .remote_items
+                        .iter()
+                        .filter(|i| i.item_type == "folder")
+                        .collect();
+                    if !root_folders.is_empty() {
+                        let inc = root_folders
+                            .iter()
+                            .filter(|f| {
+                                !self
+                                    .status
+                                    .settings
+                                    .excluded_folders
+                                    .iter()
+                                    .any(|ex| ex == &f.name)
+                            })
+                            .count();
+                        Some(format!("{inc}/{}", root_folders.len()))
+                    } else {
+                        None
+                    }
+                } else if !self.selective_folders.is_empty() {
                     let inc = self
                         .selective_folders
                         .iter()
@@ -460,10 +483,9 @@ impl ProtonDriveNativeApp {
                     None
                 };
 
-                let nav_items: [(NavTab, &str, Option<String>, bool); 5] = [
-                    (NavTab::CloudBrowser, "My files", None, false),
+                let nav_items: [(NavTab, &str, Option<String>, bool); 4] = [
+                    (NavTab::CloudBrowser, "My files", selective_badge, false),
                     (NavTab::Overview, "Sync Activity", None, false),
-                    (NavTab::SelectiveSync, "Selective Sync", selective_badge, false),
                     (NavTab::Conflicts, "Conflicts", conflict_badge, true),
                     (NavTab::Settings, "Settings", None, false),
                 ];
@@ -1578,6 +1600,64 @@ impl ProtonDriveNativeApp {
                     }
 
                     if !self.remote_items.is_empty() {
+                        let is_root_bar =
+                            self.remote_path == "/my-files" || self.remote_path == "/";
+                        if is_root_bar {
+                            ui.add_space(6.0);
+                            if proton_button(
+                                ui,
+                                Vec2::new(98.0, 32.0),
+                                "Cloud Only All",
+                                BG_CARD_ALT,
+                                Color32::from_rgb(54, 47, 72),
+                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
+                                TEXT_MUTED,
+                                12.0,
+                            )
+                            .on_hover_text(
+                                "Switch all top-level folders to Cloud only (remove local copies)",
+                            )
+                            .clicked()
+                            {
+                                let all_folder_names: Vec<String> = self
+                                    .remote_items
+                                    .iter()
+                                    .filter(|i| i.item_type == "folder")
+                                    .map(|i| i.name.clone())
+                                    .collect();
+                                self.status.settings.excluded_folders = all_folder_names.clone();
+                                for sf in &mut self.selective_folders {
+                                    sf.excluded = true;
+                                }
+                                let _ = self.tx.send(WorkerCommand::SaveSettings(
+                                    serde_json::json!({ "excludedFolders": all_folder_names }),
+                                ));
+                            }
+
+                            ui.add_space(6.0);
+                            if proton_button(
+                                ui,
+                                Vec2::new(76.0, 32.0),
+                                "Sync All",
+                                BG_CARD_ALT,
+                                Color32::from_rgb(54, 47, 72),
+                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
+                                TEXT_PRIMARY,
+                                12.0,
+                            )
+                            .on_hover_text("Sync all top-level folders to this computer")
+                            .clicked()
+                            {
+                                self.status.settings.excluded_folders.clear();
+                                for sf in &mut self.selective_folders {
+                                    sf.excluded = false;
+                                }
+                                let _ = self.tx.send(WorkerCommand::SaveSettings(
+                                    serde_json::json!({ "excludedFolders": Vec::<String>::new() }),
+                                ));
+                            }
+                        }
+
                         ui.add_space(10.0);
                         let folder_count = self
                             .remote_items
@@ -1829,30 +1909,71 @@ impl ProtonDriveNativeApp {
                                 name_color,
                             );
 
-                            // 2. Sync Status Column ("✓ Synced" vs "Cloud only")
+                            // 2. Sync Status Column ("✓ Synced" vs "Cloud only" — clickable toggle on root folders!)
                             let pill_rect = egui::Rect::from_min_size(
-                                egui::pos2(row_status_x, row_cy - 10.5),
-                                Vec2::new(84.0, 21.0),
+                                egui::pos2(row_status_x, row_cy - 11.0),
+                                Vec2::new(96.0, 22.0),
                             );
+                            let can_toggle_sync = is_root && is_folder;
+                            let pointer_pos = ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
+                            let pill_hovered = can_toggle_sync
+                                && row_resp.hovered()
+                                && pointer_pos.is_some_and(|p| pill_rect.expand(4.0).contains(p));
+
                             if is_excluded {
-                                ui.painter().rect_filled(
-                                    pill_rect,
-                                    CornerRadius::same(99),
-                                    Color32::from_rgb(38, 33, 52),
-                                );
+                                let bg = if pill_hovered {
+                                    Color32::from_rgb(54, 47, 74)
+                                } else {
+                                    Color32::from_rgb(38, 33, 52)
+                                };
+                                ui.painter()
+                                    .rect_filled(pill_rect, CornerRadius::same(99), bg);
+                                if can_toggle_sync {
+                                    ui.painter().rect_stroke(
+                                        pill_rect,
+                                        CornerRadius::same(99),
+                                        Stroke::new(
+                                            1.0_f32,
+                                            if pill_hovered {
+                                                PROTON_PURPLE_TEXT
+                                            } else {
+                                                BORDER_SUBTLE
+                                            },
+                                        ),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
                                 ui.painter().text(
                                     pill_rect.center(),
                                     egui::Align2::CENTER_CENTER,
                                     "Cloud only",
                                     FontId::new(11.0, FontFamily::Proportional),
-                                    TEXT_MUTED,
+                                    if pill_hovered { TEXT_PRIMARY } else { TEXT_MUTED },
                                 );
                             } else {
-                                ui.painter().rect_filled(
-                                    pill_rect,
-                                    CornerRadius::same(99),
-                                    Color32::from_rgba_unmultiplied(30, 168, 133, 30),
-                                );
+                                let bg = if pill_hovered {
+                                    Color32::from_rgba_unmultiplied(30, 168, 133, 52)
+                                } else {
+                                    Color32::from_rgba_unmultiplied(30, 168, 133, 30)
+                                };
+                                ui.painter()
+                                    .rect_filled(pill_rect, CornerRadius::same(99), bg);
+                                if can_toggle_sync {
+                                    ui.painter().rect_stroke(
+                                        pill_rect,
+                                        CornerRadius::same(99),
+                                        Stroke::new(
+                                            1.0_f32,
+                                            Color32::from_rgba_unmultiplied(
+                                                30,
+                                                168,
+                                                133,
+                                                if pill_hovered { 160 } else { 75 },
+                                            ),
+                                        ),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
                                 ui.painter().text(
                                     pill_rect.center(),
                                     egui::Align2::CENTER_CENTER,
@@ -1885,7 +2006,37 @@ impl ProtonDriveNativeApp {
                                 TEXT_MUTED,
                             );
 
-                            if is_folder && row_resp.clicked() {
+                            let clicked_in_pill = can_toggle_sync
+                                && row_resp.clicked()
+                                && ui
+                                    .input(|i| i.pointer.interact_pos())
+                                    .is_some_and(|p| pill_rect.expand(6.0).contains(p));
+
+                            if clicked_in_pill {
+                                if is_excluded {
+                                    self.status
+                                        .settings
+                                        .excluded_folders
+                                        .retain(|ex| ex != &item.name);
+                                } else if !self
+                                    .status
+                                    .settings
+                                    .excluded_folders
+                                    .contains(&item.name)
+                                {
+                                    self.status.settings.excluded_folders.push(item.name.clone());
+                                }
+                                for sf in &mut self.selective_folders {
+                                    if sf.name == item.name {
+                                        sf.excluded = !is_excluded;
+                                    }
+                                }
+                                let updated_excluded =
+                                    self.status.settings.excluded_folders.clone();
+                                let _ = self.tx.send(WorkerCommand::SaveSettings(
+                                    serde_json::json!({ "excludedFolders": updated_excluded }),
+                                ));
+                            } else if is_folder && row_resp.clicked() {
                                 clicked_folder = Some(format!(
                                     "{}/{}",
                                     self.remote_path.trim_end_matches('/'),
@@ -2425,6 +2576,37 @@ impl ProtonDriveNativeApp {
                 self.settings_dirty = true;
             }
 
+            ui.add_space(20.0);
+            ui.separator();
+            ui.add_space(16.0);
+
+            ui.label(
+                RichText::new("Ignore Patterns (Glob)")
+                    .size(14.5)
+                    .strong()
+                    .color(TEXT_PRIMARY),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "One glob pattern per line. Matching files or folders (e.g. .git, node_modules, *.part) are skipped during two-way sync.",
+                )
+                .size(12.0)
+                .color(TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            if ui
+                .add(
+                    egui::TextEdit::multiline(&mut self.ignore_patterns_text)
+                        .desired_rows(8)
+                        .desired_width(f32::INFINITY)
+                        .font(FontId::new(13.0, FontFamily::Monospace)),
+                )
+                .changed()
+            {
+                self.settings_dirty = true;
+            }
+
             ui.add_space(18.0);
             if proton_button(
                 ui,
@@ -2438,11 +2620,18 @@ impl ProtonDriveNativeApp {
             )
             .clicked()
             {
+                let patterns: Vec<String> = self
+                    .ignore_patterns_text
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 self.settings_dirty = false;
                 let _ = self.tx.send(WorkerCommand::SaveSettings(serde_json::json!({
                     "syncDir": self.edit_sync_dir,
                     "conflictStrategy": self.edit_conflict_strategy,
                     "notificationsEnabled": self.edit_notifications,
+                    "ignorePatterns": patterns,
                 })));
             }
         });
@@ -3102,13 +3291,19 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                 ctx.request_repaint();
             }
             WorkerCommand::LoadRemotePath(path) => {
-                let url = format!("{DAEMON_URL}/api/remote/list?path={path}");
-                let res = ureq::get(&url)
-                    .call()
-                    .map_err(|e| e.to_string())
-                    .and_then(|r| r.into_json::<RemoteListResponse>().map_err(|e| e.to_string()));
-                let _ = tx.send(WorkerEvent::RemoteLoaded(res));
-                ctx.request_repaint();
+                let tx_clone = tx.clone();
+                let ctx_clone = ctx.clone();
+                thread::spawn(move || {
+                    let url = format!("{DAEMON_URL}/api/remote/list?path={path}");
+                    let res = ureq::get(&url)
+                        .call()
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| {
+                            r.into_json::<RemoteListResponse>().map_err(|e| e.to_string())
+                        });
+                    let _ = tx_clone.send(WorkerEvent::RemoteLoaded(res));
+                    ctx_clone.request_repaint();
+                });
             }
             WorkerCommand::CreateRemoteFolder { parent_path, name } => {
                 let _ = ureq::post(&format!("{DAEMON_URL}/api/remote/mkdir")).send_json(
