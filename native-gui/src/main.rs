@@ -150,7 +150,7 @@ fn table_header_bg() -> Color32 {
     if is_light_mode() {
         Color32::from_rgb(243, 241, 250)
     } else {
-        table_header_bg()
+        Color32::from_rgb(26, 23, 36)
     }
 }
 #[inline]
@@ -158,7 +158,7 @@ fn row_hover_bg() -> Color32 {
     if is_light_mode() {
         Color32::from_rgb(240, 236, 252)
     } else {
-        row_hover_bg()
+        Color32::from_rgb(43, 38, 60)
     }
 }
 #[inline]
@@ -166,7 +166,7 @@ fn row_divider_color() -> Color32 {
     if is_light_mode() {
         Color32::from_rgb(234, 231, 244)
     } else {
-        row_divider_color()
+        Color32::from_rgb(40, 35, 54)
     }
 }
 #[inline]
@@ -174,7 +174,7 @@ fn btn_secondary_hover_bg() -> Color32 {
     if is_light_mode() {
         Color32::from_rgb(228, 224, 242)
     } else {
-        btn_secondary_hover_bg()
+        Color32::from_rgb(54, 47, 72)
     }
 }
 
