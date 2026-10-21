@@ -16,7 +16,9 @@
         "daemon": "bun run src/cli/main.ts daemon",
         "gui": "bun run src/cli/main.ts gui",
         "build": "bun ./scripts/build.ts",
-        "build:deb": "bash ./scripts/build-deb.sh",
+        "build:deb": "bash ./packaging/linux/package.sh --formats deb",
+        "package:linux": "bash ./packaging/linux/package.sh",
+        "install:user": "bash ./packaging/linux/install.sh --user",
         "check-types": "bunx tsc --noEmit",
         "test": "bun test tests"
     },

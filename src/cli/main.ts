@@ -46,22 +46,21 @@ async function createStandaloneRuntime(verbose = false) {
 }
 
 function printHelp(): void {
-    console.log(`Proton Drive for Ubuntu (Unofficial Client powered by Proton Drive SDK)
-Notice: ${THIRD_PARTY_DISCLOSURE}
+    console.log(`Proton Drive for Linux (Powered by Proton Drive SDK)
 App Version Header: ${DEFAULT_APP_VERSION}
 
 Usage:
-  proton-drive-ubuntu <command> [options]
+  protondrive <command> [options]
 
 Daemon & Desktop GUI Commands:
   daemon                         Run two-way folder sync daemon & local control server
-  gui                            Launch Ubuntu Desktop GUI window (starts daemon if needed)
+  gui                            Launch Native Desktop GUI window (starts daemon if needed)
   status [--json]                Show sync status, local folder, and synced file counts
   sync                           Trigger an immediate two-way synchronization pass
   pause                          Pause background synchronization
   resume                         Resume background synchronization
 
-Authentication Commands (OS Keyring / libsecret):
+Authentication Commands (OS Keyring / XDG Fallback):
   auth login                     Sign in via web browser (stores session in OS Keyring)
   auth logout                    Sign out and clear local caches
   auth status                    Check current authentication status

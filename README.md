@@ -1,74 +1,83 @@
-# Proton Drive for Ubuntu (Unofficial Client)
+# Proton Drive for Linux
 
-> **Disclaimer:** _This is a third-party application not officially supported by Proton._
-> It does not use Proton branding or trademarks and identifies itself honestly via `x-pm-appversion: external-drive-ubuntu_sync@0.1.0-alpha` in compliance with the [Proton Drive SDK Operational & Legal Guidelines](https://github.com/ProtonDriveApps/sdk).
+A fast, native Linux desktop application and two-way background folder synchronization client for **Proton Drive**, built on top of the official **Proton Drive SDK (`@protontech/drive-sdk`)** and a native Rust **`eframe` / `egui`** desktop GUI (modeled on the cross-distro architecture of [`wordcraft`](https://github.com/storytold/wordcraft)).
 
-A native Ubuntu/Linux two-way folder synchronization daemon, Desktop GUI, CLI, and GNOME Files (Nautilus) integration built directly on top of the official **Proton Drive SDK (`@protontech/drive-sdk`)** and **`proton-drive-sdk-account`**.
+---
+
+## Supported Linux Distributions & Package Formats
+
+Built to work out-of-the-box across all major Linux distributions and desktop environments (GNOME, KDE Plasma, XFCE, Cinnamon, MATE, COSMIC, Sway, Hyprland):
+
+| Format | Output Artifact (`dist/release/`) | Target Distributions |
+| :--- | :--- | :--- |
+| **AppImage** | `protondrive-0.1.0-linux-x86_64.AppImage` | **Universal** — runs on any Linux distro (Ubuntu, Fedora, Arch, openSUSE, Mint, NixOS, SteamOS) without installation |
+| **Debian / Ubuntu (`.deb`)** | `protondrive-0.1.0-linux-amd64.deb` | Debian, Ubuntu, Linux Mint, Pop!\_OS, Zorin OS, Elementary OS, Kali |
+| **Fedora / RHEL / SUSE (`.rpm`)** | `protondrive-0.1.0-linux-x86_64.rpm` | Fedora, RHEL, CentOS Stream, Rocky Linux, AlmaLinux, openSUSE Tumbleweed / Leap |
+| **Portable Tarball (`.tar.gz`)** | `protondrive-0.1.0-linux-x86_64.tar.gz` | Any Linux distro — includes FHS tree (`bin/`, `share/`, `lib/systemd/user/`) and universal `install.sh` (`--user` or `--system`) |
+| **Arch Linux (`PKGBUILD`)** | `packaging/linux/arch/PKGBUILD` | Arch Linux, Manjaro, EndeavourOS, Garuda (`makepkg -si`) |
+| **Flatpak Bundle (`.flatpak`)** | `packaging/linux/flatpak-bundle.sh` | Sandboxed Flatpak bundle for Flathub / Fedora Silverblue / immutable distros |
 
 ---
 
 ## Features
 
-- **Official Proton Drive SDK Integration (`@protontech/drive-sdk`)**:
-  - End-to-end OpenPGP encryption & verification via `@protontech/crypto` (`OpenPGPCryptoWithCryptoProxy`)
-  - Encrypted local SQLite crypto and entity caches (`cache-crypto.sqlite`, `cache-entities.sqlite`)
-  - SHA1 digest verification on uploads and downloads
+- **Native Rust Desktop App (`protondrive-gui`)**:
+  - Built with `eframe`/`egui` in Rust using Proton's **Carbon Dark** design palette and embedded `Inter` + `JetBrains Mono` typography.
+  - Proper Freedesktop reverse-DNS App ID (`ch.proton.drive`), `StartupWMClass=ch.proton.drive`, AppStream metainfo, and complete `hicolor` icon theme (`16x16` through `512x512` + `scalable` SVG) so docks and taskbars display the official Proton Drive icon across X11 and Wayland.
+  - **Self-Starting Companion Daemon**: Launching the GUI automatically spawns `protondrive daemon` in the background if it is not already running.
 - **Event-Driven Two-Way Folder Synchronization (`~/ProtonDrive`)**:
-  - Real-time remote updates via Proton Drive SDK event subscriptions (`subscribeToDriveEvents` & `subscribeToTreeEvents`) with persisted event cursors
-  - Real-time local filesystem watching on Linux via `inotify` (`fs.watch`) with debouncing and atomic temp-file writes
-- **OS Keyring & Browser Authentication**:
-  - Browser-based Proton sign-in (`auth.authViaWeb`) — never prompts for raw credentials in the app
-  - Persists session tokens securely in the Ubuntu OS Keyring (`libsecret` / GNOME Keyring) or `pass`
-- **Conflict Resolution & Selective Sync**:
-  - Configurable strategies: `keep-both` (saves conflict copy with timestamp & hostname), `keep-local`, `keep-remote`, or `prompt` (manual resolution in the GUI/CLI)
-  - Selective sync to exclude specific remote `/my-files` top-level folders plus customizable glob ignore patterns (`.git`, `node_modules`, `*.tmp`, etc.)
-- **Ubuntu Desktop GUI & Linux Integration**:
-  - Adwaita-inspired dark Desktop GUI (`proton-drive-ubuntu gui`) with live transfer progress, activity log, cloud file browser, conflict center, and selective sync configuration
-  - **Ubuntu Nautilus (`python3-nautilus`) Extension** (`linux/nautilus/proton_drive_nautilus.py`) for sync status emblems and right-click context menu actions
-  - **Systemd User Service** (`linux/systemd/proton-drive-ubuntu.service`) for automatic background startup on login
-  - **Debian Package (`.deb`) Builder** (`bun run build:deb`)
+  - Real-time remote changes via Proton Drive SDK event subscriptions (`subscribeToDriveEvents` & `subscribeToTreeEvents`) with persisted cursors.
+  - Real-time local filesystem watching via Linux `inotify` (`fs.watch`) with debouncing and atomic writes.
+- **Cross-Distro OS Keyring & Browser Authentication**:
+  - Browser-based Proton sign-in (`auth.authViaWeb`).
+  - Stores credentials in the Freedesktop Secret Service (`libsecret` / GNOME Keyring / KDE KWallet / KeePassXC) with automatic fallback to a mode-`0600` local XDG session store on minimal window managers or headless systems.
+- **Multi-Desktop File Manager Integration**:
+  - **GNOME Files (Nautilus)**: `linux/nautilus/proton_drive_nautilus.py`
+  - **Cinnamon / Linux Mint (Nemo)**: `linux/nemo/proton_drive_nemo.py`
+  - **KDE Plasma (Dolphin)**: `linux/dolphin/protondrive.desktop`
 
 ---
 
-## Quick Start
+## Building & Installing on Any Linux Distro
 
-### 1. Install Dependencies & Run from Source
+### Build All Linux Packages (`.AppImage`, `.deb`, `.rpm`, `.tar.gz`)
 
 ```bash
-bun install
-bun run start help
+./packaging/linux/package.sh
 ```
 
-### 2. Sign In with Your Proton Account
+This outputs all 4 universal release artifacts to `./dist/release/`:
+- `dist/release/protondrive-0.1.0-linux-x86_64.AppImage`
+- `dist/release/protondrive-0.1.0-linux-amd64.deb`
+- `dist/release/protondrive-0.1.0-linux-x86_64.rpm`
+- `dist/release/protondrive-0.1.0-linux-x86_64.tar.gz`
+
+### Option A: Universal Per-User Install (Any Distro, No Root Needed)
 
 ```bash
-bun run start auth login
+./packaging/linux/install.sh --user
+systemctl --user enable --now protondrive.service
 ```
 
-This opens `account.proton.me` in your browser and stores the encrypted session in your Ubuntu Keyring (`libsecret`).
-
-### 3. Start the Desktop GUI or Background Sync Daemon
+### Option B: Debian / Ubuntu / Mint / Pop!\_OS (`.deb`)
 
 ```bash
-# Launch the Desktop GUI (automatically starts the sync daemon on 127.0.0.1:49152)
-bun run gui
-
-# Or run the background daemon directly
-bun run daemon
+sudo dpkg -i ./dist/release/protondrive-0.1.0-linux-amd64.deb
+systemctl --user enable --now protondrive.service
 ```
 
-### 4. Build Standalone Binary & Ubuntu `.deb` Package
+### Option C: Fedora / RHEL / openSUSE (`.rpm`)
 
 ```bash
-# Build standalone executable at ./release/proton-drive-ubuntu
-bun run build
+sudo dnf install ./dist/release/protondrive-0.1.0-linux-x86_64.rpm
+systemctl --user enable --now protondrive.service
+```
 
-# Build installable Debian package at ./release/proton-drive-ubuntu_0.1.0_amd64.deb
-bun run build:deb
+### Option D: Universal AppImage (Zero Installation)
 
-# Install on Ubuntu
-sudo dpkg -i ./release/proton-drive-ubuntu_0.1.0_amd64.deb
-systemctl --user enable --now proton-drive-ubuntu.service
+```bash
+chmod +x ./dist/release/protondrive-0.1.0-linux-x86_64.AppImage
+./dist/release/protondrive-0.1.0-linux-x86_64.AppImage
 ```
 
 ---
@@ -76,23 +85,17 @@ systemctl --user enable --now proton-drive-ubuntu.service
 ## CLI Reference
 
 ```bash
-proton-drive-ubuntu daemon                         # Run two-way sync daemon & local API server
-proton-drive-ubuntu gui                            # Open Ubuntu Desktop GUI window
-proton-drive-ubuntu status [--json]                # Show sync status & statistics
-proton-drive-ubuntu sync                           # Trigger immediate two-way sync pass
-proton-drive-ubuntu pause / resume                 # Pause or resume background sync
-proton-drive-ubuntu auth login / logout / status   # Manage Proton account session
-proton-drive-ubuntu conflicts                      # List or resolve file conflicts
-proton-drive-ubuntu selective-sync list            # Manage selective folder sync
-proton-drive-ubuntu ls [/my-files]                 # Browse remote Proton Drive files
-proton-drive-ubuntu upload <local> <remoteDir>     # Upload a file directly
-proton-drive-ubuntu download <remote> <local>      # Download a file directly
-proton-drive-ubuntu mkdir <remoteDir> <name>       # Create a remote folder
-proton-drive-ubuntu trash <remotePath>             # Move a remote node to Trash
+protondrive gui                            # Open native Rust Proton Drive desktop app
+protondrive daemon                         # Run two-way sync daemon & local API server
+protondrive status [--json]                # Show sync status & statistics
+protondrive sync                           # Trigger immediate two-way sync pass
+protondrive pause / resume                 # Pause or resume background sync
+protondrive auth login / logout / status   # Manage Proton account session
+protondrive conflicts                      # List or resolve file conflicts
+protondrive selective-sync list            # Manage selective folder sync
+protondrive ls [/my-files]                 # Browse remote Proton Drive files
+protondrive upload <local> <remoteDir>     # Upload a file directly
+protondrive download <remote> <local>      # Download a file directly
+protondrive mkdir <remoteDir> <name>       # Create a remote folder
+protondrive trash <remotePath>             # Move a remote node to Trash
 ```
-
----
-
-## License
-
-MIT License. Access to Proton's hosted services remains subject to Proton's terms of service and operational policies.

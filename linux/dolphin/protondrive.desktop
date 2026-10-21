@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Service
+MimeType=inode/directory;all/allfiles;
+Actions=ProtonDriveSyncNow;ProtonDriveOpenGui;
+X-KDE-Priority=TopLevel
+X-KDE-Submenu=Proton Drive
+
+[Desktop Action ProtonDriveSyncNow]
+Name=Sync Now
+Icon=ch.proton.drive
+Exec=protondrive sync
+
+[Desktop Action ProtonDriveOpenGui]
+Name=Open Proton Drive
+Icon=ch.proton.drive
+Exec=protondrive-gui

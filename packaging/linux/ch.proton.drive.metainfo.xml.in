@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>ch.proton.drive</id>
+  <name>Proton Drive</name>
+  <summary>End-to-end encrypted cloud storage and folder sync for Linux</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.github.gautamchauhan">
+    <name>Gautam Chauhan</name>
+  </developer>
+  <description>
+    <p>
+      Native Linux desktop client and two-way background folder synchronization daemon for Proton Drive,
+      built on the official Proton Drive SDK and a native Rust eframe/egui desktop interface.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Two-way real-time local folder sync with Linux inotify and remote event subscriptions</li>
+      <li>End-to-end encrypted transfers via the official Proton Drive SDK</li>
+      <li>Cross-distro OS Keyring integration (Freedesktop Secret Service / GNOME Keyring / KDE Wallet) with XDG fallback</li>
+      <li>Selective folder sync, custom ignore patterns, and conflict resolution</li>
+      <li>File manager integration for GNOME Files (Nautilus), Cinnamon (Nemo), and KDE Plasma (Dolphin)</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">ch.proton.drive.desktop</launchable>
+  <url type="homepage">https://github.com/gautamchauhan/proton-drive</url>
+  <provides>
+    <binary>protondrive-gui</binary>
+    <binary>protondrive</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="@VERSION@" date="@DATE@" />
+  </releases>
+</component>

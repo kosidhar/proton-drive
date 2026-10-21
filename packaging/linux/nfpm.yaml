@@ -1,0 +1,77 @@
+name: protondrive
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${VERSION}
+version_schema: semver
+release: 1
+section: net
+priority: optional
+maintainer: ${PROTONDRIVE_MAINTAINER}
+vendor: Proton Drive Linux Community
+homepage: https://github.com/gautamchauhan/proton-drive
+license: MIT
+description: |-
+  Native Linux desktop client and two-way folder sync daemon for Proton Drive.
+  Built on the official Proton Drive SDK (@protontech/drive-sdk) with a fast
+  native Rust eframe/egui desktop interface, event-based two-way local folder
+  synchronization, OS Keyring support, conflict resolution, selective sync,
+  and file manager integration for GNOME (Nautilus), Cinnamon (Nemo), and KDE (Dolphin).
+
+overrides:
+  deb:
+    replaces:
+      - proton-drive-ubuntu
+    provides:
+      - proton-drive-ubuntu
+    depends:
+      - libc6 (>= 2.35)
+      - libgcc-s1
+      - libxkbcommon0
+      - libvulkan1 | libegl1
+    recommends:
+      - libsecret-1-0
+      - libnotify-bin
+      - xdg-utils
+      - libwayland-client0
+      - libx11-6
+      - libxcursor1
+      - libxi6
+      - libxrandr2
+      - mesa-vulkan-drivers
+      - xdg-desktop-portal
+  rpm:
+    depends:
+      - libxkbcommon
+      - (vulkan-loader or libglvnd-egl)
+    recommends:
+      - libsecret
+      - libnotify
+      - xdg-utils
+      - libwayland-client
+      - libX11
+      - libXcursor
+      - libXi
+      - libXrandr
+      - mesa-vulkan-drivers
+      - xdg-desktop-portal
+
+contents:
+  - src: ${STAGE}/usr/bin/protondrive
+    dst: /usr/bin/protondrive
+    file_info: { mode: 0755 }
+  - src: ${STAGE}/usr/bin/protondrive-gui
+    dst: /usr/bin/protondrive-gui
+    file_info: { mode: 0755 }
+  - src: /usr/bin/protondrive
+    dst: /usr/bin/proton-drive-ubuntu
+    type: symlink
+  - src: ${STAGE}/usr/lib/
+    dst: /usr/lib/
+    type: tree
+  - src: ${STAGE}/usr/share/
+    dst: /usr/share/
+    type: tree
+
+scripts:
+  postinstall: packaging/linux/postinst.sh
+  postremove: packaging/linux/postinst.sh

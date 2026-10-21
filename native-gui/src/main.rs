@@ -86,6 +86,7 @@ struct DaemonStatus {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ActivityRecord {
+    #[allow(dead_code)]
     timestamp: u64,
     action: String,
     local_rel_path: String,
@@ -101,6 +102,7 @@ struct RemoteItem {
     #[serde(rename = "type")]
     item_type: String,
     size: u64,
+    #[allow(dead_code)]
     modification_time: String,
 }
 
@@ -128,6 +130,7 @@ struct SelectiveFoldersResponse {
 struct ConflictRecord {
     id: u64,
     local_rel_path: String,
+    #[allow(dead_code)]
     detected_at: u64,
     resolved: u8,
     resolution: Option<String>,
@@ -300,7 +303,7 @@ impl ProtonDriveNativeApp {
                 Frame::NONE
                     .fill(BG_SIDEBAR)
                     .inner_margin(Margin::symmetric(16, 20))
-                    .stroke(Stroke::new(1.0, BORDER_SUBTLE)),
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE)),
             )
             .show(ctx, |ui| {
                 // Brand Header
@@ -321,7 +324,7 @@ impl ProtonDriveNativeApp {
                                 .color(TEXT_PRIMARY),
                         );
                         ui.label(
-                            RichText::new("Linux Sync Client")
+                            RichText::new("Encrypted Cloud Sync")
                                 .size(11.5)
                                 .color(TEXT_MUTED),
                         );
@@ -507,7 +510,7 @@ impl ProtonDriveNativeApp {
                     .add(
                         egui::Button::new(RichText::new(pause_label).size(13.0).color(TEXT_PRIMARY))
                             .fill(BG_CARD_ALT)
-                            .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                            .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
                             .corner_radius(CornerRadius::same(8))
                             .min_size(Vec2::new(105.0, 32.0)),
                     )
@@ -597,7 +600,7 @@ impl ProtonDriveNativeApp {
                                     RichText::new("Sign Out").size(12.5).color(STATUS_DANGER),
                                 )
                                 .fill(Color32::from_rgba_unmultiplied(220, 50, 81, 28))
-                                .stroke(Stroke::new(1.0, STATUS_DANGER))
+                                .stroke(Stroke::new(1.0_f32, STATUS_DANGER))
                                 .corner_radius(CornerRadius::same(8))
                                 .min_size(Vec2::new(90.0, 32.0)),
                             )
@@ -818,7 +821,7 @@ impl ProtonDriveNativeApp {
 
                 Frame::NONE
                     .fill(BG_INPUT)
-                    .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
                     .corner_radius(CornerRadius::same(6))
                     .inner_margin(Margin::symmetric(12, 6))
                     .show(ui, |ui| {
@@ -1302,7 +1305,7 @@ impl eframe::App for ProtonDriveNativeApp {
 fn card_frame() -> Frame {
     Frame::NONE
         .fill(BG_CARD)
-        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+        .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
         .corner_radius(CornerRadius::same(12))
         .inner_margin(Margin::same(18))
 }
@@ -1322,27 +1325,62 @@ fn render_stat_card(ui: &mut egui::Ui, label: &str, value: &str) {
 }
 
 fn configure_proton_theme(ctx: &egui::Context) {
+    // Embed Inter & JetBrains Mono fonts (matching Proton Carbon Design System & WordCraft)
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "Inter".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../assets/fonts/Inter-Regular.ttf"
+        ))),
+    );
+    fonts.font_data.insert(
+        "InterMedium".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../assets/fonts/Inter-Medium.ttf"
+        ))),
+    );
+    fonts.font_data.insert(
+        "InterSemiBold".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../assets/fonts/Inter-SemiBold.ttf"
+        ))),
+    );
+    fonts.font_data.insert(
+        "JetBrainsMono".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../assets/fonts/JetBrainsMono-Regular.ttf"
+        ))),
+    );
+    if let Some(prop) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        prop.insert(0, "Inter".to_owned());
+        prop.insert(1, "InterMedium".to_owned());
+    }
+    if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+        mono.insert(0, "JetBrainsMono".to_owned());
+    }
+    ctx.set_fonts(fonts);
+
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = BG_CANVAS;
     visuals.window_fill = BG_CARD;
     visuals.faint_bg_color = Color32::from_rgb(28, 25, 38);
     visuals.extreme_bg_color = BG_INPUT;
     visuals.selection.bg_fill = PROTON_PURPLE;
-    visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
     visuals.widgets.noninteractive.bg_fill = BG_CARD;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER_SUBTLE);
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER_SUBTLE);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     visuals.widgets.inactive.bg_fill = BG_CARD_ALT;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER_SUBTLE);
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER_SUBTLE);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     visuals.widgets.hovered.bg_fill = PROTON_PURPLE_HOVER;
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     visuals.widgets.active.bg_fill = PROTON_PURPLE;
     ctx.set_visuals(visuals);
 }
 
 fn load_app_icon() -> Option<IconData> {
-    let png_bytes = include_bytes!("../../linux/icons/protondrive-256.png");
+    let png_bytes = include_bytes!("../../assets/app-icon/hicolor/256x256/apps/ch.proton.drive.png");
     eframe::icon_data::from_png_bytes(png_bytes).ok()
 }
 
@@ -1392,22 +1430,53 @@ fn truncate_middle(s: &str, max_chars: usize) -> String {
     format!("{start}…{end}")
 }
 
+fn try_autostart_daemon() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static TRIED: AtomicBool = AtomicBool::new(false);
+    if TRIED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("protondrive"));
+            candidates.push(dir.join("proton-drive-ubuntu"));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = std::path::PathBuf::from(home);
+        candidates.push(home_path.join(".local/bin/protondrive"));
+    }
+    candidates.push(std::path::PathBuf::from("/usr/bin/protondrive"));
+    candidates.push(std::path::PathBuf::from("protondrive"));
+
+    for bin in candidates {
+        if Command::new(&bin)
+            .arg("daemon")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+        {
+            thread::sleep(Duration::from_millis(900));
+            break;
+        }
+    }
+}
+
 fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::Context) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
             WorkerCommand::RefreshAll => {
-                let status = ureq::get(&format!("{DAEMON_URL}/api/status"))
-                    .timeout(Duration::from_millis(1200))
-                    .call()
-                    .map_err(|e| e.to_string())
-                    .and_then(|r| r.into_json::<DaemonStatus>().map_err(|e| e.to_string()));
+                let mut status = fetch_status();
+                if status.is_err() {
+                    try_autostart_daemon();
+                    status = fetch_status();
+                }
 
-                let activity = ureq::get(&format!("{DAEMON_URL}/api/activity?limit=40"))
-                    .timeout(Duration::from_millis(1200))
-                    .call()
-                    .ok()
-                    .and_then(|r| r.into_json::<Vec<ActivityRecord>>().ok())
-                    .unwrap_or_default();
+                let activity = fetch_activity();
 
                 let _ = tx.send(WorkerEvent::StatusAndActivity { status, activity });
                 ctx.request_repaint();
@@ -1534,18 +1603,41 @@ fn fetch_activity() -> Vec<ActivityRecord> {
         .unwrap_or_default()
 }
 
+const USAGE: &str = "\
+protondrive-gui — Proton Drive native Linux desktop client
+
+USAGE:
+  protondrive-gui [OPTIONS]
+
+OPTIONS:
+  --screenshot <PATH>   render UI, save a PNG screenshot to PATH, and exit
+  --version             print the version
+  -h, --help            print this help
+";
+
 fn main() -> eframe::Result {
     let mut screenshot_target: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--screenshot" {
-            screenshot_target = args.next();
+        match arg.as_str() {
+            "--screenshot" => {
+                screenshot_target = args.next();
+            }
+            "--version" | "-V" => {
+                println!("protondrive-gui {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                print!("{USAGE}");
+                return Ok(());
+            }
+            _ => {}
         }
     }
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Proton Drive")
-        .with_app_id("proton-drive")
+        .with_app_id("ch.proton.drive")
         .with_inner_size([1180.0, 760.0])
         .with_min_inner_size([840.0, 540.0]);
 
@@ -1558,7 +1650,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    // Match wordcraft: use XWayland when DISPLAY is set so window icon and WM_CLASS work reliably on Ubuntu GNOME
+    // Match wordcraft: use XWayland when DISPLAY is set so window icon and WM_CLASS work reliably across Linux desktop environments
     if std::env::var_os("DISPLAY").is_some() && std::env::var_os("PROTONDRIVE_WAYLAND").is_none() {
         options.event_loop_builder = Some(Box::new(|b| {
             use winit::platform::x11::EventLoopBuilderExtX11;

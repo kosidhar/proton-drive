@@ -15,13 +15,14 @@ export function initCredentials(config: Config, logger: Logger): Credentials {
 }
 
 function createAuthSessionStore(config: Config, logger: Logger): CredentialsStore {
+    const fileFallback = new PlaintextFileSessionStore(config.appDir, logger);
     switch (config.credentialsStore) {
         case 'unsafe_file':
-            return new PlaintextFileSessionStore(config.appDir, logger);
+            return fileFallback;
         case 'pass':
             return new PassSessionStore(logger);
         case 'keychain':
-            return new SecretsSessionStore(logger);
+            return new SecretsSessionStore(logger, fileFallback);
         default:
             throw new Error(`Invalid credentials store: ${config.credentialsStore}`);
     }

@@ -14,12 +14,12 @@ export function sendDesktopNotification(options: {
     }
 
     const urgency = options.urgency ?? 'normal';
-    const icon = options.icon ?? 'folder-cloud';
+    const icon = options.icon ?? 'ch.proton.drive';
 
     try {
         const child = spawn(
             'notify-send',
-            ['--app-name=Proton Drive Ubuntu (Unofficial)', `--urgency=${urgency}`, `--icon=${icon}`, options.title, options.body],
+            ['--app-name=Proton Drive', `--urgency=${urgency}`, `--icon=${icon}`, options.title, options.body],
             {
                 detached: true,
                 stdio: 'ignore',
