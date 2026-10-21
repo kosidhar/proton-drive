@@ -7,20 +7,27 @@ import json
 import os
 import subprocess
 import sys
+import types
 import urllib.parse
 import urllib.request
 from gi.repository import GObject, Nautilus
 
 DAEMON_URL = os.environ.get("PROTON_DRIVE_DAEMON_URL", "http://127.0.0.1:49152")
 
-# Neutralize any legacy /usr/share/nautilus-python/extensions/proton_drive_nautilus.py
-# that may still be installed from an older package version in the same Nautilus process.
-_legacy_mod = sys.modules.get("proton_drive_nautilus")
-if _legacy_mod is not None and hasattr(_legacy_mod, "ProtonDriveUbuntuExtension"):
-    _legacy_cls = getattr(_legacy_mod, "ProtonDriveUbuntuExtension")
-    _legacy_cls.get_file_items = lambda self, *args: []
-    _legacy_cls.get_background_items = lambda self, *args: []
-    _legacy_cls.update_file_info = lambda self, *args: None
+
+def _neutralize_legacy_extension():
+    legacy_mod = sys.modules.get("proton_drive_nautilus")
+    if legacy_mod is not None and hasattr(legacy_mod, "ProtonDriveUbuntuExtension"):
+        legacy_cls = getattr(legacy_mod, "ProtonDriveUbuntuExtension")
+        legacy_cls.get_file_items = lambda self, *args: []
+        legacy_cls.get_background_items = lambda self, *args: []
+        legacy_cls.update_file_info = lambda self, *args: None
+    elif "proton_drive_nautilus" not in sys.modules:
+        # Block /usr/share/nautilus-python/extensions/proton_drive_nautilus.py from being imported later
+        sys.modules["proton_drive_nautilus"] = types.ModuleType("proton_drive_nautilus")
+
+
+_neutralize_legacy_extension()
 
 
 def _query_daemon(endpoint: str, method: str = "GET"):
@@ -88,6 +95,7 @@ class ProtonDriveNautilusExtension(
             file.add_emblem("emblem-important")
 
     def get_file_items(self, *args):
+        _neutralize_legacy_extension()
         files = args[-1] if args else []
         if not files:
             return []
@@ -113,6 +121,7 @@ class ProtonDriveNautilusExtension(
         return [sync_item, open_app_item]
 
     def get_background_items(self, *args):
+        _neutralize_legacy_extension()
         folder = args[-1] if args else None
         if folder is not None and hasattr(folder, "get_location"):
             folder_path = folder.get_location().get_path()
