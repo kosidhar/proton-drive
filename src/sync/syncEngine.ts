@@ -168,6 +168,35 @@ export class ProtonDriveSyncEngine {
             .sort((a, b) => a.name.localeCompare(b.name));
     }
 
+    async applySelectiveSyncExclusions(): Promise<void> {
+        const settings = this.stateDb.getSettings();
+        if (!settings.excludedFolders || settings.excludedFolders.length === 0) {
+            return;
+        }
+
+        for (const folderName of settings.excludedFolders) {
+            const trimmed = folderName.trim().replace(/^\/+|\/+$/g, '');
+            if (!trimmed) {
+                continue;
+            }
+            const localFolderFullPath = path.join(settings.syncDir, trimmed);
+            const st = await stat(localFolderFullPath).catch(() => null);
+            const dbItem = this.stateDb.getItemByPath(trimmed);
+
+            if (st || dbItem) {
+                // Suppress local watcher so removing the local copy does NOT trash the cloud folder
+                this.watcher.suppressPath(trimmed, 20000);
+                await rm(localFolderFullPath, { recursive: true, force: true }).catch(() => {});
+                this.stateDb.removeItemByPath(trimmed);
+                this.stateDb.logActivity({
+                    action: 'delete-local',
+                    localRelPath: trimmed,
+                    details: 'Excluded by Selective Sync (removed local copy; kept in Proton Drive cloud)',
+                });
+            }
+        }
+    }
+
     async reconcileNow(): Promise<void> {
         if (!this.auth.isLoggedIn()) {
             this.state = 'unauthenticated';
@@ -185,18 +214,19 @@ export class ProtonDriveSyncEngine {
 
         this.reconcileRunning = true;
         this.state = 'syncing';
-        this.currentAction = 'Scanning remote Proton Drive folders...';
+        this.currentAction = 'Applying selective sync rules...';
         this.lastError = null;
 
         try {
             await mkdir(settings.syncDir, { recursive: true });
+            await this.applySelectiveSyncExclusions();
             const root = await this.getRootFolder();
             await this.eventsManager.subscribeDriveScope(root.treeEventScopeId);
 
             // Sync folder-by-folder incrementally so files & folders appear in ~/ProtonDrive
             // and in the GUI dashboard immediately instead of waiting for a full tree scan.
             const remoteMap = new Map<string, NodeEntity>();
-            await this.reconcileDirectoryIncremental(root, '', remoteMap, settings);
+            await this.reconcileDirectoryIncremental(root, '', remoteMap, this.stateDb.getSettings());
 
             this.lastSyncAt = Date.now();
             this.currentAction = null;
@@ -861,23 +891,29 @@ export class ProtonDriveSyncEngine {
         folderNode: NodeEntity,
         prefix: string,
         remoteMap: Map<string, NodeEntity>,
-        settings: SyncSettings,
+        _initialSettings: SyncSettings,
     ): Promise<void> {
-        if (this.stateDb.getSettings().paused) {
+        const liveSettings = this.stateDb.getSettings();
+        if (liveSettings.paused) {
+            return;
+        }
+        if (prefix && matchesIgnorePatterns(prefix, liveSettings.ignorePatterns, liveSettings.excludedFolders)) {
+            await this.applySelectiveSyncExclusions();
             return;
         }
 
-        const localDirFullPath = prefix ? path.join(settings.syncDir, prefix) : settings.syncDir;
+        const localDirFullPath = prefix ? path.join(liveSettings.syncDir, prefix) : liveSettings.syncDir;
         this.watcher.suppressPath(prefix || '.');
         await mkdir(localDirFullPath, { recursive: true });
 
         this.currentAction = `Listing /my-files/${prefix || ''}`;
         const remoteChildren = await listFolderChildren(this.sdk, folderNode);
+        const freshSettings = this.stateDb.getSettings();
         const remoteChildByName = new Map<string, NodeEntity>();
         for (const child of remoteChildren) {
             const name = getName(child);
             const relPath = prefix ? `${prefix}/${name}` : name;
-            if (!matchesIgnorePatterns(relPath, settings.ignorePatterns, settings.excludedFolders)) {
+            if (!matchesIgnorePatterns(relPath, freshSettings.ignorePatterns, freshSettings.excludedFolders)) {
                 remoteChildByName.set(name, child);
                 remoteMap.set(relPath, child);
             }
@@ -887,7 +923,7 @@ export class ProtonDriveSyncEngine {
         const localChildByName = new Map<string, { isDirectory: boolean; size: number; mtimeMs: number }>();
         for (const entry of localEntries) {
             const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
-            if (matchesIgnorePatterns(relPath, settings.ignorePatterns, settings.excludedFolders)) {
+            if (matchesIgnorePatterns(relPath, freshSettings.ignorePatterns, freshSettings.excludedFolders)) {
                 continue;
             }
             const fullPath = path.join(localDirFullPath, entry.name);
@@ -908,7 +944,9 @@ export class ProtonDriveSyncEngine {
             const itemDir = path.posix.dirname(item.localRelPath);
             const expectedDir = prefix || '.';
             if (itemDir === expectedDir) {
-                dbChildByName.set(path.posix.basename(item.localRelPath), item);
+                if (!matchesIgnorePatterns(item.localRelPath, freshSettings.ignorePatterns, freshSettings.excludedFolders)) {
+                    dbChildByName.set(path.posix.basename(item.localRelPath), item);
+                }
             }
         }
 
@@ -919,11 +957,13 @@ export class ProtonDriveSyncEngine {
         const subFoldersToRecurse: Array<{ node: NodeEntity; relPath: string }> = [];
 
         for (const name of childNames) {
-            if (this.stateDb.getSettings().paused) {
+            const stepSettings = this.stateDb.getSettings();
+            if (stepSettings.paused) {
                 return;
             }
             const relPath = prefix ? `${prefix}/${name}` : name;
-            if (matchesIgnorePatterns(relPath, settings.ignorePatterns, settings.excludedFolders)) {
+            if (matchesIgnorePatterns(relPath, stepSettings.ignorePatterns, stepSettings.excludedFolders)) {
+                await this.applySelectiveSyncExclusions();
                 continue;
             }
 
@@ -932,10 +972,10 @@ export class ProtonDriveSyncEngine {
             const localChild = localChildByName.get(name);
             const dbRecord = dbChildByName.get(name);
 
-            await this.reconcileSinglePath(relPath, remoteChild, localChild, dbRecord, remoteMap, settings);
+            await this.reconcileSinglePath(relPath, remoteChild, localChild, dbRecord, remoteMap, stepSettings);
 
             const resolvedFolderNode = remoteMap.get(relPath) ?? remoteChild;
-            const localStillExists = await stat(path.join(settings.syncDir, relPath))
+            const localStillExists = await stat(path.join(stepSettings.syncDir, relPath))
                 .then((s) => s.isDirectory())
                 .catch(() => false);
             if (resolvedFolderNode && resolvedFolderNode.type === NodeType.Folder && localStillExists) {
@@ -944,10 +984,15 @@ export class ProtonDriveSyncEngine {
         }
 
         for (const sub of subFoldersToRecurse) {
-            if (this.stateDb.getSettings().paused) {
+            const nextSettings = this.stateDb.getSettings();
+            if (nextSettings.paused) {
                 return;
             }
-            await this.reconcileDirectoryIncremental(sub.node, sub.relPath, remoteMap, settings);
+            if (matchesIgnorePatterns(sub.relPath, nextSettings.ignorePatterns, nextSettings.excludedFolders)) {
+                await this.applySelectiveSyncExclusions();
+                continue;
+            }
+            await this.reconcileDirectoryIncremental(sub.node, sub.relPath, remoteMap, nextSettings);
         }
     }
 }

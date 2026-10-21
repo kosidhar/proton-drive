@@ -67,8 +67,11 @@ mkdir -p "$STAGE/usr/share/metainfo"
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@DATE@/$BUILD_DATE/g" \
   "$HERE/$APP_ID.metainfo.xml.in" > "$STAGE/usr/share/metainfo/$APP_ID.metainfo.xml"
 
-mkdir -p "$STAGE/usr/share/icons"
+mkdir -p "$STAGE/usr/share/icons" "$STAGE/usr/share/protondrive/tray"
 cp -R "$ROOT/assets/app-icon/hicolor" "$STAGE/usr/share/icons/"
+cp -R "$ROOT/assets/app-icon/tray/"*.png "$STAGE/usr/share/protondrive/tray/"
+cp -R "$ROOT/assets/app-icon/tray/"*.png "$STAGE/usr/share/icons/hicolor/64x64/apps/"
+install -Dm755 "$ROOT/linux/tray/proton_drive_tray.py" "$STAGE/usr/share/protondrive/proton_drive_tray.py"
 
 # File manager integrations (GNOME Nautilus, Cinnamon Nemo, KDE Dolphin)
 install -Dm644 "$ROOT/linux/nautilus/proton_drive_nautilus.py" \

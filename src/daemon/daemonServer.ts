@@ -1,7 +1,7 @@
 import path from 'node:path';
 
 import { getDashboardHtml } from '../gui/dashboardHtml';
-import { getSystemdServiceStatus, sendDesktopNotification } from '../linux/notifications';
+import { ensureSystemTrayIndicator, getSystemdServiceStatus, sendDesktopNotification } from '../linux/notifications';
 import {
     DEFAULT_APP_VERSION,
     DEFAULT_CLIENT_UID_PREFIX,
@@ -49,6 +49,7 @@ export async function startSyncDaemon(options: {
     );
 
     await engine.start({ backgroundInitialReconcile: true });
+    ensureSystemTrayIndicator();
 
     const settings = stateDb.getSettings();
     const reconcileTimer = setInterval(() => {
@@ -124,6 +125,7 @@ export async function startSyncDaemon(options: {
                                 enabled: stateDb.getSettings().notificationsEnabled,
                             });
                             await engine.start({ backgroundInitialReconcile: true });
+    ensureSystemTrayIndicator();
                         })
                         .catch((err: unknown) => {
                             runtime.logger.error('Web authentication failed', err);
@@ -169,8 +171,16 @@ export async function startSyncDaemon(options: {
                 }
 
                 if (req.method === 'POST' && pathname === '/api/settings') {
+                    const prev = stateDb.getSettings();
                     const body = (await req.json()) as Record<string, unknown>;
                     const updated = stateDb.updateSettings(body);
+                    await engine.applySelectiveSyncExclusions();
+                    if (
+                        JSON.stringify(prev.excludedFolders) !== JSON.stringify(updated.excludedFolders) ||
+                        JSON.stringify(prev.ignorePatterns) !== JSON.stringify(updated.ignorePatterns)
+                    ) {
+                        void engine.reconcileNow();
+                    }
                     return Response.json({ ok: true, settings: updated });
                 }
 

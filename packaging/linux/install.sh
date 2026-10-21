@@ -70,6 +70,7 @@ mkdir -p \
   "$PREFIX/share/applications" \
   "$PREFIX/share/metainfo" \
   "$PREFIX/share/icons" \
+  "$PREFIX/share/protondrive/tray" \
   "$PREFIX/share/nautilus-python/extensions" \
   "$PREFIX/share/nemo-python/extensions" \
   "$PREFIX/share/kio/servicemenus" \
@@ -80,6 +81,7 @@ if [ -d "$SRC_Root/bin" ]; then
   install -Dm755 "$SRC_Root/bin/protondrive-gui" "$PREFIX/bin/protondrive-gui"
   ln -sf protondrive "$PREFIX/bin/proton-drive-ubuntu"
   cp -R "$SRC_Root/share/icons/hicolor" "$PREFIX/share/icons/"
+  [ -d "$SRC_Root/share/protondrive" ] && cp -R "$SRC_Root/share/protondrive/"* "$PREFIX/share/protondrive/"
   install -Dm644 "$SRC_Root/share/applications/ch.proton.drive.desktop" "$PREFIX/share/applications/ch.proton.drive.desktop"
   [ -f "$SRC_Root/share/metainfo/ch.proton.drive.metainfo.xml" ] && \
     install -Dm644 "$SRC_Root/share/metainfo/ch.proton.drive.metainfo.xml" "$PREFIX/share/metainfo/ch.proton.drive.metainfo.xml"
@@ -94,6 +96,9 @@ else
   install -Dm755 "$SRC_Root/release/protondrive-gui" "$PREFIX/bin/protondrive-gui"
   ln -sf protondrive "$PREFIX/bin/proton-drive-ubuntu"
   cp -R "$SRC_Root/assets/app-icon/hicolor" "$PREFIX/share/icons/"
+  cp -R "$SRC_Root/assets/app-icon/tray/"*.png "$PREFIX/share/protondrive/tray/"
+  cp -R "$SRC_Root/assets/app-icon/tray/"*.png "$PREFIX/share/icons/hicolor/64x64/apps/"
+  install -Dm755 "$SRC_Root/linux/tray/proton_drive_tray.py" "$PREFIX/share/protondrive/proton_drive_tray.py"
   install -Dm644 "$SRC_Root/packaging/linux/ch.proton.drive.desktop" "$PREFIX/share/applications/ch.proton.drive.desktop"
   install -Dm644 "$SRC_Root/linux/nautilus/proton_drive_nautilus.py" "$PREFIX/share/nautilus-python/extensions/proton_drive_nautilus.py"
   install -Dm644 "$SRC_Root/linux/nemo/proton_drive_nemo.py" "$PREFIX/share/nemo-python/extensions/proton_drive_nemo.py"

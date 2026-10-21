@@ -161,6 +161,62 @@ enum WorkerEvent {
     ConflictsLoaded(Vec<ConflictRecord>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct WindowGeometry {
+    position: Option<[f32; 2]>,
+    width: f32,
+    height: f32,
+    maximized: bool,
+}
+
+impl Default for WindowGeometry {
+    fn default() -> Self {
+        Self {
+            position: None,
+            width: 1280.0,
+            height: 820.0,
+            maximized: true,
+        }
+    }
+}
+
+fn ui_prefs_path() -> Option<std::path::PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.trim().is_empty() {
+            return Some(std::path::PathBuf::from(xdg).join("protondrive/ui.json"));
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    Some(std::path::PathBuf::from(home).join(".config/protondrive/ui.json"))
+}
+
+fn load_window_geometry() -> WindowGeometry {
+    if let Some(p) = ui_prefs_path() {
+        if let Ok(bytes) = std::fs::read(&p) {
+            if let Ok(mut g) = serde_json::from_slice::<WindowGeometry>(&bytes) {
+                g.width = g.width.clamp(840.0, 16384.0);
+                g.height = g.height.clamp(540.0, 16384.0);
+                return g;
+            }
+        }
+    }
+    WindowGeometry::default()
+}
+
+fn save_window_geometry(geom: &WindowGeometry) {
+    let Some(p) = ui_prefs_path() else { return };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(geom) {
+        let tmp = p.with_file_name(format!(".ui.json.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &p)).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
 struct ProtonDriveNativeApp {
     tab: NavTab,
     tx: Sender<WorkerCommand>,
@@ -182,6 +238,7 @@ struct ProtonDriveNativeApp {
 
     // Selective sync state
     selective_folders: Vec<SelectiveFolder>,
+    selective_filter: String,
     ignore_patterns_text: String,
     settings_dirty: bool,
 
@@ -193,6 +250,10 @@ struct ProtonDriveNativeApp {
     edit_conflict_strategy: String,
     edit_notifications: bool,
 
+    // Window geometry state
+    window_geometry: WindowGeometry,
+    maximize_applied_on_open: bool,
+
     // Automatic screenshot support for visual verification
     screenshot_target: Option<String>,
     frames_rendered: u32,
@@ -201,7 +262,12 @@ struct ProtonDriveNativeApp {
 }
 
 impl ProtonDriveNativeApp {
-    fn new(cc: &eframe::CreationContext<'_>, screenshot_target: Option<String>) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        screenshot_target: Option<String>,
+        initial_tab: NavTab,
+        window_geometry: WindowGeometry,
+    ) -> Self {
         configure_proton_theme(&cc.egui_ctx);
 
         let logo_texture = load_glyph_texture(&cc.egui_ctx);
@@ -215,9 +281,16 @@ impl ProtonDriveNativeApp {
         });
 
         let _ = cmd_tx.send(WorkerCommand::RefreshAll);
+        if initial_tab == NavTab::SelectiveSync {
+            let _ = cmd_tx.send(WorkerCommand::LoadSelectiveFolders);
+        } else if initial_tab == NavTab::CloudBrowser {
+            let _ = cmd_tx.send(WorkerCommand::LoadRemotePath("/my-files".to_string()));
+        } else if initial_tab == NavTab::Conflicts {
+            let _ = cmd_tx.send(WorkerCommand::LoadConflicts);
+        }
 
         Self {
-            tab: NavTab::Overview,
+            tab: initial_tab,
             tx: cmd_tx,
             rx: evt_rx,
             logo_texture,
@@ -232,12 +305,15 @@ impl ProtonDriveNativeApp {
             new_folder_name: String::new(),
             show_new_folder_modal: false,
             selective_folders: Vec::new(),
+            selective_filter: String::new(),
             ignore_patterns_text: String::new(),
             settings_dirty: false,
             conflicts: Vec::new(),
             edit_sync_dir: String::new(),
             edit_conflict_strategy: "keep-both".to_string(),
             edit_notifications: true,
+            window_geometry,
+            maximize_applied_on_open: false,
             screenshot_target,
             frames_rendered: 0,
             screenshot_requested: false,
@@ -971,110 +1047,333 @@ impl ProtonDriveNativeApp {
     }
 
     fn render_selective_tab(&mut self, ui: &mut egui::Ui) {
-        card_frame().show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.label(
-                RichText::new("Selective Folder Sync (/my-files)")
-                    .size(15.5)
-                    .strong()
-                    .color(TEXT_PRIMARY),
-            );
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("Uncheck top-level Proton Drive folders you want to exclude from local sync.")
-                    .size(12.5)
-                    .color(TEXT_MUTED),
-            );
-            ui.add_space(12.0);
+        let total_folders = self.selective_folders.len();
+        let synced_folders = self.selective_folders.iter().filter(|f| !f.excluded).count();
+        let avail_h = (ui.available_height() - 6.0).max(420.0);
+        let total_w = ui.available_width();
+        let left_w = ((total_w - 16.0) * 0.62).max(380.0);
+        let right_w = (total_w - left_w - 16.0).max(260.0);
 
-            ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                let mut changed = false;
-                for folder in &mut self.selective_folders {
-                    let mut included = !folder.excluded;
-                    Frame::NONE
-                        .fill(BG_CARD_ALT)
-                        .corner_radius(CornerRadius::same(8))
-                        .inner_margin(Margin::symmetric(12, 8))
-                        .show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            if ui
-                                .checkbox(
-                                    &mut included,
-                                    RichText::new(&folder.name)
-                                        .size(13.5)
+        ui.horizontal_top(|ui| {
+            // Left Column: Spacious Full-Height Selective Folder Sync Card
+            ui.allocate_ui_with_layout(Vec2::new(left_w, avail_h), Layout::top_down(Align::Min), |ui| {
+                card_frame().show(ui, |ui| {
+                    ui.set_min_width(left_w - 38.0);
+                    ui.set_max_width(left_w - 38.0);
+                    ui.set_min_height(avail_h - 38.0);
+
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Selective Folder Sync (/my-files)")
+                                        .size(16.0)
+                                        .strong()
                                         .color(TEXT_PRIMARY),
+                                );
+                                ui.add_space(6.0);
+                                Frame::NONE
+                                    .fill(PROTON_PURPLE_SOFT)
+                                    .corner_radius(CornerRadius::same(99))
+                                    .inner_margin(Margin::symmetric(10, 3))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{synced_folders} of {total_folders} synced"
+                                            ))
+                                            .size(11.5)
+                                            .strong()
+                                            .color(PROTON_PURPLE_TEXT),
+                                        );
+                                    });
+                            });
+                            ui.add_space(3.0);
+                            ui.label(
+                                RichText::new("Unchecked folders are removed from local disk and kept safely in Proton Drive cloud.")
+                                    .size(12.5)
+                                    .color(TEXT_MUTED),
+                            );
+                        });
+
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let mut bulk_change: Option<bool> = None;
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("None").size(12.0).color(TEXT_PRIMARY),
+                                    )
+                                    .fill(BG_CARD_ALT)
+                                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                                    .corner_radius(CornerRadius::same(6))
+                                    .min_size(Vec2::new(60.0, 28.0)),
                                 )
-                                .changed()
+                                .on_hover_text("Exclude all top-level folders from local sync")
+                                .clicked()
                             {
-                                folder.excluded = !included;
-                                changed = true;
+                                bulk_change = Some(true);
+                            }
+                            ui.add_space(6.0);
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Select All").size(12.0).color(TEXT_PRIMARY),
+                                    )
+                                    .fill(BG_CARD_ALT)
+                                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                                    .corner_radius(CornerRadius::same(6))
+                                    .min_size(Vec2::new(78.0, 28.0)),
+                                )
+                                .on_hover_text("Include all top-level folders in local sync")
+                                .clicked()
+                            {
+                                bulk_change = Some(false);
+                            }
+
+                            if let Some(exclude_all) = bulk_change {
+                                for f in &mut self.selective_folders {
+                                    f.excluded = exclude_all;
+                                }
+                                let excluded: Vec<String> = self
+                                    .selective_folders
+                                    .iter()
+                                    .filter(|f| f.excluded)
+                                    .map(|f| f.name.clone())
+                                    .collect();
+                                let _ = self.tx.send(WorkerCommand::SaveSettings(
+                                    serde_json::json!({ "excludedFolders": excluded }),
+                                ));
                             }
                         });
-                    ui.add_space(6.0);
-                }
+                    });
 
-                if changed {
-                    let excluded: Vec<String> = self
-                        .selective_folders
-                        .iter()
-                        .filter(|f| f.excluded)
-                        .map(|f| f.name.clone())
-                        .collect();
-                    let _ = self.tx.send(WorkerCommand::SaveSettings(
-                        serde_json::json!({ "excludedFolders": excluded }),
-                    ));
-                }
+                    ui.add_space(12.0);
+
+                    // Filter box
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.selective_filter)
+                                .hint_text("Filter folders in /my-files...")
+                                .desired_width(ui.available_width() - 80.0),
+                        );
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("Refresh").size(12.0))
+                                    .fill(BG_CARD_ALT)
+                                    .corner_radius(CornerRadius::same(6))
+                                    .min_size(Vec2::new(70.0, 28.0)),
+                            )
+                            .clicked()
+                        {
+                            let _ = self.tx.send(WorkerCommand::LoadSelectiveFolders);
+                        }
+                    });
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    let scroll_h = (ui.available_height() - 6.0).max(240.0);
+                    let filter_lower = self.selective_filter.trim().to_lowercase();
+
+                    ScrollArea::vertical()
+                        .id_salt("selective_folders_scroll")
+                        .max_height(scroll_h)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if self.selective_folders.is_empty() {
+                                ui.add_space(20.0);
+                                ui.label(
+                                    RichText::new("Loading remote top-level folders from /my-files...")
+                                        .size(13.5)
+                                        .color(TEXT_MUTED),
+                                );
+                                return;
+                            }
+
+                            let mut changed = false;
+                            for folder in &mut self.selective_folders {
+                                if !filter_lower.is_empty()
+                                    && !folder.name.to_lowercase().contains(&filter_lower)
+                                {
+                                    continue;
+                                }
+                                let mut included = !folder.excluded;
+                                let row_fill = if included {
+                                    BG_CARD_ALT
+                                } else {
+                                    Color32::from_rgb(27, 24, 36)
+                                };
+                                let border_col = if included {
+                                    Color32::from_rgb(56, 48, 78)
+                                } else {
+                                    BORDER_SUBTLE
+                                };
+
+                                Frame::NONE
+                                    .fill(row_fill)
+                                    .stroke(Stroke::new(1.0_f32, border_col))
+                                    .corner_radius(CornerRadius::same(8))
+                                    .inner_margin(Margin::symmetric(14, 10))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            if ui.checkbox(&mut included, "").changed() {
+                                                folder.excluded = !included;
+                                                changed = true;
+                                            }
+                                            ui.add_space(4.0);
+                                            let (f_rect, _) = ui.allocate_exact_size(
+                                                Vec2::new(16.0, 13.0),
+                                                Sense::hover(),
+                                            );
+                                            let folder_color = if included {
+                                                PROTON_PURPLE
+                                            } else {
+                                                TEXT_MUTED
+                                            };
+                                            ui.painter().rect_filled(
+                                                f_rect,
+                                                CornerRadius::same(3),
+                                                folder_color,
+                                            );
+                                            ui.add_space(6.0);
+
+                                            let name_resp = ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&folder.name)
+                                                        .size(14.0)
+                                                        .strong()
+                                                        .color(if included {
+                                                            TEXT_PRIMARY
+                                                        } else {
+                                                            TEXT_MUTED
+                                                        }),
+                                                )
+                                                .sense(Sense::click()),
+                                            );
+                                            if name_resp.clicked() {
+                                                included = !included;
+                                                folder.excluded = !included;
+                                                changed = true;
+                                            }
+
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    if included {
+                                                        Frame::NONE
+                                                            .fill(Color32::from_rgba_unmultiplied(
+                                                                30, 168, 133, 32,
+                                                            ))
+                                                            .corner_radius(CornerRadius::same(99))
+                                                            .inner_margin(Margin::symmetric(10, 3))
+                                                            .show(ui, |ui| {
+                                                                ui.label(
+                                                                    RichText::new("Synced Locally")
+                                                                        .size(11.5)
+                                                                        .strong()
+                                                                        .color(STATUS_SUCCESS),
+                                                                );
+                                                            });
+                                                    } else {
+                                                        Frame::NONE
+                                                            .fill(Color32::from_rgb(35, 31, 46))
+                                                            .corner_radius(CornerRadius::same(99))
+                                                            .inner_margin(Margin::symmetric(10, 3))
+                                                            .show(ui, |ui| {
+                                                                ui.label(
+                                                                    RichText::new("Cloud Only")
+                                                                        .size(11.5)
+                                                                        .color(TEXT_MUTED),
+                                                                );
+                                                            });
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    });
+                                ui.add_space(6.0);
+                            }
+
+                            if changed {
+                                let excluded: Vec<String> = self
+                                    .selective_folders
+                                    .iter()
+                                    .filter(|f| f.excluded)
+                                    .map(|f| f.name.clone())
+                                    .collect();
+                                let _ = self.tx.send(WorkerCommand::SaveSettings(
+                                    serde_json::json!({ "excludedFolders": excluded }),
+                                ));
+                            }
+                        });
+                });
             });
-        });
 
-        ui.add_space(14.0);
+            ui.add_space(14.0);
 
-        card_frame().show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.label(
-                RichText::new("Ignore Patterns (Glob)")
-                    .size(15.5)
-                    .strong()
-                    .color(TEXT_PRIMARY),
-            );
-            ui.add_space(6.0);
-            if ui
-                .add(
-                    egui::TextEdit::multiline(&mut self.ignore_patterns_text)
-                        .desired_rows(6)
-                        .desired_width(f32::INFINITY)
-                        .font(FontId::new(13.0, FontFamily::Monospace)),
-                )
-                .changed()
-            {
-                self.settings_dirty = true;
-            }
-            ui.add_space(10.0);
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new("Save Ignore Rules")
-                            .size(13.0)
+            // Right Column: Full-Height Ignore Patterns Card
+            ui.allocate_ui_with_layout(Vec2::new(right_w, avail_h), Layout::top_down(Align::Min), |ui| {
+                card_frame().show(ui, |ui| {
+                    ui.set_min_width(right_w - 38.0);
+                    ui.set_max_width(right_w - 38.0);
+                    ui.set_min_height(avail_h - 38.0);
+                    ui.label(
+                        RichText::new("Ignore Patterns (Glob)")
+                            .size(16.0)
                             .strong()
-                            .color(Color32::WHITE),
-                    )
-                    .fill(PROTON_PURPLE)
-                    .corner_radius(CornerRadius::same(8))
-                    .min_size(Vec2::new(140.0, 34.0)),
-                )
-                .clicked()
-            {
-                let patterns: Vec<String> = self
-                    .ignore_patterns_text
-                    .lines()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                self.settings_dirty = false;
-                let _ = self.tx.send(WorkerCommand::SaveSettings(
-                    serde_json::json!({ "ignorePatterns": patterns }),
-                ));
-            }
+                            .color(TEXT_PRIMARY),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "One glob pattern per line. Matching files or folders are skipped during two-way sync.",
+                        )
+                        .size(12.5)
+                        .color(TEXT_MUTED),
+                    );
+                    ui.add_space(12.0);
+
+                    let rows = ((avail_h - 175.0) / 19.0).clamp(8.0, 32.0) as usize;
+                    if ui
+                        .add(
+                            egui::TextEdit::multiline(&mut self.ignore_patterns_text)
+                                .desired_rows(rows)
+                                .desired_width(f32::INFINITY)
+                                .font(FontId::new(13.0, FontFamily::Monospace)),
+                        )
+                        .changed()
+                    {
+                        self.settings_dirty = true;
+                    }
+                    ui.add_space(12.0);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Save Ignore Rules")
+                                    .size(13.0)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(PROTON_PURPLE)
+                            .corner_radius(CornerRadius::same(8))
+                            .min_size(Vec2::new(ui.available_width(), 36.0)),
+                        )
+                        .clicked()
+                    {
+                        let patterns: Vec<String> = self
+                            .ignore_patterns_text
+                            .lines()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        self.settings_dirty = false;
+                        let _ = self.tx.send(WorkerCommand::SaveSettings(
+                            serde_json::json!({ "ignorePatterns": patterns }),
+                        ));
+                    }
+                });
+            });
         });
     }
 
@@ -1244,6 +1543,56 @@ impl ProtonDriveNativeApp {
 impl eframe::App for ProtonDriveNativeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_worker_events();
+        self.frames_rendered += 1;
+
+        if self.screenshot_target.is_none() {
+            if self.frames_rendered <= 3 {
+                if self.window_geometry.maximized {
+                    ctx.send_viewport_cmd(ViewportCommand::Maximized(true));
+                }
+                self.maximize_applied_on_open = true;
+            } else if self.frames_rendered == 8 {
+                save_window_geometry(&self.window_geometry);
+            } else if self.frames_rendered > 8 {
+                let updated_geom = ctx.input(|i| {
+                    let vp = i.viewport();
+                    if vp.minimized == Some(true) || vp.fullscreen == Some(true) {
+                        return None;
+                    }
+                    let content_size = vp.inner_rect.map_or(i.screen_rect().size(), |r| r.size());
+                    let is_max_by_monitor = vp
+                        .monitor_size
+                        .filter(|m| m.is_finite() && m.x > 0.0 && m.y > 0.0)
+                        .is_some_and(|m| {
+                            content_size.x >= m.x * 0.90 && content_size.y >= m.y * 0.84
+                        });
+                    let maximized = vp.maximized == Some(true) || is_max_by_monitor;
+                    if maximized {
+                        Some(WindowGeometry {
+                            maximized: true,
+                            ..self.window_geometry
+                        })
+                    } else if content_size.x >= 800.0 && content_size.y >= 500.0 {
+                        let position = vp.outer_rect.map(|r| [r.min.x, r.min.y]);
+                        Some(WindowGeometry {
+                            position: position.or(self.window_geometry.position),
+                            width: content_size.x.clamp(840.0, 16384.0),
+                            height: content_size.y.clamp(540.0, 16384.0),
+                            maximized: false,
+                        })
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(next_geom) = updated_geom {
+                    if next_geom != self.window_geometry {
+                        self.window_geometry = next_geom;
+                        save_window_geometry(&self.window_geometry);
+                    }
+                }
+            }
+        }
 
         if self.last_poll.elapsed() >= Duration::from_millis(1500) {
             self.last_poll = Instant::now();
@@ -1277,8 +1626,13 @@ impl eframe::App for ProtonDriveNativeApp {
 
         // Handle --screenshot <path> for automated visual inspection
         if let Some(target_path) = self.screenshot_target.clone() {
-            self.frames_rendered += 1;
-            if self.frames_rendered == 6 && !self.screenshot_requested {
+            let ready = if self.tab == NavTab::SelectiveSync {
+                (!self.selective_folders.is_empty() && self.frames_rendered >= 6)
+                    || self.frames_rendered >= 45
+            } else {
+                self.frames_rendered >= 6
+            };
+            if ready && !self.screenshot_requested {
                 self.screenshot_requested = true;
                 ctx.send_viewport_cmd(ViewportCommand::Screenshot(egui::UserData::default()));
             }
@@ -1298,6 +1652,12 @@ impl eframe::App for ProtonDriveNativeApp {
             }
         } else {
             ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.screenshot_target.is_none() {
+            save_window_geometry(&self.window_geometry);
         }
     }
 }
@@ -1603,6 +1963,41 @@ fn fetch_activity() -> Vec<ActivityRecord> {
         .unwrap_or_default()
 }
 
+fn try_autostart_tray() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static TRIED_TRAY: AtomicBool = AtomicBool::new(false);
+    if TRIED_TRAY.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let mut script_candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            script_candidates.push(dir.join("../linux/tray/proton_drive_tray.py"));
+            script_candidates.push(dir.join("../share/protondrive/proton_drive_tray.py"));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let hp = std::path::PathBuf::from(home);
+        script_candidates.push(hp.join(".local/share/protondrive/proton_drive_tray.py"));
+    }
+    script_candidates.push(std::path::PathBuf::from(
+        "/usr/share/protondrive/proton_drive_tray.py",
+    ));
+
+    for script in script_candidates {
+        if script.is_file() {
+            let _ = Command::new("python3")
+                .arg(&script)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            break;
+        }
+    }
+}
+
 const USAGE: &str = "\
 protondrive-gui — Proton Drive native Linux desktop client
 
@@ -1610,6 +2005,7 @@ USAGE:
   protondrive-gui [OPTIONS]
 
 OPTIONS:
+  --tab <TAB>           initial tab (overview | browser | selective | conflicts | settings)
   --screenshot <PATH>   render UI, save a PNG screenshot to PATH, and exit
   --version             print the version
   -h, --help            print this help
@@ -1617,11 +2013,23 @@ OPTIONS:
 
 fn main() -> eframe::Result {
     let mut screenshot_target: Option<String> = None;
+    let mut initial_tab = NavTab::Overview;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--screenshot" => {
                 screenshot_target = args.next();
+            }
+            "--tab" => {
+                if let Some(t) = args.next() {
+                    initial_tab = match t.as_str() {
+                        "browser" | "cloud" => NavTab::CloudBrowser,
+                        "selective" => NavTab::SelectiveSync,
+                        "conflicts" => NavTab::Conflicts,
+                        "settings" => NavTab::Settings,
+                        _ => NavTab::Overview,
+                    };
+                }
             }
             "--version" | "-V" => {
                 println!("protondrive-gui {}", env!("CARGO_PKG_VERSION"));
@@ -1635,11 +2043,33 @@ fn main() -> eframe::Result {
         }
     }
 
+    if screenshot_target.is_none() {
+        try_autostart_tray();
+    }
+
+    let saved_geom = load_window_geometry();
+    let initial_size = if screenshot_target.is_some() {
+        [1440.0, 900.0]
+    } else if saved_geom.maximized {
+        [1920.0, 1080.0]
+    } else {
+        [saved_geom.width, saved_geom.height]
+    };
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Proton Drive")
         .with_app_id("ch.proton.drive")
-        .with_inner_size([1180.0, 760.0])
+        .with_inner_size(initial_size)
         .with_min_inner_size([840.0, 540.0]);
+
+    if screenshot_target.is_none() {
+        viewport = viewport.with_maximized(saved_geom.maximized);
+        if !saved_geom.maximized {
+            if let Some(pos) = saved_geom.position {
+                viewport = viewport.with_position(pos);
+            }
+        }
+    }
 
     if let Some(icon) = load_app_icon() {
         viewport = viewport.with_icon(icon);
@@ -1661,6 +2091,13 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Proton Drive",
         options,
-        Box::new(move |cc| Ok(Box::new(ProtonDriveNativeApp::new(cc, screenshot_target)))),
+        Box::new(move |cc| {
+            Ok(Box::new(ProtonDriveNativeApp::new(
+                cc,
+                screenshot_target,
+                initial_tab,
+                saved_geom,
+            )))
+        }),
     )
 }
