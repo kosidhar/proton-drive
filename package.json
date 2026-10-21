@@ -1,0 +1,45 @@
+{
+    "name": "proton-drive-ubuntu",
+    "private": true,
+    "version": "0.1.0",
+    "description": "Unofficial Proton Drive client for Ubuntu/Linux powered by Proton Drive SDK",
+    "license": "MIT",
+    "main": "src/cli/main.ts",
+    "bin": {
+        "proton-drive-ubuntu": "./src/cli/main.ts"
+    },
+    "engines": {
+        "bun": ">=1.4.2"
+    },
+    "scripts": {
+        "start": "bun run src/cli/main.ts",
+        "daemon": "bun run src/cli/main.ts daemon",
+        "gui": "bun run src/cli/main.ts gui",
+        "build": "bun ./scripts/build.ts",
+        "build:deb": "bash ./scripts/build-deb.sh",
+        "check-types": "bunx tsc --noEmit",
+        "test": "bun test tests"
+    },
+    "dependencies": {
+        "@boltffi/runtime": "0.31.0",
+        "@noble/hashes": "^1.8.0",
+        "@protontech/crypto": "2.0.0",
+        "@protontech/drive-sdk": "file:./vendor/sdk/client/js",
+        "@sentry/bun": "^10.73.0",
+        "@xmldom/xmldom": "^0.9.12",
+        "comlink": "^4.4.2",
+        "exifreader": "^4.44.0",
+        "ky": "^1.14.3",
+        "proton-drive-sdk-account": "file:./vendor/sdk/incubating/account/js",
+        "ttag": "^1.8.7"
+    },
+    "devDependencies": {
+        "@protontech/global-types": "^1.0.0",
+        "@types/bun": "^1.4.2",
+        "bun-types": "^1.4.2",
+        "typescript": "^5.9.3"
+    },
+    "patchedDependencies": {
+        "@protontech/crypto@2.0.0": "./vendor/sdk/config/js/patches/@protontech%2Fcrypto@2.0.0.patch"
+    }
+}

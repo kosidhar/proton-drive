@@ -1,0 +1,38 @@
+{
+    "compilerOptions": {
+        "allowJs": false,
+        "baseUrl": ".",
+        "esModuleInterop": true,
+        "forceConsistentCasingInFileNames": true,
+        "incremental": true,
+        "module": "esnext",
+        "moduleResolution": "bundler",
+        "paths": {
+            "proton-drive-sdk-account": ["./vendor/sdk/incubating/account/js/src/index.ts"],
+            "proton-drive-sdk-account/*": ["./vendor/sdk/incubating/account/js/src/*"],
+            "@protontech/drive-sdk": ["./vendor/sdk/client/js/src/index.ts"],
+            "@protontech/drive-sdk/*": ["./vendor/sdk/client/js/src/*"],
+            "@protontech/crypto": ["./node_modules/@protontech/crypto/src/index.ts"],
+            "@protontech/crypto/*": ["./node_modules/@protontech/crypto/src/*"]
+        },
+        "noEmit": true,
+        "noImplicitAny": true,
+        "strict": true,
+        "skipLibCheck": true,
+        "target": "esnext",
+        "resolveJsonModule": true,
+        "allowImportingTsExtensions": true,
+        "rewriteRelativeImportExtensions": true,
+        "types": ["bun"]
+    },
+    "include": [
+        "src/**/*.ts",
+        "tests/**/*.ts"
+    ],
+    "exclude": [
+        "**/node_modules/*",
+        "**/api-core-types.ts",
+        "dist/**/*",
+        "release/**/*"
+    ]
+}
