@@ -134,6 +134,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
         if (await isDaemonRunning()) {
             console.log(`[proton-drive-ubuntu] Opening desktop GUI (${DAEMON_BASE_URL})...`);
             launchDesktopWindow(DAEMON_BASE_URL);
+            await new Promise((r) => setTimeout(r, 200));
             return;
         }
         console.log(`[proton-drive-ubuntu] Starting sync daemon and opening desktop GUI...`);
@@ -276,7 +277,6 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
                     console.log('Complete sign-in in your browser. Waiting for authentication...');
                     console.log(`If the browser did not open, visit:\n${signInUrl}`);
                 });
-                await runtime.eventsManager.startSubscriptions();
                 console.log('Authentication successful! Session saved to OS secret store.');
                 return;
             }
@@ -510,9 +510,13 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
 }
 
 if (import.meta.main) {
-    runCli().catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`Error: ${msg}`);
-        process.exit(1);
-    });
+    runCli()
+        .then(() => {
+            process.exit(0);
+        })
+        .catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`Error: ${msg}`);
+            process.exit(1);
+        });
 }
