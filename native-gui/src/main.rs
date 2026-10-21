@@ -11,22 +11,172 @@ use serde::{Deserialize, Serialize};
 
 const DAEMON_URL: &str = "http://127.0.0.1:49152";
 
-// Official Proton Carbon Dark Palette (matching Proton Mail & Proton Drive Desktop)
-const BG_CANVAS: Color32 = Color32::from_rgb(26, 24, 35); // #1A1823
-const BG_SIDEBAR: Color32 = Color32::from_rgb(20, 18, 27); // #14121B
-const BG_CARD: Color32 = Color32::from_rgb(33, 29, 44); // #211D2C
-const BG_CARD_ALT: Color32 = Color32::from_rgb(42, 37, 56); // #2A2538
-const BG_INPUT: Color32 = Color32::from_rgb(35, 31, 48); // #231F30
-const BORDER_SUBTLE: Color32 = Color32::from_rgb(48, 43, 64); // #302B40
-const TEXT_PRIMARY: Color32 = Color32::from_rgb(247, 246, 252);
-const TEXT_MUTED: Color32 = Color32::from_rgb(162, 158, 178);
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+static IS_LIGHT_MODE: AtomicBool = AtomicBool::new(false);
+static SYSTEM_LIGHT_MODE: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn is_light_mode() -> bool {
+    IS_LIGHT_MODE.load(AtomicOrdering::Relaxed)
+}
+
+fn detect_system_light_mode() -> bool {
+    if let Ok(out) = Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "color-scheme"])
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).to_lowercase();
+            if s.contains("prefer-dark") {
+                return false;
+            }
+            if s.contains("prefer-light") || s.contains("default") {
+                if let Ok(tk) = Command::new("gsettings")
+                    .args(["get", "org.gnome.desktop.interface", "gtk-theme"])
+                    .output()
+                {
+                    let theme_str = String::from_utf8_lossy(&tk.stdout).to_lowercase();
+                    if theme_str.contains("-dark") {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// Official Proton Carbon (Dark) & Proton Snow (Light) Adaptive Palette
+#[inline]
+#[allow(non_snake_case)]
+fn BG_CANVAS() -> Color32 {
+    if is_light_mode() {
+        Color32::from_rgb(245, 244, 250) // #F5F4FA Proton Snow canvas
+    } else {
+        Color32::from_rgb(26, 24, 35) // #1A1823 Proton Carbon canvas
+    }
+}
+#[inline]
+#[allow(non_snake_case)]
+fn BG_SIDEBAR() -> Color32 {
+    if is_light_mode() {
+        Color32::from_rgb(255, 255, 255) // #FFFFFF Crisp white sidebar & header
+    } else {
+        Color32::from_rgb(20, 18, 27) // #14121B
+    }
+}
+#[inline]
+#[allow(non_snake_case)]
+fn BG_CARD() -> Color32 {
+    if is_light_mode() {
+        Color32::from_rgb(255, 255, 255) // #FFFFFF
+    } else {
+        Color32::from_rgb(33, 29, 44) // #211D2C
+    }
+}
+#[inline]
+#[allow(non_snake_case)]
+fn BG_CARD_ALT() -> Color32 {
+    if is_light_mode() {
+        Color32::from_rgb(240, 238, 248) // #F0EEF8
+    } else {
+        Color32::from_rgb(42, 37, 56) // #2A2538
+    }
+}
+#[inline]
+#[allow(non_snake_case)]
+fn BG_INPUT() -> Color32 {
+    if is_light_mode() {
+        Color32::from_rgb(243, 241, 250) // #F3F1FA
+    } else {
+        Color32::from_rgb(35, 31, 48) // #231F30
+    }
+}
+#[inline]
+#[allow(non_snake_case)]
+fn BORDER_SUBTLE() -> Color32 {
+    if is_light_mode() {
+        Color32::from_rgb(222, 218, 235) // #DEDAEB
+    } else {
+        Color32::from_rgb(48, 43, 64) // #302B40
+    }
+}
+#[inline]
+#[allow(non_snake_case)]
+fn TEXT_PRIMARY() -> Color32 {
+    if is_light_mode() {
+        Color32::from_rgb(28, 24, 43) // #1C182B
+    } else {
+        Color32::from_rgb(247, 246, 252)
+    }
+}
+#[inline]
+#[allow(non_snake_case)]
+fn TEXT_MUTED() -> Color32 {
+    if is_light_mode() {
+        Color32::from_rgb(106, 101, 126) // #6A657E
+    } else {
+        Color32::from_rgb(162, 158, 178)
+    }
+}
 const PROTON_PURPLE: Color32 = Color32::from_rgb(109, 74, 255); // #6D4AFF
 const PROTON_PURPLE_HOVER: Color32 = Color32::from_rgb(126, 94, 255); // #7E5EFF
-const PROTON_PURPLE_SOFT: Color32 = Color32::from_rgb(44, 37, 69); // #2C2545 Active nav pill
-const PROTON_PURPLE_TEXT: Color32 = Color32::from_rgb(214, 204, 255);
-const STATUS_SUCCESS: Color32 = Color32::from_rgb(30, 168, 133); // #1EA885
-const STATUS_WARNING: Color32 = Color32::from_rgb(255, 153, 0); // #FF9900
+#[inline]
+#[allow(non_snake_case)]
+fn PROTON_PURPLE_SOFT() -> Color32 {
+    if is_light_mode() {
+        Color32::from_rgb(235, 229, 255) // #EBE5FF
+    } else {
+        Color32::from_rgb(44, 37, 69) // #2C2545
+    }
+}
+#[inline]
+#[allow(non_snake_case)]
+fn PROTON_PURPLE_TEXT() -> Color32 {
+    if is_light_mode() {
+        Color32::from_rgb(93, 56, 235) // #5D38EB
+    } else {
+        Color32::from_rgb(214, 204, 255)
+    }
+}
+const STATUS_SUCCESS: Color32 = Color32::from_rgb(25, 150, 118); // #199676
+const STATUS_WARNING: Color32 = Color32::from_rgb(230, 138, 0); // #E68A00
 const STATUS_DANGER: Color32 = Color32::from_rgb(220, 50, 81); // #DC3251
+
+#[inline]
+fn table_header_bg() -> Color32 {
+    if is_light_mode() {
+        Color32::from_rgb(243, 241, 250)
+    } else {
+        table_header_bg()
+    }
+}
+#[inline]
+fn row_hover_bg() -> Color32 {
+    if is_light_mode() {
+        Color32::from_rgb(240, 236, 252)
+    } else {
+        row_hover_bg()
+    }
+}
+#[inline]
+fn row_divider_color() -> Color32 {
+    if is_light_mode() {
+        Color32::from_rgb(234, 231, 244)
+    } else {
+        row_divider_color()
+    }
+}
+#[inline]
+fn btn_secondary_hover_bg() -> Color32 {
+    if is_light_mode() {
+        Color32::from_rgb(228, 224, 242)
+    } else {
+        btn_secondary_hover_bg()
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NavTab {
@@ -176,13 +326,14 @@ enum WorkerEvent {
     ConflictsLoaded(Vec<ConflictRecord>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct WindowGeometry {
     position: Option<[f32; 2]>,
     width: f32,
     height: f32,
     maximized: bool,
+    theme_mode: String,
 }
 
 impl Default for WindowGeometry {
@@ -192,6 +343,7 @@ impl Default for WindowGeometry {
             width: 1280.0,
             height: 820.0,
             maximized: true,
+            theme_mode: "system".to_string(),
         }
     }
 }
@@ -277,6 +429,7 @@ struct ProtonDriveNativeApp {
     // Window geometry state
     window_geometry: WindowGeometry,
     maximize_applied_on_open: bool,
+    applied_light_mode: bool,
 
     // Automatic screenshot support for visual verification
     screenshot_target: Option<String>,
@@ -294,7 +447,16 @@ impl ProtonDriveNativeApp {
         initial_confirm_folder: Option<String>,
         window_geometry: WindowGeometry,
     ) -> Self {
+        let sys_light = detect_system_light_mode();
+        SYSTEM_LIGHT_MODE.store(sys_light, AtomicOrdering::Relaxed);
+        let initial_light = match window_geometry.theme_mode.as_str() {
+            "light" => true,
+            "dark" => false,
+            _ => sys_light,
+        };
+        IS_LIGHT_MODE.store(initial_light, AtomicOrdering::Relaxed);
         configure_proton_theme(&cc.egui_ctx);
+        apply_proton_visuals(&cc.egui_ctx, initial_light);
 
         let logo_texture = load_glyph_texture(&cc.egui_ctx);
 
@@ -340,6 +502,7 @@ impl ProtonDriveNativeApp {
             edit_notifications: true,
             window_geometry,
             maximize_applied_on_open: false,
+            applied_light_mode: initial_light,
             screenshot_target,
             frames_rendered: 0,
             screenshot_requested: false,
@@ -403,9 +566,9 @@ impl ProtonDriveNativeApp {
             .exact_width(252.0)
             .frame(
                 Frame::NONE
-                    .fill(BG_SIDEBAR)
+                    .fill(BG_SIDEBAR())
                     .inner_margin(Margin::symmetric(16, 18))
-                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE)),
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE())),
             )
             .show(ctx, |ui| {
                 // Brand Header (matching official Proton desktop header)
@@ -422,7 +585,7 @@ impl ProtonDriveNativeApp {
                         RichText::new("Proton Drive")
                             .size(18.5)
                             .strong()
-                            .color(TEXT_PRIMARY),
+                            .color(TEXT_PRIMARY()),
                     );
                 });
 
@@ -502,19 +665,19 @@ impl ProtonDriveNativeApp {
                 for (tab, label, badge, is_danger_badge) in nav_items {
                     let active = self.tab == tab;
                     let fill = if active {
-                        PROTON_PURPLE_SOFT
+                        PROTON_PURPLE_SOFT()
                     } else {
                         Color32::TRANSPARENT
                     };
                     let text_color = if active {
-                        TEXT_PRIMARY
+                        TEXT_PRIMARY()
                     } else {
-                        TEXT_MUTED
+                        TEXT_MUTED()
                     };
                     let icon_color = if active {
-                        PROTON_PURPLE_TEXT
+                        PROTON_PURPLE_TEXT()
                     } else {
-                        TEXT_MUTED
+                        TEXT_MUTED()
                     };
 
                     let response = Frame::NONE
@@ -541,12 +704,12 @@ impl ProtonDriveNativeApp {
                                         let badge_fill = if is_danger_badge {
                                             STATUS_DANGER
                                         } else {
-                                            BG_CARD_ALT
+                                            BG_CARD_ALT()
                                         };
                                         let badge_fg = if is_danger_badge {
                                             Color32::WHITE
                                         } else {
-                                            TEXT_MUTED
+                                            TEXT_MUTED()
                                         };
                                         Frame::NONE
                                             .fill(badge_fill)
@@ -615,10 +778,10 @@ impl ProtonDriveNativeApp {
                     ui,
                     Vec2::new(ui.available_width(), 34.0),
                     &format!("Open {short_sync_folder} folder"),
-                    BG_CARD,
-                    BG_CARD_ALT,
-                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
-                    TEXT_PRIMARY,
+                    BG_CARD(),
+                    BG_CARD_ALT(),
+                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                    TEXT_PRIMARY(),
                     12.5,
                 )
                 .clicked()
@@ -656,7 +819,7 @@ impl ProtonDriveNativeApp {
                 ui.painter().rect_filled(
                     bar_rect,
                     CornerRadius::same(2),
-                    Color32::from_rgb(46, 41, 62),
+                    if is_light_mode() { Color32::from_rgb(225, 221, 238) } else { Color32::from_rgb(46, 41, 62) },
                 );
                 let mut fill_rect = bar_rect;
                 fill_rect.set_width((bar_w * ratio).max(4.0));
@@ -686,13 +849,13 @@ impl ProtonDriveNativeApp {
                         RichText::new(quota_label)
                             .size(11.5)
                             .strong()
-                            .color(TEXT_PRIMARY),
+                            .color(TEXT_PRIMARY()),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new(env!("CARGO_PKG_VERSION"))
                                 .size(11.5)
-                                .color(TEXT_MUTED),
+                                .color(TEXT_MUTED()),
                         );
                     });
                 });
@@ -705,7 +868,7 @@ impl ProtonDriveNativeApp {
                         self.status.stats.total_files
                     ))
                     .size(11.0)
-                    .color(TEXT_MUTED),
+                    .color(TEXT_MUTED()),
                 );
             });
     }
@@ -714,15 +877,15 @@ impl ProtonDriveNativeApp {
         ui.horizontal(|ui| {
             // Search / filter input on the left (matching Proton Mail top bar)
             Frame::NONE
-                .fill(BG_INPUT)
-                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                .fill(BG_INPUT())
+                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
                 .corner_radius(CornerRadius::same(8))
                 .inner_margin(Margin::symmetric(12, 6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         let (s_rect, _) =
                             ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
-                        draw_search_icon(ui.painter(), s_rect, TEXT_MUTED);
+                        draw_search_icon(ui.painter(), s_rect, TEXT_MUTED());
                         ui.add_space(4.0);
                         ui.add(
                             egui::TextEdit::singleline(&mut self.search_query)
@@ -734,7 +897,7 @@ impl ProtonDriveNativeApp {
                             && ui
                                 .add(
                                     egui::Button::new(
-                                        RichText::new("×").size(14.0).color(TEXT_MUTED),
+                                        RichText::new("×").size(14.0).color(TEXT_MUTED()),
                                     )
                                     .frame(false),
                                 )
@@ -778,7 +941,13 @@ impl ProtonDriveNativeApp {
                 // Initials Avatar Badge (34x34 rounded square matching Proton Mail's "GC" badge)
                 let (avatar_rect, avatar_resp) =
                     ui.allocate_exact_size(Vec2::new(34.0, 34.0), Sense::click());
-                let avatar_fill = if self.show_account_menu || avatar_resp.hovered() {
+                let avatar_fill = if is_light_mode() {
+                    if self.show_account_menu || avatar_resp.hovered() {
+                        Color32::from_rgb(224, 214, 255)
+                    } else {
+                        Color32::from_rgb(235, 229, 255)
+                    }
+                } else if self.show_account_menu || avatar_resp.hovered() {
                     Color32::from_rgb(66, 53, 108)
                 } else {
                     Color32::from_rgb(50, 41, 82)
@@ -796,7 +965,7 @@ impl ProtonDriveNativeApp {
                         if self.show_account_menu {
                             PROTON_PURPLE
                         } else {
-                            Color32::from_rgb(92, 74, 156)
+                            if is_light_mode() { Color32::from_rgb(168, 146, 245) } else { Color32::from_rgb(92, 74, 156) }
                         },
                     ),
                     egui::StrokeKind::Inside,
@@ -806,7 +975,7 @@ impl ProtonDriveNativeApp {
                     egui::Align2::CENTER_CENTER,
                     &initials,
                     FontId::new(13.0, FontFamily::Proportional),
-                    TEXT_PRIMARY,
+                    TEXT_PRIMARY(),
                 );
                 if avatar_resp.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -827,9 +996,9 @@ impl ProtonDriveNativeApp {
                                 RichText::new(&display_name)
                                     .size(13.0)
                                     .strong()
-                                    .color(TEXT_PRIMARY),
+                                    .color(TEXT_PRIMARY()),
                             );
-                            ui.label(RichText::new(&email).size(11.5).color(TEXT_MUTED));
+                            ui.label(RichText::new(&email).size(11.5).color(TEXT_MUTED()));
                         },
                     )
                     .response
@@ -851,13 +1020,13 @@ impl ProtonDriveNativeApp {
                     ui.painter().rect_filled(
                         gear_rect,
                         CornerRadius::same(8),
-                        BG_CARD_ALT,
+                        BG_CARD_ALT(),
                     );
                 }
                 let gear_color = if gear_resp.hovered() || self.tab == NavTab::Settings {
-                    TEXT_PRIMARY
+                    TEXT_PRIMARY()
                 } else {
-                    Color32::from_rgb(218, 214, 232)
+                    if is_light_mode() { Color32::from_rgb(82, 76, 104) } else { Color32::from_rgb(218, 214, 232) }
                 };
                 draw_gear_icon(ui.painter(), gear_rect.shrink(7.0), gear_color);
                 if gear_resp.on_hover_text("Synchronization Settings").clicked() {
@@ -873,10 +1042,10 @@ impl ProtonDriveNativeApp {
                     ui,
                     Vec2::new(76.0, 30.0),
                     pause_label,
-                    BG_CARD,
-                    BG_CARD_ALT,
-                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
-                    TEXT_PRIMARY,
+                    BG_CARD(),
+                    BG_CARD_ALT(),
+                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                    TEXT_PRIMARY(),
                     12.5,
                 )
                 .clicked()
@@ -907,12 +1076,12 @@ impl ProtonDriveNativeApp {
                 };
 
                 Frame::NONE
-                    .fill(BG_CARD)
-                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                    .fill(BG_CARD())
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
                     .corner_radius(CornerRadius::same(8))
                     .inner_margin(Margin::symmetric(12, 6))
                     .show(ui, |ui| {
-                        ui.label(RichText::new(status_text).size(12.0).color(TEXT_PRIMARY));
+                        ui.label(RichText::new(status_text).size(12.0).color(TEXT_PRIMARY()));
                         ui.add_space(4.0);
                         let (rect, _) =
                             ui.allocate_exact_size(Vec2::new(8.0, 8.0), Sense::hover());
@@ -967,8 +1136,8 @@ impl ProtonDriveNativeApp {
             .fixed_pos(pop_pos)
             .show(ctx, |ui| {
                 Frame::NONE
-                    .fill(Color32::from_rgb(28, 25, 38)) // #1C1926 matching Proton Mail popover
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(60, 53, 82)))
+                    .fill(if is_light_mode() { Color32::WHITE } else { Color32::from_rgb(28, 25, 38) })
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
                     .corner_radius(CornerRadius::same(12))
                     .show(ui, |ui| {
                         ui.set_min_width(pop_w);
@@ -983,7 +1152,7 @@ impl ProtonDriveNativeApp {
                                     ui.label(
                                         RichText::new("✓  End-to-end encrypted sync   ›")
                                             .size(12.5)
-                                            .color(Color32::from_rgb(206, 202, 222)),
+                                            .color(TEXT_MUTED()),
                                     );
                                 });
                             });
@@ -991,7 +1160,7 @@ impl ProtonDriveNativeApp {
                         let (sep_rect, _) =
                             ui.allocate_exact_size(Vec2::new(pop_w, 1.0), Sense::hover());
                         ui.painter()
-                            .rect_filled(sep_rect, 0, Color32::from_rgb(48, 43, 66));
+                            .rect_filled(sep_rect, 0, BORDER_SUBTLE());
 
                         // Main Popover Body
                         Frame::NONE
@@ -1024,14 +1193,14 @@ impl ProtonDriveNativeApp {
                                         RichText::new(&display_name)
                                             .size(14.5)
                                             .strong()
-                                            .color(TEXT_PRIMARY),
+                                            .color(TEXT_PRIMARY()),
                                     );
 
                                     ui.add_space(2.0);
 
                                     // Email
                                     ui.label(
-                                        RichText::new(&email).size(12.5).color(TEXT_MUTED),
+                                        RichText::new(&email).size(12.5).color(TEXT_MUTED()),
                                     );
 
                                     ui.add_space(8.0);
@@ -1062,10 +1231,10 @@ impl ProtonDriveNativeApp {
                                         ui,
                                         Vec2::new(btn_w, 34.0),
                                         "Open local sync folder",
-                                        Color32::from_rgb(28, 25, 38),
-                                        Color32::from_rgb(42, 37, 56),
-                                        Some(Stroke::new(1.0_f32, Color32::from_rgb(76, 69, 100))),
-                                        TEXT_PRIMARY,
+                                        BG_CARD(),
+                                        BG_CARD_ALT(),
+                                        Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                                        TEXT_PRIMARY(),
                                         13.0,
                                     )
                                     .clicked()
@@ -1087,10 +1256,10 @@ impl ProtonDriveNativeApp {
                                             ui,
                                             Vec2::new(btn_w, 34.0),
                                             "Sign out",
-                                            Color32::from_rgb(28, 25, 38),
-                                            Color32::from_rgb(46, 36, 82),
+                                            BG_CARD(),
+                                            PROTON_PURPLE_SOFT(),
                                             Some(Stroke::new(1.2_f32, PROTON_PURPLE)),
-                                            TEXT_PRIMARY,
+                                            TEXT_PRIMARY(),
                                             13.0,
                                         )
                                         .clicked()
@@ -1135,7 +1304,7 @@ impl ProtonDriveNativeApp {
                 RichText::new("Sync Activity & Storage")
                     .size(20.0)
                     .strong()
-                    .color(TEXT_PRIMARY),
+                    .color(TEXT_PRIMARY()),
             );
             if !self.status.logged_in {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1162,7 +1331,7 @@ impl ProtonDriveNativeApp {
             ui.label(
                 RichText::new(format!("Sign-in URL opened in browser: {url}"))
                     .size(12.0)
-                    .color(PROTON_PURPLE_TEXT),
+                    .color(PROTON_PURPLE_TEXT()),
             );
         }
 
@@ -1215,7 +1384,7 @@ impl ProtonDriveNativeApp {
                     RichText::new("Active Transfers")
                         .size(15.0)
                         .strong()
-                        .color(TEXT_PRIMARY),
+                        .color(TEXT_PRIMARY()),
                 );
                 ui.add_space(10.0);
                 for t in &self.status.active_transfers {
@@ -1230,8 +1399,8 @@ impl ProtonDriveNativeApp {
                         } else {
                             "↓ Downloading"
                         };
-                        ui.label(RichText::new(badge).size(12.5).strong().color(PROTON_PURPLE_TEXT));
-                        ui.label(RichText::new(&t.rel_path).size(12.5).color(TEXT_PRIMARY));
+                        ui.label(RichText::new(badge).size(12.5).strong().color(PROTON_PURPLE_TEXT()));
+                        ui.label(RichText::new(&t.rel_path).size(12.5).color(TEXT_PRIMARY()));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.label(
                                 RichText::new(format!(
@@ -1240,7 +1409,7 @@ impl ProtonDriveNativeApp {
                                     format_bytes(t.total_bytes)
                                 ))
                                 .size(12.0)
-                                .color(TEXT_MUTED),
+                                .color(TEXT_MUTED()),
                             );
                         });
                     });
@@ -1267,7 +1436,7 @@ impl ProtonDriveNativeApp {
                     RichText::new("Recent Sync Activity")
                         .size(15.5)
                         .strong()
-                        .color(TEXT_PRIMARY),
+                        .color(TEXT_PRIMARY()),
                 );
                 if let Some(acct) = &self.status.account {
                     if acct.used_drive_space > 0 {
@@ -1279,7 +1448,7 @@ impl ProtonDriveNativeApp {
                                     self.status.sync_dir
                                 ))
                                 .size(12.0)
-                                .color(TEXT_MUTED),
+                                .color(TEXT_MUTED()),
                             );
                         });
                     }
@@ -1293,7 +1462,7 @@ impl ProtonDriveNativeApp {
             ui.painter().rect_filled(
                 hdr_rect,
                 CornerRadius::same(7),
-                Color32::from_rgb(26, 23, 36),
+                table_header_bg(),
             );
             let hdr_y = hdr_rect.center().y;
             let file_col_x = hdr_rect.min.x + 152.0;
@@ -1305,28 +1474,28 @@ impl ProtonDriveNativeApp {
                 egui::Align2::LEFT_CENTER,
                 "Status",
                 FontId::new(12.0, FontFamily::Proportional),
-                TEXT_MUTED,
+                TEXT_MUTED(),
             );
             ui.painter().text(
                 egui::pos2(file_col_x, hdr_y),
                 egui::Align2::LEFT_CENTER,
                 "File / Folder",
                 FontId::new(12.0, FontFamily::Proportional),
-                TEXT_MUTED,
+                TEXT_MUTED(),
             );
             ui.painter().text(
                 egui::pos2(details_col_x, hdr_y),
                 egui::Align2::LEFT_CENTER,
                 "Details",
                 FontId::new(12.0, FontFamily::Proportional),
-                TEXT_MUTED,
+                TEXT_MUTED(),
             );
             ui.painter().text(
                 egui::pos2(time_right_x, hdr_y),
                 egui::Align2::RIGHT_CENTER,
                 "Time",
                 FontId::new(12.0, FontFamily::Proportional),
-                TEXT_MUTED,
+                TEXT_MUTED(),
             );
 
             ui.add_space(4.0);
@@ -1342,7 +1511,7 @@ impl ProtonDriveNativeApp {
                         ui.label(
                             RichText::new("No synchronization activity recorded yet.")
                                 .size(13.0)
-                                .color(TEXT_MUTED),
+                                .color(TEXT_MUTED()),
                         );
                     } else {
                         for act in self
@@ -1366,7 +1535,7 @@ impl ProtonDriveNativeApp {
                                 ui.painter().rect_filled(
                                     row_rect,
                                     CornerRadius::same(6),
-                                    Color32::from_rgb(41, 36, 56),
+                                    row_hover_bg(),
                                 );
                             }
                             ui.painter().line_segment(
@@ -1374,7 +1543,7 @@ impl ProtonDriveNativeApp {
                                     egui::pos2(row_rect.min.x + 10.0, row_rect.max.y),
                                     egui::pos2(row_rect.max.x - 10.0, row_rect.max.y),
                                 ],
-                                Stroke::new(1.0_f32, Color32::from_rgb(40, 35, 54)),
+                                Stroke::new(1.0_f32, row_divider_color()),
                             );
 
                             let cy = row_rect.center().y;
@@ -1416,21 +1585,21 @@ impl ProtonDriveNativeApp {
                                 egui::Align2::LEFT_CENTER,
                                 truncate_middle(&act.local_rel_path, 42),
                                 FontId::new(13.0, FontFamily::Proportional),
-                                TEXT_PRIMARY,
+                                TEXT_PRIMARY(),
                             );
                             ui.painter().text(
                                 egui::pos2(r_details_x, cy),
                                 egui::Align2::LEFT_CENTER,
                                 truncate_middle(&act.details, 92),
                                 FontId::new(12.0, FontFamily::Proportional),
-                                TEXT_MUTED,
+                                TEXT_MUTED(),
                             );
                             ui.painter().text(
                                 egui::pos2(r_time_right_x, cy),
                                 egui::Align2::RIGHT_CENTER,
                                 format_relative_timestamp(act.timestamp),
                                 FontId::new(11.5, FontFamily::Proportional),
-                                TEXT_MUTED,
+                                TEXT_MUTED(),
                             );
                         }
                     }
@@ -1447,8 +1616,8 @@ impl ProtonDriveNativeApp {
                 0.5
             };
             Frame::NONE
-                .fill(BG_CARD)
-                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                .fill(BG_CARD())
+                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
                 .corner_radius(CornerRadius::same(10))
                 .inner_margin(Margin::symmetric(14, 10))
                 .show(ui, |ui| {
@@ -1463,9 +1632,9 @@ impl ProtonDriveNativeApp {
                             RichText::new(badge)
                                 .size(12.5)
                                 .strong()
-                                .color(PROTON_PURPLE_TEXT),
+                                .color(PROTON_PURPLE_TEXT()),
                         );
-                        ui.label(RichText::new(&t.rel_path).size(12.5).color(TEXT_PRIMARY));
+                        ui.label(RichText::new(&t.rel_path).size(12.5).color(TEXT_PRIMARY()));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.label(
                                 RichText::new(format!(
@@ -1474,7 +1643,7 @@ impl ProtonDriveNativeApp {
                                     format_bytes(t.total_bytes)
                                 ))
                                 .size(12.0)
-                                .color(TEXT_MUTED),
+                                .color(TEXT_MUTED()),
                             );
                         });
                     });
@@ -1511,10 +1680,10 @@ impl ProtonDriveNativeApp {
                         ui,
                         Vec2::new(34.0, 32.0),
                         "↑",
-                        BG_CARD_ALT,
-                        Color32::from_rgb(54, 47, 72),
-                        Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
-                        TEXT_PRIMARY,
+                        BG_CARD_ALT(),
+                        btn_secondary_hover_bg(),
+                        Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                        TEXT_PRIMARY(),
                         14.0,
                     )
                     .on_hover_text("Go to parent folder")
@@ -1537,19 +1706,19 @@ impl ProtonDriveNativeApp {
                     let target_path = format!("/{}", parts[..=idx].join("/"));
 
                     let crumb_fill = if is_last {
-                        PROTON_PURPLE_SOFT
+                        PROTON_PURPLE_SOFT()
                     } else {
-                        BG_INPUT
+                        BG_INPUT()
                     };
                     let crumb_text_col = if is_last {
-                        TEXT_PRIMARY
+                        TEXT_PRIMARY()
                     } else {
-                        TEXT_MUTED
+                        TEXT_MUTED()
                     };
 
                     let resp = Frame::NONE
                         .fill(crumb_fill)
-                        .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                        .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
                         .corner_radius(CornerRadius::same(7))
                         .inner_margin(Margin::symmetric(12, 6))
                         .show(ui, |ui| {
@@ -1570,7 +1739,7 @@ impl ProtonDriveNativeApp {
                         if resp.clicked() {
                             navigate_to = Some(target_path);
                         }
-                        ui.label(RichText::new("›").size(15.0).color(TEXT_MUTED));
+                        ui.label(RichText::new("›").size(15.0).color(TEXT_MUTED()));
                     }
                 }
 
@@ -1597,10 +1766,10 @@ impl ProtonDriveNativeApp {
                         ui,
                         Vec2::new(108.0, 32.0),
                         "+ New folder",
-                        BG_CARD_ALT,
-                        Color32::from_rgb(54, 47, 72),
-                        Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
-                        TEXT_PRIMARY,
+                        BG_CARD_ALT(),
+                        btn_secondary_hover_bg(),
+                        Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                        TEXT_PRIMARY(),
                         13.0,
                     )
                     .clicked()
@@ -1617,10 +1786,10 @@ impl ProtonDriveNativeApp {
                                 ui,
                                 Vec2::new(98.0, 32.0),
                                 "Cloud Only All",
-                                BG_CARD_ALT,
-                                Color32::from_rgb(54, 47, 72),
-                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
-                                TEXT_MUTED,
+                                BG_CARD_ALT(),
+                                btn_secondary_hover_bg(),
+                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                                TEXT_MUTED(),
                                 12.0,
                             )
                             .on_hover_text(
@@ -1645,10 +1814,10 @@ impl ProtonDriveNativeApp {
                                 ui,
                                 Vec2::new(76.0, 32.0),
                                 "Sync All",
-                                BG_CARD_ALT,
-                                Color32::from_rgb(54, 47, 72),
-                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
-                                TEXT_PRIMARY,
+                                BG_CARD_ALT(),
+                                btn_secondary_hover_bg(),
+                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                                TEXT_PRIMARY(),
                                 12.0,
                             )
                             .on_hover_text("Sync all top-level folders to this computer")
@@ -1676,7 +1845,7 @@ impl ProtonDriveNativeApp {
                                 "{folder_count} folders  •  {file_count} files"
                             ))
                             .size(12.0)
-                            .color(TEXT_MUTED),
+                            .color(TEXT_MUTED()),
                         );
                     }
                 });
@@ -1690,8 +1859,8 @@ impl ProtonDriveNativeApp {
             if self.show_new_folder_modal {
                 ui.add_space(10.0);
                 Frame::NONE
-                    .fill(BG_INPUT)
-                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                    .fill(BG_INPUT())
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
                     .corner_radius(CornerRadius::same(8))
                     .inner_margin(Margin::symmetric(14, 10))
                     .show(ui, |ui| {
@@ -1699,7 +1868,7 @@ impl ProtonDriveNativeApp {
                             ui.label(
                                 RichText::new("New folder name:")
                                     .size(13.0)
-                                    .color(TEXT_MUTED),
+                                    .color(TEXT_MUTED()),
                             );
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.new_folder_name)
@@ -1730,10 +1899,10 @@ impl ProtonDriveNativeApp {
                                 ui,
                                 Vec2::new(68.0, 28.0),
                                 "Cancel",
-                                BG_CARD_ALT,
-                                Color32::from_rgb(54, 47, 72),
-                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
-                                TEXT_MUTED,
+                                BG_CARD_ALT(),
+                                btn_secondary_hover_bg(),
+                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                                TEXT_MUTED(),
                                 12.5,
                             )
                             .clicked()
@@ -1752,7 +1921,7 @@ impl ProtonDriveNativeApp {
             ui.painter().rect_filled(
                 hdr_rect,
                 CornerRadius::same(7),
-                Color32::from_rgb(26, 23, 36),
+                table_header_bg(),
             );
             let hdr_y = hdr_rect.center().y;
             let status_x = (hdr_rect.max.x - 395.0).max(hdr_rect.min.x + 240.0);
@@ -1764,28 +1933,28 @@ impl ProtonDriveNativeApp {
                 egui::Align2::LEFT_CENTER,
                 "Name",
                 FontId::new(12.0, FontFamily::Proportional),
-                TEXT_MUTED,
+                TEXT_MUTED(),
             );
             ui.painter().text(
                 egui::pos2(status_x, hdr_y),
                 egui::Align2::LEFT_CENTER,
                 "Sync Status",
                 FontId::new(12.0, FontFamily::Proportional),
-                TEXT_MUTED,
+                TEXT_MUTED(),
             );
             ui.painter().text(
                 egui::pos2(mod_x, hdr_y),
                 egui::Align2::LEFT_CENTER,
                 "Modified",
                 FontId::new(12.0, FontFamily::Proportional),
-                TEXT_MUTED,
+                TEXT_MUTED(),
             );
             ui.painter().text(
                 egui::pos2(size_right_x, hdr_y),
                 egui::Align2::RIGHT_CENTER,
                 "Size",
                 FontId::new(12.0, FontFamily::Proportional),
-                TEXT_MUTED,
+                TEXT_MUTED(),
             );
 
             ui.add_space(4.0);
@@ -1796,7 +1965,7 @@ impl ProtonDriveNativeApp {
                     ui.label(
                         RichText::new("Loading Proton Drive folder contents...")
                             .size(13.5)
-                            .color(TEXT_MUTED),
+                            .color(TEXT_MUTED()),
                     );
                 });
             } else if let Some(err) = &self.remote_error {
@@ -1808,7 +1977,7 @@ impl ProtonDriveNativeApp {
                     ui.label(
                         RichText::new("This folder is empty.")
                             .size(13.5)
-                            .color(TEXT_MUTED),
+                            .color(TEXT_MUTED()),
                     );
                 });
             } else {
@@ -1872,7 +2041,7 @@ impl ProtonDriveNativeApp {
                                 ui.painter().rect_filled(
                                     row_rect,
                                     CornerRadius::same(7),
-                                    Color32::from_rgb(43, 38, 60),
+                                    row_hover_bg(),
                                 );
                             }
 
@@ -1882,7 +2051,7 @@ impl ProtonDriveNativeApp {
                                     egui::pos2(row_rect.min.x + 10.0, row_rect.max.y),
                                     egui::pos2(row_rect.max.x - 10.0, row_rect.max.y),
                                 ],
-                                Stroke::new(1.0_f32, Color32::from_rgb(40, 35, 54)),
+                                Stroke::new(1.0_f32, row_divider_color()),
                             );
 
                             let row_cy = row_rect.center().y;
@@ -1902,11 +2071,7 @@ impl ProtonDriveNativeApp {
                                 draw_file_icon(ui.painter(), ic_rect, &item.name);
                             }
 
-                            let name_color = if is_folder {
-                                TEXT_PRIMARY
-                            } else {
-                                Color32::from_rgb(230, 228, 240)
-                            };
+                            let name_color = TEXT_PRIMARY();
                             ui.painter().text(
                                 egui::pos2(row_rect.min.x + 46.0, row_cy),
                                 egui::Align2::LEFT_CENTER,
@@ -1928,9 +2093,9 @@ impl ProtonDriveNativeApp {
 
                             if is_excluded {
                                 let bg = if pill_hovered {
-                                    Color32::from_rgb(54, 47, 74)
+                                    btn_secondary_hover_bg()
                                 } else {
-                                    Color32::from_rgb(38, 33, 52)
+                                    BG_CARD_ALT()
                                 };
                                 ui.painter()
                                     .rect_filled(pill_rect, CornerRadius::same(99), bg);
@@ -1941,9 +2106,9 @@ impl ProtonDriveNativeApp {
                                         Stroke::new(
                                             1.0_f32,
                                             if pill_hovered {
-                                                PROTON_PURPLE_TEXT
+                                                PROTON_PURPLE_TEXT()
                                             } else {
-                                                BORDER_SUBTLE
+                                                BORDER_SUBTLE()
                                             },
                                         ),
                                         egui::StrokeKind::Inside,
@@ -1954,7 +2119,7 @@ impl ProtonDriveNativeApp {
                                     egui::Align2::CENTER_CENTER,
                                     "Cloud only",
                                     FontId::new(11.0, FontFamily::Proportional),
-                                    if pill_hovered { TEXT_PRIMARY } else { TEXT_MUTED },
+                                    if pill_hovered { TEXT_PRIMARY() } else { TEXT_MUTED() },
                                 );
                             } else {
                                 let bg = if pill_hovered {
@@ -1995,7 +2160,7 @@ impl ProtonDriveNativeApp {
                                 egui::Align2::LEFT_CENTER,
                                 format_iso_date(&item.modification_time),
                                 FontId::new(12.0, FontFamily::Proportional),
-                                TEXT_MUTED,
+                                TEXT_MUTED(),
                             );
 
                             // 4. Size Column
@@ -2009,7 +2174,7 @@ impl ProtonDriveNativeApp {
                                 egui::Align2::RIGHT_CENTER,
                                 size_str,
                                 FontId::new(12.0, FontFamily::Proportional),
-                                TEXT_MUTED,
+                                TEXT_MUTED(),
                             );
 
                             let clicked_in_pill = can_toggle_sync
@@ -2093,11 +2258,11 @@ impl ProtonDriveNativeApp {
                                     RichText::new("Selective Folder Sync (/my-files)")
                                         .size(16.0)
                                         .strong()
-                                        .color(TEXT_PRIMARY),
+                                        .color(TEXT_PRIMARY()),
                                 );
                                 ui.add_space(6.0);
                                 Frame::NONE
-                                    .fill(PROTON_PURPLE_SOFT)
+                                    .fill(PROTON_PURPLE_SOFT())
                                     .corner_radius(CornerRadius::same(99))
                                     .inner_margin(Margin::symmetric(10, 3))
                                     .show(ui, |ui| {
@@ -2107,7 +2272,7 @@ impl ProtonDriveNativeApp {
                                             ))
                                             .size(11.5)
                                             .strong()
-                                            .color(PROTON_PURPLE_TEXT),
+                                            .color(PROTON_PURPLE_TEXT()),
                                         );
                                     });
                             });
@@ -2115,7 +2280,7 @@ impl ProtonDriveNativeApp {
                             ui.label(
                                 RichText::new("Unchecked folders are removed from local disk and kept safely in Proton Drive cloud.")
                                     .size(12.5)
-                                    .color(TEXT_MUTED),
+                                    .color(TEXT_MUTED()),
                             );
                         });
 
@@ -2124,10 +2289,10 @@ impl ProtonDriveNativeApp {
                             if ui
                                 .add(
                                     egui::Button::new(
-                                        RichText::new("None").size(12.0).color(TEXT_PRIMARY),
+                                        RichText::new("None").size(12.0).color(TEXT_PRIMARY()),
                                     )
-                                    .fill(BG_CARD_ALT)
-                                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                                    .fill(BG_CARD_ALT())
+                                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
                                     .corner_radius(CornerRadius::same(6))
                                     .min_size(Vec2::new(60.0, 28.0)),
                                 )
@@ -2140,10 +2305,10 @@ impl ProtonDriveNativeApp {
                             if ui
                                 .add(
                                     egui::Button::new(
-                                        RichText::new("Select All").size(12.0).color(TEXT_PRIMARY),
+                                        RichText::new("Select All").size(12.0).color(TEXT_PRIMARY()),
                                     )
-                                    .fill(BG_CARD_ALT)
-                                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                                    .fill(BG_CARD_ALT())
+                                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
                                     .corner_radius(CornerRadius::same(6))
                                     .min_size(Vec2::new(78.0, 28.0)),
                                 )
@@ -2182,7 +2347,7 @@ impl ProtonDriveNativeApp {
                         if ui
                             .add(
                                 egui::Button::new(RichText::new("Refresh").size(12.0))
-                                    .fill(BG_CARD_ALT)
+                                    .fill(BG_CARD_ALT())
                                     .corner_radius(CornerRadius::same(6))
                                     .min_size(Vec2::new(70.0, 28.0)),
                             )
@@ -2209,7 +2374,7 @@ impl ProtonDriveNativeApp {
                                 ui.label(
                                     RichText::new("Loading remote top-level folders from /my-files...")
                                         .size(13.5)
-                                        .color(TEXT_MUTED),
+                                        .color(TEXT_MUTED()),
                                 );
                                 return;
                             }
@@ -2223,14 +2388,14 @@ impl ProtonDriveNativeApp {
                                 }
                                 let mut included = !folder.excluded;
                                 let row_fill = if included {
-                                    BG_CARD_ALT
+                                    BG_CARD_ALT()
                                 } else {
                                     Color32::from_rgb(27, 24, 36)
                                 };
                                 let border_col = if included {
                                     Color32::from_rgb(56, 48, 78)
                                 } else {
-                                    BORDER_SUBTLE
+                                    BORDER_SUBTLE()
                                 };
 
                                 Frame::NONE
@@ -2253,7 +2418,7 @@ impl ProtonDriveNativeApp {
                                             let folder_color = if included {
                                                 PROTON_PURPLE
                                             } else {
-                                                TEXT_MUTED
+                                                TEXT_MUTED()
                                             };
                                             ui.painter().rect_filled(
                                                 f_rect,
@@ -2268,9 +2433,9 @@ impl ProtonDriveNativeApp {
                                                         .size(14.0)
                                                         .strong()
                                                         .color(if included {
-                                                            TEXT_PRIMARY
+                                                            TEXT_PRIMARY()
                                                         } else {
-                                                            TEXT_MUTED
+                                                            TEXT_MUTED()
                                                         }),
                                                 )
                                                 .sense(Sense::click()),
@@ -2308,7 +2473,7 @@ impl ProtonDriveNativeApp {
                                                                 ui.label(
                                                                     RichText::new("Cloud Only")
                                                                         .size(11.5)
-                                                                        .color(TEXT_MUTED),
+                                                                        .color(TEXT_MUTED()),
                                                                 );
                                                             });
                                                     }
@@ -2346,7 +2511,7 @@ impl ProtonDriveNativeApp {
                         RichText::new("Ignore Patterns (Glob)")
                             .size(16.0)
                             .strong()
-                            .color(TEXT_PRIMARY),
+                            .color(TEXT_PRIMARY()),
                     );
                     ui.add_space(4.0);
                     ui.label(
@@ -2354,7 +2519,7 @@ impl ProtonDriveNativeApp {
                             "One glob pattern per line. Matching files or folders are skipped during two-way sync.",
                         )
                         .size(12.5)
-                        .color(TEXT_MUTED),
+                        .color(TEXT_MUTED()),
                     );
                     ui.add_space(12.0);
 
@@ -2408,19 +2573,19 @@ impl ProtonDriveNativeApp {
                 RichText::new("File Conflicts")
                     .size(15.5)
                     .strong()
-                    .color(TEXT_PRIMARY),
+                    .color(TEXT_PRIMARY()),
             );
             ui.add_space(8.0);
             if self.conflicts.is_empty() {
                 ui.label(
                     RichText::new("No file conflicts detected.")
                         .size(13.0)
-                        .color(TEXT_MUTED),
+                        .color(TEXT_MUTED()),
                 );
             } else {
                 for c in self.conflicts.clone() {
                     Frame::NONE
-                        .fill(BG_CARD_ALT)
+                        .fill(BG_CARD_ALT())
                         .corner_radius(CornerRadius::same(8))
                         .inner_margin(Margin::symmetric(12, 10))
                         .show(ui, |ui| {
@@ -2430,7 +2595,7 @@ impl ProtonDriveNativeApp {
                                     RichText::new(&c.local_rel_path)
                                         .size(13.5)
                                         .strong()
-                                        .color(TEXT_PRIMARY),
+                                        .color(TEXT_PRIMARY()),
                                 );
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if c.resolved != 0 {
@@ -2474,11 +2639,11 @@ impl ProtonDriveNativeApp {
                 RichText::new("Synchronization Settings")
                     .size(16.0)
                     .strong()
-                    .color(TEXT_PRIMARY),
+                    .color(TEXT_PRIMARY()),
             );
             ui.add_space(16.0);
 
-            ui.label(RichText::new("Local Sync Folder").size(13.0).color(TEXT_MUTED));
+            ui.label(RichText::new("Local Sync Folder").size(13.0).color(TEXT_MUTED()));
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let input_w = (ui.available_width() - 104.0).max(240.0);
@@ -2497,10 +2662,10 @@ impl ProtonDriveNativeApp {
                     ui,
                     Vec2::new(92.0, 34.0),
                     "Browse...",
-                    BG_CARD_ALT,
-                    Color32::from_rgb(56, 50, 76),
-                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
-                    TEXT_PRIMARY,
+                    BG_CARD_ALT(),
+                    btn_secondary_hover_bg(),
+                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                    TEXT_PRIMARY(),
                     12.5,
                 )
                 .clicked()
@@ -2529,14 +2694,47 @@ impl ProtonDriveNativeApp {
                     "Changing the sync location safely moves your existing synced files to the new folder, switches the real-time file watcher, and preserves all cloud files without re-uploading or deleting them.",
                 )
                 .size(11.5)
-                .color(TEXT_MUTED),
+                .color(TEXT_MUTED()),
             );
+
+            ui.add_space(16.0);
+            ui.label(
+                RichText::new("Appearance Theme")
+                    .size(13.0)
+                    .color(TEXT_MUTED()),
+            );
+            ui.add_space(6.0);
+            egui::ComboBox::from_id_salt("appearance_theme_combo")
+                .selected_text(match self.window_geometry.theme_mode.as_str() {
+                    "light" => "Light (Proton Snow)",
+                    "dark" => "Dark (Proton Carbon)",
+                    _ => "Follow Ubuntu System Theme",
+                })
+                .width(360.0)
+                .show_ui(ui, |ui| {
+                    for (val, text) in [
+                        ("system", "Follow Ubuntu System Theme"),
+                        ("light", "Light (Proton Snow)"),
+                        ("dark", "Dark (Proton Carbon)"),
+                    ] {
+                        if ui
+                            .selectable_value(
+                                &mut self.window_geometry.theme_mode,
+                                val.to_string(),
+                                text,
+                            )
+                            .changed()
+                        {
+                            save_window_geometry(&self.window_geometry);
+                        }
+                    }
+                });
 
             ui.add_space(16.0);
             ui.label(
                 RichText::new("Conflict Resolution Strategy")
                     .size(13.0)
-                    .color(TEXT_MUTED),
+                    .color(TEXT_MUTED()),
             );
             ui.add_space(6.0);
             egui::ComboBox::from_id_salt("conflict_strategy_combo")
@@ -2573,7 +2771,7 @@ impl ProtonDriveNativeApp {
                     &mut self.edit_notifications,
                     RichText::new("Enable Ubuntu desktop notifications")
                         .size(13.5)
-                        .color(TEXT_PRIMARY),
+                        .color(TEXT_PRIMARY()),
                 )
                 .changed()
             {
@@ -2588,7 +2786,7 @@ impl ProtonDriveNativeApp {
                 RichText::new("Ignore Patterns (Glob)")
                     .size(14.5)
                     .strong()
-                    .color(TEXT_PRIMARY),
+                    .color(TEXT_PRIMARY()),
             );
             ui.add_space(4.0);
             ui.label(
@@ -2596,7 +2794,7 @@ impl ProtonDriveNativeApp {
                     "One glob pattern per line. Matching files or folders (e.g. .git, node_modules, *.part) are skipped during two-way sync.",
                 )
                 .size(12.0)
-                .color(TEXT_MUTED),
+                .color(TEXT_MUTED()),
             );
             ui.add_space(8.0);
             if ui
@@ -2692,8 +2890,8 @@ impl ProtonDriveNativeApp {
             .fixed_pos(modal_pos)
             .show(ctx, |ui| {
                 Frame::NONE
-                    .fill(Color32::from_rgb(33, 29, 46))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(76, 66, 108)))
+                    .fill(BG_CARD())
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
                     .corner_radius(CornerRadius::same(14))
                     .shadow(egui::Shadow {
                         offset: [0, 12],
@@ -2710,17 +2908,17 @@ impl ProtonDriveNativeApp {
                             RichText::new(title)
                                 .size(16.5)
                                 .strong()
-                                .color(TEXT_PRIMARY),
+                                .color(TEXT_PRIMARY()),
                         );
                         ui.add_space(10.0);
-                        ui.label(RichText::new(body_line1).size(13.0).color(TEXT_PRIMARY));
+                        ui.label(RichText::new(body_line1).size(13.0).color(TEXT_PRIMARY()));
                         ui.add_space(6.0);
                         ui.label(
                             RichText::new(
                                 "Your files remain safely stored in Proton Drive cloud and can be re-synced anytime.",
                             )
                             .size(12.5)
-                            .color(TEXT_MUTED),
+                            .color(TEXT_MUTED()),
                         );
 
                         ui.add_space(20.0);
@@ -2777,10 +2975,10 @@ impl ProtonDriveNativeApp {
                                 ui,
                                 Vec2::new(88.0, 36.0),
                                 "Cancel",
-                                BG_CARD_ALT,
-                                Color32::from_rgb(56, 50, 76),
-                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
-                                TEXT_PRIMARY,
+                                BG_CARD_ALT(),
+                                btn_secondary_hover_bg(),
+                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                                TEXT_PRIMARY(),
                                 13.0,
                             )
                             .clicked()
@@ -2807,6 +3005,17 @@ impl eframe::App for ProtonDriveNativeApp {
         self.process_worker_events();
         self.frames_rendered += 1;
 
+        let desired_light = match self.window_geometry.theme_mode.as_str() {
+            "light" => true,
+            "dark" => false,
+            _ => SYSTEM_LIGHT_MODE.load(AtomicOrdering::Relaxed),
+        };
+        if desired_light != self.applied_light_mode {
+            self.applied_light_mode = desired_light;
+            IS_LIGHT_MODE.store(desired_light, AtomicOrdering::Relaxed);
+            apply_proton_visuals(ctx, desired_light);
+        }
+
         if self.screenshot_target.is_none() {
             if self.frames_rendered <= 3 {
                 if self.window_geometry.maximized {
@@ -2832,7 +3041,7 @@ impl eframe::App for ProtonDriveNativeApp {
                     if maximized {
                         Some(WindowGeometry {
                             maximized: true,
-                            ..self.window_geometry
+                            ..self.window_geometry.clone()
                         })
                     } else if content_size.x >= 800.0 && content_size.y >= 500.0 {
                         let position = vp.outer_rect.map(|r| [r.min.x, r.min.y]);
@@ -2841,6 +3050,7 @@ impl eframe::App for ProtonDriveNativeApp {
                             width: content_size.x.clamp(840.0, 16384.0),
                             height: content_size.y.clamp(540.0, 16384.0),
                             maximized: false,
+                            theme_mode: self.window_geometry.theme_mode.clone(),
                         })
                     } else {
                         None
@@ -2877,9 +3087,9 @@ impl eframe::App for ProtonDriveNativeApp {
             .exact_height(56.0)
             .frame(
                 Frame::NONE
-                    .fill(BG_SIDEBAR)
+                    .fill(BG_SIDEBAR())
                     .inner_margin(Margin::symmetric(24, 11))
-                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE)),
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE())),
             )
             .show(ctx, |ui| {
                 self.render_top_bar(ui);
@@ -2888,7 +3098,7 @@ impl eframe::App for ProtonDriveNativeApp {
         egui::CentralPanel::default()
             .frame(
                 Frame::NONE
-                    .fill(BG_CANVAS)
+                    .fill(BG_CANVAS())
                     .inner_margin(Margin::symmetric(26, 20)),
             )
             .show(ctx, |ui| {
@@ -2950,8 +3160,8 @@ impl eframe::App for ProtonDriveNativeApp {
 
 fn card_frame() -> Frame {
     Frame::NONE
-        .fill(BG_CARD)
-        .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+        .fill(BG_CARD())
+        .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
         .corner_radius(CornerRadius::same(12))
         .inner_margin(Margin::same(18))
 }
@@ -2989,13 +3199,13 @@ fn proton_button(
 fn render_stat_card(ui: &mut egui::Ui, label: &str, value: &str) {
     card_frame().show(ui, |ui| {
         ui.set_min_width(ui.available_width());
-        ui.label(RichText::new(label).size(12.5).color(TEXT_MUTED));
+        ui.label(RichText::new(label).size(12.5).color(TEXT_MUTED()));
         ui.add_space(6.0);
         ui.label(
             RichText::new(value)
                 .size(24.0)
                 .strong()
-                .color(TEXT_PRIMARY),
+                .color(TEXT_PRIMARY()),
         );
     });
 }
@@ -3035,20 +3245,30 @@ fn configure_proton_theme(ctx: &egui::Context) {
         mono.insert(0, "JetBrainsMono".to_owned());
     }
     ctx.set_fonts(fonts);
+}
 
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = BG_CANVAS;
-    visuals.window_fill = BG_CARD;
-    visuals.faint_bg_color = Color32::from_rgb(28, 25, 38);
-    visuals.extreme_bg_color = BG_INPUT;
+fn apply_proton_visuals(ctx: &egui::Context, light: bool) {
+    let mut visuals = if light {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    };
+    visuals.panel_fill = BG_CANVAS();
+    visuals.window_fill = BG_CARD();
+    visuals.faint_bg_color = if light {
+        Color32::from_rgb(243, 241, 250)
+    } else {
+        Color32::from_rgb(28, 25, 38)
+    };
+    visuals.extreme_bg_color = BG_INPUT();
     visuals.selection.bg_fill = PROTON_PURPLE;
     visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
-    visuals.widgets.noninteractive.bg_fill = BG_CARD;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER_SUBTLE);
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
-    visuals.widgets.inactive.bg_fill = BG_CARD_ALT;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER_SUBTLE);
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
+    visuals.widgets.noninteractive.bg_fill = BG_CARD();
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER_SUBTLE());
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY());
+    visuals.widgets.inactive.bg_fill = BG_CARD_ALT();
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER_SUBTLE());
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY());
     visuals.widgets.hovered.bg_fill = PROTON_PURPLE_HOVER;
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     visuals.widgets.active.bg_fill = PROTON_PURPLE;
@@ -3254,7 +3474,7 @@ fn draw_file_icon(painter: &egui::Painter, rect: egui::Rect, filename: &str) {
         "md" | "txt" | "doc" | "docx" => PROTON_PURPLE_HOVER,
         _ => Color32::from_rgb(154, 148, 176),
     };
-    painter.rect_filled(r, CornerRadius::same(2), Color32::from_rgb(44, 39, 62));
+    painter.rect_filled(r, CornerRadius::same(2), BG_CARD_ALT());
     painter.rect_stroke(
         r,
         CornerRadius::same(2),
@@ -3288,17 +3508,17 @@ fn humanize_activity_action(action: &str) -> (&'static str, Color32, Color32) {
         "upload" => (
             "↑ Uploaded",
             Color32::from_rgba_unmultiplied(109, 74, 255, 42),
-            PROTON_PURPLE_TEXT,
+            PROTON_PURPLE_TEXT(),
         ),
         "mkdir" => (
             "+ Folder created",
-            Color32::from_rgb(42, 37, 60),
-            Color32::from_rgb(214, 208, 235),
+            BG_CARD_ALT(),
+            TEXT_PRIMARY(),
         ),
         "delete-local" => (
             "− Removed locally",
-            Color32::from_rgb(44, 38, 56),
-            TEXT_MUTED,
+            BG_CARD_ALT(),
+            TEXT_MUTED(),
         ),
         "delete-remote" | "trash-remote" => (
             "Trash (Cloud)",
@@ -3315,7 +3535,7 @@ fn humanize_activity_action(action: &str) -> (&'static str, Color32, Color32) {
             Color32::from_rgba_unmultiplied(239, 68, 68, 38),
             STATUS_DANGER,
         ),
-        _ => ("• Synced", BG_CARD_ALT, TEXT_PRIMARY),
+        _ => ("• Synced", BG_CARD_ALT(), TEXT_PRIMARY()),
     }
 }
 
@@ -3409,6 +3629,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
     while let Ok(cmd) = rx.recv() {
         match cmd {
             WorkerCommand::RefreshAll => {
+                SYSTEM_LIGHT_MODE.store(detect_system_light_mode(), AtomicOrdering::Relaxed);
                 let mut status = fetch_status();
                 if status.is_err() {
                     try_autostart_daemon();
@@ -3601,6 +3822,7 @@ fn main() -> eframe::Result {
     let mut initial_tab = NavTab::CloudBrowser;
     let mut initial_account_menu = false;
     let mut initial_confirm_folder: Option<String> = None;
+    let mut cli_theme_override: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -3612,6 +3834,9 @@ fn main() -> eframe::Result {
             }
             "--confirm-cloud-only" => {
                 initial_confirm_folder = args.next();
+            }
+            "--theme" => {
+                cli_theme_override = args.next();
             }
             "--tab" => {
                 if let Some(t) = args.next() {
@@ -3641,7 +3866,10 @@ fn main() -> eframe::Result {
         try_autostart_tray();
     }
 
-    let saved_geom = load_window_geometry();
+    let mut saved_geom = load_window_geometry();
+    if let Some(theme_ov) = cli_theme_override {
+        saved_geom.theme_mode = theme_ov;
+    }
     let initial_size = if screenshot_target.is_some() {
         [1440.0, 900.0]
     } else if saved_geom.maximized {
