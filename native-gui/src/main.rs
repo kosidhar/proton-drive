@@ -1244,8 +1244,46 @@ impl ProtonDriveNativeApp {
             });
             ui.add_space(12.0);
 
+            // Full-width Column Header Bar for Recent Sync Activity
+            let (hdr_rect, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::hover());
+            ui.painter().rect_filled(
+                hdr_rect,
+                CornerRadius::same(7),
+                Color32::from_rgb(26, 23, 36),
+            );
+            let hdr_y = hdr_rect.center().y;
+            let file_col_x = hdr_rect.min.x + 124.0;
+            let details_col_x = (hdr_rect.min.x + hdr_rect.width() * 0.54).max(file_col_x + 220.0);
+
+            ui.painter().text(
+                egui::pos2(hdr_rect.min.x + 14.0, hdr_y),
+                egui::Align2::LEFT_CENTER,
+                "Action",
+                FontId::new(12.0, FontFamily::Proportional),
+                TEXT_MUTED,
+            );
+            ui.painter().text(
+                egui::pos2(file_col_x, hdr_y),
+                egui::Align2::LEFT_CENTER,
+                "File / Folder",
+                FontId::new(12.0, FontFamily::Proportional),
+                TEXT_MUTED,
+            );
+            ui.painter().text(
+                egui::pos2(details_col_x, hdr_y),
+                egui::Align2::LEFT_CENTER,
+                "Details",
+                FontId::new(12.0, FontFamily::Proportional),
+                TEXT_MUTED,
+            );
+
+            ui.add_space(4.0);
+
             ScrollArea::vertical()
-                .max_height(ui.available_height() - 10.0)
+                .id_salt("activity_table_scroll")
+                .max_height((ui.available_height() - 10.0).max(200.0))
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     if self.activities.is_empty() {
@@ -1256,249 +1294,525 @@ impl ProtonDriveNativeApp {
                                 .color(TEXT_MUTED),
                         );
                     } else {
-                        egui::Grid::new("activity_unified_grid")
-                            .num_columns(3)
-                            .spacing([24.0, 10.0])
-                            .min_col_width(90.0)
-                            .striped(true)
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new("Action").size(12.0).strong().color(TEXT_MUTED),
+                        for act in self
+                            .activities
+                            .iter()
+                            .filter(|a| {
+                                query_lower.is_empty()
+                                    || a.local_rel_path
+                                        .to_lowercase()
+                                        .contains(&query_lower)
+                                    || a.details.to_lowercase().contains(&query_lower)
+                                    || a.action.to_lowercase().contains(&query_lower)
+                            })
+                            .take(40)
+                        {
+                            let (row_rect, row_resp) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 36.0),
+                                Sense::hover(),
+                            );
+                            if row_resp.hovered() {
+                                ui.painter().rect_filled(
+                                    row_rect,
+                                    CornerRadius::same(6),
+                                    Color32::from_rgb(41, 36, 56),
                                 );
-                                ui.label(
-                                    RichText::new("File / Folder")
-                                        .size(12.0)
-                                        .strong()
-                                        .color(TEXT_MUTED),
-                                );
-                                ui.label(
-                                    RichText::new("Details")
-                                        .size(12.0)
-                                        .strong()
-                                        .color(TEXT_MUTED),
-                                );
-                                ui.end_row();
+                            }
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(row_rect.min.x + 10.0, row_rect.max.y),
+                                    egui::pos2(row_rect.max.x - 10.0, row_rect.max.y),
+                                ],
+                                Stroke::new(1.0_f32, Color32::from_rgb(40, 35, 54)),
+                            );
 
-                                for act in self
-                                    .activities
-                                    .iter()
-                                    .filter(|a| {
-                                        query_lower.is_empty()
-                                            || a.local_rel_path
-                                                .to_lowercase()
-                                                .contains(&query_lower)
-                                            || a.details.to_lowercase().contains(&query_lower)
-                                            || a.action.to_lowercase().contains(&query_lower)
-                                    })
-                                    .take(40)
-                                {
-                                    let pill_color = match act.action.as_str() {
-                                        "upload" => PROTON_PURPLE,
-                                        "download" => STATUS_SUCCESS,
-                                        "error" | "conflict" => STATUS_DANGER,
-                                        _ => BG_CARD_ALT,
-                                    };
-                                    Frame::NONE
-                                        .fill(pill_color)
-                                        .corner_radius(CornerRadius::same(6))
-                                        .inner_margin(Margin::symmetric(8, 3))
-                                        .show(ui, |ui| {
-                                            ui.label(
-                                                RichText::new(&act.action)
-                                                    .size(11.5)
-                                                    .strong()
-                                                    .color(Color32::WHITE),
-                                            );
-                                        });
+                            let cy = row_rect.center().y;
+                            let r_file_x = row_rect.min.x + 124.0;
+                            let r_details_x =
+                                (row_rect.min.x + row_rect.width() * 0.54).max(r_file_x + 220.0);
 
-                                    ui.label(
-                                        RichText::new(truncate_middle(&act.local_rel_path, 56))
-                                            .size(13.0)
-                                            .color(TEXT_PRIMARY),
-                                    );
-                                    ui.label(
-                                        RichText::new(&act.details).size(12.5).color(TEXT_MUTED),
-                                    );
-                                    ui.end_row();
-                                }
-                            });
+                            let pill_color = match act.action.as_str() {
+                                "upload" => PROTON_PURPLE,
+                                "download" => STATUS_SUCCESS,
+                                "error" | "conflict" => STATUS_DANGER,
+                                _ => BG_CARD_ALT,
+                            };
+                            let pill_rect = egui::Rect::from_min_size(
+                                egui::pos2(row_rect.min.x + 12.0, cy - 10.0),
+                                Vec2::new(88.0, 20.0),
+                            );
+                            ui.painter()
+                                .rect_filled(pill_rect, CornerRadius::same(5), pill_color);
+                            ui.painter().text(
+                                pill_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                &act.action,
+                                FontId::new(11.0, FontFamily::Proportional),
+                                Color32::WHITE,
+                            );
+
+                            ui.painter().text(
+                                egui::pos2(r_file_x, cy),
+                                egui::Align2::LEFT_CENTER,
+                                truncate_middle(&act.local_rel_path, 52),
+                                FontId::new(13.0, FontFamily::Proportional),
+                                TEXT_PRIMARY,
+                            );
+                            ui.painter().text(
+                                egui::pos2(r_details_x, cy),
+                                egui::Align2::LEFT_CENTER,
+                                truncate_middle(&act.details, 64),
+                                FontId::new(12.5, FontFamily::Proportional),
+                                TEXT_MUTED,
+                            );
+                        }
                     }
                 });
         });
     }
 
     fn render_browser_tab(&mut self, ui: &mut egui::Ui) {
+        let avail_h = (ui.available_height() - 4.0).max(400.0);
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            ui.set_min_height(avail_h - 36.0);
+
+            // Top Breadcrumb & Action Bar
+            let parts: Vec<String> = self
+                .remote_path
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+
+            let mut navigate_to: Option<String> = None;
+
             ui.horizontal(|ui| {
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("↑ Up").size(13.0).color(TEXT_PRIMARY))
-                            .fill(BG_CARD_ALT)
-                            .corner_radius(CornerRadius::same(6))
-                            .min_size(Vec2::new(64.0, 30.0)),
+                // Up button if deeper than /my-files
+                if parts.len() > 1 {
+                    if proton_button(
+                        ui,
+                        Vec2::new(34.0, 32.0),
+                        "↑",
+                        BG_CARD_ALT,
+                        Color32::from_rgb(54, 47, 72),
+                        Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
+                        TEXT_PRIMARY,
+                        14.0,
                     )
+                    .on_hover_text("Go to parent folder")
                     .clicked()
-                {
-                    let parts: Vec<&str> = self
-                        .remote_path
-                        .split('/')
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    if parts.len() > 1 {
+                    {
                         let parent = format!("/{}", parts[..parts.len() - 1].join("/"));
-                        self.remote_loading = true;
-                        let _ = self.tx.send(WorkerCommand::LoadRemotePath(parent));
+                        navigate_to = Some(parent);
+                    }
+                    ui.add_space(4.0);
+                }
+
+                // Interactive Breadcrumbs ("My files  ›  subfolder")
+                for (idx, part) in parts.iter().enumerate() {
+                    let is_last = idx + 1 == parts.len();
+                    let label = if idx == 0 && part == "my-files" {
+                        "My files"
+                    } else {
+                        part.as_str()
+                    };
+                    let target_path = format!("/{}", parts[..=idx].join("/"));
+
+                    let crumb_fill = if is_last {
+                        PROTON_PURPLE_SOFT
+                    } else {
+                        BG_INPUT
+                    };
+                    let crumb_text_col = if is_last {
+                        TEXT_PRIMARY
+                    } else {
+                        TEXT_MUTED
+                    };
+
+                    let resp = Frame::NONE
+                        .fill(crumb_fill)
+                        .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                        .corner_radius(CornerRadius::same(7))
+                        .inner_margin(Margin::symmetric(12, 6))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(label)
+                                    .size(13.5)
+                                    .strong()
+                                    .color(crumb_text_col),
+                            );
+                        })
+                        .response
+                        .interact(Sense::click());
+
+                    if !is_last {
+                        if resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if resp.clicked() {
+                            navigate_to = Some(target_path);
+                        }
+                        ui.label(RichText::new("›").size(15.0).color(TEXT_MUTED));
                     }
                 }
 
-                Frame::NONE
-                    .fill(BG_INPUT)
-                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
-                    .corner_radius(CornerRadius::same(6))
-                    .inner_margin(Margin::symmetric(12, 6))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(&self.remote_path)
-                                .font(FontId::new(13.0, FontFamily::Monospace))
-                                .color(PROTON_PURPLE_TEXT),
-                        );
-                    });
-
+                // Right-side Toolbar Buttons & Item Counter
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("Refresh").size(13.0).strong().color(Color32::WHITE),
-                            )
-                            .fill(PROTON_PURPLE)
-                            .corner_radius(CornerRadius::same(6))
-                            .min_size(Vec2::new(80.0, 30.0)),
-                        )
-                        .clicked()
+                    if proton_button(
+                        ui,
+                        Vec2::new(84.0, 32.0),
+                        "Refresh",
+                        PROTON_PURPLE,
+                        PROTON_PURPLE_HOVER,
+                        None,
+                        Color32::WHITE,
+                        13.0,
+                    )
+                    .clicked()
                     {
-                        self.remote_loading = true;
-                        let _ = self
-                            .tx
-                            .send(WorkerCommand::LoadRemotePath(self.remote_path.clone()));
+                        navigate_to = Some(self.remote_path.clone());
                     }
 
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("+ New Folder").size(13.0).color(TEXT_PRIMARY),
-                            )
-                            .fill(BG_CARD_ALT)
-                            .corner_radius(CornerRadius::same(6))
-                            .min_size(Vec2::new(105.0, 30.0)),
-                        )
-                        .clicked()
+                    ui.add_space(6.0);
+
+                    if proton_button(
+                        ui,
+                        Vec2::new(108.0, 32.0),
+                        "+ New folder",
+                        BG_CARD_ALT,
+                        Color32::from_rgb(54, 47, 72),
+                        Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
+                        TEXT_PRIMARY,
+                        13.0,
+                    )
+                    .clicked()
                     {
                         self.show_new_folder_modal = !self.show_new_folder_modal;
+                    }
+
+                    if !self.remote_items.is_empty() {
+                        ui.add_space(10.0);
+                        let folder_count = self
+                            .remote_items
+                            .iter()
+                            .filter(|i| i.item_type == "folder")
+                            .count();
+                        let file_count = self.remote_items.len().saturating_sub(folder_count);
+                        ui.label(
+                            RichText::new(format!(
+                                "{folder_count} folders  •  {file_count} files"
+                            ))
+                            .size(12.0)
+                            .color(TEXT_MUTED),
+                        );
                     }
                 });
             });
 
-            if self.show_new_folder_modal {
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Folder Name:").size(13.0).color(TEXT_MUTED));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_folder_name)
-                            .desired_width(220.0),
-                    );
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("Create").size(12.5).color(Color32::WHITE),
-                            )
-                            .fill(PROTON_PURPLE),
-                        )
-                        .clicked()
-                        && !self.new_folder_name.trim().is_empty()
-                    {
-                        let _ = self.tx.send(WorkerCommand::CreateRemoteFolder {
-                            parent_path: self.remote_path.clone(),
-                            name: self.new_folder_name.trim().to_string(),
-                        });
-                        self.new_folder_name.clear();
-                        self.show_new_folder_modal = false;
-                    }
-                });
+            if let Some(next_path) = navigate_to {
+                self.remote_loading = true;
+                let _ = self.tx.send(WorkerCommand::LoadRemotePath(next_path));
             }
 
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(8.0);
+            if self.show_new_folder_modal {
+                ui.add_space(10.0);
+                Frame::NONE
+                    .fill(BG_INPUT)
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(Margin::symmetric(14, 10))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("New folder name:")
+                                    .size(13.0)
+                                    .color(TEXT_MUTED),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.new_folder_name)
+                                    .hint_text("Enter folder name...")
+                                    .desired_width(240.0),
+                            );
+                            if proton_button(
+                                ui,
+                                Vec2::new(76.0, 28.0),
+                                "Create",
+                                PROTON_PURPLE,
+                                PROTON_PURPLE_HOVER,
+                                None,
+                                Color32::WHITE,
+                                12.5,
+                            )
+                            .clicked()
+                                && !self.new_folder_name.trim().is_empty()
+                            {
+                                let _ = self.tx.send(WorkerCommand::CreateRemoteFolder {
+                                    parent_path: self.remote_path.clone(),
+                                    name: self.new_folder_name.trim().to_string(),
+                                });
+                                self.new_folder_name.clear();
+                                self.show_new_folder_modal = false;
+                            }
+                            if proton_button(
+                                ui,
+                                Vec2::new(68.0, 28.0),
+                                "Cancel",
+                                BG_CARD_ALT,
+                                Color32::from_rgb(54, 47, 72),
+                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
+                                TEXT_MUTED,
+                                12.5,
+                            )
+                            .clicked()
+                            {
+                                self.show_new_folder_modal = false;
+                            }
+                        });
+                    });
+            }
+
+            ui.add_space(14.0);
+
+            // Column Header Bar (pixel-aligned across full table width)
+            let (hdr_rect, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::hover());
+            ui.painter().rect_filled(
+                hdr_rect,
+                CornerRadius::same(7),
+                Color32::from_rgb(26, 23, 36),
+            );
+            let hdr_y = hdr_rect.center().y;
+            let status_x = (hdr_rect.max.x - 395.0).max(hdr_rect.min.x + 240.0);
+            let mod_x = (hdr_rect.max.x - 245.0).max(status_x + 110.0);
+            let size_right_x = hdr_rect.max.x - 18.0;
+
+            ui.painter().text(
+                egui::pos2(hdr_rect.min.x + 16.0, hdr_y),
+                egui::Align2::LEFT_CENTER,
+                "Name",
+                FontId::new(12.0, FontFamily::Proportional),
+                TEXT_MUTED,
+            );
+            ui.painter().text(
+                egui::pos2(status_x, hdr_y),
+                egui::Align2::LEFT_CENTER,
+                "Sync Status",
+                FontId::new(12.0, FontFamily::Proportional),
+                TEXT_MUTED,
+            );
+            ui.painter().text(
+                egui::pos2(mod_x, hdr_y),
+                egui::Align2::LEFT_CENTER,
+                "Modified",
+                FontId::new(12.0, FontFamily::Proportional),
+                TEXT_MUTED,
+            );
+            ui.painter().text(
+                egui::pos2(size_right_x, hdr_y),
+                egui::Align2::RIGHT_CENTER,
+                "Size",
+                FontId::new(12.0, FontFamily::Proportional),
+                TEXT_MUTED,
+            );
+
+            ui.add_space(4.0);
 
             if self.remote_loading {
-                ui.label(RichText::new("Loading remote folder...").color(TEXT_MUTED));
+                ui.add_space(28.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new("Loading Proton Drive folder contents...")
+                            .size(13.5)
+                            .color(TEXT_MUTED),
+                    );
+                });
             } else if let Some(err) = &self.remote_error {
-                ui.label(RichText::new(err).color(STATUS_DANGER));
+                ui.add_space(20.0);
+                ui.label(RichText::new(err).size(13.0).color(STATUS_DANGER));
             } else if self.remote_items.is_empty() {
-                ui.label(RichText::new("This folder is empty.").color(TEXT_MUTED));
+                ui.add_space(28.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new("This folder is empty.")
+                            .size(13.5)
+                            .color(TEXT_MUTED),
+                    );
+                });
             } else {
-                ScrollArea::vertical().show(ui, |ui| {
-                    let items = self.remote_items.clone();
-                    for item in items {
-                        let is_folder = item.item_type == "folder";
-                        let resp = Frame::NONE
-                            .fill(BG_CARD_ALT)
-                            .corner_radius(CornerRadius::same(8))
-                            .inner_margin(Margin::symmetric(12, 9))
-                            .show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-                                ui.horizontal(|ui| {
-                                    let (rect, _) = ui.allocate_exact_size(Vec2::new(14.0, 12.0), Sense::hover());
-                                    if is_folder {
-                                        ui.painter().rect_filled(rect, CornerRadius::same(3), PROTON_PURPLE);
-                                    } else {
-                                        ui.painter().rect_stroke(rect, CornerRadius::same(2), Stroke::new(1.5_f32, TEXT_MUTED), egui::StrokeKind::Inside);
-                                    }
-                                    ui.add_space(6.0);
-                                    let name_color = if is_folder {
-                                        PROTON_PURPLE_TEXT
-                                    } else {
-                                        TEXT_PRIMARY
-                                    };
-                                    ui.label(
-                                        RichText::new(&item.name)
-                                            .size(13.5)
-                                            .strong()
-                                            .color(name_color),
-                                    );
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if !is_folder {
-                                            ui.label(
-                                                RichText::new(format_bytes(item.size))
-                                                    .size(12.0)
-                                                    .color(TEXT_MUTED),
-                                            );
-                                        } else {
-                                            ui.label(
-                                                RichText::new("Folder")
-                                                    .size(12.0)
-                                                    .color(TEXT_MUTED),
-                                            );
-                                        }
-                                    });
-                                });
-                            })
-                            .response
-                            .interact(Sense::click());
+                // Sort folders first (A-Z), then files (A-Z), and filter by search_query
+                let query_lower = self.search_query.trim().to_lowercase();
+                let mut sorted_items: Vec<RemoteItem> = self
+                    .remote_items
+                    .iter()
+                    .filter(|item| {
+                        query_lower.is_empty()
+                            || item.name.to_lowercase().contains(&query_lower)
+                    })
+                    .cloned()
+                    .collect();
 
-                        if is_folder && resp.clicked() {
-                            let next = format!(
-                                "{}/{}",
-                                self.remote_path.trim_end_matches('/'),
-                                item.name
+                sorted_items.sort_by(|a, b| {
+                    let a_folder = a.item_type == "folder";
+                    let b_folder = b.item_type == "folder";
+                    match (a_folder, b_folder) {
+                        (true, false) => std::cmp::Ordering::Less,
+                        (false, true) => std::cmp::Ordering::Greater,
+                        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                    }
+                });
+
+                let is_root = self.remote_path == "/my-files" || self.remote_path == "/";
+                let root_folder_name = parts.get(1).cloned();
+                let scroll_h = (ui.available_height() - 6.0).max(240.0);
+
+                ScrollArea::vertical()
+                    .id_salt("cloud_browser_table_scroll")
+                    .max_height(scroll_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let mut clicked_folder: Option<String> = None;
+
+                        for item in sorted_items {
+                            let is_folder = item.item_type == "folder";
+                            let top_check_name = if is_root {
+                                Some(item.name.as_str())
+                            } else {
+                                root_folder_name.as_deref()
+                            };
+                            let is_excluded = top_check_name.is_some_and(|top_name| {
+                                self.status
+                                    .settings
+                                    .excluded_folders
+                                    .iter()
+                                    .any(|ex| ex == top_name)
+                            });
+
+                            let (row_rect, row_resp) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 42.0),
+                                Sense::click(),
                             );
+
+                            if row_resp.hovered() {
+                                if is_folder {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                ui.painter().rect_filled(
+                                    row_rect,
+                                    CornerRadius::same(7),
+                                    Color32::from_rgb(43, 38, 60),
+                                );
+                            }
+
+                            // Subtle bottom row separator
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(row_rect.min.x + 10.0, row_rect.max.y),
+                                    egui::pos2(row_rect.max.x - 10.0, row_rect.max.y),
+                                ],
+                                Stroke::new(1.0_f32, Color32::from_rgb(40, 35, 54)),
+                            );
+
+                            let row_cy = row_rect.center().y;
+                            let row_status_x =
+                                (row_rect.max.x - 395.0).max(row_rect.min.x + 240.0);
+                            let row_mod_x = (row_rect.max.x - 245.0).max(row_status_x + 110.0);
+                            let row_size_right_x = row_rect.max.x - 18.0;
+
+                            // 1. Name Column (Vector Folder/File Icon + Item Name)
+                            let ic_rect = egui::Rect::from_center_size(
+                                egui::pos2(row_rect.min.x + 26.0, row_cy),
+                                Vec2::new(20.0, 17.0),
+                            );
+                            if is_folder {
+                                draw_folder_icon(ui.painter(), ic_rect, !is_excluded);
+                            } else {
+                                draw_file_icon(ui.painter(), ic_rect, &item.name);
+                            }
+
+                            let name_color = if is_folder {
+                                TEXT_PRIMARY
+                            } else {
+                                Color32::from_rgb(230, 228, 240)
+                            };
+                            ui.painter().text(
+                                egui::pos2(row_rect.min.x + 46.0, row_cy),
+                                egui::Align2::LEFT_CENTER,
+                                truncate_middle(&item.name, 54),
+                                FontId::new(13.5, FontFamily::Proportional),
+                                name_color,
+                            );
+
+                            // 2. Sync Status Column ("✓ Synced" vs "Cloud only")
+                            let pill_rect = egui::Rect::from_min_size(
+                                egui::pos2(row_status_x, row_cy - 10.5),
+                                Vec2::new(84.0, 21.0),
+                            );
+                            if is_excluded {
+                                ui.painter().rect_filled(
+                                    pill_rect,
+                                    CornerRadius::same(99),
+                                    Color32::from_rgb(38, 33, 52),
+                                );
+                                ui.painter().text(
+                                    pill_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "Cloud only",
+                                    FontId::new(11.0, FontFamily::Proportional),
+                                    TEXT_MUTED,
+                                );
+                            } else {
+                                ui.painter().rect_filled(
+                                    pill_rect,
+                                    CornerRadius::same(99),
+                                    Color32::from_rgba_unmultiplied(30, 168, 133, 30),
+                                );
+                                ui.painter().text(
+                                    pill_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "✓ Synced",
+                                    FontId::new(11.0, FontFamily::Proportional),
+                                    STATUS_SUCCESS,
+                                );
+                            }
+
+                            // 3. Modified Date Column
+                            ui.painter().text(
+                                egui::pos2(row_mod_x, row_cy),
+                                egui::Align2::LEFT_CENTER,
+                                format_iso_date(&item.modification_time),
+                                FontId::new(12.0, FontFamily::Proportional),
+                                TEXT_MUTED,
+                            );
+
+                            // 4. Size Column
+                            let size_str = if is_folder {
+                                "—".to_string()
+                            } else {
+                                format_bytes(item.size)
+                            };
+                            ui.painter().text(
+                                egui::pos2(row_size_right_x, row_cy),
+                                egui::Align2::RIGHT_CENTER,
+                                size_str,
+                                FontId::new(12.0, FontFamily::Proportional),
+                                TEXT_MUTED,
+                            );
+
+                            if is_folder && row_resp.clicked() {
+                                clicked_folder = Some(format!(
+                                    "{}/{}",
+                                    self.remote_path.trim_end_matches('/'),
+                                    item.name
+                                ));
+                            }
+                        }
+
+                        if let Some(next) = clicked_folder {
                             self.remote_loading = true;
                             let _ = self.tx.send(WorkerCommand::LoadRemotePath(next));
                         }
-                        ui.add_space(6.0);
-                    }
-                });
+                    });
             }
         });
     }
@@ -2097,6 +2411,9 @@ impl eframe::App for ProtonDriveNativeApp {
             let ready = if self.tab == NavTab::SelectiveSync {
                 (!self.selective_folders.is_empty() && self.frames_rendered >= 6)
                     || self.frames_rendered >= 45
+            } else if self.tab == NavTab::CloudBrowser {
+                (!self.remote_items.is_empty() && self.frames_rendered >= 6)
+                    || self.frames_rendered >= 45
             } else {
                 self.frames_rendered >= 6
             };
@@ -2375,6 +2692,83 @@ fn draw_gear_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
             [egui::pos2(c.x - dx, c.y - dy), egui::pos2(c.x + dx, c.y + dy)],
             Stroke::new(1.3_f32, color),
         );
+    }
+}
+
+fn draw_folder_icon(painter: &egui::Painter, rect: egui::Rect, synced: bool) {
+    let top_color = if synced {
+        Color32::from_rgb(142, 112, 255)
+    } else {
+        Color32::from_rgb(108, 102, 128)
+    };
+    let body_color = if synced {
+        PROTON_PURPLE
+    } else {
+        Color32::from_rgb(84, 78, 104)
+    };
+    let tab_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.min.x, rect.min.y + 1.0),
+        Vec2::new(rect.width() * 0.46, 4.5),
+    );
+    let body_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.min.x, rect.min.y + 4.0),
+        egui::pos2(rect.max.x, rect.max.y - 1.0),
+    );
+    painter.rect_filled(tab_rect, CornerRadius::same(2), top_color);
+    painter.rect_filled(body_rect, CornerRadius::same(3), body_color);
+}
+
+fn draw_file_icon(painter: &egui::Painter, rect: egui::Rect, filename: &str) {
+    let r = egui::Rect::from_min_max(
+        egui::pos2(rect.min.x + 2.0, rect.min.y + 1.0),
+        egui::pos2(rect.max.x - 2.0, rect.max.y - 1.0),
+    );
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    let accent = match ext.as_str() {
+        "pdf" => Color32::from_rgb(235, 87, 87),
+        "png" | "jpg" | "jpeg" | "svg" | "webp" | "gif" => STATUS_SUCCESS,
+        "zip" | "tar" | "gz" | "7z" => STATUS_WARNING,
+        "md" | "txt" | "doc" | "docx" => PROTON_PURPLE_HOVER,
+        _ => Color32::from_rgb(154, 148, 176),
+    };
+    painter.rect_filled(r, CornerRadius::same(2), Color32::from_rgb(44, 39, 62));
+    painter.rect_stroke(
+        r,
+        CornerRadius::same(2),
+        Stroke::new(1.3_f32, accent),
+        egui::StrokeKind::Inside,
+    );
+    // Two tiny horizontal text lines inside the document icon
+    painter.line_segment(
+        [
+            egui::pos2(r.min.x + 3.5, r.min.y + 6.0),
+            egui::pos2(r.max.x - 3.5, r.min.y + 6.0),
+        ],
+        Stroke::new(1.2_f32, accent),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(r.min.x + 3.5, r.min.y + 9.5),
+            egui::pos2(r.max.x - 5.5, r.min.y + 9.5),
+        ],
+        Stroke::new(1.2_f32, accent),
+    );
+}
+
+fn format_iso_date(iso: &str) -> String {
+    // e.g. "2026-05-07T18:55:25.000Z" -> "2026-05-07  18:55"
+    if iso.len() >= 16 {
+        let date_part = &iso[0..10];
+        let time_part = &iso[11..16];
+        format!("{date_part}  {time_part}")
+    } else if iso.is_empty() {
+        "—".to_string()
+    } else {
+        iso.to_string()
     }
 }
 
