@@ -3,9 +3,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
-import { openBrowserUrl } from '../sdk/openBrowserUrl';
-
-export function launchDesktopWindow(url: string): void {
+export function launchDesktopWindow(_url?: string): void {
     const nativeGuiCandidates = [
         path.join(path.dirname(process.execPath), 'protondrive-gui'),
         path.join(process.cwd(), 'release', 'protondrive-gui'),
@@ -25,5 +23,10 @@ export function launchDesktopWindow(url: string): void {
         }
     }
 
-    openBrowserUrl(url);
+    const fallback = spawn('protondrive-gui', [], {
+        detached: true,
+        stdio: 'ignore',
+    });
+    fallback.on('error', () => {});
+    fallback.unref();
 }

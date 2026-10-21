@@ -1,6 +1,5 @@
 import path from 'node:path';
 
-import { getDashboardHtml } from '../gui/dashboardHtml';
 import { ensureSystemTrayIndicator, getSystemdServiceStatus, sendDesktopNotification } from '../linux/notifications';
 import {
     DEFAULT_APP_VERSION,
@@ -68,8 +67,9 @@ export async function startSyncDaemon(options: {
 
             try {
                 if (req.method === 'GET' && (pathname === '/' || pathname === '/dashboard')) {
-                    return new Response(getDashboardHtml(), {
-                        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+                    return Response.json({
+                        service: 'protondrive-daemon',
+                        status: engine.getStatus().state,
                     });
                 }
 

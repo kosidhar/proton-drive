@@ -85,8 +85,9 @@ if [ -d "$SRC_Root/bin" ]; then
   install -Dm644 "$SRC_Root/share/applications/ch.proton.drive.desktop" "$PREFIX/share/applications/ch.proton.drive.desktop"
   [ -f "$SRC_Root/share/metainfo/ch.proton.drive.metainfo.xml" ] && \
     install -Dm644 "$SRC_Root/share/metainfo/ch.proton.drive.metainfo.xml" "$PREFIX/share/metainfo/ch.proton.drive.metainfo.xml"
-  [ -f "$SRC_Root/share/nautilus-python/extensions/proton_drive_nautilus.py" ] && \
-    install -Dm644 "$SRC_Root/share/nautilus-python/extensions/proton_drive_nautilus.py" "$PREFIX/share/nautilus-python/extensions/proton_drive_nautilus.py"
+  rm -f "$PREFIX/share/nautilus-python/extensions/proton_drive_nautilus.py"
+  [ -f "$SRC_Root/share/nautilus-python/extensions/ch_proton_drive_nautilus.py" ] && \
+    install -Dm644 "$SRC_Root/share/nautilus-python/extensions/ch_proton_drive_nautilus.py" "$PREFIX/share/nautilus-python/extensions/ch_proton_drive_nautilus.py"
   [ -f "$SRC_Root/share/nemo-python/extensions/proton_drive_nemo.py" ] && \
     install -Dm644 "$SRC_Root/share/nemo-python/extensions/proton_drive_nemo.py" "$PREFIX/share/nemo-python/extensions/proton_drive_nemo.py"
   [ -f "$SRC_Root/share/kio/servicemenus/protondrive.desktop" ] && \
@@ -100,7 +101,8 @@ else
   cp -R "$SRC_Root/assets/app-icon/tray/"*.png "$PREFIX/share/icons/hicolor/64x64/apps/"
   install -Dm755 "$SRC_Root/linux/tray/proton_drive_tray.py" "$PREFIX/share/protondrive/proton_drive_tray.py"
   install -Dm644 "$SRC_Root/packaging/linux/ch.proton.drive.desktop" "$PREFIX/share/applications/ch.proton.drive.desktop"
-  install -Dm644 "$SRC_Root/linux/nautilus/proton_drive_nautilus.py" "$PREFIX/share/nautilus-python/extensions/proton_drive_nautilus.py"
+  rm -f "$PREFIX/share/nautilus-python/extensions/proton_drive_nautilus.py"
+  install -Dm644 "$SRC_Root/linux/nautilus/proton_drive_nautilus.py" "$PREFIX/share/nautilus-python/extensions/ch_proton_drive_nautilus.py"
   install -Dm644 "$SRC_Root/linux/nemo/proton_drive_nemo.py" "$PREFIX/share/nemo-python/extensions/proton_drive_nemo.py"
   install -Dm644 "$SRC_Root/linux/dolphin/protondrive.desktop" "$PREFIX/share/kio/servicemenus/protondrive.desktop"
 fi

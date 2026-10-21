@@ -1,21 +1,26 @@
 """
-Ubuntu Nautilus (GNOME Files) extension for Proton Drive Ubuntu Sync (Unofficial).
-Notice: This is a third-party application not officially supported by Proton.
-
-Install to:
-  ~/.local/share/nautilus-python/extensions/proton_drive_nautilus.py
-or system-wide via the .deb package:
-  /usr/share/nautilus-python/extensions/proton_drive_nautilus.py
+GNOME Files (Nautilus) extension for Proton Drive on Linux.
+Provides sync status emblems and native context menu actions (never opens a browser).
 """
 
 import json
 import os
 import subprocess
+import sys
 import urllib.parse
 import urllib.request
 from gi.repository import GObject, Nautilus
 
 DAEMON_URL = os.environ.get("PROTON_DRIVE_DAEMON_URL", "http://127.0.0.1:49152")
+
+# Neutralize any legacy /usr/share/nautilus-python/extensions/proton_drive_nautilus.py
+# that may still be installed from an older package version in the same Nautilus process.
+_legacy_mod = sys.modules.get("proton_drive_nautilus")
+if _legacy_mod is not None and hasattr(_legacy_mod, "ProtonDriveUbuntuExtension"):
+    _legacy_cls = getattr(_legacy_mod, "ProtonDriveUbuntuExtension")
+    _legacy_cls.get_file_items = lambda self, *args: []
+    _legacy_cls.get_background_items = lambda self, *args: []
+    _legacy_cls.update_file_info = lambda self, *args: None
 
 
 def _query_daemon(endpoint: str, method: str = "GET"):
@@ -27,20 +32,46 @@ def _query_daemon(endpoint: str, method: str = "GET"):
         return None
 
 
-class ProtonDriveUbuntuExtension(
+def _launch_native_gui():
+    candidates = [
+        os.path.expanduser("~/.local/bin/protondrive-gui"),
+        "/usr/bin/protondrive-gui",
+        "protondrive-gui",
+    ]
+    for bin_path in candidates:
+        try:
+            subprocess.Popen(
+                [bin_path],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return
+        except Exception:
+            continue
+
+
+class ProtonDriveNautilusExtension(
     GObject.GObject,
     Nautilus.InfoProvider,
     Nautilus.MenuProvider,
 ):
     def __init__(self):
         super().__init__()
+        self.sync_dir = os.path.expanduser("~/ProtonDrive")
+
+    def _is_inside_sync_dir(self, local_path: str) -> bool:
+        if not local_path:
+            return False
+        return local_path == self.sync_dir or local_path.startswith(self.sync_dir + os.sep)
 
     def update_file_info(self, file: Nautilus.FileInfo):
         if file.get_uri_scheme() != "file":
             return
 
         local_path = file.get_location().get_path()
-        if not local_path:
+        if not local_path or not self._is_inside_sync_dir(local_path):
             return
 
         encoded = urllib.parse.quote(local_path)
@@ -61,33 +92,51 @@ class ProtonDriveUbuntuExtension(
         if not files:
             return []
 
+        first_path = files[0].get_location().get_path()
+        if not self._is_inside_sync_dir(first_path):
+            return []
+
         sync_item = Nautilus.MenuItem(
-            name="ProtonDriveUbuntu::SyncNow",
-            label="Cloud Sync: Sync Now",
+            name="ProtonDrive::SyncNow",
+            label="Proton Drive: Sync Now",
             tip="Trigger immediate two-way synchronization with Proton Drive",
         )
         sync_item.connect("activate", self._on_sync_now)
 
-        dashboard_item = Nautilus.MenuItem(
-            name="ProtonDriveUbuntu::OpenDashboard",
-            label="Cloud Sync: Open Dashboard",
-            tip="Open the Ubuntu Cloud Sync GUI dashboard",
+        open_app_item = Nautilus.MenuItem(
+            name="ProtonDrive::OpenApp",
+            label="Open Proton Drive",
+            tip="Open the native Proton Drive desktop application",
         )
-        dashboard_item.connect("activate", self._on_open_dashboard)
+        open_app_item.connect("activate", self._on_open_app)
 
-        return [sync_item, dashboard_item]
+        return [sync_item, open_app_item]
 
     def get_background_items(self, *args):
+        folder = args[-1] if args else None
+        if folder is not None and hasattr(folder, "get_location"):
+            folder_path = folder.get_location().get_path()
+            if not self._is_inside_sync_dir(folder_path):
+                return []
+
         sync_item = Nautilus.MenuItem(
-            name="ProtonDriveUbuntu::BgSyncNow",
-            label="Cloud Sync: Sync Folder Now",
+            name="ProtonDrive::BgSyncNow",
+            label="Proton Drive: Sync Folder Now",
             tip="Trigger immediate two-way synchronization with Proton Drive",
         )
         sync_item.connect("activate", self._on_sync_now)
-        return [sync_item]
+
+        open_app_item = Nautilus.MenuItem(
+            name="ProtonDrive::BgOpenApp",
+            label="Open Proton Drive",
+            tip="Open the native Proton Drive desktop application",
+        )
+        open_app_item.connect("activate", self._on_open_app)
+
+        return [sync_item, open_app_item]
 
     def _on_sync_now(self, _menu):
         _query_daemon("/api/sync", method="POST")
 
-    def _on_open_dashboard(self, _menu):
-        subprocess.Popen(["xdg-open", DAEMON_URL], start_new_session=True)
+    def _on_open_app(self, _menu):
+        _launch_native_gui()

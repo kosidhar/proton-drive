@@ -75,7 +75,7 @@ install -Dm755 "$ROOT/linux/tray/proton_drive_tray.py" "$STAGE/usr/share/protond
 
 # File manager integrations (GNOME Nautilus, Cinnamon Nemo, KDE Dolphin)
 install -Dm644 "$ROOT/linux/nautilus/proton_drive_nautilus.py" \
-  "$STAGE/usr/share/nautilus-python/extensions/proton_drive_nautilus.py"
+  "$STAGE/usr/share/nautilus-python/extensions/ch_proton_drive_nautilus.py"
 install -Dm644 "$ROOT/linux/nemo/proton_drive_nemo.py" \
   "$STAGE/usr/share/nemo-python/extensions/proton_drive_nemo.py"
 install -Dm644 "$ROOT/linux/dolphin/protondrive.desktop" \
