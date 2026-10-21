@@ -232,6 +232,12 @@ fn save_window_geometry(geom: &WindowGeometry) {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum CloudOnlyConfirm {
+    SingleFolder(String),
+    AllFolders(Vec<String>),
+}
+
 struct ProtonDriveNativeApp {
     tab: NavTab,
     tx: Sender<WorkerCommand>,
@@ -244,6 +250,7 @@ struct ProtonDriveNativeApp {
     login_url: Option<String>,
     search_query: String,
     show_account_menu: bool,
+    pending_cloud_only_confirm: Option<CloudOnlyConfirm>,
 
     // Cloud Browser state
     remote_path: String,
@@ -284,6 +291,7 @@ impl ProtonDriveNativeApp {
         screenshot_target: Option<String>,
         initial_tab: NavTab,
         initial_account_menu: bool,
+        initial_confirm_folder: Option<String>,
         window_geometry: WindowGeometry,
     ) -> Self {
         configure_proton_theme(&cc.egui_ctx);
@@ -315,6 +323,7 @@ impl ProtonDriveNativeApp {
             login_url: None,
             search_query: String::new(),
             show_account_menu: initial_account_menu,
+            pending_cloud_only_confirm: initial_confirm_folder.map(CloudOnlyConfirm::SingleFolder),
             remote_path: "/my-files".to_string(),
             remote_items: Vec::new(),
             remote_loading: true,
@@ -1625,13 +1634,10 @@ impl ProtonDriveNativeApp {
                                     .filter(|i| i.item_type == "folder")
                                     .map(|i| i.name.clone())
                                     .collect();
-                                self.status.settings.excluded_folders = all_folder_names.clone();
-                                for sf in &mut self.selective_folders {
-                                    sf.excluded = true;
+                                if !all_folder_names.is_empty() {
+                                    self.pending_cloud_only_confirm =
+                                        Some(CloudOnlyConfirm::AllFolders(all_folder_names));
                                 }
-                                let _ = self.tx.send(WorkerCommand::SaveSettings(
-                                    serde_json::json!({ "excludedFolders": all_folder_names }),
-                                ));
                             }
 
                             ui.add_space(6.0);
@@ -2014,28 +2020,26 @@ impl ProtonDriveNativeApp {
 
                             if clicked_in_pill {
                                 if is_excluded {
+                                    // Switching from Cloud only -> Synced is non-destructive, apply immediately
                                     self.status
                                         .settings
                                         .excluded_folders
                                         .retain(|ex| ex != &item.name);
-                                } else if !self
-                                    .status
-                                    .settings
-                                    .excluded_folders
-                                    .contains(&item.name)
-                                {
-                                    self.status.settings.excluded_folders.push(item.name.clone());
-                                }
-                                for sf in &mut self.selective_folders {
-                                    if sf.name == item.name {
-                                        sf.excluded = !is_excluded;
+                                    for sf in &mut self.selective_folders {
+                                        if sf.name == item.name {
+                                            sf.excluded = false;
+                                        }
                                     }
+                                    let updated_excluded =
+                                        self.status.settings.excluded_folders.clone();
+                                    let _ = self.tx.send(WorkerCommand::SaveSettings(
+                                        serde_json::json!({ "excludedFolders": updated_excluded }),
+                                    ));
+                                } else {
+                                    // Switching from Synced -> Cloud only removes local copy: ask confirmation first
+                                    self.pending_cloud_only_confirm =
+                                        Some(CloudOnlyConfirm::SingleFolder(item.name.clone()));
                                 }
-                                let updated_excluded =
-                                    self.status.settings.excluded_folders.clone();
-                                let _ = self.tx.send(WorkerCommand::SaveSettings(
-                                    serde_json::json!({ "excludedFolders": updated_excluded }),
-                                ));
                             } else if is_folder && row_resp.clicked() {
                                 clicked_folder = Some(format!(
                                     "{}/{}",
@@ -2636,6 +2640,166 @@ impl ProtonDriveNativeApp {
             }
         });
     }
+
+    fn render_cloud_only_confirm_modal(&mut self, ctx: &egui::Context) {
+        let Some(confirm) = self.pending_cloud_only_confirm.clone() else {
+            return;
+        };
+
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.pending_cloud_only_confirm = None;
+            return;
+        }
+
+        let screen_rect = ctx.screen_rect();
+        // Paint dimmed backdrop on Foreground layer
+        egui::Area::new(egui::Id::new("cloud_only_confirm_backdrop"))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .fixed_pos(screen_rect.min)
+            .show(ctx, |ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(screen_rect.size(), Sense::hover());
+                ui.painter().rect_filled(
+                    rect,
+                    0,
+                    Color32::from_rgba_unmultiplied(10, 8, 16, 175),
+                );
+            });
+
+        let modal_w = 436.0;
+        let modal_h = 216.0;
+        let modal_pos = egui::pos2(
+            screen_rect.center().x - modal_w * 0.5,
+            screen_rect.center().y - modal_h * 0.5,
+        );
+
+        let (title, body_line1) = match &confirm {
+            CloudOnlyConfirm::SingleFolder(name) => (
+                format!("Switch \"{name}\" to Cloud only?"),
+                format!(
+                    "This will remove the local copy of \"{name}\" from your computer to free up disk space."
+                ),
+            ),
+            CloudOnlyConfirm::AllFolders(names) => (
+                format!("Switch all {} folders to Cloud only?", names.len()),
+                "This will remove the local copies of all top-level folders from your computer to free up disk space.".to_string(),
+            ),
+        };
+
+        let area_resp = egui::Area::new(egui::Id::new("cloud_only_confirm_dialog"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(modal_pos)
+            .show(ctx, |ui| {
+                Frame::NONE
+                    .fill(Color32::from_rgb(33, 29, 46))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(76, 66, 108)))
+                    .corner_radius(CornerRadius::same(14))
+                    .shadow(egui::Shadow {
+                        offset: [0, 12],
+                        blur: 32,
+                        spread: 2,
+                        color: Color32::from_rgba_unmultiplied(0, 0, 0, 190),
+                    })
+                    .inner_margin(Margin::symmetric(24, 22))
+                    .show(ui, |ui| {
+                        ui.set_min_width(modal_w - 48.0);
+                        ui.set_max_width(modal_w - 48.0);
+
+                        ui.label(
+                            RichText::new(title)
+                                .size(16.5)
+                                .strong()
+                                .color(TEXT_PRIMARY),
+                        );
+                        ui.add_space(10.0);
+                        ui.label(RichText::new(body_line1).size(13.0).color(TEXT_PRIMARY));
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(
+                                "Your files remain safely stored in Proton Drive cloud and can be re-synced anytime.",
+                            )
+                            .size(12.5)
+                            .color(TEXT_MUTED),
+                        );
+
+                        ui.add_space(20.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if proton_button(
+                                ui,
+                                Vec2::new(158.0, 36.0),
+                                "Switch to Cloud only",
+                                PROTON_PURPLE,
+                                PROTON_PURPLE_HOVER,
+                                None,
+                                Color32::WHITE,
+                                13.0,
+                            )
+                            .clicked()
+                            {
+                                match confirm {
+                                    CloudOnlyConfirm::SingleFolder(folder_name) => {
+                                        if !self
+                                            .status
+                                            .settings
+                                            .excluded_folders
+                                            .contains(&folder_name)
+                                        {
+                                            self.status
+                                                .settings
+                                                .excluded_folders
+                                                .push(folder_name.clone());
+                                        }
+                                        for sf in &mut self.selective_folders {
+                                            if sf.name == folder_name {
+                                                sf.excluded = true;
+                                            }
+                                        }
+                                    }
+                                    CloudOnlyConfirm::AllFolders(all_names) => {
+                                        self.status.settings.excluded_folders = all_names;
+                                        for sf in &mut self.selective_folders {
+                                            sf.excluded = true;
+                                        }
+                                    }
+                                }
+                                let updated_excluded =
+                                    self.status.settings.excluded_folders.clone();
+                                let _ = self.tx.send(WorkerCommand::SaveSettings(
+                                    serde_json::json!({ "excludedFolders": updated_excluded }),
+                                ));
+                                self.pending_cloud_only_confirm = None;
+                            }
+
+                            ui.add_space(8.0);
+
+                            if proton_button(
+                                ui,
+                                Vec2::new(88.0, 36.0),
+                                "Cancel",
+                                BG_CARD_ALT,
+                                Color32::from_rgb(56, 50, 76),
+                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE)),
+                                TEXT_PRIMARY,
+                                13.0,
+                            )
+                            .clicked()
+                            {
+                                self.pending_cloud_only_confirm = None;
+                            }
+                        });
+                    });
+            });
+
+        // Dismiss if clicked outside the modal dialog
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                if !area_resp.response.rect.contains(pos) {
+                    self.pending_cloud_only_confirm = None;
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for ProtonDriveNativeApp {
@@ -2728,6 +2892,9 @@ impl eframe::App for ProtonDriveNativeApp {
                     .inner_margin(Margin::symmetric(26, 20)),
             )
             .show(ctx, |ui| {
+                if self.pending_cloud_only_confirm.is_some() {
+                    ui.disable();
+                }
                 match self.tab {
                     NavTab::Overview => self.render_overview_tab(ui),
                     NavTab::CloudBrowser => self.render_browser_tab(ui),
@@ -2738,6 +2905,7 @@ impl eframe::App for ProtonDriveNativeApp {
             });
 
         self.render_account_popover(ctx);
+        self.render_cloud_only_confirm_modal(ctx);
 
         // Handle --screenshot <path> for automated visual inspection
         if let Some(target_path) = self.screenshot_target.clone() {
@@ -3432,6 +3600,7 @@ fn main() -> eframe::Result {
     let mut screenshot_target: Option<String> = None;
     let mut initial_tab = NavTab::CloudBrowser;
     let mut initial_account_menu = false;
+    let mut initial_confirm_folder: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -3440,6 +3609,9 @@ fn main() -> eframe::Result {
             }
             "--account-menu" => {
                 initial_account_menu = true;
+            }
+            "--confirm-cloud-only" => {
+                initial_confirm_folder = args.next();
             }
             "--tab" => {
                 if let Some(t) = args.next() {
@@ -3519,6 +3691,7 @@ fn main() -> eframe::Result {
                 screenshot_target,
                 initial_tab,
                 initial_account_menu,
+                initial_confirm_folder,
                 saved_geom,
             )))
         }),
