@@ -812,30 +812,30 @@ impl ProtonDriveNativeApp {
                     self.show_account_menu = !self.show_account_menu;
                 }
 
-                ui.add_space(10.0);
+                ui.add_space(12.0);
 
-                // Subtle vertical divider
-                let (div_rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 24.0), Sense::hover());
-                ui.painter().rect_filled(div_rect, 0, BORDER_SUBTLE);
-
-                ui.add_space(10.0);
-
-                // Settings Icon Button
+                // Settings Icon Button (matching Proton official header cogwheel)
                 let (gear_rect, gear_resp) =
                     ui.allocate_exact_size(Vec2::new(32.0, 32.0), Sense::click());
-                if gear_resp.hovered() || self.tab == NavTab::Settings {
+                if gear_resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     ui.painter().rect_filled(
                         gear_rect,
                         CornerRadius::same(8),
                         BG_CARD_ALT,
                     );
                 }
-                draw_gear_icon(ui.painter(), gear_rect.shrink(8.0), TEXT_MUTED);
+                let gear_color = if gear_resp.hovered() || self.tab == NavTab::Settings {
+                    TEXT_PRIMARY
+                } else {
+                    Color32::from_rgb(218, 214, 232)
+                };
+                draw_gear_icon(ui.painter(), gear_rect.shrink(7.0), gear_color);
                 if gear_resp.on_hover_text("Synchronization Settings").clicked() {
                     self.tab = NavTab::Settings;
                 }
 
-                ui.add_space(6.0);
+                ui.add_space(10.0);
 
                 // Pause / Resume Button (centered text)
                 let paused = self.status.settings.paused;
@@ -2716,7 +2716,7 @@ fn draw_nav_icon(painter: &egui::Painter, rect: egui::Rect, tab: NavTab, color: 
             painter.circle_filled(egui::pos2(c.x, c.y + 3.2), 1.0, color);
         }
         NavTab::Settings => {
-            draw_gear_icon(painter, rect.shrink(1.0), color);
+            draw_gear_icon(painter, rect.shrink(0.5), color);
         }
     }
 }
@@ -2732,21 +2732,40 @@ fn draw_search_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
 }
 
 fn draw_gear_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
-    let stroke = Stroke::new(1.5_f32, color);
+    // Official Proton Carbon `ic-cog-wheel` 8-tooth outline cogwheel + hollow center circle
     let c = rect.center();
-    let r_outer = rect.width() * 0.44;
-    let r_inner = rect.width() * 0.20;
-    painter.circle_stroke(c, r_outer * 0.75, stroke);
-    painter.circle_filled(c, r_inner, color);
-    for i in 0..4 {
-        let angle = i as f32 * std::f32::consts::FRAC_PI_4;
-        let dx = angle.cos() * r_outer;
-        let dy = angle.sin() * r_outer;
-        painter.line_segment(
-            [egui::pos2(c.x - dx, c.y - dy), egui::pos2(c.x + dx, c.y + dy)],
-            Stroke::new(1.3_f32, color),
-        );
+    let radius = rect.width().min(rect.height()) * 0.5;
+    let r_outer = radius * 0.96;
+    let r_valley = radius * 0.72;
+    let r_hole = radius * 0.33;
+    let stroke = Stroke::new(1.35_f32, color);
+
+    let teeth = 8;
+    let step = std::f32::consts::TAU / teeth as f32;
+    let half_tip = 0.13_f32; // angular half-width of tooth crest (~7.5 deg)
+    let half_base = 0.22_f32; // angular half-width of tooth base (~12.6 deg)
+
+    let mut pts = Vec::with_capacity(teeth * 5);
+    for i in 0..teeth {
+        let theta = i as f32 * step;
+        let a0 = theta - half_base;
+        let a1 = theta - half_tip;
+        let a2 = theta + half_tip;
+        let a3 = theta + half_base;
+        let a_mid_valley = theta + step * 0.5;
+
+        pts.push(egui::pos2(c.x + a0.cos() * r_valley, c.y + a0.sin() * r_valley));
+        pts.push(egui::pos2(c.x + a1.cos() * r_outer, c.y + a1.sin() * r_outer));
+        pts.push(egui::pos2(c.x + a2.cos() * r_outer, c.y + a2.sin() * r_outer));
+        pts.push(egui::pos2(c.x + a3.cos() * r_valley, c.y + a3.sin() * r_valley));
+        pts.push(egui::pos2(
+            c.x + a_mid_valley.cos() * r_valley,
+            c.y + a_mid_valley.sin() * r_valley,
+        ));
     }
+
+    painter.add(egui::Shape::closed_line(pts, stroke));
+    painter.circle_stroke(c, r_hole, stroke);
 }
 
 fn draw_folder_icon(painter: &egui::Painter, rect: egui::Rect, synced: bool) {
