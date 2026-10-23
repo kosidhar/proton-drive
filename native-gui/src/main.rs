@@ -1808,7 +1808,7 @@ impl ProtonDriveNativeApp {
     fn render_browser_toolbar(&mut self, ui: &mut egui::Ui, count: Option<&str>, navigate_to: &mut Option<String>) {
         if proton_button(
             ui,
-            Vec2::new(84.0, 32.0),
+            Vec2::new(TOOLBAR_REFRESH_W, 32.0),
             "Refresh",
             PROTON_PURPLE,
             PROTON_PURPLE_HOVER,
@@ -1825,7 +1825,7 @@ impl ProtonDriveNativeApp {
 
         if proton_button(
             ui,
-            Vec2::new(108.0, 32.0),
+            Vec2::new(TOOLBAR_NEW_FOLDER_W, 32.0),
             "+ New folder",
             BG_CARD_ALT(),
             btn_secondary_hover_bg(),
@@ -1845,7 +1845,7 @@ impl ProtonDriveNativeApp {
                 ui.add_space(6.0);
                 if proton_button(
                     ui,
-                    Vec2::new(98.0, 32.0),
+                    Vec2::new(TOOLBAR_CLOUD_ONLY_ALL_W, 32.0),
                     "Cloud Only All",
                     BG_CARD_ALT(),
                     btn_secondary_hover_bg(),
@@ -1873,7 +1873,7 @@ impl ProtonDriveNativeApp {
                 ui.add_space(6.0);
                 if proton_button(
                     ui,
-                    Vec2::new(76.0, 32.0),
+                    Vec2::new(TOOLBAR_SYNC_ALL_W, 32.0),
                     "Sync All",
                     BG_CARD_ALT(),
                     btn_secondary_hover_bg(),
@@ -1980,8 +1980,12 @@ impl ProtonDriveNativeApp {
             let crumbs_w = breadcrumbs_width(ui.painter(), &parts, gap);
             let has_items = !self.remote_items.is_empty();
             let is_root_bar = self.remote_path == "/my-files" || self.remote_path == "/";
-            let buttons_w = 84.0 + 6.0 + 108.0 + gap * 2.0
-                + if has_items && is_root_bar { 6.0 + 98.0 + 6.0 + 76.0 + gap * 2.0 } else { 0.0 };
+            let buttons_w = TOOLBAR_REFRESH_W + 6.0 + TOOLBAR_NEW_FOLDER_W + gap * 2.0
+                + if has_items && is_root_bar {
+                    6.0 + TOOLBAR_CLOUD_ONLY_ALL_W + 6.0 + TOOLBAR_SYNC_ALL_W + gap * 2.0
+                } else {
+                    0.0
+                };
             let folder_count = self.remote_items.iter().filter(|i| i.item_type == "folder").count();
             let file_count = self.remote_items.len().saturating_sub(folder_count);
             let count_text = format!("{folder_count} folders  •  {file_count} files");
@@ -3071,10 +3075,34 @@ fn render_breadcrumbs(ui: &mut egui::Ui, parts: &[String], navigate_to: &mut Opt
     }
 
     // Interactive Breadcrumbs ("My files  ›  subfolder")
+    let crumb_font = FontId::new(BREADCRUMB_FONT_SIZE, FontFamily::Proportional);
+    let crumb_chrome_w = BREADCRUMB_PAD_X * 2.0 + 2.0;
+    let separator_w = text_width(ui.painter(), "›", &FontId::new(BREADCRUMB_SEPARATOR_SIZE, FontFamily::Proportional));
+    let gap = ui.spacing().item_spacing.x;
     for (idx, part) in parts.iter().enumerate() {
         let is_last = idx + 1 == parts.len();
         let label = breadcrumb_label(idx, part);
         let target_path = format!("/{}", parts[..=idx].join("/"));
+
+        // In the wrapping (two-row) toolbar, start a new row rather than breaking a folder name inside its
+        // pill, and shorten a single crumb that's wider than a whole row (full name on hover). Both are
+        // no-ops in the one-row layout, which is only used when every crumb fits.
+        // (available_width() is the whole row in a wrapping layout; what's left on this row is
+        // available_size_before_wrap.)
+        let separator = if is_last { 0.0 } else { gap + separator_w };
+        let at_row_start = ui.cursor().left() <= ui.max_rect().left() + 0.5;
+        if !at_row_start
+            && text_width(ui.painter(), label, &crumb_font) + crumb_chrome_w + separator
+                > ui.available_size_before_wrap().x
+        {
+            ui.end_row();
+        }
+        let shown = truncate_middle_to_width(
+            ui.painter(),
+            label,
+            &crumb_font,
+            ui.available_size_before_wrap().x - crumb_chrome_w - separator,
+        );
 
         let crumb_fill = if is_last {
             PROTON_PURPLE_SOFT()
@@ -3087,21 +3115,27 @@ fn render_breadcrumbs(ui: &mut egui::Ui, parts: &[String], navigate_to: &mut Opt
             TEXT_MUTED()
         };
 
-        let resp = Frame::NONE
+        let mut resp = Frame::NONE
             .fill(crumb_fill)
             .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
             .corner_radius(CornerRadius::same(7))
-            .inner_margin(Margin::symmetric(12, 6))
+            .inner_margin(Margin::symmetric(BREADCRUMB_PAD_X as i8, 6))
             .show(ui, |ui| {
-                ui.label(
-                    RichText::new(label)
-                        .size(13.5)
-                        .strong()
-                        .color(crumb_text_col),
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&shown)
+                            .size(BREADCRUMB_FONT_SIZE)
+                            .strong()
+                            .color(crumb_text_col),
+                    )
+                    .extend(),
                 );
             })
             .response
             .interact(Sense::click());
+        if shown != label {
+            resp = resp.on_hover_text(label);
+        }
 
         if !is_last {
             if resp.hovered() {
@@ -3110,7 +3144,7 @@ fn render_breadcrumbs(ui: &mut egui::Ui, parts: &[String], navigate_to: &mut Opt
             if resp.clicked() {
                 *navigate_to = Some(target_path);
             }
-            ui.label(RichText::new("›").size(15.0).color(TEXT_MUTED()));
+            ui.label(RichText::new("›").size(BREADCRUMB_SEPARATOR_SIZE).color(TEXT_MUTED()));
         }
     }
 }
@@ -3125,15 +3159,15 @@ fn breadcrumb_label(idx: usize, part: &str) -> &str {
 
 /// Width of the My files breadcrumb row as `render_breadcrumbs` lays it out.
 fn breadcrumbs_width(painter: &egui::Painter, parts: &[String], gap: f32) -> f32 {
-    let crumb_font = FontId::new(13.5, FontFamily::Proportional);
-    let separator_w = text_width(painter, "›", &FontId::new(15.0, FontFamily::Proportional));
+    let crumb_font = FontId::new(BREADCRUMB_FONT_SIZE, FontFamily::Proportional);
+    let separator_w = text_width(painter, "›", &FontId::new(BREADCRUMB_SEPARATOR_SIZE, FontFamily::Proportional));
     let up_w = if parts.len() > 1 { 34.0 + 4.0 + gap } else { 0.0 };
     up_w + parts
         .iter()
         .enumerate()
         .map(|(idx, part)| {
             let separator = if idx + 1 == parts.len() { 0.0 } else { separator_w + gap };
-            text_width(painter, breadcrumb_label(idx, part), &crumb_font) + 12.0 * 2.0 + 2.0 + gap + separator
+            text_width(painter, breadcrumb_label(idx, part), &crumb_font) + BREADCRUMB_PAD_X * 2.0 + 2.0 + gap + separator
         })
         .sum::<f32>()
 }
@@ -3177,6 +3211,13 @@ fn proton_button(
     resp
 }
 
+const BREADCRUMB_FONT_SIZE: f32 = 13.5;
+const BREADCRUMB_SEPARATOR_SIZE: f32 = 15.0;
+const BREADCRUMB_PAD_X: f32 = 12.0;
+const TOOLBAR_REFRESH_W: f32 = 84.0;
+const TOOLBAR_NEW_FOLDER_W: f32 = 108.0;
+const TOOLBAR_CLOUD_ONLY_ALL_W: f32 = 98.0;
+const TOOLBAR_SYNC_ALL_W: f32 = 76.0;
 /// Safety margin for toolbar widths that are estimated before layout.
 const TOOLBAR_FIT_SLACK: f32 = 12.0;
 
@@ -4202,6 +4243,24 @@ mod tests {
             }
             // The decision follows the measured text: a long quota needs a wider window
             assert!(switch_points[0] > switch_points[1]);
+        });
+    }
+
+    #[test]
+    fn breadcrumbs_width_matches_the_laid_out_breadcrumbs() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let gap = ui.spacing().item_spacing.x;
+                for path in ["/my-files", "/my-files/logo/exports", "/my-files/写真/trailamigo-store-screenshots-2026-10"] {
+                    let parts: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(String::from).collect();
+                    let mut nav = None;
+                    let laid_out = ui.horizontal(|ui| render_breadcrumbs(ui, &parts, &mut nav)).response.rect.width();
+                    let estimate = breadcrumbs_width(ui.painter(), &parts, gap);
+                    // The estimate also counts the gap before whatever follows the last crumb
+                    assert!((estimate - (laid_out + gap)).abs() < 0.5, "{path}: {estimate} vs {laid_out} + {gap}");
+                }
+            });
         });
     }
 
