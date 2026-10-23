@@ -2065,7 +2065,8 @@ impl ProtonDriveNativeApp {
             let hdr_y = hdr_rect.center().y;
             let date_font = FontId::new(12.0, FontFamily::Proportional);
             let date_w = text_width(ui.painter(), "0000-00-00  00:00", &date_font);
-            let hdr_cols = browser_columns(hdr_rect, date_w);
+            let short_date_w = text_width(ui.painter(), "0000-00-00", &date_font);
+            let hdr_cols = browser_columns(hdr_rect, date_w, short_date_w);
 
             ui.painter().text(
                 egui::pos2(hdr_rect.min.x + 16.0, hdr_y),
@@ -2196,7 +2197,7 @@ impl ProtonDriveNativeApp {
                             );
 
                             let row_cy = row_rect.center().y;
-                            let row_cols = browser_columns(row_rect, date_w);
+                            let row_cols = browser_columns(row_rect, date_w, short_date_w);
                             let row_status_x = row_cols.status_x;
 
                             // 1. Name Column (Vector Folder/File Icon + Item Name)
@@ -2368,12 +2369,18 @@ impl ProtonDriveNativeApp {
                                 );
                             }
 
-                            // 3. Modified Date Column (dropped on the narrowest windows)
+                            // 3. Modified Date Column (date only on narrow windows, dropped on the narrowest)
                             if let Some(mod_x) = row_cols.mod_x {
+                                let modified = format_iso_date(&item.modification_time);
+                                let modified = if row_cols.date_only {
+                                    modified.chars().take(10).collect()
+                                } else {
+                                    modified
+                                };
                                 ui.painter().text(
                                     egui::pos2(mod_x, row_cy),
                                     egui::Align2::LEFT_CENTER,
-                                    format_iso_date(&item.modification_time),
+                                    modified,
                                     date_font.clone(),
                                     TEXT_MUTED(),
                                 );
@@ -3219,7 +3226,7 @@ const TABLE_COL_GAP: f32 = 16.0;
 const TABLE_STATUS_PILL_W: f32 = 96.0;
 /// Fits the widest formatted size, e.g. "1023.9 MB".
 const TABLE_SIZE_COL_W: f32 = 64.0;
-const TABLE_NAME_MIN_W: f32 = 160.0;
+const TABLE_NAME_MIN_W: f32 = 140.0;
 
 /// Room for about five 38px activity rows.
 const ACTIVITY_TABLE_MIN_HEIGHT: f32 = 200.0;
@@ -3738,32 +3745,45 @@ fn render_transfer_line(ui: &mut egui::Ui, t: &ActiveTransfer) -> (egui::Rect, e
 struct BrowserColumns {
     name_max_w: f32,
     status_x: f32,
+    /// Left edge of the Modified column, if it's shown at all
     mod_x: Option<f32>,
+    /// Show only the date (no time) in Modified
+    date_only: bool,
     size_right_x: f32,
 }
 
-/// The original column spacing when there's room for it; on narrower rows the columns pack against
-/// Size, and when even that would squeeze names below TABLE_NAME_MIN_W the Modified column is dropped.
-fn browser_columns(row: egui::Rect, date_w: f32) -> BrowserColumns {
+/// The original column spacing on wide rows. As the row narrows the columns slide right (names keep
+/// ~194px) until they're packed against Size, then names shrink to TABLE_NAME_MIN_W. Past that Modified
+/// shows the date only, and on the very narrowest rows it's dropped.
+fn browser_columns(row: egui::Rect, date_w: f32, short_date_w: f32) -> BrowserColumns {
     let name_left = row.min.x + 46.0;
     let size_right_x = row.max.x - 18.0;
     let size_left = size_right_x - TABLE_SIZE_COL_W;
     let names_fit = |status_x: f32| status_x - TABLE_COL_GAP - name_left >= TABLE_NAME_MIN_W;
+    // Status and Modified packed as far right as they go, for a given date width
+    let packed = |date_w: f32| {
+        let mod_x = size_left - TABLE_COL_GAP - date_w;
+        (mod_x - TABLE_COL_GAP - TABLE_STATUS_PILL_W, mod_x)
+    };
 
-    let roomy_status_x = row.max.x - 395.0;
-    let packed_mod_x = size_left - TABLE_COL_GAP - date_w;
-    let packed_status_x = packed_mod_x - TABLE_COL_GAP - TABLE_STATUS_PILL_W;
-    let (status_x, mod_x) = if names_fit(roomy_status_x) {
-        (roomy_status_x, Some(row.max.x - 245.0))
-    } else if names_fit(packed_status_x) {
-        (packed_status_x, Some(packed_mod_x))
+    let (full_status_x, full_mod_x) = packed(date_w);
+    let (short_status_x, short_mod_x) = packed(short_date_w);
+    let (status_x, mod_x, date_only) = if names_fit(full_status_x) {
+        let status_x = (row.max.x - 395.0).max(full_status_x.min(row.min.x + 240.0));
+        let mod_x = (row.max.x - 245.0)
+            .max(status_x + TABLE_STATUS_PILL_W + TABLE_COL_GAP)
+            .min(full_mod_x);
+        (status_x, Some(mod_x), false)
+    } else if names_fit(short_status_x) {
+        (short_status_x, Some(short_mod_x), true)
     } else {
-        (size_left - TABLE_COL_GAP - TABLE_STATUS_PILL_W, None)
+        (size_left - TABLE_COL_GAP - TABLE_STATUS_PILL_W, None, false)
     };
     BrowserColumns {
         name_max_w: status_x - TABLE_COL_GAP - name_left,
         status_x,
         mod_x,
+        date_only,
         size_right_x,
     }
 }
@@ -4339,31 +4359,44 @@ mod tests {
 
     #[test]
     fn browser_columns_keep_wide_layout_and_never_overlap_when_narrow() {
-        let date_w = 105.0;
+        // Inter 12pt widths of "0000-00-00  00:00" and "0000-00-00"
+        let (date_w, short_date_w) = (118.0, 76.0);
         let row = |w: f32| egui::Rect::from_min_size(egui::pos2(300.0, 0.0), Vec2::new(w, 45.0));
 
         // Wide rows keep the original spacing
-        let wide = browser_columns(row(1100.0), date_w);
+        let wide = browser_columns(row(1100.0), date_w, short_date_w);
         assert_eq!(wide.status_x, 300.0 + 1100.0 - 395.0);
         assert_eq!(wide.mod_x, Some(300.0 + 1100.0 - 245.0));
+        assert!(!wide.date_only);
 
+        let mut prev: Option<BrowserColumns> = None;
         for w in (400..=1400).step_by(5).map(|w| w as f32) {
-            let c = browser_columns(row(w), date_w);
+            let c = browser_columns(row(w), date_w, short_date_w);
             let size_left = c.size_right_x - TABLE_SIZE_COL_W;
             let status_right = c.status_x + TABLE_STATUS_PILL_W;
+            let shown_date_w = if c.date_only { short_date_w } else { date_w };
             match c.mod_x {
                 Some(mod_x) => {
                     assert!(status_right + TABLE_COL_GAP <= mod_x + 0.01, "{w}: status runs into Modified");
-                    assert!(mod_x + date_w + TABLE_COL_GAP <= size_left + 0.01, "{w}: Modified runs into Size");
+                    assert!(mod_x + shown_date_w + TABLE_COL_GAP <= size_left + 0.01, "{w}: Modified runs into Size");
                     assert!(c.name_max_w >= TABLE_NAME_MIN_W, "{w}: Modified kept at the cost of names");
                 }
                 None => assert!(status_right + TABLE_COL_GAP <= size_left + 0.01, "{w}: status runs into Size"),
             }
             assert!(c.status_x - TABLE_COL_GAP - c.name_max_w >= 300.0 + 46.0 - 0.01, "{w}: name area overlaps status");
+            // No jumps while resizing, other than where the date format changes
+            if let Some(p) = &prev {
+                if p.date_only == c.date_only && p.mod_x.is_some() == c.mod_x.is_some() {
+                    assert!((c.status_x - p.status_x).abs() <= 5.01, "{w}: status column jumps");
+                }
+            }
+            prev = Some(c);
         }
-        // Modified is only dropped when there's genuinely no room for it
-        assert!(browser_columns(row(496.0), date_w).mod_x.is_none());
-        assert!(browser_columns(row(560.0), date_w).mod_x.is_some());
+        // At the minimum window's row width the date stays visible (date only); Modified goes only below that
+        let narrow = browser_columns(row(496.0), date_w, short_date_w);
+        assert!(narrow.mod_x.is_some() && narrow.date_only);
+        assert!(browser_columns(row(560.0), date_w, short_date_w).mod_x.is_some());
+        assert!(browser_columns(row(460.0), date_w, short_date_w).mod_x.is_none());
     }
 
     #[test]
