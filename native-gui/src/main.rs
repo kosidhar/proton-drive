@@ -1083,7 +1083,7 @@ impl ProtonDriveNativeApp {
                     + search_min_w
                     + gap * 3.0;
                 let show_name = ui.available_width() >= name_w + 12.0 + gap + after_name_w;
-                if !show_name {
+                if !show_name && !self.show_account_menu {
                     avatar_resp.on_hover_text(format!("{display_name}\n{email}"));
                 }
                 if show_name {
@@ -1219,7 +1219,8 @@ impl ProtonDriveNativeApp {
                                     (ui.available_width() - clear_w).clamp(0.0, TOP_BAR_SEARCH_MAX_TEXT_WIDTH);
                                 let full_hint = "Search files and sync activity";
                                 let hint_font = egui::TextStyle::Body.resolve(ui.style());
-                                let hint = if text_width(ui.painter(), full_hint, &hint_font) <= text_w {
+                                // TextEdit insets its text (and placeholder) by a 4px margin on each side
+                                let hint = if text_width(ui.painter(), full_hint, &hint_font) <= text_w - 8.0 {
                                     full_hint
                                 } else {
                                     "Search…"
@@ -1674,7 +1675,9 @@ impl ProtonDriveNativeApp {
             // While part of the table is off screen the wheel scrolls the page, bringing the table fully into
             // view; only then does the table take the wheel itself
             let table_rect = egui::Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), table_h));
-            let table_in_view = ui.clip_rect().contains_rect(table_rect.shrink(0.5));
+            // (If the table can never be fully visible, e.g. when zoomed in, it always scrolls itself.)
+            let table_in_view = ui.clip_rect().contains_rect(table_rect.shrink(0.5))
+                || table_h >= ui.clip_rect().height();
             ScrollArea::vertical()
                 .id_salt("activity_table_scroll")
                 .max_height(table_h)
