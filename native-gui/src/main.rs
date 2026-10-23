@@ -2106,9 +2106,9 @@ impl ProtonDriveNativeApp {
                 table_header_bg(),
             );
             let hdr_y = hdr_rect.center().y;
-            let status_x = (hdr_rect.max.x - 395.0).max(hdr_rect.min.x + 240.0);
-            let mod_x = (hdr_rect.max.x - 245.0).max(status_x + 110.0);
-            let size_right_x = hdr_rect.max.x - 18.0;
+            let date_font = FontId::new(12.0, FontFamily::Proportional);
+            let date_w = text_width(ui.painter(), "0000-00-00  00:00", &date_font);
+            let hdr_cols = browser_columns(hdr_rect, date_w);
 
             ui.painter().text(
                 egui::pos2(hdr_rect.min.x + 16.0, hdr_y),
@@ -2118,21 +2118,23 @@ impl ProtonDriveNativeApp {
                 TEXT_MUTED(),
             );
             ui.painter().text(
-                egui::pos2(status_x, hdr_y),
+                egui::pos2(hdr_cols.status_x, hdr_y),
                 egui::Align2::LEFT_CENTER,
                 "Sync Status",
                 FontId::new(12.0, FontFamily::Proportional),
                 TEXT_MUTED(),
             );
+            if let Some(mod_x) = hdr_cols.mod_x {
+                ui.painter().text(
+                    egui::pos2(mod_x, hdr_y),
+                    egui::Align2::LEFT_CENTER,
+                    "Modified",
+                    FontId::new(12.0, FontFamily::Proportional),
+                    TEXT_MUTED(),
+                );
+            }
             ui.painter().text(
-                egui::pos2(mod_x, hdr_y),
-                egui::Align2::LEFT_CENTER,
-                "Modified",
-                FontId::new(12.0, FontFamily::Proportional),
-                TEXT_MUTED(),
-            );
-            ui.painter().text(
-                egui::pos2(size_right_x, hdr_y),
+                egui::pos2(hdr_cols.size_right_x, hdr_y),
                 egui::Align2::RIGHT_CENTER,
                 "Size",
                 FontId::new(12.0, FontFamily::Proportional),
@@ -2237,10 +2239,8 @@ impl ProtonDriveNativeApp {
                             );
 
                             let row_cy = row_rect.center().y;
-                            let row_status_x =
-                                (row_rect.max.x - 395.0).max(row_rect.min.x + 240.0);
-                            let row_mod_x = (row_rect.max.x - 245.0).max(row_status_x + 110.0);
-                            let row_size_right_x = row_rect.max.x - 18.0;
+                            let row_cols = browser_columns(row_rect, date_w);
+                            let row_status_x = row_cols.status_x;
 
                             // 1. Name Column (Vector Folder/File Icon + Item Name)
                             let ic_rect = egui::Rect::from_center_size(
@@ -2254,11 +2254,19 @@ impl ProtonDriveNativeApp {
                             }
 
                             let name_color = TEXT_PRIMARY();
+                            let name_font = FontId::new(13.5, FontFamily::Proportional);
+                            let name_text =
+                                truncate_middle_to_width(ui.painter(), &item.name, &name_font, row_cols.name_max_w);
+                            if name_text != item.name
+                                && row_resp.hover_pos().is_some_and(|p| p.x < row_cols.status_x)
+                            {
+                                row_resp.clone().on_hover_text(&item.name);
+                            }
                             ui.painter().text(
                                 egui::pos2(row_rect.min.x + 46.0, row_cy),
                                 egui::Align2::LEFT_CENTER,
-                                truncate_middle(&item.name, 54),
-                                FontId::new(13.5, FontFamily::Proportional),
+                                name_text,
+                                name_font,
                                 name_color,
                             );
 
@@ -2304,7 +2312,7 @@ impl ProtonDriveNativeApp {
 
                             let pill_rect = egui::Rect::from_min_size(
                                 egui::pos2(row_status_x, row_cy - 11.0),
-                                Vec2::new(96.0, 22.0),
+                                Vec2::new(TABLE_STATUS_PILL_W, 22.0),
                             );
                             let can_toggle_sync = is_root && is_folder;
                             let pointer_pos = ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
@@ -2403,14 +2411,16 @@ impl ProtonDriveNativeApp {
                                 );
                             }
 
-                            // 3. Modified Date Column
-                            ui.painter().text(
-                                egui::pos2(row_mod_x, row_cy),
-                                egui::Align2::LEFT_CENTER,
-                                format_iso_date(&item.modification_time),
-                                FontId::new(12.0, FontFamily::Proportional),
-                                TEXT_MUTED(),
-                            );
+                            // 3. Modified Date Column (dropped on the narrowest windows)
+                            if let Some(mod_x) = row_cols.mod_x {
+                                ui.painter().text(
+                                    egui::pos2(mod_x, row_cy),
+                                    egui::Align2::LEFT_CENTER,
+                                    format_iso_date(&item.modification_time),
+                                    date_font.clone(),
+                                    TEXT_MUTED(),
+                                );
+                            }
 
                             // 4. Size Column
                             let size_str = if is_folder {
@@ -2419,7 +2429,7 @@ impl ProtonDriveNativeApp {
                                 format_bytes(item.size)
                             };
                             ui.painter().text(
-                                egui::pos2(row_size_right_x, row_cy),
+                                egui::pos2(row_cols.size_right_x, row_cy),
                                 egui::Align2::RIGHT_CENTER,
                                 size_str,
                                 FontId::new(12.0, FontFamily::Proportional),
@@ -3248,6 +3258,12 @@ const TOP_BAR_SEARCH_MIN_TEXT_WIDTH: f32 = 110.0;
 const TOP_BAR_SEARCH_MAX_TEXT_WIDTH: f32 = 280.0;
 const TOP_BAR_STATUS_MAX_WIDTH: f32 = 240.0;
 
+const TABLE_COL_GAP: f32 = 16.0;
+const TABLE_STATUS_PILL_W: f32 = 96.0;
+/// Fits the widest formatted size, e.g. "1023.9 MB".
+const TABLE_SIZE_COL_W: f32 = 64.0;
+const TABLE_NAME_MIN_W: f32 = 160.0;
+
 /// Room for about five 38px activity rows.
 const ACTIVITY_TABLE_MIN_HEIGHT: f32 = 200.0;
 
@@ -3724,6 +3740,40 @@ fn activity_header_detail(painter: &egui::Painter, usage: &str, sync_dir: &str, 
         return usage.to_string();
     }
     String::new()
+}
+
+/// Column positions in the My files table, shared by the header and the rows.
+struct BrowserColumns {
+    name_max_w: f32,
+    status_x: f32,
+    mod_x: Option<f32>,
+    size_right_x: f32,
+}
+
+/// The original column spacing when there's room for it; on narrower rows the columns pack against
+/// Size, and when even that would squeeze names below TABLE_NAME_MIN_W the Modified column is dropped.
+fn browser_columns(row: egui::Rect, date_w: f32) -> BrowserColumns {
+    let name_left = row.min.x + 46.0;
+    let size_right_x = row.max.x - 18.0;
+    let size_left = size_right_x - TABLE_SIZE_COL_W;
+    let names_fit = |status_x: f32| status_x - TABLE_COL_GAP - name_left >= TABLE_NAME_MIN_W;
+
+    let roomy_status_x = row.max.x - 395.0;
+    let packed_mod_x = size_left - TABLE_COL_GAP - date_w;
+    let packed_status_x = packed_mod_x - TABLE_COL_GAP - TABLE_STATUS_PILL_W;
+    let (status_x, mod_x) = if names_fit(roomy_status_x) {
+        (roomy_status_x, Some(row.max.x - 245.0))
+    } else if names_fit(packed_status_x) {
+        (packed_status_x, Some(packed_mod_x))
+    } else {
+        (size_left - TABLE_COL_GAP - TABLE_STATUS_PILL_W, None)
+    };
+    BrowserColumns {
+        name_max_w: status_x - TABLE_COL_GAP - name_left,
+        status_x,
+        mod_x,
+        size_right_x,
+    }
 }
 
 /// Spawn `cmd` and wait on it from a background thread so it never lingers as a zombie child.
@@ -4267,6 +4317,35 @@ mod tests {
             // The decision follows the measured text: a long quota needs a wider window
             assert!(switch_points[0] > switch_points[1]);
         });
+    }
+
+    #[test]
+    fn browser_columns_keep_wide_layout_and_never_overlap_when_narrow() {
+        let date_w = 105.0;
+        let row = |w: f32| egui::Rect::from_min_size(egui::pos2(300.0, 0.0), Vec2::new(w, 45.0));
+
+        // Wide rows keep the original spacing
+        let wide = browser_columns(row(1100.0), date_w);
+        assert_eq!(wide.status_x, 300.0 + 1100.0 - 395.0);
+        assert_eq!(wide.mod_x, Some(300.0 + 1100.0 - 245.0));
+
+        for w in (400..=1400).step_by(5).map(|w| w as f32) {
+            let c = browser_columns(row(w), date_w);
+            let size_left = c.size_right_x - TABLE_SIZE_COL_W;
+            let status_right = c.status_x + TABLE_STATUS_PILL_W;
+            match c.mod_x {
+                Some(mod_x) => {
+                    assert!(status_right + TABLE_COL_GAP <= mod_x + 0.01, "{w}: status runs into Modified");
+                    assert!(mod_x + date_w + TABLE_COL_GAP <= size_left + 0.01, "{w}: Modified runs into Size");
+                    assert!(c.name_max_w >= TABLE_NAME_MIN_W, "{w}: Modified kept at the cost of names");
+                }
+                None => assert!(status_right + TABLE_COL_GAP <= size_left + 0.01, "{w}: status runs into Size"),
+            }
+            assert!(c.status_x - TABLE_COL_GAP - c.name_max_w >= 300.0 + 46.0 - 0.01, "{w}: name area overlaps status");
+        }
+        // Modified is only dropped when there's genuinely no room for it
+        assert!(browser_columns(row(496.0), date_w).mod_x.is_none());
+        assert!(browser_columns(row(560.0), date_w).mod_x.is_some());
     }
 
     #[test]
