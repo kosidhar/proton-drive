@@ -1690,10 +1690,15 @@ impl ProtonDriveNativeApp {
             let used_h = ui.cursor().top() - content_top;
             let table_h = (viewport_h - used_h - card_frame().total_margin().bottom - 10.0)
                 .max(ACTIVITY_TABLE_MIN_HEIGHT);
+            // While part of the table is off screen the wheel scrolls the page, bringing the table fully into
+            // view; only then does the table take the wheel itself
+            let table_rect = egui::Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), table_h));
+            let table_in_view = ui.clip_rect().contains_rect(table_rect.shrink(0.5));
             ScrollArea::vertical()
                 .id_salt("activity_table_scroll")
                 .max_height(table_h)
                 .min_scrolled_height(table_h)
+                .enable_scrolling(table_in_view)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
