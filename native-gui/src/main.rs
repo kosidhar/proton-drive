@@ -1439,6 +1439,18 @@ impl ProtonDriveNativeApp {
     }
 
     fn render_overview_tab(&mut self, ui: &mut egui::Ui) {
+        // The page scrolls when the window is too short for the stat cards plus a usable activity
+        // table; on taller windows the table fills the rest exactly, so no page scrollbar appears.
+        let viewport_h = ui.available_height();
+        ScrollArea::vertical()
+            .id_salt("overview_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.render_overview_content(ui, viewport_h));
+    }
+
+    fn render_overview_content(&mut self, ui: &mut egui::Ui, viewport_h: f32) {
+        let content_top = ui.cursor().top();
+
         // Section Title Bar
         ui.horizontal(|ui| {
             ui.label(
@@ -1652,9 +1664,16 @@ impl ProtonDriveNativeApp {
 
             ui.add_space(4.0);
 
+            // Fill what's left of the viewport, but never fewer than ~5 rows. min_scrolled_height lets the
+            // table be taller than the visible space (egui caps nested scroll areas to it); the page
+            // scroll area then scrolls to reveal the rest.
+            let used_h = ui.cursor().top() - content_top;
+            let table_h = (viewport_h - used_h - card_frame().total_margin().bottom - 10.0)
+                .max(ACTIVITY_TABLE_MIN_HEIGHT);
             ScrollArea::vertical()
                 .id_salt("activity_table_scroll")
-                .max_height((ui.available_height() - 10.0).max(200.0))
+                .max_height(table_h)
+                .min_scrolled_height(table_h)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
@@ -3160,6 +3179,9 @@ const TOOLBAR_FIT_SLACK: f32 = 12.0;
 const TOP_BAR_SEARCH_MIN_TEXT_WIDTH: f32 = 110.0;
 const TOP_BAR_SEARCH_MAX_TEXT_WIDTH: f32 = 280.0;
 const TOP_BAR_STATUS_MAX_WIDTH: f32 = 240.0;
+
+/// Room for about five 38px activity rows.
+const ACTIVITY_TABLE_MIN_HEIGHT: f32 = 200.0;
 
 const STAT_LABEL_SIZE: f32 = 12.5;
 const STAT_VALUE_SIZE: f32 = 24.0;
