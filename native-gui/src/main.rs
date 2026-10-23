@@ -1775,6 +1775,111 @@ impl ProtonDriveNativeApp {
         });
     }
 
+    /// My files toolbar, laid out right to left: Refresh, New folder, the root-only Sync All /
+    /// Cloud Only All buttons and, when there's room, the item count.
+    fn render_browser_toolbar(&mut self, ui: &mut egui::Ui, count: Option<&str>, navigate_to: &mut Option<String>) {
+        if proton_button(
+            ui,
+            Vec2::new(84.0, 32.0),
+            "Refresh",
+            PROTON_PURPLE,
+            PROTON_PURPLE_HOVER,
+            None,
+            Color32::WHITE,
+            13.0,
+        )
+        .clicked()
+        {
+            *navigate_to = Some(self.remote_path.clone());
+        }
+
+        ui.add_space(6.0);
+
+        if proton_button(
+            ui,
+            Vec2::new(108.0, 32.0),
+            "+ New folder",
+            BG_CARD_ALT(),
+            btn_secondary_hover_bg(),
+            Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+            TEXT_PRIMARY(),
+            13.0,
+        )
+        .clicked()
+        {
+            self.show_new_folder_modal = !self.show_new_folder_modal;
+        }
+
+        if !self.remote_items.is_empty() {
+            let is_root_bar =
+                self.remote_path == "/my-files" || self.remote_path == "/";
+            if is_root_bar {
+                ui.add_space(6.0);
+                if proton_button(
+                    ui,
+                    Vec2::new(98.0, 32.0),
+                    "Cloud Only All",
+                    BG_CARD_ALT(),
+                    btn_secondary_hover_bg(),
+                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                    TEXT_MUTED(),
+                    12.0,
+                )
+                .on_hover_text(
+                    "Switch all top-level folders to Cloud only (remove local copies)",
+                )
+                .clicked()
+                {
+                    let all_folder_names: Vec<String> = self
+                        .remote_items
+                        .iter()
+                        .filter(|i| i.item_type == "folder")
+                        .map(|i| i.name.clone())
+                        .collect();
+                    if !all_folder_names.is_empty() {
+                        self.pending_cloud_only_confirm =
+                            Some(CloudOnlyConfirm::AllFolders(all_folder_names));
+                    }
+                }
+
+                ui.add_space(6.0);
+                if proton_button(
+                    ui,
+                    Vec2::new(76.0, 32.0),
+                    "Sync All",
+                    BG_CARD_ALT(),
+                    btn_secondary_hover_bg(),
+                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                    TEXT_PRIMARY(),
+                    12.0,
+                )
+                .on_hover_text("Sync all top-level folders to this computer")
+                .clicked()
+                {
+                    let prev_excluded =
+                        std::mem::take(&mut self.status.settings.excluded_folders);
+                    for folder_name in prev_excluded {
+                        if !self.pending_sync_folders.contains(&folder_name) {
+                            self.pending_sync_folders.push(folder_name.clone());
+                        }
+                        if !self.status.syncing_folders.contains(&folder_name) {
+                            self.status.syncing_folders.push(folder_name);
+                        }
+                    }
+                    self.status.state = "syncing".to_string();
+                    let _ = self.tx.send(WorkerCommand::SaveSettings(
+                        serde_json::json!({ "excludedFolders": Vec::<String>::new() }),
+                    ));
+                }
+            }
+
+            if let Some(count) = count {
+                ui.add_space(10.0);
+                ui.label(RichText::new(count).size(12.0).color(TEXT_MUTED()));
+            }
+        }
+    }
+
     fn render_browser_tab(&mut self, ui: &mut egui::Ui) {
         // If there is an active transfer, show a compact live sync banner above My files
         if let Some(t) = self.status.active_transfers.first() {
@@ -1841,190 +1946,39 @@ impl ProtonDriveNativeApp {
 
             let mut navigate_to: Option<String> = None;
 
-            ui.horizontal(|ui| {
-                // Up button if deeper than /my-files
-                if parts.len() > 1 {
-                    if proton_button(
-                        ui,
-                        Vec2::new(34.0, 32.0),
-                        "↑",
-                        BG_CARD_ALT(),
-                        btn_secondary_hover_bg(),
-                        Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                        TEXT_PRIMARY(),
-                        14.0,
-                    )
-                    .on_hover_text("Go to parent folder")
-                    .clicked()
-                    {
-                        let parent = format!("/{}", parts[..parts.len() - 1].join("/"));
-                        navigate_to = Some(parent);
-                    }
-                    ui.add_space(4.0);
-                }
+            // Breadcrumbs and toolbar share one row when they fit. On narrow windows the item count is
+            // dropped first, then the buttons move to their own row, so nothing spills past the card.
+            let gap = ui.spacing().item_spacing.x;
+            let crumbs_w = breadcrumbs_width(ui.painter(), &parts, gap);
+            let has_items = !self.remote_items.is_empty();
+            let is_root_bar = self.remote_path == "/my-files" || self.remote_path == "/";
+            let buttons_w = 84.0 + 6.0 + 108.0 + gap * 2.0
+                + if has_items && is_root_bar { 6.0 + 98.0 + 6.0 + 76.0 + gap * 2.0 } else { 0.0 };
+            let folder_count = self.remote_items.iter().filter(|i| i.item_type == "folder").count();
+            let file_count = self.remote_items.len().saturating_sub(folder_count);
+            let count_text = format!("{folder_count} folders  •  {file_count} files");
+            let count_w = 10.0 + text_width(ui.painter(), &count_text, &FontId::new(12.0, FontFamily::Proportional)) + gap;
+            let available = ui.available_width() - TOOLBAR_FIT_SLACK;
+            let one_row = crumbs_w + buttons_w <= available;
+            let row_room = if one_row { available - crumbs_w } else { available };
+            let count = (has_items && buttons_w + count_w <= row_room).then_some(count_text.as_str());
 
-                // Interactive Breadcrumbs ("My files  ›  subfolder")
-                for (idx, part) in parts.iter().enumerate() {
-                    let is_last = idx + 1 == parts.len();
-                    let label = if idx == 0 && part == "my-files" {
-                        "My files"
-                    } else {
-                        part.as_str()
-                    };
-                    let target_path = format!("/{}", parts[..=idx].join("/"));
-
-                    let crumb_fill = if is_last {
-                        PROTON_PURPLE_SOFT()
-                    } else {
-                        BG_INPUT()
-                    };
-                    let crumb_text_col = if is_last {
-                        TEXT_PRIMARY()
-                    } else {
-                        TEXT_MUTED()
-                    };
-
-                    let resp = Frame::NONE
-                        .fill(crumb_fill)
-                        .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
-                        .corner_radius(CornerRadius::same(7))
-                        .inner_margin(Margin::symmetric(12, 6))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new(label)
-                                    .size(13.5)
-                                    .strong()
-                                    .color(crumb_text_col),
-                            );
-                        })
-                        .response
-                        .interact(Sense::click());
-
-                    if !is_last {
-                        if resp.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                        if resp.clicked() {
-                            navigate_to = Some(target_path);
-                        }
-                        ui.label(RichText::new("›").size(15.0).color(TEXT_MUTED()));
-                    }
-                }
-
-                // Right-side Toolbar Buttons & Item Counter
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if proton_button(
-                        ui,
-                        Vec2::new(84.0, 32.0),
-                        "Refresh",
-                        PROTON_PURPLE,
-                        PROTON_PURPLE_HOVER,
-                        None,
-                        Color32::WHITE,
-                        13.0,
-                    )
-                    .clicked()
-                    {
-                        navigate_to = Some(self.remote_path.clone());
-                    }
-
-                    ui.add_space(6.0);
-
-                    if proton_button(
-                        ui,
-                        Vec2::new(108.0, 32.0),
-                        "+ New folder",
-                        BG_CARD_ALT(),
-                        btn_secondary_hover_bg(),
-                        Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                        TEXT_PRIMARY(),
-                        13.0,
-                    )
-                    .clicked()
-                    {
-                        self.show_new_folder_modal = !self.show_new_folder_modal;
-                    }
-
-                    if !self.remote_items.is_empty() {
-                        let is_root_bar =
-                            self.remote_path == "/my-files" || self.remote_path == "/";
-                        if is_root_bar {
-                            ui.add_space(6.0);
-                            if proton_button(
-                                ui,
-                                Vec2::new(98.0, 32.0),
-                                "Cloud Only All",
-                                BG_CARD_ALT(),
-                                btn_secondary_hover_bg(),
-                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                                TEXT_MUTED(),
-                                12.0,
-                            )
-                            .on_hover_text(
-                                "Switch all top-level folders to Cloud only (remove local copies)",
-                            )
-                            .clicked()
-                            {
-                                let all_folder_names: Vec<String> = self
-                                    .remote_items
-                                    .iter()
-                                    .filter(|i| i.item_type == "folder")
-                                    .map(|i| i.name.clone())
-                                    .collect();
-                                if !all_folder_names.is_empty() {
-                                    self.pending_cloud_only_confirm =
-                                        Some(CloudOnlyConfirm::AllFolders(all_folder_names));
-                                }
-                            }
-
-                            ui.add_space(6.0);
-                            if proton_button(
-                                ui,
-                                Vec2::new(76.0, 32.0),
-                                "Sync All",
-                                BG_CARD_ALT(),
-                                btn_secondary_hover_bg(),
-                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                                TEXT_PRIMARY(),
-                                12.0,
-                            )
-                            .on_hover_text("Sync all top-level folders to this computer")
-                            .clicked()
-                            {
-                                let prev_excluded =
-                                    std::mem::take(&mut self.status.settings.excluded_folders);
-                                for folder_name in prev_excluded {
-                                    if !self.pending_sync_folders.contains(&folder_name) {
-                                        self.pending_sync_folders.push(folder_name.clone());
-                                    }
-                                    if !self.status.syncing_folders.contains(&folder_name) {
-                                        self.status.syncing_folders.push(folder_name);
-                                    }
-                                }
-                                self.status.state = "syncing".to_string();
-                                let _ = self.tx.send(WorkerCommand::SaveSettings(
-                                    serde_json::json!({ "excludedFolders": Vec::<String>::new() }),
-                                ));
-                            }
-                        }
-
-                        ui.add_space(10.0);
-                        let folder_count = self
-                            .remote_items
-                            .iter()
-                            .filter(|i| i.item_type == "folder")
-                            .count();
-                        let file_count = self.remote_items.len().saturating_sub(folder_count);
-                        ui.label(
-                            RichText::new(format!(
-                                "{folder_count} folders  •  {file_count} files"
-                            ))
-                            .size(12.0)
-                            .color(TEXT_MUTED()),
-                        );
-                    }
+            if one_row {
+                ui.horizontal(|ui| {
+                    render_breadcrumbs(ui, &parts, &mut navigate_to);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        self.render_browser_toolbar(ui, count, &mut navigate_to);
+                    });
                 });
-            });
+            } else {
+                ui.horizontal_wrapped(|ui| render_breadcrumbs(ui, &parts, &mut navigate_to));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        self.render_browser_toolbar(ui, count, &mut navigate_to);
+                    });
+                });
+            }
 
             if let Some(next_path) = navigate_to {
                 self.remote_loading = true;
@@ -3065,6 +3019,97 @@ impl eframe::App for ProtonDriveNativeApp {
     }
 }
 
+/// Up button plus clickable "My files › subfolder" breadcrumbs for the My files tab.
+fn render_breadcrumbs(ui: &mut egui::Ui, parts: &[String], navigate_to: &mut Option<String>) {
+    // Up button if deeper than /my-files
+    if parts.len() > 1 {
+        if proton_button(
+            ui,
+            Vec2::new(34.0, 32.0),
+            "↑",
+            BG_CARD_ALT(),
+            btn_secondary_hover_bg(),
+            Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+            TEXT_PRIMARY(),
+            14.0,
+        )
+        .on_hover_text("Go to parent folder")
+        .clicked()
+        {
+            let parent = format!("/{}", parts[..parts.len() - 1].join("/"));
+            *navigate_to = Some(parent);
+        }
+        ui.add_space(4.0);
+    }
+
+    // Interactive Breadcrumbs ("My files  ›  subfolder")
+    for (idx, part) in parts.iter().enumerate() {
+        let is_last = idx + 1 == parts.len();
+        let label = breadcrumb_label(idx, part);
+        let target_path = format!("/{}", parts[..=idx].join("/"));
+
+        let crumb_fill = if is_last {
+            PROTON_PURPLE_SOFT()
+        } else {
+            BG_INPUT()
+        };
+        let crumb_text_col = if is_last {
+            TEXT_PRIMARY()
+        } else {
+            TEXT_MUTED()
+        };
+
+        let resp = Frame::NONE
+            .fill(crumb_fill)
+            .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
+            .corner_radius(CornerRadius::same(7))
+            .inner_margin(Margin::symmetric(12, 6))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(label)
+                        .size(13.5)
+                        .strong()
+                        .color(crumb_text_col),
+                );
+            })
+            .response
+            .interact(Sense::click());
+
+        if !is_last {
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if resp.clicked() {
+                *navigate_to = Some(target_path);
+            }
+            ui.label(RichText::new("›").size(15.0).color(TEXT_MUTED()));
+        }
+    }
+}
+
+fn breadcrumb_label(idx: usize, part: &str) -> &str {
+    if idx == 0 && part == "my-files" {
+        "My files"
+    } else {
+        part
+    }
+}
+
+/// Width of the My files breadcrumb row as `render_breadcrumbs` lays it out.
+fn breadcrumbs_width(painter: &egui::Painter, parts: &[String], gap: f32) -> f32 {
+    let crumb_font = FontId::new(13.5, FontFamily::Proportional);
+    let separator_w = text_width(painter, "›", &FontId::new(15.0, FontFamily::Proportional));
+    let up_w = if parts.len() > 1 { 34.0 + 4.0 + gap } else { 0.0 };
+    up_w + parts
+        .iter()
+        .enumerate()
+        .map(|(idx, part)| {
+            let separator = if idx + 1 == parts.len() { 0.0 } else { separator_w + gap };
+            text_width(painter, breadcrumb_label(idx, part), &crumb_font) + 12.0 * 2.0 + 2.0 + gap + separator
+        })
+        .sum::<f32>()
+}
+
 fn card_frame() -> Frame {
     Frame::NONE
         .fill(BG_CARD())
@@ -3103,6 +3148,9 @@ fn proton_button(
     );
     resp
 }
+
+/// Safety margin for toolbar widths that are estimated before layout.
+const TOOLBAR_FIT_SLACK: f32 = 12.0;
 
 const TOP_BAR_SEARCH_MIN_TEXT_WIDTH: f32 = 110.0;
 const TOP_BAR_SEARCH_MAX_TEXT_WIDTH: f32 = 280.0;
