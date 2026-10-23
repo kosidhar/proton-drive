@@ -1587,16 +1587,21 @@ impl ProtonDriveNativeApp {
                 );
                 if let Some(acct) = &self.status.account {
                     if acct.used_drive_space > 0 {
+                        let usage =
+                            format!("Drive Cloud Usage: {}", format_bytes_precise(acct.used_drive_space));
+                        let full = format!("{usage}  •  Syncing {}", self.status.sync_dir);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "Drive Cloud Usage: {}  •  Syncing {}",
-                                    format_bytes_precise(acct.used_drive_space),
-                                    self.status.sync_dir
-                                ))
-                                .size(12.0)
-                                .color(TEXT_MUTED()),
-                            );
+                            // Fit the space left of the title instead of running over it
+                            let font = FontId::new(12.0, FontFamily::Proportional);
+                            let room = ui.available_width() - 16.0;
+                            let shown =
+                                activity_header_detail(ui.painter(), &usage, &self.status.sync_dir, &font, room);
+                            if !shown.is_empty() {
+                                let resp = ui.label(RichText::new(&shown).size(12.0).color(TEXT_MUTED()));
+                                if shown != full {
+                                    resp.on_hover_text(&full);
+                                }
+                            }
                         });
                     }
                 }
@@ -3612,6 +3617,25 @@ fn fit_font_size(painter: &egui::Painter, text: &str, base_size: f32, min_size: 
     size.max(min_size)
 }
 
+/// The Recent Sync Activity header detail, "<usage>  •  Syncing <dir>", fitted to `max_width`: the
+/// folder path is middle-truncated first, then dropped, then the whole text.
+fn activity_header_detail(painter: &egui::Painter, usage: &str, sync_dir: &str, font: &FontId, max_width: f32) -> String {
+    let prefix = format!("{usage}  •  Syncing ");
+    let full = format!("{prefix}{sync_dir}");
+    if text_width(painter, &full, font) <= max_width {
+        return full;
+    }
+    let path = truncate_middle_to_width(painter, sync_dir, font, max_width - text_width(painter, &prefix, font));
+    // Only keep the path while enough of it survives to be recognisable
+    if path.chars().count() >= 12 {
+        return format!("{prefix}{path}");
+    }
+    if text_width(painter, usage, font) <= max_width {
+        return usage.to_string();
+    }
+    String::new()
+}
+
 /// Spawn `cmd` and wait on it from a background thread so it never lingers as a zombie child.
 fn spawn_reaped(cmd: &mut Command) -> std::io::Result<()> {
     let mut child = cmd.spawn()?;
@@ -4146,6 +4170,28 @@ mod tests {
             }
             // The decision follows the measured text: a long quota needs a wider window
             assert!(switch_points[0] > switch_points[1]);
+        });
+    }
+
+    #[test]
+    fn activity_header_detail_shortens_path_then_drops_it_then_everything() {
+        with_painter(|p| {
+            let font = FontId::proportional(12.0);
+            let usage = "Drive Cloud Usage: 13.13 GB";
+            let dir = "/home/gautam-chauhan/ProtonDrive";
+            let full = format!("{usage}  •  Syncing {dir}");
+            let full_w = text_width(p, &full, &font);
+
+            assert_eq!(activity_header_detail(p, usage, dir, &font, full_w + 10.0), full);
+
+            let shortened = activity_header_detail(p, usage, dir, &font, full_w - 60.0);
+            assert!(shortened.starts_with(&format!("{usage}  •  Syncing /")), "{shortened:?}");
+            assert!(shortened.contains('…') && shortened.ends_with("ProtonDrive"));
+            assert!(text_width(p, &shortened, &font) <= full_w - 60.0);
+
+            let usage_w = text_width(p, usage, &font);
+            assert_eq!(activity_header_detail(p, usage, dir, &font, usage_w + 20.0), usage);
+            assert_eq!(activity_header_detail(p, usage, dir, &font, usage_w - 1.0), "");
         });
     }
 
