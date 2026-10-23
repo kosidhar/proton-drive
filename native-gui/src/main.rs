@@ -464,7 +464,7 @@ struct ProtonDriveNativeApp {
     new_folder_name: String,
     show_new_folder_modal: bool,
 
-    // Selective sync state
+    // Ignore patterns editor (Settings)
     ignore_patterns_text: String,
     settings_dirty: bool,
 
@@ -3968,7 +3968,7 @@ USAGE:
   protondrive-gui [OPTIONS]
 
 OPTIONS:
-  --tab <TAB>           initial tab (overview | browser | selective | conflicts | settings)
+  --tab <TAB>           initial tab (overview | browser | conflicts | settings)
   --screenshot <PATH>   render UI, save a PNG screenshot to PATH, and exit
   --search <QUERY>      pre-fill the search/filter box
   --path <FOLDER>       open My files at a remote folder, e.g. /my-files/photos
