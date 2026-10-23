@@ -1077,9 +1077,16 @@ impl ProtonDriveNativeApp {
                     .max(text_width(ui.painter(), &email, &FontId::new(11.5, FontFamily::Proportional)))
                     + 1.0;
                 let status_reserve_w = text_width(ui.painter(), "Sign in required", &status_font);
-                let after_name_w =
-                    32.0 + 10.0 + 76.0 + 6.0 + pill_chrome_w + status_reserve_w + search_min_w + gap * 3.0;
-                if ui.available_width() >= name_w + 12.0 + gap + after_name_w {
+                let after_name_w = TOP_BAR_GEAR_SIZE + 10.0 + TOP_BAR_PAUSE_W + 6.0
+                    + pill_chrome_w
+                    + status_reserve_w
+                    + search_min_w
+                    + gap * 3.0;
+                let show_name = ui.available_width() >= name_w + 12.0 + gap + after_name_w;
+                if !show_name {
+                    avatar_resp.on_hover_text(format!("{display_name}\n{email}"));
+                }
+                if show_name {
                     let name_resp = ui
                         .allocate_ui_with_layout(
                             Vec2::new(name_w, 34.0),
@@ -1108,7 +1115,7 @@ impl ProtonDriveNativeApp {
 
                 // Settings Icon Button (matching Proton official header cogwheel)
                 let (gear_rect, gear_resp) =
-                    ui.allocate_exact_size(Vec2::new(32.0, 32.0), Sense::click());
+                    ui.allocate_exact_size(Vec2::splat(TOP_BAR_GEAR_SIZE), Sense::click());
                 if gear_resp.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     ui.painter().rect_filled(
@@ -1134,7 +1141,7 @@ impl ProtonDriveNativeApp {
                 let pause_label = if paused { "Resume" } else { "Pause" };
                 if proton_button(
                     ui,
-                    Vec2::new(76.0, 30.0),
+                    Vec2::new(TOP_BAR_PAUSE_W, 30.0),
                     pause_label,
                     BG_CARD(),
                     BG_CARD_ALT(),
@@ -1207,15 +1214,24 @@ impl ProtonDriveNativeApp {
                                     ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
                                 draw_search_icon(ui.painter(), s_rect, TEXT_MUTED());
                                 ui.add_space(4.0);
-                                let clear_w = if self.search_query.is_empty() { 0.0 } else { 24.0 };
+                                let clear_w = if self.search_query.is_empty() { 0.0 } else { 25.0 };
+                                let text_w =
+                                    (ui.available_width() - clear_w).clamp(0.0, TOP_BAR_SEARCH_MAX_TEXT_WIDTH);
+                                let full_hint = "Search files and sync activity";
+                                let hint_font = egui::TextStyle::Body.resolve(ui.style());
+                                let hint = if text_width(ui.painter(), full_hint, &hint_font) <= text_w {
+                                    full_hint
+                                } else {
+                                    "Search…"
+                                };
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.search_query)
-                                        .hint_text("Search files and sync activity")
+                                        // Stable id: the widgets laid out before it vary (the name block can
+                                        // hide), and an auto id would drop focus when they do
+                                        .id_salt("top_bar_search")
+                                        .hint_text(hint)
                                         .frame(false)
-                                        .desired_width(
-                                            (ui.available_width() - clear_w)
-                                                .clamp(0.0, TOP_BAR_SEARCH_MAX_TEXT_WIDTH),
-                                        ),
+                                        .desired_width(text_w),
                                 );
                                 if !self.search_query.is_empty()
                                     && ui
@@ -3221,6 +3237,8 @@ const TOOLBAR_SYNC_ALL_W: f32 = 76.0;
 /// Safety margin for toolbar widths that are estimated before layout.
 const TOOLBAR_FIT_SLACK: f32 = 12.0;
 
+const TOP_BAR_GEAR_SIZE: f32 = 32.0;
+const TOP_BAR_PAUSE_W: f32 = 76.0;
 const TOP_BAR_SEARCH_MIN_TEXT_WIDTH: f32 = 110.0;
 const TOP_BAR_SEARCH_MAX_TEXT_WIDTH: f32 = 280.0;
 const TOP_BAR_STATUS_MAX_WIDTH: f32 = 240.0;
