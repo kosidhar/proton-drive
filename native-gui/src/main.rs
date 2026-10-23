@@ -319,7 +319,7 @@ enum WorkerCommand {
 
 enum WorkerEvent {
     StatusAndActivity {
-        status: Result<DaemonStatus, String>,
+        status: Box<Result<DaemonStatus, String>>,
         activity: Vec<ActivityRecord>,
     },
     LoginStarted(String),
@@ -603,7 +603,7 @@ impl ProtonDriveNativeApp {
     fn process_worker_events(&mut self) {
         while let Ok(evt) = self.rx.try_recv() {
             match evt {
-                WorkerEvent::StatusAndActivity { status, activity } => match status {
+                WorkerEvent::StatusAndActivity { status, activity } => match *status {
                     Ok(s) => {
                         let was_offline = !self.daemon_online;
                         self.daemon_online = true;
@@ -3416,6 +3416,7 @@ fn card_frame() -> Frame {
         .inner_margin(Margin::same(18))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn proton_button(
     ui: &mut egui::Ui,
     size: Vec2,
@@ -3950,13 +3951,16 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
 
                 let activity = fetch_activity();
 
-                let _ = tx.send(WorkerEvent::StatusAndActivity { status, activity });
+                let _ = tx.send(WorkerEvent::StatusAndActivity {
+                    status: Box::new(status),
+                    activity,
+                });
                 ctx.request_repaint();
             }
             WorkerCommand::TriggerSync => {
                 let _ = ureq::post(&format!("{DAEMON_URL}/api/sync")).call();
                 let _ = tx.send(WorkerEvent::StatusAndActivity {
-                    status: fetch_status(),
+                    status: Box::new(fetch_status()),
                     activity: fetch_activity(),
                 });
                 ctx.request_repaint();
@@ -3965,7 +3969,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                 let _ = ureq::post(&format!("{DAEMON_URL}/api/pause"))
                     .send_json(serde_json::json!({ "paused": paused }));
                 let _ = tx.send(WorkerEvent::StatusAndActivity {
-                    status: fetch_status(),
+                    status: Box::new(fetch_status()),
                     activity: fetch_activity(),
                 });
                 ctx.request_repaint();
@@ -3986,7 +3990,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
             WorkerCommand::Logout => {
                 let _ = ureq::post(&format!("{DAEMON_URL}/api/auth/logout")).call();
                 let _ = tx.send(WorkerEvent::StatusAndActivity {
-                    status: fetch_status(),
+                    status: Box::new(fetch_status()),
                     activity: fetch_activity(),
                 });
                 ctx.request_repaint();
@@ -4042,7 +4046,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
             WorkerCommand::SaveSettings(payload) => {
                 let _ = ureq::post(&format!("{DAEMON_URL}/api/settings")).send_json(payload);
                 let _ = tx.send(WorkerEvent::StatusAndActivity {
-                    status: fetch_status(),
+                    status: Box::new(fetch_status()),
                     activity: fetch_activity(),
                 });
                 ctx.request_repaint();
@@ -4359,7 +4363,7 @@ mod tests {
         with_painter(|p| {
             let quota = "13.22 GB / 510.00 GB";
             let size = fit_font_size(p, quota, 24.0, 14.0, 200.0);
-            assert!(size < 24.0 && size >= 14.0);
+            assert!((14.0..24.0).contains(&size));
             assert!(text_width(p, quota, &FontId::proportional(size)) <= 200.0);
             assert_eq!(fit_font_size(p, quota, 24.0, 14.0, 20.0), 14.0);
         });
