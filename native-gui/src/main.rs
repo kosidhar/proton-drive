@@ -1572,26 +1572,7 @@ impl ProtonDriveNativeApp {
                     } else {
                         0.5
                     };
-                    ui.horizontal(|ui| {
-                        let badge = if t.direction == "upload" {
-                            "↑ Uploading"
-                        } else {
-                            "↓ Downloading"
-                        };
-                        ui.label(RichText::new(badge).size(12.5).strong().color(PROTON_PURPLE_TEXT()));
-                        ui.label(RichText::new(&t.rel_path).size(12.5).color(TEXT_PRIMARY()));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} / {}",
-                                    format_bytes(t.bytes_transferred),
-                                    format_bytes(t.total_bytes)
-                                ))
-                                .size(12.0)
-                                .color(TEXT_MUTED()),
-                            );
-                        });
-                    });
+                    render_transfer_line(ui, t);
                     ui.add_space(4.0);
                     ui.add(
                         egui::ProgressBar::new(frac)
@@ -1944,31 +1925,7 @@ impl ProtonDriveNativeApp {
                 .inner_margin(Margin::symmetric(14, 10))
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        let badge = if t.direction == "upload" {
-                            "↑ Uploading"
-                        } else {
-                            "↓ Downloading"
-                        };
-                        ui.label(
-                            RichText::new(badge)
-                                .size(12.5)
-                                .strong()
-                                .color(PROTON_PURPLE_TEXT()),
-                        );
-                        ui.label(RichText::new(&t.rel_path).size(12.5).color(TEXT_PRIMARY()));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} / {}",
-                                    format_bytes(t.bytes_transferred),
-                                    format_bytes(t.total_bytes)
-                                ))
-                                .size(12.0)
-                                .color(TEXT_MUTED()),
-                            );
-                        });
-                    });
+                    render_transfer_line(ui, t);
                     ui.add_space(4.0);
                     ui.add(
                         egui::ProgressBar::new(frac)
@@ -3742,6 +3699,41 @@ fn activity_header_detail(painter: &egui::Painter, usage: &str, sync_dir: &str, 
     String::new()
 }
 
+/// One active-transfer line: direction badge, the path (middle-truncated to the room left, full path on
+/// hover) and the right-aligned "transferred / total". Returns the path and byte-count label rects.
+fn render_transfer_line(ui: &mut egui::Ui, t: &ActiveTransfer) -> (egui::Rect, egui::Rect) {
+    ui.horizontal(|ui| {
+        let badge = if t.direction == "upload" { "↑ Uploading" } else { "↓ Downloading" };
+        ui.label(RichText::new(badge).size(12.5).strong().color(PROTON_PURPLE_TEXT()));
+        // Byte counts first (right to left) so the path gets what's left and never runs under them
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let counts_rect = ui
+                .label(
+                    RichText::new(format!("{} / {}", format_bytes(t.bytes_transferred), format_bytes(t.total_bytes)))
+                        .size(12.0)
+                        .color(TEXT_MUTED()),
+                )
+                .rect;
+            let path_rect = ui
+                .with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    let font = FontId::new(12.5, FontFamily::Proportional);
+                    let room = ui.available_width() - ui.spacing().item_spacing.x;
+                    let shown = truncate_middle_to_width(ui.painter(), &t.rel_path, &font, room);
+                    let resp = ui.label(RichText::new(&shown).size(12.5).color(TEXT_PRIMARY()));
+                    let rect = resp.rect;
+                    if shown != t.rel_path {
+                        resp.on_hover_text(&t.rel_path);
+                    }
+                    rect
+                })
+                .inner;
+            (path_rect, counts_rect)
+        })
+        .inner
+    })
+    .inner
+}
+
 /// Column positions in the My files table, shared by the header and the rows.
 struct BrowserColumns {
     name_max_w: f32,
@@ -4317,6 +4309,32 @@ mod tests {
             // The decision follows the measured text: a long quota needs a wider window
             assert!(switch_points[0] > switch_points[1]);
         });
+    }
+
+    #[test]
+    fn transfer_line_keeps_the_path_clear_of_the_byte_counts() {
+        let transfer = ActiveTransfer {
+            id: "t1".into(),
+            direction: "download".into(),
+            rel_path: "xyz/Gabriela Valientes/archive/2025/summer/gabiinthewild_1753137399_3863415252.mp4".into(),
+            bytes_transferred: 512 * 1024 * 1024,
+            total_bytes: 1536 * 1024 * 1024,
+        };
+        for screen_width in [480.0, 700.0, 1400.0] {
+            let ctx = egui::Context::default();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(screen_width, 300.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let row_right = ui.max_rect().right();
+                    let (path_rect, counts_rect) = render_transfer_line(ui, &transfer);
+                    assert!(path_rect.right() <= counts_rect.left(), "{screen_width}: path runs under the counts");
+                    assert!(counts_rect.right() <= row_right + 0.5, "{screen_width}: counts pushed out of the row");
+                });
+            });
+        }
     }
 
     #[test]
