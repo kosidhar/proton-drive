@@ -495,6 +495,7 @@ impl ProtonDriveNativeApp {
         initial_tab: NavTab,
         initial_account_menu: bool,
         initial_confirm_folder: Option<String>,
+        initial_path: Option<String>,
         window_geometry: WindowGeometry,
     ) -> Self {
         let sys_light = detect_system_light_mode();
@@ -529,7 +530,9 @@ impl ProtonDriveNativeApp {
 
         // Ensure RefreshAll (which autostarts the daemon if needed) runs BEFORE LoadRemotePath
         let _ = cmd_tx.send(WorkerCommand::RefreshAll);
-        let _ = cmd_tx.send(WorkerCommand::LoadRemotePath("/my-files".to_string()));
+        let start_path = initial_path.unwrap_or_else(|| "/my-files".to_string());
+        let start_at_root = start_path == "/my-files" || start_path == "/";
+        let _ = cmd_tx.send(WorkerCommand::LoadRemotePath(start_path.clone()));
         if initial_tab == NavTab::Conflicts {
             let _ = cmd_tx.send(WorkerCommand::LoadConflicts);
         }
@@ -558,9 +561,10 @@ impl ProtonDriveNativeApp {
             show_account_menu: initial_account_menu,
             pending_cloud_only_confirm: initial_confirm_folder.map(CloudOnlyConfirm::SingleFolder),
             pending_sync_folders: Vec::new(),
-            remote_path: "/my-files".to_string(),
-            remote_items: initial_root_items,
-            remote_loading: !has_cached_items,
+            remote_path: start_path,
+            // The startup cache only holds the root listing, so don't show it under another folder
+            remote_items: if start_at_root { initial_root_items } else { Vec::new() },
+            remote_loading: !start_at_root || !has_cached_items,
             remote_error: None,
             new_folder_name: String::new(),
             show_new_folder_modal: false,
@@ -3903,6 +3907,7 @@ OPTIONS:
   --tab <TAB>           initial tab (overview | browser | selective | conflicts | settings)
   --screenshot <PATH>   render UI, save a PNG screenshot to PATH, and exit
   --search <QUERY>      pre-fill the search/filter box
+  --path <FOLDER>       open My files at a remote folder, e.g. /my-files/photos
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --version             print the version
   -h, --help            print this help
@@ -3923,6 +3928,7 @@ fn main() -> eframe::Result {
     let mut initial_confirm_folder: Option<String> = None;
     let mut cli_theme_override: Option<String> = None;
     let mut cli_search: Option<String> = None;
+    let mut cli_path: Option<String> = None;
     let mut cli_size: Option<[f32; 2]> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -3945,6 +3951,9 @@ fn main() -> eframe::Result {
                 if cli_size.is_none() {
                     eprintln!("protondrive-gui: ignoring invalid --size {raw:?} (expected WxH, e.g. 1280x800)");
                 }
+            }
+            "--path" => {
+                cli_path = args.next();
             }
             "--search" => {
                 cli_search = args.next();
@@ -4034,6 +4043,7 @@ fn main() -> eframe::Result {
                 initial_tab,
                 initial_account_menu,
                 initial_confirm_folder,
+                cli_path,
                 saved_geom,
             );
             if let Some(q) = cli_search {
