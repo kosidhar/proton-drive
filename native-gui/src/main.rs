@@ -182,7 +182,6 @@ fn btn_secondary_hover_bg() -> Color32 {
 enum NavTab {
     Overview,
     CloudBrowser,
-    SelectiveSync,
     Conflicts,
     Settings,
 }
@@ -280,19 +279,6 @@ struct RemoteListResponse {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct SelectiveFolder {
-    name: String,
-    #[allow(dead_code)]
-    uid: String,
-    excluded: bool,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct SelectiveFoldersResponse {
-    folders: Vec<SelectiveFolder>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ConflictRecord {
     id: u64,
@@ -311,7 +297,6 @@ enum WorkerCommand {
     Logout,
     LoadRemotePath(String),
     CreateRemoteFolder { parent_path: String, name: String },
-    LoadSelectiveFolders,
     SaveSettings(serde_json::Value),
     LoadConflicts,
     ResolveConflict { id: u64, choice: String },
@@ -324,7 +309,6 @@ enum WorkerEvent {
     },
     LoginStarted(String),
     RemoteLoaded(Result<RemoteListResponse, String>),
-    SelectiveLoaded(Vec<SelectiveFolder>),
     ConflictsLoaded(Vec<ConflictRecord>),
 }
 
@@ -481,8 +465,6 @@ struct ProtonDriveNativeApp {
     show_new_folder_modal: bool,
 
     // Selective sync state
-    selective_folders: Vec<SelectiveFolder>,
-    selective_filter: String,
     ignore_patterns_text: String,
     settings_dirty: bool,
 
@@ -582,8 +564,6 @@ impl ProtonDriveNativeApp {
             remote_error: None,
             new_folder_name: String::new(),
             show_new_folder_modal: false,
-            selective_folders: Vec::new(),
-            selective_filter: String::new(),
             ignore_patterns_text,
             settings_dirty: false,
             conflicts: Vec::new(),
@@ -680,9 +660,6 @@ impl ProtonDriveNativeApp {
                         }
                     }
                 }
-                WorkerEvent::SelectiveLoaded(folders) => {
-                    self.selective_folders = folders;
-                }
                 WorkerEvent::ConflictsLoaded(conflicts) => {
                     self.conflicts = conflicts;
                 }
@@ -769,13 +746,6 @@ impl ProtonDriveNativeApp {
                     } else {
                         None
                     }
-                } else if !self.selective_folders.is_empty() {
-                    let inc = self
-                        .selective_folders
-                        .iter()
-                        .filter(|f| !f.excluded)
-                        .count();
-                    Some(format!("{inc}/{}", self.selective_folders.len()))
                 } else {
                     None
                 };
@@ -871,9 +841,6 @@ impl ProtonDriveNativeApp {
                                 let _ = self
                                     .tx
                                     .send(WorkerCommand::LoadRemotePath(self.remote_path.clone()));
-                            }
-                            NavTab::SelectiveSync => {
-                                let _ = self.tx.send(WorkerCommand::LoadSelectiveFolders);
                             }
                             NavTab::Conflicts => {
                                 let _ = self.tx.send(WorkerCommand::LoadConflicts);
@@ -2001,9 +1968,6 @@ impl ProtonDriveNativeApp {
                                     }
                                 }
                                 self.status.state = "syncing".to_string();
-                                for sf in &mut self.selective_folders {
-                                    sf.excluded = false;
-                                }
                                 let _ = self.tx.send(WorkerCommand::SaveSettings(
                                     serde_json::json!({ "excludedFolders": Vec::<String>::new() }),
                                 ));
@@ -2443,11 +2407,6 @@ impl ProtonDriveNativeApp {
                                     self.status.state = "syncing".to_string();
                                     self.status.current_action =
                                         Some(format!("Syncing {}", item.name));
-                                    for sf in &mut self.selective_folders {
-                                        if sf.name == item.name {
-                                            sf.excluded = false;
-                                        }
-                                    }
                                     let updated_excluded =
                                         self.status.settings.excluded_folders.clone();
                                     let _ = self.tx.send(WorkerCommand::SaveSettings(
@@ -2485,337 +2444,6 @@ impl ProtonDriveNativeApp {
                         }
                     });
             }
-        });
-    }
-
-    fn render_selective_tab(&mut self, ui: &mut egui::Ui) {
-        let total_folders = self.selective_folders.len();
-        let synced_folders = self.selective_folders.iter().filter(|f| !f.excluded).count();
-        let avail_h = (ui.available_height() - 6.0).max(420.0);
-        let total_w = ui.available_width();
-        let left_w = ((total_w - 16.0) * 0.62).max(380.0);
-        let right_w = (total_w - left_w - 16.0).max(260.0);
-
-        ui.horizontal_top(|ui| {
-            // Left Column: Spacious Full-Height Selective Folder Sync Card
-            ui.allocate_ui_with_layout(Vec2::new(left_w, avail_h), Layout::top_down(Align::Min), |ui| {
-                card_frame().show(ui, |ui| {
-                    ui.set_min_width(left_w - 38.0);
-                    ui.set_max_width(left_w - 38.0);
-                    ui.set_min_height(avail_h - 38.0);
-
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("Selective Folder Sync (/my-files)")
-                                        .size(16.0)
-                                        .strong()
-                                        .color(TEXT_PRIMARY()),
-                                );
-                                ui.add_space(6.0);
-                                Frame::NONE
-                                    .fill(PROTON_PURPLE_SOFT())
-                                    .corner_radius(CornerRadius::same(99))
-                                    .inner_margin(Margin::symmetric(10, 3))
-                                    .show(ui, |ui| {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "{synced_folders} of {total_folders} synced"
-                                            ))
-                                            .size(11.5)
-                                            .strong()
-                                            .color(PROTON_PURPLE_TEXT()),
-                                        );
-                                    });
-                            });
-                            ui.add_space(3.0);
-                            ui.label(
-                                RichText::new("Unchecked folders are removed from local disk and kept safely in Proton Drive cloud.")
-                                    .size(12.5)
-                                    .color(TEXT_MUTED()),
-                            );
-                        });
-
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let mut bulk_change: Option<bool> = None;
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new("None").size(12.0).color(TEXT_PRIMARY()),
-                                    )
-                                    .fill(BG_CARD_ALT())
-                                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
-                                    .corner_radius(CornerRadius::same(6))
-                                    .min_size(Vec2::new(60.0, 28.0)),
-                                )
-                                .on_hover_text("Exclude all top-level folders from local sync")
-                                .clicked()
-                            {
-                                bulk_change = Some(true);
-                            }
-                            ui.add_space(6.0);
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new("Select All").size(12.0).color(TEXT_PRIMARY()),
-                                    )
-                                    .fill(BG_CARD_ALT())
-                                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
-                                    .corner_radius(CornerRadius::same(6))
-                                    .min_size(Vec2::new(78.0, 28.0)),
-                                )
-                                .on_hover_text("Include all top-level folders in local sync")
-                                .clicked()
-                            {
-                                bulk_change = Some(false);
-                            }
-
-                            if let Some(exclude_all) = bulk_change {
-                                for f in &mut self.selective_folders {
-                                    f.excluded = exclude_all;
-                                }
-                                let excluded: Vec<String> = self
-                                    .selective_folders
-                                    .iter()
-                                    .filter(|f| f.excluded)
-                                    .map(|f| f.name.clone())
-                                    .collect();
-                                let _ = self.tx.send(WorkerCommand::SaveSettings(
-                                    serde_json::json!({ "excludedFolders": excluded }),
-                                ));
-                            }
-                        });
-                    });
-
-                    ui.add_space(12.0);
-
-                    // Filter box
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.selective_filter)
-                                .hint_text("Filter folders in /my-files...")
-                                .desired_width(ui.available_width() - 80.0),
-                        );
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("Refresh").size(12.0))
-                                    .fill(BG_CARD_ALT())
-                                    .corner_radius(CornerRadius::same(6))
-                                    .min_size(Vec2::new(70.0, 28.0)),
-                            )
-                            .clicked()
-                        {
-                            let _ = self.tx.send(WorkerCommand::LoadSelectiveFolders);
-                        }
-                    });
-
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-
-                    let scroll_h = (ui.available_height() - 6.0).max(240.0);
-                    let filter_lower = self.selective_filter.trim().to_lowercase();
-
-                    ScrollArea::vertical()
-                        .id_salt("selective_folders_scroll")
-                        .max_height(scroll_h)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            if self.selective_folders.is_empty() {
-                                ui.add_space(20.0);
-                                ui.label(
-                                    RichText::new("Loading remote top-level folders from /my-files...")
-                                        .size(13.5)
-                                        .color(TEXT_MUTED()),
-                                );
-                                return;
-                            }
-
-                            let mut changed = false;
-                            for folder in &mut self.selective_folders {
-                                if !filter_lower.is_empty()
-                                    && !folder.name.to_lowercase().contains(&filter_lower)
-                                {
-                                    continue;
-                                }
-                                let mut included = !folder.excluded;
-                                let row_fill = if included {
-                                    BG_CARD_ALT()
-                                } else {
-                                    Color32::from_rgb(27, 24, 36)
-                                };
-                                let border_col = if included {
-                                    Color32::from_rgb(56, 48, 78)
-                                } else {
-                                    BORDER_SUBTLE()
-                                };
-
-                                Frame::NONE
-                                    .fill(row_fill)
-                                    .stroke(Stroke::new(1.0_f32, border_col))
-                                    .corner_radius(CornerRadius::same(8))
-                                    .inner_margin(Margin::symmetric(14, 10))
-                                    .show(ui, |ui| {
-                                        ui.set_min_width(ui.available_width());
-                                        ui.horizontal(|ui| {
-                                            if ui.checkbox(&mut included, "").changed() {
-                                                folder.excluded = !included;
-                                                changed = true;
-                                            }
-                                            ui.add_space(4.0);
-                                            let (f_rect, _) = ui.allocate_exact_size(
-                                                Vec2::new(16.0, 13.0),
-                                                Sense::hover(),
-                                            );
-                                            let folder_color = if included {
-                                                PROTON_PURPLE
-                                            } else {
-                                                TEXT_MUTED()
-                                            };
-                                            ui.painter().rect_filled(
-                                                f_rect,
-                                                CornerRadius::same(3),
-                                                folder_color,
-                                            );
-                                            ui.add_space(6.0);
-
-                                            let name_resp = ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(&folder.name)
-                                                        .size(14.0)
-                                                        .strong()
-                                                        .color(if included {
-                                                            TEXT_PRIMARY()
-                                                        } else {
-                                                            TEXT_MUTED()
-                                                        }),
-                                                )
-                                                .sense(Sense::click()),
-                                            );
-                                            if name_resp.clicked() {
-                                                included = !included;
-                                                folder.excluded = !included;
-                                                changed = true;
-                                            }
-
-                                            ui.with_layout(
-                                                Layout::right_to_left(Align::Center),
-                                                |ui| {
-                                                    if included {
-                                                        Frame::NONE
-                                                            .fill(Color32::from_rgba_unmultiplied(
-                                                                30, 168, 133, 32,
-                                                            ))
-                                                            .corner_radius(CornerRadius::same(99))
-                                                            .inner_margin(Margin::symmetric(10, 3))
-                                                            .show(ui, |ui| {
-                                                                ui.label(
-                                                                    RichText::new("Synced Locally")
-                                                                        .size(11.5)
-                                                                        .strong()
-                                                                        .color(STATUS_SUCCESS),
-                                                                );
-                                                            });
-                                                    } else {
-                                                        Frame::NONE
-                                                            .fill(Color32::from_rgb(35, 31, 46))
-                                                            .corner_radius(CornerRadius::same(99))
-                                                            .inner_margin(Margin::symmetric(10, 3))
-                                                            .show(ui, |ui| {
-                                                                ui.label(
-                                                                    RichText::new("Cloud Only")
-                                                                        .size(11.5)
-                                                                        .color(TEXT_MUTED()),
-                                                                );
-                                                            });
-                                                    }
-                                                },
-                                            );
-                                        });
-                                    });
-                                ui.add_space(6.0);
-                            }
-
-                            if changed {
-                                let excluded: Vec<String> = self
-                                    .selective_folders
-                                    .iter()
-                                    .filter(|f| f.excluded)
-                                    .map(|f| f.name.clone())
-                                    .collect();
-                                let _ = self.tx.send(WorkerCommand::SaveSettings(
-                                    serde_json::json!({ "excludedFolders": excluded }),
-                                ));
-                            }
-                        });
-                });
-            });
-
-            ui.add_space(14.0);
-
-            // Right Column: Full-Height Ignore Patterns Card
-            ui.allocate_ui_with_layout(Vec2::new(right_w, avail_h), Layout::top_down(Align::Min), |ui| {
-                card_frame().show(ui, |ui| {
-                    ui.set_min_width(right_w - 38.0);
-                    ui.set_max_width(right_w - 38.0);
-                    ui.set_min_height(avail_h - 38.0);
-                    ui.label(
-                        RichText::new("Ignore Patterns (Glob)")
-                            .size(16.0)
-                            .strong()
-                            .color(TEXT_PRIMARY()),
-                    );
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(
-                            "One glob pattern per line. Matching files or folders are skipped during two-way sync.",
-                        )
-                        .size(12.5)
-                        .color(TEXT_MUTED()),
-                    );
-                    ui.add_space(12.0);
-
-                    let rows = ((avail_h - 175.0) / 19.0).clamp(8.0, 32.0) as usize;
-                    if ui
-                        .add(
-                            egui::TextEdit::multiline(&mut self.ignore_patterns_text)
-                                .desired_rows(rows)
-                                .desired_width(f32::INFINITY)
-                                .font(FontId::new(13.0, FontFamily::Monospace)),
-                        )
-                        .changed()
-                    {
-                        self.settings_dirty = true;
-                    }
-                    ui.add_space(12.0);
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("Save Ignore Rules")
-                                    .size(13.0)
-                                    .strong()
-                                    .color(Color32::WHITE),
-                            )
-                            .fill(PROTON_PURPLE)
-                            .corner_radius(CornerRadius::same(8))
-                            .min_size(Vec2::new(ui.available_width(), 36.0)),
-                        )
-                        .clicked()
-                    {
-                        let patterns: Vec<String> = self
-                            .ignore_patterns_text
-                            .lines()
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        self.settings_dirty = false;
-                        let _ = self.tx.send(WorkerCommand::SaveSettings(
-                            serde_json::json!({ "ignorePatterns": patterns }),
-                        ));
-                    }
-                });
-            });
         });
     }
 
@@ -3203,19 +2831,11 @@ impl ProtonDriveNativeApp {
                                                 .excluded_folders
                                                 .push(folder_name.clone());
                                         }
-                                        for sf in &mut self.selective_folders {
-                                            if sf.name == folder_name {
-                                                sf.excluded = true;
-                                            }
-                                        }
                                     }
                                     CloudOnlyConfirm::AllFolders(all_names) => {
                                         self.pending_sync_folders.clear();
                                         self.status.syncing_folders.clear();
                                         self.status.settings.excluded_folders = all_names;
-                                        for sf in &mut self.selective_folders {
-                                            sf.excluded = true;
-                                        }
                                     }
                                 }
                                 let updated_excluded =
@@ -3365,7 +2985,6 @@ impl eframe::App for ProtonDriveNativeApp {
                 match self.tab {
                     NavTab::Overview => self.render_overview_tab(ui),
                     NavTab::CloudBrowser => self.render_browser_tab(ui),
-                    NavTab::SelectiveSync => self.render_selective_tab(ui),
                     NavTab::Conflicts => self.render_conflicts_tab(ui),
                     NavTab::Settings => self.render_settings_tab(ui),
                 }
@@ -3376,10 +2995,7 @@ impl eframe::App for ProtonDriveNativeApp {
 
         // Handle --screenshot <path> for automated visual inspection
         if let Some(target_path) = self.screenshot_target.clone() {
-            let ready = if self.tab == NavTab::SelectiveSync {
-                (!self.selective_folders.is_empty() && self.frames_rendered >= 6)
-                    || self.frames_rendered >= 60
-            } else if self.tab == NavTab::CloudBrowser {
+            let ready = if self.tab == NavTab::CloudBrowser {
                 (!self.remote_items.is_empty() && self.frames_rendered >= 6)
                     || self.frames_rendered >= 60
             } else {
@@ -3649,17 +3265,6 @@ fn draw_nav_icon(painter: &egui::Painter, rect: egui::Rect, tab: NavTab, color: 
                 egui::pos2(r.max.x, cy),
             ];
             painter.add(egui::Shape::line(pts, stroke));
-        }
-        NavTab::SelectiveSync => {
-            // Checklist / filter bars icon
-            for i in 0..3 {
-                let y = r.min.y + 2.0 + i as f32 * 4.5;
-                painter.circle_filled(egui::pos2(r.min.x + 2.0, y), 1.4, color);
-                painter.line_segment(
-                    [egui::pos2(r.min.x + 5.5, y), egui::pos2(r.max.x, y)],
-                    stroke,
-                );
-            }
         }
         NavTab::Conflicts => {
             // Warning badge icon
@@ -4069,15 +3674,6 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                 let _ = tx.send(WorkerEvent::RemoteLoaded(res));
                 ctx.request_repaint();
             }
-            WorkerCommand::LoadSelectiveFolders => {
-                if let Ok(resp) = ureq::get(&format!("{DAEMON_URL}/api/selective-sync/folders")).call()
-                {
-                    if let Ok(parsed) = resp.into_json::<SelectiveFoldersResponse>() {
-                        let _ = tx.send(WorkerEvent::SelectiveLoaded(parsed.folders));
-                        ctx.request_repaint();
-                    }
-                }
-            }
             WorkerCommand::SaveSettings(payload) => {
                 let _ = ureq::post(&format!("{DAEMON_URL}/api/settings")).send_json(payload);
                 let _ = tx.send(WorkerEvent::StatusAndActivity {
@@ -4224,9 +3820,9 @@ fn main() -> eframe::Result {
             "--tab" => {
                 if let Some(t) = args.next() {
                     initial_tab = match t.as_str() {
-                        "browser" | "cloud" | "files" => NavTab::CloudBrowser,
+                        // Selective sync lives in My files now
+                        "browser" | "cloud" | "files" | "selective" => NavTab::CloudBrowser,
                         "overview" | "activity" => NavTab::Overview,
-                        "selective" => NavTab::SelectiveSync,
                         "conflicts" => NavTab::Conflicts,
                         "settings" => NavTab::Settings,
                         _ => NavTab::CloudBrowser,
