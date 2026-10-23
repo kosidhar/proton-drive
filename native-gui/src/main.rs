@@ -972,41 +972,17 @@ impl ProtonDriveNativeApp {
 
     fn render_top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            // Search / filter input on the left (matching Proton Mail top bar)
-            Frame::NONE
-                .fill(BG_INPUT())
-                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::symmetric(12, 6))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let (s_rect, _) =
-                            ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
-                        draw_search_icon(ui.painter(), s_rect, TEXT_MUTED());
-                        ui.add_space(4.0);
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.search_query)
-                                .hint_text("Search files and sync activity")
-                                .frame(false)
-                                .desired_width(280.0),
-                        );
-                        if !self.search_query.is_empty()
-                            && ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new("×").size(14.0).color(TEXT_MUTED()),
-                                    )
-                                    .frame(false),
-                                )
-                                .clicked()
-                        {
-                            self.search_query.clear();
-                        }
-                    });
-                });
-
-            // Right side: Proton User Profile (Name + Email + Initials Avatar) + Settings Gear + Sync Status
+            // Right side first (right to left): avatar, name + email, settings gear, pause, sync status.
+            // The search box is added last and takes whatever width is left, so nothing can be drawn
+            // over it on narrow windows or while a long status is shown.
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let gap = ui.spacing().item_spacing.x;
+                // Narrowest search box worth showing: text field + frame margins, stroke, icon and spacing
+                let search_min_w = TOP_BAR_SEARCH_MIN_TEXT_WIDTH + 12.0 * 2.0 + 2.0 + 14.0 + 4.0 + gap * 3.0;
+                // Status pill without its text: frame margins, stroke, dot and spacing
+                let pill_chrome_w = 12.0 * 2.0 + 2.0 + 4.0 + 8.0 + gap * 2.0;
+                let status_font = FontId::new(12.0, FontFamily::Proportional);
+
                 let (display_name, email, initials) = if let Some(acct) = &self.status.account {
                     (
                         if acct.display_name.is_empty() {
@@ -1089,31 +1065,42 @@ impl ProtonDriveNativeApp {
 
                 ui.add_space(8.0);
 
-                // Stacked Display Name + Email (right-aligned next to avatar, clickable to open account menu)
-                let name_resp = ui
-                    .allocate_ui_with_layout(
-                        Vec2::new(195.0, 34.0),
-                        Layout::top_down(Align::Max),
-                        |ui| {
-                            ui.label(
-                                RichText::new(&display_name)
-                                    .size(13.0)
-                                    .strong()
-                                    .color(TEXT_PRIMARY()),
-                            );
-                            ui.label(RichText::new(&email).size(11.5).color(TEXT_MUTED()));
-                        },
-                    )
-                    .response
-                    .interact(Sense::click());
-                if name_resp.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                if name_resp.clicked() {
-                    self.show_account_menu = !self.show_account_menu;
-                }
+                // Stacked Display Name + Email (right-aligned next to avatar, clickable to open account menu).
+                // Hidden when there isn't room for it plus the controls and a usable search box; the avatar's
+                // account menu still shows both. The longest fixed status is reserved instead of the live one
+                // so the name doesn't flicker in and out as sync messages change.
+                let name_w = text_width(ui.painter(), &display_name, &FontId::new(13.0, FontFamily::Proportional))
+                    .max(text_width(ui.painter(), &email, &FontId::new(11.5, FontFamily::Proportional)))
+                    + 1.0;
+                let status_reserve_w = text_width(ui.painter(), "Sign in required", &status_font);
+                let after_name_w =
+                    32.0 + 10.0 + 76.0 + 6.0 + pill_chrome_w + status_reserve_w + search_min_w + gap * 3.0;
+                if ui.available_width() >= name_w + 12.0 + gap + after_name_w {
+                    let name_resp = ui
+                        .allocate_ui_with_layout(
+                            Vec2::new(name_w, 34.0),
+                            Layout::top_down(Align::Max),
+                            |ui| {
+                                ui.label(
+                                    RichText::new(&display_name)
+                                        .size(13.0)
+                                        .strong()
+                                        .color(TEXT_PRIMARY()),
+                                );
+                                ui.label(RichText::new(&email).size(11.5).color(TEXT_MUTED()));
+                            },
+                        )
+                        .response
+                        .interact(Sense::click());
+                    if name_resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if name_resp.clicked() {
+                        self.show_account_menu = !self.show_account_menu;
+                    }
 
-                ui.add_space(12.0);
+                    ui.add_space(12.0);
+                }
 
                 // Settings Icon Button (matching Proton official header cogwheel)
                 let (gear_rect, gear_resp) =
@@ -1175,25 +1162,72 @@ impl ProtonDriveNativeApp {
                         .current_action
                         .as_deref()
                         .unwrap_or("Syncing...");
-                    (PROTON_PURPLE_HOVER, truncate_middle(act, 36))
+                    (PROTON_PURPLE_HOVER, act.to_string())
                 } else if self.status.state == "error" {
                     (STATUS_DANGER, "Sync Error".to_string())
                 } else {
                     (STATUS_SUCCESS, "Up to date".to_string())
                 };
 
-                Frame::NONE
+                // Shorten the status to the room left after a minimum-width search box (full text on hover)
+                let status_max_w =
+                    (ui.available_width() - pill_chrome_w - search_min_w).min(TOP_BAR_STATUS_MAX_WIDTH);
+                let shown_status =
+                    truncate_middle_to_width(ui.painter(), &status_text, &status_font, status_max_w);
+                let pill = Frame::NONE
                     .fill(BG_CARD())
                     .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
                     .corner_radius(CornerRadius::same(8))
                     .inner_margin(Margin::symmetric(12, 6))
                     .show(ui, |ui| {
-                        ui.label(RichText::new(status_text).size(12.0).color(TEXT_PRIMARY()));
+                        ui.label(RichText::new(&shown_status).size(12.0).color(TEXT_PRIMARY()));
                         ui.add_space(4.0);
                         let (rect, _) =
                             ui.allocate_exact_size(Vec2::new(8.0, 8.0), Sense::hover());
                         ui.painter().circle_filled(rect.center(), 4.0, dot_color);
                     });
+                if shown_status != status_text {
+                    pill.response.on_hover_text(&status_text);
+                }
+
+                // Search / filter input on the left (matching Proton Mail top bar), sized to the space left
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    Frame::NONE
+                        .fill(BG_INPUT())
+                        .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::symmetric(12, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let (s_rect, _) =
+                                    ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
+                                draw_search_icon(ui.painter(), s_rect, TEXT_MUTED());
+                                ui.add_space(4.0);
+                                let clear_w = if self.search_query.is_empty() { 0.0 } else { 24.0 };
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.search_query)
+                                        .hint_text("Search files and sync activity")
+                                        .frame(false)
+                                        .desired_width(
+                                            (ui.available_width() - clear_w)
+                                                .clamp(0.0, TOP_BAR_SEARCH_MAX_TEXT_WIDTH),
+                                        ),
+                                );
+                                if !self.search_query.is_empty()
+                                    && ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new("×").size(14.0).color(TEXT_MUTED()),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                {
+                                    self.search_query.clear();
+                                }
+                            });
+                        });
+                });
             });
         });
     }
@@ -3069,6 +3103,10 @@ fn proton_button(
     );
     resp
 }
+
+const TOP_BAR_SEARCH_MIN_TEXT_WIDTH: f32 = 110.0;
+const TOP_BAR_SEARCH_MAX_TEXT_WIDTH: f32 = 280.0;
+const TOP_BAR_STATUS_MAX_WIDTH: f32 = 240.0;
 
 const STAT_LABEL_SIZE: f32 = 12.5;
 const STAT_VALUE_SIZE: f32 = 24.0;
