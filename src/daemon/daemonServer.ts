@@ -391,7 +391,15 @@ export async function startSyncDaemon(options: {
                     }
                     const updated = stateDb.updateSettings(body);
                     await engine.applySelectiveSyncExclusions();
-                    if (
+                    const newlyIncluded = prev.excludedFolders.filter(
+                        (f) => !updated.excludedFolders.includes(f),
+                    );
+                    if (newlyIncluded.length > 0) {
+                        engine.markFoldersSyncing(newlyIncluded);
+                        void engine.syncFoldersPriority(newlyIncluded).then(() => {
+                            void engine.reconcileNow();
+                        });
+                    } else if (
                         prev.syncDir !== updated.syncDir ||
                         JSON.stringify(prev.excludedFolders) !== JSON.stringify(updated.excludedFolders) ||
                         JSON.stringify(prev.ignorePatterns) !== JSON.stringify(updated.ignorePatterns)

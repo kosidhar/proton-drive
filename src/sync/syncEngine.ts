@@ -48,6 +48,7 @@ export class ProtonDriveSyncEngine {
     private unsubscribeDriveEvents: (() => void) | null = null;
     private reconcileRunning = false;
     private reconcileQueued = false;
+    private syncingFolders = new Set<string>();
     private localQueue = new Map<string, Promise<void>>();
 
     constructor(
@@ -74,13 +75,20 @@ export class ProtonDriveSyncEngine {
         const stats = this.stateDb.getSummaryStats();
         const loggedIn = this.auth.isLoggedIn();
         return {
-            state: !loggedIn ? ('unauthenticated' as EngineState) : settings.paused ? ('paused' as EngineState) : this.state,
+            state: !loggedIn
+                ? ('unauthenticated' as EngineState)
+                : settings.paused
+                  ? ('paused' as EngineState)
+                  : this.syncingFolders.size > 0
+                    ? ('syncing' as EngineState)
+                    : this.state,
             currentAction: this.currentAction,
             loggedIn,
             syncDir: settings.syncDir,
             lastSyncAt: this.lastSyncAt,
             lastError: this.lastError,
             activeTransfers: Array.from(this.activeTransfers.values()),
+            syncingFolders: Array.from(this.syncingFolders),
             stats,
             settings,
         };
@@ -245,6 +253,7 @@ export class ProtonDriveSyncEngine {
             if (!trimmed) {
                 continue;
             }
+            this.syncingFolders.delete(trimmed);
             const localFolderFullPath = path.join(settings.syncDir, trimmed);
             const st = await stat(localFolderFullPath).catch(() => null);
             const dbItem = this.stateDb.getItemByPath(trimmed);
@@ -259,6 +268,95 @@ export class ProtonDriveSyncEngine {
                     localRelPath: trimmed,
                     details: 'Excluded by Selective Sync (removed local copy; kept in Proton Drive cloud)',
                 });
+            }
+        }
+    }
+
+    markFoldersSyncing(folderNames: string[]): void {
+        for (const name of folderNames) {
+            const trimmed = name.trim().replace(/^\/+|\/+$/g, '');
+            if (trimmed) {
+                this.syncingFolders.add(trimmed);
+            }
+        }
+        if (this.syncingFolders.size > 0 && this.auth.isLoggedIn() && !this.stateDb.getSettings().paused) {
+            this.state = 'syncing';
+        }
+    }
+
+    async syncFoldersPriority(folderNames: string[]): Promise<void> {
+        const cleaned = folderNames
+            .map((f) => f.trim().replace(/^\/+|\/+$/g, ''))
+            .filter(Boolean);
+        if (cleaned.length === 0 || !this.auth.isLoggedIn()) {
+            return;
+        }
+        this.markFoldersSyncing(cleaned);
+        const settings = this.stateDb.getSettings();
+        if (settings.paused) {
+            return;
+        }
+
+        this.state = 'syncing';
+        try {
+            await mkdir(settings.syncDir, { recursive: true });
+            const root = await this.getRootFolder();
+            const children = await listFolderChildren(this.sdk, root);
+            const childByName = new Map<string, NodeEntity>();
+            for (const c of children) {
+                childByName.set(getName(c), c);
+            }
+
+            const remoteMap = new Map<string, NodeEntity>();
+            for (const folderName of cleaned) {
+                const liveSettings = this.stateDb.getSettings();
+                if (liveSettings.paused || liveSettings.excludedFolders.includes(folderName)) {
+                    this.syncingFolders.delete(folderName);
+                    continue;
+                }
+                const remoteFolder = childByName.get(folderName);
+                if (!remoteFolder) {
+                    this.syncingFolders.delete(folderName);
+                    continue;
+                }
+                try {
+                    this.currentAction = `Syncing ${folderName}`;
+                    remoteMap.set(folderName, remoteFolder);
+                    const localFullPath = path.join(liveSettings.syncDir, folderName);
+                    const st = await stat(localFullPath).catch(() => null);
+                    const localInfo = st
+                        ? { isDirectory: st.isDirectory(), size: st.isDirectory() ? 0 : st.size, mtimeMs: st.mtimeMs }
+                        : undefined;
+                    let dbRecord = this.stateDb.getItemByPath(folderName) ?? undefined;
+                    if (!localInfo && dbRecord) {
+                        // Stale record from before the folder was Cloud only: never treat as a local deletion
+                        this.stateDb.removeItemByPath(folderName);
+                        dbRecord = undefined;
+                    }
+                    await this.reconcileSinglePath(
+                        folderName,
+                        remoteFolder,
+                        localInfo,
+                        dbRecord,
+                        remoteMap,
+                        liveSettings,
+                    );
+                    if (remoteFolder.type === NodeType.Folder) {
+                        await this.reconcileDirectoryIncremental(remoteFolder, folderName, remoteMap, liveSettings);
+                    }
+                } finally {
+                    this.syncingFolders.delete(folderName);
+                }
+            }
+        } catch (err) {
+            this.logger.warn(`Priority folder sync encountered error: ${err}`);
+            for (const folderName of cleaned) {
+                this.syncingFolders.delete(folderName);
+            }
+        } finally {
+            if (!this.reconcileRunning && this.syncingFolders.size === 0) {
+                this.currentAction = null;
+                this.state = this.stateDb.getSettings().paused ? 'paused' : 'idle';
             }
         }
     }
@@ -295,8 +393,10 @@ export class ProtonDriveSyncEngine {
             await this.reconcileDirectoryIncremental(root, '', remoteMap, this.stateDb.getSettings());
 
             this.lastSyncAt = Date.now();
-            this.currentAction = null;
-            this.state = this.stateDb.getSettings().paused ? 'paused' : 'idle';
+            if (this.syncingFolders.size === 0) {
+                this.currentAction = null;
+                this.state = this.stateDb.getSettings().paused ? 'paused' : 'idle';
+            }
         } catch (error: unknown) {
             const msg = error instanceof Error ? error.message : String(error);
             this.lastError = msg;
@@ -1030,6 +1130,10 @@ export class ProtonDriveSyncEngine {
             const relPath = prefix ? `${prefix}/${name}` : name;
             if (matchesIgnorePatterns(relPath, stepSettings.ignorePatterns, stepSettings.excludedFolders)) {
                 await this.applySelectiveSyncExclusions();
+                continue;
+            }
+            if (!prefix && this.syncingFolders.has(name)) {
+                // Being handled by syncFoldersPriority right now; avoid concurrent duplicate work
                 continue;
             }
 

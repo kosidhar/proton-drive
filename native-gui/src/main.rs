@@ -242,6 +242,8 @@ struct DaemonStatus {
     logged_in: bool,
     sync_dir: String,
     active_transfers: Vec<ActiveTransfer>,
+    #[serde(default)]
+    syncing_folders: Vec<String>,
     stats: SummaryStats,
     settings: SyncSettings,
     #[serde(default)]
@@ -468,6 +470,7 @@ struct ProtonDriveNativeApp {
     search_query: String,
     show_account_menu: bool,
     pending_cloud_only_confirm: Option<CloudOnlyConfirm>,
+    pending_sync_folders: Vec<String>,
 
     // Cloud Browser state
     remote_path: String,
@@ -572,6 +575,7 @@ impl ProtonDriveNativeApp {
             search_query: String::new(),
             show_account_menu: initial_account_menu,
             pending_cloud_only_confirm: initial_confirm_folder.map(CloudOnlyConfirm::SingleFolder),
+            pending_sync_folders: Vec::new(),
             remote_path: "/my-files".to_string(),
             remote_items: initial_root_items,
             remote_loading: !has_cached_items,
@@ -613,7 +617,20 @@ impl ProtonDriveNativeApp {
                         if s.logged_in {
                             self.login_url = None;
                         }
+                        self.pending_sync_folders.retain(|f| {
+                            if s.syncing_folders.contains(f) {
+                                return true;
+                            }
+                            if !s.sync_dir.is_empty() {
+                                return !std::path::Path::new(&s.sync_dir).join(f).exists();
+                            }
+                            false
+                        });
                         self.status = s;
+                        // A status poll queued before our SaveSettings may still list the folder as excluded
+                        for f in &self.pending_sync_folders {
+                            self.status.settings.excluded_folders.retain(|ex| ex != f);
+                        }
                         self.activities = activity;
                         save_startup_cache(&self.status, &self.cached_root_items, &self.activities);
 
@@ -1946,7 +1963,17 @@ impl ProtonDriveNativeApp {
                             .on_hover_text("Sync all top-level folders to this computer")
                             .clicked()
                             {
-                                self.status.settings.excluded_folders.clear();
+                                let prev_excluded =
+                                    std::mem::take(&mut self.status.settings.excluded_folders);
+                                for folder_name in prev_excluded {
+                                    if !self.pending_sync_folders.contains(&folder_name) {
+                                        self.pending_sync_folders.push(folder_name.clone());
+                                    }
+                                    if !self.status.syncing_folders.contains(&folder_name) {
+                                        self.status.syncing_folders.push(folder_name);
+                                    }
+                                }
+                                self.status.state = "syncing".to_string();
                                 for sf in &mut self.selective_folders {
                                     sf.excluded = false;
                                 }
@@ -2203,7 +2230,46 @@ impl ProtonDriveNativeApp {
                                 name_color,
                             );
 
-                            // 2. Sync Status Column ("✓ Synced" vs "Cloud only" — clickable toggle on root folders!)
+                            // 2. Sync Status Column ("✓ Synced" vs "↻ Syncing..." vs "Cloud only" — clickable toggle on root folders!)
+                            let is_syncing = !is_excluded
+                                && top_check_name.is_some_and(|top_name| {
+                                    let in_pending = self
+                                        .pending_sync_folders
+                                        .iter()
+                                        .any(|f| f == top_name)
+                                        || self
+                                            .status
+                                            .syncing_folders
+                                            .iter()
+                                            .any(|f| f == top_name);
+                                    let has_active_transfer =
+                                        self.status.active_transfers.iter().any(|t| {
+                                            t.rel_path == top_name
+                                                || t.rel_path.starts_with(&format!("{top_name}/"))
+                                        });
+                                    let matches_current_action = self.status.state == "syncing"
+                                        && self.status.current_action.as_deref().is_some_and(
+                                            |act| {
+                                                act == format!("Syncing {top_name}")
+                                                    || act.starts_with(&format!(
+                                                        "Syncing {top_name}/"
+                                                    ))
+                                                    || act.ends_with(&format!("/{top_name}"))
+                                                    || act.contains(&format!("/{top_name}/"))
+                                            },
+                                        );
+                                    let missing_locally = is_root
+                                        && is_folder
+                                        && !self.status.sync_dir.is_empty()
+                                        && !std::path::Path::new(&self.status.sync_dir)
+                                            .join(top_name)
+                                            .exists();
+                                    in_pending
+                                        || has_active_transfer
+                                        || matches_current_action
+                                        || missing_locally
+                                });
+
                             let pill_rect = egui::Rect::from_min_size(
                                 egui::pos2(row_status_x, row_cy - 11.0),
                                 Vec2::new(96.0, 22.0),
@@ -2243,6 +2309,34 @@ impl ProtonDriveNativeApp {
                                     "Cloud only",
                                     FontId::new(11.0, FontFamily::Proportional),
                                     if pill_hovered { TEXT_PRIMARY() } else { TEXT_MUTED() },
+                                );
+                            } else if is_syncing {
+                                let bg = if pill_hovered {
+                                    Color32::from_rgba_unmultiplied(109, 74, 255, 58)
+                                } else {
+                                    PROTON_PURPLE_SOFT()
+                                };
+                                ui.painter()
+                                    .rect_filled(pill_rect, CornerRadius::same(99), bg);
+                                ui.painter().rect_stroke(
+                                    pill_rect,
+                                    CornerRadius::same(99),
+                                    Stroke::new(
+                                        1.0_f32,
+                                        if pill_hovered {
+                                            PROTON_PURPLE_HOVER
+                                        } else {
+                                            PROTON_PURPLE
+                                        },
+                                    ),
+                                    egui::StrokeKind::Inside,
+                                );
+                                ui.painter().text(
+                                    pill_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "↻ Syncing...",
+                                    FontId::new(11.0, FontFamily::Proportional),
+                                    PROTON_PURPLE_TEXT(),
                                 );
                             } else {
                                 let bg = if pill_hovered {
@@ -2308,11 +2402,20 @@ impl ProtonDriveNativeApp {
 
                             if clicked_in_pill {
                                 if is_excluded {
-                                    // Switching from Cloud only -> Synced is non-destructive, apply immediately
+                                    // Switching from Cloud only -> Syncing... -> Synced once downloaded locally
                                     self.status
                                         .settings
                                         .excluded_folders
                                         .retain(|ex| ex != &item.name);
+                                    if !self.pending_sync_folders.contains(&item.name) {
+                                        self.pending_sync_folders.push(item.name.clone());
+                                    }
+                                    if !self.status.syncing_folders.contains(&item.name) {
+                                        self.status.syncing_folders.push(item.name.clone());
+                                    }
+                                    self.status.state = "syncing".to_string();
+                                    self.status.current_action =
+                                        Some(format!("Syncing {}", item.name));
                                     for sf in &mut self.selective_folders {
                                         if sf.name == item.name {
                                             sf.excluded = false;
@@ -3060,6 +3163,8 @@ impl ProtonDriveNativeApp {
                             {
                                 match confirm {
                                     CloudOnlyConfirm::SingleFolder(folder_name) => {
+                                        self.pending_sync_folders.retain(|f| f != &folder_name);
+                                        self.status.syncing_folders.retain(|f| f != &folder_name);
                                         if !self
                                             .status
                                             .settings
@@ -3078,6 +3183,8 @@ impl ProtonDriveNativeApp {
                                         }
                                     }
                                     CloudOnlyConfirm::AllFolders(all_names) => {
+                                        self.pending_sync_folders.clear();
+                                        self.status.syncing_folders.clear();
                                         self.status.settings.excluded_folders = all_names;
                                         for sf in &mut self.selective_folders {
                                             sf.excluded = true;
@@ -3951,6 +4058,7 @@ USAGE:
 OPTIONS:
   --tab <TAB>           initial tab (overview | browser | selective | conflicts | settings)
   --screenshot <PATH>   render UI, save a PNG screenshot to PATH, and exit
+  --search <QUERY>      pre-fill the search/filter box
   --version             print the version
   -h, --help            print this help
 ";
@@ -3961,6 +4069,7 @@ fn main() -> eframe::Result {
     let mut initial_account_menu = false;
     let mut initial_confirm_folder: Option<String> = None;
     let mut cli_theme_override: Option<String> = None;
+    let mut cli_search: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -3975,6 +4084,9 @@ fn main() -> eframe::Result {
             }
             "--theme" => {
                 cli_theme_override = args.next();
+            }
+            "--search" => {
+                cli_search = args.next();
             }
             "--tab" => {
                 if let Some(t) = args.next() {
@@ -4052,14 +4164,18 @@ fn main() -> eframe::Result {
         "Proton Drive",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(ProtonDriveNativeApp::new(
+            let mut app = ProtonDriveNativeApp::new(
                 cc,
                 screenshot_target,
                 initial_tab,
                 initial_account_menu,
                 initial_confirm_folder,
                 saved_geom,
-            )))
+            );
+            if let Some(q) = cli_search {
+                app.search_query = q;
+            }
+            Ok(Box::new(app))
         }),
     )
 }
