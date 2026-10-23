@@ -1498,21 +1498,28 @@ impl ProtonDriveNativeApp {
             ("Synced Files", self.status.stats.total_files.to_string()),
             ("Synced Folders", self.status.stats.total_folders.to_string()),
         ];
-        ui.columns(4, |cols| {
-            // One shared value size so the longest value (usually the quota) fits on a single line
-            // and all four cards stay visually consistent.
-            let card_margin = card_frame().total_margin().sum().x;
-            let value_size = stat_cards
-                .iter()
-                .zip(cols.iter())
-                .map(|((_, value), col)| {
-                    fit_font_size(col.painter(), value, 24.0, 14.0, col.available_width() - card_margin)
-                })
-                .fold(24.0, f32::min);
-            for ((label, value), col) in stat_cards.iter().zip(cols.iter_mut()) {
-                render_stat_card(col, label, value, value_size);
+        let spacing = ui.spacing().item_spacing.x;
+        let per_row = stat_cards_per_row(ui.painter(), &stat_cards, ui.available_width(), spacing);
+        let content_width = stat_card_content_width(ui.available_width(), spacing, per_row);
+        // One shared value size so the longest value (usually the quota) fits on a single line
+        // and all cards stay visually consistent.
+        let value_size = stat_cards
+            .iter()
+            .map(|(_, value)| {
+                fit_font_size(ui.painter(), value, STAT_VALUE_SIZE, STAT_VALUE_MIN_SIZE, content_width)
+            })
+            .fold(STAT_VALUE_SIZE, f32::min);
+        for (row_idx, row) in stat_cards.chunks(per_row).enumerate() {
+            if row_idx > 0 {
+                // Make the gap between rows match the gap between columns
+                ui.add_space((spacing - ui.spacing().item_spacing.y).max(0.0));
             }
-        });
+            ui.columns(per_row, |cols| {
+                for ((label, value), col) in row.iter().zip(cols.iter_mut()) {
+                    render_stat_card(col, label, value, value_size);
+                }
+            });
+        }
 
         // Active Transfers Card (if any)
         if !self.status.active_transfers.is_empty() {
@@ -3447,10 +3454,38 @@ fn proton_button(
     resp
 }
 
+const STAT_LABEL_SIZE: f32 = 12.5;
+const STAT_VALUE_SIZE: f32 = 24.0;
+const STAT_VALUE_MIN_SIZE: f32 = 14.0;
+/// Smallest value size accepted with four cards per row before switching to a 2×2 grid.
+const STAT_VALUE_COMFORT_SIZE: f32 = 18.0;
+
+/// Width left for a stat card's text when `per_row` cards share `available_width` (mirrors `ui.columns`).
+fn stat_card_content_width(available_width: f32, spacing: f32, per_row: usize) -> f32 {
+    let n = per_row as f32;
+    (available_width - spacing * (n - 1.0)) / n - card_frame().total_margin().sum().x
+}
+
+/// All cards in one row when every label and value fits on one line at a comfortable size,
+/// otherwise two rows (a 2×2 grid for four cards) so narrow windows neither wrap labels nor
+/// shrink values to nothing.
+fn stat_cards_per_row(painter: &egui::Painter, cards: &[(&str, String)], available_width: f32, spacing: f32) -> usize {
+    let content_width = stat_card_content_width(available_width, spacing, cards.len());
+    let fits = cards.iter().all(|(label, value)| {
+        text_width(painter, label, &FontId::proportional(STAT_LABEL_SIZE)) <= content_width
+            && text_width(painter, value, &FontId::proportional(STAT_VALUE_COMFORT_SIZE)) <= content_width
+    });
+    if fits {
+        cards.len()
+    } else {
+        cards.len().div_ceil(2)
+    }
+}
+
 fn render_stat_card(ui: &mut egui::Ui, label: &str, value: &str, value_size: f32) {
     card_frame().show(ui, |ui| {
         ui.set_min_width(ui.available_width());
-        ui.label(RichText::new(label).size(12.5).color(TEXT_MUTED()));
+        ui.label(RichText::new(label).size(STAT_LABEL_SIZE).color(TEXT_MUTED()));
         ui.add_space(6.0);
         // Never wrap the value; if even the minimum size can't fit, elide instead
         ui.add(
@@ -4140,9 +4175,18 @@ OPTIONS:
   --tab <TAB>           initial tab (overview | browser | selective | conflicts | settings)
   --screenshot <PATH>   render UI, save a PNG screenshot to PATH, and exit
   --search <QUERY>      pre-fill the search/filter box
+  --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --version             print the version
   -h, --help            print this help
 ";
+
+/// Parses a `--size` value like "1280x800", clamped to the window range the app supports
+/// (winit panics on zero/negative sizes under Wayland).
+fn parse_window_size(s: &str) -> Option<[f32; 2]> {
+    let (w, h) = s.trim().split_once(['x', 'X'])?;
+    let (w, h): (f32, f32) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
+    (w.is_finite() && h.is_finite()).then(|| [w.clamp(840.0, 16384.0), h.clamp(540.0, 16384.0)])
+}
 
 fn main() -> eframe::Result {
     let mut screenshot_target: Option<String> = None;
@@ -4151,6 +4195,7 @@ fn main() -> eframe::Result {
     let mut initial_confirm_folder: Option<String> = None;
     let mut cli_theme_override: Option<String> = None;
     let mut cli_search: Option<String> = None;
+    let mut cli_size: Option<[f32; 2]> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -4165,6 +4210,13 @@ fn main() -> eframe::Result {
             }
             "--theme" => {
                 cli_theme_override = args.next();
+            }
+            "--size" => {
+                let raw = args.next().unwrap_or_default();
+                cli_size = parse_window_size(&raw);
+                if cli_size.is_none() {
+                    eprintln!("protondrive-gui: ignoring invalid --size {raw:?} (expected WxH, e.g. 1280x800)");
+                }
             }
             "--search" => {
                 cli_search = args.next();
@@ -4201,8 +4253,11 @@ fn main() -> eframe::Result {
     if let Some(theme_ov) = cli_theme_override {
         saved_geom.theme_mode = theme_ov;
     }
+    if cli_size.is_some() && screenshot_target.is_none() {
+        eprintln!("protondrive-gui: --size only applies together with --screenshot; ignoring it");
+    }
     let initial_size = if screenshot_target.is_some() {
-        [1440.0, 900.0]
+        cli_size.unwrap_or([1440.0, 900.0])
     } else if saved_geom.maximized {
         [1920.0, 1080.0]
     } else {
@@ -4349,6 +4404,80 @@ mod tests {
         }
         thread::sleep(Duration::from_millis(300));
         assert_eq!(zombie_children(), 0);
+    }
+
+    #[test]
+    fn stat_card_content_width_matches_what_egui_gives_the_card() {
+        // Odd widths too, so egui's pixel rounding of column positions is exercised
+        for screen_width in [1440.0, 1133.7, 841.3, 1001.0] {
+            let ctx = egui::Context::default();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(screen_width, 900.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let available = ui.available_width();
+                    let spacing = ui.spacing().item_spacing.x;
+                    for per_row in [2, 4] {
+                        let mut actual = 0.0;
+                        ui.columns(per_row, |cols| {
+                            card_frame().show(&mut cols[0], |ui| actual = ui.available_width());
+                        });
+                        let predicted = stat_card_content_width(available, spacing, per_row);
+                        // egui snaps layout positions to multiples of GUI_ROUNDING (1/32 pt)
+                        assert!(
+                            (predicted - actual).abs() <= egui::emath::GUI_ROUNDING,
+                            "{screen_width}px, {per_row} per row: {predicted} vs {actual}"
+                        );
+                    }
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn stat_cards_switch_to_two_rows_exactly_when_one_row_stops_fitting() {
+        with_painter(|p| {
+            let spacing = 8.0;
+            let margin = card_frame().total_margin().sum().x;
+            let long_quota = [
+                ("Proton Cloud Storage", "13.22 GB / 510.00 GB".to_string()),
+                ("Local Synced Size", "5.29 GB".to_string()),
+                ("Synced Files", "372".to_string()),
+                ("Synced Folders", "60".to_string()),
+            ];
+            let short_values = long_quota.clone().map(|(label, _)| (label, "1".to_string()));
+            let mut switch_points = vec![];
+            for cards in [&long_quota, &short_values] {
+                let needed = cards
+                    .iter()
+                    .map(|(label, value)| {
+                        text_width(p, label, &FontId::proportional(STAT_LABEL_SIZE))
+                            .max(text_width(p, value, &FontId::proportional(STAT_VALUE_COMFORT_SIZE)))
+                    })
+                    .fold(0.0, f32::max);
+                let switch_at = 4.0 * (needed + margin) + 3.0 * spacing;
+                assert_eq!(stat_cards_per_row(p, cards, switch_at + 0.5, spacing), 4);
+                assert_eq!(stat_cards_per_row(p, cards, switch_at - 0.5, spacing), 2);
+                switch_points.push(switch_at);
+            }
+            // The decision follows the measured text: a long quota needs a wider window
+            assert!(switch_points[0] > switch_points[1]);
+        });
+    }
+
+    #[test]
+    fn parse_window_size_accepts_wxh_and_clamps_to_supported_range() {
+        assert_eq!(parse_window_size("1280x800"), Some([1280.0, 800.0]));
+        assert_eq!(parse_window_size(" 1280X800 "), Some([1280.0, 800.0]));
+        // Sizes winit can't handle (zero/negative) or below the minimum window are clamped
+        assert_eq!(parse_window_size("0x0"), Some([840.0, 540.0]));
+        assert_eq!(parse_window_size("-100x700"), Some([840.0, 700.0]));
+        assert_eq!(parse_window_size("99999x99999"), Some([16384.0, 16384.0]));
+        for bad in ["", "1280", "x800", "abcxdef", "NaNx700", "infx700"] {
+            assert_eq!(parse_window_size(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
