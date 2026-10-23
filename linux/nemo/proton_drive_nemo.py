@@ -1,7 +1,25 @@
 import os
-import subprocess
+import signal
 import urllib.request
-from gi.repository import GObject, Nemo
+from gi.repository import GLib, GObject, Nemo
+
+
+def _spawn_detached(argv) -> None:
+    # Like Popen(start_new_session=True): own session, stdio on /dev/null, none of Nemo's fds
+    # and default SIGPIPE/SIGXFSZ. The GLib child watch reaps it so it never lingers as a
+    # zombie of the long-lived Nemo process. Raises OSError if argv[0] can't be executed.
+    file_actions = [(os.POSIX_SPAWN_OPEN, fd, os.devnull, os.O_RDWR, 0) for fd in (0, 1, 2)]
+    if hasattr(os, "POSIX_SPAWN_CLOSEFROM"):  # Python 3.13+
+        file_actions.append((os.POSIX_SPAWN_CLOSEFROM, 3))
+    pid = os.posix_spawnp(
+        argv[0],
+        argv,
+        os.environ,
+        file_actions=file_actions,
+        setsid=True,
+        setsigdef=(signal.SIGPIPE, signal.SIGXFSZ),
+    )
+    GLib.child_watch_add(GLib.PRIORITY_DEFAULT, pid, lambda *_: None)
 
 
 class ProtonDriveNemoExtension(GObject.GObject, Nemo.MenuProvider, Nemo.InfoProvider):
@@ -45,7 +63,7 @@ class ProtonDriveNemoExtension(GObject.GObject, Nemo.MenuProvider, Nemo.InfoProv
             req = urllib.request.Request("http://127.0.0.1:49152/api/sync", method="POST")
             urllib.request.urlopen(req, timeout=2)
         except Exception:
-            subprocess.Popen(["protondrive", "sync"])
+            _spawn_detached(["protondrive", "sync"])
 
     def _on_open_gui(self, _menu):
-        subprocess.Popen(["protondrive-gui"])
+        _spawn_detached(["protondrive-gui"])

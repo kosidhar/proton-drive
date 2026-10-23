@@ -5,12 +5,12 @@ Provides sync status emblems and native context menu actions (never opens a brow
 
 import json
 import os
-import subprocess
+import signal
 import sys
 import types
 import urllib.parse
 import urllib.request
-from gi.repository import GObject, Nautilus
+from gi.repository import GLib, GObject, Nautilus
 
 DAEMON_URL = os.environ.get("PROTON_DRIVE_DAEMON_URL", "http://127.0.0.1:49152")
 
@@ -39,6 +39,24 @@ def _query_daemon(endpoint: str, method: str = "GET"):
         return None
 
 
+def _spawn_detached(argv) -> None:
+    # Like Popen(start_new_session=True): own session, stdio on /dev/null, none of Nautilus's
+    # fds and default SIGPIPE/SIGXFSZ. The GLib child watch reaps it so it never lingers as a
+    # zombie of the long-lived Nautilus service. Raises OSError if argv[0] can't be executed.
+    file_actions = [(os.POSIX_SPAWN_OPEN, fd, os.devnull, os.O_RDWR, 0) for fd in (0, 1, 2)]
+    if hasattr(os, "POSIX_SPAWN_CLOSEFROM"):  # Python 3.13+
+        file_actions.append((os.POSIX_SPAWN_CLOSEFROM, 3))
+    pid = os.posix_spawnp(
+        argv[0],
+        argv,
+        os.environ,
+        file_actions=file_actions,
+        setsid=True,
+        setsigdef=(signal.SIGPIPE, signal.SIGXFSZ),
+    )
+    GLib.child_watch_add(GLib.PRIORITY_DEFAULT, pid, lambda *_: None)
+
+
 def _launch_native_gui():
     candidates = [
         os.path.expanduser("~/.local/bin/protondrive-gui"),
@@ -47,15 +65,9 @@ def _launch_native_gui():
     ]
     for bin_path in candidates:
         try:
-            subprocess.Popen(
-                [bin_path],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            _spawn_detached([bin_path])
             return
-        except Exception:
+        except OSError:
             continue
 
 

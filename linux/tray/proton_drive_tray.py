@@ -29,6 +29,27 @@ except (ValueError, ImportError):
 DAEMON_URL = os.environ.get("PROTON_DRIVE_DAEMON_URL", "http://127.0.0.1:49152")
 
 
+def spawn_detached(argv) -> None:
+    """Launch argv like Popen(start_new_session=True): own session, stdio on /dev/null,
+    no inherited fds and default SIGPIPE/SIGXFSZ handling.
+
+    A GLib child watch reaps it when it exits, so it never lingers as a zombie of this
+    long-running tray. Raises OSError if argv[0] can't be executed.
+    """
+    file_actions = [(os.POSIX_SPAWN_OPEN, fd, os.devnull, os.O_RDWR, 0) for fd in (0, 1, 2)]
+    if hasattr(os, "POSIX_SPAWN_CLOSEFROM"):  # Python 3.13+
+        file_actions.append((os.POSIX_SPAWN_CLOSEFROM, 3))
+    pid = os.posix_spawnp(
+        argv[0],
+        argv,
+        os.environ,
+        file_actions=file_actions,
+        setsid=True,
+        setsigdef=(signal.SIGPIPE, signal.SIGXFSZ),
+    )
+    GLib.child_watch_add(GLib.PRIORITY_DEFAULT, pid, lambda *_: None)
+
+
 def find_icon_dir() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
@@ -197,24 +218,13 @@ class ProtonDriveTrayIndicator:
         ]
         for bin_path in candidates:
             try:
-                subprocess.Popen(
-                    [bin_path],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
+                spawn_detached([bin_path])
                 return
-            except Exception:
+            except OSError:
                 continue
 
     def on_open_folder(self, _widget):
-        subprocess.Popen(
-            ["xdg-open", self.sync_dir],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        spawn_detached(["xdg-open", self.sync_dir])
 
     def on_sync_now(self, _widget):
         try:

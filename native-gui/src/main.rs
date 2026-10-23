@@ -921,7 +921,7 @@ impl ProtonDriveNativeApp {
                     } else {
                         &self.status.sync_dir
                     };
-                    let _ = Command::new("xdg-open").arg(folder).spawn();
+                    let _ = spawn_reaped(Command::new("xdg-open").arg(folder));
                 }
 
                 ui.add_space(14.0);
@@ -1384,7 +1384,7 @@ impl ProtonDriveNativeApp {
                                         } else {
                                             &self.status.sync_dir
                                         };
-                                        let _ = Command::new("xdg-open").arg(folder).spawn();
+                                        let _ = spawn_reaped(Command::new("xdg-open").arg(folder));
                                         self.show_account_menu = false;
                                     }
 
@@ -1492,27 +1492,26 @@ impl ProtonDriveNativeApp {
             format_bytes(self.status.stats.total_bytes)
         };
 
+        let stat_cards = [
+            ("Proton Cloud Storage", cloud_quota_str),
+            ("Local Synced Size", format_bytes_precise(self.status.stats.total_bytes)),
+            ("Synced Files", self.status.stats.total_files.to_string()),
+            ("Synced Folders", self.status.stats.total_folders.to_string()),
+        ];
         ui.columns(4, |cols| {
-            render_stat_card(
-                &mut cols[0],
-                "Proton Cloud Storage",
-                &cloud_quota_str,
-            );
-            render_stat_card(
-                &mut cols[1],
-                "Local Synced Size",
-                &format_bytes_precise(self.status.stats.total_bytes),
-            );
-            render_stat_card(
-                &mut cols[2],
-                "Synced Files",
-                &self.status.stats.total_files.to_string(),
-            );
-            render_stat_card(
-                &mut cols[3],
-                "Synced Folders",
-                &self.status.stats.total_folders.to_string(),
-            );
+            // One shared value size so the longest value (usually the quota) fits on a single line
+            // and all four cards stay visually consistent.
+            let card_margin = card_frame().total_margin().sum().x;
+            let value_size = stat_cards
+                .iter()
+                .zip(cols.iter())
+                .map(|((_, value), col)| {
+                    fit_font_size(col.painter(), value, 24.0, 14.0, col.available_width() - card_margin)
+                })
+                .fold(24.0, f32::min);
+            for ((label, value), col) in stat_cards.iter().zip(cols.iter_mut()) {
+                render_stat_card(col, label, value, value_size);
+            }
         });
 
         // Active Transfers Card (if any)
@@ -1720,27 +1719,48 @@ impl ProtonDriveNativeApp {
                                 draw_file_icon(ui.painter(), ic_rect, &act.local_rel_path);
                             }
 
+                            // Truncate by measured pixel width so long names/details never spill into the next column
+                            let col_gap = 16.0;
+                            let name_font = FontId::new(13.0, FontFamily::Proportional);
+                            let details_font = FontId::new(12.0, FontFamily::Proportional);
+                            let time_font = FontId::new(11.5, FontFamily::Proportional);
+                            let time_str = format_relative_timestamp(act.timestamp);
+                            let time_w = text_width(ui.painter(), &time_str, &time_font);
+                            let name_x = r_file_x + 25.0;
+                            let time_left_x = r_time_right_x - time_w - col_gap;
+                            // Names stop at Details, or at Time when zoomed in so far that Details collapses
+                            let name_max_w = (r_details_x - col_gap).min(time_left_x) - name_x;
+                            let details_max_w = time_left_x - r_details_x;
+                            let name_text =
+                                truncate_middle_to_width(ui.painter(), &act.local_rel_path, &name_font, name_max_w);
+                            let details_text =
+                                truncate_middle_to_width(ui.painter(), &act.details, &details_font, details_max_w);
+                            let truncated = name_text != act.local_rel_path || details_text != act.details;
+
                             ui.painter().text(
-                                egui::pos2(r_file_x + 25.0, cy),
+                                egui::pos2(name_x, cy),
                                 egui::Align2::LEFT_CENTER,
-                                truncate_middle(&act.local_rel_path, 42),
-                                FontId::new(13.0, FontFamily::Proportional),
+                                name_text,
+                                name_font,
                                 TEXT_PRIMARY(),
                             );
                             ui.painter().text(
                                 egui::pos2(r_details_x, cy),
                                 egui::Align2::LEFT_CENTER,
-                                truncate_middle(&act.details, 92),
-                                FontId::new(12.0, FontFamily::Proportional),
+                                details_text,
+                                details_font,
                                 TEXT_MUTED(),
                             );
                             ui.painter().text(
                                 egui::pos2(r_time_right_x, cy),
                                 egui::Align2::RIGHT_CENTER,
-                                format_relative_timestamp(act.timestamp),
-                                FontId::new(11.5, FontFamily::Proportional),
+                                time_str,
+                                time_font,
                                 TEXT_MUTED(),
                             );
+                            if truncated {
+                                row_resp.on_hover_text(format!("{}\n{}", act.local_rel_path, act.details));
+                            }
                         }
                     }
                 });
@@ -2448,7 +2468,7 @@ impl ProtonDriveNativeApp {
                                 } else {
                                     format!("{}/{}/{}", self.status.sync_dir, rel_sub, item.name)
                                 };
-                                let _ = Command::new("xdg-open").arg(local_target).spawn();
+                                let _ = spawn_reaped(Command::new("xdg-open").arg(local_target));
                             }
                         }
 
@@ -3426,16 +3446,20 @@ fn proton_button(
     resp
 }
 
-fn render_stat_card(ui: &mut egui::Ui, label: &str, value: &str) {
+fn render_stat_card(ui: &mut egui::Ui, label: &str, value: &str, value_size: f32) {
     card_frame().show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         ui.label(RichText::new(label).size(12.5).color(TEXT_MUTED()));
         ui.add_space(6.0);
-        ui.label(
-            RichText::new(value)
-                .size(24.0)
-                .strong()
-                .color(TEXT_PRIMARY()),
+        // Never wrap the value; if even the minimum size can't fit, elide instead
+        ui.add(
+            egui::Label::new(
+                RichText::new(value)
+                    .size(value_size)
+                    .strong()
+                    .color(TEXT_PRIMARY()),
+            )
+            .truncate(),
         );
     });
 }
@@ -3819,6 +3843,57 @@ fn truncate_middle(s: &str, max_chars: usize) -> String {
     format!("{start}…{end}")
 }
 
+fn text_width(painter: &egui::Painter, text: &str, font: &FontId) -> f32 {
+    painter
+        .layout_no_wrap(text.to_owned(), font.clone(), Color32::PLACEHOLDER)
+        .size()
+        .x
+}
+
+/// Middle-truncate `s` so it fits within `max_width` pixels when drawn in `font`.
+fn truncate_middle_to_width(painter: &egui::Painter, s: &str, font: &FontId, max_width: f32) -> String {
+    // No room at all (e.g. a collapsed column when zoomed in): draw nothing rather than overlap
+    if max_width <= 0.0 {
+        return String::new();
+    }
+    if text_width(painter, s, font) <= max_width {
+        return s.to_string();
+    }
+    // Binary search for the longest truncation that still fits
+    let (mut lo, mut hi) = (2, s.chars().count().saturating_sub(1));
+    let mut best = truncate_middle(s, 2);
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let candidate = truncate_middle(s, mid);
+        if text_width(painter, &candidate, font) <= max_width {
+            best = candidate;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best
+}
+
+/// Largest font size in `min_size..=base_size` at which `text` fits within `max_width` on one line,
+/// or `min_size` if it doesn't fit even then.
+fn fit_font_size(painter: &egui::Painter, text: &str, base_size: f32, min_size: f32, max_width: f32) -> f32 {
+    let mut size = base_size;
+    while size > min_size && text_width(painter, text, &FontId::proportional(size)) > max_width {
+        size -= 0.5;
+    }
+    size.max(min_size)
+}
+
+/// Spawn `cmd` and wait on it from a background thread so it never lingers as a zombie child.
+fn spawn_reaped(cmd: &mut Command) -> std::io::Result<()> {
+    let mut child = cmd.spawn()?;
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 fn try_autostart_daemon() {
     use std::sync::atomic::{AtomicBool, Ordering};
     static TRIED: AtomicBool = AtomicBool::new(false);
@@ -3841,13 +3916,14 @@ fn try_autostart_daemon() {
     candidates.push(std::path::PathBuf::from("protondrive"));
 
     for bin in candidates {
-        if Command::new(&bin)
-            .arg("daemon")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .is_ok()
+        if spawn_reaped(
+            Command::new(&bin)
+                .arg("daemon")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .is_ok()
         {
             // Poll up to ~3.6s so we return as soon as the daemon HTTP listener is ready
             for _ in 0..30 {
@@ -4038,12 +4114,13 @@ fn try_autostart_tray() {
 
     for script in script_candidates {
         if script.is_file() {
-            let _ = Command::new("python3")
-                .arg(&script)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
+            let _ = spawn_reaped(
+                Command::new("python3")
+                    .arg(&script)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null()),
+            );
             break;
         }
     }
@@ -4178,4 +4255,113 @@ fn main() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_painter(f: impl FnOnce(&egui::Painter)) {
+        let ctx = egui::Context::default();
+        let mut f = Some(f);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            if let Some(f) = f.take() {
+                f(&ctx.layer_painter(egui::LayerId::background()));
+            }
+        });
+    }
+
+    #[test]
+    fn truncate_to_width_keeps_text_that_fits() {
+        with_painter(|p| {
+            let font = FontId::proportional(12.0);
+            assert_eq!(truncate_middle_to_width(p, "short.txt", &font, 500.0), "short.txt");
+        });
+    }
+
+    #[test]
+    fn truncate_to_width_fits_long_text_in_pixels() {
+        with_painter(|p| {
+            let font = FontId::proportional(12.0);
+            let details = "Download failed: ENOENT: no such file or directory, rename \
+                '/home/user/ProtonDrive/xyz/.proton-drive-tmp-00849-gabiinthewild_1753137399_3863415252.mp4'";
+            for max_width in [80.0, 250.0, 550.0] {
+                let out = truncate_middle_to_width(p, details, &font, max_width);
+                assert!(text_width(p, &out, &font) <= max_width, "{out:?} wider than {max_width}");
+                assert!(out.contains('…'));
+                assert!(out.starts_with("Down") && out.ends_with('\''));
+            }
+        });
+    }
+
+    #[test]
+    fn truncate_to_width_returns_empty_when_there_is_no_room() {
+        with_painter(|p| {
+            let font = FontId::proportional(12.0);
+            assert_eq!(truncate_middle_to_width(p, "", &font, -1.0), "");
+            assert_eq!(truncate_middle_to_width(p, "report.pdf", &font, -40.0), "");
+            assert_eq!(truncate_middle_to_width(p, "report.pdf", &font, 0.0), "");
+        });
+    }
+
+    #[test]
+    fn truncate_to_width_uses_the_longest_truncation_that_fits() {
+        with_painter(|p| {
+            let font = FontId::proportional(12.0);
+            let name = "xyz/Gabriela Valientes/gabiinthewild_1753137399_3863415252.mp4";
+            let out = truncate_middle_to_width(p, name, &font, 200.0);
+            let kept = out.chars().count();
+            assert!(text_width(p, &truncate_middle(name, kept + 1), &font) > 200.0);
+        });
+    }
+
+    #[test]
+    fn truncate_to_width_handles_multibyte_text() {
+        with_painter(|p| {
+            let font = FontId::proportional(12.0);
+            let name = "写真/日本語のファイル名_とても長い名前_2026年10月23日_最終版.txt";
+            let out = truncate_middle_to_width(p, name, &font, 120.0);
+            assert!(text_width(p, &out, &font) <= 120.0);
+            assert!(out.starts_with('写') && out.ends_with(".txt"));
+        });
+    }
+
+    #[test]
+    fn spawn_reaped_leaves_no_zombie_children() {
+        let zombie_children = || {
+            let me = std::process::id().to_string();
+            std::fs::read_dir("/proc")
+                .unwrap()
+                .filter_map(|e| std::fs::read_to_string(e.ok()?.path().join("stat")).ok())
+                .filter(|stat| {
+                    // Fields after the "(comm)" are: state ppid ...
+                    let rest: Vec<&str> = stat.rsplit_once(')').map_or(vec![], |(_, r)| r.split_whitespace().collect());
+                    rest.first() == Some(&"Z") && rest.get(1) == Some(&me.as_str())
+                })
+                .count()
+        };
+        for _ in 0..3 {
+            spawn_reaped(&mut Command::new("true")).unwrap();
+        }
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(zombie_children(), 0);
+    }
+
+    #[test]
+    fn fit_font_size_keeps_base_size_when_text_fits() {
+        with_painter(|p| {
+            assert_eq!(fit_font_size(p, "372", 24.0, 14.0, 300.0), 24.0);
+        });
+    }
+
+    #[test]
+    fn fit_font_size_shrinks_wide_text_to_fit_without_going_below_min() {
+        with_painter(|p| {
+            let quota = "13.22 GB / 510.00 GB";
+            let size = fit_font_size(p, quota, 24.0, 14.0, 200.0);
+            assert!(size < 24.0 && size >= 14.0);
+            assert!(text_width(p, quota, &FontId::proportional(size)) <= 200.0);
+            assert_eq!(fit_font_size(p, quota, 24.0, 14.0, 20.0), 14.0);
+        });
+    }
 }
