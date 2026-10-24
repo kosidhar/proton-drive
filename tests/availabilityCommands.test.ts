@@ -13,20 +13,54 @@ afterEach(async () => {
     while (cleanups.length) await cleanups.pop()!();
 });
 
+describe('toMyFilesRelPath relative to the working directory', () => {
+    const inDocs = `${SYNC}/Docs`;
+    test('resolves against cwd when it is inside the sync folder', () => {
+        expect(toMyFilesRelPath('.', SYNC, inDocs)).toBe('Docs');
+        expect(toMyFilesRelPath('./', SYNC, inDocs)).toBe('Docs');
+        expect(toMyFilesRelPath('file.txt', SYNC, inDocs)).toBe('Docs/file.txt');
+        expect(toMyFilesRelPath('../Other', SYNC, inDocs)).toBe('Other');
+    });
+
+    test('refuses an escape from the sync folder', () => {
+        expect(() => toMyFilesRelPath('..', SYNC, SYNC)).toThrow();
+        expect(() => toMyFilesRelPath('../..', SYNC, inDocs)).toThrow();
+    });
+
+    test('refuses empty and dot targets that would mean the whole drive', () => {
+        for (const cwd of ['/tmp', SYNC]) {
+            for (const input of ['', '  ', '.', './']) {
+                expect(() => toMyFilesRelPath(input, SYNC, cwd)).toThrow('to act on the whole drive, use /my-files');
+            }
+        }
+        expect(() => toMyFilesRelPath('..', SYNC, inDocs)).toThrow();
+    });
+
+    test('the root can be named explicitly', () => {
+        expect(toMyFilesRelPath('/my-files', SYNC, '/tmp')).toBe('');
+        expect(toMyFilesRelPath(SYNC, SYNC, '/tmp')).toBe('');
+        expect(toMyFilesRelPath(`${SYNC}/`, SYNC, inDocs)).toBe('');
+    });
+
+    test('outside the sync folder, relative input is My files relative', () => {
+        expect(toMyFilesRelPath('a/b', SYNC, '/tmp')).toBe('a/b');
+    });
+});
+
 describe('toMyFilesRelPath', () => {
     test('normalises the accepted forms', () => {
         expect(toMyFilesRelPath(`${SYNC}/a/b`, SYNC)).toBe('a/b');
         expect(toMyFilesRelPath('/my-files/a/b', SYNC)).toBe('a/b');
-        expect(toMyFilesRelPath('a/b/', SYNC)).toBe('a/b');
+        expect(toMyFilesRelPath('a/b/', SYNC, '/tmp')).toBe('a/b');
         expect(toMyFilesRelPath(`${SYNC}/`, SYNC)).toBe('');
         expect(toMyFilesRelPath('/my-files', SYNC)).toBe('');
-        expect(toMyFilesRelPath('a/../b', SYNC)).toBe('b');
+        expect(toMyFilesRelPath('a/../b', SYNC, '/tmp')).toBe('b');
     });
 
     test('refuses anything outside My files', () => {
         expect(() => toMyFilesRelPath('/etc/passwd', SYNC)).toThrow();
-        expect(() => toMyFilesRelPath('../x', SYNC)).toThrow();
-        expect(() => toMyFilesRelPath('a/../../x', SYNC)).toThrow();
+        expect(() => toMyFilesRelPath('../x', SYNC, '/tmp')).toThrow();
+        expect(() => toMyFilesRelPath('a/../../x', SYNC, '/tmp')).toThrow();
         expect(() => toMyFilesRelPath(`${SYNC}/../x`, SYNC)).toThrow();
         expect(() => toMyFilesRelPath('/my-files/../etc', SYNC)).toThrow();
         expect(() => toMyFilesRelPath(`${SYNC}-evil/a`, SYNC)).toThrow();
@@ -80,6 +114,7 @@ describe('runAvailabilityCommand', () => {
         const { socketPath } = await fakeDaemon({ state: 'online-only', kept: ['Docs/a.txt'], refused: null });
         const { out } = capture();
         expect(await runAvailabilityCommand('free', 'Docs', SYNC, socketPath)).toBe(0);
+        expect(out[0]).toContain('Docs');
         expect(out.join('\n')).toContain('online-only');
         expect(out.join('\n')).toContain('Docs/a.txt');
     });

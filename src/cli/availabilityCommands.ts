@@ -7,32 +7,38 @@ export const DAEMON_NOT_RUNNING_MESSAGE = `The Proton Drive daemon isn't running
 
 const MY_FILES_PREFIX = '/my-files';
 
+const WHOLE_DRIVE_HINT = 'Name a file or folder inside your Proton Drive folder; to act on the whole drive, use /my-files.';
+
 /**
  * Turn a user-typed path into a My files relPath (no leading slash, root is '').
- * Accepts '<syncDir>/a/b', '/my-files/a/b' and 'a/b/'. Throws for anything outside My files.
+ * Accepts '<syncDir>/a/b' and '/my-files/a/b' (absolute), or a relative path, which resolves against `cwd`
+ * when cwd is inside syncDir and against the My files root otherwise. Throws for anything outside My files,
+ * and for empty or dot targets that would mean the whole drive: the root has to be named explicitly.
  */
-export function toMyFilesRelPath(input: string, syncDir: string): string {
+export function toMyFilesRelPath(input: string, syncDir: string, cwd: string = process.cwd()): string {
     const raw = input.trim();
-    let rel: string;
     const syncRoot = path.resolve(syncDir);
+    let rel: string;
     if (raw === MY_FILES_PREFIX || raw.startsWith(`${MY_FILES_PREFIX}/`)) {
         rel = raw.slice(MY_FILES_PREFIX.length);
+        if (!isWithin(rel)) throw new Error(`${input} is outside your Proton Drive folder`);
     } else if (path.isAbsolute(raw)) {
-        const resolved = path.resolve(raw);
-        const fromRoot = path.relative(syncRoot, resolved);
+        const fromRoot = path.relative(syncRoot, path.resolve(raw));
         if (fromRoot === '..' || fromRoot.startsWith(`..${path.sep}`) || path.isAbsolute(fromRoot)) {
             throw new Error(`${input} is outside your Proton Drive folder (${syncRoot})`);
         }
         rel = fromRoot.split(path.sep).join('/');
     } else {
-        rel = raw;
+        const cwdFromRoot = path.relative(syncRoot, path.resolve(cwd));
+        const cwdInside = cwdFromRoot !== '..' && !cwdFromRoot.startsWith(`..${path.sep}`) && !path.isAbsolute(cwdFromRoot);
+        const base = cwdInside ? cwdFromRoot.split(path.sep).join('/') : '';
+        rel = base ? `${base}/${raw}` : raw;
+        if (!isWithin(rel)) throw new Error(`${input} is outside your Proton Drive folder`);
+        if (path.posix.normalize(`/${rel}`).replace(/^\/+|\/+$/g, '') === '') {
+            throw new Error(WHOLE_DRIVE_HINT);
+        }
     }
-    const normalised = path.posix.normalize(`/${rel}`);
-    // Normalising against a root swallows leading '..', so check the raw segments too
-    if (rel.split('/').includes('..') && !isWithin(rel)) {
-        throw new Error(`${input} is outside your Proton Drive folder`);
-    }
-    return normalised.replace(/^\/+|\/+$/g, '');
+    return path.posix.normalize(`/${rel}`).replace(/^\/+|\/+$/g, '');
 }
 
 /** True if '..' segments never climb above the start of the path. */
@@ -67,6 +73,9 @@ export async function runAvailabilityCommand(
         console.error(err instanceof Error ? err.message : String(err));
         return 1;
     }
+
+    const verbs = { pin: 'Pinning', free: 'Freeing', hide: 'Hiding', unhide: 'Unhiding', status: 'Checking' };
+    console.log(`${verbs[action]} ${relPath || '/my-files'}…`);
 
     let res: Response;
     try {
