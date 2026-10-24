@@ -1,6 +1,6 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { appendFileSync, writeFileSync } from 'node:fs';
-import { mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -987,10 +987,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
 
         test('hide waits for uploads, then completes', async () => {
-            const { engine, nodes, calls, files } = await downloaded(
-                { 'Drafts/old.txt': 'old', 'Drafts/gone.txt': 'deleted while hiding' },
-                'vol~root',
-            );
+            const { engine, nodes, calls, files } = await downloaded({ 'Drafts/old.txt': 'old' }, 'vol~root');
             await files.writeLocal('Drafts/new.txt', 'not uploaded yet');
 
             const result = await engine.setAvailability('Drafts', 'hide');
@@ -998,9 +995,6 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(result).toEqual({ state: 'hiding', kept: [], refused: null });
             expect(await files.exists('Drafts/new.txt')).toBe(true);
             expect(await files.exists('Drafts/old.txt')).toBe(true);
-            // Deleted while hiding: not taken to the cloud, and its record must not outlive the hide
-            await rm(local('Drafts/gone.txt'));
-            await (engine as any).handleLocalFileChange('Drafts/gone.txt');
 
             // The next sync uploads it through the usual path, then finishes the hide
             await engine.reconcileNow();
@@ -1010,12 +1004,11 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(files.recordCount('Drafts')).toBe(0);
             expect(calls.trashed).toEqual([]);
             expect(nodes.has('vol~Drafts/old.txt')).toBe(true);
-            expect(nodes.has('vol~Drafts/gone.txt')).toBe(true);
 
             // Hidden stays hidden: nothing comes back
             await engine.reconcileNow();
             expect(await files.exists('Drafts')).toBe(false);
-            expect(calls.downloads.sort()).toEqual(['Drafts/gone.txt', 'Drafts/old.txt']);
+            expect(calls.downloads).toEqual(['Drafts/old.txt']);
         });
 
         test('hiding a folder already deleted here leaves no records behind and trashes nothing', async () => {
@@ -1070,9 +1063,9 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(calls.trashed).toEqual([]);
         });
 
-        test('a hiding folder keeps uploading but downloads nothing new and trashes nothing', async () => {
+        test('a hiding folder keeps syncing local changes, deletes included, but downloads nothing new', async () => {
             const { engine, add, nodes, calls, files } = await downloaded(
-                { 'Work/a.txt': 'a', 'Work/b.txt': 'b', 'Work/c.txt': 'c' },
+                { 'Work/a.txt': 'a', 'Work/b.txt': 'b', 'Work/c.txt': 'c', 'Work/d.txt': 'd' },
                 'vol~root',
             );
             // An unresolved conflict keeps the hide waiting
@@ -1097,12 +1090,33 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await writeFile(local('Work/b.txt'), 'b edited');
             await (engine as any).handleLocalFileChange('Work/b.txt');
             expect(calls.uploads).toEqual(['Work/local-new.txt', 'Work/b.txt']);
-            // A local deletion while hiding is not taken to the cloud
+            // A local deletion goes to the cloud as it would for a visible folder, and only once, whether the watcher
+            // or the sync sees it
             await rm(local('Work/c.txt'));
             await (engine as any).handleLocalFileChange('Work/c.txt');
+            await rm(local('Work/d.txt'));
             await engine.reconcileNow();
-            expect(calls.trashed).toEqual([]);
-            expect(nodes.has('vol~Work/c.txt')).toBe(true);
+            expect(calls.trashed).toEqual([['vol~Work/c.txt'], ['vol~Work/d.txt']]);
+            expect(nodes.has('vol~Work/b.txt')).toBe(true);
+        });
+
+        test('a delete in a hiding folder is trashed in the cloud at once, and a later refusal trashes nothing more', async () => {
+            const { engine, nodes, calls, files } = await downloaded({ 'Drafts/old.txt': 'old', 'Drafts/gone.txt': 'g' }, 'vol~root');
+            await files.writeLocal('Drafts/new.txt', 'not uploaded yet');
+            expect((await engine.setAvailability('Drafts', 'hide')).state).toBe('hiding');
+
+            await rm(local('Drafts/gone.txt'));
+            await (engine as any).handleLocalFileChange('Drafts/gone.txt');
+
+            expect(calls.trashed).toEqual([['vol~Drafts/gone.txt']]);
+            expect(stateDb.getItemByPath('Drafts/gone.txt')).toBeNull();
+            // The hide is then refused on its next try, and nothing else goes to the trash
+            await files.writeLocal('Drafts/node_modules/x/index.js', 'ignored, so never uploaded');
+            await engine.reconcileNow();
+            expect(['hidden', 'hiding']).not.toContain(engine.availability.stateOf('Drafts'));
+            await engine.reconcileNow();
+            expect(calls.trashed).toEqual([['vol~Drafts/gone.txt']]);
+            expect(nodes.has('vol~Drafts/old.txt')).toBe(true);
         });
 
         test('a hiding folder that gains never-uploaded content stops hiding and says why', async () => {
@@ -1209,6 +1223,198 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(stateDb.getMeta(PIN_ROOT_ON_FIRST_SYNC)).toBeNull();
             expect(calls.downloads).toEqual([]);
             expect(engine.availability.stateOf('')).not.toBe('pinned');
+        });
+
+        // A change handler for Docs/a.txt that is already past its wait for availability changes, held on the network
+        // round trip its upload makes to see whether the cloud copy is identical
+        const handlerHeldOnTheNetwork = async (drive: Awaited<ReturnType<typeof downloaded>>, rel: string) => {
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            const getNode = drive.sdk.getNode.bind(drive.sdk);
+            (drive.sdk as any).getNode = async (uid: string) => {
+                if (uid === `vol~${rel}`) {
+                    (drive.sdk as any).getNode = getNode;
+                    entered();
+                    await gate;
+                }
+                return getNode(uid);
+            };
+            const handler: Promise<void> = (drive.engine as any).handleLocalFileChange(rel);
+            await inside;
+            return { release, handler };
+        };
+
+        test('a change handler already under way when Free removes a file does not record it again', async () => {
+            const drive = await downloaded({ 'Docs/a.txt': 'a', 'Docs/b.txt': 'b' }, 'vol~Docs');
+            const { engine, nodes, calls, files } = drive;
+            await writeFile(local('Docs/b.txt'), 'edited, so Free keeps it and the folder');
+            // Touched, not changed: Free still sees an unchanged synced copy
+            await utimes(local('Docs/a.txt'), new Date(), new Date(Date.now() + 60_000));
+            const { release, handler } = await handlerHeldOnTheNetwork(drive, 'Docs/a.txt');
+
+            await engine.setAvailability('Docs', 'free');
+            expect(await files.exists('Docs/a.txt')).toBe(false);
+            release();
+            await handler; // finishes after the removal
+
+            await files.expectNoRecordWithoutFile('Docs');
+            await engine.reconcileNow();
+            expect(calls.trashed).toEqual([]);
+            expect(nodes.has('vol~Docs/a.txt')).toBe(true);
+        });
+
+        test('a change handler finishing after Free emptied the folder leaves nothing that a later pin trashes', async () => {
+            const drive = await downloaded({ 'Docs/a.txt': 'a', 'Docs/b.txt': 'b' }, 'vol~Docs');
+            const { engine, nodes, calls, files } = drive;
+            await utimes(local('Docs/a.txt'), new Date(), new Date(Date.now() + 60_000));
+            const { release, handler } = await handlerHeldOnTheNetwork(drive, 'Docs/a.txt');
+
+            await engine.setAvailability('Docs', 'free');
+            expect(await files.exists('Docs')).toBe(false);
+            release();
+            await handler;
+
+            expect(stateDb.getItemByPath('Docs/a.txt')).toBeNull();
+            await engine.reconcileNow();
+            await engine.setAvailability('Docs', 'pin');
+            expect(calls.trashed).toEqual([]);
+            expect(nodes.has('vol~Docs/a.txt')).toBe(true);
+            expect(await readFile(local('Docs/a.txt'), 'utf8')).toBe('a');
+        });
+
+        test('a sync that hashed a file before Free removed it does not record it afterwards', async () => {
+            const { engine, nodes, calls, files } = await downloaded({ 'Docs/a.txt': 'a' }, 'vol~Docs');
+            await files.writeLocal('Docs/.DS_Store', 'ignored, so Free keeps it and the folder');
+            await utimes(local('Docs/a.txt'), new Date(), new Date(Date.now() + 60_000));
+            // The sync's hash of a.txt reads the file as it is now, then is held until Free has run
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            const realFile = Bun.file.bind(Bun);
+            const spy = spyOn(Bun, 'file').mockImplementation(((p: string, ...rest: unknown[]) => {
+                const file = (realFile as any)(p, ...rest);
+                if (p !== local('Docs/a.txt')) {
+                    return file;
+                }
+                spy.mockRestore(); // only the sync's hash; Free's own look reads the file normally
+                const bytes = file.arrayBuffer();
+                return {
+                    stream: () =>
+                        new ReadableStream({
+                            async start(controller) {
+                                const data = new Uint8Array(await bytes);
+                                entered();
+                                await gate;
+                                controller.enqueue(data);
+                                controller.close();
+                            },
+                        }),
+                };
+            }) as any);
+            const sync = engine.reconcileNow();
+            await inside;
+
+            await engine.setAvailability('Docs', 'free');
+            expect(await files.exists('Docs/a.txt')).toBe(false);
+            release();
+            await sync;
+
+            await files.expectNoRecordWithoutFile('Docs');
+            await engine.reconcileNow();
+            expect(calls.trashed).toEqual([]);
+            expect(nodes.has('vol~Docs/a.txt')).toBe(true);
+        });
+
+        test('a record written in the instant between Free dropping it and removing the file does not stay', async () => {
+            const { engine, nodes, calls, files } = await downloaded({ 'Docs/a.txt': 'a', 'Docs/b.txt': 'b' }, 'vol~Docs');
+            await writeFile(local('Docs/b.txt'), 'edited, so Free keeps it and the folder');
+            // An upload or download of a.txt finishing right then: its record is gone, its file not yet
+            const record = stateDb.getItemByPath('Docs/a.txt')!;
+            const removeItemByPath = stateDb.removeItemByPath.bind(stateDb);
+            let written = false;
+            stateDb.removeItemByPath = (rel: string) => {
+                removeItemByPath(rel);
+                if (rel === 'Docs/a.txt' && !written) {
+                    written = true;
+                    (engine as any).recordSynced(record);
+                }
+            };
+
+            await engine.setAvailability('Docs', 'free');
+
+            expect(written).toBe(true);
+            expect(await files.exists('Docs/a.txt')).toBe(false);
+            await files.expectNoRecordWithoutFile('Docs');
+            await engine.reconcileNow();
+            expect(calls.trashed).toEqual([]);
+            expect(nodes.has('vol~Docs/a.txt')).toBe(true);
+        });
+
+        test('a record written in the instant between a hide dropping it and removing the file does not stay', async () => {
+            const names = ['a', 'b', 'c'].map((n) => `Docs/${n}.txt`);
+            const { engine, files } = await downloaded(Object.fromEntries(names.map((n) => [n, n])), 'vol~Docs');
+            const records = new Map(names.map((n) => [n, stateDb.getItemByPath(n)!]));
+            // The first file's record is written again right after it is dropped (an upload finishing then), and the
+            // others are edited, so the hide stops after that file and waits as hiding
+            const removeItemByPath = stateDb.removeItemByPath.bind(stateDb);
+            let first = '';
+            stateDb.removeItemByPath = (rel: string) => {
+                removeItemByPath(rel);
+                if (!first && records.has(rel)) {
+                    first = rel;
+                    (engine as any).recordSynced(records.get(rel));
+                    for (const other of names.filter((n) => n !== rel)) {
+                        writeFileSync(local(other), 'edited while hiding');
+                    }
+                }
+            };
+
+            expect((await engine.setAvailability('Docs', 'hide')).state).toBe('hiding');
+
+            expect(await files.exists(first)).toBe(false);
+            await files.expectNoRecordWithoutFile('Docs');
+        });
+
+        test('pinning a folder whose name ends in a space clears its syncing mark', async () => {
+            const { engine, add, calls } = setup();
+            add('Photos /a.jpg', 'a');
+            await engine.reconcileNow();
+
+            await engine.setAvailability('Photos ', 'pin');
+
+            expect(calls.downloads).toEqual(['Photos /a.jpg']);
+            expect(engine.getStatus().syncingFolders).toEqual([]);
+            expect(engine.getStatus().state).toBe('idle');
+        });
+
+        test('an unhide asked while a pending hide waits its turn stops it', async () => {
+            const { engine, files } = await downloaded({ 'Music/song.mp3': 'la la' }, 'vol~Music');
+            await files.writeLocal('Music/demo.mp3', 'not uploaded yet');
+            expect((await engine.setAvailability('Music', 'hide')).state).toBe('hiding');
+            // Something else holds the queue when the sync finishes, and the user unhides Music meanwhile
+            const p = engine as any;
+            const completePendingHides = p.completePendingHides.bind(engine);
+            let unhide: Promise<AvailabilityResult> | undefined;
+            p.completePendingHides = async () => {
+                let releaseHold!: () => void;
+                const hold = new Promise<void>((resolve) => (releaseHold = resolve));
+                const held = p.inAvailabilityRun(() => hold);
+                const done = completePendingHides(); // waits behind the hold
+                unhide = engine.setAvailability('Music', 'unhide');
+                releaseHold();
+                await held;
+                await done;
+            };
+
+            await engine.reconcileNow();
+            await unhide;
+
+            expect(await readFile(local('Music/song.mp3'), 'utf8')).toBe('la la');
+            expect(await readFile(local('Music/demo.mp3'), 'utf8')).toBe('not uploaded yet');
+            expect(engine.availability.stateOf('Music')).toBe('downloaded');
         });
     });
 });
