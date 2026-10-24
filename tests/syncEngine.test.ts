@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { appendFileSync, writeFileSync } from 'node:fs';
-import { mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -1339,7 +1339,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 removeItemByPath(rel);
                 if (rel === 'Docs/a.txt' && !written) {
                     written = true;
-                    (engine as any).recordSynced(record);
+                    (engine as any).recordSynced(record, 0);
                 }
             };
 
@@ -1365,7 +1365,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 removeItemByPath(rel);
                 if (!first && records.has(rel)) {
                     first = rel;
-                    (engine as any).recordSynced(records.get(rel));
+                    (engine as any).recordSynced(records.get(rel), 0);
                     for (const other of names.filter((n) => n !== rel)) {
                         writeFileSync(local(other), 'edited while hiding');
                     }
@@ -1376,6 +1376,175 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
             expect(await files.exists(first)).toBe(false);
             await files.expectNoRecordWithoutFile('Docs');
+        });
+
+        // Lets the upload of `rel` send its bytes, then runs `during` (the user acting on the file) before it completes
+        const duringUpload = (sdk: ProtonDriveClient, rel: string, during: () => Promise<void>) => {
+            const getFileUploader = sdk.getFileUploader.bind(sdk);
+            (sdk as any).getFileUploader = async (parent: NodeEntity, name: string, metadata: any) => {
+                const uploader = await getFileUploader(parent, name, metadata);
+                if (name !== path.posix.basename(rel)) {
+                    return uploader;
+                }
+                return {
+                    uploadFromStream: async (...args: Parameters<typeof uploader.uploadFromStream>) => {
+                        const result = await uploader.uploadFromStream(...args);
+                        await during();
+                        return result;
+                    },
+                };
+            };
+        };
+        const namesIn = (nodes: Map<string, NodeEntity>, parentUid: string) =>
+            [...nodes.values()]
+                .filter((n) => n.uid !== 'vol~root' && n.parentUid === parentUid)
+                .map((n) => (n.name.ok ? n.name.value : ''))
+                .sort();
+
+        test('a new file deleted while it uploads is trashed in the cloud, not brought back', async () => {
+            const { engine, sdk, nodes, calls, files } = await downloaded({ 'Docs/a.txt': 'a' }, 'vol~root');
+            await files.writeLocal('Docs/big.bin', 'big');
+            let deleted: Promise<void> | undefined;
+            duringUpload(sdk, 'Docs/big.bin', async () => {
+                await rm(local('Docs/big.bin'));
+                deleted = (engine as any).handleLocalFileChange('Docs/big.bin'); // the watcher's delete event
+            });
+
+            await (engine as any).handleLocalFileChange('Docs/big.bin');
+            await deleted;
+            await engine.reconcileNow();
+
+            expect(calls.trashed).toHaveLength(1);
+            expect(namesIn(nodes, 'vol~Docs')).toEqual(['a.txt']);
+            expect(await files.exists('Docs/big.bin')).toBe(false);
+            expect(stateDb.getItemByPath('Docs/big.bin')).toBeNull();
+        });
+
+        test('a new file renamed while it uploads ends up once, under its new name', async () => {
+            const { engine, sdk, nodes, files } = await downloaded({ 'Docs/a.txt': 'a' }, 'vol~root');
+            await files.writeLocal('Docs/draft.txt', 'text');
+            let handlers: Promise<void>[] = [];
+            duringUpload(sdk, 'Docs/draft.txt', async () => {
+                await rename(local('Docs/draft.txt'), local('Docs/final.txt'));
+                handlers = ['Docs/draft.txt', 'Docs/final.txt'].map((rel) => (engine as any).handleLocalFileChange(rel));
+            });
+
+            await (engine as any).handleLocalFileChange('Docs/draft.txt');
+            await Promise.all(handlers);
+            await engine.reconcileNow();
+
+            expect(namesIn(nodes, 'vol~Docs')).toEqual(['a.txt', 'final.txt']);
+            expect((await readdir(local('Docs'))).sort()).toEqual(['a.txt', 'final.txt']);
+        });
+
+        test('a new folder renamed while it is created in the cloud ends up once, under its new name', async () => {
+            const { engine, sdk, nodes } = await downloaded({ 'Docs/a.txt': 'a' }, 'vol~root');
+            await mkdir(local('Untitled Folder'));
+            const createFolder = sdk.createFolder.bind(sdk);
+            let handlers: Promise<void>[] = [];
+            (sdk as any).createFolder = async (parent: NodeEntity, name: string) => {
+                const folder = await createFolder(parent, name);
+                if (name === 'Untitled Folder') {
+                    await rename(local('Untitled Folder'), local('Projects'));
+                    handlers = ['Untitled Folder', 'Projects'].map((rel) => (engine as any).handleLocalFileChange(rel));
+                }
+                return folder;
+            };
+
+            await (engine as any).handleLocalFileChange('Untitled Folder');
+            await Promise.all(handlers);
+            await engine.reconcileNow();
+
+            expect(namesIn(nodes, 'vol~root')).toEqual(['Docs', 'Projects']);
+            expect((await readdir(local(''))).sort()).toEqual(['Docs', 'Projects']);
+        });
+
+        test('a new file Free keeps gets its record when its upload finishes during the removal', async () => {
+            const { engine, sdk, calls, files } = await downloaded({ 'Docs/a.txt': 'a', 'Docs/b.txt': 'b' }, 'vol~Docs');
+            await files.writeLocal('Docs/n.txt', 'new');
+            // The upload completes only once Free has started removing
+            let removalStarted!: () => void;
+            const removing = new Promise<void>((resolve) => (removalStarted = resolve));
+            files.onRemoval(1, () => removalStarted());
+            let uploading!: () => void;
+            const uploaded = new Promise<void>((resolve) => (uploading = resolve));
+            duringUpload(sdk, 'Docs/n.txt', async () => {
+                uploading();
+                await removing;
+            });
+            const handler = (engine as any).handleLocalFileChange('Docs/n.txt');
+            await uploaded;
+
+            const result = await engine.setAvailability('Docs', 'free');
+            await handler;
+
+            expect(result.kept).toContain('Docs/n.txt');
+            expect(stateDb.getItemByPath('Docs/n.txt')).not.toBeNull();
+            // So a later edit uploads as an edit, not as a conflict
+            await writeFile(local('Docs/n.txt'), 'new, edited again');
+            await engine.reconcileNow();
+            expect((await readdir(local('Docs'))).sort()).toEqual(['n.txt']);
+            expect(calls.uploads).toEqual(['Docs/n.txt', 'Docs/n.txt']);
+        });
+
+        test('a sync about to hash a file that Free then removes carries on', async () => {
+            const { engine, calls, files } = await downloaded({ 'Docs/a.txt': 'a', 'Docs/z.txt': 'z' }, 'vol~Docs');
+            await files.writeLocal('Docs/.DS_Store', 'ignored, so Free keeps it and the folder');
+            await utimes(local('Docs/a.txt'), new Date(), new Date(Date.now() + 60_000));
+            // The sync's hash of a.txt opens the file only once Free has removed it
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            const realFile = Bun.file.bind(Bun);
+            const spy = spyOn(Bun, 'file').mockImplementation(((p: string, ...rest: unknown[]) => {
+                if (p !== local('Docs/a.txt')) {
+                    return (realFile as any)(p, ...rest);
+                }
+                spy.mockRestore();
+                return {
+                    stream: () =>
+                        new ReadableStream({
+                            async start(controller) {
+                                entered();
+                                await gate;
+                                try {
+                                    controller.enqueue(new Uint8Array(await (realFile as any)(p).arrayBuffer()));
+                                    controller.close();
+                                } catch (error) {
+                                    controller.error(error);
+                                }
+                            },
+                        }),
+                };
+            }) as any);
+            const sync = engine.reconcileNow();
+            await inside;
+
+            await engine.setAvailability('Docs', 'free');
+            release();
+            await sync;
+
+            expect(engine.getStatus().state).toBe('idle');
+            expect(engine.getStatus().lastError).toBeNull();
+            await engine.reconcileNow();
+            expect(calls.trashed).toEqual([]);
+        });
+
+        test('a record check that cannot look at the path counts it as gone instead of failing', async () => {
+            const { engine, files } = await downloaded({ 'Docs/sub/f.txt': 'f', 'Docs/keep.txt': 'k' }, 'vol~Docs');
+            await writeFile(local('Docs/keep.txt'), 'edited, so Free keeps it and the folder');
+            const record = stateDb.getItemByPath('Docs/sub/f.txt')!;
+            // Work that began before the free, finishing after it
+            await (engine as any).observingLocal(async (since: number) => {
+                await engine.setAvailability('Docs', 'free');
+                await writeFile(local('Docs/sub'), 'now a file, so looking at Docs/sub/f.txt fails with ENOTDIR');
+
+                expect(() => (engine as any).recordSynced(record, since)).not.toThrow();
+            });
+
+            expect(stateDb.getItemByPath('Docs/sub/f.txt')).toBeNull();
+            expect(await files.exists('Docs/sub')).toBe(true);
         });
 
         test('pinning a folder whose name ends in a space clears its syncing mark', async () => {

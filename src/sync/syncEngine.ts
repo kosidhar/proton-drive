@@ -72,8 +72,14 @@ export class ProtonDriveSyncEngine {
     // How many availability changes were asked for per node uid: a later one supersedes an earlier one on the same item
     // that is still waiting or running (an unhide stops a hide's removal, a pin stops a free's).
     private availabilityAsks = new Map<string, number>();
-    // Items whose local copies Free up space or Hide is removing right now: nothing below them is recorded meanwhile.
-    private removingLocal = new Set<string>();
+    // Local copies removed by Free up space or Hide (see recordSynced). While a removal runs, the paths it has dropped
+    // records for are in runningRemovals; when it ends they become a batch numbered by localRemovals, the count of
+    // finished removals. A batch is kept while some work that began before it is still running (workSince counts the
+    // running work by the count it began at).
+    private localRemovals = 0;
+    private runningRemovals = new Set<Set<string>>();
+    private removalBatches: Array<{ n: number; paths: Set<string> }> = [];
+    private workSince = new Map<number, number>();
     private readonly index: RemoteIndex;
     private readonly policy: AvailabilityPolicy;
 
@@ -316,7 +322,9 @@ export class ProtonDriveSyncEngine {
             // Sync folder-by-folder incrementally so files & folders appear in ~/ProtonDrive
             // and in the GUI dashboard immediately instead of waiting for a full tree scan.
             const remoteMap = new Map<string, NodeEntity>();
-            await this.reconcileDirectoryIncremental(root, '', remoteMap, this.stateDb.getSettings());
+            await this.observingLocal((since) =>
+                this.reconcileDirectoryIncremental(root, '', remoteMap, this.stateDb.getSettings(), since),
+            );
             // Hides that were waiting for uploads finish once those are done
             await this.completePendingHides();
 
@@ -352,6 +360,7 @@ export class ProtonDriveSyncEngine {
         dbRecord: SyncedItemRecord | undefined,
         remoteMap: Map<string, NodeEntity>,
         settings: SyncSettings,
+        since: number,
     ): Promise<void> {
         const localFullPath = path.join(settings.syncDir, relPath);
         const hiddenBy = this.policy.hiddenBy(relPath);
@@ -403,7 +412,7 @@ export class ProtonDriveSyncEngine {
                     size: 0,
                     syncStatus: 'synced',
                     lastError: null,
-                });
+                }, since);
                 this.stateDb.logActivity({
                     action: 'mkdir',
                     localRelPath: relPath,
@@ -414,7 +423,7 @@ export class ProtonDriveSyncEngine {
                 !isUnsupportedRemoteNode(remoteNode) &&
                 this.policy.isPinned(relPath)
             ) {
-                await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath);
+                await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
             }
             return;
         }
@@ -450,14 +459,14 @@ export class ProtonDriveSyncEngine {
                     size: 0,
                     syncStatus: 'synced',
                     lastError: null,
-                });
+                }, since);
                 this.stateDb.logActivity({
                     action: 'mkdir',
                     localRelPath: relPath,
                     details: 'Created folder on Proton Drive',
                 });
             } else {
-                await this.uploadLocalToRemote(relPath, localFullPath, parentNode);
+                await this.uploadLocalToRemote(relPath, localFullPath, parentNode, since);
             }
             return;
         }
@@ -484,7 +493,7 @@ export class ProtonDriveSyncEngine {
                         size: 0,
                         syncStatus: 'synced',
                         lastError: null,
-                    });
+                    }, since);
                 }
                 return;
             }
@@ -509,7 +518,15 @@ export class ProtonDriveSyncEngine {
                     return;
                 }
 
-                const localSha1 = await computeLocalFileSha1(localFullPath);
+                const localSha1 = await computeLocalFileSha1(localFullPath).catch((error: unknown) => {
+                    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+                        this.logger.warn(`Could not read ${relPath} to compare it with Proton Drive: ${error}`);
+                    }
+                    return null;
+                });
+                if (localSha1 === null) {
+                    return; // Gone (freed, say) or unreadable since it was listed: the next pass looks again
+                }
                 if (remoteSha1 && localSha1 === remoteSha1) {
                     this.recordSynced({
                         localRelPath: relPath,
@@ -523,7 +540,7 @@ export class ProtonDriveSyncEngine {
                         size: localInfo.size,
                         syncStatus: 'synced',
                         lastError: null,
-                    });
+                    }, since);
                     return;
                 }
 
@@ -532,10 +549,10 @@ export class ProtonDriveSyncEngine {
 
                 if (localChangedSinceSync && !remoteChangedSinceSync) {
                     const parentNode = await this.ensureParentFolderNode(relPath, remoteMap);
-                    await this.uploadLocalToRemote(relPath, localFullPath, parentNode, remoteNode.uid);
+                    await this.uploadLocalToRemote(relPath, localFullPath, parentNode, since, remoteNode.uid);
                 } else if (!localChangedSinceSync && remoteChangedSinceSync) {
                     if (!hiding) {
-                        await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath);
+                        await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
                     }
                 } else if (localChangedSinceSync && remoteChangedSinceSync) {
                     await this.handleFileConflict(
@@ -548,6 +565,7 @@ export class ProtonDriveSyncEngine {
                         remoteMtimeMs,
                         remoteMap,
                         settings,
+                        since,
                     );
                 }
             }
@@ -564,6 +582,7 @@ export class ProtonDriveSyncEngine {
         remoteMtimeMs: number,
         remoteMap: Map<string, NodeEntity>,
         settings: SyncSettings,
+        since: number,
     ): Promise<void> {
         const strategy = settings.conflictStrategy;
         sendDesktopNotification({
@@ -594,7 +613,7 @@ export class ProtonDriveSyncEngine {
 
         if (strategy === 'keep-local') {
             const parentNode = await this.ensureParentFolderNode(relPath, remoteMap);
-            await this.uploadLocalToRemote(relPath, localFullPath, parentNode, remoteNode.uid);
+            await this.uploadLocalToRemote(relPath, localFullPath, parentNode, since, remoteNode.uid);
             this.stateDb.recordConflict({
                 localRelPath: relPath,
                 nodeUid: remoteNode.uid,
@@ -609,7 +628,7 @@ export class ProtonDriveSyncEngine {
         }
 
         if (strategy === 'keep-remote') {
-            await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath);
+            await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
             this.stateDb.recordConflict({
                 localRelPath: relPath,
                 nodeUid: remoteNode.uid,
@@ -626,10 +645,10 @@ export class ProtonDriveSyncEngine {
         // Default: keep-both
         const conflictCopyFullPath = await createLocalConflictCopy(localFullPath);
         const conflictCopyRelPath = path.relative(settings.syncDir, conflictCopyFullPath).split(path.sep).join('/');
-        await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath);
+        await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
 
         const parentNode = await this.ensureParentFolderNode(conflictCopyRelPath, remoteMap);
-        await this.uploadLocalToRemote(conflictCopyRelPath, conflictCopyFullPath, parentNode);
+        await this.uploadLocalToRemote(conflictCopyRelPath, conflictCopyFullPath, parentNode, since);
 
         this.stateDb.recordConflict({
             localRelPath: relPath,
@@ -659,27 +678,29 @@ export class ProtonDriveSyncEngine {
         }
         const settings = this.stateDb.getSettings();
         const localFullPath = path.join(settings.syncDir, conflict.localRelPath);
-        const remoteNode = await this.sdk.getNode(conflict.nodeUid);
         const remoteMap = new Map<string, NodeEntity>();
 
-        if (choice === 'keep-local') {
-            const parentNode = await this.ensureParentFolderNode(conflict.localRelPath, remoteMap);
-            await this.uploadLocalToRemote(conflict.localRelPath, localFullPath, parentNode, remoteNode.uid);
-            this.stateDb.markConflictResolved(conflictId, 'keep-local');
-        } else if (choice === 'keep-remote') {
-            await this.downloadRemoteToLocal(conflict.localRelPath, remoteNode, localFullPath);
-            this.stateDb.markConflictResolved(conflictId, 'keep-remote');
-        } else {
-            const conflictCopyFullPath = await createLocalConflictCopy(localFullPath);
-            const conflictCopyRelPath = path
-                .relative(settings.syncDir, conflictCopyFullPath)
-                .split(path.sep)
-                .join('/');
-            await this.downloadRemoteToLocal(conflict.localRelPath, remoteNode, localFullPath);
-            const parentNode = await this.ensureParentFolderNode(conflictCopyRelPath, remoteMap);
-            await this.uploadLocalToRemote(conflictCopyRelPath, conflictCopyFullPath, parentNode);
-            this.stateDb.markConflictResolved(conflictId, 'keep-both', conflictCopyRelPath);
-        }
+        await this.observingLocal(async (since) => {
+            const remoteNode = await this.sdk.getNode(conflict.nodeUid);
+            if (choice === 'keep-local') {
+                const parentNode = await this.ensureParentFolderNode(conflict.localRelPath, remoteMap);
+                await this.uploadLocalToRemote(conflict.localRelPath, localFullPath, parentNode, since, remoteNode.uid);
+                this.stateDb.markConflictResolved(conflictId, 'keep-local');
+            } else if (choice === 'keep-remote') {
+                await this.downloadRemoteToLocal(conflict.localRelPath, remoteNode, localFullPath, since);
+                this.stateDb.markConflictResolved(conflictId, 'keep-remote');
+            } else {
+                const conflictCopyFullPath = await createLocalConflictCopy(localFullPath);
+                const conflictCopyRelPath = path
+                    .relative(settings.syncDir, conflictCopyFullPath)
+                    .split(path.sep)
+                    .join('/');
+                await this.downloadRemoteToLocal(conflict.localRelPath, remoteNode, localFullPath, since);
+                const parentNode = await this.ensureParentFolderNode(conflictCopyRelPath, remoteMap);
+                await this.uploadLocalToRemote(conflictCopyRelPath, conflictCopyFullPath, parentNode, since);
+                this.stateDb.markConflictResolved(conflictId, 'keep-both', conflictCopyRelPath);
+            }
+        });
 
         return this.stateDb.getConflictById(conflictId)!;
     }
@@ -688,6 +709,7 @@ export class ProtonDriveSyncEngine {
         relPath: string,
         remoteNode: NodeEntity,
         localFullPath: string,
+        since: number,
     ): Promise<void> {
         const transferId = `dl:${relPath}`;
         this.watcher.suppressPath(relPath, 10000);
@@ -731,7 +753,7 @@ export class ProtonDriveSyncEngine {
                     size: result.size,
                     syncStatus: 'synced',
                     lastError: null,
-                });
+                }, since);
 
                 if (result.status === 'downloaded') {
                     this.stateDb.logActivity({
@@ -761,6 +783,7 @@ export class ProtonDriveSyncEngine {
         relPath: string,
         localFullPath: string,
         parentNode: NodeEntity,
+        since: number,
         existingNodeUid?: string,
     ): Promise<void> {
         const transferId = `ul:${relPath}`;
@@ -805,7 +828,7 @@ export class ProtonDriveSyncEngine {
                     size: result.size,
                     syncStatus: 'synced',
                     lastError: null,
-                });
+                }, since);
             }
 
             if (result.status === 'uploaded' || result.status === 'updated-revision') {
@@ -997,36 +1020,78 @@ export class ProtonDriveSyncEngine {
         }
     }
 
-    // Writes a sync record, unless its local item is gone or is being removed by Free up space or Hide. Work that looked
-    // at a file before such a removal (an upload, a download, a hash) can finish after it, and a record left without
-    // its file reads as the user deleting it, which trashes the cloud copy. Checked and written in one go, with nothing
-    // able to run in between. A record skipped while the file is there is written by the next sync.
-    private recordSynced(item: Omit<SyncedItemRecord, 'updatedAt'>): void {
-        if (
-            this.isBeingRemoved(item.localRelPath) ||
-            !lstatSync(path.join(this.stateDb.getSettings().syncDir, item.localRelPath), { throwIfNoEntry: false })
-        ) {
+    // Writes a sync record for work that began when `since` removals of local copies had finished (see observingLocal).
+    // Work that looked at a file before Free up space or Hide removed it (an upload, a download, a hash) can finish
+    // after the removal, and a record left without its file reads as the user deleting it, which trashes the cloud
+    // copy. So the record is not written for a path:
+    // - whose record a running removal has dropped: its file is about to go;
+    // - that a removal finished since the work began took away, if it is still gone.
+    // Anything else is written as usual, a missing file included: that is the user deleting or renaming it while it
+    // synced, which the next look at it takes to the cloud. Checked and written with nothing able to run in between.
+    private recordSynced(item: Omit<SyncedItemRecord, 'updatedAt'>, since: number): void {
+        const relPath = item.localRelPath;
+        for (const dropped of this.runningRemovals) {
+            if (dropped.has(relPath)) {
+                return;
+            }
+        }
+        if (this.removalBatches.some((batch) => batch.n > since && batch.paths.has(relPath)) && !this.localItemExists(relPath)) {
             return;
         }
         this.stateDb.upsertItem(item);
     }
 
-    private isBeingRemoved(relPath: string): boolean {
-        for (const removing of this.removingLocal) {
-            if (removing === '' || relPath === removing || relPath.startsWith(`${removing}/`)) {
-                return true;
-            }
+    // Any failure to look (ENOTDIR, EACCES, …) counts as gone: this only ever decides against writing a record.
+    private localItemExists(relPath: string): boolean {
+        try {
+            return lstatSync(path.join(this.stateDb.getSettings().syncDir, relPath), { throwIfNoEntry: false }) !== undefined;
+        } catch {
+            return false;
         }
-        return false;
     }
 
-    // Runs a removal of local copies at relPath with it marked as being removed (see recordSynced).
-    private async whileRemoving<T>(relPath: string, removal: () => Promise<T>): Promise<T> {
-        this.removingLocal.add(relPath);
+    // Runs work that looks at local files and may record them, giving it the count of finished removals to pass to
+    // recordSynced.
+    private async observingLocal<T>(work: (since: number) => Promise<T>): Promise<T> {
+        const since = this.localRemovals;
+        this.workSince.set(since, (this.workSince.get(since) ?? 0) + 1);
         try {
-            return await removal();
+            return await work(since);
         } finally {
-            this.removingLocal.delete(relPath);
+            const left = (this.workSince.get(since) ?? 1) - 1;
+            if (left > 0) {
+                this.workSince.set(since, left);
+            } else {
+                this.workSince.delete(since);
+            }
+            this.pruneRemovalBatches();
+        }
+    }
+
+    // A batch matters only to work that began before it ended
+    private pruneRemovalBatches(): void {
+        const oldest = this.workSince.size > 0 ? Math.min(...this.workSince.keys()) : Number.POSITIVE_INFINITY;
+        if (this.removalBatches.length > 0) {
+            this.removalBatches = this.removalBatches.filter((batch) => batch.n > oldest);
+        }
+    }
+
+    // Runs a removal of local copies. Its `drop` drops a record just before the file goes, noting the path for
+    // recordSynced and keeping the record so that one whose file stayed after all can be put back with `putBack`.
+    private async whileRemoving<T>(
+        removal: (records: { drop(relPath: string): void; putBack(stayed: string[]): Promise<void> }) => Promise<T>,
+    ): Promise<T> {
+        const dropped = new Set<string>();
+        this.runningRemovals.add(dropped);
+        try {
+            return await removal(this.recordDropper(dropped));
+        } finally {
+            this.runningRemovals.delete(dropped);
+            this.localRemovals += 1;
+            if (dropped.size > 0) {
+                this.removalBatches.push({ n: this.localRemovals, paths: dropped });
+            }
+            this.pruneRemovalBatches();
         }
     }
 
@@ -1060,7 +1125,7 @@ export class ProtonDriveSyncEngine {
             await existingTask.catch(() => {});
         }
 
-        const task = (async () => {
+        const task = this.observingLocal(async (since) => {
             const fullPath = path.join(settings.syncDir, relPath);
             const st = await stat(fullPath).catch(() => null);
             const dbRecord = this.stateDb.getItemByPath(relPath);
@@ -1095,11 +1160,11 @@ export class ProtonDriveSyncEngine {
                     size: 0,
                     syncStatus: 'synced',
                     lastError: null,
-                });
+                }, since);
             } else if (st.isFile()) {
-                await this.uploadLocalToRemote(relPath, fullPath, parentNode, dbRecord?.nodeUid);
+                await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, dbRecord?.nodeUid);
             }
-        })();
+        });
 
         this.localQueue.set(relPath, task);
         try {
@@ -1246,7 +1311,7 @@ export class ProtonDriveSyncEngine {
     // Drops records for a removal of local copies (each just before its file goes). The records are kept aside so
     // that one whose file stayed after all, because it changed at the very last moment, can be put back: without it an
     // edit would read as a conflict on the next sync, which the keep-remote strategy settles by overwriting it.
-    private recordDropper() {
+    private recordDropper(droppedPaths: Set<string>) {
         const dropped = new Map<string, SyncedItemRecord>();
         return {
             drop: (relPath: string) => {
@@ -1254,6 +1319,7 @@ export class ProtonDriveSyncEngine {
                 if (record) {
                     dropped.set(relPath, record);
                 }
+                droppedPaths.add(relPath);
                 this.stateDb.removeItemByPath(relPath);
             },
             putBack: async (stayed: string[]) => {
@@ -1309,21 +1375,24 @@ export class ProtonDriveSyncEngine {
                 : undefined;
             const remoteMap = new Map<string, NodeEntity>([[relPath, node]]);
             this.currentAction = `Syncing ${relPath}`;
-            await this.reconcileSinglePath(
-                relPath,
-                node,
-                localInfo,
-                this.stateDb.getItemByPath(relPath) ?? undefined,
-                remoteMap,
-                settings,
-            );
-            const isLocalFolder = await stat(localFullPath).then(
-                (s) => s.isDirectory(),
-                () => false,
-            );
-            if (node.type === NodeType.Folder && isLocalFolder) {
-                await this.reconcileDirectoryIncremental(node, relPath, remoteMap, settings);
-            }
+            await this.observingLocal(async (since) => {
+                await this.reconcileSinglePath(
+                    relPath,
+                    node,
+                    localInfo,
+                    this.stateDb.getItemByPath(relPath) ?? undefined,
+                    remoteMap,
+                    settings,
+                    since,
+                );
+                const isLocalFolder = await stat(localFullPath).then(
+                    (s) => s.isDirectory(),
+                    () => false,
+                );
+                if (node.type === NodeType.Folder && isLocalFolder) {
+                    await this.reconcileDirectoryIncremental(node, relPath, remoteMap, settings, since);
+                }
+            });
         } catch (error: unknown) {
             this.logger.warn(`Could not download ${relPath} now; the next sync tries again: ${error}`);
         } finally {
@@ -1356,8 +1425,7 @@ export class ProtonDriveSyncEngine {
         if (!current()) {
             return this.availabilityResult(relPath); // Asked again while it was being looked at: that ask decides
         }
-        const records = this.recordDropper();
-        const { kept } = await this.whileRemoving(relPath, async () => {
+        const { kept } = await this.whileRemoving(async (records) => {
             const removal = await removeScannedEntries({
                 syncDir: settings.syncDir,
                 entries: scan.entries,
@@ -1444,8 +1512,7 @@ export class ProtonDriveSyncEngine {
             return this.availabilityResult(relPath);
         }
         this.policy.setHide(uid, 'hidden');
-        const records = this.recordDropper();
-        const removal = await this.whileRemoving(relPath, async () => {
+        const removal = await this.whileRemoving(async (records) => {
             const result = await removeScannedEntries({
                 syncDir: settings.syncDir,
                 entries: scan.entries,
@@ -1639,6 +1706,7 @@ export class ProtonDriveSyncEngine {
         prefix: string,
         remoteMap: Map<string, NodeEntity>,
         _initialSettings: SyncSettings,
+        since: number,
     ): Promise<void> {
         const liveSettings = this.stateDb.getSettings();
         if (liveSettings.paused) {
@@ -1729,7 +1797,7 @@ export class ProtonDriveSyncEngine {
             const localChild = localChildByName.get(name);
             const dbRecord = dbChildByName.get(name);
 
-            await this.reconcileSinglePath(relPath, remoteChild, localChild, dbRecord, remoteMap, stepSettings);
+            await this.reconcileSinglePath(relPath, remoteChild, localChild, dbRecord, remoteMap, stepSettings, since);
 
             const resolvedFolderNode = remoteMap.get(relPath) ?? remoteChild;
             const localStillExists = await stat(path.join(stepSettings.syncDir, relPath))
@@ -1753,7 +1821,7 @@ export class ProtonDriveSyncEngine {
             ) {
                 continue;
             }
-            await this.reconcileDirectoryIncremental(sub.node, sub.relPath, remoteMap, nextSettings);
+            await this.reconcileDirectoryIncremental(sub.node, sub.relPath, remoteMap, nextSettings, since);
         }
     }
 }
