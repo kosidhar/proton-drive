@@ -50,6 +50,12 @@ export function makeMockDrive() {
     const nameOf = (node: NodeEntity) => (node.name.ok ? node.name.value : '');
     const childNamed = (parentUid: string, name: string) =>
         Array.from(nodes.values()).find((n) => n.uid !== root.uid && n.parentUid === parentUid && nameOf(n) === name);
+    const refuseTakenName = (parentUid: string, name: string) => {
+        const taken = childNamed(parentUid, name);
+        if (taken) {
+            throw new NodeWithSameNameExistsValidationError('An item with that name already exists', 2500, taken.uid);
+        }
+    };
     const pathOf = (uid: string): string => {
         const node = nodes.get(uid);
         if (!node || uid === root.uid || !node.parentUid) {
@@ -102,9 +108,12 @@ export function makeMockDrive() {
                 if (node.uid !== root.uid && node.parentUid === parentUid) yield node;
             }
         },
+        // As the API does, a name already used in the folder is refused, naming the item that has it (ensureRemoteFolder
+        // then takes that item)
         createFolder: async (parent: NodeEntity | string, name: string) => {
             maybeFail('createFolder');
             const parentUid = typeof parent === 'string' ? parent : parent.uid;
+            refuseTakenName(parentUid, name);
             const folder = makeMockNode({ uid: `vol~created${nextId++}`, parentUid, nameStr: name, type: NodeType.Folder });
             nodes.set(folder.uid, folder);
             return folder;
@@ -125,9 +134,12 @@ export function makeMockDrive() {
                 },
             };
         },
+        // A new file with a name already used in the folder is refused as the API refuses it, naming the item that has
+        // it: uploadLocalFileToDrive then uploads a new revision of that item instead
         getFileUploader: async (parent: NodeEntity | string, name: string, metadata: { expectedSha1: string }) => {
             maybeFail('getFileUploader');
             const parentUid = typeof parent === 'string' ? parent : parent.uid;
+            refuseTakenName(parentUid, name);
             const parentPath = pathOf(parentUid);
             calls.uploads.push(parentPath ? `${parentPath}/${name}` : name);
             return {
