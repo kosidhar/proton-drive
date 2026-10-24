@@ -311,16 +311,17 @@ fn availability_pill(a: Availability) -> (&'static str, PillStyle) {
     }
 }
 
-/// Menu entries for one item, as (label, action) with the daemon's action names. The root can't be hidden.
+/// Menu entries for one item, as (label, action) with the daemon's action names. The root can't be hidden, and a
+/// hidden or hiding item offers only Unhide: it has to be unhidden before it can be kept (ruling R18).
 fn menu_actions(a: Availability, is_root: bool) -> Vec<(&'static str, &'static str)> {
     let mut out = Vec::new();
-    if a != Availability::Pinned {
+    let hidden = matches!(a, Availability::Hidden | Availability::Hiding);
+    if a != Availability::Pinned && !hidden {
         out.push(("Always keep on this device", "pin"));
     }
     if matches!(a, Availability::Pinned | Availability::Downloaded) {
         out.push(("Free up space", "free"));
     }
-    let hidden = matches!(a, Availability::Hidden | Availability::Hiding);
     if !hidden && !is_root {
         out.push(("Hide from this computer", "hide"));
     }
@@ -419,7 +420,7 @@ fn control_request(
 const AVAILABILITY_READ_TIMEOUT: Duration = Duration::from_secs(600);
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// What a read timeout means: the daemon accepted the request and is still busy with it.
-const STILL_WORKING: &str = "Still working on it in the background — the list updates when it's done.";
+const STILL_WORKING: &str = "Still working on it in the background. Refresh to see the result.";
 
 fn control_request_at(
     socket: &std::path::Path,
@@ -499,6 +500,50 @@ enum PendingConfirm {
     Hide { name: String, rel_path: String },
     /// Free up space for everything in the current folder (`rel_path` is empty at the root).
     FreeAll { rel_path: String },
+    /// Keep all at the My files root, which downloads the whole drive (ruling R19); in a folder it needs no confirmation.
+    KeepAll,
+}
+
+/// What a confirmation dialog says, and what its button asks the daemon to do to which path.
+struct ConfirmCopy {
+    title: String,
+    body: String,
+    detail: &'static str,
+    button: &'static str,
+    rel_path: String,
+    action: &'static str,
+}
+
+fn confirm_copy(confirm: &PendingConfirm) -> ConfirmCopy {
+    match confirm {
+        PendingConfirm::Hide { name, rel_path } => ConfirmCopy {
+            title: format!("Hide \"{name}\" from this computer?"),
+            body: format!("\"{name}\" disappears from your Proton Drive folder on this computer. It stays in Proton Drive, and you can unhide it any time."),
+            detail: "Changes that haven't synced yet are uploaded first. Hiding is refused if anything inside exists only on this computer.",
+            button: "Hide",
+            rel_path: rel_path.clone(),
+            action: "hide",
+        },
+        PendingConfirm::FreeAll { rel_path } => {
+            let place = if rel_path.is_empty() { "My files".to_string() } else { format!("\"{rel_path}\"") };
+            ConfirmCopy {
+                title: format!("Free up space in {place}?"),
+                body: format!("This removes the local copies of everything in {place} that is safely in Proton Drive. Nothing is deleted online. Use Always keep to download them again."),
+                detail: "Anything marked Always keep here stops being kept. Files that aren't fully synced, or that you've told Proton Drive to ignore, stay on this computer.",
+                button: "Free up space",
+                rel_path: rel_path.clone(),
+                action: "free",
+            }
+        }
+        PendingConfirm::KeepAll => ConfirmCopy {
+            title: "Keep everything on this device?".to_string(),
+            body: "This downloads everything in My files to this computer and keeps it updated.".to_string(),
+            detail: "Items you made online only are downloaded too; hidden items stay hidden. This can take a long time and use a lot of disk space.",
+            button: "Keep everything",
+            rel_path: String::new(),
+            action: "pin",
+        },
+    }
 }
 
 /// Screenshot-only: a `RemoteListResponse` JSON file that replaces the daemon's listing.
@@ -2129,7 +2174,11 @@ impl ProtonDriveNativeApp {
             .inner
             .on_hover_text("Always keep everything in this folder on this device");
         if keep_all.clicked() && !folder_busy {
-            self.send_availability(folder_rel_path(&self.remote_path).to_string(), "pin");
+            if here.is_empty() {
+                self.pending_confirm = Some(PendingConfirm::KeepAll); // The whole drive: ask first
+            } else {
+                self.send_availability(here.to_string(), "pin");
+            }
         }
 
         if !self.remote_items.is_empty() {
@@ -2215,6 +2264,8 @@ impl ProtonDriveNativeApp {
             menu.pos.y.min(screen.bottom() - menu_h - 8.0).max(screen.top() + 8.0),
         );
         let mut chosen: Option<&'static str> = None;
+        // Above the window's contents and below the menu, so a click outside the menu only closes it
+        click_shield(ctx, "row_menu_shield", egui::Order::Middle, None);
         let area = egui::Area::new(egui::Id::new("row_menu"))
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
@@ -2265,7 +2316,7 @@ impl ProtonDriveNativeApp {
         }
     }
 
-    /// Confirmation for Hide (one item) and Free up all (the current folder).
+    /// Confirmation for Hide (one item), Free up all (the current folder) and Keep all at the root.
     fn render_confirm_modal(&mut self, ctx: &egui::Context) {
         let Some(confirm) = self.pending_confirm.clone() else {
             return;
@@ -2276,14 +2327,13 @@ impl ProtonDriveNativeApp {
         }
 
         let screen_rect = ctx.screen_rect();
-        egui::Area::new(egui::Id::new("confirm_backdrop"))
-            .order(egui::Order::Foreground)
-            .interactable(false)
-            .fixed_pos(screen_rect.min)
-            .show(ctx, |ui| {
-                let (rect, _) = ui.allocate_exact_size(screen_rect.size(), Sense::hover());
-                ui.painter().rect_filled(rect, 0, Color32::from_rgba_unmultiplied(10, 8, 16, 175));
-            });
+        // The dimmed backdrop takes the clicks meant for what is under it: a click outside only cancels
+        click_shield(
+            ctx,
+            "confirm_backdrop",
+            egui::Order::Foreground,
+            Some(Color32::from_rgba_unmultiplied(10, 8, 16, 175)),
+        );
 
         let modal_w = 436.0;
         let modal_h = 236.0;
@@ -2292,27 +2342,7 @@ impl ProtonDriveNativeApp {
             screen_rect.center().y - modal_h * 0.5,
         );
 
-        let (title, body, detail, button, action_path, action) = match &confirm {
-            PendingConfirm::Hide { name, rel_path } => (
-                format!("Hide \"{name}\" from this computer?"),
-                format!("\"{name}\" disappears from your Proton Drive folder on this computer. It stays in Proton Drive, and you can unhide it any time."),
-                "Changes that haven't synced yet are uploaded first. Hiding is refused if anything inside exists only on this computer.",
-                "Hide",
-                rel_path.clone(),
-                "hide",
-            ),
-            PendingConfirm::FreeAll { rel_path } => {
-                let place = if rel_path.is_empty() { "My files".to_string() } else { format!("\"{rel_path}\"") };
-                (
-                    format!("Free up space in {place}?"),
-                    format!("This removes the local copies of everything in {place} that is safely in Proton Drive. Nothing is deleted online. Use Always keep to download them again."),
-                    "Anything marked Always keep here stops being kept. Files that aren't fully synced, or that you've told Proton Drive to ignore, stay on this computer.",
-                    "Free up space",
-                    rel_path.clone(),
-                    "free",
-                )
-            }
-        };
+        let ConfirmCopy { title, body, detail, button, rel_path: action_path, action } = confirm_copy(&confirm);
 
         let area_resp = egui::Area::new(egui::Id::new("confirm_dialog"))
             .order(egui::Order::Tooltip)
@@ -2385,6 +2415,45 @@ impl ProtonDriveNativeApp {
                 }
             }
         }
+    }
+
+    /// One frame of the window's contents: sidebar, header, the current tab and anything floating over them.
+    fn render_ui(&mut self, ctx: &egui::Context) {
+        self.render_sidebar(ctx);
+
+        egui::TopBottomPanel::top("proton_top_header")
+            .exact_height(56.0)
+            .frame(
+                Frame::NONE
+                    .fill(BG_SIDEBAR())
+                    .inner_margin(Margin::symmetric(24, 11))
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+            )
+            .show(ctx, |ui| {
+                self.render_top_bar(ui);
+            });
+
+        egui::CentralPanel::default()
+            .frame(
+                Frame::NONE
+                    .fill(BG_CANVAS())
+                    .inner_margin(Margin::symmetric(26, 20)),
+            )
+            .show(ctx, |ui| {
+                if self.pending_confirm.is_some() {
+                    ui.disable(); // Nothing under the confirmation dialog takes clicks or keys while it is open
+                }
+                match self.tab {
+                    NavTab::Overview => self.render_overview_tab(ui),
+                    NavTab::CloudBrowser => self.render_browser_tab(ui),
+                    NavTab::Conflicts => self.render_conflicts_tab(ui),
+                    NavTab::Settings => self.render_settings_tab(ui),
+                }
+            });
+
+        self.render_account_popover(ctx);
+        self.render_row_menu(ctx);
+        self.render_confirm_modal(ctx);
     }
 
     fn render_browser_tab(&mut self, ui: &mut egui::Ui) {
@@ -3217,38 +3286,7 @@ impl eframe::App for ProtonDriveNativeApp {
             let _ = self.tx.send(WorkerCommand::RefreshAll);
         }
 
-        self.render_sidebar(ctx);
-
-        egui::TopBottomPanel::top("proton_top_header")
-            .exact_height(56.0)
-            .frame(
-                Frame::NONE
-                    .fill(BG_SIDEBAR())
-                    .inner_margin(Margin::symmetric(24, 11))
-                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-            )
-            .show(ctx, |ui| {
-                self.render_top_bar(ui);
-            });
-
-        egui::CentralPanel::default()
-            .frame(
-                Frame::NONE
-                    .fill(BG_CANVAS())
-                    .inner_margin(Margin::symmetric(26, 20)),
-            )
-            .show(ctx, |ui| {
-                match self.tab {
-                    NavTab::Overview => self.render_overview_tab(ui),
-                    NavTab::CloudBrowser => self.render_browser_tab(ui),
-                    NavTab::Conflicts => self.render_conflicts_tab(ui),
-                    NavTab::Settings => self.render_settings_tab(ui),
-                }
-            });
-
-        self.render_account_popover(ctx);
-        self.render_row_menu(ctx);
-        self.render_confirm_modal(ctx);
+        self.render_ui(ctx);
 
         // Handle --screenshot <path> for automated visual inspection
         if let Some(target_path) = self.screenshot_target.clone() {
@@ -3415,6 +3453,23 @@ fn card_frame() -> Frame {
         .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
         .corner_radius(CornerRadius::same(12))
         .inner_margin(Margin::same(18))
+}
+
+/// A layer over the whole window that takes every click meant for what is under it, so a click outside a menu or
+/// dialog only closes it. `dim` paints it as a dialog backdrop; without it the layer is invisible.
+fn click_shield(ctx: &egui::Context, id: &str, order: egui::Order, dim: Option<Color32>) {
+    let screen = ctx.screen_rect();
+    egui::Area::new(egui::Id::new(id))
+        .order(order)
+        .fixed_pos(screen.min)
+        .default_size(screen.size())
+        .sense(Sense::click())
+        .show(ctx, |ui| {
+            let (rect, _) = ui.allocate_exact_size(screen.size(), Sense::click());
+            if let Some(color) = dim {
+                ui.painter().rect_filled(rect, 0, color);
+            }
+        });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4294,6 +4349,7 @@ OPTIONS:
   --confirm-hide <NAME> with --screenshot: show the Hide confirmation for the item NAME
   --working <NAME>      with --screenshot: show the item NAME (or . for this folder) as still working
   --confirm-free-all    with --screenshot: show the Free up all confirmation
+  --confirm-keep-all    with --screenshot: show the Keep all confirmation (for the whole drive)
   --path <FOLDER>       open My files at a remote folder, e.g. /my-files/photos
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --version             print the version
@@ -4320,6 +4376,7 @@ fn main() -> eframe::Result {
     let mut cli_row_menu: Option<String> = None;
     let mut cli_confirm_hide: Option<String> = None;
     let mut cli_confirm_free_all = false;
+    let mut cli_confirm_keep_all = false;
     let mut cli_working: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -4345,6 +4402,9 @@ fn main() -> eframe::Result {
             }
             "--confirm-free-all" => {
                 cli_confirm_free_all = true;
+            }
+            "--confirm-keep-all" => {
+                cli_confirm_keep_all = true;
             }
             "--theme" => {
                 cli_theme_override = args.next();
@@ -4477,6 +4537,8 @@ fn main() -> eframe::Result {
                 } else if cli_confirm_free_all {
                     let rel_path = folder_rel_path(&app.remote_path).to_string();
                     app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path });
+                } else if cli_confirm_keep_all {
+                    app.pending_confirm = Some(PendingConfirm::KeepAll);
                 }
             }
             Ok(Box::new(app))
@@ -4810,8 +4872,9 @@ mod tests {
         assert_eq!(menu_actions(Pinned, false), vec![free, hide]);
         assert_eq!(menu_actions(Downloaded, false), vec![keep, free, hide]);
         assert_eq!(menu_actions(OnlineOnly, false), vec![keep, hide]);
-        assert_eq!(menu_actions(Hidden, false), vec![keep, unhide]);
-        assert_eq!(menu_actions(Hiding, false), vec![keep, unhide]);
+        // Unhide first, then keep (ruling R18)
+        assert_eq!(menu_actions(Hidden, false), vec![unhide]);
+        assert_eq!(menu_actions(Hiding, false), vec![unhide]);
     }
 
     #[test]
@@ -4926,7 +4989,8 @@ mod tests {
         });
         let body = serde_json::json!({ "path": "x", "action": "pin" });
         let err = control_request_at(&sock, "POST", "/availability", Some(&body), Duration::from_millis(100)).unwrap_err();
-        assert_eq!(err, STILL_WORKING);
+        // Nothing reloads the list when the work finishes later, so the user is told to refresh
+        assert_eq!(err, "Still working on it in the background. Refresh to see the result.");
         server.join().unwrap();
         let _ = std::fs::remove_file(&sock);
     }
@@ -5002,6 +5066,271 @@ mod tests {
             availability_notice(&r(&["1", "2", "3", "4", "5"], None)).as_deref(),
             Some("5 items stay on this computer because they aren't safely in Proton Drive: 1, 2, 3 and 2 more")
         );
+    }
+
+    /// The app driven headlessly: no worker thread and no daemon; what it asks the worker for lands in `commands`.
+    struct Harness {
+        ctx: egui::Context,
+        app: ProtonDriveNativeApp,
+        commands: Receiver<WorkerCommand>,
+        last: Option<egui::FullOutput>,
+    }
+
+    impl Harness {
+        fn new(remote_path: &str) -> Self {
+            let (tx, commands) = mpsc::channel();
+            let (_events_tx, rx) = mpsc::channel();
+            let items: Vec<RemoteItem> = serde_json::from_str(
+                r#"[
+                    {"uid": "1", "name": "Projects", "type": "folder", "size": 0, "modificationTime": "2026-10-20T10:00:00Z", "availability": "downloaded"},
+                    {"uid": "2", "name": "Photos", "type": "folder", "size": 0, "modificationTime": "2026-10-19T10:00:00Z", "availability": "online-only"},
+                    {"uid": "3", "name": "Archive", "type": "folder", "size": 0, "modificationTime": "2026-10-18T10:00:00Z", "availability": "pinned"},
+                    {"uid": "4", "name": "photo.jpg", "type": "file", "size": 42, "modificationTime": "2026-10-17T10:00:00Z", "availability": "online-only"}
+                ]"#,
+            )
+            .unwrap();
+            let status = DaemonStatus { state: "idle".into(), logged_in: true, ..Default::default() };
+            let app = ProtonDriveNativeApp {
+                tab: NavTab::CloudBrowser,
+                tx,
+                rx,
+                logo_texture: None,
+                daemon_online: true,
+                initial_connecting: false,
+                status,
+                activities: Vec::new(),
+                cached_root_items: Vec::new(),
+                login_url: None,
+                search_query: String::new(),
+                show_account_menu: false,
+                remote_path: remote_path.to_string(),
+                remote_items: items,
+                remote_loading: false,
+                remote_error: None,
+                new_folder_name: String::new(),
+                show_new_folder_modal: false,
+                row_menu: None,
+                working: Vec::new(),
+                pending_confirm: None,
+                notice: None,
+                screenshot_menu_for: None,
+                ignore_patterns_text: String::new(),
+                settings_dirty: false,
+                conflicts: Vec::new(),
+                edit_sync_dir: String::new(),
+                edit_conflict_strategy: "keep-both".into(),
+                edit_notifications: false,
+                window_geometry: WindowGeometry::default(),
+                maximize_applied_on_open: true,
+                applied_light_mode: false,
+                screenshot_target: None,
+                frames_rendered: 0,
+                screenshot_requested: false,
+                last_poll: Instant::now(),
+            };
+            let ctx = egui::Context::default();
+            configure_proton_theme(&ctx);
+            apply_proton_visuals(&ctx, false);
+            let mut h = Self { ctx, app, commands, last: None };
+            h.frames(3);
+            h
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1440.0, 900.0))),
+                events,
+                ..Default::default()
+            };
+            let app = &mut self.app;
+            self.last = Some(self.ctx.run(input, |ctx| app.render_ui(ctx)));
+        }
+
+        fn frames(&mut self, n: usize) {
+            for _ in 0..n {
+                self.frame(Vec::new());
+            }
+        }
+
+        /// A left click as the windowing system sends it: move there, press, release, each in its own frame.
+        fn click(&mut self, pos: egui::Pos2) {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            self.frame(vec![egui::Event::PointerMoved(pos)]);
+            self.frame(vec![button(true)]);
+            self.frame(vec![button(false)]);
+            self.frames(2);
+        }
+
+        /// Where the last frame painted exactly this text.
+        fn text_at(&self, text: &str) -> Option<egui::Pos2> {
+            fn find(shape: &egui::Shape, text: &str) -> Option<egui::Pos2> {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == text => Some(t.visual_bounding_rect().center()),
+                    egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, text)),
+                    _ => None,
+                }
+            }
+            self.last.as_ref()?.shapes.iter().find_map(|c| find(&c.shape, text))
+        }
+
+        /// Availability actions and folder changes asked of the worker since the last call.
+        fn sent(&self) -> Vec<String> {
+            self.commands
+                .try_iter()
+                .filter_map(|c| match c {
+                    WorkerCommand::SetAvailability { path, action } => Some(format!("{action} {path:?}")),
+                    WorkerCommand::LoadRemotePath(path) => Some(format!("open {path}")),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    /// Clicks Keep all with nothing open, to prove `pos` is where it reacts, then forgets what that did.
+    fn keep_all_reacts_at(h: &mut Harness, pos: egui::Pos2) {
+        h.sent();
+        h.click(pos);
+        let reacted = !h.sent().is_empty() || h.app.pending_confirm.is_some();
+        assert!(reacted, "Keep all did not react to a click at {pos:?}");
+        h.app.pending_confirm = None;
+        h.app.working.clear();
+        h.frames(2);
+    }
+
+    #[test]
+    fn clicking_outside_a_confirm_dialog_closes_it_and_clicks_nothing_under_it() {
+        let mut h = Harness::new("/my-files");
+        let keep_all = h.text_at("Keep all").expect("Keep all is painted");
+        keep_all_reacts_at(&mut h, keep_all);
+
+        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
+        h.frames(2);
+        h.click(keep_all);
+
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+        assert!(h.app.working.is_empty());
+    }
+
+    #[test]
+    fn clicking_outside_the_row_menu_closes_it_and_clicks_nothing_under_it() {
+        let mut h = Harness::new("/my-files");
+        let keep_all = h.text_at("Keep all").expect("Keep all is painted");
+        keep_all_reacts_at(&mut h, keep_all);
+        let open_menu = |h: &mut Harness| {
+            h.app.row_menu = Some(RowMenu {
+                name: "photo.jpg".into(),
+                rel_path: "photo.jpg".into(),
+                availability: Availability::OnlineOnly,
+                pos: egui::pos2(1000.0, 700.0),
+            });
+            h.frames(2);
+        };
+
+        open_menu(&mut h);
+        h.click(keep_all);
+        assert!(h.app.row_menu.is_none());
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+
+        // Nor does a click on another row open that folder
+        open_menu(&mut h);
+        let projects = h.text_at("Projects").expect("the Projects row is painted");
+        h.click(projects);
+        assert!(h.app.row_menu.is_none());
+        assert_eq!(h.sent(), Vec::<String>::new());
+        assert_eq!(h.app.remote_path, "/my-files");
+    }
+
+    #[test]
+    fn a_click_in_the_frame_a_confirm_dialog_appears_clicks_nothing_under_it() {
+        let mut h = Harness::new("/my-files");
+        let keep_all = h.text_at("Keep all").expect("Keep all is painted");
+        keep_all_reacts_at(&mut h, keep_all);
+
+        // No frame has drawn the backdrop yet when the click arrives
+        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
+        let button = |pressed| egui::Event::PointerButton {
+            pos: keep_all,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        h.frame(vec![button(true), button(false)]);
+        h.frames(2);
+
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn menu_entries_and_dialog_buttons_still_take_clicks() {
+        let mut h = Harness::new("/my-files");
+        h.app.row_menu = Some(RowMenu {
+            name: "photo.jpg".into(),
+            rel_path: "photo.jpg".into(),
+            availability: Availability::OnlineOnly,
+            pos: egui::pos2(1000.0, 700.0),
+        });
+        h.frames(2);
+        h.click(h.text_at("Always keep on this device").expect("the menu is painted"));
+        assert_eq!(h.sent(), vec![r#"pin "photo.jpg""#.to_string()]);
+        assert!(h.app.row_menu.is_none());
+
+        h.app.working.clear();
+        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
+        h.frames(2);
+        h.click(h.text_at("Cancel").expect("the dialog is painted"));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+
+        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
+        h.frames(2);
+        h.click(h.text_at("Free up space").expect("the dialog is painted"));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), vec![r#"free """#.to_string()]);
+    }
+
+    #[test]
+    fn keep_all_at_the_root_asks_first_and_in_a_subfolder_does_not() {
+        // The whole drive: confirmed first (ruling R19)
+        let mut h = Harness::new("/my-files");
+        h.click(h.text_at("Keep all").expect("Keep all is painted"));
+        assert!(h.app.pending_confirm.is_some());
+        assert_eq!(h.sent(), Vec::<String>::new());
+        h.click(h.text_at("Keep everything").expect("the dialog is painted"));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), vec![r#"pin """#.to_string()]);
+
+        let mut h = Harness::new("/my-files");
+        h.click(h.text_at("Keep all").expect("Keep all is painted"));
+        h.click(h.text_at("Cancel").expect("the dialog is painted"));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+
+        // A folder inside: at once, as before
+        let mut h = Harness::new("/my-files/Projects");
+        h.click(h.text_at("Keep all").expect("Keep all is painted"));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), vec![r#"pin "Projects""#.to_string()]);
+    }
+
+    #[test]
+    fn keep_all_confirmation_says_it_downloads_everything() {
+        let copy = confirm_copy(&PendingConfirm::KeepAll);
+        assert_eq!(copy.title, "Keep everything on this device?");
+        assert_eq!(copy.body, "This downloads everything in My files to this computer and keeps it updated.");
+        assert_eq!((copy.button, copy.action, copy.rel_path.as_str()), ("Keep everything", "pin", ""));
+        // The other dialogs keep their wording
+        let hide = confirm_copy(&PendingConfirm::Hide { name: "a".into(), rel_path: "x/a".into() });
+        assert_eq!((hide.title.as_str(), hide.action, hide.rel_path.as_str()), ("Hide \"a\" from this computer?", "hide", "x/a"));
+        let free = confirm_copy(&PendingConfirm::FreeAll { rel_path: String::new() });
+        assert_eq!((free.title.as_str(), free.action, free.rel_path.as_str()), ("Free up space in My files?", "free", ""));
     }
 
     #[test]
