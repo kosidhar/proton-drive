@@ -205,7 +205,6 @@ struct SyncSettings {
     notifications_enabled: bool,
     reconcile_interval_sec: u64,
     paused: bool,
-    excluded_folders: Vec<String>,
     ignore_patterns: Vec<String>,
 }
 
@@ -270,6 +269,289 @@ struct RemoteItem {
     size: u64,
     #[allow(dead_code)]
     modification_time: String,
+    /// One of pinned, downloaded, online-only, hidden or hiding; older daemons omit it.
+    #[serde(default)]
+    availability: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Availability {
+    Pinned,
+    Downloaded,
+    OnlineOnly,
+    Hidden,
+    Hiding,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PillStyle {
+    SolidGreen,
+    OutlineGreen,
+    Muted,
+}
+
+/// Maps the daemon's availability string; a missing or unknown value reads as online only.
+fn parse_availability(s: Option<&str>) -> Availability {
+    match s {
+        Some("pinned") => Availability::Pinned,
+        Some("downloaded") => Availability::Downloaded,
+        Some("hidden") => Availability::Hidden,
+        Some("hiding") => Availability::Hiding,
+        _ => Availability::OnlineOnly,
+    }
+}
+
+fn availability_pill(a: Availability) -> (&'static str, PillStyle) {
+    match a {
+        Availability::Pinned => ("Always keep", PillStyle::SolidGreen),
+        Availability::Downloaded => ("Downloaded", PillStyle::OutlineGreen),
+        Availability::OnlineOnly => ("Online only", PillStyle::Muted),
+        Availability::Hidden => ("Hidden", PillStyle::Muted),
+        Availability::Hiding => ("Hiding…", PillStyle::Muted),
+    }
+}
+
+/// Menu entries for one item, as (label, action) with the daemon's action names. The root can't be hidden, and a
+/// hidden or hiding item offers only Unhide: it has to be unhidden before it can be kept (ruling R18).
+fn menu_actions(a: Availability, is_root: bool) -> Vec<(&'static str, &'static str)> {
+    let mut out = Vec::new();
+    let hidden = matches!(a, Availability::Hidden | Availability::Hiding);
+    if a != Availability::Pinned && !hidden {
+        out.push(("Always keep on this device", "pin"));
+    }
+    if matches!(a, Availability::Pinned | Availability::Downloaded) {
+        out.push(("Free up space", "free"));
+    }
+    if !hidden && !is_root {
+        out.push(("Hide from this computer", "hide"));
+    }
+    if hidden {
+        out.push(("Unhide", "unhide"));
+    }
+    out
+}
+
+/// The browser path relative to the sync folder; empty at the root.
+fn folder_rel_path(remote_path: &str) -> &str {
+    remote_path.strip_prefix("/my-files").unwrap_or(remote_path).trim_matches('/')
+}
+
+/// An item's path relative to the sync folder: the browser path without `/my-files`, joined with its name.
+fn item_rel_path(remote_path: &str, name: &str) -> String {
+    let dir = folder_rel_path(remote_path);
+    if dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// What the daemon's control socket answers to an availability action.
+#[derive(Clone, Debug, Deserialize)]
+struct AvailabilityResult {
+    #[allow(dead_code)]
+    state: String,
+    #[serde(default)]
+    kept: Vec<String>,
+    #[serde(default)]
+    refused: Option<String>,
+}
+
+/// The kept things themselves: not the folders holding them, and not the engine's own downloads in progress
+/// (the daemon's own notification applies the same filter).
+fn kept_leaves(kept: &[String]) -> Vec<String> {
+    // Containment is judged against the full list, temp files included, as the daemon does
+    kept.iter()
+        .filter(|p| !kept.iter().any(|q| q.strip_prefix(p.as_str()).is_some_and(|rest| rest.starts_with('/'))))
+        .filter(|p| !p.rsplit('/').next().unwrap_or("").starts_with(".proton-drive-tmp-"))
+        .cloned()
+        .collect()
+}
+
+/// The line shown above the table after an action: the refusal, else the items that had to stay.
+fn availability_notice(r: &AvailabilityResult) -> Option<String> {
+    if let Some(refused) = r.refused.as_ref().filter(|m| !m.is_empty()) {
+        return Some(refused.clone());
+    }
+    let kept = kept_leaves(&r.kept);
+    if kept.is_empty() {
+        return None;
+    }
+    const SHOWN: usize = 3;
+    let n = kept.len();
+    let (subject, verb) = if n == 1 { ("item", "stays") } else { ("items", "stay") };
+    let pronoun = if n == 1 { "it isn't" } else { "they aren't" };
+    let mut names = kept.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    if n > SHOWN {
+        names.push_str(&format!(" and {} more", n - SHOWN));
+    }
+    Some(format!(
+        "{n} {subject} {verb} on this computer because {pronoun} safely in Proton Drive: {names}"
+    ))
+}
+
+/// Same rule as the daemon's `defaultControlSocketPath`: `$XDG_RUNTIME_DIR/protondrive/control.sock`, else
+/// `<tmp>/protondrive-<uid>/control.sock`.
+fn control_socket_path_from(xdg_runtime_dir: Option<std::ffi::OsString>, tmp: std::path::PathBuf, uid: u32) -> std::path::PathBuf {
+    match xdg_runtime_dir.filter(|d| !d.is_empty()) {
+        Some(dir) => std::path::PathBuf::from(dir).join("protondrive").join("control.sock"),
+        None => tmp.join(format!("protondrive-{uid}")).join("control.sock"),
+    }
+}
+
+fn control_socket_path() -> std::path::PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(0);
+    control_socket_path_from(std::env::var_os("XDG_RUNTIME_DIR"), std::env::temp_dir(), uid)
+}
+
+/// One HTTP/1.1 request to the daemon's user-only control socket. Pin, free, hide and unhide go
+/// only through here, never through the TCP API.
+fn control_request(
+    method: &str,
+    path_and_query: &str,
+    body: Option<&serde_json::Value>,
+    read_timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    control_request_at(&control_socket_path(), method, path_and_query, body, read_timeout)
+}
+
+/// Pin and free reply only once the work is done, which can take a long time on a big folder.
+const AVAILABILITY_READ_TIMEOUT: Duration = Duration::from_secs(600);
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// What a read timeout means: the daemon accepted the request and is still busy with it.
+const STILL_WORKING: &str = "Still working on it in the background. Refresh to see the result.";
+
+fn control_request_at(
+    socket: &std::path::Path,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&serde_json::Value>,
+    read_timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    use std::io::{Read, Write};
+    const UNREACHABLE: &str = "Can't reach the Proton Drive background service";
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(socket).map_err(|e| format!("{UNREACHABLE} ({e})"))?;
+    let _ = stream.set_read_timeout(Some(read_timeout));
+    let _ = stream.set_write_timeout(Some(CONTROL_WRITE_TIMEOUT));
+
+    let payload = body.map(|b| b.to_string()).unwrap_or_default();
+    let mut request = format!("{method} {path_and_query} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: application/json\r\n");
+    if body.is_some() {
+        request.push_str(&format!("Content-Type: application/json\r\nContent-Length: {}\r\n", payload.len()));
+    }
+    request.push_str("\r\n");
+    request.push_str(&payload);
+    stream.write_all(request.as_bytes()).map_err(|e| format!("{UNREACHABLE} ({e})"))?;
+
+    // Connection: close ends the reply at EOF; Content-Length, when present, trims anything after the body
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).map_err(|e| match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => STILL_WORKING.to_string(),
+        _ => format!("{UNREACHABLE} ({e})"),
+    })?;
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or("Malformed reply from the Proton Drive background service")?;
+    let head = String::from_utf8_lossy(&raw[..split]).to_string();
+    let mut body_bytes = &raw[split + 4..];
+    let mut lines = head.lines();
+    let status: u16 = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .ok_or("Malformed reply from the Proton Drive background service")?;
+    let content_length = lines.find_map(|l| {
+        let (name, value) = l.split_once(':')?;
+        name.trim().eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok())?
+    });
+    if let Some(len) = content_length.filter(|len| *len <= body_bytes.len()) {
+        body_bytes = &body_bytes[..len];
+    }
+    let json: Option<serde_json::Value> = serde_json::from_slice(body_bytes).ok();
+    if (200..300).contains(&status) {
+        return json.ok_or_else(|| "Unreadable reply from the Proton Drive background service".to_string());
+    }
+    Err(json
+        .as_ref()
+        .and_then(|j| j.get("error"))
+        .and_then(|e| e.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| format!("The Proton Drive background service answered {status}")))
+}
+
+fn set_availability(path: &str, action: &str) -> Result<AvailabilityResult, String> {
+    let body = serde_json::json!({ "path": path, "action": action });
+    let reply = control_request("POST", "/availability", Some(&body), AVAILABILITY_READ_TIMEOUT)?;
+    serde_json::from_value(reply).map_err(|e| e.to_string())
+}
+
+/// An open row menu: the item it acts on and where it was opened.
+#[derive(Clone, Debug)]
+struct RowMenu {
+    name: String,
+    rel_path: String,
+    availability: Availability,
+    pos: egui::Pos2,
+}
+
+/// An action that waits for the user's confirmation.
+#[derive(Clone, Debug, PartialEq)]
+enum PendingConfirm {
+    Hide { name: String, rel_path: String },
+    /// Free up space for everything in the current folder (`rel_path` is empty at the root).
+    FreeAll { rel_path: String },
+    /// Keep all at the My files root, which downloads the whole drive (ruling R19); in a folder it needs no confirmation.
+    KeepAll,
+}
+
+/// What a confirmation dialog says, and what its button asks the daemon to do to which path.
+struct ConfirmCopy {
+    title: String,
+    body: String,
+    detail: &'static str,
+    button: &'static str,
+    rel_path: String,
+    action: &'static str,
+}
+
+fn confirm_copy(confirm: &PendingConfirm) -> ConfirmCopy {
+    match confirm {
+        PendingConfirm::Hide { name, rel_path } => ConfirmCopy {
+            title: format!("Hide \"{name}\" from this computer?"),
+            body: format!("\"{name}\" disappears from your Proton Drive folder on this computer. It stays in Proton Drive, and you can unhide it any time."),
+            detail: "Changes that haven't synced yet are uploaded first. Hiding is refused if anything inside exists only on this computer.",
+            button: "Hide",
+            rel_path: rel_path.clone(),
+            action: "hide",
+        },
+        PendingConfirm::FreeAll { rel_path } => {
+            let place = if rel_path.is_empty() { "My files".to_string() } else { format!("\"{rel_path}\"") };
+            ConfirmCopy {
+                title: format!("Free up space in {place}?"),
+                body: format!("This removes the local copies of everything in {place} that is safely in Proton Drive. Nothing is deleted online. Use Always keep to download them again."),
+                detail: "Anything marked Always keep here stops being kept. Files that aren't fully synced, or that you've told Proton Drive to ignore, stay on this computer.",
+                button: "Free up space",
+                rel_path: rel_path.clone(),
+                action: "free",
+            }
+        }
+        PendingConfirm::KeepAll => ConfirmCopy {
+            title: "Keep everything on this device?".to_string(),
+            body: "This downloads everything in My files to this computer and keeps it updated.".to_string(),
+            detail: "Items you made online only are downloaded too; hidden items stay hidden. This can take a long time and use a lot of disk space.",
+            button: "Keep everything",
+            rel_path: String::new(),
+            action: "pin",
+        },
+    }
+}
+
+/// Screenshot-only: a `RemoteListResponse` JSON file that replaces the daemon's listing.
+static REMOTE_FIXTURE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn load_remote_fixture(path: &str) -> Result<RemoteListResponse, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    serde_json::from_str(&raw).map_err(|e| format!("{path}: {e}"))
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -300,6 +582,7 @@ enum WorkerCommand {
     SaveSettings(serde_json::Value),
     LoadConflicts,
     ResolveConflict { id: u64, choice: String },
+    SetAvailability { path: String, action: String },
 }
 
 enum WorkerEvent {
@@ -310,6 +593,7 @@ enum WorkerEvent {
     LoginStarted(String),
     RemoteLoaded(Result<RemoteListResponse, String>),
     ConflictsLoaded(Vec<ConflictRecord>),
+    AvailabilityDone { path: String, result: Result<AvailabilityResult, String> },
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -433,12 +717,6 @@ fn format_remote_error(raw: &str) -> String {
     raw.to_string()
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum CloudOnlyConfirm {
-    SingleFolder(String),
-    AllFolders(Vec<String>),
-}
-
 struct ProtonDriveNativeApp {
     tab: NavTab,
     tx: Sender<WorkerCommand>,
@@ -453,8 +731,6 @@ struct ProtonDriveNativeApp {
     login_url: Option<String>,
     search_query: String,
     show_account_menu: bool,
-    pending_cloud_only_confirm: Option<CloudOnlyConfirm>,
-    pending_sync_folders: Vec<String>,
 
     // Cloud Browser state
     remote_path: String,
@@ -463,6 +739,14 @@ struct ProtonDriveNativeApp {
     remote_error: Option<String>,
     new_folder_name: String,
     show_new_folder_modal: bool,
+    row_menu: Option<RowMenu>,
+    /// Paths (relative to the sync folder; empty is the whole drive) with an action still running.
+    working: Vec<String>,
+    pending_confirm: Option<PendingConfirm>,
+    /// Dismissible line above the table: a refusal, the items that had to stay, or an error.
+    notice: Option<String>,
+    /// Screenshot-only: open the row menu of the item with this name once it is laid out.
+    screenshot_menu_for: Option<String>,
 
     // Ignore patterns editor (Settings)
     ignore_patterns_text: String,
@@ -494,7 +778,6 @@ impl ProtonDriveNativeApp {
         screenshot_target: Option<String>,
         initial_tab: NavTab,
         initial_account_menu: bool,
-        initial_confirm_folder: Option<String>,
         initial_path: Option<String>,
         window_geometry: WindowGeometry,
     ) -> Self {
@@ -559,8 +842,6 @@ impl ProtonDriveNativeApp {
             login_url: None,
             search_query: String::new(),
             show_account_menu: initial_account_menu,
-            pending_cloud_only_confirm: initial_confirm_folder.map(CloudOnlyConfirm::SingleFolder),
-            pending_sync_folders: Vec::new(),
             remote_path: start_path,
             // The startup cache only holds the root listing, so don't show it under another folder
             remote_items: if start_at_root { initial_root_items } else { Vec::new() },
@@ -568,6 +849,11 @@ impl ProtonDriveNativeApp {
             remote_error: None,
             new_folder_name: String::new(),
             show_new_folder_modal: false,
+            row_menu: None,
+            working: Vec::new(),
+            pending_confirm: None,
+            notice: None,
+            screenshot_menu_for: None,
             ignore_patterns_text,
             settings_dirty: false,
             conflicts: Vec::new(),
@@ -601,20 +887,7 @@ impl ProtonDriveNativeApp {
                         if s.logged_in {
                             self.login_url = None;
                         }
-                        self.pending_sync_folders.retain(|f| {
-                            if s.syncing_folders.contains(f) {
-                                return true;
-                            }
-                            if !s.sync_dir.is_empty() {
-                                return !std::path::Path::new(&s.sync_dir).join(f).exists();
-                            }
-                            false
-                        });
                         self.status = s;
-                        // A status poll queued before our SaveSettings may still list the folder as excluded
-                        for f in &self.pending_sync_folders {
-                            self.status.settings.excluded_folders.retain(|ex| ex != f);
-                        }
                         self.activities = activity;
                         save_startup_cache(&self.status, &self.cached_root_items, &self.activities);
 
@@ -641,7 +914,9 @@ impl ProtonDriveNativeApp {
                     self.remote_loading = false;
                     match res {
                         Ok(list) => {
-                            if list.path == "/my-files" || list.path == "/" {
+                            if (list.path == "/my-files" || list.path == "/")
+                                && REMOTE_FIXTURE.get().is_none()
+                            {
                                 self.cached_root_items = list.items.clone();
                                 save_startup_cache(&self.status, &self.cached_root_items, &self.activities);
                             }
@@ -666,6 +941,18 @@ impl ProtonDriveNativeApp {
                 }
                 WorkerEvent::ConflictsLoaded(conflicts) => {
                     self.conflicts = conflicts;
+                }
+                WorkerEvent::AvailabilityDone { path, result } => {
+                    if let Some(i) = self.working.iter().position(|w| w == &path) {
+                        self.working.remove(i);
+                    }
+                    self.notice = match result {
+                        Ok(result) => availability_notice(&result),
+                        Err(e) => Some(e),
+                    };
+                    // Pills and the status counters change with the action
+                    let _ = self.tx.send(WorkerCommand::RefreshAll);
+                    let _ = self.tx.send(WorkerCommand::LoadRemotePath(self.remote_path.clone()));
                 }
             }
         }
@@ -738,12 +1025,10 @@ impl ProtonDriveNativeApp {
                         let inc = root_folders
                             .iter()
                             .filter(|f| {
-                                !self
-                                    .status
-                                    .settings
-                                    .excluded_folders
-                                    .iter()
-                                    .any(|ex| ex == &f.name)
+                                matches!(
+                                    parse_availability(f.availability.as_deref()),
+                                    Availability::Pinned | Availability::Downloaded
+                                )
                             })
                             .count();
                         Some(format!("{inc}/{}", root_folders.len()))
@@ -1808,8 +2093,8 @@ impl ProtonDriveNativeApp {
         });
     }
 
-    /// My files toolbar, laid out right to left: Refresh, New folder, the root-only Sync All /
-    /// Cloud Only All buttons and, when there's room, the item count.
+    /// My files toolbar, laid out right to left: Refresh, New folder, Free up all, Keep all and, when
+    /// there's room, the item count.
     fn render_browser_toolbar(&mut self, ui: &mut egui::Ui, count: Option<&str>, navigate_to: &mut Option<String>) {
         if proton_button(
             ui,
@@ -1843,74 +2128,332 @@ impl ProtonDriveNativeApp {
             self.show_new_folder_modal = !self.show_new_folder_modal;
         }
 
-        if !self.remote_items.is_empty() {
-            let is_root_bar =
-                self.remote_path == "/my-files" || self.remote_path == "/";
-            if is_root_bar {
-                ui.add_space(6.0);
-                if proton_button(
-                    ui,
-                    Vec2::new(TOOLBAR_CLOUD_ONLY_ALL_W, 32.0),
-                    "Cloud Only All",
-                    BG_CARD_ALT(),
-                    btn_secondary_hover_bg(),
-                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                    TEXT_MUTED(),
-                    12.0,
-                )
-                .on_hover_text(
-                    "Switch all top-level folders to Cloud only (remove local copies)",
-                )
-                .clicked()
-                {
-                    let all_folder_names: Vec<String> = self
-                        .remote_items
-                        .iter()
-                        .filter(|i| i.item_type == "folder")
-                        .map(|i| i.name.clone())
-                        .collect();
-                    if !all_folder_names.is_empty() {
-                        self.pending_cloud_only_confirm =
-                            Some(CloudOnlyConfirm::AllFolders(all_folder_names));
-                    }
-                }
+        ui.add_space(6.0);
 
-                ui.add_space(6.0);
-                if proton_button(
+        let here = folder_rel_path(&self.remote_path);
+        let folder_busy = self
+            .working
+            .iter()
+            .any(|w| w.is_empty() || w == here || here.starts_with(&format!("{w}/")));
+        let free_all = ui
+            .add_enabled_ui(!folder_busy, |ui| {
+                proton_button(
                     ui,
-                    Vec2::new(TOOLBAR_SYNC_ALL_W, 32.0),
-                    "Sync All",
+                    Vec2::new(TOOLBAR_FREE_ALL_W, 32.0),
+                    "Free up all",
                     BG_CARD_ALT(),
                     btn_secondary_hover_bg(),
                     Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
                     TEXT_PRIMARY(),
-                    12.0,
+                    13.0,
                 )
-                .on_hover_text("Sync all top-level folders to this computer")
-                .clicked()
-                {
-                    let prev_excluded =
-                        std::mem::take(&mut self.status.settings.excluded_folders);
-                    for folder_name in prev_excluded {
-                        if !self.pending_sync_folders.contains(&folder_name) {
-                            self.pending_sync_folders.push(folder_name.clone());
-                        }
-                        if !self.status.syncing_folders.contains(&folder_name) {
-                            self.status.syncing_folders.push(folder_name);
-                        }
-                    }
-                    self.status.state = "syncing".to_string();
-                    let _ = self.tx.send(WorkerCommand::SaveSettings(
-                        serde_json::json!({ "excludedFolders": Vec::<String>::new() }),
-                    ));
-                }
-            }
+            })
+            .inner
+            .on_hover_text("Free up space for everything in this folder");
+        if free_all.clicked() && !folder_busy {
+            self.pending_confirm = Some(PendingConfirm::FreeAll {
+                rel_path: folder_rel_path(&self.remote_path).to_string(),
+            });
+        }
 
+        ui.add_space(6.0);
+
+        let keep_all = ui
+            .add_enabled_ui(!folder_busy, |ui| {
+                proton_button(
+                    ui,
+                    Vec2::new(TOOLBAR_KEEP_ALL_W, 32.0),
+                    "Keep all",
+                    BG_CARD_ALT(),
+                    btn_secondary_hover_bg(),
+                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                    TEXT_PRIMARY(),
+                    13.0,
+                )
+            })
+            .inner
+            .on_hover_text("Always keep everything in this folder on this device");
+        if keep_all.clicked() && !folder_busy {
+            if here.is_empty() {
+                self.pending_confirm = Some(PendingConfirm::KeepAll); // The whole drive: ask first
+            } else {
+                self.send_availability(here.to_string(), "pin");
+            }
+        }
+
+        if !self.remote_items.is_empty() {
             if let Some(count) = count {
                 ui.add_space(10.0);
                 ui.label(RichText::new(count).size(12.0).color(TEXT_MUTED()));
             }
         }
+    }
+
+    /// Asks the daemon, over the control socket and off the UI thread, to change availability.
+    fn send_availability(&mut self, rel_path: String, action: &str) {
+        self.row_menu = None;
+        self.notice = None;
+        self.working.push(rel_path.clone());
+        let _ = self.tx.send(WorkerCommand::SetAvailability { path: rel_path, action: action.to_string() });
+    }
+
+    /// Dismissible warning line above the table.
+    fn render_notice(&mut self, ui: &mut egui::Ui) {
+        if !self.working.is_empty() {
+            ui.add_space(10.0);
+            Frame::NONE
+                .fill(PROTON_PURPLE_SOFT())
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.label(
+                        RichText::new("↻ Working… this can take a while for large folders. The list updates when it's done.")
+                            .size(12.5)
+                            .color(PROTON_PURPLE_TEXT()),
+                    );
+                });
+        }
+        let Some(text) = self.notice.clone() else {
+            return;
+        };
+        ui.add_space(10.0);
+        Frame::NONE
+            .fill(Color32::from_rgba_unmultiplied(230, 138, 0, 32))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(230, 138, 0, 120)))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal_top(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        let close = ui
+                            .add(
+                                egui::Button::new(RichText::new("×").size(18.0).color(TEXT_MUTED()))
+                                    .frame(false),
+                            )
+                            .on_hover_text("Dismiss");
+                        if close.clicked() {
+                            self.notice = None;
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(&text).size(12.5).color(TEXT_PRIMARY())).wrap(),
+                            );
+                        });
+                    });
+                });
+            });
+    }
+
+    /// The context menu for one row, closed by Escape, a click elsewhere or choosing an entry.
+    fn render_row_menu(&mut self, ctx: &egui::Context) {
+        let Some(menu) = self.row_menu.clone() else {
+            return;
+        };
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.row_menu = None;
+            return;
+        }
+        let actions = menu_actions(menu.availability, menu.rel_path.is_empty());
+        let menu_w = 224.0;
+        let menu_h = actions.len() as f32 * 30.0 + 12.0;
+        let screen = ctx.screen_rect();
+        let pos = egui::pos2(
+            menu.pos.x.min(screen.right() - menu_w - 8.0).max(screen.left() + 8.0),
+            menu.pos.y.min(screen.bottom() - menu_h - 8.0).max(screen.top() + 8.0),
+        );
+        let mut chosen: Option<&'static str> = None;
+        // Above the window's contents and below the menu, so a click outside the menu only closes it
+        click_shield(ctx, "row_menu_shield", egui::Order::Middle, None);
+        let area = egui::Area::new(egui::Id::new("row_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                Frame::NONE
+                    .fill(BG_CARD())
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
+                    .corner_radius(CornerRadius::same(10))
+                    .shadow(egui::Shadow {
+                        offset: [0, 6],
+                        blur: 18,
+                        spread: 0,
+                        color: Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+                    })
+                    .inner_margin(Margin::same(6))
+                    .show(ui, |ui| {
+                        ui.set_min_width(menu_w - 12.0);
+                        ui.set_max_width(menu_w - 12.0);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for (label, action) in &actions {
+                            let entry = egui::Button::new(RichText::new(*label).size(13.0).color(TEXT_PRIMARY()))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE)
+                                .corner_radius(CornerRadius::same(6))
+                                .min_size(Vec2::new(menu_w - 12.0, 28.0));
+                            if ui.add(entry).clicked() {
+                                chosen = Some(action);
+                            }
+                        }
+                    });
+            });
+
+        if let Some(action) = chosen {
+            match action {
+                "hide" => {
+                    self.pending_confirm =
+                        Some(PendingConfirm::Hide { name: menu.name, rel_path: menu.rel_path });
+                    self.row_menu = None;
+                }
+                _ => self.send_availability(menu.rel_path, action),
+            }
+        } else if ctx.input(|i| i.pointer.any_pressed()) {
+            if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
+                if !area.response.rect.contains(p) {
+                    self.row_menu = None;
+                }
+            }
+        }
+    }
+
+    /// Confirmation for Hide (one item), Free up all (the current folder) and Keep all at the root.
+    fn render_confirm_modal(&mut self, ctx: &egui::Context) {
+        let Some(confirm) = self.pending_confirm.clone() else {
+            return;
+        };
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.pending_confirm = None;
+            return;
+        }
+
+        let screen_rect = ctx.screen_rect();
+        // The dimmed backdrop takes the clicks meant for what is under it: a click outside only cancels
+        click_shield(
+            ctx,
+            "confirm_backdrop",
+            egui::Order::Foreground,
+            Some(Color32::from_rgba_unmultiplied(10, 8, 16, 175)),
+        );
+
+        let modal_w = 436.0;
+        let modal_h = 236.0;
+        let modal_pos = egui::pos2(
+            screen_rect.center().x - modal_w * 0.5,
+            screen_rect.center().y - modal_h * 0.5,
+        );
+
+        let ConfirmCopy { title, body, detail, button, rel_path: action_path, action } = confirm_copy(&confirm);
+
+        let area_resp = egui::Area::new(egui::Id::new("confirm_dialog"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(modal_pos)
+            .show(ctx, |ui| {
+                Frame::NONE
+                    .fill(BG_CARD())
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
+                    .corner_radius(CornerRadius::same(14))
+                    .shadow(egui::Shadow {
+                        offset: [0, 12],
+                        blur: 32,
+                        spread: 2,
+                        color: Color32::from_rgba_unmultiplied(0, 0, 0, 190),
+                    })
+                    .inner_margin(Margin::symmetric(24, 22))
+                    .show(ui, |ui| {
+                        ui.set_min_width(modal_w - 48.0);
+                        ui.set_max_width(modal_w - 48.0);
+
+                        ui.label(RichText::new(title).size(16.5).strong().color(TEXT_PRIMARY()));
+                        ui.add_space(10.0);
+                        ui.label(RichText::new(body).size(13.0).color(TEXT_PRIMARY()));
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(detail).size(12.5).color(TEXT_MUTED()));
+
+                        ui.add_space(20.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if proton_button(
+                                ui,
+                                Vec2::new(138.0, 36.0),
+                                button,
+                                PROTON_PURPLE,
+                                PROTON_PURPLE_HOVER,
+                                None,
+                                Color32::WHITE,
+                                13.0,
+                            )
+                            .clicked()
+                            {
+                                self.send_availability(action_path.clone(), action);
+                                self.pending_confirm = None;
+                            }
+
+                            ui.add_space(8.0);
+
+                            if proton_button(
+                                ui,
+                                Vec2::new(88.0, 36.0),
+                                "Cancel",
+                                BG_CARD_ALT(),
+                                btn_secondary_hover_bg(),
+                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                                TEXT_PRIMARY(),
+                                13.0,
+                            )
+                            .clicked()
+                            {
+                                self.pending_confirm = None;
+                            }
+                        });
+                    });
+            });
+
+        // Dismiss if clicked outside the dialog
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                if !area_resp.response.rect.contains(pos) {
+                    self.pending_confirm = None;
+                }
+            }
+        }
+    }
+
+    /// One frame of the window's contents: sidebar, header, the current tab and anything floating over them.
+    fn render_ui(&mut self, ctx: &egui::Context) {
+        self.render_sidebar(ctx);
+
+        egui::TopBottomPanel::top("proton_top_header")
+            .exact_height(56.0)
+            .frame(
+                Frame::NONE
+                    .fill(BG_SIDEBAR())
+                    .inner_margin(Margin::symmetric(24, 11))
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+            )
+            .show(ctx, |ui| {
+                self.render_top_bar(ui);
+            });
+
+        egui::CentralPanel::default()
+            .frame(
+                Frame::NONE
+                    .fill(BG_CANVAS())
+                    .inner_margin(Margin::symmetric(26, 20)),
+            )
+            .show(ctx, |ui| {
+                if self.pending_confirm.is_some() {
+                    ui.disable(); // Nothing under the confirmation dialog takes clicks or keys while it is open
+                }
+                match self.tab {
+                    NavTab::Overview => self.render_overview_tab(ui),
+                    NavTab::CloudBrowser => self.render_browser_tab(ui),
+                    NavTab::Conflicts => self.render_conflicts_tab(ui),
+                    NavTab::Settings => self.render_settings_tab(ui),
+                }
+            });
+
+        self.render_account_popover(ctx);
+        self.render_row_menu(ctx);
+        self.render_confirm_modal(ctx);
     }
 
     fn render_browser_tab(&mut self, ui: &mut egui::Ui) {
@@ -1960,13 +2503,12 @@ impl ProtonDriveNativeApp {
             let gap = ui.spacing().item_spacing.x;
             let crumbs_w = breadcrumbs_width(ui.painter(), &parts, gap);
             let has_items = !self.remote_items.is_empty();
-            let is_root_bar = self.remote_path == "/my-files" || self.remote_path == "/";
-            let buttons_w = TOOLBAR_REFRESH_W + 6.0 + TOOLBAR_NEW_FOLDER_W + gap * 2.0
-                + if has_items && is_root_bar {
-                    6.0 + TOOLBAR_CLOUD_ONLY_ALL_W + 6.0 + TOOLBAR_SYNC_ALL_W + gap * 2.0
-                } else {
-                    0.0
-                };
+            let buttons_w = TOOLBAR_REFRESH_W
+                + TOOLBAR_NEW_FOLDER_W
+                + TOOLBAR_FREE_ALL_W
+                + TOOLBAR_KEEP_ALL_W
+                + 3.0 * 6.0
+                + gap * 4.0;
             let folder_count = self.remote_items.iter().filter(|i| i.item_type == "folder").count();
             let file_count = self.remote_items.len().saturating_sub(folder_count);
             let count_text = format!("{folder_count} folders  •  {file_count} files");
@@ -2054,6 +2596,8 @@ impl ProtonDriveNativeApp {
                         });
                     });
             }
+
+            self.render_notice(ui);
 
             ui.add_space(14.0);
 
@@ -2148,8 +2692,6 @@ impl ProtonDriveNativeApp {
                     }
                 });
 
-                let is_root = self.remote_path == "/my-files" || self.remote_path == "/";
-                let root_folder_name = parts.get(1).cloned();
                 let scroll_h = (ui.available_height() - 6.0).max(240.0);
 
                 ScrollArea::vertical()
@@ -2161,18 +2703,15 @@ impl ProtonDriveNativeApp {
 
                         for item in sorted_items {
                             let is_folder = item.item_type == "folder";
-                            let top_check_name = if is_root {
-                                Some(item.name.as_str())
-                            } else {
-                                root_folder_name.as_deref()
-                            };
-                            let is_excluded = top_check_name.is_some_and(|top_name| {
-                                self.status
-                                    .settings
-                                    .excluded_folders
-                                    .iter()
-                                    .any(|ex| ex == top_name)
-                            });
+                            let availability = parse_availability(item.availability.as_deref());
+                            let is_muted_row =
+                                matches!(availability, Availability::Hidden | Availability::Hiding);
+                            let is_hidden = availability == Availability::Hidden;
+                            let has_local_copy = matches!(
+                                availability,
+                                Availability::Pinned | Availability::Downloaded
+                            );
+                            let item_rel = item_rel_path(&self.remote_path, &item.name);
 
                             let (row_rect, row_resp) = ui.allocate_exact_size(
                                 Vec2::new(ui.available_width(), 42.0),
@@ -2180,7 +2719,7 @@ impl ProtonDriveNativeApp {
                             );
 
                             if row_resp.hovered() {
-                                if is_folder || !is_excluded {
+                                if (is_folder && !is_hidden) || (!is_folder && has_local_copy) {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                 }
                                 ui.painter().rect_filled(
@@ -2209,16 +2748,24 @@ impl ProtonDriveNativeApp {
                                 Vec2::new(20.0, 17.0),
                             );
                             if is_folder {
-                                draw_folder_icon(ui.painter(), ic_rect, !is_excluded);
+                                draw_folder_icon(ui.painter(), ic_rect, has_local_copy);
                             } else {
                                 draw_file_icon(ui.painter(), ic_rect, &item.name);
                             }
 
-                            let name_color = TEXT_PRIMARY();
+                            let name_color = if is_muted_row { TEXT_MUTED() } else { TEXT_PRIMARY() };
                             let name_font = FontId::new(13.5, FontFamily::Proportional);
                             let name_text =
                                 truncate_middle_to_width(ui.painter(), &item.name, &name_font, row_cols.name_max_w);
-                            if name_text != item.name
+                            if is_hidden {
+                                let hint = "Hidden from this computer. Right-click to unhide.";
+                                let tip = if name_text != item.name {
+                                    format!("{}\n{hint}", item.name)
+                                } else {
+                                    hint.to_string()
+                                };
+                                row_resp.clone().on_hover_text(tip);
+                            } else if name_text != item.name
                                 && row_resp.hover_pos().is_some_and(|p| p.x < row_cols.status_x)
                             {
                                 row_resp.clone().on_hover_text(&item.name);
@@ -2231,145 +2778,105 @@ impl ProtonDriveNativeApp {
                                 name_color,
                             );
 
-                            // 2. Sync Status Column ("✓ Synced" vs "↻ Syncing..." vs "Cloud only" — clickable toggle on root folders!)
-                            let is_syncing = !is_excluded
-                                && top_check_name.is_some_and(|top_name| {
-                                    let in_pending = self
-                                        .pending_sync_folders
-                                        .iter()
-                                        .any(|f| f == top_name)
-                                        || self
-                                            .status
-                                            .syncing_folders
-                                            .iter()
-                                            .any(|f| f == top_name);
-                                    let has_active_transfer =
-                                        self.status.active_transfers.iter().any(|t| {
-                                            t.rel_path == top_name
-                                                || t.rel_path.starts_with(&format!("{top_name}/"))
-                                        });
-                                    let matches_current_action = self.status.state == "syncing"
-                                        && self.status.current_action.as_deref().is_some_and(
-                                            |act| {
-                                                act == format!("Syncing {top_name}")
-                                                    || act.starts_with(&format!(
-                                                        "Syncing {top_name}/"
-                                                    ))
-                                                    || act.ends_with(&format!("/{top_name}"))
-                                                    || act.contains(&format!("/{top_name}/"))
-                                            },
-                                        );
-                                    let missing_locally = is_root
-                                        && is_folder
-                                        && !self.status.sync_dir.is_empty()
-                                        && !std::path::Path::new(&self.status.sync_dir)
-                                            .join(top_name)
-                                            .exists();
-                                    in_pending
-                                        || has_active_transfer
-                                        || matches_current_action
-                                        || missing_locally
+                            // 2. Availability pill; "↻ Syncing..." overrides it while the item is being transferred
+                            let is_working = self
+                                .working
+                                .iter()
+                                .any(|w| *w == item_rel || w.is_empty() || item_rel.starts_with(&format!("{w}/")));
+                            let is_syncing = is_working || self.status.syncing_folders.iter().any(|f| f == &item_rel)
+                                || self.status.active_transfers.iter().any(|t| {
+                                    t.rel_path == item_rel
+                                        || t.rel_path.starts_with(&format!("{item_rel}/"))
                                 });
 
                             let pill_rect = egui::Rect::from_min_size(
                                 egui::pos2(row_status_x, row_cy - 11.0),
                                 Vec2::new(TABLE_STATUS_PILL_W, 22.0),
                             );
-                            let can_toggle_sync = is_root && is_folder;
-                            let pointer_pos = ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
-                            let pill_hovered = can_toggle_sync
-                                && row_resp.hovered()
-                                && pointer_pos.is_some_and(|p| pill_rect.expand(4.0).contains(p));
+                            let pill_font = FontId::new(11.0, FontFamily::Proportional);
 
-                            if is_excluded {
-                                let bg = if pill_hovered {
-                                    btn_secondary_hover_bg()
-                                } else {
-                                    BG_CARD_ALT()
-                                };
+                            if is_syncing {
                                 ui.painter()
-                                    .rect_filled(pill_rect, CornerRadius::same(99), bg);
-                                if can_toggle_sync {
-                                    ui.painter().rect_stroke(
-                                        pill_rect,
-                                        CornerRadius::same(99),
-                                        Stroke::new(
-                                            1.0_f32,
-                                            if pill_hovered {
-                                                PROTON_PURPLE_TEXT()
-                                            } else {
-                                                BORDER_SUBTLE()
-                                            },
-                                        ),
-                                        egui::StrokeKind::Inside,
-                                    );
-                                }
-                                ui.painter().text(
-                                    pill_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "Cloud only",
-                                    FontId::new(11.0, FontFamily::Proportional),
-                                    if pill_hovered { TEXT_PRIMARY() } else { TEXT_MUTED() },
-                                );
-                            } else if is_syncing {
-                                let bg = if pill_hovered {
-                                    Color32::from_rgba_unmultiplied(109, 74, 255, 58)
-                                } else {
-                                    PROTON_PURPLE_SOFT()
-                                };
-                                ui.painter()
-                                    .rect_filled(pill_rect, CornerRadius::same(99), bg);
+                                    .rect_filled(pill_rect, CornerRadius::same(99), PROTON_PURPLE_SOFT());
                                 ui.painter().rect_stroke(
                                     pill_rect,
                                     CornerRadius::same(99),
-                                    Stroke::new(
-                                        1.0_f32,
-                                        if pill_hovered {
-                                            PROTON_PURPLE_HOVER
-                                        } else {
-                                            PROTON_PURPLE
-                                        },
-                                    ),
+                                    Stroke::new(1.0_f32, PROTON_PURPLE),
                                     egui::StrokeKind::Inside,
                                 );
                                 ui.painter().text(
                                     pill_rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    "↻ Syncing...",
-                                    FontId::new(11.0, FontFamily::Proportional),
+                                    if is_working { "↻ Working…" } else { "↻ Syncing..." },
+                                    pill_font,
                                     PROTON_PURPLE_TEXT(),
                                 );
                             } else {
-                                let bg = if pill_hovered {
-                                    Color32::from_rgba_unmultiplied(30, 168, 133, 52)
-                                } else {
-                                    Color32::from_rgba_unmultiplied(30, 168, 133, 30)
-                                };
-                                ui.painter()
-                                    .rect_filled(pill_rect, CornerRadius::same(99), bg);
-                                if can_toggle_sync {
-                                    ui.painter().rect_stroke(
-                                        pill_rect,
-                                        CornerRadius::same(99),
-                                        Stroke::new(
-                                            1.0_f32,
-                                            Color32::from_rgba_unmultiplied(
-                                                30,
-                                                168,
-                                                133,
-                                                if pill_hovered { 160 } else { 75 },
+                                let (label, style) = availability_pill(availability);
+                                let painter = ui.painter();
+                                let round = CornerRadius::same(99);
+                                let text_color = match style {
+                                    PillStyle::SolidGreen => {
+                                        painter.rect_filled(pill_rect, round, STATUS_SUCCESS);
+                                        Color32::WHITE
+                                    }
+                                    PillStyle::OutlineGreen => {
+                                        painter.rect_filled(
+                                            pill_rect,
+                                            round,
+                                            Color32::from_rgba_unmultiplied(30, 168, 133, 30),
+                                        );
+                                        painter.rect_stroke(
+                                            pill_rect,
+                                            round,
+                                            Stroke::new(
+                                                1.0_f32,
+                                                Color32::from_rgba_unmultiplied(30, 168, 133, 110),
                                             ),
-                                        ),
-                                        egui::StrokeKind::Inside,
-                                    );
-                                }
-                                ui.painter().text(
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        STATUS_SUCCESS
+                                    }
+                                    PillStyle::Muted => {
+                                        painter.rect_filled(pill_rect, round, BG_CARD_ALT());
+                                        TEXT_MUTED()
+                                    }
+                                };
+                                painter.text(
                                     pill_rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    "✓ Synced",
-                                    FontId::new(11.0, FontFamily::Proportional),
-                                    STATUS_SUCCESS,
+                                    label,
+                                    pill_font,
+                                    text_color,
                                 );
+                            }
+
+                            // The pill and a right-click anywhere on the row open the same menu
+                            let pill_resp = ui.interact(
+                                pill_rect,
+                                ui.id().with(("availability_pill", &item.name)),
+                                Sense::click(),
+                            );
+                            if pill_resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            let menu_pos = if pill_resp.clicked() {
+                                Some(pill_rect.left_bottom() + Vec2::new(0.0, 4.0))
+                            } else if row_resp.secondary_clicked() {
+                                row_resp.interact_pointer_pos()
+                            } else if self.screenshot_menu_for.as_deref() == Some(item.name.as_str()) {
+                                self.screenshot_menu_for = None;
+                                Some(pill_rect.left_bottom() + Vec2::new(0.0, 4.0))
+                            } else {
+                                None
+                            };
+                            if let Some(pos) = menu_pos {
+                                self.row_menu = Some(RowMenu {
+                                    name: item.name.clone(),
+                                    rel_path: item_rel.clone(),
+                                    availability,
+                                    pos,
+                                });
                             }
 
                             // 3. Modified Date Column (date only on narrow windows, dropped on the narrowest)
@@ -2403,55 +2910,14 @@ impl ProtonDriveNativeApp {
                                 TEXT_MUTED(),
                             );
 
-                            let clicked_in_pill = can_toggle_sync
-                                && row_resp.clicked()
-                                && ui
-                                    .input(|i| i.pointer.interact_pos())
-                                    .is_some_and(|p| pill_rect.expand(6.0).contains(p));
-
-                            if clicked_in_pill {
-                                if is_excluded {
-                                    // Switching from Cloud only -> Syncing... -> Synced once downloaded locally
-                                    self.status
-                                        .settings
-                                        .excluded_folders
-                                        .retain(|ex| ex != &item.name);
-                                    if !self.pending_sync_folders.contains(&item.name) {
-                                        self.pending_sync_folders.push(item.name.clone());
-                                    }
-                                    if !self.status.syncing_folders.contains(&item.name) {
-                                        self.status.syncing_folders.push(item.name.clone());
-                                    }
-                                    self.status.state = "syncing".to_string();
-                                    self.status.current_action =
-                                        Some(format!("Syncing {}", item.name));
-                                    let updated_excluded =
-                                        self.status.settings.excluded_folders.clone();
-                                    let _ = self.tx.send(WorkerCommand::SaveSettings(
-                                        serde_json::json!({ "excludedFolders": updated_excluded }),
-                                    ));
-                                } else {
-                                    // Switching from Synced -> Cloud only removes local copy: ask confirmation first
-                                    self.pending_cloud_only_confirm =
-                                        Some(CloudOnlyConfirm::SingleFolder(item.name.clone()));
-                                }
-                            } else if is_folder && row_resp.clicked() {
+                            if is_folder && !is_hidden && row_resp.clicked() {
                                 clicked_folder = Some(format!(
                                     "{}/{}",
                                     self.remote_path.trim_end_matches('/'),
                                     item.name
                                 ));
-                            } else if !is_folder && !is_excluded && row_resp.clicked() {
-                                let rel_sub = self
-                                    .remote_path
-                                    .strip_prefix("/my-files")
-                                    .unwrap_or(&self.remote_path)
-                                    .trim_matches('/');
-                                let local_target = if rel_sub.is_empty() {
-                                    format!("{}/{}", self.status.sync_dir, item.name)
-                                } else {
-                                    format!("{}/{}/{}", self.status.sync_dir, rel_sub, item.name)
-                                };
+                            } else if !is_folder && has_local_copy && row_resp.clicked() {
+                                let local_target = format!("{}/{}", self.status.sync_dir, item_rel);
                                 let _ = spawn_reaped(Command::new("xdg-open").arg(local_target));
                             }
                         }
@@ -2737,162 +3203,6 @@ impl ProtonDriveNativeApp {
             }
         });
     }
-
-    fn render_cloud_only_confirm_modal(&mut self, ctx: &egui::Context) {
-        let Some(confirm) = self.pending_cloud_only_confirm.clone() else {
-            return;
-        };
-
-        if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            self.pending_cloud_only_confirm = None;
-            return;
-        }
-
-        let screen_rect = ctx.screen_rect();
-        // Paint dimmed backdrop on Foreground layer
-        egui::Area::new(egui::Id::new("cloud_only_confirm_backdrop"))
-            .order(egui::Order::Foreground)
-            .interactable(false)
-            .fixed_pos(screen_rect.min)
-            .show(ctx, |ui| {
-                let (rect, _) =
-                    ui.allocate_exact_size(screen_rect.size(), Sense::hover());
-                ui.painter().rect_filled(
-                    rect,
-                    0,
-                    Color32::from_rgba_unmultiplied(10, 8, 16, 175),
-                );
-            });
-
-        let modal_w = 436.0;
-        let modal_h = 216.0;
-        let modal_pos = egui::pos2(
-            screen_rect.center().x - modal_w * 0.5,
-            screen_rect.center().y - modal_h * 0.5,
-        );
-
-        let (title, body_line1) = match &confirm {
-            CloudOnlyConfirm::SingleFolder(name) => (
-                format!("Switch \"{name}\" to Cloud only?"),
-                format!(
-                    "This will remove the local copy of \"{name}\" from your computer to free up disk space."
-                ),
-            ),
-            CloudOnlyConfirm::AllFolders(names) => (
-                format!("Switch all {} folders to Cloud only?", names.len()),
-                "This will remove the local copies of all top-level folders from your computer to free up disk space.".to_string(),
-            ),
-        };
-
-        let area_resp = egui::Area::new(egui::Id::new("cloud_only_confirm_dialog"))
-            .order(egui::Order::Tooltip)
-            .fixed_pos(modal_pos)
-            .show(ctx, |ui| {
-                Frame::NONE
-                    .fill(BG_CARD())
-                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
-                    .corner_radius(CornerRadius::same(14))
-                    .shadow(egui::Shadow {
-                        offset: [0, 12],
-                        blur: 32,
-                        spread: 2,
-                        color: Color32::from_rgba_unmultiplied(0, 0, 0, 190),
-                    })
-                    .inner_margin(Margin::symmetric(24, 22))
-                    .show(ui, |ui| {
-                        ui.set_min_width(modal_w - 48.0);
-                        ui.set_max_width(modal_w - 48.0);
-
-                        ui.label(
-                            RichText::new(title)
-                                .size(16.5)
-                                .strong()
-                                .color(TEXT_PRIMARY()),
-                        );
-                        ui.add_space(10.0);
-                        ui.label(RichText::new(body_line1).size(13.0).color(TEXT_PRIMARY()));
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(
-                                "Your files stay in Proton Drive and can be synced again anytime. A folder holding anything not in Proton Drive yet, like ignored .git folders or unsynced edits, stays on this computer.",
-                            )
-                            .size(12.5)
-                            .color(TEXT_MUTED()),
-                        );
-
-                        ui.add_space(20.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if proton_button(
-                                ui,
-                                Vec2::new(158.0, 36.0),
-                                "Switch to Cloud only",
-                                PROTON_PURPLE,
-                                PROTON_PURPLE_HOVER,
-                                None,
-                                Color32::WHITE,
-                                13.0,
-                            )
-                            .clicked()
-                            {
-                                match confirm {
-                                    CloudOnlyConfirm::SingleFolder(folder_name) => {
-                                        self.pending_sync_folders.retain(|f| f != &folder_name);
-                                        self.status.syncing_folders.retain(|f| f != &folder_name);
-                                        if !self
-                                            .status
-                                            .settings
-                                            .excluded_folders
-                                            .contains(&folder_name)
-                                        {
-                                            self.status
-                                                .settings
-                                                .excluded_folders
-                                                .push(folder_name.clone());
-                                        }
-                                    }
-                                    CloudOnlyConfirm::AllFolders(all_names) => {
-                                        self.pending_sync_folders.clear();
-                                        self.status.syncing_folders.clear();
-                                        self.status.settings.excluded_folders = all_names;
-                                    }
-                                }
-                                let updated_excluded =
-                                    self.status.settings.excluded_folders.clone();
-                                let _ = self.tx.send(WorkerCommand::SaveSettings(
-                                    serde_json::json!({ "excludedFolders": updated_excluded }),
-                                ));
-                                self.pending_cloud_only_confirm = None;
-                            }
-
-                            ui.add_space(8.0);
-
-                            if proton_button(
-                                ui,
-                                Vec2::new(88.0, 36.0),
-                                "Cancel",
-                                BG_CARD_ALT(),
-                                btn_secondary_hover_bg(),
-                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                                TEXT_PRIMARY(),
-                                13.0,
-                            )
-                            .clicked()
-                            {
-                                self.pending_cloud_only_confirm = None;
-                            }
-                        });
-                    });
-            });
-
-        // Dismiss if clicked outside the modal dialog
-        if ctx.input(|i| i.pointer.any_pressed()) {
-            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                if !area_resp.response.rect.contains(pos) {
-                    self.pending_cloud_only_confirm = None;
-                }
-            }
-        }
-    }
 }
 
 impl eframe::App for ProtonDriveNativeApp {
@@ -2976,40 +3286,7 @@ impl eframe::App for ProtonDriveNativeApp {
             let _ = self.tx.send(WorkerCommand::RefreshAll);
         }
 
-        self.render_sidebar(ctx);
-
-        egui::TopBottomPanel::top("proton_top_header")
-            .exact_height(56.0)
-            .frame(
-                Frame::NONE
-                    .fill(BG_SIDEBAR())
-                    .inner_margin(Margin::symmetric(24, 11))
-                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-            )
-            .show(ctx, |ui| {
-                self.render_top_bar(ui);
-            });
-
-        egui::CentralPanel::default()
-            .frame(
-                Frame::NONE
-                    .fill(BG_CANVAS())
-                    .inner_margin(Margin::symmetric(26, 20)),
-            )
-            .show(ctx, |ui| {
-                if self.pending_cloud_only_confirm.is_some() {
-                    ui.disable();
-                }
-                match self.tab {
-                    NavTab::Overview => self.render_overview_tab(ui),
-                    NavTab::CloudBrowser => self.render_browser_tab(ui),
-                    NavTab::Conflicts => self.render_conflicts_tab(ui),
-                    NavTab::Settings => self.render_settings_tab(ui),
-                }
-            });
-
-        self.render_account_popover(ctx);
-        self.render_cloud_only_confirm_modal(ctx);
+        self.render_ui(ctx);
 
         // Handle --screenshot <path> for automated visual inspection
         if let Some(target_path) = self.screenshot_target.clone() {
@@ -3178,6 +3455,23 @@ fn card_frame() -> Frame {
         .inner_margin(Margin::same(18))
 }
 
+/// A layer over the whole window that takes every click meant for what is under it, so a click outside a menu or
+/// dialog only closes it. `dim` paints it as a dialog backdrop; without it the layer is invisible.
+fn click_shield(ctx: &egui::Context, id: &str, order: egui::Order, dim: Option<Color32>) {
+    let screen = ctx.screen_rect();
+    egui::Area::new(egui::Id::new(id))
+        .order(order)
+        .fixed_pos(screen.min)
+        .default_size(screen.size())
+        .sense(Sense::click())
+        .show(ctx, |ui| {
+            let (rect, _) = ui.allocate_exact_size(screen.size(), Sense::click());
+            if let Some(color) = dim {
+                ui.painter().rect_filled(rect, 0, color);
+            }
+        });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn proton_button(
     ui: &mut egui::Ui,
@@ -3214,8 +3508,8 @@ const BREADCRUMB_SEPARATOR_SIZE: f32 = 15.0;
 const BREADCRUMB_PAD_X: f32 = 12.0;
 const TOOLBAR_REFRESH_W: f32 = 84.0;
 const TOOLBAR_NEW_FOLDER_W: f32 = 108.0;
-const TOOLBAR_CLOUD_ONLY_ALL_W: f32 = 98.0;
-const TOOLBAR_SYNC_ALL_W: f32 = 76.0;
+const TOOLBAR_KEEP_ALL_W: f32 = 84.0;
+const TOOLBAR_FREE_ALL_W: f32 = 100.0;
 /// Safety margin for toolbar widths that are estimated before layout.
 const TOOLBAR_FIT_SLACK: f32 = 12.0;
 
@@ -3900,6 +4194,11 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                 });
                 ctx.request_repaint();
             }
+            WorkerCommand::LoadRemotePath(_) if REMOTE_FIXTURE.get().is_some() => {
+                let res = load_remote_fixture(REMOTE_FIXTURE.get().map_or("", String::as_str));
+                let _ = tx.send(WorkerEvent::RemoteLoaded(res));
+                ctx.request_repaint();
+            }
             WorkerCommand::LoadRemotePath(path) => {
                 let tx_clone = tx.clone();
                 let ctx_clone = ctx.clone();
@@ -3946,6 +4245,15 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                     activity: fetch_activity(),
                 });
                 ctx.request_repaint();
+            }
+            WorkerCommand::SetAvailability { path, action } => {
+                // Off-thread: Free and Hide can take a while on big folders
+                let tx_clone = tx.clone();
+                let ctx_clone = ctx.clone();
+                thread::spawn(move || {
+                    let _ = tx_clone.send(WorkerEvent::AvailabilityDone { result: set_availability(&path, &action), path });
+                    ctx_clone.request_repaint();
+                });
             }
             WorkerCommand::LoadConflicts => {
                 if let Ok(resp) = ureq::get(&format!("{DAEMON_URL}/api/conflicts")).call() {
@@ -4036,6 +4344,12 @@ OPTIONS:
   --tab <TAB>           initial tab (overview | browser | conflicts | settings)
   --screenshot <PATH>   render UI, save a PNG screenshot to PATH, and exit
   --search <QUERY>      pre-fill the search/filter box
+  --remote-fixture <F>  with --screenshot: list My files from a JSON file instead of the daemon
+  --row-menu <NAME>     with --screenshot: open the actions menu of the item NAME
+  --confirm-hide <NAME> with --screenshot: show the Hide confirmation for the item NAME
+  --working <NAME>      with --screenshot: show the item NAME (or . for this folder) as still working
+  --confirm-free-all    with --screenshot: show the Free up all confirmation
+  --confirm-keep-all    with --screenshot: show the Keep all confirmation (for the whole drive)
   --path <FOLDER>       open My files at a remote folder, e.g. /my-files/photos
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --version             print the version
@@ -4054,11 +4368,16 @@ fn main() -> eframe::Result {
     let mut screenshot_target: Option<String> = None;
     let mut initial_tab = NavTab::CloudBrowser;
     let mut initial_account_menu = false;
-    let mut initial_confirm_folder: Option<String> = None;
     let mut cli_theme_override: Option<String> = None;
     let mut cli_search: Option<String> = None;
     let mut cli_path: Option<String> = None;
     let mut cli_size: Option<[f32; 2]> = None;
+    let mut cli_fixture: Option<String> = None;
+    let mut cli_row_menu: Option<String> = None;
+    let mut cli_confirm_hide: Option<String> = None;
+    let mut cli_confirm_free_all = false;
+    let mut cli_confirm_keep_all = false;
+    let mut cli_working: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -4068,8 +4387,24 @@ fn main() -> eframe::Result {
             "--account-menu" => {
                 initial_account_menu = true;
             }
-            "--confirm-cloud-only" => {
-                initial_confirm_folder = args.next();
+            "--remote-fixture" => {
+                // Screenshot-only: show this RemoteListResponse JSON instead of the daemon's listing
+                cli_fixture = args.next();
+            }
+            "--row-menu" => {
+                cli_row_menu = args.next();
+            }
+            "--confirm-hide" => {
+                cli_confirm_hide = args.next();
+            }
+            "--working" => {
+                cli_working = args.next();
+            }
+            "--confirm-free-all" => {
+                cli_confirm_free_all = true;
+            }
+            "--confirm-keep-all" => {
+                cli_confirm_keep_all = true;
             }
             "--theme" => {
                 cli_theme_override = args.next();
@@ -4108,6 +4443,14 @@ fn main() -> eframe::Result {
                 return Ok(());
             }
             _ => {}
+        }
+    }
+
+    if let Some(path) = cli_fixture {
+        if screenshot_target.is_some() {
+            let _ = REMOTE_FIXTURE.set(path);
+        } else {
+            eprintln!("protondrive-gui: --remote-fixture only applies together with --screenshot; ignoring it");
         }
     }
 
@@ -4171,12 +4514,32 @@ fn main() -> eframe::Result {
                 screenshot_target,
                 initial_tab,
                 initial_account_menu,
-                initial_confirm_folder,
                 cli_path,
                 saved_geom,
             );
             if let Some(q) = cli_search {
                 app.search_query = q;
+            }
+            // Screenshot-only: these flags only draw the menu and dialogs, nothing is sent
+            if app.screenshot_target.is_some() {
+                app.screenshot_menu_for = cli_row_menu;
+                if let Some(name) = cli_working {
+                    let rel_path = if name == "." {
+                        folder_rel_path(&app.remote_path).to_string()
+                    } else {
+                        item_rel_path(&app.remote_path, &name)
+                    };
+                    app.working.push(rel_path);
+                }
+                if let Some(name) = cli_confirm_hide {
+                    let rel_path = item_rel_path(&app.remote_path, &name);
+                    app.pending_confirm = Some(PendingConfirm::Hide { name, rel_path });
+                } else if cli_confirm_free_all {
+                    let rel_path = folder_rel_path(&app.remote_path).to_string();
+                    app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path });
+                } else if cli_confirm_keep_all {
+                    app.pending_confirm = Some(PendingConfirm::KeepAll);
+                }
             }
             Ok(Box::new(app))
         }),
@@ -4470,6 +4833,518 @@ mod tests {
             assert!((14.0..24.0).contains(&size));
             assert!(text_width(p, quota, &FontId::proportional(size)) <= 200.0);
             assert_eq!(fit_font_size(p, quota, 24.0, 14.0, 20.0), 14.0);
+        });
+    }
+
+    #[test]
+    fn parse_availability_maps_every_daemon_string() {
+        assert_eq!(parse_availability(Some("pinned")), Availability::Pinned);
+        assert_eq!(parse_availability(Some("downloaded")), Availability::Downloaded);
+        assert_eq!(parse_availability(Some("online-only")), Availability::OnlineOnly);
+        assert_eq!(parse_availability(Some("hidden")), Availability::Hidden);
+        assert_eq!(parse_availability(Some("hiding")), Availability::Hiding);
+    }
+
+    #[test]
+    fn parse_availability_defaults_to_online_only() {
+        assert_eq!(parse_availability(None), Availability::OnlineOnly);
+        assert_eq!(parse_availability(Some("")), Availability::OnlineOnly);
+        assert_eq!(parse_availability(Some("Pinned")), Availability::OnlineOnly);
+        assert_eq!(parse_availability(Some("syncing")), Availability::OnlineOnly);
+    }
+
+    #[test]
+    fn availability_pill_uses_the_agreed_labels_and_styles() {
+        assert_eq!(availability_pill(Availability::Pinned), ("Always keep", PillStyle::SolidGreen));
+        assert_eq!(availability_pill(Availability::Downloaded), ("Downloaded", PillStyle::OutlineGreen));
+        assert_eq!(availability_pill(Availability::OnlineOnly), ("Online only", PillStyle::Muted));
+        assert_eq!(availability_pill(Availability::Hidden), ("Hidden", PillStyle::Muted));
+        assert_eq!(availability_pill(Availability::Hiding), ("Hiding…", PillStyle::Muted));
+    }
+
+    #[test]
+    fn menu_actions_follow_the_state() {
+        use Availability::*;
+        let keep = ("Always keep on this device", "pin");
+        let free = ("Free up space", "free");
+        let hide = ("Hide from this computer", "hide");
+        let unhide = ("Unhide", "unhide");
+        assert_eq!(menu_actions(Pinned, false), vec![free, hide]);
+        assert_eq!(menu_actions(Downloaded, false), vec![keep, free, hide]);
+        assert_eq!(menu_actions(OnlineOnly, false), vec![keep, hide]);
+        // Unhide first, then keep (ruling R18)
+        assert_eq!(menu_actions(Hidden, false), vec![unhide]);
+        assert_eq!(menu_actions(Hiding, false), vec![unhide]);
+    }
+
+    #[test]
+    fn menu_actions_never_offer_hide_on_the_root() {
+        use Availability::*;
+        for a in [Pinned, Downloaded, OnlineOnly, Hidden, Hiding] {
+            assert!(menu_actions(a, true).iter().all(|(_, action)| *action != "hide"), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn control_socket_path_honours_xdg_runtime_dir_and_falls_back_to_tmp() {
+        let tmp = std::path::PathBuf::from("/tmp");
+        assert_eq!(
+            control_socket_path_from(Some("/run/user/1000".into()), tmp.clone(), 1000),
+            std::path::PathBuf::from("/run/user/1000/protondrive/control.sock")
+        );
+        for unset in [None, Some(std::ffi::OsString::new())] {
+            assert_eq!(
+                control_socket_path_from(unset, tmp.clone(), 1000),
+                std::path::PathBuf::from("/tmp/protondrive-1000/control.sock")
+            );
+        }
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/4242");
+        assert_eq!(control_socket_path(), std::path::PathBuf::from("/run/user/4242/protondrive/control.sock"));
+    }
+
+    /// Serves one canned HTTP reply on a fresh socket; returns the socket path and the request it saw.
+    fn serve_once(reply: &'static [u8]) -> (std::path::PathBuf, thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("pd-gui-test-{}-{:?}", std::process::id(), thread::current().id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join(format!("c{}.sock", reply.len()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let handle = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = conn.read(&mut buf).unwrap();
+                seen.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&seen).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let want = head
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                        .unwrap_or(0);
+                    if body.len() >= want {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            conn.write_all(reply).unwrap();
+            String::from_utf8_lossy(&seen).to_string()
+        });
+        (sock, handle)
+    }
+
+    #[test]
+    fn control_request_parses_a_json_reply() {
+        let reply: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 48\r\n\r\n{\"state\":\"pinned\",\"kept\":[\"a/b\"],\"refused\":null}   ";
+        let (sock, server) = serve_once(reply);
+        let body = serde_json::json!({ "path": "Projects", "action": "pin" });
+        let got = control_request_at(&sock, "POST", "/availability", Some(&body), SHORT).unwrap();
+        assert_eq!(got["state"], "pinned");
+        assert_eq!(got["kept"][0], "a/b");
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /availability HTTP/1.1\r\n"), "{request}");
+        assert!(request.to_ascii_lowercase().contains("connection: close"));
+        assert!(request.ends_with(&body.to_string()));
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn control_request_reads_to_eof_without_content_length() {
+        let reply: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"path\":\"x\",\"state\":\"hidden\"}";
+        let (sock, server) = serve_once(reply);
+        let got = control_request_at(&sock, "GET", "/availability?path=x", None, SHORT).unwrap();
+        assert_eq!(got["state"], "hidden");
+        assert!(server.join().unwrap().starts_with("GET /availability?path=x HTTP/1.1"));
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn control_request_turns_an_error_status_into_the_daemon_message() {
+        let reply: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 34\r\n\r\n{\"error\":\"Not in Proton Drive: x\"}    ";
+        let (sock, server) = serve_once(reply);
+        let err = control_request_at(&sock, "GET", "/availability?path=x", None, SHORT).unwrap_err();
+        server.join().unwrap();
+        assert_eq!(err, "Not in Proton Drive: x");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    const SHORT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn control_request_timeout_means_still_working_not_unreachable() {
+        let dir = std::env::temp_dir().join(format!("pd-gui-timeout-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("slow.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // Accepts and then says nothing, like a daemon that is still downloading
+        let server = thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(600));
+            drop(conn);
+        });
+        let body = serde_json::json!({ "path": "x", "action": "pin" });
+        let err = control_request_at(&sock, "POST", "/availability", Some(&body), Duration::from_millis(100)).unwrap_err();
+        // Nothing reloads the list when the work finishes later, so the user is told to refresh
+        assert_eq!(err, "Still working on it in the background. Refresh to see the result.");
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn availability_requests_wait_ten_minutes() {
+        assert_eq!(AVAILABILITY_READ_TIMEOUT, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn kept_leaves_drop_folders_holding_kept_items_and_engine_temp_files() {
+        let kept: Vec<String> = ["Projects/app/.git", "Projects/app", "Projects", "Projects/.proton-drive-tmp-1-2-x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(kept_leaves(&kept), vec!["Projects/app/.git".to_string()]);
+        // Siblings that merely share a name prefix are both kept
+        let kept: Vec<String> = ["a/b", "a/bc"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(kept_leaves(&kept), kept);
+        // A folder whose only kept content is an in-progress download is not a leaf either
+        let kept: Vec<String> = ["Projects/.proton-drive-tmp-1", "Projects"].iter().map(|s| s.to_string()).collect();
+        assert!(kept_leaves(&kept).is_empty());
+        let kept: Vec<String> = ["Projects/.proton-drive-tmp-123-456-a.pdf", "Projects"].iter().map(|s| s.to_string()).collect();
+        assert!(kept_leaves(&kept).is_empty());
+    }
+
+    #[test]
+    fn availability_notice_ignores_folders_and_temp_files_in_kept() {
+        let r = AvailabilityResult {
+            state: "online-only".into(),
+            kept: ["Projects/app/.git", "Projects/app", "Projects"].iter().map(|s| s.to_string()).collect(),
+            refused: None,
+        };
+        assert_eq!(
+            availability_notice(&r).as_deref(),
+            Some("1 item stays on this computer because it isn't safely in Proton Drive: Projects/app/.git")
+        );
+        let only_temp = AvailabilityResult { state: "x".into(), kept: vec!["a/.proton-drive-tmp-1".into(), "a".into()], refused: None };
+        assert_eq!(availability_notice(&only_temp), None);
+    }
+
+    #[test]
+    fn control_request_reports_a_missing_daemon() {
+        let err = control_request_at(std::path::Path::new("/nonexistent/control.sock"), "GET", "/availability?path=", None, SHORT).unwrap_err();
+        assert!(err.contains("Proton Drive background service"), "{err}");
+    }
+
+    #[test]
+    fn item_rel_path_strips_my_files_and_joins_the_name() {
+        assert_eq!(item_rel_path("/my-files", "a.txt"), "a.txt");
+        assert_eq!(item_rel_path("/my-files/", "a.txt"), "a.txt");
+        assert_eq!(item_rel_path("/my-files/Projects/2026", "a b.txt"), "Projects/2026/a b.txt");
+        assert_eq!(item_rel_path("/", "x"), "x");
+    }
+
+    #[test]
+    fn availability_notice_prefers_the_refusal_then_lists_kept_items() {
+        let r = |kept: &[&str], refused: Option<&str>| AvailabilityResult {
+            state: "online-only".into(),
+            kept: kept.iter().map(|s| s.to_string()).collect(),
+            refused: refused.map(String::from),
+        };
+        assert_eq!(availability_notice(&r(&[], None)), None);
+        assert_eq!(
+            availability_notice(&r(&["a"], Some("Can't hide x: y exists only on this computer"))).as_deref(),
+            Some("Can't hide x: y exists only on this computer")
+        );
+        assert_eq!(
+            availability_notice(&r(&["a/b.txt"], None)).as_deref(),
+            Some("1 item stays on this computer because it isn't safely in Proton Drive: a/b.txt")
+        );
+        assert_eq!(
+            availability_notice(&r(&["1", "2", "3", "4", "5"], None)).as_deref(),
+            Some("5 items stay on this computer because they aren't safely in Proton Drive: 1, 2, 3 and 2 more")
+        );
+    }
+
+    /// The app driven headlessly: no worker thread and no daemon; what it asks the worker for lands in `commands`.
+    struct Harness {
+        ctx: egui::Context,
+        app: ProtonDriveNativeApp,
+        commands: Receiver<WorkerCommand>,
+        last: Option<egui::FullOutput>,
+    }
+
+    impl Harness {
+        fn new(remote_path: &str) -> Self {
+            let (tx, commands) = mpsc::channel();
+            let (_events_tx, rx) = mpsc::channel();
+            let items: Vec<RemoteItem> = serde_json::from_str(
+                r#"[
+                    {"uid": "1", "name": "Projects", "type": "folder", "size": 0, "modificationTime": "2026-10-20T10:00:00Z", "availability": "downloaded"},
+                    {"uid": "2", "name": "Photos", "type": "folder", "size": 0, "modificationTime": "2026-10-19T10:00:00Z", "availability": "online-only"},
+                    {"uid": "3", "name": "Archive", "type": "folder", "size": 0, "modificationTime": "2026-10-18T10:00:00Z", "availability": "pinned"},
+                    {"uid": "4", "name": "photo.jpg", "type": "file", "size": 42, "modificationTime": "2026-10-17T10:00:00Z", "availability": "online-only"}
+                ]"#,
+            )
+            .unwrap();
+            let status = DaemonStatus { state: "idle".into(), logged_in: true, ..Default::default() };
+            let app = ProtonDriveNativeApp {
+                tab: NavTab::CloudBrowser,
+                tx,
+                rx,
+                logo_texture: None,
+                daemon_online: true,
+                initial_connecting: false,
+                status,
+                activities: Vec::new(),
+                cached_root_items: Vec::new(),
+                login_url: None,
+                search_query: String::new(),
+                show_account_menu: false,
+                remote_path: remote_path.to_string(),
+                remote_items: items,
+                remote_loading: false,
+                remote_error: None,
+                new_folder_name: String::new(),
+                show_new_folder_modal: false,
+                row_menu: None,
+                working: Vec::new(),
+                pending_confirm: None,
+                notice: None,
+                screenshot_menu_for: None,
+                ignore_patterns_text: String::new(),
+                settings_dirty: false,
+                conflicts: Vec::new(),
+                edit_sync_dir: String::new(),
+                edit_conflict_strategy: "keep-both".into(),
+                edit_notifications: false,
+                window_geometry: WindowGeometry::default(),
+                maximize_applied_on_open: true,
+                applied_light_mode: false,
+                screenshot_target: None,
+                frames_rendered: 0,
+                screenshot_requested: false,
+                last_poll: Instant::now(),
+            };
+            let ctx = egui::Context::default();
+            configure_proton_theme(&ctx);
+            apply_proton_visuals(&ctx, false);
+            let mut h = Self { ctx, app, commands, last: None };
+            h.frames(3);
+            h
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1440.0, 900.0))),
+                events,
+                ..Default::default()
+            };
+            let app = &mut self.app;
+            self.last = Some(self.ctx.run(input, |ctx| app.render_ui(ctx)));
+        }
+
+        fn frames(&mut self, n: usize) {
+            for _ in 0..n {
+                self.frame(Vec::new());
+            }
+        }
+
+        /// A left click as the windowing system sends it: move there, press, release, each in its own frame.
+        fn click(&mut self, pos: egui::Pos2) {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            self.frame(vec![egui::Event::PointerMoved(pos)]);
+            self.frame(vec![button(true)]);
+            self.frame(vec![button(false)]);
+            self.frames(2);
+        }
+
+        /// Where the last frame painted exactly this text.
+        fn text_at(&self, text: &str) -> Option<egui::Pos2> {
+            fn find(shape: &egui::Shape, text: &str) -> Option<egui::Pos2> {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == text => Some(t.visual_bounding_rect().center()),
+                    egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, text)),
+                    _ => None,
+                }
+            }
+            self.last.as_ref()?.shapes.iter().find_map(|c| find(&c.shape, text))
+        }
+
+        /// Availability actions and folder changes asked of the worker since the last call.
+        fn sent(&self) -> Vec<String> {
+            self.commands
+                .try_iter()
+                .filter_map(|c| match c {
+                    WorkerCommand::SetAvailability { path, action } => Some(format!("{action} {path:?}")),
+                    WorkerCommand::LoadRemotePath(path) => Some(format!("open {path}")),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    /// Clicks Keep all with nothing open, to prove `pos` is where it reacts, then forgets what that did.
+    fn keep_all_reacts_at(h: &mut Harness, pos: egui::Pos2) {
+        h.sent();
+        h.click(pos);
+        let reacted = !h.sent().is_empty() || h.app.pending_confirm.is_some();
+        assert!(reacted, "Keep all did not react to a click at {pos:?}");
+        h.app.pending_confirm = None;
+        h.app.working.clear();
+        h.frames(2);
+    }
+
+    #[test]
+    fn clicking_outside_a_confirm_dialog_closes_it_and_clicks_nothing_under_it() {
+        let mut h = Harness::new("/my-files");
+        let keep_all = h.text_at("Keep all").expect("Keep all is painted");
+        keep_all_reacts_at(&mut h, keep_all);
+
+        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
+        h.frames(2);
+        h.click(keep_all);
+
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+        assert!(h.app.working.is_empty());
+    }
+
+    #[test]
+    fn clicking_outside_the_row_menu_closes_it_and_clicks_nothing_under_it() {
+        let mut h = Harness::new("/my-files");
+        let keep_all = h.text_at("Keep all").expect("Keep all is painted");
+        keep_all_reacts_at(&mut h, keep_all);
+        let open_menu = |h: &mut Harness| {
+            h.app.row_menu = Some(RowMenu {
+                name: "photo.jpg".into(),
+                rel_path: "photo.jpg".into(),
+                availability: Availability::OnlineOnly,
+                pos: egui::pos2(1000.0, 700.0),
+            });
+            h.frames(2);
+        };
+
+        open_menu(&mut h);
+        h.click(keep_all);
+        assert!(h.app.row_menu.is_none());
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+
+        // Nor does a click on another row open that folder
+        open_menu(&mut h);
+        let projects = h.text_at("Projects").expect("the Projects row is painted");
+        h.click(projects);
+        assert!(h.app.row_menu.is_none());
+        assert_eq!(h.sent(), Vec::<String>::new());
+        assert_eq!(h.app.remote_path, "/my-files");
+    }
+
+    #[test]
+    fn a_click_in_the_frame_a_confirm_dialog_appears_clicks_nothing_under_it() {
+        let mut h = Harness::new("/my-files");
+        let keep_all = h.text_at("Keep all").expect("Keep all is painted");
+        keep_all_reacts_at(&mut h, keep_all);
+
+        // No frame has drawn the backdrop yet when the click arrives
+        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
+        let button = |pressed| egui::Event::PointerButton {
+            pos: keep_all,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        h.frame(vec![button(true), button(false)]);
+        h.frames(2);
+
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn menu_entries_and_dialog_buttons_still_take_clicks() {
+        let mut h = Harness::new("/my-files");
+        h.app.row_menu = Some(RowMenu {
+            name: "photo.jpg".into(),
+            rel_path: "photo.jpg".into(),
+            availability: Availability::OnlineOnly,
+            pos: egui::pos2(1000.0, 700.0),
+        });
+        h.frames(2);
+        h.click(h.text_at("Always keep on this device").expect("the menu is painted"));
+        assert_eq!(h.sent(), vec![r#"pin "photo.jpg""#.to_string()]);
+        assert!(h.app.row_menu.is_none());
+
+        h.app.working.clear();
+        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
+        h.frames(2);
+        h.click(h.text_at("Cancel").expect("the dialog is painted"));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+
+        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
+        h.frames(2);
+        h.click(h.text_at("Free up space").expect("the dialog is painted"));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), vec![r#"free """#.to_string()]);
+    }
+
+    #[test]
+    fn keep_all_at_the_root_asks_first_and_in_a_subfolder_does_not() {
+        // The whole drive: confirmed first (ruling R19)
+        let mut h = Harness::new("/my-files");
+        h.click(h.text_at("Keep all").expect("Keep all is painted"));
+        assert!(h.app.pending_confirm.is_some());
+        assert_eq!(h.sent(), Vec::<String>::new());
+        h.click(h.text_at("Keep everything").expect("the dialog is painted"));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), vec![r#"pin """#.to_string()]);
+
+        let mut h = Harness::new("/my-files");
+        h.click(h.text_at("Keep all").expect("Keep all is painted"));
+        h.click(h.text_at("Cancel").expect("the dialog is painted"));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+
+        // A folder inside: at once, as before
+        let mut h = Harness::new("/my-files/Projects");
+        h.click(h.text_at("Keep all").expect("Keep all is painted"));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), vec![r#"pin "Projects""#.to_string()]);
+    }
+
+    #[test]
+    fn keep_all_confirmation_says_it_downloads_everything() {
+        let copy = confirm_copy(&PendingConfirm::KeepAll);
+        assert_eq!(copy.title, "Keep everything on this device?");
+        assert_eq!(copy.body, "This downloads everything in My files to this computer and keeps it updated.");
+        assert_eq!((copy.button, copy.action, copy.rel_path.as_str()), ("Keep everything", "pin", ""));
+        // The other dialogs keep their wording
+        let hide = confirm_copy(&PendingConfirm::Hide { name: "a".into(), rel_path: "x/a".into() });
+        assert_eq!((hide.title.as_str(), hide.action, hide.rel_path.as_str()), ("Hide \"a\" from this computer?", "hide", "x/a"));
+        let free = confirm_copy(&PendingConfirm::FreeAll { rel_path: String::new() });
+        assert_eq!((free.title.as_str(), free.action, free.rel_path.as_str()), ("Free up space in My files?", "free", ""));
+    }
+
+    #[test]
+    fn toolbar_buttons_are_wide_enough_for_their_labels() {
+        with_painter(|p| {
+            for (label, w) in [
+                ("Refresh", TOOLBAR_REFRESH_W),
+                ("+ New folder", TOOLBAR_NEW_FOLDER_W),
+                ("Keep all", TOOLBAR_KEEP_ALL_W),
+                ("Free up all", TOOLBAR_FREE_ALL_W),
+            ] {
+                let text_w = text_width(p, label, &FontId::proportional(13.0));
+                assert!(text_w + 20.0 <= w, "{label}: {text_w} in {w}");
+            }
         });
     }
 }

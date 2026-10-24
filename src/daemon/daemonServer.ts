@@ -13,8 +13,10 @@ import {
     PathType,
     THIRD_PARTY_DISCLOSURE,
 } from '../sdk';
+import { migrateExcludedFolders } from '../sync/availabilityMigration';
 import { ProtonDriveSyncEngine } from '../sync/syncEngine';
 import { SyncStateDatabase } from '../sync/syncStateDb';
+import { defaultControlSocketPath, startControlServer } from './controlServer';
 import { isTrustedLocalRequest } from './requestGuard';
 
 export const DEFAULT_DAEMON_PORT = Number(process.env.PROTON_DRIVE_DAEMON_PORT || 49152);
@@ -80,6 +82,11 @@ export async function startSyncDaemon(options: {
         runtime.logger,
     );
 
+    // Before the first sync with the availability policy, so what is synced today stays downloaded. A failure stops
+    // the start: syncing unmigrated would leave old Cloud only records that read as local deletions.
+    if ((await migrateExcludedFolders(stateDb, engine.availability, stateDbPath)) === 'migrated') {
+        runtime.logger.info('Migrated Cloud only folders to the availability policy');
+    }
     await engine.start({ backgroundInitialReconcile: true });
     ensureSystemTrayIndicator();
 
@@ -185,54 +192,31 @@ export async function startSyncDaemon(options: {
         return items;
     };
 
-    const buildFallbackFromStateDb = (remotePath: string): CachedRemoteItem[] => {
+    // What the remote index last saw in a My files folder, for answering before a live listing arrives
+    const buildFallbackFromIndex = (remotePath: string): CachedRemoteItem[] => {
+        if (remotePath !== '/my-files' && !remotePath.startsWith('/my-files/')) {
+            return [];
+        }
         const relDir = remotePath.replace(/^\/my-files\/?/, '').replace(/^\/+|\/+$/g, '');
-        const allItems = stateDb.getAllItems();
-        const excluded = stateDb.getSettings().excludedFolders;
-        const result = new Map<string, CachedRemoteItem>();
+        return engine.remoteIndex.listChildren(relDir).map((entry) => ({
+            uid: entry.uid,
+            name: entry.name,
+            type: entry.type,
+            size: entry.size,
+            modificationTime: entry.mtimeMs > 0 ? new Date(entry.mtimeMs).toISOString() : '',
+        }));
+    };
 
-        if (!relDir) {
-            for (const exName of excluded) {
-                result.set(exName, {
-                    uid: `excluded-${exName}`,
-                    name: exName,
-                    type: 'folder',
-                    size: 0,
-                    modificationTime: '',
-                });
-            }
+    // Availability is computed per response, never cached, so a cached listing still shows the current state
+    const withAvailability = (remotePath: string, items: CachedRemoteItem[]) => {
+        if (remotePath !== '/my-files' && !remotePath.startsWith('/my-files/')) {
+            return items;
         }
-
-        const prefix = relDir ? `${relDir}/` : '';
-        for (const item of allItems) {
-            if (relDir && !item.localRelPath.startsWith(prefix)) {
-                continue;
-            }
-            const rest = relDir ? item.localRelPath.slice(prefix.length) : item.localRelPath;
-            if (!rest) continue;
-            const slashIdx = rest.indexOf('/');
-            if (slashIdx === -1) {
-                result.set(rest, {
-                    uid: item.nodeUid,
-                    name: rest,
-                    type: item.type,
-                    size: item.size,
-                    modificationTime: item.localMtimeMs > 0 ? new Date(item.localMtimeMs).toISOString() : '',
-                });
-            } else {
-                const topChild = rest.slice(0, slashIdx);
-                if (!result.has(topChild)) {
-                    result.set(topChild, {
-                        uid: `folder-${topChild}`,
-                        name: topChild,
-                        type: 'folder',
-                        size: 0,
-                        modificationTime: item.localMtimeMs > 0 ? new Date(item.localMtimeMs).toISOString() : '',
-                    });
-                }
-            }
-        }
-        return Array.from(result.values());
+        const relDir = remotePath.replace(/^\/my-files\/?/, '').replace(/^\/+|\/+$/g, '');
+        return items.map((item) => ({
+            ...item,
+            availability: engine.availability.stateOf(relDir ? `${relDir}/${item.name}` : item.name),
+        }));
     };
 
     if (runtime.auth.isLoggedIn()) {
@@ -379,11 +363,6 @@ export async function startSyncDaemon(options: {
                     return Response.json({ ok: true });
                 }
 
-                if (req.method === 'GET' && pathname === '/api/selective-sync/folders') {
-                    const folders = await engine.listRemoteTopLevelFolders();
-                    return Response.json({ folders });
-                }
-
                 if (req.method === 'GET' && pathname === '/api/conflicts') {
                     const conflicts = stateDb.listConflicts(true);
                     return Response.json(conflicts);
@@ -406,23 +385,12 @@ export async function startSyncDaemon(options: {
                         body.syncDir = relocated;
                     }
                     const updated = stateDb.updateSettings(body);
-                    await engine.applySelectiveSyncExclusions();
-                    const newlyIncluded = prev.excludedFolders.filter(
-                        (f) => !updated.excludedFolders.includes(f),
-                    );
-                    if (newlyIncluded.length > 0) {
-                        engine.markFoldersSyncing(newlyIncluded);
-                        void engine.syncFoldersPriority(newlyIncluded).then(() => {
-                            void engine.reconcileNow();
-                        });
-                    } else if (
+                    if (
                         prev.syncDir !== updated.syncDir ||
-                        JSON.stringify(prev.excludedFolders) !== JSON.stringify(updated.excludedFolders) ||
                         JSON.stringify(prev.ignorePatterns) !== JSON.stringify(updated.ignorePatterns)
                     ) {
                         void engine.reconcileNow();
                     }
-                    // Re-read: Cloud only is refused for folders holding files that exist only on this computer
                     return Response.json({ ok: true, settings: stateDb.getSettings() });
                 }
 
@@ -438,10 +406,10 @@ export async function startSyncDaemon(options: {
                         if (Date.now() - cached.updatedAt > 15_000) {
                             void fetchRemotePathItems(remotePath).catch(() => {});
                         }
-                        return Response.json({ path: remotePath, items: cached.items });
+                        return Response.json({ path: remotePath, items: withAvailability(remotePath, cached.items) });
                     }
                     const livePromise = fetchRemotePathItems(remotePath);
-                    const fallbackItems = buildFallbackFromStateDb(remotePath);
+                    const fallbackItems = buildFallbackFromIndex(remotePath);
                     if (fallbackItems.length > 0 && !forceRefresh) {
                         const items = await Promise.race([
                             livePromise.catch(() => fallbackItems),
@@ -449,10 +417,10 @@ export async function startSyncDaemon(options: {
                                 setTimeout(() => resolve(fallbackItems), 900),
                             ),
                         ]);
-                        return Response.json({ path: remotePath, items });
+                        return Response.json({ path: remotePath, items: withAvailability(remotePath, items) });
                     }
                     const items = await livePromise;
-                    return Response.json({ path: remotePath, items });
+                    return Response.json({ path: remotePath, items: withAvailability(remotePath, items) });
                 }
 
                 if (req.method === 'POST' && pathname === '/api/remote/mkdir') {
@@ -507,9 +475,18 @@ export async function startSyncDaemon(options: {
         },
     });
 
+    // The only way to pin, free, hide or unhide: a user-only Unix socket, never the TCP API above
+    let controlServer: { stop(): void } | null = null;
+    try {
+        controlServer = await startControlServer({ socketPath: defaultControlSocketPath(), engine });
+    } catch (err) {
+        runtime.logger.error(`Control socket unavailable, availability actions are disabled: ${String(err)}`);
+    }
+
     const stop = async () => {
         clearInterval(reconcileTimer);
         server.stop();
+        controlServer?.stop();
         await engine.stop();
         stateDb.close();
         await runtime.dispose();

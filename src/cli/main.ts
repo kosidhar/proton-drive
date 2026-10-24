@@ -19,6 +19,8 @@ import {
     THIRD_PARTY_DISCLOSURE,
     uploadLocalFileToDrive,
 } from '../sdk';
+import { DAEMON_NOT_RUNNING_MESSAGE, runAvailabilityCommand } from './availabilityCommands';
+import { migrateExcludedFolders } from '../sync/availabilityMigration';
 import { formatBytes, ProtonDriveSyncEngine } from '../sync/syncEngine';
 import { SyncStateDatabase } from '../sync/syncStateDb';
 
@@ -33,6 +35,32 @@ async function isDaemonRunning(): Promise<boolean> {
     } catch {
         return false;
     }
+}
+
+/** The sync folder, as the running daemon reports it; null when the daemon isn't running. */
+async function daemonSyncDir(): Promise<string | null> {
+    if (!(await isDaemonRunning())) return null;
+    try {
+        const res = await fetch(`${DAEMON_BASE_URL}/api/status`);
+        const status = (await res.json()) as { syncDir?: string };
+        return status.syncDir ?? null;
+    } catch {
+        return null;
+    }
+}
+
+async function runAvailabilityCli(action: 'pin' | 'free' | 'hide' | 'unhide' | 'status', target: string | undefined): Promise<void> {
+    if (!target) {
+        console.error(`Usage: protondrive ${action} <path>`);
+        process.exit(1);
+    }
+    const syncDir = await daemonSyncDir();
+    if (syncDir === null) {
+        console.error(DAEMON_NOT_RUNNING_MESSAGE);
+        process.exit(2);
+    }
+    const code = await runAvailabilityCommand(action, target, syncDir);
+    if (code !== 0) process.exit(code);
 }
 
 async function createStandaloneRuntime(verbose = false) {
@@ -57,6 +85,11 @@ Daemon & Desktop GUI Commands:
   daemon                         Run two-way folder sync daemon & local control server
   gui                            Launch Native Desktop GUI window (starts daemon if needed)
   status [--json]                Show sync status, local folder, and synced file counts
+  status <path>                  Show whether a file or folder is kept, downloaded, online only or hidden
+  pin <path>                     Always keep a file or folder on this device
+  free <path>                    Free up space: make downloaded files online only
+  hide <path>                    Hide a file or folder from this computer
+  unhide <path>                  Unhide it (it becomes online only)
   sync                           Trigger an immediate two-way synchronization pass
   pause                          Pause background synchronization
   resume                         Resume background synchronization
@@ -69,9 +102,8 @@ Authentication Commands (OS Keyring / XDG Fallback):
 Conflict & Selective Sync Commands:
   conflicts                      List detected file conflicts
   conflicts resolve <id> <mode>  Resolve conflict (#id) with keep-both | keep-local | keep-remote
-  selective-sync list            List remote top-level folders and their inclusion status
-  selective-sync exclude <name>  Exclude a top-level remote folder from local sync
-  selective-sync include <name>  Re-include a top-level remote folder in local sync
+  selective-sync list            List top-level folders with their availability
+  selective-sync exclude|include Same as hide|unhide
 
 Direct Cloud File Commands (@protontech/drive-sdk):
   ls [remotePath]                List remote folder contents (default: /my-files)
@@ -150,6 +182,11 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
         process.on('SIGINT', shutdown);
         process.on('SIGTERM', shutdown);
         await new Promise(() => {});
+        return;
+    }
+
+    if (cmd === 'pin' || cmd === 'free' || cmd === 'hide' || cmd === 'unhide' || (cmd === 'status' && args[1])) {
+        await runAvailabilityCli(cmd, args[1]);
         return;
     }
 
@@ -238,7 +275,8 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
             if (!runtime.auth.isLoggedIn()) {
                 throw new Error('Not signed in. Run `proton-drive-ubuntu auth login` first.');
             }
-            const stateDb = new SyncStateDatabase(path.join(runtime.config.appDir, 'ubuntu-sync-state.sqlite'));
+            const stateDbPath = path.join(runtime.config.appDir, 'ubuntu-sync-state.sqlite');
+            const stateDb = new SyncStateDatabase(stateDbPath);
             const engine = new ProtonDriveSyncEngine(
                 runtime.sdk,
                 runtime.eventsManager,
@@ -246,6 +284,8 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
                 stateDb,
                 runtime.logger,
             );
+            // As the daemon does, in case this is the first sync since Cloud only folders were retired
+            await migrateExcludedFolders(stateDb, engine.availability, stateDbPath);
             console.log(`Syncing ${stateDb.getSettings().syncDir} with Proton Drive...`);
             await engine.reconcileNow();
             const stats = stateDb.getSummaryStats();
@@ -338,42 +378,29 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
 
     if (cmd === 'selective-sync') {
         const sub = args[1] || 'list';
-        const folderName = args[2];
-        const runtime = await createStandaloneRuntime(verboseFlag);
-        try {
-            const stateDb = new SyncStateDatabase(path.join(runtime.config.appDir, 'ubuntu-sync-state.sqlite'));
-            const settings = stateDb.getSettings();
-            const excluded = new Set(settings.excludedFolders);
-
-            if (sub === 'exclude' && folderName) {
-                excluded.add(folderName);
-                stateDb.updateSettings({ excludedFolders: Array.from(excluded) });
-                console.log(`Excluded '${folderName}' from local synchronization.`);
-            } else if (sub === 'include' && folderName) {
-                excluded.delete(folderName);
-                stateDb.updateSettings({ excludedFolders: Array.from(excluded) });
-                console.log(`Included '${folderName}' in local synchronization.`);
-            } else {
-                const engine = new ProtonDriveSyncEngine(
-                    runtime.sdk,
-                    runtime.eventsManager,
-                    runtime.auth,
-                    stateDb,
-                    runtime.logger,
-                );
-                const folders = await engine.listRemoteTopLevelFolders();
-                if (jsonFlag) {
-                    console.log(JSON.stringify({ folders, excludedFolders: Array.from(excluded) }, null, 2));
-                } else {
-                    console.log('Excluded Top-Level Folders:', Array.from(excluded).join(', ') || '(none)');
-                    for (const f of folders) {
-                        console.log(`  [${f.excluded ? 'EXCLUDED' : 'SYNCED'}] /my-files/${f.name}`);
-                    }
-                }
+        if (sub === 'exclude' || sub === 'include') {
+            await runAvailabilityCli(sub === 'exclude' ? 'hide' : 'unhide', args[2]);
+            return;
+        }
+        if (!(await isDaemonRunning())) {
+            console.error(DAEMON_NOT_RUNNING_MESSAGE);
+            process.exit(2);
+        }
+        const res = await fetch(`${DAEMON_BASE_URL}/api/remote/list?path=${encodeURIComponent('/my-files')}`);
+        if (!res.ok) {
+            throw new Error(`The daemon could not list your folders (HTTP ${res.status})`);
+        }
+        const listing = (await res.json()) as { items: Array<{ uid: string; name: string; type: string; availability?: string }> };
+        const folders = listing.items
+            .filter((item) => item.type === 'folder')
+            .map((item) => ({ name: item.name, uid: item.uid, availability: item.availability ?? 'online-only' }))
+            .sort((a, b) => a.name.localeCompare(b.name));
+        if (jsonFlag) {
+            console.log(JSON.stringify({ folders }, null, 2));
+        } else {
+            for (const folder of folders) {
+                console.log(`/my-files/${folder.name}  [${folder.availability}]`);
             }
-            stateDb.close();
-        } finally {
-            await runtime.dispose();
         }
         return;
     }

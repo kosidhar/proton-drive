@@ -8,18 +8,13 @@ export type LocalFileChangeEvent = {
     eventType: 'change' | 'rename';
 };
 
-export function matchesIgnorePatterns(relPath: string, patterns: string[], excludedTopFolders: string[]): boolean {
+export function matchesIgnorePatterns(relPath: string, patterns: string[]): boolean {
     const normalized = relPath.split(path.sep).join('/');
     if (!normalized || normalized === '.') {
         return false;
     }
 
     const segments = normalized.split('/');
-    const topFolder = segments[0]!;
-    if (excludedTopFolders.includes(topFolder)) {
-        return true;
-    }
-
     const baseName = segments[segments.length - 1]!;
     if (baseName.startsWith('.proton-drive-tmp-')) {
         return true;
@@ -55,7 +50,8 @@ export class LocalFolderWatcher {
 
     constructor(
         private readonly getRootDir: () => string,
-        private readonly getIgnoreConfig: () => { ignorePatterns: string[]; excludedFolders: string[] },
+        // Paths whose changes are never reported and whose folders are not watched (ignore patterns, hidden items)
+        private readonly shouldIgnore: (relPath: string) => boolean,
         private readonly onLocalChange: (event: LocalFileChangeEvent) => void | Promise<void>,
         private readonly debounceMs = 450,
     ) {}
@@ -119,8 +115,7 @@ export class LocalFolderWatcher {
         }
         const rootDir = this.getRootDir();
         const relDir = path.relative(rootDir, dirPath).split(path.sep).join('/');
-        const { ignorePatterns, excludedFolders } = this.getIgnoreConfig();
-        if (relDir && matchesIgnorePatterns(relDir, ignorePatterns, excludedFolders)) {
+        if (relDir && this.shouldIgnore(relDir)) {
             return;
         }
 
@@ -162,8 +157,7 @@ export class LocalFolderWatcher {
         }
         // Suppression and ignore rules only decide whether the change is reported. Keeping the watchers right has to
         // happen for every folder, including the ones the sync engine itself creates or deletes (it suppresses those).
-        const { ignorePatterns, excludedFolders } = this.getIgnoreConfig();
-        const reportable = !this.isSuppressed(relPath) && !matchesIgnorePatterns(relPath, ignorePatterns, excludedFolders);
+        const reportable = !this.isSuppressed(relPath) && !this.shouldIgnore(relPath);
         if (!reportable && eventType !== 'rename' && !this.watchers.has(fullPath)) {
             return;
         }

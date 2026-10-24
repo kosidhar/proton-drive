@@ -20,13 +20,13 @@ describe('LocalFolderWatcher', () => {
     let base: string;
     let root: string;
     let changes: string[];
-    let excluded: string[];
+    let hidden: string[];
     let watcher: LocalFolderWatcher;
 
     const start = async (debounceMs = 50) => {
         watcher = new LocalFolderWatcher(
             () => root,
-            () => ({ ignorePatterns: [], excludedFolders: excluded }),
+            (rel) => hidden.some((h) => rel === h || rel.startsWith(`${h}/`)),
             (event) => {
                 changes.push(event.relPath);
             },
@@ -42,7 +42,7 @@ describe('LocalFolderWatcher', () => {
         root = path.join(base, 'root');
         await mkdir(root);
         changes = [];
-        excluded = [];
+        hidden = [];
     });
 
     afterEach(async () => {
@@ -107,14 +107,14 @@ describe('LocalFolderWatcher', () => {
         expect(changes).not.toContain('P');
     });
 
-    test('watches a folder again after it was excluded, deleted and synced back', async () => {
+    test('watches a folder again after it was hidden, deleted and synced back', async () => {
         await mkdir(path.join(root, 'P'));
         await start();
 
-        excluded = ['P'];
+        hidden = ['P'];
         await rm(path.join(root, 'P'), { recursive: true });
         await Bun.sleep(150);
-        excluded = [];
+        hidden = [];
         watcher.suppressPath('P');
         watcher.suppressPath('P/sub');
         await mkdir(path.join(root, 'P/sub'), { recursive: true });
