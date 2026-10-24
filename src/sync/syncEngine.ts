@@ -44,6 +44,14 @@ export type EngineState = 'idle' | 'syncing' | 'paused' | 'unauthenticated' | 'e
 
 export type AvailabilityAction = 'pin' | 'free' | 'hide' | 'unhide';
 const AVAILABILITY_ACTIONS: readonly string[] = ['pin', 'free', 'hide', 'unhide'] satisfies AvailabilityAction[];
+// How often a sync pass also crawls the folders that are online-only here (see reconcilePasses)
+const ONLINE_ONLY_CRAWL_EVERY = 10;
+// A remote folder absent from this computer, found by a sync pass
+interface OnlineOnlyFolder {
+    node: NodeEntity;
+    relPath: string;
+}
+
 export interface AvailabilityResult {
     state: ItemAvailability;
     // What Free up space left on this computer (things not in Proton Drive yet, or the folders holding them)
@@ -63,6 +71,11 @@ export class ProtonDriveSyncEngine {
     private unsubscribeDriveEvents: (() => void) | null = null;
     private reconcileRunning = false;
     private reconcileQueued = false;
+    // Full sync passes since start(). Folders that aren't on this computer are listed for the remote index only on
+    // some passes (ruling R17): the first after start, one after a TreeRefresh or FastForward event, and every
+    // ONLINE_ONLY_CRAWL_EVERY-th pass. Between them, change events re-list just the folder they happen in.
+    private reconcilePasses = 0;
+    private onlineOnlyCrawlDue = true;
     private syncingFolders = new Set<string>();
     private localQueue = new Map<string, Promise<void>>();
     // Availability changes (setAvailability, and finishing pending hides) run one at a time on this chain, and local
@@ -130,6 +143,8 @@ export class ProtonDriveSyncEngine {
     async start(options: { backgroundInitialReconcile?: boolean } = {}): Promise<void> {
         const settings = this.stateDb.getSettings();
         await mkdir(settings.syncDir, { recursive: true });
+        this.reconcilePasses = 0;
+        this.onlineOnlyCrawlDue = true;
 
         if (!this.auth.isLoggedIn()) {
             this.state = 'unauthenticated';
@@ -305,6 +320,10 @@ export class ProtonDriveSyncEngine {
         this.state = 'syncing';
         this.currentAction = 'Starting sync...';
         this.lastError = null;
+        this.reconcilePasses += 1;
+        // Taken now, so a crawl asked for while this pass runs is left to the next one
+        const crawl = this.onlineOnlyCrawlDue || this.reconcilePasses % ONLINE_ONLY_CRAWL_EVERY === 0;
+        this.onlineOnlyCrawlDue = false;
 
         try {
             await mkdir(settings.syncDir, { recursive: true });
@@ -322,11 +341,16 @@ export class ProtonDriveSyncEngine {
             // Sync folder-by-folder incrementally so files & folders appear in ~/ProtonDrive
             // and in the GUI dashboard immediately instead of waiting for a full tree scan.
             const remoteMap = new Map<string, NodeEntity>();
+            const onlineOnly: OnlineOnlyFolder[] = [];
             await this.observingLocal((since) =>
-                this.reconcileDirectoryIncremental(root, '', remoteMap, this.stateDb.getSettings(), since),
+                this.reconcileDirectoryIncremental(root, '', remoteMap, this.stateDb.getSettings(), since, onlineOnly),
             );
             // Hides that were waiting for uploads finish once those are done
             await this.completePendingHides();
+            // Last, so nothing on this computer waits behind it
+            if (crawl) {
+                await this.crawlOnlineOnly(onlineOnly);
+            }
 
             this.lastSyncAt = Date.now();
             if (this.syncingFolders.size === 0) {
@@ -334,6 +358,9 @@ export class ProtonDriveSyncEngine {
                 this.state = this.stateDb.getSettings().paused ? 'paused' : 'idle';
             }
         } catch (error: unknown) {
+            if (crawl) {
+                this.onlineOnlyCrawlDue = true; // The next pass crawls instead
+            }
             const msg = error instanceof Error ? error.message : String(error);
             this.lastError = msg;
             this.currentAction = null;
@@ -1185,6 +1212,9 @@ export class ProtonDriveSyncEngine {
             event.type === DriveEventType.FastForward ||
             event.type === DriveEventType.SharedWithMeUpdated
         ) {
+            if (event.type !== DriveEventType.SharedWithMeUpdated) {
+                this.onlineOnlyCrawlDue = true; // Changes may have been missed anywhere, online-only folders included
+            }
             await this.reconcileNow();
             return;
         }
@@ -1224,8 +1254,44 @@ export class ProtonDriveSyncEngine {
                 return;
             }
 
+            if (event.parentNodeUid) {
+                await this.indexChangeInOnlineOnlyFolder(event.parentNodeUid);
+            }
             // Trigger incremental reconcile
             await this.reconcileNow();
+        }
+    }
+
+    // The sync pass lists only the folders on this computer, and the crawl of the others runs only now and then, so a
+    // change inside a folder that isn't here re-lists just that folder for the index: an item added in the cloud can
+    // then be pinned at once. Hidden folders are never listed.
+    private async indexChangeInOnlineOnlyFolder(parentUid: string): Promise<void> {
+        const parent = this.index.getByUid(parentUid);
+        if (
+            !parent ||
+            parent.relPath === '' ||
+            parent.type !== 'folder' ||
+            this.policy.hiddenBy(parent.relPath)?.hide === 'hidden' ||
+            (await this.existsLocally(parent.relPath))
+        ) {
+            return;
+        }
+        try {
+            const node = await this.sdk.getNode(parentUid);
+            this.recordListing(node, parent.relPath, await listFolderChildren(this.sdk, node));
+        } catch (error: unknown) {
+            this.logger.warn(`Could not list ${parent.relPath} for the remote index: ${error}`);
+        }
+    }
+
+    // Records the subtrees of folders found online-only during a pass, one after another.
+    private async crawlOnlineOnly(folders: OnlineOnlyFolder[]): Promise<void> {
+        for (const folder of folders) {
+            if (this.stateDb.getSettings().paused) {
+                return;
+            }
+            this.currentAction = `Listing /my-files/${folder.relPath}`;
+            await this.indexRemoteSubtree(folder.node, folder.relPath);
         }
     }
 
@@ -1374,6 +1440,7 @@ export class ProtonDriveSyncEngine {
                 ? { isDirectory: st.isDirectory(), size: st.isDirectory() ? 0 : st.size, mtimeMs: st.mtimeMs }
                 : undefined;
             const remoteMap = new Map<string, NodeEntity>([[relPath, node]]);
+            const onlineOnly: OnlineOnlyFolder[] = [];
             this.currentAction = `Syncing ${relPath}`;
             await this.observingLocal(async (since) => {
                 await this.reconcileSinglePath(
@@ -1390,9 +1457,11 @@ export class ProtonDriveSyncEngine {
                     () => false,
                 );
                 if (node.type === NodeType.Folder && isLocalFolder) {
-                    await this.reconcileDirectoryIncremental(node, relPath, remoteMap, settings, since);
+                    await this.reconcileDirectoryIncremental(node, relPath, remoteMap, settings, since, onlineOnly);
                 }
             });
+            // A pin always reads its own subtree in full
+            await this.crawlOnlineOnly(onlineOnly);
         } catch (error: unknown) {
             this.logger.warn(`Could not download ${relPath} now; the next sync tries again: ${error}`);
         } finally {
@@ -1701,12 +1770,15 @@ export class ProtonDriveSyncEngine {
         return complete;
     }
 
+    // Syncs a folder that is on this computer and, depth first, its subfolders that are too. Remote folders that aren't
+    // here are added to `onlineOnly`, for the caller to crawl (or not) once the whole local pass is done.
     private async reconcileDirectoryIncremental(
         folderNode: NodeEntity,
         prefix: string,
         remoteMap: Map<string, NodeEntity>,
         _initialSettings: SyncSettings,
         since: number,
+        onlineOnly: OnlineOnlyFolder[],
     ): Promise<void> {
         const liveSettings = this.stateDb.getSettings();
         if (liveSettings.paused) {
@@ -1806,7 +1878,7 @@ export class ProtonDriveSyncEngine {
             if (resolvedFolderNode && resolvedFolderNode.type === NodeType.Folder && localStillExists) {
                 subFoldersToRecurse.push({ node: resolvedFolderNode, relPath });
             } else if (resolvedFolderNode && resolvedFolderNode.type === NodeType.Folder) {
-                await this.indexRemoteSubtree(resolvedFolderNode, relPath);
+                onlineOnly.push({ node: resolvedFolderNode, relPath });
             }
         }
 
@@ -1821,7 +1893,7 @@ export class ProtonDriveSyncEngine {
             ) {
                 continue;
             }
-            await this.reconcileDirectoryIncremental(sub.node, sub.relPath, remoteMap, nextSettings, since);
+            await this.reconcileDirectoryIncremental(sub.node, sub.relPath, remoteMap, nextSettings, since, onlineOnly);
         }
     }
 }

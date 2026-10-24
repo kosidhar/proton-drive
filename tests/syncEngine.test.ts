@@ -384,7 +384,9 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(await files.exists('Other')).toBe(false);
             expect(calls.downloads).toEqual(['Docs/new.txt']);
             expect(engine.remoteIndex.getByPath('Other')).not.toBeNull();
-            expect(engine.remoteIndex.getByPath('Other/x.txt')).not.toBeNull();
+            // What is inside an online-only folder reaches the index on the next crawl, not on every pass (see
+            // 'online-only crawl')
+            expect(engine.remoteIndex.getByPath('Other/x.txt')).toBeNull();
         });
 
         test('pinning a deep folder creates online-only ancestors but not siblings', async () => {
@@ -729,6 +731,113 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
             expect(calls.trashed).toEqual([['vol~Done']]);
             expect(nodes.has('vol~Done/sub/b.txt')).toBe(false);
+        });
+    });
+
+    // Folders absent here are listed for the index only now and then (ruling R17), and after the local pass
+    describe('online-only crawl', () => {
+        // Stopped even when a test fails, so no watcher outlives the database
+        const engines: ProtonDriveSyncEngine[] = [];
+        afterEach(async () => {
+            while (engines.length) await engines.pop()!.stop();
+        });
+        const setup = () => {
+            const drive = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger);
+            engines.push(engine);
+            // Every listing and download, in order, by path ('' is the root)
+            const log: string[] = [];
+            const pathOfUid = (uid: string) => (uid === drive.root.uid ? '' : uid.replace(/^vol~/, ''));
+            const iterate = (drive.sdk as any).iterateFolderChildren;
+            (drive.sdk as any).iterateFolderChildren = (parent: NodeEntity | string) => {
+                log.push(`list:${pathOfUid(typeof parent === 'string' ? parent : parent.uid)}`);
+                return iterate(parent);
+            };
+            const downloader = drive.sdk.getFileRevisionDownloader.bind(drive.sdk);
+            (drive.sdk as any).getFileRevisionDownloader = async (revisionUid: string) => {
+                log.push(`download:${pathOfUid(revisionUid.replace(/~rev\d+$/, ''))}`);
+                return downloader(revisionUid);
+            };
+            const listings = () => log.filter((entry) => entry.startsWith('list:')).map((entry) => entry.slice(5));
+            return { ...drive, engine, log, listings };
+        };
+
+        test('online-only folders are crawled on the first pass, not on passes 2 to 9, and again on the 10th', async () => {
+            const { engine, add, log, listings } = setup();
+            const docs = add('Docs');
+            engine.availability.setPin(docs.uid, 'pinned', false);
+            add('Other/Deep/x.txt', 'x');
+
+            await engine.reconcileNow(); // pass 1
+            expect(listings()).toEqual(expect.arrayContaining(['', 'Docs', 'Other', 'Other/Deep']));
+            expect(engine.remoteIndex.getByPath('Other/Deep/x.txt')).not.toBeNull();
+
+            add('Other/Deep/y.txt', 'y');
+            for (let pass = 2; pass <= 9; pass++) {
+                log.length = 0;
+                await engine.reconcileNow();
+                expect({ pass, listed: listings().sort() }).toEqual({ pass, listed: ['', 'Docs'] });
+            }
+            expect(engine.remoteIndex.getByPath('Other/Deep/y.txt')).toBeNull();
+
+            log.length = 0;
+            await engine.reconcileNow(); // pass 10
+            expect(listings()).toEqual(expect.arrayContaining(['Other', 'Other/Deep']));
+            expect(engine.remoteIndex.getByPath('Other/Deep/y.txt')).not.toBeNull();
+        });
+
+        for (const type of [DriveEventType.TreeRefresh, DriveEventType.FastForward] as const) {
+            test(`a ${type} event forces a crawl of online-only folders`, async () => {
+                const { engine, add, log, listings, fire } = setup();
+                add('Other/x.txt', 'x');
+                await engine.start(); // pass 1 crawls
+                await engine.reconcileNow(); // pass 2 doesn't
+                add('Other/new.txt', 'new');
+                log.length = 0;
+                await engine.reconcileNow(); // nor does pass 3
+                expect(listings()).toEqual(['']);
+                expect(engine.remoteIndex.getByPath('Other/new.txt')).toBeNull();
+
+                log.length = 0;
+                await fire({ type, treeEventScopeId: 'scope-main', eventId: 'evt-r17' } as DriveEvent);
+
+                expect(listings()).toEqual(['', 'Other']);
+                expect(engine.remoteIndex.getByPath('Other/new.txt')).not.toBeNull();
+            });
+        }
+
+        test('a pinned folder is synced, and a new file in it downloaded, before online-only folders are crawled', async () => {
+            const { engine, add, log } = setup();
+            add('Archive/Old/x.txt', 'x'); // online-only, and listed before Docs among the root's children
+            const docs = add('Docs');
+            engine.availability.setPin(docs.uid, 'pinned', false);
+            add('Docs/new.txt', 'new');
+
+            await engine.reconcileNow(); // the first pass crawls
+
+            expect(log).toEqual(['list:', 'list:Docs', 'download:Docs/new.txt', 'list:Archive', 'list:Archive/Old']);
+        });
+
+        test('a change event inside an online-only folder updates the index without waiting for the crawl', async () => {
+            const { engine, add, listings, log, fire } = setup();
+            add('Other/Deep/x.txt', 'x');
+            await engine.start(); // pass 1 crawls
+            const created = add('Other/Deep/new.txt', 'new');
+            log.length = 0;
+
+            await fire({
+                type: DriveEventType.NodeCreated,
+                nodeUid: created.uid,
+                parentNodeUid: 'vol~Other/Deep',
+                isTrashed: false,
+                isShared: false,
+                treeEventScopeId: 'scope-main',
+                eventId: 'evt-created',
+            });
+
+            expect(engine.remoteIndex.getByPath('Other/Deep/new.txt')).not.toBeNull();
+            // Just that folder, not a crawl of the rest
+            expect(listings().sort()).toEqual(['', 'Other/Deep']);
         });
     });
 
