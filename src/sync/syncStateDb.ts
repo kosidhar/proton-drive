@@ -2,6 +2,8 @@ import { Database } from 'bun:sqlite';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
+import { selfOrDescendant, selfOrDescendantWhere } from './pathRange';
+
 export type ItemSyncStatus = 'synced' | 'uploading' | 'downloading' | 'conflict' | 'error' | 'ignored';
 export type ConflictStrategy = 'keep-both' | 'keep-local' | 'keep-remote' | 'prompt';
 
@@ -66,16 +68,13 @@ export const DEFAULT_IGNORE_PATTERNS = [
     '.Trash-*',
 ];
 
-// A path or anything under it. A range rather than LIKE, which ignores case and treats '_' as a wildcard, so
-// 'Photos/%' would also match 'photos/...'; '0' is the character after '/'. It can also use the primary key index.
-const SELF_OR_DESCENDANT = 'localRelPath = $path OR (localRelPath >= $lo AND localRelPath < $hi)';
-
-function selfOrDescendant(localRelPath: string) {
-    return { $path: localRelPath, $lo: `${localRelPath}/`, $hi: `${localRelPath}0` };
-}
-
 export class SyncStateDatabase {
     private db: Database;
+
+    // For modules that keep their own tables in this database file, such as RemoteIndex.
+    get connection(): Database {
+        return this.db;
+    }
 
     constructor(dbFilePath: string) {
         this.db = new Database(dbFilePath, { create: true });
@@ -236,13 +235,13 @@ export class SyncStateDatabase {
     }
 
     removeItemByPath(localRelPath: string): void {
-        this.db.query(`DELETE FROM synced_items WHERE ${SELF_OR_DESCENDANT}`).run(selfOrDescendant(localRelPath));
+        this.db.query(`DELETE FROM synced_items WHERE ${selfOrDescendantWhere('localRelPath')}`).run(selfOrDescendant(localRelPath));
     }
 
     hasItemsUnder(localRelPath: string): boolean {
         return (
             this.db
-                .query(`SELECT 1 FROM synced_items WHERE ${SELF_OR_DESCENDANT} LIMIT 1`)
+                .query(`SELECT 1 FROM synced_items WHERE ${selfOrDescendantWhere('localRelPath')} LIMIT 1`)
                 .get(selfOrDescendant(localRelPath)) !== null
         );
     }

@@ -7,11 +7,9 @@ import path from 'node:path';
 import {
     type DriveEvent,
     DriveEventType,
-    MemberRole,
     type NodeEntity,
     NodeType,
     type ProtonDriveClient,
-    RevisionState,
 } from '@protontech/drive-sdk';
 
 import type { Manager as EventsManager } from '../src/sdk/events/manager';
@@ -20,43 +18,7 @@ import { createLocalConflictCopy, formatConflictFileName } from '../src/sync/con
 import { matchesIgnorePatterns } from '../src/sync/localWatcher';
 import { ProtonDriveSyncEngine } from '../src/sync/syncEngine';
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
-
-function makeMockNode(overrides: Partial<NodeEntity> & { uid: string; nameStr: string; type: NodeType; sha1?: string; content?: string }): NodeEntity {
-    const now = new Date();
-    const contentBytes = Buffer.from(overrides.content ?? '');
-    return {
-        parentUid: 'vol~root',
-        name: { ok: true, value: overrides.nameStr },
-        keyAuthor: { ok: true, value: 'user@proton.me' },
-        nameAuthor: { ok: true, value: 'user@proton.me' },
-        directRole: MemberRole.Admin,
-        ownedBy: { email: 'user@proton.me' },
-        mediaType: overrides.type === NodeType.File ? 'text/plain' : undefined,
-        isShared: false,
-        isSharedByUrl: false,
-        creationTime: now,
-        modificationTime: now,
-        treeEventScopeId: 'scope-main',
-        activeRevision:
-            overrides.type === NodeType.File
-                ? {
-                      uid: `${overrides.uid}~rev1`,
-                      state: RevisionState.Active,
-                      creationTime: now,
-                      contentAuthor: { ok: true, value: 'user@proton.me' },
-                      storageSize: contentBytes.length,
-                      isImported: false,
-                      claimedSize: contentBytes.length,
-                      claimedModificationTime: now,
-                      claimedDigests: {
-                          sha1: overrides.sha1 ?? new Bun.CryptoHasher('sha1').update(contentBytes).digest('hex'),
-                          sha1Verified: true,
-                      },
-                  }
-                : undefined,
-        ...overrides,
-    };
-}
+import { makeMockNode } from './helpers/mockNodes';
 
 describe('Proton Drive Ubuntu Sync Suite', () => {
     let tempDir: string;
