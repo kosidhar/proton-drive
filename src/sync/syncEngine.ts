@@ -826,10 +826,26 @@ export class ProtonDriveSyncEngine {
     // the folder is left online-only.
     private async trashForDeletedLocal(relPath: string, remoteNode: NodeEntity): Promise<void> {
         if (remoteNode.type !== NodeType.Folder) {
-            // Checked here too, as callers may have waited on the network since: the record is still there and the
-            // file still missing
-            if (this.stateDb.getItemByPath(relPath) && !(await this.existsLocally(relPath))) {
+            // Only the node the record points at may be trashed: the listing is by name, so what it shows can be a
+            // replacement (a Proton Doc, or a new upload) that never was on this computer
+            const recordedUid = this.stateDb.getItemByPath(relPath)?.nodeUid;
+            const recorded =
+                recordedUid && recordedUid !== remoteNode.uid
+                    ? await this.sdk.getNode(recordedUid).catch(() => null)
+                    : null;
+            // Checked last, as callers may have waited on the network since: the record is still there and the file
+            // still missing
+            const record = this.stateDb.getItemByPath(relPath);
+            if (!record || (await this.existsLocally(relPath))) {
+                return;
+            }
+            if (record.nodeUid === remoteNode.uid) {
                 await this.trashRemoteNodeForDeletedLocal(relPath, remoteNode);
+            } else if (recorded && !recorded.trashTime && recorded.uid === record.nodeUid) {
+                await this.trashRemoteNodeForDeletedLocal(relPath, recorded);
+            } else if (record.nodeUid === recordedUid) {
+                // The recorded node is gone or already trashed: the replacement shows up as a new item next pass
+                this.stateDb.removeItemByPath(relPath);
             }
             return;
         }

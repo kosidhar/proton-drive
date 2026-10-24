@@ -527,6 +527,46 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(files.recordCount('Photos')).toBe(0);
         });
 
+        test('deleting a file that was replaced in the cloud by another of the same name trashes nothing when the recorded one is gone', async () => {
+            const { engine, add, root, nodes, calls, files } = setup();
+            add('Report', 'v1');
+            engine.availability.setPin(root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            await rm(local('Report'));
+            // The recorded file is still in the cloud, but a Proton Doc of the same name now sits beside it
+            const doc = makeMockNode({ uid: 'vol~ReportDoc', parentUid: root.uid, nameStr: 'Report', type: NodeType.File, content: 'doc' });
+            Object.assign(doc, { mediaType: 'application/vnd.proton.doc' });
+            nodes.delete('vol~Report');
+            nodes.set(doc.uid, doc);
+
+            await engine.reconcileNow();
+
+            expect(calls.trashed).toEqual([]);
+            expect(nodes.has(doc.uid)).toBe(true);
+            expect(files.recordCount('Report')).toBe(0);
+        });
+
+        test('deleting a file replaced by a new upload trashes the recorded file when it is still there', async () => {
+            const { engine, add, root, nodes, calls, files } = setup();
+            add('Report', 'v1');
+            engine.availability.setPin(root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            await rm(local('Report'));
+            // Listed by name: only the newer upload; the recorded node is still reachable by its uid
+            const newer = makeMockNode({ uid: 'vol~newer', parentUid: root.uid, nameStr: 'Report', type: NodeType.File, content: 'v2' });
+            const old = nodes.get('vol~Report')!;
+            nodes.set(newer.uid, newer);
+            const realGet = (engine as any).sdk.getNode;
+            (engine as any).sdk.getNode = async (uid: string) => (uid === 'vol~Report' ? old : realGet(uid));
+            nodes.delete('vol~Report');
+
+            await engine.reconcileNow();
+
+            expect(calls.trashed).toEqual([['vol~Report']]);
+            expect(nodes.has(newer.uid)).toBe(true);
+            expect(files.recordCount('Report')).toBe(0);
+        });
+
         test('a deleted folder is not trashed while its cloud contents cannot all be listed', async () => {
             const { engine, calls, failListing, warnings, files } = await partlyDownloaded();
             failListing.add('vol~Photos');
