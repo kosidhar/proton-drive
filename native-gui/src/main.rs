@@ -359,11 +359,11 @@ struct AvailabilityResult {
 /// The kept things themselves: not the folders holding them, and not the engine's own downloads in progress
 /// (the daemon's own notification applies the same filter).
 fn kept_leaves(kept: &[String]) -> Vec<String> {
-    let is_temp = |p: &str| p.split('/').any(|c| c.starts_with(".proton-drive-tmp-"));
-    let real: Vec<&String> = kept.iter().filter(|p| !is_temp(p)).collect();
-    real.iter()
-        .filter(|p| !real.iter().any(|q| q.strip_prefix(p.as_str()).is_some_and(|rest| rest.starts_with('/'))))
-        .map(|p| (*p).clone())
+    // Containment is judged against the full list, temp files included, as the daemon does
+    kept.iter()
+        .filter(|p| !kept.iter().any(|q| q.strip_prefix(p.as_str()).is_some_and(|rest| rest.starts_with('/'))))
+        .filter(|p| !p.rsplit('/').next().unwrap_or("").starts_with(".proton-drive-tmp-"))
+        .cloned()
         .collect()
 }
 
@@ -4946,7 +4946,11 @@ mod tests {
         // Siblings that merely share a name prefix are both kept
         let kept: Vec<String> = ["a/b", "a/bc"].iter().map(|s| s.to_string()).collect();
         assert_eq!(kept_leaves(&kept), kept);
-        assert!(kept_leaves(&["x/.proton-drive-tmp-9".to_string()]).is_empty());
+        // A folder whose only kept content is an in-progress download is not a leaf either
+        let kept: Vec<String> = ["Projects/.proton-drive-tmp-1", "Projects"].iter().map(|s| s.to_string()).collect();
+        assert!(kept_leaves(&kept).is_empty());
+        let kept: Vec<String> = ["Projects/.proton-drive-tmp-123-456-a.pdf", "Projects"].iter().map(|s| s.to_string()).collect();
+        assert!(kept_leaves(&kept).is_empty());
     }
 
     #[test]
@@ -4960,7 +4964,7 @@ mod tests {
             availability_notice(&r).as_deref(),
             Some("1 item stays on this computer because it isn't safely in Proton Drive: Projects/app/.git")
         );
-        let only_temp = AvailabilityResult { state: "x".into(), kept: vec!["a/.proton-drive-tmp-1".into()], refused: None };
+        let only_temp = AvailabilityResult { state: "x".into(), kept: vec!["a/.proton-drive-tmp-1".into(), "a".into()], refused: None };
         assert_eq!(availability_notice(&only_temp), None);
     }
 
