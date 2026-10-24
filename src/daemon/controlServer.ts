@@ -21,7 +21,7 @@ export function defaultControlSocketPath(): string {
 
 export interface ControlServerOptions {
     socketPath: string;
-    engine: Pick<ProtonDriveSyncEngine, 'setAvailability' | 'availability'>;
+    engine: Pick<ProtonDriveSyncEngine, 'setAvailability' | 'availabilityOf'>;
 }
 
 // 'live' when something accepts connections on the socket, 'stale' when it refuses or is gone
@@ -82,7 +82,11 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
             if (req.method === 'GET') {
                 const relPath = url.searchParams.get('path');
                 if (relPath === null) return jsonError('Missing path');
-                return Response.json({ path: relPath, state: engine.availability.stateOf(relPath) });
+                try {
+                    return Response.json({ path: relPath, state: await engine.availabilityOf(relPath) });
+                } catch (err) {
+                    return jsonError(err instanceof Error ? err.message : String(err)); // Not in Proton Drive: <path>
+                }
             }
             if (req.method === 'POST') {
                 let body: { path?: unknown; action?: unknown };

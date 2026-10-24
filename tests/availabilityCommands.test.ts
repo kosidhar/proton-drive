@@ -76,7 +76,10 @@ async function fakeDaemon(result: AvailabilityResult) {
             calls.push([relPath, action]);
             return result;
         },
-        availability: { stateOf: () => 'pinned' as const },
+        async availabilityOf(relPath: string) {
+            if (relPath === 'typo.txt') throw new Error(`Not in Proton Drive: ${relPath}`);
+            return 'pinned' as const;
+        },
     };
     const socketPath = path.join(root, 'd', 'control.sock');
     const server = await startControlServer({ socketPath, engine: engine as never });
@@ -124,6 +127,14 @@ describe('runAvailabilityCommand', () => {
         const { out } = capture();
         expect(await runAvailabilityCommand('status', 'Docs', SYNC, socketPath)).toBe(0);
         expect(out.join('\n')).toContain('pinned');
+    });
+
+    test('status of a path that is not in Proton Drive says so and exits 1', async () => {
+        const { socketPath } = await fakeDaemon({ state: 'pinned', kept: [], refused: null });
+        const { out, err } = capture();
+        expect(await runAvailabilityCommand('status', 'typo.txt', SYNC, socketPath)).toBe(1);
+        expect(err.join('\n')).toContain('Not in Proton Drive: typo.txt');
+        expect(out.join('\n')).not.toContain('pinned');
     });
 
     test('exits 2 with the not-running message when there is no socket', async () => {

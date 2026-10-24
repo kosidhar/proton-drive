@@ -20,7 +20,12 @@ function makeFake(rejectWith?: string) {
             if (rejectWith) throw new Error(rejectWith);
             return { state: action === 'free' ? 'online-only' : 'pinned', kept: ['a.txt'], refused: null };
         },
+        // The nearest indexed ancestor's state, for any path (what GET answered before it checked the path exists)
         availability: { stateOf: (relPath: string) => (relPath === 'Docs' ? ('pinned' as const) : ('online-only' as const)) },
+        async availabilityOf(relPath: string) {
+            if (relPath === 'typo.txt') throw new Error(`Not in Proton Drive: ${relPath}`);
+            return relPath === 'Docs' ? ('pinned' as const) : ('online-only' as const);
+        },
     };
     return engine;
 }
@@ -53,6 +58,13 @@ describe('control socket', () => {
         const { socketPath } = await start();
         const res = await call(socketPath, '/availability?path=Docs');
         expect(await res.json()).toEqual({ path: 'Docs', state: 'pinned' });
+    });
+
+    test('GET /availability on a path that is not in Proton Drive is 400', async () => {
+        const { socketPath } = await start();
+        const res = await call(socketPath, '/availability?path=typo.txt');
+        expect(res.status).toBe(400);
+        expect(await res.json()).toEqual({ error: 'Not in Proton Drive: typo.txt' });
     });
 
     test('socket is user-only', async () => {

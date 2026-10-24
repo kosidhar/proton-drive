@@ -875,6 +875,30 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(unknown).toBe('Unknown availability action: delete');
         });
 
+        test('the state of a path the cloud holds, or of a new local item through its folder, and never of a missing path', async () => {
+            const { engine, add, files } = setup();
+            const docs = add('Docs');
+            add('Docs/a.txt', 'a');
+            add('Other/b.txt', 'b');
+            engine.availability.setPin(docs.uid, 'pinned', false);
+            await engine.reconcileNow();
+            await files.writeLocal('Docs/new.txt', 'not uploaded yet'); // on disk, not in the index (ruling R3)
+            const stateOf = (relPath: string) =>
+                engine.availabilityOf(relPath).then(
+                    (state) => state,
+                    (e: Error) => e.message,
+                );
+
+            expect(await stateOf('Docs')).toBe('pinned');
+            expect(await stateOf('Other/b.txt')).toBe('online-only');
+            expect(await stateOf('Docs/new.txt')).toBe('pinned');
+            expect(await stateOf('')).toBe('online-only');
+            expect(await stateOf('typo.txt')).toBe('Not in Proton Drive: typo.txt');
+            expect(await stateOf('Docs/typo.txt')).toBe('Not in Proton Drive: Docs/typo.txt');
+            // The state database sits next to the sync folder: a path climbing out of it is not in Proton Drive
+            expect(await stateOf('../state.sqlite')).toBe('Not in Proton Drive: ../state.sqlite');
+        });
+
         test('hide and unhide do not apply to the whole drive, and asking for them does not stop a free of it', async () => {
             const { engine, files } = await downloaded({ 'a.txt': 'a', 'b.txt': 'b', 'c.txt': 'c' }, 'vol~root');
             const refusals: Array<Promise<string | null>> = [];

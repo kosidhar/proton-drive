@@ -1352,6 +1352,30 @@ export class ProtonDriveSyncEngine {
         return this.availabilityResult(relPath);
     }
 
+    // The availability of an item of My files by its path, for `status <path>`. A path the remote index doesn't hold
+    // resolves through its nearest indexed folder only while it exists on this computer (new local items aren't indexed
+    // until they are uploaded, ruling R3); otherwise this rejects with `Not in Proton Drive: <path>`.
+    async availabilityOf(relPath: string): Promise<ItemAvailability> {
+        if (!this.index.getByPath(relPath) && !(await this.existsInSyncFolder(relPath))) {
+            throw new Error(`Not in Proton Drive: ${relPath}`);
+        }
+        return this.policy.stateOf(relPath);
+    }
+
+    // Like existsLocally, for a path from outside the engine: one that climbs out of the sync folder is not in it.
+    private async existsInSyncFolder(relPath: string): Promise<boolean> {
+        const syncDir = path.resolve(this.stateDb.getSettings().syncDir);
+        const fullPath = path.resolve(syncDir, relPath);
+        const fromRoot = path.relative(syncDir, fullPath);
+        if (fromRoot === '..' || fromRoot.startsWith(`..${path.sep}`) || path.isAbsolute(fromRoot)) {
+            return false;
+        }
+        return lstat(fullPath).then(
+            () => true,
+            () => false,
+        );
+    }
+
     private askAvailability(uid: string | undefined): { uid: string; n: number } | null {
         if (!uid) {
             return null;
