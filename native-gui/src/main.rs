@@ -205,8 +205,6 @@ struct SyncSettings {
     notifications_enabled: bool,
     reconcile_interval_sec: u64,
     paused: bool,
-    #[serde(default)]
-    excluded_folders: Vec<String>,
     ignore_patterns: Vec<String>,
 }
 
@@ -271,6 +269,54 @@ struct RemoteItem {
     size: u64,
     #[allow(dead_code)]
     modification_time: String,
+    /// One of pinned, downloaded, online-only, hidden or hiding; older daemons omit it.
+    #[serde(default)]
+    availability: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Availability {
+    Pinned,
+    Downloaded,
+    OnlineOnly,
+    Hidden,
+    Hiding,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PillStyle {
+    SolidGreen,
+    OutlineGreen,
+    Muted,
+}
+
+/// Maps the daemon's availability string; a missing or unknown value reads as online only.
+fn parse_availability(s: Option<&str>) -> Availability {
+    match s {
+        Some("pinned") => Availability::Pinned,
+        Some("downloaded") => Availability::Downloaded,
+        Some("hidden") => Availability::Hidden,
+        Some("hiding") => Availability::Hiding,
+        _ => Availability::OnlineOnly,
+    }
+}
+
+fn availability_pill(a: Availability) -> (&'static str, PillStyle) {
+    match a {
+        Availability::Pinned => ("Always keep", PillStyle::SolidGreen),
+        Availability::Downloaded => ("Downloaded", PillStyle::OutlineGreen),
+        Availability::OnlineOnly => ("Online only", PillStyle::Muted),
+        Availability::Hidden => ("Hidden", PillStyle::Muted),
+        Availability::Hiding => ("Hiding…", PillStyle::Muted),
+    }
+}
+
+/// Screenshot-only: a `RemoteListResponse` JSON file that replaces the daemon's listing.
+static REMOTE_FIXTURE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn load_remote_fixture(path: &str) -> Result<RemoteListResponse, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    serde_json::from_str(&raw).map_err(|e| format!("{path}: {e}"))
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -434,12 +480,6 @@ fn format_remote_error(raw: &str) -> String {
     raw.to_string()
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum CloudOnlyConfirm {
-    SingleFolder(String),
-    AllFolders(Vec<String>),
-}
-
 struct ProtonDriveNativeApp {
     tab: NavTab,
     tx: Sender<WorkerCommand>,
@@ -454,8 +494,6 @@ struct ProtonDriveNativeApp {
     login_url: Option<String>,
     search_query: String,
     show_account_menu: bool,
-    pending_cloud_only_confirm: Option<CloudOnlyConfirm>,
-    pending_sync_folders: Vec<String>,
 
     // Cloud Browser state
     remote_path: String,
@@ -495,7 +533,6 @@ impl ProtonDriveNativeApp {
         screenshot_target: Option<String>,
         initial_tab: NavTab,
         initial_account_menu: bool,
-        initial_confirm_folder: Option<String>,
         initial_path: Option<String>,
         window_geometry: WindowGeometry,
     ) -> Self {
@@ -560,8 +597,6 @@ impl ProtonDriveNativeApp {
             login_url: None,
             search_query: String::new(),
             show_account_menu: initial_account_menu,
-            pending_cloud_only_confirm: initial_confirm_folder.map(CloudOnlyConfirm::SingleFolder),
-            pending_sync_folders: Vec::new(),
             remote_path: start_path,
             // The startup cache only holds the root listing, so don't show it under another folder
             remote_items: if start_at_root { initial_root_items } else { Vec::new() },
@@ -602,20 +637,7 @@ impl ProtonDriveNativeApp {
                         if s.logged_in {
                             self.login_url = None;
                         }
-                        self.pending_sync_folders.retain(|f| {
-                            if s.syncing_folders.contains(f) {
-                                return true;
-                            }
-                            if !s.sync_dir.is_empty() {
-                                return !std::path::Path::new(&s.sync_dir).join(f).exists();
-                            }
-                            false
-                        });
                         self.status = s;
-                        // A status poll queued before our SaveSettings may still list the folder as excluded
-                        for f in &self.pending_sync_folders {
-                            self.status.settings.excluded_folders.retain(|ex| ex != f);
-                        }
                         self.activities = activity;
                         save_startup_cache(&self.status, &self.cached_root_items, &self.activities);
 
@@ -642,7 +664,9 @@ impl ProtonDriveNativeApp {
                     self.remote_loading = false;
                     match res {
                         Ok(list) => {
-                            if list.path == "/my-files" || list.path == "/" {
+                            if (list.path == "/my-files" || list.path == "/")
+                                && REMOTE_FIXTURE.get().is_none()
+                            {
                                 self.cached_root_items = list.items.clone();
                                 save_startup_cache(&self.status, &self.cached_root_items, &self.activities);
                             }
@@ -739,12 +763,10 @@ impl ProtonDriveNativeApp {
                         let inc = root_folders
                             .iter()
                             .filter(|f| {
-                                !self
-                                    .status
-                                    .settings
-                                    .excluded_folders
-                                    .iter()
-                                    .any(|ex| ex == &f.name)
+                                matches!(
+                                    parse_availability(f.availability.as_deref()),
+                                    Availability::Pinned | Availability::Downloaded
+                                )
                             })
                             .count();
                         Some(format!("{inc}/{}", root_folders.len()))
@@ -1809,8 +1831,8 @@ impl ProtonDriveNativeApp {
         });
     }
 
-    /// My files toolbar, laid out right to left: Refresh, New folder, the root-only Sync All /
-    /// Cloud Only All buttons and, when there's room, the item count.
+    /// My files toolbar, laid out right to left: Refresh, New folder and, when there's room, the
+    /// item count.
     fn render_browser_toolbar(&mut self, ui: &mut egui::Ui, count: Option<&str>, navigate_to: &mut Option<String>) {
         if proton_button(
             ui,
@@ -1845,68 +1867,6 @@ impl ProtonDriveNativeApp {
         }
 
         if !self.remote_items.is_empty() {
-            let is_root_bar =
-                self.remote_path == "/my-files" || self.remote_path == "/";
-            if is_root_bar {
-                ui.add_space(6.0);
-                if proton_button(
-                    ui,
-                    Vec2::new(TOOLBAR_CLOUD_ONLY_ALL_W, 32.0),
-                    "Cloud Only All",
-                    BG_CARD_ALT(),
-                    btn_secondary_hover_bg(),
-                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                    TEXT_MUTED(),
-                    12.0,
-                )
-                .on_hover_text(
-                    "Switch all top-level folders to Cloud only (remove local copies)",
-                )
-                .clicked()
-                {
-                    let all_folder_names: Vec<String> = self
-                        .remote_items
-                        .iter()
-                        .filter(|i| i.item_type == "folder")
-                        .map(|i| i.name.clone())
-                        .collect();
-                    if !all_folder_names.is_empty() {
-                        self.pending_cloud_only_confirm =
-                            Some(CloudOnlyConfirm::AllFolders(all_folder_names));
-                    }
-                }
-
-                ui.add_space(6.0);
-                if proton_button(
-                    ui,
-                    Vec2::new(TOOLBAR_SYNC_ALL_W, 32.0),
-                    "Sync All",
-                    BG_CARD_ALT(),
-                    btn_secondary_hover_bg(),
-                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                    TEXT_PRIMARY(),
-                    12.0,
-                )
-                .on_hover_text("Sync all top-level folders to this computer")
-                .clicked()
-                {
-                    let prev_excluded =
-                        std::mem::take(&mut self.status.settings.excluded_folders);
-                    for folder_name in prev_excluded {
-                        if !self.pending_sync_folders.contains(&folder_name) {
-                            self.pending_sync_folders.push(folder_name.clone());
-                        }
-                        if !self.status.syncing_folders.contains(&folder_name) {
-                            self.status.syncing_folders.push(folder_name);
-                        }
-                    }
-                    self.status.state = "syncing".to_string();
-                    let _ = self.tx.send(WorkerCommand::SaveSettings(
-                        serde_json::json!({ "excludedFolders": Vec::<String>::new() }),
-                    ));
-                }
-            }
-
             if let Some(count) = count {
                 ui.add_space(10.0);
                 ui.label(RichText::new(count).size(12.0).color(TEXT_MUTED()));
@@ -1961,13 +1921,7 @@ impl ProtonDriveNativeApp {
             let gap = ui.spacing().item_spacing.x;
             let crumbs_w = breadcrumbs_width(ui.painter(), &parts, gap);
             let has_items = !self.remote_items.is_empty();
-            let is_root_bar = self.remote_path == "/my-files" || self.remote_path == "/";
-            let buttons_w = TOOLBAR_REFRESH_W + 6.0 + TOOLBAR_NEW_FOLDER_W + gap * 2.0
-                + if has_items && is_root_bar {
-                    6.0 + TOOLBAR_CLOUD_ONLY_ALL_W + 6.0 + TOOLBAR_SYNC_ALL_W + gap * 2.0
-                } else {
-                    0.0
-                };
+            let buttons_w = TOOLBAR_REFRESH_W + 6.0 + TOOLBAR_NEW_FOLDER_W + gap * 2.0;
             let folder_count = self.remote_items.iter().filter(|i| i.item_type == "folder").count();
             let file_count = self.remote_items.len().saturating_sub(folder_count);
             let count_text = format!("{folder_count} folders  •  {file_count} files");
@@ -2149,8 +2103,6 @@ impl ProtonDriveNativeApp {
                     }
                 });
 
-                let is_root = self.remote_path == "/my-files" || self.remote_path == "/";
-                let root_folder_name = parts.get(1).cloned();
                 let scroll_h = (ui.available_height() - 6.0).max(240.0);
 
                 ScrollArea::vertical()
@@ -2162,18 +2114,26 @@ impl ProtonDriveNativeApp {
 
                         for item in sorted_items {
                             let is_folder = item.item_type == "folder";
-                            let top_check_name = if is_root {
-                                Some(item.name.as_str())
-                            } else {
-                                root_folder_name.as_deref()
+                            let availability = parse_availability(item.availability.as_deref());
+                            let is_muted_row =
+                                matches!(availability, Availability::Hidden | Availability::Hiding);
+                            let is_hidden = availability == Availability::Hidden;
+                            let has_local_copy = matches!(
+                                availability,
+                                Availability::Pinned | Availability::Downloaded
+                            );
+                            let item_rel = {
+                                let dir = self
+                                    .remote_path
+                                    .strip_prefix("/my-files")
+                                    .unwrap_or(&self.remote_path)
+                                    .trim_matches('/');
+                                if dir.is_empty() {
+                                    item.name.clone()
+                                } else {
+                                    format!("{dir}/{}", item.name)
+                                }
                             };
-                            let is_excluded = top_check_name.is_some_and(|top_name| {
-                                self.status
-                                    .settings
-                                    .excluded_folders
-                                    .iter()
-                                    .any(|ex| ex == top_name)
-                            });
 
                             let (row_rect, row_resp) = ui.allocate_exact_size(
                                 Vec2::new(ui.available_width(), 42.0),
@@ -2181,7 +2141,7 @@ impl ProtonDriveNativeApp {
                             );
 
                             if row_resp.hovered() {
-                                if is_folder || !is_excluded {
+                                if (is_folder && !is_hidden) || (!is_folder && has_local_copy) {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                 }
                                 ui.painter().rect_filled(
@@ -2210,16 +2170,24 @@ impl ProtonDriveNativeApp {
                                 Vec2::new(20.0, 17.0),
                             );
                             if is_folder {
-                                draw_folder_icon(ui.painter(), ic_rect, !is_excluded);
+                                draw_folder_icon(ui.painter(), ic_rect, has_local_copy);
                             } else {
                                 draw_file_icon(ui.painter(), ic_rect, &item.name);
                             }
 
-                            let name_color = TEXT_PRIMARY();
+                            let name_color = if is_muted_row { TEXT_MUTED() } else { TEXT_PRIMARY() };
                             let name_font = FontId::new(13.5, FontFamily::Proportional);
                             let name_text =
                                 truncate_middle_to_width(ui.painter(), &item.name, &name_font, row_cols.name_max_w);
-                            if name_text != item.name
+                            if is_hidden {
+                                let hint = "Hidden from this computer. Right-click to unhide.";
+                                let tip = if name_text != item.name {
+                                    format!("{}\n{hint}", item.name)
+                                } else {
+                                    hint.to_string()
+                                };
+                                row_resp.clone().on_hover_text(tip);
+                            } else if name_text != item.name
                                 && row_resp.hover_pos().is_some_and(|p| p.x < row_cols.status_x)
                             {
                                 row_resp.clone().on_hover_text(&item.name);
@@ -2232,144 +2200,72 @@ impl ProtonDriveNativeApp {
                                 name_color,
                             );
 
-                            // 2. Sync Status Column ("✓ Synced" vs "↻ Syncing..." vs "Cloud only" — clickable toggle on root folders!)
-                            let is_syncing = !is_excluded
-                                && top_check_name.is_some_and(|top_name| {
-                                    let in_pending = self
-                                        .pending_sync_folders
-                                        .iter()
-                                        .any(|f| f == top_name)
-                                        || self
-                                            .status
-                                            .syncing_folders
-                                            .iter()
-                                            .any(|f| f == top_name);
-                                    let has_active_transfer =
-                                        self.status.active_transfers.iter().any(|t| {
-                                            t.rel_path == top_name
-                                                || t.rel_path.starts_with(&format!("{top_name}/"))
-                                        });
-                                    let matches_current_action = self.status.state == "syncing"
-                                        && self.status.current_action.as_deref().is_some_and(
-                                            |act| {
-                                                act == format!("Syncing {top_name}")
-                                                    || act.starts_with(&format!(
-                                                        "Syncing {top_name}/"
-                                                    ))
-                                                    || act.ends_with(&format!("/{top_name}"))
-                                                    || act.contains(&format!("/{top_name}/"))
-                                            },
-                                        );
-                                    let missing_locally = is_root
-                                        && is_folder
-                                        && !self.status.sync_dir.is_empty()
-                                        && !std::path::Path::new(&self.status.sync_dir)
-                                            .join(top_name)
-                                            .exists();
-                                    in_pending
-                                        || has_active_transfer
-                                        || matches_current_action
-                                        || missing_locally
+                            // 2. Availability pill; "↻ Syncing..." overrides it while the item is being transferred
+                            let is_syncing = self.status.syncing_folders.iter().any(|f| f == &item_rel)
+                                || self.status.active_transfers.iter().any(|t| {
+                                    t.rel_path == item_rel
+                                        || t.rel_path.starts_with(&format!("{item_rel}/"))
                                 });
 
                             let pill_rect = egui::Rect::from_min_size(
                                 egui::pos2(row_status_x, row_cy - 11.0),
                                 Vec2::new(TABLE_STATUS_PILL_W, 22.0),
                             );
-                            let can_toggle_sync = is_root && is_folder;
-                            let pointer_pos = ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
-                            let pill_hovered = can_toggle_sync
-                                && row_resp.hovered()
-                                && pointer_pos.is_some_and(|p| pill_rect.expand(4.0).contains(p));
+                            let pill_font = FontId::new(11.0, FontFamily::Proportional);
 
-                            if is_excluded {
-                                let bg = if pill_hovered {
-                                    btn_secondary_hover_bg()
-                                } else {
-                                    BG_CARD_ALT()
-                                };
+                            if is_syncing {
                                 ui.painter()
-                                    .rect_filled(pill_rect, CornerRadius::same(99), bg);
-                                if can_toggle_sync {
-                                    ui.painter().rect_stroke(
-                                        pill_rect,
-                                        CornerRadius::same(99),
-                                        Stroke::new(
-                                            1.0_f32,
-                                            if pill_hovered {
-                                                PROTON_PURPLE_TEXT()
-                                            } else {
-                                                BORDER_SUBTLE()
-                                            },
-                                        ),
-                                        egui::StrokeKind::Inside,
-                                    );
-                                }
-                                ui.painter().text(
-                                    pill_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "Cloud only",
-                                    FontId::new(11.0, FontFamily::Proportional),
-                                    if pill_hovered { TEXT_PRIMARY() } else { TEXT_MUTED() },
-                                );
-                            } else if is_syncing {
-                                let bg = if pill_hovered {
-                                    Color32::from_rgba_unmultiplied(109, 74, 255, 58)
-                                } else {
-                                    PROTON_PURPLE_SOFT()
-                                };
-                                ui.painter()
-                                    .rect_filled(pill_rect, CornerRadius::same(99), bg);
+                                    .rect_filled(pill_rect, CornerRadius::same(99), PROTON_PURPLE_SOFT());
                                 ui.painter().rect_stroke(
                                     pill_rect,
                                     CornerRadius::same(99),
-                                    Stroke::new(
-                                        1.0_f32,
-                                        if pill_hovered {
-                                            PROTON_PURPLE_HOVER
-                                        } else {
-                                            PROTON_PURPLE
-                                        },
-                                    ),
+                                    Stroke::new(1.0_f32, PROTON_PURPLE),
                                     egui::StrokeKind::Inside,
                                 );
                                 ui.painter().text(
                                     pill_rect.center(),
                                     egui::Align2::CENTER_CENTER,
                                     "↻ Syncing...",
-                                    FontId::new(11.0, FontFamily::Proportional),
+                                    pill_font,
                                     PROTON_PURPLE_TEXT(),
                                 );
                             } else {
-                                let bg = if pill_hovered {
-                                    Color32::from_rgba_unmultiplied(30, 168, 133, 52)
-                                } else {
-                                    Color32::from_rgba_unmultiplied(30, 168, 133, 30)
-                                };
-                                ui.painter()
-                                    .rect_filled(pill_rect, CornerRadius::same(99), bg);
-                                if can_toggle_sync {
-                                    ui.painter().rect_stroke(
-                                        pill_rect,
-                                        CornerRadius::same(99),
-                                        Stroke::new(
-                                            1.0_f32,
-                                            Color32::from_rgba_unmultiplied(
-                                                30,
-                                                168,
-                                                133,
-                                                if pill_hovered { 160 } else { 75 },
+                                let (label, style) = availability_pill(availability);
+                                let painter = ui.painter();
+                                let round = CornerRadius::same(99);
+                                let text_color = match style {
+                                    PillStyle::SolidGreen => {
+                                        painter.rect_filled(pill_rect, round, STATUS_SUCCESS);
+                                        Color32::WHITE
+                                    }
+                                    PillStyle::OutlineGreen => {
+                                        painter.rect_filled(
+                                            pill_rect,
+                                            round,
+                                            Color32::from_rgba_unmultiplied(30, 168, 133, 30),
+                                        );
+                                        painter.rect_stroke(
+                                            pill_rect,
+                                            round,
+                                            Stroke::new(
+                                                1.0_f32,
+                                                Color32::from_rgba_unmultiplied(30, 168, 133, 110),
                                             ),
-                                        ),
-                                        egui::StrokeKind::Inside,
-                                    );
-                                }
-                                ui.painter().text(
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        STATUS_SUCCESS
+                                    }
+                                    PillStyle::Muted => {
+                                        painter.rect_filled(pill_rect, round, BG_CARD_ALT());
+                                        TEXT_MUTED()
+                                    }
+                                };
+                                painter.text(
                                     pill_rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    "✓ Synced",
-                                    FontId::new(11.0, FontFamily::Proportional),
-                                    STATUS_SUCCESS,
+                                    label,
+                                    pill_font,
+                                    text_color,
                                 );
                             }
 
@@ -2404,45 +2300,13 @@ impl ProtonDriveNativeApp {
                                 TEXT_MUTED(),
                             );
 
-                            let clicked_in_pill = can_toggle_sync
-                                && row_resp.clicked()
-                                && ui
-                                    .input(|i| i.pointer.interact_pos())
-                                    .is_some_and(|p| pill_rect.expand(6.0).contains(p));
-
-                            if clicked_in_pill {
-                                if is_excluded {
-                                    // Switching from Cloud only -> Syncing... -> Synced once downloaded locally
-                                    self.status
-                                        .settings
-                                        .excluded_folders
-                                        .retain(|ex| ex != &item.name);
-                                    if !self.pending_sync_folders.contains(&item.name) {
-                                        self.pending_sync_folders.push(item.name.clone());
-                                    }
-                                    if !self.status.syncing_folders.contains(&item.name) {
-                                        self.status.syncing_folders.push(item.name.clone());
-                                    }
-                                    self.status.state = "syncing".to_string();
-                                    self.status.current_action =
-                                        Some(format!("Syncing {}", item.name));
-                                    let updated_excluded =
-                                        self.status.settings.excluded_folders.clone();
-                                    let _ = self.tx.send(WorkerCommand::SaveSettings(
-                                        serde_json::json!({ "excludedFolders": updated_excluded }),
-                                    ));
-                                } else {
-                                    // Switching from Synced -> Cloud only removes local copy: ask confirmation first
-                                    self.pending_cloud_only_confirm =
-                                        Some(CloudOnlyConfirm::SingleFolder(item.name.clone()));
-                                }
-                            } else if is_folder && row_resp.clicked() {
+                            if is_folder && !is_hidden && row_resp.clicked() {
                                 clicked_folder = Some(format!(
                                     "{}/{}",
                                     self.remote_path.trim_end_matches('/'),
                                     item.name
                                 ));
-                            } else if !is_folder && !is_excluded && row_resp.clicked() {
+                            } else if !is_folder && has_local_copy && row_resp.clicked() {
                                 let rel_sub = self
                                     .remote_path
                                     .strip_prefix("/my-files")
@@ -2738,162 +2602,6 @@ impl ProtonDriveNativeApp {
             }
         });
     }
-
-    fn render_cloud_only_confirm_modal(&mut self, ctx: &egui::Context) {
-        let Some(confirm) = self.pending_cloud_only_confirm.clone() else {
-            return;
-        };
-
-        if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            self.pending_cloud_only_confirm = None;
-            return;
-        }
-
-        let screen_rect = ctx.screen_rect();
-        // Paint dimmed backdrop on Foreground layer
-        egui::Area::new(egui::Id::new("cloud_only_confirm_backdrop"))
-            .order(egui::Order::Foreground)
-            .interactable(false)
-            .fixed_pos(screen_rect.min)
-            .show(ctx, |ui| {
-                let (rect, _) =
-                    ui.allocate_exact_size(screen_rect.size(), Sense::hover());
-                ui.painter().rect_filled(
-                    rect,
-                    0,
-                    Color32::from_rgba_unmultiplied(10, 8, 16, 175),
-                );
-            });
-
-        let modal_w = 436.0;
-        let modal_h = 216.0;
-        let modal_pos = egui::pos2(
-            screen_rect.center().x - modal_w * 0.5,
-            screen_rect.center().y - modal_h * 0.5,
-        );
-
-        let (title, body_line1) = match &confirm {
-            CloudOnlyConfirm::SingleFolder(name) => (
-                format!("Switch \"{name}\" to Cloud only?"),
-                format!(
-                    "This will remove the local copy of \"{name}\" from your computer to free up disk space."
-                ),
-            ),
-            CloudOnlyConfirm::AllFolders(names) => (
-                format!("Switch all {} folders to Cloud only?", names.len()),
-                "This will remove the local copies of all top-level folders from your computer to free up disk space.".to_string(),
-            ),
-        };
-
-        let area_resp = egui::Area::new(egui::Id::new("cloud_only_confirm_dialog"))
-            .order(egui::Order::Tooltip)
-            .fixed_pos(modal_pos)
-            .show(ctx, |ui| {
-                Frame::NONE
-                    .fill(BG_CARD())
-                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
-                    .corner_radius(CornerRadius::same(14))
-                    .shadow(egui::Shadow {
-                        offset: [0, 12],
-                        blur: 32,
-                        spread: 2,
-                        color: Color32::from_rgba_unmultiplied(0, 0, 0, 190),
-                    })
-                    .inner_margin(Margin::symmetric(24, 22))
-                    .show(ui, |ui| {
-                        ui.set_min_width(modal_w - 48.0);
-                        ui.set_max_width(modal_w - 48.0);
-
-                        ui.label(
-                            RichText::new(title)
-                                .size(16.5)
-                                .strong()
-                                .color(TEXT_PRIMARY()),
-                        );
-                        ui.add_space(10.0);
-                        ui.label(RichText::new(body_line1).size(13.0).color(TEXT_PRIMARY()));
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(
-                                "Your files stay in Proton Drive and can be synced again anytime. A folder holding anything not in Proton Drive yet, like ignored .git folders or unsynced edits, stays on this computer.",
-                            )
-                            .size(12.5)
-                            .color(TEXT_MUTED()),
-                        );
-
-                        ui.add_space(20.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if proton_button(
-                                ui,
-                                Vec2::new(158.0, 36.0),
-                                "Switch to Cloud only",
-                                PROTON_PURPLE,
-                                PROTON_PURPLE_HOVER,
-                                None,
-                                Color32::WHITE,
-                                13.0,
-                            )
-                            .clicked()
-                            {
-                                match confirm {
-                                    CloudOnlyConfirm::SingleFolder(folder_name) => {
-                                        self.pending_sync_folders.retain(|f| f != &folder_name);
-                                        self.status.syncing_folders.retain(|f| f != &folder_name);
-                                        if !self
-                                            .status
-                                            .settings
-                                            .excluded_folders
-                                            .contains(&folder_name)
-                                        {
-                                            self.status
-                                                .settings
-                                                .excluded_folders
-                                                .push(folder_name.clone());
-                                        }
-                                    }
-                                    CloudOnlyConfirm::AllFolders(all_names) => {
-                                        self.pending_sync_folders.clear();
-                                        self.status.syncing_folders.clear();
-                                        self.status.settings.excluded_folders = all_names;
-                                    }
-                                }
-                                let updated_excluded =
-                                    self.status.settings.excluded_folders.clone();
-                                let _ = self.tx.send(WorkerCommand::SaveSettings(
-                                    serde_json::json!({ "excludedFolders": updated_excluded }),
-                                ));
-                                self.pending_cloud_only_confirm = None;
-                            }
-
-                            ui.add_space(8.0);
-
-                            if proton_button(
-                                ui,
-                                Vec2::new(88.0, 36.0),
-                                "Cancel",
-                                BG_CARD_ALT(),
-                                btn_secondary_hover_bg(),
-                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                                TEXT_PRIMARY(),
-                                13.0,
-                            )
-                            .clicked()
-                            {
-                                self.pending_cloud_only_confirm = None;
-                            }
-                        });
-                    });
-            });
-
-        // Dismiss if clicked outside the modal dialog
-        if ctx.input(|i| i.pointer.any_pressed()) {
-            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                if !area_resp.response.rect.contains(pos) {
-                    self.pending_cloud_only_confirm = None;
-                }
-            }
-        }
-    }
 }
 
 impl eframe::App for ProtonDriveNativeApp {
@@ -2998,9 +2706,6 @@ impl eframe::App for ProtonDriveNativeApp {
                     .inner_margin(Margin::symmetric(26, 20)),
             )
             .show(ctx, |ui| {
-                if self.pending_cloud_only_confirm.is_some() {
-                    ui.disable();
-                }
                 match self.tab {
                     NavTab::Overview => self.render_overview_tab(ui),
                     NavTab::CloudBrowser => self.render_browser_tab(ui),
@@ -3010,7 +2715,6 @@ impl eframe::App for ProtonDriveNativeApp {
             });
 
         self.render_account_popover(ctx);
-        self.render_cloud_only_confirm_modal(ctx);
 
         // Handle --screenshot <path> for automated visual inspection
         if let Some(target_path) = self.screenshot_target.clone() {
@@ -3215,8 +2919,6 @@ const BREADCRUMB_SEPARATOR_SIZE: f32 = 15.0;
 const BREADCRUMB_PAD_X: f32 = 12.0;
 const TOOLBAR_REFRESH_W: f32 = 84.0;
 const TOOLBAR_NEW_FOLDER_W: f32 = 108.0;
-const TOOLBAR_CLOUD_ONLY_ALL_W: f32 = 98.0;
-const TOOLBAR_SYNC_ALL_W: f32 = 76.0;
 /// Safety margin for toolbar widths that are estimated before layout.
 const TOOLBAR_FIT_SLACK: f32 = 12.0;
 
@@ -3901,6 +3603,11 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                 });
                 ctx.request_repaint();
             }
+            WorkerCommand::LoadRemotePath(_) if REMOTE_FIXTURE.get().is_some() => {
+                let res = load_remote_fixture(REMOTE_FIXTURE.get().map_or("", String::as_str));
+                let _ = tx.send(WorkerEvent::RemoteLoaded(res));
+                ctx.request_repaint();
+            }
             WorkerCommand::LoadRemotePath(path) => {
                 let tx_clone = tx.clone();
                 let ctx_clone = ctx.clone();
@@ -4037,6 +3744,7 @@ OPTIONS:
   --tab <TAB>           initial tab (overview | browser | conflicts | settings)
   --screenshot <PATH>   render UI, save a PNG screenshot to PATH, and exit
   --search <QUERY>      pre-fill the search/filter box
+  --remote-fixture <F>  with --screenshot: list My files from a JSON file instead of the daemon
   --path <FOLDER>       open My files at a remote folder, e.g. /my-files/photos
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --version             print the version
@@ -4055,11 +3763,11 @@ fn main() -> eframe::Result {
     let mut screenshot_target: Option<String> = None;
     let mut initial_tab = NavTab::CloudBrowser;
     let mut initial_account_menu = false;
-    let mut initial_confirm_folder: Option<String> = None;
     let mut cli_theme_override: Option<String> = None;
     let mut cli_search: Option<String> = None;
     let mut cli_path: Option<String> = None;
     let mut cli_size: Option<[f32; 2]> = None;
+    let mut cli_fixture: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -4069,8 +3777,9 @@ fn main() -> eframe::Result {
             "--account-menu" => {
                 initial_account_menu = true;
             }
-            "--confirm-cloud-only" => {
-                initial_confirm_folder = args.next();
+            "--remote-fixture" => {
+                // Screenshot-only: show this RemoteListResponse JSON instead of the daemon's listing
+                cli_fixture = args.next();
             }
             "--theme" => {
                 cli_theme_override = args.next();
@@ -4109,6 +3818,14 @@ fn main() -> eframe::Result {
                 return Ok(());
             }
             _ => {}
+        }
+    }
+
+    if let Some(path) = cli_fixture {
+        if screenshot_target.is_some() {
+            let _ = REMOTE_FIXTURE.set(path);
+        } else {
+            eprintln!("protondrive-gui: --remote-fixture only applies together with --screenshot; ignoring it");
         }
     }
 
@@ -4172,7 +3889,6 @@ fn main() -> eframe::Result {
                 screenshot_target,
                 initial_tab,
                 initial_account_menu,
-                initial_confirm_folder,
                 cli_path,
                 saved_geom,
             );
@@ -4472,5 +4188,31 @@ mod tests {
             assert!(text_width(p, quota, &FontId::proportional(size)) <= 200.0);
             assert_eq!(fit_font_size(p, quota, 24.0, 14.0, 20.0), 14.0);
         });
+    }
+
+    #[test]
+    fn parse_availability_maps_every_daemon_string() {
+        assert_eq!(parse_availability(Some("pinned")), Availability::Pinned);
+        assert_eq!(parse_availability(Some("downloaded")), Availability::Downloaded);
+        assert_eq!(parse_availability(Some("online-only")), Availability::OnlineOnly);
+        assert_eq!(parse_availability(Some("hidden")), Availability::Hidden);
+        assert_eq!(parse_availability(Some("hiding")), Availability::Hiding);
+    }
+
+    #[test]
+    fn parse_availability_defaults_to_online_only() {
+        assert_eq!(parse_availability(None), Availability::OnlineOnly);
+        assert_eq!(parse_availability(Some("")), Availability::OnlineOnly);
+        assert_eq!(parse_availability(Some("Pinned")), Availability::OnlineOnly);
+        assert_eq!(parse_availability(Some("syncing")), Availability::OnlineOnly);
+    }
+
+    #[test]
+    fn availability_pill_uses_the_agreed_labels_and_styles() {
+        assert_eq!(availability_pill(Availability::Pinned), ("Always keep", PillStyle::SolidGreen));
+        assert_eq!(availability_pill(Availability::Downloaded), ("Downloaded", PillStyle::OutlineGreen));
+        assert_eq!(availability_pill(Availability::OnlineOnly), ("Online only", PillStyle::Muted));
+        assert_eq!(availability_pill(Availability::Hidden), ("Hidden", PillStyle::Muted));
+        assert_eq!(availability_pill(Availability::Hiding), ("Hiding…", PillStyle::Muted));
     }
 }
