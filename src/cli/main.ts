@@ -2,8 +2,6 @@
 
 import path from 'node:path';
 
-import { NodeType } from '@protontech/drive-sdk';
-
 import { launchDesktopWindow } from '../gui/launcher';
 import { ensureSystemTrayIndicator } from '../linux/notifications';
 import { DEFAULT_DAEMON_HOST, DEFAULT_DAEMON_PORT, startSyncDaemon } from '../daemon/daemonServer';
@@ -21,6 +19,7 @@ import {
     THIRD_PARTY_DISCLOSURE,
     uploadLocalFileToDrive,
 } from '../sdk';
+import { DAEMON_NOT_RUNNING_MESSAGE, runAvailabilityCommand } from './availabilityCommands';
 import { migrateExcludedFolders } from '../sync/availabilityMigration';
 import { formatBytes, ProtonDriveSyncEngine } from '../sync/syncEngine';
 import { SyncStateDatabase } from '../sync/syncStateDb';
@@ -36,6 +35,32 @@ async function isDaemonRunning(): Promise<boolean> {
     } catch {
         return false;
     }
+}
+
+/** The sync folder, as the running daemon reports it; null when the daemon isn't running. */
+async function daemonSyncDir(): Promise<string | null> {
+    if (!(await isDaemonRunning())) return null;
+    try {
+        const res = await fetch(`${DAEMON_BASE_URL}/api/status`);
+        const status = (await res.json()) as { syncDir?: string };
+        return status.syncDir ?? null;
+    } catch {
+        return null;
+    }
+}
+
+async function runAvailabilityCli(action: 'pin' | 'free' | 'hide' | 'unhide' | 'status', target: string | undefined): Promise<void> {
+    if (!target) {
+        console.error(`Usage: protondrive ${action} <path>`);
+        process.exit(1);
+    }
+    const syncDir = await daemonSyncDir();
+    if (syncDir === null) {
+        console.error(DAEMON_NOT_RUNNING_MESSAGE);
+        process.exit(2);
+    }
+    const code = await runAvailabilityCommand(action, target, syncDir);
+    if (code !== 0) process.exit(code);
 }
 
 async function createStandaloneRuntime(verbose = false) {
@@ -60,6 +85,11 @@ Daemon & Desktop GUI Commands:
   daemon                         Run two-way folder sync daemon & local control server
   gui                            Launch Native Desktop GUI window (starts daemon if needed)
   status [--json]                Show sync status, local folder, and synced file counts
+  status <path>                  Show whether a file or folder is kept, downloaded, online only or hidden
+  pin <path>                     Always keep a file or folder on this device
+  free <path>                    Free up space: make downloaded files online only
+  hide <path>                    Hide a file or folder from this computer
+  unhide <path>                  Unhide it (it becomes online only)
   sync                           Trigger an immediate two-way synchronization pass
   pause                          Pause background synchronization
   resume                         Resume background synchronization
@@ -72,8 +102,8 @@ Authentication Commands (OS Keyring / XDG Fallback):
 Conflict & Selective Sync Commands:
   conflicts                      List detected file conflicts
   conflicts resolve <id> <mode>  Resolve conflict (#id) with keep-both | keep-local | keep-remote
-  selective-sync list            List remote top-level folders
-  selective-sync exclude|include Replaced by hide|unhide (available once Stage 1 lands)
+  selective-sync list            List top-level folders with their availability
+  selective-sync exclude|include Same as hide|unhide
 
 Direct Cloud File Commands (@protontech/drive-sdk):
   ls [remotePath]                List remote folder contents (default: /my-files)
@@ -152,6 +182,11 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
         process.on('SIGINT', shutdown);
         process.on('SIGTERM', shutdown);
         await new Promise(() => {});
+        return;
+    }
+
+    if (cmd === 'pin' || cmd === 'free' || cmd === 'hide' || cmd === 'unhide' || (cmd === 'status' && args[1])) {
+        await runAvailabilityCli(cmd, args[1]);
         return;
     }
 
@@ -344,29 +379,28 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     if (cmd === 'selective-sync') {
         const sub = args[1] || 'list';
         if (sub === 'exclude' || sub === 'include') {
-            // Cloud only folders gave way to per-item availability; the new commands come later in Stage 1
-            console.error('Use `protondrive hide|unhide <path>` (available once Stage 1 lands)');
-            process.exit(1);
+            await runAvailabilityCli(sub === 'exclude' ? 'hide' : 'unhide', args[2]);
+            return;
         }
-        const runtime = await createStandaloneRuntime(verboseFlag);
-        try {
-            if (!runtime.auth.isLoggedIn()) {
-                throw new Error('Not signed in. Run `proton-drive-ubuntu auth login` first.');
+        if (!(await isDaemonRunning())) {
+            console.error(DAEMON_NOT_RUNNING_MESSAGE);
+            process.exit(2);
+        }
+        const res = await fetch(`${DAEMON_BASE_URL}/api/remote/list?path=${encodeURIComponent('/my-files')}`);
+        if (!res.ok) {
+            throw new Error(`The daemon could not list your folders (HTTP ${res.status})`);
+        }
+        const listing = (await res.json()) as { items: Array<{ uid: string; name: string; type: string; availability?: string }> };
+        const folders = listing.items
+            .filter((item) => item.type === 'folder')
+            .map((item) => ({ name: item.name, uid: item.uid, availability: item.availability ?? 'online-only' }))
+            .sort((a, b) => a.name.localeCompare(b.name));
+        if (jsonFlag) {
+            console.log(JSON.stringify({ folders }, null, 2));
+        } else {
+            for (const folder of folders) {
+                console.log(`/my-files/${folder.name}  [${folder.availability}]`);
             }
-            const root = await runtime.sdk.getMyFilesRootFolder();
-            const folders = (await listFolderChildren(runtime.sdk, root))
-                .filter((child) => child.type === NodeType.Folder)
-                .map((child) => ({ name: getName(child), uid: child.uid }))
-                .sort((a, b) => a.name.localeCompare(b.name));
-            if (jsonFlag) {
-                console.log(JSON.stringify({ folders }, null, 2));
-            } else {
-                for (const folder of folders) {
-                    console.log(`/my-files/${folder.name}`);
-                }
-            }
-        } finally {
-            await runtime.dispose();
         }
         return;
     }
