@@ -311,6 +311,170 @@ fn availability_pill(a: Availability) -> (&'static str, PillStyle) {
     }
 }
 
+/// Menu entries for one item, as (label, action) with the daemon's action names. The root can't be hidden.
+fn menu_actions(a: Availability, is_root: bool) -> Vec<(&'static str, &'static str)> {
+    let mut out = Vec::new();
+    if a != Availability::Pinned {
+        out.push(("Always keep on this device", "pin"));
+    }
+    if matches!(a, Availability::Pinned | Availability::Downloaded) {
+        out.push(("Free up space", "free"));
+    }
+    let hidden = matches!(a, Availability::Hidden | Availability::Hiding);
+    if !hidden && !is_root {
+        out.push(("Hide from this computer", "hide"));
+    }
+    if hidden {
+        out.push(("Unhide", "unhide"));
+    }
+    out
+}
+
+/// The browser path relative to the sync folder; empty at the root.
+fn folder_rel_path(remote_path: &str) -> &str {
+    remote_path.strip_prefix("/my-files").unwrap_or(remote_path).trim_matches('/')
+}
+
+/// An item's path relative to the sync folder: the browser path without `/my-files`, joined with its name.
+fn item_rel_path(remote_path: &str, name: &str) -> String {
+    let dir = folder_rel_path(remote_path);
+    if dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// What the daemon's control socket answers to an availability action.
+#[derive(Clone, Debug, Deserialize)]
+struct AvailabilityResult {
+    #[allow(dead_code)]
+    state: String,
+    #[serde(default)]
+    kept: Vec<String>,
+    #[serde(default)]
+    refused: Option<String>,
+}
+
+/// The line shown above the table after an action: the refusal, else the items that had to stay.
+fn availability_notice(r: &AvailabilityResult) -> Option<String> {
+    if let Some(refused) = r.refused.as_ref().filter(|m| !m.is_empty()) {
+        return Some(refused.clone());
+    }
+    if r.kept.is_empty() {
+        return None;
+    }
+    const SHOWN: usize = 3;
+    let n = r.kept.len();
+    let (subject, verb) = if n == 1 { ("item", "stays") } else { ("items", "stay") };
+    let pronoun = if n == 1 { "it isn't" } else { "they aren't" };
+    let mut names = r.kept.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    if n > SHOWN {
+        names.push_str(&format!(" and {} more", n - SHOWN));
+    }
+    Some(format!(
+        "{n} {subject} {verb} on this computer because {pronoun} safely in Proton Drive: {names}"
+    ))
+}
+
+/// Same rule as the daemon's `defaultControlSocketPath`: `$XDG_RUNTIME_DIR/protondrive/control.sock`, else
+/// `<tmp>/protondrive-<uid>/control.sock`.
+fn control_socket_path_from(xdg_runtime_dir: Option<std::ffi::OsString>, tmp: std::path::PathBuf, uid: u32) -> std::path::PathBuf {
+    match xdg_runtime_dir.filter(|d| !d.is_empty()) {
+        Some(dir) => std::path::PathBuf::from(dir).join("protondrive").join("control.sock"),
+        None => tmp.join(format!("protondrive-{uid}")).join("control.sock"),
+    }
+}
+
+fn control_socket_path() -> std::path::PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(0);
+    control_socket_path_from(std::env::var_os("XDG_RUNTIME_DIR"), std::env::temp_dir(), uid)
+}
+
+/// One HTTP/1.1 request to the daemon's user-only control socket. Pin, free, hide and unhide go
+/// only through here, never through the TCP API.
+fn control_request(method: &str, path_and_query: &str, body: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
+    control_request_at(&control_socket_path(), method, path_and_query, body)
+}
+
+fn control_request_at(
+    socket: &std::path::Path,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    use std::io::{Read, Write};
+    const UNREACHABLE: &str = "Can't reach the Proton Drive background service";
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(socket).map_err(|e| format!("{UNREACHABLE} ({e})"))?;
+    let timeout = Some(Duration::from_secs(10));
+    let _ = stream.set_read_timeout(timeout);
+    let _ = stream.set_write_timeout(timeout);
+
+    let payload = body.map(|b| b.to_string()).unwrap_or_default();
+    let mut request = format!("{method} {path_and_query} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: application/json\r\n");
+    if body.is_some() {
+        request.push_str(&format!("Content-Type: application/json\r\nContent-Length: {}\r\n", payload.len()));
+    }
+    request.push_str("\r\n");
+    request.push_str(&payload);
+    stream.write_all(request.as_bytes()).map_err(|e| format!("{UNREACHABLE} ({e})"))?;
+
+    // Connection: close ends the reply at EOF; Content-Length, when present, trims anything after the body
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).map_err(|e| format!("{UNREACHABLE} ({e})"))?;
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or("Malformed reply from the Proton Drive background service")?;
+    let head = String::from_utf8_lossy(&raw[..split]).to_string();
+    let mut body_bytes = &raw[split + 4..];
+    let mut lines = head.lines();
+    let status: u16 = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .ok_or("Malformed reply from the Proton Drive background service")?;
+    let content_length = lines.find_map(|l| {
+        let (name, value) = l.split_once(':')?;
+        name.trim().eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok())?
+    });
+    if let Some(len) = content_length.filter(|len| *len <= body_bytes.len()) {
+        body_bytes = &body_bytes[..len];
+    }
+    let json: Option<serde_json::Value> = serde_json::from_slice(body_bytes).ok();
+    if (200..300).contains(&status) {
+        return json.ok_or_else(|| "Unreadable reply from the Proton Drive background service".to_string());
+    }
+    Err(json
+        .as_ref()
+        .and_then(|j| j.get("error"))
+        .and_then(|e| e.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| format!("The Proton Drive background service answered {status}")))
+}
+
+fn set_availability(path: &str, action: &str) -> Result<AvailabilityResult, String> {
+    let body = serde_json::json!({ "path": path, "action": action });
+    let reply = control_request("POST", "/availability", Some(&body))?;
+    serde_json::from_value(reply).map_err(|e| e.to_string())
+}
+
+/// An open row menu: the item it acts on and where it was opened.
+#[derive(Clone, Debug)]
+struct RowMenu {
+    name: String,
+    rel_path: String,
+    availability: Availability,
+    pos: egui::Pos2,
+}
+
+/// An action that waits for the user's confirmation.
+#[derive(Clone, Debug, PartialEq)]
+enum PendingConfirm {
+    Hide { name: String, rel_path: String },
+    /// Free up space for everything in the current folder (`rel_path` is empty at the root).
+    FreeAll { rel_path: String },
+}
+
 /// Screenshot-only: a `RemoteListResponse` JSON file that replaces the daemon's listing.
 static REMOTE_FIXTURE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -347,6 +511,7 @@ enum WorkerCommand {
     SaveSettings(serde_json::Value),
     LoadConflicts,
     ResolveConflict { id: u64, choice: String },
+    SetAvailability { path: String, action: String },
 }
 
 enum WorkerEvent {
@@ -357,6 +522,7 @@ enum WorkerEvent {
     LoginStarted(String),
     RemoteLoaded(Result<RemoteListResponse, String>),
     ConflictsLoaded(Vec<ConflictRecord>),
+    AvailabilityDone(Result<AvailabilityResult, String>),
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -502,6 +668,12 @@ struct ProtonDriveNativeApp {
     remote_error: Option<String>,
     new_folder_name: String,
     show_new_folder_modal: bool,
+    row_menu: Option<RowMenu>,
+    pending_confirm: Option<PendingConfirm>,
+    /// Dismissible line above the table: a refusal, the items that had to stay, or an error.
+    notice: Option<String>,
+    /// Screenshot-only: open the row menu of the item with this name once it is laid out.
+    screenshot_menu_for: Option<String>,
 
     // Ignore patterns editor (Settings)
     ignore_patterns_text: String,
@@ -604,6 +776,10 @@ impl ProtonDriveNativeApp {
             remote_error: None,
             new_folder_name: String::new(),
             show_new_folder_modal: false,
+            row_menu: None,
+            pending_confirm: None,
+            notice: None,
+            screenshot_menu_for: None,
             ignore_patterns_text,
             settings_dirty: false,
             conflicts: Vec::new(),
@@ -691,6 +867,15 @@ impl ProtonDriveNativeApp {
                 }
                 WorkerEvent::ConflictsLoaded(conflicts) => {
                     self.conflicts = conflicts;
+                }
+                WorkerEvent::AvailabilityDone(res) => {
+                    self.notice = match res {
+                        Ok(result) => availability_notice(&result),
+                        Err(e) => Some(e),
+                    };
+                    // Pills and the status counters change with the action
+                    let _ = self.tx.send(WorkerCommand::RefreshAll);
+                    let _ = self.tx.send(WorkerCommand::LoadRemotePath(self.remote_path.clone()));
                 }
             }
         }
@@ -1831,8 +2016,8 @@ impl ProtonDriveNativeApp {
         });
     }
 
-    /// My files toolbar, laid out right to left: Refresh, New folder and, when there's room, the
-    /// item count.
+    /// My files toolbar, laid out right to left: Refresh, New folder, Free up all, Keep all and, when
+    /// there's room, the item count.
     fn render_browser_toolbar(&mut self, ui: &mut egui::Ui, count: Option<&str>, navigate_to: &mut Option<String>) {
         if proton_button(
             ui,
@@ -1866,10 +2051,278 @@ impl ProtonDriveNativeApp {
             self.show_new_folder_modal = !self.show_new_folder_modal;
         }
 
+        ui.add_space(6.0);
+
+        if proton_button(
+            ui,
+            Vec2::new(TOOLBAR_FREE_ALL_W, 32.0),
+            "Free up all",
+            BG_CARD_ALT(),
+            btn_secondary_hover_bg(),
+            Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+            TEXT_PRIMARY(),
+            13.0,
+        )
+        .on_hover_text("Free up space for everything in this folder")
+        .clicked()
+        {
+            self.pending_confirm = Some(PendingConfirm::FreeAll {
+                rel_path: folder_rel_path(&self.remote_path).to_string(),
+            });
+        }
+
+        ui.add_space(6.0);
+
+        if proton_button(
+            ui,
+            Vec2::new(TOOLBAR_KEEP_ALL_W, 32.0),
+            "Keep all",
+            BG_CARD_ALT(),
+            btn_secondary_hover_bg(),
+            Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+            TEXT_PRIMARY(),
+            13.0,
+        )
+        .on_hover_text("Always keep everything in this folder on this device")
+        .clicked()
+        {
+            self.send_availability(folder_rel_path(&self.remote_path).to_string(), "pin");
+        }
+
         if !self.remote_items.is_empty() {
             if let Some(count) = count {
                 ui.add_space(10.0);
                 ui.label(RichText::new(count).size(12.0).color(TEXT_MUTED()));
+            }
+        }
+    }
+
+    /// Asks the daemon, over the control socket and off the UI thread, to change availability.
+    fn send_availability(&mut self, rel_path: String, action: &str) {
+        self.row_menu = None;
+        let _ = self.tx.send(WorkerCommand::SetAvailability { path: rel_path, action: action.to_string() });
+    }
+
+    /// Dismissible warning line above the table.
+    fn render_notice(&mut self, ui: &mut egui::Ui) {
+        let Some(text) = self.notice.clone() else {
+            return;
+        };
+        ui.add_space(10.0);
+        Frame::NONE
+            .fill(Color32::from_rgba_unmultiplied(230, 138, 0, 32))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(230, 138, 0, 120)))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal_top(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        let close = ui
+                            .add(
+                                egui::Button::new(RichText::new("×").size(18.0).color(TEXT_MUTED()))
+                                    .frame(false),
+                            )
+                            .on_hover_text("Dismiss");
+                        if close.clicked() {
+                            self.notice = None;
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(&text).size(12.5).color(TEXT_PRIMARY())).wrap(),
+                            );
+                        });
+                    });
+                });
+            });
+    }
+
+    /// The context menu for one row, closed by Escape, a click elsewhere or choosing an entry.
+    fn render_row_menu(&mut self, ctx: &egui::Context) {
+        let Some(menu) = self.row_menu.clone() else {
+            return;
+        };
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.row_menu = None;
+            return;
+        }
+        let actions = menu_actions(menu.availability, menu.rel_path.is_empty());
+        let menu_w = 224.0;
+        let menu_h = actions.len() as f32 * 30.0 + 12.0;
+        let screen = ctx.screen_rect();
+        let pos = egui::pos2(
+            menu.pos.x.min(screen.right() - menu_w - 8.0).max(screen.left() + 8.0),
+            menu.pos.y.min(screen.bottom() - menu_h - 8.0).max(screen.top() + 8.0),
+        );
+        let mut chosen: Option<&'static str> = None;
+        let area = egui::Area::new(egui::Id::new("row_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                Frame::NONE
+                    .fill(BG_CARD())
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
+                    .corner_radius(CornerRadius::same(10))
+                    .shadow(egui::Shadow {
+                        offset: [0, 6],
+                        blur: 18,
+                        spread: 0,
+                        color: Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+                    })
+                    .inner_margin(Margin::same(6))
+                    .show(ui, |ui| {
+                        ui.set_min_width(menu_w - 12.0);
+                        ui.set_max_width(menu_w - 12.0);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for (label, action) in &actions {
+                            let entry = egui::Button::new(RichText::new(*label).size(13.0).color(TEXT_PRIMARY()))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE)
+                                .corner_radius(CornerRadius::same(6))
+                                .min_size(Vec2::new(menu_w - 12.0, 28.0));
+                            if ui.add(entry).clicked() {
+                                chosen = Some(action);
+                            }
+                        }
+                    });
+            });
+
+        if let Some(action) = chosen {
+            match action {
+                "hide" => {
+                    self.pending_confirm =
+                        Some(PendingConfirm::Hide { name: menu.name, rel_path: menu.rel_path });
+                    self.row_menu = None;
+                }
+                _ => self.send_availability(menu.rel_path, action),
+            }
+        } else if ctx.input(|i| i.pointer.any_pressed()) {
+            if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
+                if !area.response.rect.contains(p) {
+                    self.row_menu = None;
+                }
+            }
+        }
+    }
+
+    /// Confirmation for Hide (one item) and Free up all (the current folder).
+    fn render_confirm_modal(&mut self, ctx: &egui::Context) {
+        let Some(confirm) = self.pending_confirm.clone() else {
+            return;
+        };
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.pending_confirm = None;
+            return;
+        }
+
+        let screen_rect = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("confirm_backdrop"))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .fixed_pos(screen_rect.min)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(screen_rect.size(), Sense::hover());
+                ui.painter().rect_filled(rect, 0, Color32::from_rgba_unmultiplied(10, 8, 16, 175));
+            });
+
+        let modal_w = 436.0;
+        let modal_h = 236.0;
+        let modal_pos = egui::pos2(
+            screen_rect.center().x - modal_w * 0.5,
+            screen_rect.center().y - modal_h * 0.5,
+        );
+
+        let (title, body, detail, button, action_path, action) = match &confirm {
+            PendingConfirm::Hide { name, rel_path } => (
+                format!("Hide \"{name}\" from this computer?"),
+                format!("\"{name}\" disappears from your Proton Drive folder on this computer. It stays in Proton Drive, and you can unhide it any time."),
+                "Changes that haven't synced yet are uploaded first. Hiding is refused if anything inside exists only on this computer.",
+                "Hide",
+                rel_path.clone(),
+                "hide",
+            ),
+            PendingConfirm::FreeAll { rel_path } => {
+                let place = if rel_path.is_empty() { "My files".to_string() } else { format!("\"{rel_path}\"") };
+                (
+                    format!("Free up space in {place}?"),
+                    format!("This removes the local copies of everything in {place} that is safely in Proton Drive. Nothing is deleted online, and files download again when you open them."),
+                    "Anything marked Always keep here stops being kept. Files that aren't fully synced, or that you've told Proton Drive to ignore, stay on this computer.",
+                    "Free up space",
+                    rel_path.clone(),
+                    "free",
+                )
+            }
+        };
+
+        let area_resp = egui::Area::new(egui::Id::new("confirm_dialog"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(modal_pos)
+            .show(ctx, |ui| {
+                Frame::NONE
+                    .fill(BG_CARD())
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
+                    .corner_radius(CornerRadius::same(14))
+                    .shadow(egui::Shadow {
+                        offset: [0, 12],
+                        blur: 32,
+                        spread: 2,
+                        color: Color32::from_rgba_unmultiplied(0, 0, 0, 190),
+                    })
+                    .inner_margin(Margin::symmetric(24, 22))
+                    .show(ui, |ui| {
+                        ui.set_min_width(modal_w - 48.0);
+                        ui.set_max_width(modal_w - 48.0);
+
+                        ui.label(RichText::new(title).size(16.5).strong().color(TEXT_PRIMARY()));
+                        ui.add_space(10.0);
+                        ui.label(RichText::new(body).size(13.0).color(TEXT_PRIMARY()));
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(detail).size(12.5).color(TEXT_MUTED()));
+
+                        ui.add_space(20.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if proton_button(
+                                ui,
+                                Vec2::new(138.0, 36.0),
+                                button,
+                                PROTON_PURPLE,
+                                PROTON_PURPLE_HOVER,
+                                None,
+                                Color32::WHITE,
+                                13.0,
+                            )
+                            .clicked()
+                            {
+                                self.send_availability(action_path.clone(), action);
+                                self.pending_confirm = None;
+                            }
+
+                            ui.add_space(8.0);
+
+                            if proton_button(
+                                ui,
+                                Vec2::new(88.0, 36.0),
+                                "Cancel",
+                                BG_CARD_ALT(),
+                                btn_secondary_hover_bg(),
+                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                                TEXT_PRIMARY(),
+                                13.0,
+                            )
+                            .clicked()
+                            {
+                                self.pending_confirm = None;
+                            }
+                        });
+                    });
+            });
+
+        // Dismiss if clicked outside the dialog
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                if !area_resp.response.rect.contains(pos) {
+                    self.pending_confirm = None;
+                }
             }
         }
     }
@@ -1921,7 +2374,12 @@ impl ProtonDriveNativeApp {
             let gap = ui.spacing().item_spacing.x;
             let crumbs_w = breadcrumbs_width(ui.painter(), &parts, gap);
             let has_items = !self.remote_items.is_empty();
-            let buttons_w = TOOLBAR_REFRESH_W + 6.0 + TOOLBAR_NEW_FOLDER_W + gap * 2.0;
+            let buttons_w = TOOLBAR_REFRESH_W
+                + TOOLBAR_NEW_FOLDER_W
+                + TOOLBAR_FREE_ALL_W
+                + TOOLBAR_KEEP_ALL_W
+                + 3.0 * 6.0
+                + gap * 4.0;
             let folder_count = self.remote_items.iter().filter(|i| i.item_type == "folder").count();
             let file_count = self.remote_items.len().saturating_sub(folder_count);
             let count_text = format!("{folder_count} folders  •  {file_count} files");
@@ -2009,6 +2467,8 @@ impl ProtonDriveNativeApp {
                         });
                     });
             }
+
+            self.render_notice(ui);
 
             ui.add_space(14.0);
 
@@ -2122,18 +2582,7 @@ impl ProtonDriveNativeApp {
                                 availability,
                                 Availability::Pinned | Availability::Downloaded
                             );
-                            let item_rel = {
-                                let dir = self
-                                    .remote_path
-                                    .strip_prefix("/my-files")
-                                    .unwrap_or(&self.remote_path)
-                                    .trim_matches('/');
-                                if dir.is_empty() {
-                                    item.name.clone()
-                                } else {
-                                    format!("{dir}/{}", item.name)
-                                }
-                            };
+                            let item_rel = item_rel_path(&self.remote_path, &item.name);
 
                             let (row_rect, row_resp) = ui.allocate_exact_size(
                                 Vec2::new(ui.available_width(), 42.0),
@@ -2269,6 +2718,34 @@ impl ProtonDriveNativeApp {
                                 );
                             }
 
+                            // The pill and a right-click anywhere on the row open the same menu
+                            let pill_resp = ui.interact(
+                                pill_rect,
+                                ui.id().with(("availability_pill", &item.name)),
+                                Sense::click(),
+                            );
+                            if pill_resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            let menu_pos = if pill_resp.clicked() {
+                                Some(pill_rect.left_bottom() + Vec2::new(0.0, 4.0))
+                            } else if row_resp.secondary_clicked() {
+                                row_resp.interact_pointer_pos()
+                            } else if self.screenshot_menu_for.as_deref() == Some(item.name.as_str()) {
+                                self.screenshot_menu_for = None;
+                                Some(pill_rect.left_bottom() + Vec2::new(0.0, 4.0))
+                            } else {
+                                None
+                            };
+                            if let Some(pos) = menu_pos {
+                                self.row_menu = Some(RowMenu {
+                                    name: item.name.clone(),
+                                    rel_path: item_rel.clone(),
+                                    availability,
+                                    pos,
+                                });
+                            }
+
                             // 3. Modified Date Column (date only on narrow windows, dropped on the narrowest)
                             if let Some(mod_x) = row_cols.mod_x {
                                 let modified = format_iso_date(&item.modification_time);
@@ -2307,16 +2784,7 @@ impl ProtonDriveNativeApp {
                                     item.name
                                 ));
                             } else if !is_folder && has_local_copy && row_resp.clicked() {
-                                let rel_sub = self
-                                    .remote_path
-                                    .strip_prefix("/my-files")
-                                    .unwrap_or(&self.remote_path)
-                                    .trim_matches('/');
-                                let local_target = if rel_sub.is_empty() {
-                                    format!("{}/{}", self.status.sync_dir, item.name)
-                                } else {
-                                    format!("{}/{}/{}", self.status.sync_dir, rel_sub, item.name)
-                                };
+                                let local_target = format!("{}/{}", self.status.sync_dir, item_rel);
                                 let _ = spawn_reaped(Command::new("xdg-open").arg(local_target));
                             }
                         }
@@ -2715,6 +3183,8 @@ impl eframe::App for ProtonDriveNativeApp {
             });
 
         self.render_account_popover(ctx);
+        self.render_row_menu(ctx);
+        self.render_confirm_modal(ctx);
 
         // Handle --screenshot <path> for automated visual inspection
         if let Some(target_path) = self.screenshot_target.clone() {
@@ -2919,6 +3389,8 @@ const BREADCRUMB_SEPARATOR_SIZE: f32 = 15.0;
 const BREADCRUMB_PAD_X: f32 = 12.0;
 const TOOLBAR_REFRESH_W: f32 = 84.0;
 const TOOLBAR_NEW_FOLDER_W: f32 = 108.0;
+const TOOLBAR_KEEP_ALL_W: f32 = 84.0;
+const TOOLBAR_FREE_ALL_W: f32 = 100.0;
 /// Safety margin for toolbar widths that are estimated before layout.
 const TOOLBAR_FIT_SLACK: f32 = 12.0;
 
@@ -3655,6 +4127,15 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                 });
                 ctx.request_repaint();
             }
+            WorkerCommand::SetAvailability { path, action } => {
+                // Off-thread: Free and Hide can take a while on big folders
+                let tx_clone = tx.clone();
+                let ctx_clone = ctx.clone();
+                thread::spawn(move || {
+                    let _ = tx_clone.send(WorkerEvent::AvailabilityDone(set_availability(&path, &action)));
+                    ctx_clone.request_repaint();
+                });
+            }
             WorkerCommand::LoadConflicts => {
                 if let Ok(resp) = ureq::get(&format!("{DAEMON_URL}/api/conflicts")).call() {
                     if let Ok(list) = resp.into_json::<Vec<ConflictRecord>>() {
@@ -3745,6 +4226,9 @@ OPTIONS:
   --screenshot <PATH>   render UI, save a PNG screenshot to PATH, and exit
   --search <QUERY>      pre-fill the search/filter box
   --remote-fixture <F>  with --screenshot: list My files from a JSON file instead of the daemon
+  --row-menu <NAME>     with --screenshot: open the actions menu of the item NAME
+  --confirm-hide <NAME> with --screenshot: show the Hide confirmation for the item NAME
+  --confirm-free-all    with --screenshot: show the Free up all confirmation
   --path <FOLDER>       open My files at a remote folder, e.g. /my-files/photos
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --version             print the version
@@ -3768,6 +4252,9 @@ fn main() -> eframe::Result {
     let mut cli_path: Option<String> = None;
     let mut cli_size: Option<[f32; 2]> = None;
     let mut cli_fixture: Option<String> = None;
+    let mut cli_row_menu: Option<String> = None;
+    let mut cli_confirm_hide: Option<String> = None;
+    let mut cli_confirm_free_all = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -3780,6 +4267,15 @@ fn main() -> eframe::Result {
             "--remote-fixture" => {
                 // Screenshot-only: show this RemoteListResponse JSON instead of the daemon's listing
                 cli_fixture = args.next();
+            }
+            "--row-menu" => {
+                cli_row_menu = args.next();
+            }
+            "--confirm-hide" => {
+                cli_confirm_hide = args.next();
+            }
+            "--confirm-free-all" => {
+                cli_confirm_free_all = true;
             }
             "--theme" => {
                 cli_theme_override = args.next();
@@ -3894,6 +4390,17 @@ fn main() -> eframe::Result {
             );
             if let Some(q) = cli_search {
                 app.search_query = q;
+            }
+            // Screenshot-only: these flags only draw the menu and dialogs, nothing is sent
+            if app.screenshot_target.is_some() {
+                app.screenshot_menu_for = cli_row_menu;
+                if let Some(name) = cli_confirm_hide {
+                    let rel_path = item_rel_path(&app.remote_path, &name);
+                    app.pending_confirm = Some(PendingConfirm::Hide { name, rel_path });
+                } else if cli_confirm_free_all {
+                    let rel_path = folder_rel_path(&app.remote_path).to_string();
+                    app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path });
+                }
             }
             Ok(Box::new(app))
         }),
@@ -4214,5 +4721,165 @@ mod tests {
         assert_eq!(availability_pill(Availability::OnlineOnly), ("Online only", PillStyle::Muted));
         assert_eq!(availability_pill(Availability::Hidden), ("Hidden", PillStyle::Muted));
         assert_eq!(availability_pill(Availability::Hiding), ("Hiding…", PillStyle::Muted));
+    }
+
+    #[test]
+    fn menu_actions_follow_the_state() {
+        use Availability::*;
+        let keep = ("Always keep on this device", "pin");
+        let free = ("Free up space", "free");
+        let hide = ("Hide from this computer", "hide");
+        let unhide = ("Unhide", "unhide");
+        assert_eq!(menu_actions(Pinned, false), vec![free, hide]);
+        assert_eq!(menu_actions(Downloaded, false), vec![keep, free, hide]);
+        assert_eq!(menu_actions(OnlineOnly, false), vec![keep, hide]);
+        assert_eq!(menu_actions(Hidden, false), vec![keep, unhide]);
+        assert_eq!(menu_actions(Hiding, false), vec![keep, unhide]);
+    }
+
+    #[test]
+    fn menu_actions_never_offer_hide_on_the_root() {
+        use Availability::*;
+        for a in [Pinned, Downloaded, OnlineOnly, Hidden, Hiding] {
+            assert!(menu_actions(a, true).iter().all(|(_, action)| *action != "hide"), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn control_socket_path_honours_xdg_runtime_dir_and_falls_back_to_tmp() {
+        let tmp = std::path::PathBuf::from("/tmp");
+        assert_eq!(
+            control_socket_path_from(Some("/run/user/1000".into()), tmp.clone(), 1000),
+            std::path::PathBuf::from("/run/user/1000/protondrive/control.sock")
+        );
+        for unset in [None, Some(std::ffi::OsString::new())] {
+            assert_eq!(
+                control_socket_path_from(unset, tmp.clone(), 1000),
+                std::path::PathBuf::from("/tmp/protondrive-1000/control.sock")
+            );
+        }
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/4242");
+        assert_eq!(control_socket_path(), std::path::PathBuf::from("/run/user/4242/protondrive/control.sock"));
+    }
+
+    /// Serves one canned HTTP reply on a fresh socket; returns the socket path and the request it saw.
+    fn serve_once(reply: &'static [u8]) -> (std::path::PathBuf, thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("pd-gui-test-{}-{:?}", std::process::id(), thread::current().id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join(format!("c{}.sock", reply.len()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let handle = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = conn.read(&mut buf).unwrap();
+                seen.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&seen).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let want = head
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                        .unwrap_or(0);
+                    if body.len() >= want {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            conn.write_all(reply).unwrap();
+            String::from_utf8_lossy(&seen).to_string()
+        });
+        (sock, handle)
+    }
+
+    #[test]
+    fn control_request_parses_a_json_reply() {
+        let reply: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 48\r\n\r\n{\"state\":\"pinned\",\"kept\":[\"a/b\"],\"refused\":null}   ";
+        let (sock, server) = serve_once(reply);
+        let body = serde_json::json!({ "path": "Projects", "action": "pin" });
+        let got = control_request_at(&sock, "POST", "/availability", Some(&body)).unwrap();
+        assert_eq!(got["state"], "pinned");
+        assert_eq!(got["kept"][0], "a/b");
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /availability HTTP/1.1\r\n"), "{request}");
+        assert!(request.to_ascii_lowercase().contains("connection: close"));
+        assert!(request.ends_with(&body.to_string()));
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn control_request_reads_to_eof_without_content_length() {
+        let reply: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"path\":\"x\",\"state\":\"hidden\"}";
+        let (sock, server) = serve_once(reply);
+        let got = control_request_at(&sock, "GET", "/availability?path=x", None).unwrap();
+        assert_eq!(got["state"], "hidden");
+        assert!(server.join().unwrap().starts_with("GET /availability?path=x HTTP/1.1"));
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn control_request_turns_an_error_status_into_the_daemon_message() {
+        let reply: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 34\r\n\r\n{\"error\":\"Not in Proton Drive: x\"}    ";
+        let (sock, server) = serve_once(reply);
+        let err = control_request_at(&sock, "GET", "/availability?path=x", None).unwrap_err();
+        server.join().unwrap();
+        assert_eq!(err, "Not in Proton Drive: x");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn control_request_reports_a_missing_daemon() {
+        let err = control_request_at(std::path::Path::new("/nonexistent/control.sock"), "GET", "/availability?path=", None).unwrap_err();
+        assert!(err.contains("Proton Drive background service"), "{err}");
+    }
+
+    #[test]
+    fn item_rel_path_strips_my_files_and_joins_the_name() {
+        assert_eq!(item_rel_path("/my-files", "a.txt"), "a.txt");
+        assert_eq!(item_rel_path("/my-files/", "a.txt"), "a.txt");
+        assert_eq!(item_rel_path("/my-files/Projects/2026", "a b.txt"), "Projects/2026/a b.txt");
+        assert_eq!(item_rel_path("/", "x"), "x");
+    }
+
+    #[test]
+    fn availability_notice_prefers_the_refusal_then_lists_kept_items() {
+        let r = |kept: &[&str], refused: Option<&str>| AvailabilityResult {
+            state: "online-only".into(),
+            kept: kept.iter().map(|s| s.to_string()).collect(),
+            refused: refused.map(String::from),
+        };
+        assert_eq!(availability_notice(&r(&[], None)), None);
+        assert_eq!(
+            availability_notice(&r(&["a"], Some("Can't hide x: y exists only on this computer"))).as_deref(),
+            Some("Can't hide x: y exists only on this computer")
+        );
+        assert_eq!(
+            availability_notice(&r(&["a/b.txt"], None)).as_deref(),
+            Some("1 item stays on this computer because it isn't safely in Proton Drive: a/b.txt")
+        );
+        assert_eq!(
+            availability_notice(&r(&["1", "2", "3", "4", "5"], None)).as_deref(),
+            Some("5 items stay on this computer because they aren't safely in Proton Drive: 1, 2, 3 and 2 more")
+        );
+    }
+
+    #[test]
+    fn toolbar_buttons_are_wide_enough_for_their_labels() {
+        with_painter(|p| {
+            for (label, w) in [
+                ("Refresh", TOOLBAR_REFRESH_W),
+                ("+ New folder", TOOLBAR_NEW_FOLDER_W),
+                ("Keep all", TOOLBAR_KEEP_ALL_W),
+                ("Free up all", TOOLBAR_FREE_ALL_W),
+            ] {
+                let text_w = text_width(p, label, &FontId::proportional(13.0));
+                assert!(text_w + 20.0 <= w, "{label}: {text_w} in {w}");
+            }
+        });
     }
 }
