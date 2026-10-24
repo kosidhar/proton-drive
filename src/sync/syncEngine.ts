@@ -22,8 +22,10 @@ import {
     uploadLocalFileToDrive,
 } from '../sdk/fileOps';
 import { getName } from '../sdk/node';
+import { AvailabilityPolicy } from './availability';
 import { createLocalConflictCopy } from './conflictResolver';
 import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
+import { entryFromNode, RemoteIndex } from './remoteIndex';
 import type { ConflictRecord, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
 
 // Something in a folder that only exists on this computer, so making the folder Cloud only would lose it
@@ -58,6 +60,8 @@ export class ProtonDriveSyncEngine {
     private localQueue = new Map<string, Promise<void>>();
     private exclusionRun: Promise<void> = Promise.resolve();
     private reportedUnsyncedCopies = new Set<string>();
+    private readonly index: RemoteIndex;
+    private readonly policy: AvailabilityPolicy;
 
     constructor(
         private readonly sdk: ProtonDriveClient,
@@ -66,6 +70,8 @@ export class ProtonDriveSyncEngine {
         private readonly stateDb: SyncStateDatabase,
         private readonly logger: Logger,
     ) {
+        this.index = new RemoteIndex(this.stateDb.connection);
+        this.policy = new AvailabilityPolicy(this.stateDb.connection, this.index);
         this.watcher = new LocalFolderWatcher(
             () => this.stateDb.getSettings().syncDir,
             () => {
@@ -564,6 +570,7 @@ export class ProtonDriveSyncEngine {
             await this.applySelectiveSyncExclusions();
             const root = await this.getRootFolder();
             await this.eventsManager.subscribeDriveScope(root.treeEventScopeId);
+            this.index.setRoot(root.uid);
 
             // Sync folder-by-folder incrementally so files & folders appear in ~/ProtonDrive
             // and in the GUI dashboard immediately instead of waiting for a full tree scan.
@@ -1157,6 +1164,7 @@ export class ProtonDriveSyncEngine {
         }
 
         if (event.type === DriveEventType.NodeDeleted) {
+            this.index.removeSubtree(event.nodeUid);
             const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
             if (tracked) {
                 const localFullPath = path.join(settings.syncDir, tracked.localRelPath);
@@ -1174,6 +1182,7 @@ export class ProtonDriveSyncEngine {
 
         if (event.type === DriveEventType.NodeCreated || event.type === DriveEventType.NodeUpdated) {
             if (event.isTrashed) {
+                this.index.removeSubtree(event.nodeUid);
                 const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
                 if (tracked) {
                     const localFullPath = path.join(settings.syncDir, tracked.localRelPath);
@@ -1192,6 +1201,14 @@ export class ProtonDriveSyncEngine {
             // Trigger incremental reconcile
             await this.reconcileNow();
         }
+    }
+
+    get remoteIndex(): RemoteIndex {
+        return this.index;
+    }
+
+    get availability(): AvailabilityPolicy {
+        return this.policy;
     }
 
     private async getRootFolder(): Promise<NodeEntity> {
@@ -1241,6 +1258,27 @@ export class ProtonDriveSyncEngine {
         return currentParent;
     }
 
+    private indexEntries(children: NodeEntity[], parentRelPath: string) {
+        return children.flatMap((child) => {
+            const entry = entryFromNode(child, parentRelPath);
+            return entry ? [entry] : [];
+        });
+    }
+
+    // Lists and records a remote folder's subtree in the index without touching disk or sync state.
+    private async indexRemoteSubtree(node: NodeEntity, relPath: string): Promise<void> {
+        if (this.policy.hiddenBy(relPath)) {
+            return;
+        }
+        const children = await listFolderChildren(this.sdk, node);
+        this.index.replaceChildren(node.uid, relPath, this.indexEntries(children, relPath));
+        for (const child of children) {
+            if (child.type === NodeType.Folder) {
+                await this.indexRemoteSubtree(child, `${relPath}/${getName(child)}`);
+            }
+        }
+    }
+
     private async reconcileDirectoryIncremental(
         folderNode: NodeEntity,
         prefix: string,
@@ -1262,6 +1300,8 @@ export class ProtonDriveSyncEngine {
 
         this.currentAction = `Listing /my-files/${prefix || ''}`;
         const remoteChildren = await listFolderChildren(this.sdk, folderNode);
+        // Record the whole listing (ignored children too) before any child is reconciled
+        this.index.replaceChildren(folderNode.uid, prefix, this.indexEntries(remoteChildren, prefix));
         const freshSettings = this.stateDb.getSettings();
         const remoteChildByName = new Map<string, NodeEntity>();
         for (const child of remoteChildren) {
@@ -1338,6 +1378,8 @@ export class ProtonDriveSyncEngine {
                 .catch(() => false);
             if (resolvedFolderNode && resolvedFolderNode.type === NodeType.Folder && localStillExists) {
                 subFoldersToRecurse.push({ node: resolvedFolderNode, relPath });
+            } else if (resolvedFolderNode && resolvedFolderNode.type === NodeType.Folder) {
+                await this.indexRemoteSubtree(resolvedFolderNode, relPath);
             }
         }
 

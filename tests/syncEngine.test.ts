@@ -466,4 +466,100 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(recordCount('Gone')).toBe(0);
         });
     });
+
+    describe('remote index', () => {
+        const setup = () => {
+            const remoteNodes = new Map<string, NodeEntity & { content?: string }>();
+            const rootNode = makeMockNode({ uid: 'vol~root', nameStr: 'root', type: NodeType.Folder });
+            const archive = makeMockNode({ uid: 'vol~archive', parentUid: rootNode.uid, nameStr: 'Archive', type: NodeType.Folder });
+            const year = makeMockNode({ uid: 'vol~year', parentUid: archive.uid, nameStr: '2025', type: NodeType.Folder });
+            const tax = makeMockNode({ uid: 'vol~tax', parentUid: year.uid, nameStr: 'tax.pdf', type: NodeType.File, content: 'tax' });
+            for (const n of [rootNode, archive, year, tax]) remoteNodes.set(n.uid, n);
+
+            let eventCallback: ((context: 'drive' | 'photos', event: DriveEvent) => Promise<void>) | null = null;
+            const mockEventsManager = {
+                addEventListener: (cb: (context: 'drive' | 'photos', event: DriveEvent) => Promise<void>) => {
+                    eventCallback = cb;
+                    return () => {
+                        eventCallback = null;
+                    };
+                },
+                subscribeDriveScope: async () => {},
+            } as unknown as EventsManager;
+            const mockSdk = {
+                getMyFilesRootFolder: async () => rootNode,
+                getNode: async (uid: string) => {
+                    const found = remoteNodes.get(uid);
+                    if (!found) throw new Error(`Node ${uid} not found`);
+                    return found;
+                },
+                iterateFolderChildren: async function* (parent: NodeEntity | string) {
+                    const parentUid = typeof parent === 'string' ? parent : parent.uid;
+                    for (const node of remoteNodes.values()) {
+                        if (node.uid !== rootNode.uid && node.parentUid === parentUid) yield node;
+                    }
+                },
+                getFileRevisionDownloader: async (revisionUid: string) => {
+                    const node = remoteNodes.get(revisionUid.replace(/~rev\d+$/, ''));
+                    const bytes = Buffer.from(node?.content ?? '');
+                    return {
+                        downloadToStream: (writable: WritableStream, onProgress?: (b: number) => void) => {
+                            const writer = writable.getWriter();
+                            const promise = (async () => {
+                                await writer.write(bytes);
+                                onProgress?.(bytes.length);
+                            })();
+                            return { completion: () => promise };
+                        },
+                    };
+                },
+            } as unknown as ProtonDriveClient;
+            const logger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
+            const engine = new ProtonDriveSyncEngine(mockSdk, mockEventsManager, { isLoggedIn: () => true }, stateDb, logger);
+            return { engine, remoteNodes, rootNode, archive, fire: (e: DriveEvent) => eventCallback!('drive', e) };
+        };
+
+        test('indexRemoteSubtree records a subtree without touching disk', async () => {
+            const { engine, rootNode, archive } = setup();
+            engine.remoteIndex.setRoot(rootNode.uid);
+            await (engine as any).indexRemoteSubtree(archive, 'Archive');
+
+            expect(engine.remoteIndex.getByPath('Archive/2025/tax.pdf')).not.toBeNull();
+            const archiveExists = await stat(path.join(stateDb.getSettings().syncDir, 'Archive'))
+                .then(() => true)
+                .catch(() => false);
+            expect(archiveExists).toBe(false);
+        });
+
+        test('a remote rename moves the subtree in the index', async () => {
+            const { engine, remoteNodes, archive } = setup();
+            await engine.start();
+            expect(engine.remoteIndex.getByPath('Archive/2025/tax.pdf')).not.toBeNull();
+
+            remoteNodes.set(archive.uid, { ...archive, name: { ok: true, value: 'Old' } });
+            await engine.reconcileNow();
+
+            expect(engine.remoteIndex.getByPath('Old/2025/tax.pdf')).not.toBeNull();
+            expect(engine.remoteIndex.getByPath('Archive')).toBeNull();
+            await engine.stop();
+        });
+
+        test('a NodeDeleted event removes the subtree', async () => {
+            const { engine, rootNode, archive, fire } = setup();
+            await engine.start();
+            expect(engine.remoteIndex.getByPath('Archive/2025/tax.pdf')).not.toBeNull();
+
+            await fire({
+                type: DriveEventType.NodeDeleted,
+                nodeUid: archive.uid,
+                parentNodeUid: rootNode.uid,
+                treeEventScopeId: 'scope-main',
+                eventId: 'evt-200',
+            });
+
+            expect(engine.remoteIndex.getByPath('Archive/2025/tax.pdf')).toBeNull();
+            expect(engine.remoteIndex.getByPath('Archive')).toBeNull();
+            await engine.stop();
+        });
+    });
 });
