@@ -486,6 +486,8 @@ export class ProtonDriveSyncEngine {
             await mkdir(settings.syncDir, { recursive: true });
             const root = await this.getRootFolder();
             const children = await listFolderChildren(this.sdk, root);
+            this.index.setRoot(root.uid);
+            this.recordListing(root, '', children);
             const childByName = new Map<string, NodeEntity>();
             for (const c of children) {
                 childByName.set(getName(c), c);
@@ -1079,6 +1081,7 @@ export class ProtonDriveSyncEngine {
                 localRelPath: relPath,
                 details: 'Moved remote item to Proton Drive Trash after local deletion',
             });
+            this.index.removeSubtree(remoteNode.uid);
         } catch (error: unknown) {
             this.logger.warn(`Failed to trash remote node for ${relPath}: ${error}`);
         }
@@ -1265,13 +1268,30 @@ export class ProtonDriveSyncEngine {
         });
     }
 
+    // The index is a cache: a listing is written only for a folder the index still holds at that path (so no orphan rows),
+    // and a failed write is logged without aborting the sync.
+    private recordListing(folder: NodeEntity, relPath: string, children: NodeEntity[]): boolean {
+        try {
+            if (relPath !== '' && this.index.getByUid(folder.uid)?.relPath !== relPath) {
+                return false;
+            }
+            this.index.replaceChildren(folder.uid, relPath, this.indexEntries(children, relPath));
+            return true;
+        } catch (error: unknown) {
+            this.logger.warn(`Failed to update the remote index for ${relPath || '/'}: ${error}`);
+            return false;
+        }
+    }
+
     // Lists and records a remote folder's subtree in the index without touching disk or sync state.
     private async indexRemoteSubtree(node: NodeEntity, relPath: string): Promise<void> {
-        if (this.policy.hiddenBy(relPath)) {
+        if (this.index.getByUid(node.uid)?.relPath !== relPath || this.policy.hiddenBy(relPath)) {
             return;
         }
         const children = await listFolderChildren(this.sdk, node);
-        this.index.replaceChildren(node.uid, relPath, this.indexEntries(children, relPath));
+        if (!this.recordListing(node, relPath, children)) {
+            return;
+        }
         for (const child of children) {
             if (child.type === NodeType.Folder) {
                 await this.indexRemoteSubtree(child, `${relPath}/${getName(child)}`);
@@ -1301,7 +1321,7 @@ export class ProtonDriveSyncEngine {
         this.currentAction = `Listing /my-files/${prefix || ''}`;
         const remoteChildren = await listFolderChildren(this.sdk, folderNode);
         // Record the whole listing (ignored children too) before any child is reconciled
-        this.index.replaceChildren(folderNode.uid, prefix, this.indexEntries(remoteChildren, prefix));
+        this.recordListing(folderNode, prefix, remoteChildren);
         const freshSettings = this.stateDb.getSettings();
         const remoteChildByName = new Map<string, NodeEntity>();
         for (const child of remoteChildren) {

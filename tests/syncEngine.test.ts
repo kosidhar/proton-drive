@@ -14,6 +14,7 @@ import {
 
 import type { Manager as EventsManager } from '../src/sdk/events/manager';
 import { computeLocalFileSha1, detectMediaType, THIRD_PARTY_DISCLOSURE } from '../src/sdk/fileOps';
+import { entryFromNode } from '../src/sync/remoteIndex';
 import { createLocalConflictCopy, formatConflictFileName } from '../src/sync/conflictResolver';
 import { matchesIgnorePatterns } from '../src/sync/localWatcher';
 import { ProtonDriveSyncEngine } from '../src/sync/syncEngine';
@@ -513,6 +514,12 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                         },
                     };
                 },
+                trashNodes: async function* (nodes: NodeEntity[]) {
+                    for (const n of nodes) {
+                        remoteNodes.delete(n.uid);
+                        yield { uid: n.uid, ok: true as const };
+                    }
+                },
             } as unknown as ProtonDriveClient;
             const logger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
             const engine = new ProtonDriveSyncEngine(mockSdk, mockEventsManager, { isLoggedIn: () => true }, stateDb, logger);
@@ -522,6 +529,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         test('indexRemoteSubtree records a subtree without touching disk', async () => {
             const { engine, rootNode, archive } = setup();
             engine.remoteIndex.setRoot(rootNode.uid);
+            engine.remoteIndex.replaceChildren(rootNode.uid, '', [entryFromNode(archive, '')!]);
             await (engine as any).indexRemoteSubtree(archive, 'Archive');
 
             expect(engine.remoteIndex.getByPath('Archive/2025/tax.pdf')).not.toBeNull();
@@ -560,6 +568,43 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(engine.remoteIndex.getByPath('Archive/2025/tax.pdf')).toBeNull();
             expect(engine.remoteIndex.getByPath('Archive')).toBeNull();
             await engine.stop();
+        });
+
+        test('orphan rows followed by a rename onto their path do not break the reconcile', async () => {
+            const { engine, remoteNodes, archive } = setup();
+            await engine.start();
+            // Orphans: rows whose parent folder row is missing, sitting where the renamed Archive will land
+            for (const [uid, parentUid, relPath, type] of [
+                ['orphan-dir', 'gone', 'Moved/2025', 'folder'],
+                ['orphan-file', 'orphan-dir', 'Moved/2025/x', 'file'],
+            ] as const) {
+                engine.remoteIndex.upsert({ uid, parentUid, relPath, name: path.posix.basename(relPath), type, size: 0, mtimeMs: 0, sha1: null });
+            }
+
+            remoteNodes.set(archive.uid, { ...archive, name: { ok: true, value: 'Moved' } });
+            await engine.reconcileNow();
+
+            expect(engine.getStatus().state).not.toBe('error');
+            await engine.stop();
+        });
+
+        test('a locally deleted synced folder leaves no index entries once it is trashed', async () => {
+            const { engine, remoteNodes, archive } = setup();
+            await engine.start();
+
+            await rm(path.join(stateDb.getSettings().syncDir, 'Archive'), { recursive: true, force: true });
+            await engine.reconcileNow();
+
+            expect(remoteNodes.has(archive.uid)).toBe(false);
+            expect(engine.remoteIndex.getByPath('Archive')).toBeNull();
+            expect(engine.remoteIndex.getByPath('Archive/2025/tax.pdf')).toBeNull();
+            await engine.stop();
+        });
+
+        test('syncFoldersPriority indexes the root listing', async () => {
+            const { engine } = setup();
+            await engine.syncFoldersPriority(['Archive']);
+            expect(engine.remoteIndex.getByPath('Archive')).not.toBeNull();
         });
     });
 });
