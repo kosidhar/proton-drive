@@ -1719,4 +1719,53 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(engine.availability.stateOf('Music')).toBe('downloaded');
         });
     });
+
+    describe('virtual layout', () => {
+        test('the engine works entirely in the backing dir and never creates anything in the sync folder', async () => {
+            const backingDir = path.join(tempDir, 'files');
+            const syncDir = stateDb.getSettings().syncDir;
+            stateDb.setMeta('driveLayout', 'virtual');
+            const drive = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                backingDir,
+            });
+            const files = localFiles(stateDb, () => backingDir);
+            expect(engine.localRoot()).toBe(backingDir);
+            expect(engine.getStatus().syncDir).toBe(syncDir);
+
+            drive.add('Docs/a.txt', 'a');
+            engine.availability.setPin(drive.add('Docs').uid, 'pinned', false);
+            await engine.reconcileNow();
+            expect(await readFile(path.join(backingDir, 'Docs/a.txt'), 'utf8')).toBe('a');
+
+            await files.writeLocal('Docs/new.txt', 'new');
+            await engine.reconcileNow();
+            expect(drive.calls.uploads).toEqual(['Docs/new.txt']);
+
+            await engine.setAvailability('Docs', 'free');
+            expect(await files.exists('Docs/a.txt')).toBe(false);
+            expect(drive.calls.trashed).toEqual([]);
+
+            expect(await stat(syncDir).then(() => true, () => false)).toBe(false);
+            await engine.stop();
+        });
+        test('relocating the sync folder only changes the setting, leaving the backing dir alone', async () => {
+            const backingDir = path.join(tempDir, 'files');
+            stateDb.setMeta('driveLayout', 'virtual');
+            await mkdir(backingDir, { recursive: true });
+            await writeFile(path.join(backingDir, 'a.txt'), 'a');
+            const drive = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                backingDir,
+            });
+            const target = path.join(tempDir, 'Elsewhere');
+
+            const result = await engine.relocateSyncFolder(stateDb.getSettings().syncDir, target);
+
+            expect(result).toBe(target);
+            expect(stateDb.getSettings().syncDir).toBe(target);
+            expect(await readFile(path.join(backingDir, 'a.txt'), 'utf8')).toBe('a');
+            expect(await stat(target).then(() => true, () => false)).toBe(false);
+        });
+    });
 });

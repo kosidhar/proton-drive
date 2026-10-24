@@ -26,6 +26,7 @@ import { getName } from '../sdk/node';
 import { AvailabilityPolicy, type ItemAvailability } from './availability';
 import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
 import { createLocalConflictCopy } from './conflictResolver';
+import { readDriveLayout } from './driveMode';
 import { isEngineTempName, removeScannedEntries, scanLocalCopies } from './localCopies';
 import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
 import { entryFromNode, RemoteIndex, type RemoteIndexEntry } from './remoteIndex';
@@ -102,11 +103,12 @@ export class ProtonDriveSyncEngine {
         private readonly auth: { isLoggedIn(): boolean },
         private readonly stateDb: SyncStateDatabase,
         private readonly logger: Logger,
+        private readonly options: { backingDir?: string } = {},
     ) {
         this.index = new RemoteIndex(this.stateDb.connection);
         this.policy = new AvailabilityPolicy(this.stateDb.connection, this.index);
         this.watcher = new LocalFolderWatcher(
-            () => this.stateDb.getSettings().syncDir,
+            () => this.localRoot(),
             (relPath) =>
                 matchesIgnorePatterns(relPath, this.stateDb.getSettings().ignorePatterns) ||
                 this.policy.hiddenBy(relPath)?.hide === 'hidden', // a folder being hidden still uploads its changes
@@ -114,6 +116,14 @@ export class ProtonDriveSyncEngine {
                 await this.handleLocalFileChange(ev.relPath);
             },
         );
+    }
+
+    // Where the engine keeps files: the backing store in the virtual layout, the sync folder otherwise.
+    // User-facing code (status, GUI, CLI paths) keeps using the sync folder.
+    localRoot(): string {
+        return readDriveLayout(this.stateDb) === 'virtual' && this.options.backingDir
+            ? this.options.backingDir
+            : this.stateDb.getSettings().syncDir;
     }
 
     getStatus() {
@@ -142,7 +152,7 @@ export class ProtonDriveSyncEngine {
 
     async start(options: { backgroundInitialReconcile?: boolean } = {}): Promise<void> {
         const settings = this.stateDb.getSettings();
-        await mkdir(settings.syncDir, { recursive: true });
+        await mkdir(this.localRoot(), { recursive: true });
         this.reconcilePasses = 0;
         this.onlineOnlyCrawlDue = true;
 
@@ -219,6 +229,12 @@ export class ProtonDriveSyncEngine {
         }
 
         if (resolvedNew === resolvedOld) {
+            return resolvedNew;
+        }
+
+        // The files are in the backing store, not the sync folder: only the setting changes (the mount moves with it)
+        if (readDriveLayout(this.stateDb) === 'virtual') {
+            this.stateDb.updateSettings({ syncDir: resolvedNew });
             return resolvedNew;
         }
 
@@ -326,7 +342,7 @@ export class ProtonDriveSyncEngine {
         this.onlineOnlyCrawlDue = false;
 
         try {
-            await mkdir(settings.syncDir, { recursive: true });
+            await mkdir(this.localRoot(), { recursive: true });
             const root = await this.getRootFolder();
             await this.eventsManager.subscribeDriveScope(root.treeEventScopeId);
             this.index.setRoot(root.uid);
@@ -389,7 +405,7 @@ export class ProtonDriveSyncEngine {
         settings: SyncSettings,
         since: number,
     ): Promise<void> {
-        const localFullPath = path.join(settings.syncDir, relPath);
+        const localFullPath = path.join(this.localRoot(), relPath);
         const hiddenBy = this.policy.hiddenBy(relPath);
         if (hiddenBy?.hide === 'hidden') {
             return; // Hidden: never downloaded, uploaded or trashed from here
@@ -671,7 +687,7 @@ export class ProtonDriveSyncEngine {
 
         // Default: keep-both
         const conflictCopyFullPath = await createLocalConflictCopy(localFullPath);
-        const conflictCopyRelPath = path.relative(settings.syncDir, conflictCopyFullPath).split(path.sep).join('/');
+        const conflictCopyRelPath = path.relative(this.localRoot(), conflictCopyFullPath).split(path.sep).join('/');
         await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
 
         const parentNode = await this.ensureParentFolderNode(conflictCopyRelPath, remoteMap);
@@ -704,7 +720,7 @@ export class ProtonDriveSyncEngine {
             throw new Error(`Conflict #${conflictId} not found`);
         }
         const settings = this.stateDb.getSettings();
-        const localFullPath = path.join(settings.syncDir, conflict.localRelPath);
+        const localFullPath = path.join(this.localRoot(), conflict.localRelPath);
         const remoteMap = new Map<string, NodeEntity>();
 
         await this.observingLocal(async (since) => {
@@ -719,7 +735,7 @@ export class ProtonDriveSyncEngine {
             } else {
                 const conflictCopyFullPath = await createLocalConflictCopy(localFullPath);
                 const conflictCopyRelPath = path
-                    .relative(settings.syncDir, conflictCopyFullPath)
+                    .relative(this.localRoot(), conflictCopyFullPath)
                     .split(path.sep)
                     .join('/');
                 await this.downloadRemoteToLocal(conflict.localRelPath, remoteNode, localFullPath, since);
@@ -1071,7 +1087,7 @@ export class ProtonDriveSyncEngine {
     // Any failure to look (ENOTDIR, EACCES, …) counts as gone: this only ever decides against writing a record.
     private localItemExists(relPath: string): boolean {
         try {
-            return lstatSync(path.join(this.stateDb.getSettings().syncDir, relPath), { throwIfNoEntry: false }) !== undefined;
+            return lstatSync(path.join(this.localRoot(), relPath), { throwIfNoEntry: false }) !== undefined;
         } catch {
             return false;
         }
@@ -1123,7 +1139,7 @@ export class ProtonDriveSyncEngine {
     }
 
     private existsLocally(relPath: string): Promise<boolean> {
-        return lstat(path.join(this.stateDb.getSettings().syncDir, relPath)).then(
+        return lstat(path.join(this.localRoot(), relPath)).then(
             () => true,
             () => false,
         );
@@ -1153,7 +1169,7 @@ export class ProtonDriveSyncEngine {
         }
 
         const task = this.observingLocal(async (since) => {
-            const fullPath = path.join(settings.syncDir, relPath);
+            const fullPath = path.join(this.localRoot(), relPath);
             const st = await stat(fullPath).catch(() => null);
             const dbRecord = this.stateDb.getItemByPath(relPath);
 
@@ -1223,7 +1239,7 @@ export class ProtonDriveSyncEngine {
             this.index.removeSubtree(event.nodeUid);
             const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
             if (tracked) {
-                const localFullPath = path.join(settings.syncDir, tracked.localRelPath);
+                const localFullPath = path.join(this.localRoot(), tracked.localRelPath);
                 this.watcher.suppressPath(tracked.localRelPath);
                 await rm(localFullPath, { recursive: true, force: true }).catch(() => {});
                 this.stateDb.removeItemByNodeUid(event.nodeUid);
@@ -1241,7 +1257,7 @@ export class ProtonDriveSyncEngine {
                 this.index.removeSubtree(event.nodeUid);
                 const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
                 if (tracked) {
-                    const localFullPath = path.join(settings.syncDir, tracked.localRelPath);
+                    const localFullPath = path.join(this.localRoot(), tracked.localRelPath);
                     this.watcher.suppressPath(tracked.localRelPath);
                     await rm(localFullPath, { recursive: true, force: true }).catch(() => {});
                     this.stateDb.removeItemByNodeUid(event.nodeUid);
@@ -1364,9 +1380,9 @@ export class ProtonDriveSyncEngine {
 
     // Like existsLocally, for a path from outside the engine: one that climbs out of the sync folder is not in it.
     private async existsInSyncFolder(relPath: string): Promise<boolean> {
-        const syncDir = path.resolve(this.stateDb.getSettings().syncDir);
-        const fullPath = path.resolve(syncDir, relPath);
-        const fromRoot = path.relative(syncDir, fullPath);
+        const root = path.resolve(this.localRoot());
+        const fullPath = path.resolve(root, relPath);
+        const fromRoot = path.relative(root, fullPath);
         if (fromRoot === '..' || fromRoot.startsWith(`..${path.sep}`) || path.isAbsolute(fromRoot)) {
             return false;
         }
@@ -1457,7 +1473,7 @@ export class ProtonDriveSyncEngine {
             for (let slash = relPath.indexOf('/'); slash !== -1; slash = relPath.indexOf('/', slash + 1)) {
                 this.watcher.suppressPath(relPath.slice(0, slash));
             }
-            const localFullPath = path.join(settings.syncDir, relPath);
+            const localFullPath = path.join(this.localRoot(), relPath);
             await mkdir(path.dirname(localFullPath), { recursive: true });
             const st = await stat(localFullPath).catch(() => null);
             const localInfo = st
@@ -1509,7 +1525,7 @@ export class ProtonDriveSyncEngine {
         })();
         const settings = this.stateDb.getSettings();
         const scan = await scanLocalCopies({
-            syncDir: settings.syncDir,
+            syncDir: this.localRoot(),
             relPath,
             ignorePatterns: settings.ignorePatterns,
             stopAtFirst: false,
@@ -1520,7 +1536,7 @@ export class ProtonDriveSyncEngine {
         }
         const { kept } = await this.whileRemoving(async (records) => {
             const removal = await removeScannedEntries({
-                syncDir: settings.syncDir,
+                syncDir: this.localRoot(),
                 entries: scan.entries,
                 keep: new Set(scan.localOnly.map((item) => item.relPath)),
                 mode: 'keep-changed',
@@ -1568,7 +1584,7 @@ export class ProtonDriveSyncEngine {
         }
         const settings = this.stateDb.getSettings();
         const scan = await scanLocalCopies({
-            syncDir: settings.syncDir,
+            syncDir: this.localRoot(),
             relPath,
             ignorePatterns: settings.ignorePatterns,
             stopAtFirst: false,
@@ -1607,7 +1623,7 @@ export class ProtonDriveSyncEngine {
         this.policy.setHide(uid, 'hidden');
         const removal = await this.whileRemoving(async (records) => {
             const result = await removeScannedEntries({
-                syncDir: settings.syncDir,
+                syncDir: this.localRoot(),
                 entries: scan.entries,
                 keep: new Set(),
                 mode: 'all-or-nothing',
@@ -1815,7 +1831,7 @@ export class ProtonDriveSyncEngine {
             return;
         }
 
-        const localDirFullPath = prefix ? path.join(liveSettings.syncDir, prefix) : liveSettings.syncDir;
+        const localDirFullPath = prefix ? path.join(this.localRoot(), prefix) : this.localRoot();
         this.watcher.suppressPath(prefix || '.');
         await mkdir(localDirFullPath, { recursive: true });
 
@@ -1896,7 +1912,7 @@ export class ProtonDriveSyncEngine {
             await this.reconcileSinglePath(relPath, remoteChild, localChild, dbRecord, remoteMap, stepSettings, since);
 
             const resolvedFolderNode = remoteMap.get(relPath) ?? remoteChild;
-            const localStillExists = await stat(path.join(stepSettings.syncDir, relPath))
+            const localStillExists = await stat(path.join(this.localRoot(), relPath))
                 .then((s) => s.isDirectory())
                 .catch(() => false);
             if (resolvedFolderNode && resolvedFolderNode.type === NodeType.Folder && localStillExists) {

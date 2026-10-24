@@ -21,6 +21,7 @@ import {
 } from '../sdk';
 import { DAEMON_NOT_RUNNING_MESSAGE, runAvailabilityCommand } from './availabilityCommands';
 import { migrateExcludedFolders } from '../sync/availabilityMigration';
+import { backingDirFor } from '../sync/driveMode';
 import { formatBytes, ProtonDriveSyncEngine } from '../sync/syncEngine';
 import { SyncStateDatabase } from '../sync/syncStateDb';
 
@@ -283,9 +284,10 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
                 runtime.auth,
                 stateDb,
                 runtime.logger,
+                { backingDir: backingDirFor(runtime.config.appDir) },
             );
             // As the daemon does, in case this is the first sync since Cloud only folders were retired
-            await migrateExcludedFolders(stateDb, engine.availability, stateDbPath);
+            await migrateExcludedFolders(stateDb, engine.availability, stateDbPath, engine.localRoot());
             console.log(`Syncing ${stateDb.getSettings().syncDir} with Proton Drive...`);
             await engine.reconcileNow();
             const stats = stateDb.getSummaryStats();
@@ -352,6 +354,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
                     runtime.auth,
                     stateDb,
                     runtime.logger,
+                    { backingDir: backingDirFor(runtime.config.appDir) },
                 );
                 const resolved = await engine.resolveConflictManually(id, choice);
                 console.log(`Conflict #${id} (${resolved.localRelPath}) resolved with ${choice}.`);

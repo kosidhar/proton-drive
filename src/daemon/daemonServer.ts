@@ -14,6 +14,7 @@ import {
     THIRD_PARTY_DISCLOSURE,
 } from '../sdk';
 import { migrateExcludedFolders } from '../sync/availabilityMigration';
+import { backingDirFor } from '../sync/driveMode';
 import { ProtonDriveSyncEngine } from '../sync/syncEngine';
 import { SyncStateDatabase } from '../sync/syncStateDb';
 import { defaultControlSocketPath, startControlServer } from './controlServer';
@@ -80,11 +81,12 @@ export async function startSyncDaemon(options: {
         runtime.auth,
         stateDb,
         runtime.logger,
+        { backingDir: backingDirFor(runtime.config.appDir) },
     );
 
     // Before the first sync with the availability policy, so what is synced today stays downloaded. A failure stops
     // the start: syncing unmigrated would leave old Cloud only records that read as local deletions.
-    if ((await migrateExcludedFolders(stateDb, engine.availability, stateDbPath)) === 'migrated') {
+    if ((await migrateExcludedFolders(stateDb, engine.availability, stateDbPath, engine.localRoot())) === 'migrated') {
         runtime.logger.info('Migrated Cloud only folders to the availability policy');
     }
     await engine.start({ backgroundInitialReconcile: true });

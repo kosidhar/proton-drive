@@ -18,6 +18,7 @@ export async function migrateExcludedFolders(
     stateDb: SyncStateDatabase,
     policy: AvailabilityPolicy,
     dbFilePath: string,
+    localRoot: string = stateDb.getSettings().syncDir,
 ): Promise<'migrated' | 'already-done'> {
     if (stateDb.getMeta(MIGRATED) === '1') {
         return 'already-done';
@@ -34,11 +35,11 @@ export async function migrateExcludedFolders(
             .map((name) => name.trim().replace(/^\/+|\/+$/g, ''))
             .filter((name) => name && name !== '.' && name !== '..' && !name.includes('/')),
     );
-    const { syncDir } = stateDb.getSettings();
+    const root = localRoot;
     const orphaned: string[] = [];
     for (const item of stateDb.getAllItems()) {
         const top = item.localRelPath.split('/')[0]!;
-        if (cloudOnly.has(top) && !(await lstat(path.join(syncDir, item.localRelPath)).then(() => true, () => false))) {
+        if (cloudOnly.has(top) && !(await lstat(path.join(root, item.localRelPath)).then(() => true, () => false))) {
             orphaned.push(item.localRelPath);
         }
     }

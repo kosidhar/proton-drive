@@ -6,8 +6,9 @@ import { computeLocalFileSha1 } from '../../src/sdk/fileOps';
 import type { SyncStateDatabase } from '../../src/sync/syncStateDb';
 
 // Files in the sync folder, as the engine or the user leaves them, and checks on how they line up with the records.
-export function localFiles(stateDb: SyncStateDatabase) {
-    const syncDir = () => stateDb.getSettings().syncDir;
+// `root` says where they are when that is not the sync folder (the backing store of a virtual drive).
+export function localFiles(stateDb: SyncStateDatabase, root?: () => string) {
+    const syncDir = root ?? (() => stateDb.getSettings().syncDir);
     const exists = (rel: string) =>
         stat(path.join(syncDir(), rel))
             .then(() => true)
