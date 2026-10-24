@@ -356,19 +356,31 @@ struct AvailabilityResult {
     refused: Option<String>,
 }
 
+/// The kept things themselves: not the folders holding them, and not the engine's own downloads in progress
+/// (the daemon's own notification applies the same filter).
+fn kept_leaves(kept: &[String]) -> Vec<String> {
+    let is_temp = |p: &str| p.split('/').any(|c| c.starts_with(".proton-drive-tmp-"));
+    let real: Vec<&String> = kept.iter().filter(|p| !is_temp(p)).collect();
+    real.iter()
+        .filter(|p| !real.iter().any(|q| q.strip_prefix(p.as_str()).is_some_and(|rest| rest.starts_with('/'))))
+        .map(|p| (*p).clone())
+        .collect()
+}
+
 /// The line shown above the table after an action: the refusal, else the items that had to stay.
 fn availability_notice(r: &AvailabilityResult) -> Option<String> {
     if let Some(refused) = r.refused.as_ref().filter(|m| !m.is_empty()) {
         return Some(refused.clone());
     }
-    if r.kept.is_empty() {
+    let kept = kept_leaves(&r.kept);
+    if kept.is_empty() {
         return None;
     }
     const SHOWN: usize = 3;
-    let n = r.kept.len();
+    let n = kept.len();
     let (subject, verb) = if n == 1 { ("item", "stays") } else { ("items", "stay") };
     let pronoun = if n == 1 { "it isn't" } else { "they aren't" };
-    let mut names = r.kept.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    let mut names = kept.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
     if n > SHOWN {
         names.push_str(&format!(" and {} more", n - SHOWN));
     }
@@ -394,23 +406,34 @@ fn control_socket_path() -> std::path::PathBuf {
 
 /// One HTTP/1.1 request to the daemon's user-only control socket. Pin, free, hide and unhide go
 /// only through here, never through the TCP API.
-fn control_request(method: &str, path_and_query: &str, body: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
-    control_request_at(&control_socket_path(), method, path_and_query, body)
+fn control_request(
+    method: &str,
+    path_and_query: &str,
+    body: Option<&serde_json::Value>,
+    read_timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    control_request_at(&control_socket_path(), method, path_and_query, body, read_timeout)
 }
+
+/// Pin and free reply only once the work is done, which can take a long time on a big folder.
+const AVAILABILITY_READ_TIMEOUT: Duration = Duration::from_secs(600);
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// What a read timeout means: the daemon accepted the request and is still busy with it.
+const STILL_WORKING: &str = "Still working on it in the background — the list updates when it's done.";
 
 fn control_request_at(
     socket: &std::path::Path,
     method: &str,
     path_and_query: &str,
     body: Option<&serde_json::Value>,
+    read_timeout: Duration,
 ) -> Result<serde_json::Value, String> {
     use std::io::{Read, Write};
     const UNREACHABLE: &str = "Can't reach the Proton Drive background service";
     let mut stream =
         std::os::unix::net::UnixStream::connect(socket).map_err(|e| format!("{UNREACHABLE} ({e})"))?;
-    let timeout = Some(Duration::from_secs(10));
-    let _ = stream.set_read_timeout(timeout);
-    let _ = stream.set_write_timeout(timeout);
+    let _ = stream.set_read_timeout(Some(read_timeout));
+    let _ = stream.set_write_timeout(Some(CONTROL_WRITE_TIMEOUT));
 
     let payload = body.map(|b| b.to_string()).unwrap_or_default();
     let mut request = format!("{method} {path_and_query} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: application/json\r\n");
@@ -423,7 +446,10 @@ fn control_request_at(
 
     // Connection: close ends the reply at EOF; Content-Length, when present, trims anything after the body
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).map_err(|e| format!("{UNREACHABLE} ({e})"))?;
+    stream.read_to_end(&mut raw).map_err(|e| match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => STILL_WORKING.to_string(),
+        _ => format!("{UNREACHABLE} ({e})"),
+    })?;
     let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or("Malformed reply from the Proton Drive background service")?;
     let head = String::from_utf8_lossy(&raw[..split]).to_string();
     let mut body_bytes = &raw[split + 4..];
@@ -454,7 +480,7 @@ fn control_request_at(
 
 fn set_availability(path: &str, action: &str) -> Result<AvailabilityResult, String> {
     let body = serde_json::json!({ "path": path, "action": action });
-    let reply = control_request("POST", "/availability", Some(&body))?;
+    let reply = control_request("POST", "/availability", Some(&body), AVAILABILITY_READ_TIMEOUT)?;
     serde_json::from_value(reply).map_err(|e| e.to_string())
 }
 
@@ -522,7 +548,7 @@ enum WorkerEvent {
     LoginStarted(String),
     RemoteLoaded(Result<RemoteListResponse, String>),
     ConflictsLoaded(Vec<ConflictRecord>),
-    AvailabilityDone(Result<AvailabilityResult, String>),
+    AvailabilityDone { path: String, result: Result<AvailabilityResult, String> },
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -669,6 +695,8 @@ struct ProtonDriveNativeApp {
     new_folder_name: String,
     show_new_folder_modal: bool,
     row_menu: Option<RowMenu>,
+    /// Paths (relative to the sync folder; empty is the whole drive) with an action still running.
+    working: Vec<String>,
     pending_confirm: Option<PendingConfirm>,
     /// Dismissible line above the table: a refusal, the items that had to stay, or an error.
     notice: Option<String>,
@@ -777,6 +805,7 @@ impl ProtonDriveNativeApp {
             new_folder_name: String::new(),
             show_new_folder_modal: false,
             row_menu: None,
+            working: Vec::new(),
             pending_confirm: None,
             notice: None,
             screenshot_menu_for: None,
@@ -868,8 +897,11 @@ impl ProtonDriveNativeApp {
                 WorkerEvent::ConflictsLoaded(conflicts) => {
                     self.conflicts = conflicts;
                 }
-                WorkerEvent::AvailabilityDone(res) => {
-                    self.notice = match res {
+                WorkerEvent::AvailabilityDone { path, result } => {
+                    if let Some(i) = self.working.iter().position(|w| w == &path) {
+                        self.working.remove(i);
+                    }
+                    self.notice = match result {
                         Ok(result) => availability_notice(&result),
                         Err(e) => Some(e),
                     };
@@ -2053,19 +2085,27 @@ impl ProtonDriveNativeApp {
 
         ui.add_space(6.0);
 
-        if proton_button(
-            ui,
-            Vec2::new(TOOLBAR_FREE_ALL_W, 32.0),
-            "Free up all",
-            BG_CARD_ALT(),
-            btn_secondary_hover_bg(),
-            Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-            TEXT_PRIMARY(),
-            13.0,
-        )
-        .on_hover_text("Free up space for everything in this folder")
-        .clicked()
-        {
+        let here = folder_rel_path(&self.remote_path);
+        let folder_busy = self
+            .working
+            .iter()
+            .any(|w| w.is_empty() || w == here || here.starts_with(&format!("{w}/")));
+        let free_all = ui
+            .add_enabled_ui(!folder_busy, |ui| {
+                proton_button(
+                    ui,
+                    Vec2::new(TOOLBAR_FREE_ALL_W, 32.0),
+                    "Free up all",
+                    BG_CARD_ALT(),
+                    btn_secondary_hover_bg(),
+                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                    TEXT_PRIMARY(),
+                    13.0,
+                )
+            })
+            .inner
+            .on_hover_text("Free up space for everything in this folder");
+        if free_all.clicked() && !folder_busy {
             self.pending_confirm = Some(PendingConfirm::FreeAll {
                 rel_path: folder_rel_path(&self.remote_path).to_string(),
             });
@@ -2073,19 +2113,22 @@ impl ProtonDriveNativeApp {
 
         ui.add_space(6.0);
 
-        if proton_button(
-            ui,
-            Vec2::new(TOOLBAR_KEEP_ALL_W, 32.0),
-            "Keep all",
-            BG_CARD_ALT(),
-            btn_secondary_hover_bg(),
-            Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-            TEXT_PRIMARY(),
-            13.0,
-        )
-        .on_hover_text("Always keep everything in this folder on this device")
-        .clicked()
-        {
+        let keep_all = ui
+            .add_enabled_ui(!folder_busy, |ui| {
+                proton_button(
+                    ui,
+                    Vec2::new(TOOLBAR_KEEP_ALL_W, 32.0),
+                    "Keep all",
+                    BG_CARD_ALT(),
+                    btn_secondary_hover_bg(),
+                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                    TEXT_PRIMARY(),
+                    13.0,
+                )
+            })
+            .inner
+            .on_hover_text("Always keep everything in this folder on this device");
+        if keep_all.clicked() && !folder_busy {
             self.send_availability(folder_rel_path(&self.remote_path).to_string(), "pin");
         }
 
@@ -2100,11 +2143,28 @@ impl ProtonDriveNativeApp {
     /// Asks the daemon, over the control socket and off the UI thread, to change availability.
     fn send_availability(&mut self, rel_path: String, action: &str) {
         self.row_menu = None;
+        self.notice = None;
+        self.working.push(rel_path.clone());
         let _ = self.tx.send(WorkerCommand::SetAvailability { path: rel_path, action: action.to_string() });
     }
 
     /// Dismissible warning line above the table.
     fn render_notice(&mut self, ui: &mut egui::Ui) {
+        if !self.working.is_empty() {
+            ui.add_space(10.0);
+            Frame::NONE
+                .fill(PROTON_PURPLE_SOFT())
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.label(
+                        RichText::new("↻ Working… this can take a while for large folders. The list updates when it's done.")
+                            .size(12.5)
+                            .color(PROTON_PURPLE_TEXT()),
+                    );
+                });
+        }
         let Some(text) = self.notice.clone() else {
             return;
         };
@@ -2245,7 +2305,7 @@ impl ProtonDriveNativeApp {
                 let place = if rel_path.is_empty() { "My files".to_string() } else { format!("\"{rel_path}\"") };
                 (
                     format!("Free up space in {place}?"),
-                    format!("This removes the local copies of everything in {place} that is safely in Proton Drive. Nothing is deleted online, and files download again when you open them."),
+                    format!("This removes the local copies of everything in {place} that is safely in Proton Drive. Nothing is deleted online. Use Always keep to download them again."),
                     "Anything marked Always keep here stops being kept. Files that aren't fully synced, or that you've told Proton Drive to ignore, stay on this computer.",
                     "Free up space",
                     rel_path.clone(),
@@ -2650,7 +2710,11 @@ impl ProtonDriveNativeApp {
                             );
 
                             // 2. Availability pill; "↻ Syncing..." overrides it while the item is being transferred
-                            let is_syncing = self.status.syncing_folders.iter().any(|f| f == &item_rel)
+                            let is_working = self
+                                .working
+                                .iter()
+                                .any(|w| *w == item_rel || w.is_empty() || item_rel.starts_with(&format!("{w}/")));
+                            let is_syncing = is_working || self.status.syncing_folders.iter().any(|f| f == &item_rel)
                                 || self.status.active_transfers.iter().any(|t| {
                                     t.rel_path == item_rel
                                         || t.rel_path.starts_with(&format!("{item_rel}/"))
@@ -2674,7 +2738,7 @@ impl ProtonDriveNativeApp {
                                 ui.painter().text(
                                     pill_rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    "↻ Syncing...",
+                                    if is_working { "↻ Working…" } else { "↻ Syncing..." },
                                     pill_font,
                                     PROTON_PURPLE_TEXT(),
                                 );
@@ -4132,7 +4196,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                 let tx_clone = tx.clone();
                 let ctx_clone = ctx.clone();
                 thread::spawn(move || {
-                    let _ = tx_clone.send(WorkerEvent::AvailabilityDone(set_availability(&path, &action)));
+                    let _ = tx_clone.send(WorkerEvent::AvailabilityDone { result: set_availability(&path, &action), path });
                     ctx_clone.request_repaint();
                 });
             }
@@ -4228,6 +4292,7 @@ OPTIONS:
   --remote-fixture <F>  with --screenshot: list My files from a JSON file instead of the daemon
   --row-menu <NAME>     with --screenshot: open the actions menu of the item NAME
   --confirm-hide <NAME> with --screenshot: show the Hide confirmation for the item NAME
+  --working <NAME>      with --screenshot: show the item NAME (or . for this folder) as still working
   --confirm-free-all    with --screenshot: show the Free up all confirmation
   --path <FOLDER>       open My files at a remote folder, e.g. /my-files/photos
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
@@ -4255,6 +4320,7 @@ fn main() -> eframe::Result {
     let mut cli_row_menu: Option<String> = None;
     let mut cli_confirm_hide: Option<String> = None;
     let mut cli_confirm_free_all = false;
+    let mut cli_working: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -4273,6 +4339,9 @@ fn main() -> eframe::Result {
             }
             "--confirm-hide" => {
                 cli_confirm_hide = args.next();
+            }
+            "--working" => {
+                cli_working = args.next();
             }
             "--confirm-free-all" => {
                 cli_confirm_free_all = true;
@@ -4394,6 +4463,14 @@ fn main() -> eframe::Result {
             // Screenshot-only: these flags only draw the menu and dialogs, nothing is sent
             if app.screenshot_target.is_some() {
                 app.screenshot_menu_for = cli_row_menu;
+                if let Some(name) = cli_working {
+                    let rel_path = if name == "." {
+                        folder_rel_path(&app.remote_path).to_string()
+                    } else {
+                        item_rel_path(&app.remote_path, &name)
+                    };
+                    app.working.push(rel_path);
+                }
                 if let Some(name) = cli_confirm_hide {
                     let rel_path = item_rel_path(&app.remote_path, &name);
                     app.pending_confirm = Some(PendingConfirm::Hide { name, rel_path });
@@ -4802,7 +4879,7 @@ mod tests {
         let reply: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 48\r\n\r\n{\"state\":\"pinned\",\"kept\":[\"a/b\"],\"refused\":null}   ";
         let (sock, server) = serve_once(reply);
         let body = serde_json::json!({ "path": "Projects", "action": "pin" });
-        let got = control_request_at(&sock, "POST", "/availability", Some(&body)).unwrap();
+        let got = control_request_at(&sock, "POST", "/availability", Some(&body), SHORT).unwrap();
         assert_eq!(got["state"], "pinned");
         assert_eq!(got["kept"][0], "a/b");
         let request = server.join().unwrap();
@@ -4816,7 +4893,7 @@ mod tests {
     fn control_request_reads_to_eof_without_content_length() {
         let reply: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"path\":\"x\",\"state\":\"hidden\"}";
         let (sock, server) = serve_once(reply);
-        let got = control_request_at(&sock, "GET", "/availability?path=x", None).unwrap();
+        let got = control_request_at(&sock, "GET", "/availability?path=x", None, SHORT).unwrap();
         assert_eq!(got["state"], "hidden");
         assert!(server.join().unwrap().starts_with("GET /availability?path=x HTTP/1.1"));
         let _ = std::fs::remove_file(&sock);
@@ -4826,15 +4903,70 @@ mod tests {
     fn control_request_turns_an_error_status_into_the_daemon_message() {
         let reply: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 34\r\n\r\n{\"error\":\"Not in Proton Drive: x\"}    ";
         let (sock, server) = serve_once(reply);
-        let err = control_request_at(&sock, "GET", "/availability?path=x", None).unwrap_err();
+        let err = control_request_at(&sock, "GET", "/availability?path=x", None, SHORT).unwrap_err();
         server.join().unwrap();
         assert_eq!(err, "Not in Proton Drive: x");
         let _ = std::fs::remove_file(&sock);
     }
 
+    const SHORT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn control_request_timeout_means_still_working_not_unreachable() {
+        let dir = std::env::temp_dir().join(format!("pd-gui-timeout-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("slow.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // Accepts and then says nothing, like a daemon that is still downloading
+        let server = thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(600));
+            drop(conn);
+        });
+        let body = serde_json::json!({ "path": "x", "action": "pin" });
+        let err = control_request_at(&sock, "POST", "/availability", Some(&body), Duration::from_millis(100)).unwrap_err();
+        assert_eq!(err, STILL_WORKING);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn availability_requests_wait_ten_minutes() {
+        assert_eq!(AVAILABILITY_READ_TIMEOUT, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn kept_leaves_drop_folders_holding_kept_items_and_engine_temp_files() {
+        let kept: Vec<String> = ["Projects/app/.git", "Projects/app", "Projects", "Projects/.proton-drive-tmp-1-2-x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(kept_leaves(&kept), vec!["Projects/app/.git".to_string()]);
+        // Siblings that merely share a name prefix are both kept
+        let kept: Vec<String> = ["a/b", "a/bc"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(kept_leaves(&kept), kept);
+        assert!(kept_leaves(&["x/.proton-drive-tmp-9".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn availability_notice_ignores_folders_and_temp_files_in_kept() {
+        let r = AvailabilityResult {
+            state: "online-only".into(),
+            kept: ["Projects/app/.git", "Projects/app", "Projects"].iter().map(|s| s.to_string()).collect(),
+            refused: None,
+        };
+        assert_eq!(
+            availability_notice(&r).as_deref(),
+            Some("1 item stays on this computer because it isn't safely in Proton Drive: Projects/app/.git")
+        );
+        let only_temp = AvailabilityResult { state: "x".into(), kept: vec!["a/.proton-drive-tmp-1".into()], refused: None };
+        assert_eq!(availability_notice(&only_temp), None);
+    }
+
     #[test]
     fn control_request_reports_a_missing_daemon() {
-        let err = control_request_at(std::path::Path::new("/nonexistent/control.sock"), "GET", "/availability?path=", None).unwrap_err();
+        let err = control_request_at(std::path::Path::new("/nonexistent/control.sock"), "GET", "/availability?path=", None, SHORT).unwrap_err();
         assert!(err.contains("Proton Drive background service"), "{err}");
     }
 
