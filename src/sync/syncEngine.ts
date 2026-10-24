@@ -1297,9 +1297,14 @@ export class ProtonDriveSyncEngine {
                 shouldContinue: () => true, // Stopping halfway would leave synced copies behind, unrecorded, to upload
             });
             // The cloud copy is gone, so nothing under the path stays recorded, kept things included: dropped before
-            // any of them is moved or removed
+            // any of them is moved or removed. Every scanned path is dropped too, recorded or not, so recordSynced
+            // won't record any of them while this runs, nor afterwards once it is gone: a new item still uploading
+            // would otherwise be recorded after going to the desktop Trash, and taken for a local delete.
             for (const item of this.stateDb.getItemsUnder(relPath)) {
                 records.drop(item.localRelPath);
+            }
+            for (const entry of scan.entries) {
+                records.drop(entry.relPath);
             }
             return this.clearKeptAfterCloudDelete(root, relPath, scan.entries, kept);
         });

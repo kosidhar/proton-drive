@@ -1964,6 +1964,65 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.calls.uploads).toEqual([]);
         });
 
+        // A new item still uploading when its folder is deleted in the cloud is moved to the desktop Trash: the upload
+        // finishing afterwards must not record it, or the next sync takes the missing item for a local delete
+        for (const what of ['file', 'folder'] as const) {
+            test(`a new ${what} still uploading when its folder is deleted in the cloud is not recorded once it went to the desktop Trash`, async () => {
+                const d = await downloadedProjects('plain');
+                const made = what === 'file' ? 'Projects/new.txt' : 'Projects/newdir';
+                let release!: () => void;
+                const answer = new Promise<void>((resolve) => (release = resolve));
+                let started!: () => void;
+                const uploading = new Promise<void>((resolve) => (started = resolve));
+                // The cloud has taken the new item, but its answer is still on the way back
+                const sdk = d.sdk as any;
+                if (what === 'file') {
+                    const getFileUploader = sdk.getFileUploader;
+                    sdk.getFileUploader = async (...args: unknown[]) => {
+                        const uploader = await getFileUploader(...args);
+                        return {
+                            uploadFromStream: async (stream: unknown) => {
+                                const result = await uploader.uploadFromStream(stream);
+                                started();
+                                await answer;
+                                return result;
+                            },
+                        };
+                    };
+                } else {
+                    const createFolder = sdk.createFolder;
+                    sdk.createFolder = async (parent: unknown, name: string) => {
+                        const folder = await createFolder(parent, name);
+                        if (name === 'newdir') {
+                            started();
+                            await answer;
+                        }
+                        return folder;
+                    };
+                }
+                goneFromCloud(d, 'Projects');
+                await d.files.writeLocal(what === 'file' ? made : `${made}/a.txt`, 'only here');
+                const localChange: Promise<void> = (d.engine as any).handleLocalFileChange(made);
+                await uploading;
+
+                await event(d, {
+                    type: DriveEventType.NodeDeleted,
+                    nodeUid: 'vol~Projects',
+                    parentNodeUid: d.root.uid,
+                    treeEventScopeId: 'scope-main',
+                    eventId: 'evt-deleted',
+                });
+                release();
+                await localChange;
+
+                expect(d.trashed()).toEqual([made]);
+                expect(stateDb.getItemByPath(made)).toBeNull();
+                await d.files.expectNoRecordWithoutFile('Projects');
+                await d.engine.reconcileNow();
+                expect(d.calls.trashed).toEqual([]);
+            });
+        }
+
         // Interleaved, Free's putBack could bring back a record that the cloud delete then leaves without its file
         test('a cloud delete arriving while Free up space runs on the folder waits for it, then leaves no records', async () => {
             const d = await downloadedProjects('plain');
