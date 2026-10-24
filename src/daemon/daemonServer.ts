@@ -15,6 +15,7 @@ import {
 } from '../sdk';
 import { ProtonDriveSyncEngine } from '../sync/syncEngine';
 import { SyncStateDatabase } from '../sync/syncStateDb';
+import { isTrustedLocalRequest } from './requestGuard';
 
 export const DEFAULT_DAEMON_PORT = Number(process.env.PROTON_DRIVE_DAEMON_PORT || 49152);
 export const DEFAULT_DAEMON_HOST = '127.0.0.1';
@@ -249,10 +250,25 @@ export async function startSyncDaemon(options: {
         }
     }, Math.max(30, settings.reconcileIntervalSec) * 1000);
 
+    let lastRejectionLogAt = 0;
     const server = Bun.serve({
         hostname: host,
         port,
-        async fetch(req) {
+        // Every endpoint must be served from fetch() so this check runs; Bun.serve `routes` or `static` would skip it
+        async fetch(req, srv) {
+            if (!isTrustedLocalRequest(req, srv.port ?? port)) {
+                const now = Date.now();
+                if (now - lastRejectionLogAt > 60_000) {
+                    lastRejectionLogAt = now;
+                    runtime.logger.warn(
+                        `Rejected daemon API request (host=${JSON.stringify(req.headers.get('host'))}, origin=${req.headers.has('origin')}, sec-fetch-site=${req.headers.has('sec-fetch-site')})`,
+                    );
+                }
+                return Response.json(
+                    { error: 'Forbidden: the daemon API only accepts local, non-browser clients on 127.0.0.1' },
+                    { status: 403 },
+                );
+            }
             const url = new URL(req.url);
             const pathname = url.pathname;
 
