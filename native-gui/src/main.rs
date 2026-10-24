@@ -2814,7 +2814,7 @@ impl ProtonDriveNativeApp {
                         ui.add_space(6.0);
                         ui.label(
                             RichText::new(
-                                "Your files remain safely stored in Proton Drive cloud and can be re-synced anytime.",
+                                "Your files stay in Proton Drive and can be synced again anytime. A folder holding anything not in Proton Drive yet, like ignored .git folders or unsynced edits, stays on this computer.",
                             )
                             .size(12.5)
                             .color(TEXT_MUTED()),

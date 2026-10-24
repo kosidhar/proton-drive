@@ -422,7 +422,8 @@ export async function startSyncDaemon(options: {
                     ) {
                         void engine.reconcileNow();
                     }
-                    return Response.json({ ok: true, settings: updated });
+                    // Re-read: Cloud only is refused for folders holding files that exist only on this computer
+                    return Response.json({ ok: true, settings: stateDb.getSettings() });
                 }
 
                 // Remote browser endpoints
