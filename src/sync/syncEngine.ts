@@ -1,15 +1,19 @@
-import { lstatSync } from 'node:fs';
+import { lstatSync, renameSync } from 'node:fs';
 import { cp, lstat, mkdir, readdir, rename, rm, rmdir, stat, unlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import {
+    AbortError,
+    ConnectionError,
     type DriveEvent,
     DriveEventType,
     type Logger,
     type NodeEntity,
     NodeType,
+    NodeWithSameNameExistsValidationError,
     type ProtonDriveClient,
+    ServerError,
     ValidationError,
 } from '@protontech/drive-sdk';
 
@@ -26,13 +30,14 @@ import {
 import { getName } from '../sdk/node';
 import { AvailabilityPolicy, type ItemAvailability } from './availability';
 import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
-import { createLocalConflictCopy } from './conflictResolver';
+import { createLocalConflictCopy, formatConflictFileName } from './conflictResolver';
 import { gioTrash, type MoveToDesktopTrash } from './desktopTrash';
 import { readDriveLayout } from './driveMode';
 import { isEngineTempName, removeScannedEntries, type ScanEntry, scanLocalCopies } from './localCopies';
 import { moveWithoutReplacing } from './localMove';
 import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
 import { entryFromNode, RemoteIndex, type RemoteIndexEntry } from './remoteIndex';
+import { type RemoteOp, RemoteOpsJournal } from './remoteOps';
 import type { ConflictRecord, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
 
 export interface ActiveTransfer {
@@ -43,6 +48,14 @@ export interface ActiveTransfer {
     totalBytes: number;
     startedAt: number;
 }
+
+// Meta key for a local move whose records (and journalled cloud change) are in place but whose file system step may not
+// have happened yet: { from, to, replace }. Set and cleared around that step; found set only after a crash, and then
+// finished (see recoverLocalMove).
+export const LOCAL_MOVE_IN_PROGRESS = 'localMoveInProgress';
+// How many times a journalled change may fail for a reason other than the network or the server before it is given up
+// on, so that it can't hold up everything after it for ever
+const MAX_UNEXPECTED_FAILURES = 10;
 
 export type EngineState = 'idle' | 'syncing' | 'paused' | 'unauthenticated' | 'error';
 
@@ -100,6 +113,13 @@ export class ProtonDriveSyncEngine {
     private workSince = new Map<number, number>();
     private readonly index: RemoteIndex;
     private readonly policy: AvailabilityPolicy;
+    // Renames, moves and deletes made through the virtual drive that Proton Drive has yet to get, and the replay of them:
+    // one at a time (replayRun), again when asked meanwhile (replayAgain), and after the sync pass when asked during one
+    // (replayAfterPass)
+    private readonly journal: RemoteOpsJournal;
+    private replayRun: Promise<void> | null = null;
+    private replayAgain = false;
+    private replayAfterPass = false;
 
     constructor(
         private readonly sdk: ProtonDriveClient,
@@ -111,6 +131,7 @@ export class ProtonDriveSyncEngine {
     ) {
         this.index = new RemoteIndex(this.stateDb.connection);
         this.policy = new AvailabilityPolicy(this.stateDb.connection, this.index);
+        this.journal = new RemoteOpsJournal(this.stateDb.connection);
         this.watcher = new LocalFolderWatcher(
             () => this.localRoot(),
             (relPath) =>
@@ -157,6 +178,7 @@ export class ProtonDriveSyncEngine {
     async start(options: { backgroundInitialReconcile?: boolean } = {}): Promise<void> {
         const settings = this.stateDb.getSettings();
         await mkdir(this.localRoot(), { recursive: true });
+        this.recoverLocalMove();
         this.reconcilePasses = 0;
         this.onlineOnlyCrawlDue = true;
 
@@ -346,6 +368,7 @@ export class ProtonDriveSyncEngine {
         this.onlineOnlyCrawlDue = false;
 
         try {
+            this.recoverLocalMove();
             await mkdir(this.localRoot(), { recursive: true });
             const root = await this.getRootFolder();
             await this.eventsManager.subscribeDriveScope(root.treeEventScopeId);
@@ -357,6 +380,8 @@ export class ProtonDriveSyncEngine {
                     this.stateDb.deleteMeta(PIN_ROOT_ON_FIRST_SYNC);
                 })();
             }
+            // Changes made through the drive reach Proton Drive before the pass looks at it
+            await this.runReplay();
 
             // Sync folder-by-folder incrementally so files & folders appear in ~/ProtonDrive
             // and in the GUI dashboard immediately instead of waiting for a full tree scan.
@@ -393,6 +418,10 @@ export class ProtonDriveSyncEngine {
             });
         } finally {
             this.reconcileRunning = false;
+            if (this.replayAfterPass) {
+                this.replayAfterPass = false;
+                void this.runReplay();
+            }
             if (this.reconcileQueued) {
                 this.reconcileQueued = false;
                 void this.reconcileNow();
@@ -409,6 +438,9 @@ export class ProtonDriveSyncEngine {
         settings: SyncSettings,
         since: number,
     ): Promise<void> {
+        if (this.awaitsRemoteOp(relPath, remoteNode?.uid)) {
+            return; // A rename, move or delete through the drive is on its way to Proton Drive: looked at once it is there
+        }
         const localFullPath = path.join(this.localRoot(), relPath);
         const hiddenBy = this.policy.hiddenBy(relPath);
         if (hiddenBy?.hide === 'hidden') {
@@ -505,6 +537,7 @@ export class ProtonDriveSyncEngine {
             if (localInfo.isDirectory) {
                 const createdFolder = await ensureRemoteFolder(this.sdk, parentNode, path.basename(relPath));
                 remoteMap.set(relPath, createdFolder);
+                this.indexCreatedFolder(createdFolder, relPath);
                 this.recordSynced({
                     localRelPath: relPath,
                     nodeUid: createdFolder.uid,
@@ -523,6 +556,9 @@ export class ProtonDriveSyncEngine {
                     localRelPath: relPath,
                     details: 'Created folder on Proton Drive',
                 });
+                if (this.journal.hasPending()) {
+                    void this.replayRemoteOps(); // A move into it may have been waiting for it
+                }
             } else {
                 await this.uploadLocalToRemote(relPath, localFullPath, parentNode, since);
             }
@@ -1187,6 +1223,11 @@ export class ProtonDriveSyncEngine {
         if (this.policy.hiddenBy(relPath)?.hide === 'hidden') {
             return;
         }
+        // A rename, move or delete through the drive that Proton Drive hasn't got yet is about it: left to the sync after
+        // that, as an upload now could land on the old item, which still has this name there
+        if (this.awaitsRemoteOp(relPath)) {
+            return;
+        }
         const existingTask = this.localQueue.get(relPath);
         if (existingTask) {
             await existingTask.catch(() => {});
@@ -1215,6 +1256,7 @@ export class ProtonDriveSyncEngine {
 
             if (st.isDirectory()) {
                 const folder = await ensureRemoteFolder(this.sdk, parentNode, path.basename(relPath));
+                this.indexCreatedFolder(folder, relPath);
                 this.recordSynced({
                     localRelPath: relPath,
                     nodeUid: folder.uid,
@@ -1228,6 +1270,9 @@ export class ProtonDriveSyncEngine {
                     syncStatus: 'synced',
                     lastError: null,
                 }, since);
+                if (this.journal.hasPending()) {
+                    void this.replayRemoteOps(); // A move into it may have been waiting for it
+                }
             } else if (st.isFile()) {
                 await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, dbRecord?.nodeUid);
             }
@@ -1262,7 +1307,8 @@ export class ProtonDriveSyncEngine {
         if (event.type === DriveEventType.NodeDeleted) {
             this.index.removeSubtree(event.nodeUid);
             const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
-            if (tracked) {
+            // One with a rename or move through the drive on its way is left to its replay, which keeps its local copy
+            if (tracked && !this.awaitsRemoteOp(tracked.localRelPath, event.nodeUid)) {
                 await this.removeAfterCloudDelete(tracked.localRelPath, 'deleted');
             }
             return;
@@ -1272,7 +1318,7 @@ export class ProtonDriveSyncEngine {
             if (event.isTrashed) {
                 this.index.removeSubtree(event.nodeUid);
                 const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
-                if (tracked) {
+                if (tracked && !this.awaitsRemoteOp(tracked.localRelPath, event.nodeUid)) {
                     await this.removeAfterCloudDelete(tracked.localRelPath, 'trashed');
                 }
                 return;
@@ -1600,6 +1646,817 @@ export class ProtonDriveSyncEngine {
             this.currentAction = `Listing /my-files/${folder.relPath}`;
             await this.indexRemoteSubtree(folder.node, folder.relPath);
         }
+    }
+
+    // Renames or moves an item of My files through the virtual drive. It happens here at once (its local copy if it has
+    // one, its records, and the remote index, so listings show it), and in Proton Drive from the journal of remote
+    // operations (see replayRemoteOps), so it also works offline. Replacing an existing file (an editor's atomic save)
+    // keeps the replaced file's identity: the new content uploads as a new revision of it, and the file that replaced it
+    // goes to the Proton Drive trash if it was ever uploaded. Only a file on this computer can replace, and only a file.
+    // Moving into an ignored name takes the item out of what is synced: Proton Drive keeps it where it was.
+    // Rejects with `Not found: <path>`, `Already exists: <path>`, `Hidden: <path>` or `Invalid path: <path>`.
+    async renameItem(fromRel: string, toRel: string): Promise<void> {
+        const from = normalizeDrivePath(fromRel);
+        const to = normalizeDrivePath(toRel);
+        if (from === '' || to === '') {
+            throw new Error("The whole of Proton Drive can't be renamed or replaced");
+        }
+        if (from === to) {
+            return;
+        }
+        if (to.startsWith(`${from}/`)) {
+            throw new Error(`Can't move ${from} into itself`);
+        }
+        await this.inAvailabilityRun(() => this.renameLocally(from, to));
+        void this.replayRemoteOps();
+    }
+
+    // Deletes an item of My files through the virtual drive: its local copy (everything in it, things that exist only on
+    // this computer included, as the user asked), its records and its index entries go at once, and Proton Drive moves it
+    // to its trash from the journal, downloading nothing. An ignored item is only ever local, so only its local copy goes.
+    // Rejects with `Not found: <path>`, `Hidden: <path>` or `Invalid path: <path>`.
+    async deleteItem(relPath: string): Promise<void> {
+        const rel = normalizeDrivePath(relPath);
+        if (rel === '') {
+            throw new Error("The whole of Proton Drive can't be deleted");
+        }
+        await this.inAvailabilityRun(() => this.deleteLocally(rel));
+        void this.replayRemoteOps();
+    }
+
+    // Sends the journalled renames, moves and deletes to Proton Drive, in the order they were made (spec §5.2). A network
+    // or server error leaves the operation pending and stops until the next time; nothing runs while paused. It never runs
+    // alongside a sync pass, whose listings it would make out of date: asked during one, it runs once the pass is over.
+    async replayRemoteOps(): Promise<void> {
+        if (this.reconcileRunning) {
+            this.replayAfterPass = true;
+            return;
+        }
+        await this.runReplay();
+    }
+
+    private runReplay(): Promise<void> {
+        if (this.replayRun) {
+            this.replayAgain = true; // What was journalled meanwhile goes too
+            return this.replayRun;
+        }
+        const run = (async () => {
+            try {
+                do {
+                    this.replayAgain = false;
+                    await this.replayPending();
+                } while (this.replayAgain);
+            } catch (error: unknown) {
+                this.logger.warn(`Could not send changes made through the drive to Proton Drive; trying again later: ${error}`);
+            } finally {
+                this.replayRun = null;
+            }
+        })();
+        this.replayRun = run;
+        return run;
+    }
+
+    private async replayPending(): Promise<void> {
+        this.recoverLocalMove();
+        let previous: number | null = null;
+        for (;;) {
+            if (this.stateDb.getSettings().paused || !this.auth.isLoggedIn()) {
+                return;
+            }
+            const op = this.journal.pending()[0];
+            // Every step settles its operation or stops: one coming back would be a bug, never a reason to loop
+            if (!op || op.id === previous) {
+                return;
+            }
+            previous = op.id;
+            const next = op.kind === 'trash' ? await this.replayTrash(op) : await this.replayMove(op);
+            if (next === 'stop') {
+                return;
+            }
+        }
+    }
+
+    private async renameLocally(fromRel: string, toRel: string): Promise<void> {
+        this.recoverLocalMove();
+        for (const p of [fromRel, toRel]) {
+            if (this.policy.hiddenBy(p)?.hide === 'hidden') {
+                throw new Error(`Hidden: ${p}`);
+            }
+        }
+        const root = this.localRoot();
+        const ignorePatterns = this.stateDb.getSettings().ignorePatterns;
+        const ignoredFrom = matchesIgnorePatterns(fromRel, ignorePatterns);
+        const ignoredTo = matchesIgnorePatterns(toRel, ignorePatterns);
+        const source = lstatSync(path.join(root, fromRel), { throwIfNoEntry: false });
+        // An ignored item is never in Proton Drive, whatever the cloud holds at its path
+        const sourceEntry = ignoredFrom ? null : this.index.getByPath(fromRel);
+        if (!source && !sourceEntry) {
+            throw new Error(`Not found: ${fromRel}`);
+        }
+        const sourceUid = ignoredFrom ? null : (this.stateDb.getItemByPath(fromRel)?.nodeUid ?? sourceEntry?.uid ?? null);
+        const target = lstatSync(path.join(root, toRel), { throwIfNoEntry: false });
+        const targetRecord = this.stateDb.getItemByPath(toRel);
+        const targetEntry = ignoredTo ? null : this.index.getByPath(toRel);
+        const parentRel = parentOf(toRel);
+        const parent = parentRel === '' ? null : lstatSync(path.join(root, parentRel), { throwIfNoEntry: false });
+        if (parentRel !== '' && (parent ? !parent.isDirectory() : this.index.getByPath(parentRel)?.type !== 'folder')) {
+            throw new Error(`Not found: ${parentRel}`);
+        }
+
+        if (target || targetRecord || targetEntry) {
+            // Replacing: only a file on this computer replaces, and only a file
+            const targetIsFile = target ? target.isFile() : (targetRecord?.type ?? targetEntry?.type) === 'file';
+            if (!source?.isFile() || !targetIsFile) {
+                throw new Error(`Already exists: ${toRel}`);
+            }
+            const targetUid = ignoredTo ? null : (targetRecord?.nodeUid ?? targetEntry?.uid ?? null);
+            this.watcher.suppressPath(fromRel); // Not toRel: its new content is reported, and uploads as a new revision
+            await this.whileRemoving(async (records) => {
+                const snapshot = this.snapshotLocalStep([fromRel, toRel], sourceUid === null ? [] : [sourceUid]);
+                this.stateDb.connection.transaction(() => {
+                    if (targetUid !== null) {
+                        // The replaced file keeps its identity, marked as changed here, so the next look uploads its new
+                        // content as a new revision of it
+                        const base =
+                            targetRecord?.nodeUid === targetUid ? targetRecord : recordFromIndexEntry(targetEntry!, toRel);
+                        this.stateDb.removeItemByPath(fromRel);
+                        this.stateDb.upsertItem({
+                            ...base,
+                            localSha1: null,
+                            localMtimeMs: 0,
+                            syncStatus: 'synced',
+                            lastError: null,
+                            updatedAt: undefined,
+                        });
+                        if (sourceUid !== null && sourceUid !== targetUid) {
+                            // The user replaced the target by this file: its own cloud copy goes to the trash
+                            this.journal.enqueue({ kind: 'trash', nodeUid: sourceUid, path: fromRel });
+                            this.index.removeSubtree(sourceUid);
+                        }
+                    } else if (ignoredTo) {
+                        this.stateDb.removeItemByPath(fromRel); // Into an ignored name nothing follows it
+                    } else {
+                        // What it replaces exists only here, so nothing in Proton Drive is replaced: the item moves there
+                        this.stateDb.removeItemByPath(toRel);
+                        this.stateDb.renameItemPath(fromRel, toRel);
+                        this.journal.retarget(fromRel, toRel);
+                        if (sourceUid !== null) {
+                            this.journal.enqueue({
+                                kind: parentOf(fromRel) === parentRel ? 'rename' : 'move',
+                                nodeUid: sourceUid,
+                                toPath: toRel,
+                                fromPath: fromRel,
+                            });
+                            this.indexMovedTo(sourceUid, toRel);
+                        }
+                    }
+                    this.stateDb.setMeta(LOCAL_MOVE_IN_PROGRESS, JSON.stringify({ from: fromRel, to: toRel, replace: true }));
+                })();
+                this.moveLocalOrUndo(fromRel, toRel, true, snapshot);
+                // Work still under way on the old path (its upload, say) must not record it once done
+                records.dropSubtree(fromRel);
+            });
+            this.stateDb.logActivity({ action: 'sync', localRelPath: toRel, details: `Replaced on this computer by ${fromRel}` });
+            return;
+        }
+
+        if (source && parentRel !== '' && !parent) {
+            // Into a folder only Proton Drive has (online-only): made here to hold the local copy; the next sync records it
+            for (let slash = toRel.indexOf('/'); slash !== -1; slash = toRel.indexOf('/', slash + 1)) {
+                this.watcher.suppressPath(toRel.slice(0, slash));
+            }
+            await mkdir(path.join(root, parentRel), { recursive: true });
+        }
+        this.watcher.suppressPath(fromRel);
+        if (sourceUid !== null || this.stateDb.hasItemsUnder(fromRel)) {
+            this.watcher.suppressPath(toRel); // Its records go with it: reported as something new, it would upload again
+        }
+        await this.whileRemoving(async (records) => {
+            const snapshot = this.snapshotLocalStep([fromRel, toRel], sourceUid === null ? [] : [sourceUid]);
+            // Records, journal and index first, in one transaction with a note of the move, then the item itself, with
+            // nothing able to run in between; a crash between the two is finished on the next start (recoverLocalMove)
+            this.stateDb.connection.transaction(() => {
+                if (ignoredTo || !source) {
+                    // Into an ignored name nothing follows it; and records with no local copy would read as deletes
+                    this.stateDb.removeItemByPath(fromRel);
+                } else {
+                    this.stateDb.renameItemPath(fromRel, toRel);
+                }
+                this.journal.retarget(fromRel, toRel);
+                if (sourceUid !== null && !ignoredTo) {
+                    this.journal.enqueue({
+                        kind: parentOf(fromRel) === parentRel ? 'rename' : 'move',
+                        nodeUid: sourceUid,
+                        toPath: toRel,
+                        fromPath: fromRel,
+                    });
+                    this.indexMovedTo(sourceUid, toRel);
+                }
+                if (source) {
+                    this.stateDb.setMeta(LOCAL_MOVE_IN_PROGRESS, JSON.stringify({ from: fromRel, to: toRel, replace: false }));
+                }
+            })();
+            if (source) {
+                this.moveLocalOrUndo(fromRel, toRel, false, snapshot);
+            }
+            // Work still under way anywhere in the old subtree must not record its old path once done
+            records.dropSubtree(fromRel);
+        });
+        this.stateDb.logActivity({ action: 'sync', localRelPath: toRel, details: `Renamed on this computer: ${fromRel} → ${toRel}` });
+    }
+
+    private async deleteLocally(relPath: string): Promise<void> {
+        this.recoverLocalMove();
+        if (this.policy.hiddenBy(relPath)?.hide === 'hidden') {
+            throw new Error(`Hidden: ${relPath}`);
+        }
+        const root = this.localRoot();
+        const ignored = matchesIgnorePatterns(relPath, this.stateDb.getSettings().ignorePatterns);
+        const local = lstatSync(path.join(root, relPath), { throwIfNoEntry: false });
+        const entry = ignored ? null : this.index.getByPath(relPath);
+        if (!local && !entry) {
+            throw new Error(`Not found: ${relPath}`);
+        }
+        const toTrash = ignored ? new Map<string, string>() : this.trashTargets(relPath, entry);
+        this.watcher.suppressPath(relPath);
+        await this.whileRemoving(async (records) => {
+            // Records first, in one transaction with the index and the journalled trash: a crash before the files are gone
+            // leaves them unrecorded, to upload again as new items (nothing lost), never recorded without their files
+            this.stateDb.connection.transaction(() => {
+                records.dropSubtree(relPath);
+                if (entry) {
+                    this.index.removeSubtree(entry.uid);
+                }
+                for (const [uid, where] of toTrash) {
+                    this.index.removeSubtree(uid);
+                    this.journal.enqueue({ kind: 'trash', nodeUid: uid, path: where });
+                }
+            })();
+            if (local) {
+                await rm(path.join(root, relPath), { recursive: true, force: true });
+            }
+        });
+        this.stateDb.logActivity({
+            action: 'delete-local',
+            localRelPath: relPath,
+            details: toTrash.size > 0 ? 'Deleted on this computer; it goes to Proton Drive Trash' : 'Deleted on this computer',
+        });
+    }
+
+    // What goes to the Proton Drive trash for a delete of relPath: the item itself if Proton Drive has it, and whatever was
+    // moved into it whose move hasn't reached Proton Drive yet (it isn't in the item there yet). A folder made here that
+    // never reached Proton Drive holds only such things, or things that are still where they were there.
+    private trashTargets(relPath: string, entry: RemoteIndexEntry | null): Map<string, string> {
+        const targets = new Map<string, string>();
+        const own = this.stateDb.getItemByPath(relPath)?.nodeUid ?? entry?.uid ?? null;
+        if (own !== null) {
+            targets.set(own, relPath);
+        } else {
+            const topmost: string[] = [];
+            for (const item of this.stateDb.getItemsUnder(relPath)) {
+                if (!topmost.some((p) => item.localRelPath.startsWith(`${p}/`))) {
+                    topmost.push(item.localRelPath);
+                    targets.set(item.nodeUid, item.localRelPath);
+                }
+            }
+        }
+        for (const op of this.latestOpPerNode()) {
+            if (op.kind !== 'trash' && isWithin(op.toPath, relPath) && !targets.has(op.nodeUid)) {
+                targets.set(op.nodeUid, op.toPath);
+            }
+        }
+        return targets;
+    }
+
+    private latestOpPerNode(): RemoteOp[] {
+        const latest = new Map<string, RemoteOp>();
+        for (const op of this.journal.pending()) {
+            latest.set(op.nodeUid, op);
+        }
+        return [...latest.values()];
+    }
+
+    // Whether a pending remote operation is about this path (or one above it), or about the cloud node found at it: the
+    // sync pass and local change handling leave those alone until it has run, as they would otherwise undo it here (a
+    // local copy moved back to where the cloud still has it), or do it twice (a new file uploaded onto the old item).
+    private awaitsRemoteOp(relPath: string, remoteUid?: string): boolean {
+        const { uids, paths } = this.journal.guard();
+        return (remoteUid !== undefined && uids.has(remoteUid)) || paths.some((p) => isWithin(relPath, p));
+    }
+
+    // The remote index as it will be once a move reaches Proton Drive, so listings show it now. Until its new folder is in
+    // the index (one made here, still on its way up), the item is left out of the index rather than put somewhere wrong.
+    private indexMovedTo(uid: string, toRel: string): void {
+        const entry = this.index.getByUid(uid);
+        if (!entry) {
+            return;
+        }
+        const parent = this.index.getByPath(parentOf(toRel));
+        if (parent?.type !== 'folder') {
+            this.index.removeSubtree(uid);
+            return;
+        }
+        this.index.upsert({ ...entry, parentUid: parent.uid, relPath: toRel, name: path.posix.basename(toRel) });
+    }
+
+    // The remote index as Proton Drive says it is, for a node a replayed operation just changed
+    private indexFromCloud(node: NodeEntity): void {
+        const parent = node.parentUid ? this.index.getByUid(node.parentUid) : null;
+        const entry = parent?.type === 'folder' && !node.trashTime ? entryFromNode(node, parent.relPath) : null;
+        try {
+            if (entry) {
+                this.index.upsert(entry);
+            } else {
+                this.index.removeSubtree(node.uid);
+            }
+        } catch (error: unknown) {
+            this.logger.warn(`Failed to update the remote index for ${getName(node)}: ${error}`);
+        }
+    }
+
+    // A folder just made in Proton Drive for a local one goes into the remote index at once, so a move into it can find
+    // it and listings show it without waiting for its parent to be listed again.
+    private indexCreatedFolder(folder: NodeEntity, relPath: string): void {
+        const parent = this.index.getByPath(parentOf(relPath));
+        const entry = parent && parent.uid === folder.parentUid ? entryFromNode(folder, parent.relPath) : null;
+        if (!entry || entry.relPath !== relPath) {
+            return;
+        }
+        try {
+            this.index.upsert(entry);
+        } catch (error: unknown) {
+            this.logger.warn(`Failed to add ${relPath} to the remote index: ${error}`);
+        }
+    }
+
+    // What a local move or replacement can change in the state database (records at and under both paths, the journal,
+    // and the index entries of the moving node and at both paths), taken just before it, to put back exactly as it was if
+    // the file system step then fails.
+    private snapshotLocalStep(paths: string[], uids: string[]): LocalStepSnapshot {
+        const records = paths.flatMap((p) => this.stateDb.getItemsUnder(p));
+        const indexRoots: string[] = [];
+        const index: RemoteIndexEntry[] = [];
+        const keep = (entry: RemoteIndexEntry | null) => {
+            if (entry) {
+                indexRoots.push(entry.uid);
+                index.push(...this.index.listSubtree(entry.relPath));
+            }
+        };
+        for (const uid of uids) {
+            keep(this.index.getByUid(uid));
+        }
+        for (const p of paths) {
+            keep(this.index.getByPath(p));
+        }
+        return { paths, records, ops: this.journal.snapshot(), indexRoots, index };
+    }
+
+    private restoreLocalStep(snapshot: LocalStepSnapshot): void {
+        this.stateDb.connection.transaction(() => {
+            for (const p of snapshot.paths) {
+                this.stateDb.removeItemByPath(p);
+            }
+            for (const record of snapshot.records) {
+                this.stateDb.upsertItem(record);
+            }
+            this.journal.restore(snapshot.ops);
+            for (const uid of snapshot.indexRoots) {
+                this.index.removeSubtree(uid);
+            }
+            for (const p of snapshot.paths) {
+                const occupant = this.index.getByPath(p);
+                if (occupant) {
+                    this.index.removeSubtree(occupant.uid);
+                }
+            }
+            for (const entry of snapshot.index) {
+                this.index.upsert(entry);
+            }
+            this.stateDb.deleteMeta(LOCAL_MOVE_IN_PROGRESS);
+        })();
+    }
+
+    // The file system half of a local move, once its records went in one transaction with the note of it: a replacing
+    // rename(2) when the user asked to replace, otherwise a move that never replaces what is there. If it fails, the state
+    // database is put back as it was and the error is thrown (`Already exists: <path>` for something now at toRel).
+    private moveLocalOrUndo(fromRel: string, toRel: string, replace: boolean, snapshot: LocalStepSnapshot): void {
+        const root = this.localRoot();
+        let moved = false;
+        let failure: unknown = null;
+        try {
+            if (replace) {
+                renameSync(path.join(root, fromRel), path.join(root, toRel));
+                moved = true;
+            } else {
+                moved = moveWithoutReplacing(path.join(root, fromRel), path.join(root, toRel));
+            }
+        } catch (error: unknown) {
+            failure = error;
+        }
+        if (!moved) {
+            this.restoreLocalStep(snapshot);
+            throw failure ?? new Error(`Already exists: ${toRel}`);
+        }
+        this.stateDb.deleteMeta(LOCAL_MOVE_IN_PROGRESS);
+    }
+
+    // A crash between a local move's transaction (records moved, cloud change journalled) and the move itself leaves the
+    // records at the new path without the item: once the change reached Proton Drive, they would read as the user
+    // deleting it there, which trashes it. So the move is finished on the next start. Whatever happens, no record is left
+    // where nothing is: if the item can't be put there, it syncs as a new one from where it is (nothing lost or trashed).
+    private recoverLocalMove(): void {
+        const raw = this.stateDb.getMeta(LOCAL_MOVE_IN_PROGRESS);
+        if (raw === null) {
+            return;
+        }
+        let intent: { from?: unknown; to?: unknown; replace?: unknown } = {};
+        try {
+            intent = JSON.parse(raw) as typeof intent;
+        } catch {
+            // Unreadable: nothing to finish
+        }
+        if (typeof intent.from === 'string' && typeof intent.to === 'string' && intent.from && intent.to) {
+            const root = this.localRoot();
+            const from = path.join(root, intent.from);
+            const to = path.join(root, intent.to);
+            const exists = (fullPath: string) => lstatSync(fullPath, { throwIfNoEntry: false }) !== undefined;
+            try {
+                if (intent.replace === true) {
+                    // The replaced file is there either way: the source still being there says the rename didn't happen
+                    if (exists(from)) {
+                        renameSync(from, to);
+                    }
+                } else if (exists(from) && !exists(to)) {
+                    moveWithoutReplacing(from, to);
+                }
+            } catch (error: unknown) {
+                this.logger.warn(`Could not finish moving ${intent.from} to ${intent.to}: ${error}`);
+            }
+            const finished = exists(to);
+            if (!finished) {
+                this.stateDb.removeItemByPath(intent.to);
+            }
+            this.stateDb.logActivity({
+                action: 'sync',
+                localRelPath: intent.to,
+                details: finished
+                    ? `Finished moving ${intent.from} to ${intent.to} after an interruption`
+                    : `Could not finish moving ${intent.from} to ${intent.to} after an interruption; it syncs from where it is`,
+            });
+        }
+        this.stateDb.deleteMeta(LOCAL_MOVE_IN_PROGRESS);
+    }
+
+    private async replayTrash(op: Extract<RemoteOp, { kind: 'trash' }>): Promise<'next' | 'stop'> {
+        try {
+            for await (const result of this.sdk.trashNodes([op.nodeUid])) {
+                if (result.uid === op.nodeUid && !result.ok) {
+                    throw result.error;
+                }
+            }
+        } catch (error: unknown) {
+            if (error instanceof ValidationError) {
+                // Not there any more (deleted, or trashed already), or not allowed: nothing more to do for it
+                this.journal.complete(op.id);
+                this.stateDb.logActivity({
+                    action: 'sync',
+                    localRelPath: op.path,
+                    details: `Not moved to Proton Drive Trash: ${messageOf(error)}`,
+                });
+                return 'next';
+            }
+            return this.replayFailed(op, op.path, error);
+        }
+        this.journal.complete(op.id);
+        this.index.removeSubtree(op.nodeUid);
+        this.stateDb.logActivity({
+            action: 'trash-remote',
+            localRelPath: op.path,
+            details: 'Moved to Proton Drive Trash after it was deleted or replaced on this computer',
+        });
+        return 'next';
+    }
+
+    private async replayMove(queued: Exclude<RemoteOp, { kind: 'trash' }>): Promise<'next' | 'stop'> {
+        if (this.isSuperseded(queued)) {
+            this.journal.complete(queued.id);
+            return 'next';
+        }
+        let node: NodeEntity | null = null;
+        try {
+            node = await this.sdk.getNode(queued.nodeUid);
+        } catch (error: unknown) {
+            // The SDK says ValidationError when the API has no such node
+            if (!(error instanceof ValidationError)) {
+                return this.replayFailed(queued, queued.toPath, error);
+            }
+        }
+        // As it is now: a rename here while the cloud was asked may have moved its target, or superseded it. From here to
+        // the decision below nothing waits, so nothing can change it in between.
+        const op = this.journal.get(queued.id);
+        if (!op || op.kind === 'trash') {
+            return 'next';
+        }
+        if (this.isSuperseded(op)) {
+            this.journal.complete(op.id);
+            return 'next';
+        }
+        if (!node || node.trashTime) {
+            return this.afterMoveSourceGone(op);
+        }
+        const parentRel = parentOf(op.toPath);
+        const parentUid = this.resolveFolderUid(parentRel);
+        if (parentUid === null) {
+            if (
+                parentRel !== '' &&
+                !matchesIgnorePatterns(parentRel, this.stateDb.getSettings().ignorePatterns) &&
+                lstatSync(path.join(this.localRoot(), parentRel), { throwIfNoEntry: false })?.isDirectory()
+            ) {
+                return 'stop'; // A folder made here that isn't in Proton Drive yet: waits for its upload, keeping the order
+            }
+            // Its folder is gone from here since, or is never synced (ignored): Proton Drive keeps it where it is
+            this.journal.complete(op.id);
+            this.stateDb.logActivity({
+                action: 'sync',
+                localRelPath: op.toPath,
+                details: `Not moved in Proton Drive: ${parentRel} isn't synced`,
+            });
+            return 'next';
+        }
+        let placedAs: string;
+        try {
+            placedAs = await this.placeNode(node, parentUid, op.toPath);
+        } catch (error: unknown) {
+            if (error instanceof ValidationError && !(error instanceof NodeWithSameNameExistsValidationError)) {
+                const gone = await this.isGoneFromCloud(op.nodeUid);
+                if (gone === true) {
+                    return this.afterMoveSourceGone(op);
+                }
+                if (gone === false) {
+                    // Refused (a name Proton Drive doesn't take, say): the next sync puts the local copy back where the
+                    // cloud has it
+                    this.journal.complete(op.id);
+                    this.tellUser(
+                        'sync',
+                        'Proton Drive: rename not applied',
+                        op.toPath,
+                        `${op.toPath} could not be renamed or moved in Proton Drive: ${messageOf(error)}`,
+                    );
+                    return 'next';
+                }
+            }
+            return this.replayFailed(op, op.toPath, error);
+        }
+        await this.afterMoveReplayed(op, placedAs);
+        return 'next';
+    }
+
+    // A later operation on the same item decides where it ends up, or trashes it: an earlier one has nothing left to do
+    private isSuperseded(op: RemoteOp): boolean {
+        return this.journal.pending().some((later) => later.id > op.id && later.nodeUid === op.nodeUid);
+    }
+
+    // A failed operation stays pending and replay stops, keeping the order; one that keeps failing for a reason that
+    // isn't the network or the server is given up on in the end, and the user told (the next sync then follows what the
+    // cloud has).
+    private replayFailed(op: RemoteOp, where: string, error: unknown): 'next' | 'stop' {
+        const message = messageOf(error);
+        if (isTransient(error) || op.attempts + 1 < MAX_UNEXPECTED_FAILURES) {
+            this.journal.failed(op.id, message);
+            this.logger.warn(`Could not apply a change to ${where} in Proton Drive yet; trying again later: ${message}`);
+            return 'stop';
+        }
+        this.journal.complete(op.id);
+        this.tellUser(
+            'error',
+            'Proton Drive: change not applied',
+            where,
+            `A change to ${where} could not be made in Proton Drive, and was given up on: ${message}`,
+        );
+        return 'next';
+    }
+
+    private async isGoneFromCloud(uid: string): Promise<boolean | undefined> {
+        try {
+            return Boolean((await this.sdk.getNode(uid)).trashTime);
+        } catch (error: unknown) {
+            return error instanceof ValidationError ? true : undefined;
+        }
+    }
+
+    // The node of the folder at a path here, for a move into it: from its record, from a pending rename or move that put
+    // it there, or from the remote index (at that path, or under a folder found one of those ways, as a listing can put
+    // the index back to where the cloud still has a renamed folder). Null for a folder Proton Drive doesn't have yet.
+    private resolveFolderUid(relPath: string): string | null {
+        if (relPath === '') {
+            return this.index.getByPath('')?.uid ?? this.rootNode?.uid ?? null;
+        }
+        const record = this.stateDb.getItemByPath(relPath);
+        if (record) {
+            return record.type === 'folder' ? record.nodeUid : null;
+        }
+        for (const op of this.latestOpPerNode()) {
+            if (op.kind !== 'trash' && op.toPath === relPath) {
+                return op.nodeUid;
+            }
+        }
+        const entry = this.index.getByPath(relPath);
+        if (entry) {
+            return entry.type === 'folder' ? entry.uid : null;
+        }
+        const parentUid = this.resolveFolderUid(parentOf(relPath));
+        const parent = parentUid === null ? null : this.index.getByUid(parentUid);
+        if (!parent) {
+            return null;
+        }
+        const child = this.index.getByPath(joinRel(parent.relPath, path.posix.basename(relPath)));
+        return child?.type === 'folder' && child.parentUid === parentUid ? child.uid : null;
+    }
+
+    // Puts a node into its new folder under its new name, as far as Proton Drive lets it, and returns the name it got: a
+    // conflict name when the one asked for is taken there. It looks at where the node is first, so running it again after
+    // an interruption carries on from there.
+    private async placeNode(node: NodeEntity, parentUid: string, toPath: string): Promise<string> {
+        const name = path.posix.basename(toPath);
+        const currentName = getName(node);
+        if (node.parentUid !== parentUid) {
+            try {
+                await this.moveNodeTo(node.uid, parentUid);
+            } catch (error: unknown) {
+                if (!(error instanceof NodeWithSameNameExistsValidationError)) {
+                    throw error;
+                }
+                // Its present name is taken in the new folder, which the new name may not be: renamed first, then moved
+                if (currentName === name) {
+                    return this.placeUnderConflictName(node.uid, parentUid, toPath, false);
+                }
+                try {
+                    await this.sdk.renameNode(node.uid, name);
+                    await this.moveNodeTo(node.uid, parentUid);
+                    return name;
+                } catch (retryError: unknown) {
+                    if (!(retryError instanceof NodeWithSameNameExistsValidationError)) {
+                        throw retryError;
+                    }
+                    return this.placeUnderConflictName(node.uid, parentUid, toPath, false);
+                }
+            }
+        }
+        if (currentName !== name) {
+            try {
+                await this.sdk.renameNode(node.uid, name);
+            } catch (error: unknown) {
+                if (!(error instanceof NodeWithSameNameExistsValidationError)) {
+                    throw error;
+                }
+                return this.placeUnderConflictName(node.uid, parentUid, toPath, true);
+            }
+        }
+        return name;
+    }
+
+    // The name being taken in Proton Drive, the item gets the usual conflict name there instead (one free here too)
+    private async placeUnderConflictName(uid: string, parentUid: string, toPath: string, inParent: boolean): Promise<string> {
+        const parentRel = parentOf(toPath);
+        const first = formatConflictFileName(path.posix.basename(toPath));
+        const dot = first.lastIndexOf('.');
+        const [stem, ext] = dot > 0 ? [first.slice(0, dot), first.slice(dot)] : [first, ''];
+        for (let attempt = 0; attempt < 10; attempt++) {
+            const candidate = attempt === 0 ? first : `${stem}-${attempt}${ext}`;
+            const candidatePath = joinRel(parentRel, candidate);
+            if (
+                (await this.existsLocally(candidatePath)) ||
+                this.stateDb.getItemByPath(candidatePath) ||
+                this.index.getByPath(candidatePath)
+            ) {
+                continue;
+            }
+            try {
+                await this.sdk.renameNode(uid, candidate);
+                if (!inParent) {
+                    await this.moveNodeTo(uid, parentUid);
+                }
+                return candidate;
+            } catch (error: unknown) {
+                if (!(error instanceof NodeWithSameNameExistsValidationError)) {
+                    throw error;
+                }
+            }
+        }
+        throw new Error(`No free name for ${toPath} in Proton Drive`);
+    }
+
+    private async moveNodeTo(uid: string, parentUid: string): Promise<void> {
+        for await (const result of this.sdk.moveNodes([uid], parentUid)) {
+            if (result.uid === uid && !result.ok) {
+                throw result.error;
+            }
+        }
+    }
+
+    // The rename or move is in Proton Drive. When it got a conflict name there, its local copy, records and pending
+    // operations take that name too (unless it was renamed again here meanwhile, which a later operation brings to the
+    // cloud), and the user is told. Then the remote index takes what the cloud says.
+    private async afterMoveReplayed(op: Exclude<RemoteOp, { kind: 'trash' }>, placedAs: string): Promise<void> {
+        const wanted = path.posix.basename(op.toPath);
+        const conflict = await this.inAvailabilityRun(async () => {
+            // As it is now: a folder above it may have been renamed here meanwhile
+            const fresh = this.journal.get(op.id);
+            let renamed: { from: string; to: string } | null = null;
+            if (placedAs !== wanted && fresh && fresh.kind !== 'trash' && path.posix.basename(fresh.toPath) === wanted) {
+                renamed = { from: fresh.toPath, to: joinRel(parentOf(fresh.toPath), placedAs) };
+                try {
+                    await this.moveLocalToConflictName(op.nodeUid, renamed.from, renamed.to);
+                } catch (error: unknown) {
+                    this.logger.warn(`Could not rename ${renamed.from} to ${renamed.to} here as in Proton Drive: ${error}`);
+                }
+            }
+            this.journal.complete(op.id);
+            return renamed;
+        });
+        try {
+            this.indexFromCloud(await this.sdk.getNode(op.nodeUid));
+        } catch (error: unknown) {
+            this.logger.warn(`Could not read ${op.toPath} back from Proton Drive for the remote index: ${error}`);
+        }
+        if (conflict) {
+            this.tellUser(
+                'conflict',
+                'Proton Drive: name already taken',
+                conflict.to,
+                `${conflict.from} already exists in Proton Drive, so it was renamed to ${path.posix.basename(conflict.to)}`,
+            );
+        }
+    }
+
+    private async moveLocalToConflictName(uid: string, fromRel: string, toRel: string): Promise<void> {
+        const record = this.stateDb.getItemByPath(fromRel);
+        const hasLocalCopy =
+            record?.nodeUid === uid &&
+            (await this.existsLocally(fromRel)) &&
+            !(await this.existsLocally(toRel)) &&
+            !this.stateDb.hasItemsUnder(toRel);
+        if (!hasLocalCopy) {
+            // Online-only (or not where it was): only what leads to it moves
+            this.journal.retarget(fromRel, toRel);
+            return;
+        }
+        this.watcher.suppressPath(fromRel);
+        this.watcher.suppressPath(toRel);
+        await this.whileRemoving(async (records) => {
+            const snapshot = this.snapshotLocalStep([fromRel, toRel], [uid]);
+            this.stateDb.connection.transaction(() => {
+                this.stateDb.renameItemPath(fromRel, toRel);
+                this.journal.retarget(fromRel, toRel);
+                this.stateDb.setMeta(LOCAL_MOVE_IN_PROGRESS, JSON.stringify({ from: fromRel, to: toRel, replace: false }));
+            })();
+            this.moveLocalOrUndo(fromRel, toRel, false, snapshot);
+            records.dropSubtree(fromRel);
+        });
+    }
+
+    // The item was deleted or trashed in Proton Drive before its rename or move reached it. A local copy stays and
+    // uploads as a new item from where it is now, so nothing is lost; an online-only one has nothing left to move, and
+    // the user is told.
+    private async afterMoveSourceGone(op: Exclude<RemoteOp, { kind: 'trash' }>): Promise<'next'> {
+        await this.inAvailabilityRun(async () => {
+            const fresh = this.journal.get(op.id);
+            const toPath = fresh && fresh.kind !== 'trash' ? fresh.toPath : op.toPath;
+            const record = this.stateDb.getItemByPath(toPath);
+            const hasLocalCopy = record?.nodeUid === op.nodeUid && (await this.existsLocally(toPath));
+            this.stateDb.connection.transaction(() => {
+                if (record?.nodeUid === op.nodeUid) {
+                    this.stateDb.removeItemByPath(toPath);
+                }
+                this.index.removeSubtree(op.nodeUid);
+                this.journal.complete(op.id);
+            })();
+            if (hasLocalCopy) {
+                this.stateDb.logActivity({
+                    action: 'sync',
+                    localRelPath: toPath,
+                    details: `${toPath} was deleted from Proton Drive before its rename reached it, so it uploads again as a new item`,
+                });
+            } else {
+                this.tellUser(
+                    'sync',
+                    'Proton Drive: rename not applied',
+                    toPath,
+                    `${toPath} could not be renamed or moved in Proton Drive: it was deleted there`,
+                );
+            }
+        });
+        return 'next';
+    }
+
+    private tellUser(action: 'sync' | 'conflict' | 'error', title: string, relPath: string, notice: string): void {
+        this.stateDb.logActivity({ action, localRelPath: relPath, details: notice });
+        sendDesktopNotification({
+            title,
+            body: notice,
+            urgency: 'normal',
+            enabled: this.stateDb.getSettings().notificationsEnabled,
+        });
     }
 
     get remoteIndex(): RemoteIndex {
@@ -2198,6 +3055,9 @@ export class ProtonDriveSyncEngine {
                 // Being synced on its own right now (just pinned); avoid concurrent duplicate work
                 continue;
             }
+            if (this.awaitsRemoteOp(relPath, remoteChildByName.get(name)?.uid)) {
+                continue; // Nor what is in it: a rename, move or delete through the drive is on its way to Proton Drive
+            }
 
             this.currentAction = `Syncing ${relPath}`;
             const remoteChild = remoteChildByName.get(name);
@@ -2238,6 +3098,65 @@ export class ProtonDriveSyncEngine {
 interface TakenAway {
     paths: Set<string>;
     subtrees: Set<string>;
+}
+
+// The state database as it was before a local move or replacement (see snapshotLocalStep)
+interface LocalStepSnapshot {
+    paths: string[];
+    records: SyncedItemRecord[];
+    ops: unknown[];
+    indexRoots: string[];
+    index: RemoteIndexEntry[];
+}
+
+// A path from the virtual drive as a path of My files: no slash at either end, and no empty, '.' or '..' segment, so
+// it can't climb out of it.
+function normalizeDrivePath(relPath: string): string {
+    const trimmed = relPath.replace(/^\/+|\/+$/g, '');
+    if (trimmed.includes('\0') || trimmed.split('/').some((s) => s === '.' || s === '..' || (s === '' && trimmed !== ''))) {
+        throw new Error(`Invalid path: ${relPath}`);
+    }
+    return trimmed;
+}
+
+function parentOf(relPath: string): string {
+    const slash = relPath.lastIndexOf('/');
+    return slash === -1 ? '' : relPath.slice(0, slash);
+}
+
+function joinRel(parentRel: string, name: string): string {
+    return parentRel === '' ? name : `${parentRel}/${name}`;
+}
+
+function isWithin(relPath: string, dir: string): boolean {
+    return relPath === dir || relPath.startsWith(`${dir}/`);
+}
+
+function messageOf(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+// The network or the server, which a later try may get past (a rate limit is a ServerError too)
+function isTransient(error: unknown): boolean {
+    return error instanceof ConnectionError || error instanceof AbortError || error instanceof ServerError;
+}
+
+// A record for a file only the remote index knows (online-only), as replaced through the drive: its node, and what the
+// cloud holds, so the new local content reads as an edit of it
+function recordFromIndexEntry(entry: RemoteIndexEntry, relPath: string): Omit<SyncedItemRecord, 'updatedAt'> {
+    return {
+        localRelPath: relPath,
+        nodeUid: entry.uid,
+        parentNodeUid: entry.parentUid,
+        type: 'file',
+        localSha1: null,
+        remoteSha1: entry.sha1,
+        localMtimeMs: 0,
+        remoteMtimeMs: entry.mtimeMs,
+        size: entry.size,
+        syncStatus: 'synced',
+        lastError: null,
+    };
 }
 
 function isTakenAway(takenAway: TakenAway, relPath: string): boolean {

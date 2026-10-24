@@ -1,4 +1,12 @@
-import { type DriveEvent, type NodeEntity, NodeType, type ProtonDriveClient, ValidationError } from '@protontech/drive-sdk';
+import {
+    ConnectionError,
+    type DriveEvent,
+    type NodeEntity,
+    NodeType,
+    NodeWithSameNameExistsValidationError,
+    type ProtonDriveClient,
+    ValidationError,
+} from '@protontech/drive-sdk';
 
 import type { Manager as EventsManager } from '../../src/sdk/events/manager';
 import { makeMockNode } from './mockNodes';
@@ -6,13 +14,36 @@ import { makeMockNode } from './mockNodes';
 export type MockNode = NodeEntity & { content?: string };
 
 // An in-memory My files tree behind the SDK calls the sync engine makes. Uploads, downloads and trashes are recorded
-// (by path, and trashes per call by uid) so tests can assert on exactly what reached the cloud.
+// (by path, and trashes per call by uid), as are renames and moves (by uid), so tests can assert on exactly what reached
+// the cloud. A call that fails (see failNext and down) reaches nothing and is not recorded.
 export function makeMockDrive() {
     const nodes = new Map<string, MockNode>();
     const root = makeMockNode({ uid: 'vol~root', nameStr: 'root', type: NodeType.Folder });
     nodes.set(root.uid, root);
-    const calls = { uploads: [] as string[], downloads: [] as string[], trashed: [] as string[][] };
+    const calls = {
+        uploads: [] as string[],
+        downloads: [] as string[],
+        trashed: [] as string[][],
+        renamed: [] as Array<{ uid: string; name: string }>,
+        moved: [] as Array<{ uid: string; parentUid: string }>,
+    };
     const failListing = new Set<string>(); // folder uids whose listing fails
+    // SDK methods (by name) whose next call fails with the error given, once each
+    const failures = new Map<string, Error[]>();
+    // SDK methods (by name) that fail with a ConnectionError for as long as they are in the set, as when offline
+    const down = new Set<string>();
+    const failNext = (method: string, error: Error = new ConnectionError('Network unreachable')) => {
+        failures.set(method, [...(failures.get(method) ?? []), error]);
+    };
+    const maybeFail = (method: string) => {
+        const queued = failures.get(method);
+        if (queued && queued.length > 0) {
+            throw queued.shift()!;
+        }
+        if (down.has(method)) {
+            throw new ConnectionError('Network unreachable');
+        }
+    };
     let nextId = 1;
     let eventCallback: ((context: 'drive' | 'photos', event: DriveEvent) => Promise<void>) | null = null;
 
@@ -58,24 +89,28 @@ export function makeMockDrive() {
     const sdk = {
         getMyFilesRootFolder: async () => root,
         getNode: async (uid: string) => {
+            maybeFail('getNode');
             const found = nodes.get(uid);
             if (!found) throw new ValidationError('Item not found'); // as the SDK says it
             return found;
         },
         iterateFolderChildren: async function* (parent: NodeEntity | string) {
             const parentUid = typeof parent === 'string' ? parent : parent.uid;
+            maybeFail('iterateFolderChildren');
             if (failListing.has(parentUid)) throw new Error(`Listing ${parentUid} failed`);
             for (const node of nodes.values()) {
                 if (node.uid !== root.uid && node.parentUid === parentUid) yield node;
             }
         },
         createFolder: async (parent: NodeEntity | string, name: string) => {
+            maybeFail('createFolder');
             const parentUid = typeof parent === 'string' ? parent : parent.uid;
             const folder = makeMockNode({ uid: `vol~created${nextId++}`, parentUid, nameStr: name, type: NodeType.Folder });
             nodes.set(folder.uid, folder);
             return folder;
         },
         getFileRevisionDownloader: async (revisionUid: string) => {
+            maybeFail('getFileRevisionDownloader');
             const nodeUid = revisionUid.replace(/~rev\d+$/, '');
             calls.downloads.push(pathOf(nodeUid));
             const bytes = Buffer.from(nodes.get(nodeUid)?.content ?? '');
@@ -91,6 +126,7 @@ export function makeMockDrive() {
             };
         },
         getFileUploader: async (parent: NodeEntity | string, name: string, metadata: { expectedSha1: string }) => {
+            maybeFail('getFileUploader');
             const parentUid = typeof parent === 'string' ? parent : parent.uid;
             const parentPath = pathOf(parentUid);
             calls.uploads.push(parentPath ? `${parentPath}/${name}` : name);
@@ -115,6 +151,7 @@ export function makeMockDrive() {
         },
         // A new revision of an existing file (an edit), recorded among the uploads by path
         getFileRevisionUploader: async (nodeUid: string, metadata: { expectedSha1: string }) => {
+            maybeFail('getFileRevisionUploader');
             calls.uploads.push(pathOf(nodeUid));
             return {
                 uploadFromStream: async (stream: ReadableStream<Uint8Array>) => {
@@ -136,14 +173,54 @@ export function makeMockDrive() {
                 },
             };
         },
-        trashNodes: async function* (trash: NodeEntity[]) {
-            calls.trashed.push(trash.map((n) => n.uid));
-            for (const n of trash) {
+        // Takes nodes or uids, as the SDK does
+        trashNodes: async function* (trash: Array<NodeEntity | string>) {
+            maybeFail('trashNodes');
+            const uids = trash.map((n) => (typeof n === 'string' ? n : n.uid));
+            calls.trashed.push(uids);
+            for (const uid of uids) {
                 // Trashing a folder takes everything in it along
-                const prefix = `${pathOf(n.uid)}/`;
-                const doomed = Array.from(nodes.keys()).filter((uid) => uid === n.uid || pathOf(uid).startsWith(prefix));
-                for (const uid of doomed) nodes.delete(uid);
-                yield { uid: n.uid, ok: true as const };
+                const prefix = `${pathOf(uid)}/`;
+                const doomed = Array.from(nodes.keys()).filter((u) => u === uid || pathOf(u).startsWith(prefix));
+                for (const u of doomed) nodes.delete(u);
+                yield { uid, ok: true as const };
+            }
+        },
+        // A name already used by another item in the same folder is refused, as the API refuses it
+        renameNode: async (uid: string, newName: string) => {
+            maybeFail('renameNode');
+            const node = nodes.get(uid);
+            if (!node) throw new ValidationError('Item not found');
+            const clash = childNamed(node.parentUid!, newName);
+            if (clash && clash.uid !== uid) {
+                throw new NodeWithSameNameExistsValidationError('An item with that name already exists', 2500, clash.uid);
+            }
+            const renamed: MockNode = { ...node, name: { ok: true as const, value: newName } };
+            nodes.set(uid, renamed);
+            calls.renamed.push({ uid, name: newName });
+            return renamed;
+        },
+        moveNodes: async function* (uids: string[], newParentUid: string) {
+            maybeFail('moveNodes');
+            for (const uid of uids) {
+                const node = nodes.get(uid);
+                const parent = nodes.get(newParentUid);
+                if (!node || !parent || parent.type !== NodeType.Folder) {
+                    yield { uid, ok: false as const, error: new ValidationError('Item not found') };
+                    continue;
+                }
+                const clash = childNamed(newParentUid, nameOf(node));
+                if (clash && clash.uid !== uid) {
+                    yield {
+                        uid,
+                        ok: false as const,
+                        error: new NodeWithSameNameExistsValidationError('An item with that name already exists', 2500, clash.uid),
+                    };
+                    continue;
+                }
+                nodes.set(uid, { ...node, parentUid: newParentUid });
+                calls.moved.push({ uid, parentUid: newParentUid });
+                yield { uid, ok: true as const };
             }
         },
     } as unknown as ProtonDriveClient;
@@ -171,6 +248,9 @@ export function makeMockDrive() {
         warnings,
         calls,
         failListing,
+        failNext,
+        down,
+        nameOf,
         fire: (e: DriveEvent) => eventCallback!('drive', e),
     };
 }
