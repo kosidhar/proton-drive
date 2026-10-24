@@ -109,6 +109,17 @@ export class AvailabilityPolicy {
     return this.hasLocalCopy(relPath) ? "downloaded" : "online-only";
   }
 
+  // Nodes at or below relPath that are hidden or being hidden, as their paths.
+  hiddenWithin(relPath: string): string[] {
+    const rows = this.db
+      .query(
+        `SELECT n.relPath FROM availability a JOIN remote_nodes n ON n.uid = a.nodeUid
+                 WHERE a.hide IS NOT NULL AND ${this.range("n.relPath", relPath)} ORDER BY n.relPath ASC`,
+      )
+      .all(this.rangeParams(relPath)) as { relPath: string }[];
+    return rows.map((row) => row.relPath);
+  }
+
   pendingHides(): string[] {
     const rows = this.db
       .query(

@@ -51,7 +51,6 @@ export interface SyncSettings {
     notificationsEnabled: boolean;
     reconcileIntervalSec: number;
     paused: boolean;
-    excludedFolders: string[];
     ignorePatterns: string[];
 }
 
@@ -143,13 +142,6 @@ export class SyncStateDatabase {
         const rows = this.db.query('SELECT key, value FROM settings').all() as Array<{ key: string; value: string }>;
         const map = new Map(rows.map((r) => [r.key, r.value]));
 
-        let excludedFolders: string[] = [];
-        try {
-            if (map.has('excludedFolders')) {
-                excludedFolders = JSON.parse(map.get('excludedFolders')!) as string[];
-            }
-        } catch {}
-
         let ignorePatterns = [...DEFAULT_IGNORE_PATTERNS];
         try {
             if (map.has('ignorePatterns')) {
@@ -163,7 +155,6 @@ export class SyncStateDatabase {
             notificationsEnabled: map.has('notificationsEnabled') ? map.get('notificationsEnabled') === 'true' : true,
             reconcileIntervalSec: Number(map.get('reconcileIntervalSec') || 120),
             paused: map.get('paused') === 'true',
-            excludedFolders,
             ignorePatterns,
         };
     }
@@ -178,10 +169,29 @@ export class SyncStateDatabase {
         upsert.run({ $key: 'notificationsEnabled', $value: String(next.notificationsEnabled) });
         upsert.run({ $key: 'reconcileIntervalSec', $value: String(next.reconcileIntervalSec) });
         upsert.run({ $key: 'paused', $value: String(next.paused) });
-        upsert.run({ $key: 'excludedFolders', $value: JSON.stringify(next.excludedFolders) });
         upsert.run({ $key: 'ignorePatterns', $value: JSON.stringify(next.ignorePatterns) });
 
         return next;
+    }
+
+    // Values the app keeps for itself (such as migration markers) in the settings table.
+    getMeta(key: string): string | null {
+        const row = this.db.query('SELECT value FROM settings WHERE key = $key').get({ $key: key }) as { value: string } | null;
+        return row?.value ?? null;
+    }
+
+    setMeta(key: string, value: string): void {
+        this.db.query('INSERT OR REPLACE INTO settings (key, value) VALUES ($key, $value)').run({ $key: key, $value: value });
+    }
+
+    // The top-level folders the retired Cloud only setting kept off this computer; read only by the migration.
+    readLegacyExcludedFolders(): string[] {
+        try {
+            const parsed: unknown = JSON.parse(this.getMeta('excludedFolders') ?? '[]');
+            return Array.isArray(parsed) ? parsed.filter((name): name is string => typeof name === 'string') : [];
+        } catch {
+            return [];
+        }
     }
 
     upsertItem(item: Omit<SyncedItemRecord, 'updatedAt'> & { updatedAt?: number }): void {
@@ -232,6 +242,13 @@ export class SyncStateDatabase {
         return this.db
             .query('SELECT * FROM synced_items ORDER BY localRelPath ASC')
             .all() as SyncedItemRecord[];
+    }
+
+    // The record at a path and every record under it.
+    getItemsUnder(localRelPath: string): SyncedItemRecord[] {
+        return this.db
+            .query(`SELECT * FROM synced_items WHERE ${selfOrDescendantWhere('localRelPath')} ORDER BY localRelPath ASC`)
+            .all(selfOrDescendant(localRelPath)) as SyncedItemRecord[];
     }
 
     removeItemByPath(localRelPath: string): void {

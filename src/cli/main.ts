@@ -2,6 +2,8 @@
 
 import path from 'node:path';
 
+import { NodeType } from '@protontech/drive-sdk';
+
 import { launchDesktopWindow } from '../gui/launcher';
 import { ensureSystemTrayIndicator } from '../linux/notifications';
 import { DEFAULT_DAEMON_HOST, DEFAULT_DAEMON_PORT, startSyncDaemon } from '../daemon/daemonServer';
@@ -19,6 +21,7 @@ import {
     THIRD_PARTY_DISCLOSURE,
     uploadLocalFileToDrive,
 } from '../sdk';
+import { migrateExcludedFolders } from '../sync/availabilityMigration';
 import { formatBytes, ProtonDriveSyncEngine } from '../sync/syncEngine';
 import { SyncStateDatabase } from '../sync/syncStateDb';
 
@@ -69,9 +72,8 @@ Authentication Commands (OS Keyring / XDG Fallback):
 Conflict & Selective Sync Commands:
   conflicts                      List detected file conflicts
   conflicts resolve <id> <mode>  Resolve conflict (#id) with keep-both | keep-local | keep-remote
-  selective-sync list            List remote top-level folders and their inclusion status
-  selective-sync exclude <name>  Exclude a top-level remote folder from local sync
-  selective-sync include <name>  Re-include a top-level remote folder in local sync
+  selective-sync list            List remote top-level folders
+  selective-sync exclude|include Replaced by hide|unhide (available once Stage 1 lands)
 
 Direct Cloud File Commands (@protontech/drive-sdk):
   ls [remotePath]                List remote folder contents (default: /my-files)
@@ -238,7 +240,8 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
             if (!runtime.auth.isLoggedIn()) {
                 throw new Error('Not signed in. Run `proton-drive-ubuntu auth login` first.');
             }
-            const stateDb = new SyncStateDatabase(path.join(runtime.config.appDir, 'ubuntu-sync-state.sqlite'));
+            const stateDbPath = path.join(runtime.config.appDir, 'ubuntu-sync-state.sqlite');
+            const stateDb = new SyncStateDatabase(stateDbPath);
             const engine = new ProtonDriveSyncEngine(
                 runtime.sdk,
                 runtime.eventsManager,
@@ -246,6 +249,8 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
                 stateDb,
                 runtime.logger,
             );
+            // As the daemon does, in case this is the first sync since Cloud only folders were retired
+            await migrateExcludedFolders(stateDb, engine.availability, stateDbPath);
             console.log(`Syncing ${stateDb.getSettings().syncDir} with Proton Drive...`);
             await engine.reconcileNow();
             const stats = stateDb.getSummaryStats();
@@ -338,40 +343,28 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
 
     if (cmd === 'selective-sync') {
         const sub = args[1] || 'list';
-        const folderName = args[2];
+        if (sub === 'exclude' || sub === 'include') {
+            // Cloud only folders gave way to per-item availability; the new commands come later in Stage 1
+            console.error('Use `protondrive hide|unhide <path>` (available once Stage 1 lands)');
+            process.exit(1);
+        }
         const runtime = await createStandaloneRuntime(verboseFlag);
         try {
-            const stateDb = new SyncStateDatabase(path.join(runtime.config.appDir, 'ubuntu-sync-state.sqlite'));
-            const settings = stateDb.getSettings();
-            const excluded = new Set(settings.excludedFolders);
-
-            if (sub === 'exclude' && folderName) {
-                excluded.add(folderName);
-                stateDb.updateSettings({ excludedFolders: Array.from(excluded) });
-                console.log(`Excluded '${folderName}' from local synchronization.`);
-            } else if (sub === 'include' && folderName) {
-                excluded.delete(folderName);
-                stateDb.updateSettings({ excludedFolders: Array.from(excluded) });
-                console.log(`Included '${folderName}' in local synchronization.`);
+            if (!runtime.auth.isLoggedIn()) {
+                throw new Error('Not signed in. Run `proton-drive-ubuntu auth login` first.');
+            }
+            const root = await runtime.sdk.getMyFilesRootFolder();
+            const folders = (await listFolderChildren(runtime.sdk, root))
+                .filter((child) => child.type === NodeType.Folder)
+                .map((child) => ({ name: getName(child), uid: child.uid }))
+                .sort((a, b) => a.name.localeCompare(b.name));
+            if (jsonFlag) {
+                console.log(JSON.stringify({ folders }, null, 2));
             } else {
-                const engine = new ProtonDriveSyncEngine(
-                    runtime.sdk,
-                    runtime.eventsManager,
-                    runtime.auth,
-                    stateDb,
-                    runtime.logger,
-                );
-                const folders = await engine.listRemoteTopLevelFolders();
-                if (jsonFlag) {
-                    console.log(JSON.stringify({ folders, excludedFolders: Array.from(excluded) }, null, 2));
-                } else {
-                    console.log('Excluded Top-Level Folders:', Array.from(excluded).join(', ') || '(none)');
-                    for (const f of folders) {
-                        console.log(`  [${f.excluded ? 'EXCLUDED' : 'SYNCED'}] /my-files/${f.name}`);
-                    }
+                for (const folder of folders) {
+                    console.log(`/my-files/${folder.name}`);
                 }
             }
-            stateDb.close();
         } finally {
             await runtime.dispose();
         }

@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { writeFileSync } from 'node:fs';
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -19,6 +18,8 @@ import { createLocalConflictCopy, formatConflictFileName } from '../src/sync/con
 import { matchesIgnorePatterns } from '../src/sync/localWatcher';
 import { ProtonDriveSyncEngine } from '../src/sync/syncEngine';
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
+import { localFiles } from './helpers/localFiles';
+import { makeMockDrive } from './helpers/mockDrive';
 import { makeMockNode } from './helpers/mockNodes';
 
 describe('Proton Drive Ubuntu Sync Suite', () => {
@@ -51,15 +52,13 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         expect(detectMediaType(sampleFile)).toBe('text/markdown');
     });
 
-    test('matches ignore patterns and selective sync exclusions', () => {
+    test('matches ignore patterns', () => {
         const patterns = ['.git', 'node_modules', '*.tmp'];
-        const excludedFolders = ['Archive'];
 
-        expect(matchesIgnorePatterns('.git/config', patterns, excludedFolders)).toBe(true);
-        expect(matchesIgnorePatterns('project/node_modules/pkg/index.js', patterns, excludedFolders)).toBe(true);
-        expect(matchesIgnorePatterns('notes/draft.tmp', patterns, excludedFolders)).toBe(true);
-        expect(matchesIgnorePatterns('Archive/2025/tax.pdf', patterns, excludedFolders)).toBe(true);
-        expect(matchesIgnorePatterns('Documents/report.pdf', patterns, excludedFolders)).toBe(false);
+        expect(matchesIgnorePatterns('.git/config', patterns)).toBe(true);
+        expect(matchesIgnorePatterns('project/node_modules/pkg/index.js', patterns)).toBe(true);
+        expect(matchesIgnorePatterns('notes/draft.tmp', patterns)).toBe(true);
+        expect(matchesIgnorePatterns('Documents/report.pdf', patterns)).toBe(false);
     });
 
     test('formats conflict filenames and creates conflict copies', async () => {
@@ -188,6 +187,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             mockLogger,
         );
 
+        // Only pinned items come to this computer; pinning the root brings everything
+        engine.availability.setPin(rootNode.uid, 'pinned', false);
         await engine.start();
 
         // 1. Verify remote `welcome.txt` was downloaded to local syncDir
@@ -221,251 +222,6 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         expect(welcomeExistsAfterDelete).toBe(false);
 
         await engine.stop();
-    });
-
-    describe('Cloud only', () => {
-        const syncDir = () => stateDb.getSettings().syncDir;
-        const exists = (rel: string) =>
-            stat(path.join(syncDir(), rel))
-                .then(() => true)
-                .catch(() => false);
-        const recordCount = (dir: string) =>
-            stateDb.getAllItems().filter((i) => i.localRelPath === dir || i.localRelPath.startsWith(`${dir}/`)).length;
-        const writeLocal = async (rel: string, content: string) => {
-            await mkdir(path.dirname(path.join(syncDir(), rel)), { recursive: true });
-            await writeFile(path.join(syncDir(), rel), content);
-        };
-        // A file as the engine leaves it after a sync: on disk and recorded with matching hashes
-        const writeSynced = async (rel: string, content: string) => {
-            await writeLocal(rel, content);
-            const fullPath = path.join(syncDir(), rel);
-            const st = await stat(fullPath);
-            const sha1 = await computeLocalFileSha1(fullPath);
-            stateDb.upsertItem({
-                localRelPath: rel,
-                nodeUid: `uid-${rel}`,
-                parentNodeUid: null,
-                type: 'file',
-                localSha1: sha1,
-                remoteSha1: sha1,
-                localMtimeMs: st.mtimeMs,
-                remoteMtimeMs: st.mtimeMs,
-                size: st.size,
-                syncStatus: 'synced',
-                lastError: null,
-            });
-        };
-        const makeEngine = () =>
-            new ProtonDriveSyncEngine(
-                {} as ProtonDriveClient,
-                {} as EventsManager,
-                { isLoggedIn: () => true },
-                stateDb,
-                { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
-            );
-
-        test('removes a folder whose every file is an unchanged synced copy', async () => {
-            await writeSynced('Archive/2025/tax.pdf', 'tax');
-            await writeSynced('Archive/touched.txt', 'same content');
-            // Touched but not changed: size and mtime no longer match the record, so only the hash can tell
-            await utimes(path.join(syncDir(), 'Archive/touched.txt'), new Date(), new Date(Date.now() + 60_000));
-            stateDb.updateSettings({ excludedFolders: ['Archive'] });
-
-            await makeEngine().applySelectiveSyncExclusions();
-
-            expect(await exists('Archive')).toBe(false);
-            expect(recordCount('Archive')).toBe(0);
-            expect(stateDb.getSettings().excludedFolders).toEqual(['Archive']);
-            const logged = stateDb.listActivity().filter((a) => a.localRelPath === 'Archive');
-            expect(logged.map((a) => a.action)).toEqual(['delete-local']);
-            expect((await readdir(syncDir())).filter((n) => n.startsWith('.proton-drive-tmp-'))).toEqual([]);
-        });
-
-        test('keeps a folder holding anything that exists only on this computer, and says why', async () => {
-            await writeSynced('Code/app/main.ts', 'synced');
-            await writeLocal('Code/app/.git/HEAD', 'ref: refs/heads/main'); // ignored, so never uploaded
-            await writeSynced('Drafts/old.txt', 'synced');
-            await writeLocal('Drafts/new.txt', 'not uploaded yet');
-            await writeSynced('Notes/todo.txt', 'synced version');
-            await writeFile(path.join(syncDir(), 'Notes/todo.txt'), 'edited after the last sync');
-            await writeSynced('Photos/cat.jpg', 'meow');
-            stateDb.updateSettings({ excludedFolders: ['Code', 'Drafts', 'Notes', 'Photos'] });
-
-            await makeEngine().applySelectiveSyncExclusions();
-
-            for (const kept of ['Code/app/main.ts', 'Code/app/.git/HEAD', 'Drafts/old.txt', 'Drafts/new.txt']) {
-                expect(await exists(kept)).toBe(true);
-            }
-            expect(await readFile(path.join(syncDir(), 'Notes/todo.txt'), 'utf8')).toBe('edited after the last sync');
-            expect([recordCount('Code'), recordCount('Drafts'), recordCount('Notes')]).toEqual([1, 1, 1]);
-            expect(await exists('Photos')).toBe(false);
-            expect(stateDb.getSettings().excludedFolders).toEqual(['Photos']);
-            const refusals = stateDb.listActivity().filter((a) => a.action === 'error');
-            expect(refusals.map((a) => a.localRelPath).sort()).toEqual(['Code', 'Drafts', 'Notes']);
-            expect(refusals.find((a) => a.localRelPath === 'Code')!.details).toContain(
-                'Code/app/.git matches an ignore pattern',
-            );
-            expect(refusals.find((a) => a.localRelPath === 'Drafts')!.details).toContain('Drafts/new.txt');
-            expect(refusals.find((a) => a.localRelPath === 'Notes')!.details).toContain('Notes/todo.txt');
-        });
-
-        test('leaves the folder alone when it is switched back to Sync while being checked', async () => {
-            await writeSynced('Music/song.mp3', 'la la');
-            await writeSynced('Music/track.mp3', 'dum dum');
-            await writeLocal('Music/demo.mp3', 'not uploaded yet');
-            stateDb.updateSettings({ excludedFolders: ['Music'] });
-            // The user switches back to Sync once the check has started looking at files
-            const getItemByPath = stateDb.getItemByPath.bind(stateDb);
-            stateDb.getItemByPath = (rel: string) => {
-                if (rel.startsWith('Music/')) {
-                    stateDb.updateSettings({ excludedFolders: [] });
-                }
-                return getItemByPath(rel);
-            };
-
-            await makeEngine().applySelectiveSyncExclusions();
-
-            expect(await exists('Music/song.mp3')).toBe(true);
-            expect(recordCount('Music')).toBe(2);
-            // Nothing to refuse either: the folder is no longer on its way to Cloud only
-            expect(stateDb.listActivity().filter((a) => a.localRelPath === 'Music')).toHaveLength(0);
-        });
-
-        test('never treats a name that is not a single top-level folder as something to delete', async () => {
-            await writeSynced('Docs/a/b.txt', 'b');
-            stateDb.updateSettings({ excludedFolders: ['..', '.', 'Docs/a', ''] });
-
-            await makeEngine().applySelectiveSyncExclusions();
-
-            expect(await exists('Docs/a/b.txt')).toBe(true);
-            expect(recordCount('Docs')).toBe(1);
-        });
-
-        // A record whose file is gone reads as the user deleting it, and trashes the cloud copy on the next pass
-        const expectNoRecordWithoutFile = async (dir: string) => {
-            for (const item of stateDb.getAllItems().filter((i) => i.localRelPath.startsWith(`${dir}/`))) {
-                expect({ path: item.localRelPath, exists: await exists(item.localRelPath) }).toEqual({
-                    path: item.localRelPath,
-                    exists: true,
-                });
-            }
-        };
-        // Runs `during` once, just before the n-th record removal (removal drops each record right before its file)
-        const onRemoval = (n: number, during: (rel: string) => Promise<void> | void) => {
-            const removeItemByPath = stateDb.removeItemByPath.bind(stateDb);
-            let calls = 0;
-            const pending: Promise<void>[] = [];
-            stateDb.removeItemByPath = (rel: string) => {
-                calls += 1;
-                if (calls === n) {
-                    const result = during(rel);
-                    if (result) {
-                        pending.push(result);
-                    }
-                }
-                removeItemByPath(rel);
-            };
-            return () => Promise.all(pending);
-        };
-
-        test('stops when something new is saved into the folder while it is being removed', async () => {
-            await writeSynced('Shots/2024/a.png', 'a');
-            await writeSynced('Shots/2024/b.png', 'b');
-            await writeSynced('Shots/2025/c.png', 'c');
-            stateDb.updateSettings({ excludedFolders: ['Shots'] });
-            // Another app saves into a folder the removal hasn't reached yet
-            const written = onRemoval(1, () => writeFileSync(path.join(syncDir(), 'Shots/2024/new.png'), 'new'));
-
-            await makeEngine().applySelectiveSyncExclusions();
-            await written();
-
-            expect(await readFile(path.join(syncDir(), 'Shots/2024/new.png'), 'utf8')).toBe('new');
-            await expectNoRecordWithoutFile('Shots');
-            expect(stateDb.listActivity().filter((a) => a.action === 'delete-local')).toHaveLength(0);
-        });
-
-        test('stops when a file it has not reached yet is edited while the folder is being removed', async () => {
-            const files = ['Docs/a.txt', 'Docs/b.txt', 'Docs/sub/c.txt'];
-            for (const f of files) {
-                await writeSynced(f, 'synced');
-            }
-            stateDb.updateSettings({ excludedFolders: ['Docs'] });
-            // Everything but the file being removed right now gets edited
-            onRemoval(1, (rel) => {
-                for (const f of files.filter((f) => f !== rel)) {
-                    writeFileSync(path.join(syncDir(), f), 'edited while removing');
-                }
-            });
-
-            await makeEngine().applySelectiveSyncExclusions();
-
-            const left = [];
-            for (const f of files) {
-                if (await exists(f)) {
-                    left.push(await readFile(path.join(syncDir(), f), 'utf8'));
-                }
-            }
-            expect(left).toEqual(['edited while removing', 'edited while removing']);
-            await expectNoRecordWithoutFile('Docs');
-        });
-
-        test('stops when the folder is switched back to Sync while it is being removed', async () => {
-            await writeSynced('Books/a.epub', 'a');
-            await writeSynced('Books/b.epub', 'b');
-            await writeSynced('Books/c.epub', 'c');
-            stateDb.updateSettings({ excludedFolders: ['Books'] });
-            onRemoval(2, () => {
-                stateDb.updateSettings({ excludedFolders: [] });
-            });
-
-            await makeEngine().applySelectiveSyncExclusions();
-
-            await expectNoRecordWithoutFile('Books');
-            expect(stateDb.getAllItems().filter((i) => i.localRelPath.startsWith('Books/')).length).toBeGreaterThan(0);
-        });
-
-        test('leaves alone a local folder that reappears after the folder went Cloud only, and says so once', async () => {
-            await writeLocal('Downloads/invoice.pdf', 'saved by a browser');
-            stateDb.updateSettings({ excludedFolders: ['Downloads'] });
-            const engine = makeEngine();
-
-            await engine.applySelectiveSyncExclusions();
-            await engine.applySelectiveSyncExclusions();
-
-            expect(await exists('Downloads/invoice.pdf')).toBe(true);
-            expect(stateDb.getSettings().excludedFolders).toEqual(['Downloads']);
-            expect(stateDb.listActivity().filter((a) => a.localRelPath === 'Downloads')).toHaveLength(1);
-        });
-
-        test('only unlinks a top-level folder that is a symlink, and a symlink inside a folder blocks it', async () => {
-            const outside = path.join(tempDir, 'elsewhere');
-            await mkdir(outside, { recursive: true });
-            await writeFile(path.join(outside, 'keep.txt'), 'outside the sync folder');
-            await mkdir(syncDir(), { recursive: true });
-            await symlink(outside, path.join(syncDir(), 'Linked'));
-            await writeSynced('Mixed/a.txt', 'a');
-            await symlink(outside, path.join(syncDir(), 'Mixed/link'));
-            stateDb.updateSettings({ excludedFolders: ['Linked', 'Mixed'] });
-
-            await makeEngine().applySelectiveSyncExclusions();
-
-            expect(await exists('Linked')).toBe(false);
-            expect(await readFile(path.join(outside, 'keep.txt'), 'utf8')).toBe('outside the sync folder');
-            expect(await exists('Mixed/a.txt')).toBe(true);
-            expect(stateDb.listActivity().find((a) => a.localRelPath === 'Mixed')!.details).toContain(
-                "Mixed/link isn't a regular file",
-            );
-        });
-
-        test('drops records left for a folder that is already gone', async () => {
-            await writeSynced('Gone/file.txt', 'x');
-            await rm(path.join(syncDir(), 'Gone'), { recursive: true });
-            stateDb.updateSettings({ excludedFolders: ['Gone'] });
-
-            await makeEngine().applySelectiveSyncExclusions();
-
-            expect(recordCount('Gone')).toBe(0);
-        });
     });
 
     describe('remote index', () => {
@@ -589,7 +345,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
 
         test('a locally deleted synced folder leaves no index entries once it is trashed', async () => {
-            const { engine, remoteNodes, archive } = setup();
+            const { engine, remoteNodes, rootNode, archive } = setup();
+            engine.availability.setPin(rootNode.uid, 'pinned', false);
             await engine.start();
 
             await rm(path.join(stateDb.getSettings().syncDir, 'Archive'), { recursive: true, force: true });
@@ -600,11 +357,302 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(engine.remoteIndex.getByPath('Archive/2025/tax.pdf')).toBeNull();
             await engine.stop();
         });
+    });
 
-        test('syncFoldersPriority indexes the root listing', async () => {
-            const { engine } = setup();
-            await engine.syncFoldersPriority(['Archive']);
-            expect(engine.remoteIndex.getByPath('Archive')).not.toBeNull();
+    describe('availability', () => {
+        const setup = () => {
+            const drive = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger);
+            return { ...drive, engine, files: localFiles(stateDb) };
+        };
+        const local = (rel: string) => path.join(stateDb.getSettings().syncDir, rel);
+
+        test('new remote files download only under a pin', async () => {
+            const { engine, add, calls, files } = setup();
+            const docs = add('Docs');
+            add('Other');
+            engine.availability.setPin(docs.uid, 'pinned', false);
+            await engine.reconcileNow();
+            add('Docs/new.txt', 'new');
+            add('Other/x.txt', 'x');
+
+            await engine.reconcileNow();
+
+            expect(await readFile(local('Docs/new.txt'), 'utf8')).toBe('new');
+            expect(await files.exists('Other')).toBe(false);
+            expect(calls.downloads).toEqual(['Docs/new.txt']);
+            expect(engine.remoteIndex.getByPath('Other')).not.toBeNull();
+            expect(engine.remoteIndex.getByPath('Other/x.txt')).not.toBeNull();
+        });
+
+        test('pinning a deep folder creates online-only ancestors but not siblings', async () => {
+            const { engine, add, calls, files } = setup();
+            add('A/B/C/f.txt', 'deep');
+            add('A/sibling.txt', 'beside');
+            add('A/B/cousin.txt', 'beside too');
+            await engine.reconcileNow();
+            expect(calls.downloads).toEqual([]);
+
+            engine.availability.setPin('vol~A/B/C', 'pinned', false);
+            await engine.reconcileNow();
+
+            expect(await readFile(local('A/B/C/f.txt'), 'utf8')).toBe('deep');
+            expect(await files.exists('A/sibling.txt')).toBe(false);
+            expect(await files.exists('A/B/cousin.txt')).toBe(false);
+            expect(calls.downloads).toEqual(['A/B/C/f.txt']);
+            expect(engine.availability.stateOf('A')).toBe('online-only');
+            expect(engine.availability.stateOf('A/B/C')).toBe('pinned');
+        });
+
+        test('hidden items are never downloaded or uploaded', async () => {
+            const { engine, add, root, calls, files } = setup();
+            add('welcome.txt', 'hello');
+            add('Secret/s.txt', 'remote secret');
+            engine.availability.setPin(root.uid, 'pinned', false);
+            engine.availability.setHide('vol~Secret', 'hidden');
+            await engine.start();
+
+            await files.writeLocal('Secret/x.txt', 'local secret');
+            await Bun.sleep(700); // past the watcher's debounce
+            // The watcher neither watches the hidden folder nor reports changes in it
+            const watcher = (engine as any).watcher;
+            expect(watcher.watchers.has(local('Secret'))).toBe(false);
+            expect(watcher.shouldIgnore('Secret/x.txt')).toBe(true);
+            expect(watcher.shouldIgnore('welcome.txt')).toBe(false);
+            await engine.reconcileNow();
+            await (engine as any).handleLocalFileChange('Secret/x.txt');
+            await engine.stop();
+
+            expect(calls.downloads).toEqual(['welcome.txt']);
+            expect(calls.uploads).toEqual([]);
+            expect(await files.exists('Secret/s.txt')).toBe(false);
+            expect(files.recordCount('Secret')).toBe(0);
+        });
+
+        // Photos with a.jpg downloaded (pinned on its own) and b.jpg … z.jpg online-only
+        const partlyDownloaded = async () => {
+            const drive = setup();
+            for (const letter of 'abcdefghijklmnopqrstuvwxyz') {
+                drive.add(`Photos/${letter}.jpg`, letter);
+            }
+            await drive.engine.reconcileNow();
+            drive.engine.availability.setPin('vol~Photos/a.jpg', 'pinned', false);
+            await drive.engine.reconcileNow();
+            expect(drive.calls.downloads).toEqual(['Photos/a.jpg']);
+            expect(drive.files.recordCount('Photos')).toBe(2); // the folder and a.jpg
+            return drive;
+        };
+
+        test('deleting a partly downloaded folder trashes only what was local', async () => {
+            const { engine, nodes, calls, files } = await partlyDownloaded();
+
+            await rm(local('Photos'), { recursive: true });
+            await engine.reconcileNow();
+
+            expect(calls.trashed).toEqual([['vol~Photos/a.jpg']]);
+            expect(nodes.has('vol~Photos')).toBe(true);
+            expect(nodes.has('vol~Photos/b.jpg')).toBe(true);
+            expect(files.recordCount('Photos')).toBe(0);
+            // Left online-only: the next pass does not bring it back or trash anything more
+            await engine.reconcileNow();
+            expect(await files.exists('Photos')).toBe(false);
+            expect(engine.availability.stateOf('Photos')).toBe('online-only');
+            expect(calls.trashed).toHaveLength(1);
+        });
+
+        test('a partly downloaded folder deleted under the watcher also trashes only what was local', async () => {
+            const { engine, nodes, calls, files } = await partlyDownloaded();
+
+            await rm(local('Photos'), { recursive: true });
+            await (engine as any).handleLocalFileChange('Photos');
+
+            expect(calls.trashed).toEqual([['vol~Photos/a.jpg']]);
+            expect(nodes.has('vol~Photos')).toBe(true);
+            expect(files.recordCount('Photos')).toBe(0);
+        });
+
+        test('a deleted pinned folder holding something never downloaded is left online-only, not brought back', async () => {
+            const { engine, add, nodes, calls, files } = setup();
+            const aJpg = add('Photos/a.jpg', 'a');
+            add('Photos/.DS_Store', 'matches an ignore pattern, so never downloaded');
+            engine.availability.setPin('vol~Photos', 'pinned', false);
+            await engine.reconcileNow();
+            expect(calls.downloads).toEqual(['Photos/a.jpg']);
+
+            await rm(local('Photos'), { recursive: true });
+            await engine.reconcileNow();
+            await engine.reconcileNow();
+
+            expect(calls.trashed).toEqual([[aJpg.uid]]);
+            expect(nodes.has('vol~Photos/.DS_Store')).toBe(true);
+            expect(await files.exists('Photos')).toBe(false);
+            expect(engine.availability.stateOf('Photos')).toBe('online-only');
+        });
+
+        test('deleting a folder never trashes a hidden or hiding folder inside it', async () => {
+            const { engine, add, root, nodes, calls, files } = setup();
+            add('Work/plan.txt', 'plan');
+            add('Work/Secret/s.txt', 'secret');
+            engine.availability.setPin(root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            // Hiding, still waiting on uploads: its local copy and records are all still here
+            engine.availability.setHide('vol~Work/Secret', 'pending');
+
+            await rm(local('Work'), { recursive: true });
+            await engine.reconcileNow();
+
+            expect(calls.trashed).toEqual([['vol~Work/plan.txt']]);
+            expect(nodes.has('vol~Work/Secret/s.txt')).toBe(true);
+            expect(files.recordCount('Work')).toBe(0);
+        });
+
+        test('deleting a folder that was replaced in the cloud by another of the same name trashes nothing', async () => {
+            const { engine, add, root, nodes, calls, files } = setup();
+            add('Photos/a.jpg', 'old');
+            engine.availability.setPin(root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            // Another device replaces Photos with a new folder holding a new a.jpg
+            nodes.delete('vol~Photos');
+            nodes.delete('vol~Photos/a.jpg');
+            const newer = makeMockNode({ uid: 'vol~newer', parentUid: root.uid, nameStr: 'Photos', type: NodeType.Folder });
+            const newerA = makeMockNode({ uid: 'vol~newer-a', parentUid: newer.uid, nameStr: 'a.jpg', type: NodeType.File, content: 'new' });
+            nodes.set(newer.uid, newer);
+            nodes.set(newerA.uid, newerA);
+
+            await rm(local('Photos'), { recursive: true });
+            await engine.reconcileNow();
+
+            expect(calls.trashed).toEqual([]);
+            expect(nodes.has(newerA.uid)).toBe(true);
+            expect(files.recordCount('Photos')).toBe(0);
+        });
+
+        test('a deleted folder is not trashed while its cloud contents cannot all be listed', async () => {
+            const { engine, calls, failListing, warnings, files } = await partlyDownloaded();
+            failListing.add('vol~Photos');
+
+            await rm(local('Photos'), { recursive: true });
+            await engine.reconcileNow();
+
+            expect(calls.trashed).toEqual([]);
+            expect(files.recordCount('Photos')).toBe(2); // kept, so the next pass tries again
+            expect(engine.getStatus().state).not.toBe('error');
+            expect(warnings.some((w) => w.includes('Not trashing Photos yet'))).toBe(true);
+
+            failListing.clear();
+            await engine.reconcileNow();
+            expect(calls.trashed).toEqual([['vol~Photos/a.jpg']]);
+        });
+
+        test('a folder that fails to list is logged and skipped, and the rest still syncs', async () => {
+            const { engine, add, calls, failListing, warnings } = setup();
+            add('Docs/d.txt', 'd');
+            add('Other/deep/o.txt', 'o');
+            add('Other/later/l.txt', 'l');
+            add('Zebra/z.txt', 'z');
+            engine.availability.setPin('vol~Docs', 'pinned', false);
+            engine.availability.setPin('vol~Zebra', 'pinned', false);
+            failListing.add('vol~Other/deep');
+
+            await engine.reconcileNow();
+
+            expect(engine.getStatus().state).not.toBe('error');
+            expect(calls.downloads.sort()).toEqual(['Docs/d.txt', 'Zebra/z.txt']);
+            expect(engine.remoteIndex.getByPath('Other/deep')).not.toBeNull();
+            expect(engine.remoteIndex.getByPath('Other/later/l.txt')).not.toBeNull();
+            expect(warnings.some((w) => w.includes('Could not list Other/deep'))).toBe(true);
+        });
+
+        test('an item whose record is dropped while a deletion is being worked out is not trashed', async () => {
+            const { engine, calls } = await partlyDownloaded();
+            await rm(local('Photos'), { recursive: true });
+            // Free up space (say) drops a.jpg's record just after the deletion has read the records
+            const getItemsUnder = stateDb.getItemsUnder.bind(stateDb);
+            stateDb.getItemsUnder = (rel: string) => {
+                const items = getItemsUnder(rel);
+                stateDb.removeItemByPath('Photos/a.jpg');
+                return items;
+            };
+
+            await engine.reconcileNow();
+
+            expect(calls.trashed).toEqual([]);
+        });
+
+        test('the remote index crawl lists nothing while paused', async () => {
+            const { engine, add, nodes } = setup();
+            add('Other/x.txt', 'x');
+            await engine.reconcileNow();
+            engine.remoteIndex.replaceChildren('vol~Other', 'Other', []); // forget what the first crawl found
+            stateDb.updateSettings({ paused: true });
+
+            expect(await (engine as any).indexRemoteSubtree(nodes.get('vol~Other'), 'Other')).toBe(false);
+            expect(engine.remoteIndex.getByPath('Other/x.txt')).toBeNull();
+        });
+
+        test('what was local in a partly downloaded folder goes to the trash in one call', async () => {
+            const { engine, add, calls } = await partlyDownloaded();
+            add('Photos/2024/x.jpg', 'x');
+            add('Photos/2024/y.jpg', 'y');
+            engine.availability.setPin('vol~Photos/c.jpg', 'pinned', false);
+            engine.availability.setPin('vol~Photos/2024', 'pinned', false);
+            await engine.reconcileNow();
+
+            await rm(local('Photos'), { recursive: true });
+            await engine.reconcileNow();
+
+            // A subfolder that was wholly local goes as one item, with what is in it
+            expect(calls.trashed).toEqual([['vol~Photos/2024', 'vol~Photos/a.jpg', 'vol~Photos/c.jpg']]);
+        });
+
+        test('a deleted folder that comes back while its cloud contents are listed is not trashed', async () => {
+            const { engine, add, root, sdk, calls, files } = setup();
+            add('Done/a.txt', 'a');
+            engine.availability.setPin(root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            await rm(local('Done'), { recursive: true });
+            // The user restores the folder just as the engine lists it to decide what to trash
+            const iterate = sdk.iterateFolderChildren.bind(sdk);
+            (sdk as any).iterateFolderChildren = async function* (parent: NodeEntity) {
+                if (parent.uid === 'vol~Done') await files.writeLocal('Done/a.txt', 'a');
+                yield* iterate(parent);
+            };
+
+            await engine.reconcileNow();
+
+            expect(calls.trashed).toEqual([]);
+        });
+
+        test('a deleted file whose record is dropped while its cloud node is looked up is not trashed', async () => {
+            const { engine, add, root, sdk, calls } = setup();
+            add('note.txt', 'n');
+            engine.availability.setPin(root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            await rm(local('note.txt'));
+            // Free up space (say) drops the record while the watcher's handler waits on the network
+            const getNode = sdk.getNode.bind(sdk);
+            (sdk as any).getNode = async (uid: string) => {
+                stateDb.removeItemByPath('note.txt');
+                return getNode(uid);
+            };
+
+            await (engine as any).handleLocalFileChange('note.txt');
+
+            expect(calls.trashed).toEqual([]);
+        });
+
+        test('a deleted folder whose every item was local is trashed whole, as before', async () => {
+            const { engine, add, root, nodes, calls } = setup();
+            add('Done/a.txt', 'a');
+            add('Done/sub/b.txt', 'b');
+            engine.availability.setPin(root.uid, 'pinned', false);
+            await engine.reconcileNow();
+
+            await rm(local('Done'), { recursive: true });
+            await engine.reconcileNow();
+
+            expect(calls.trashed).toEqual([['vol~Done']]);
+            expect(nodes.has('vol~Done/sub/b.txt')).toBe(false);
         });
     });
 });

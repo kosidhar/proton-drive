@@ -1,4 +1,4 @@
-import { cp, lstat, mkdir, readdir, rename, rm, rmdir, stat, unlink } from 'node:fs/promises';
+import { cp, lstat, mkdir, readdir, rename, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -25,14 +25,8 @@ import { getName } from '../sdk/node';
 import { AvailabilityPolicy } from './availability';
 import { createLocalConflictCopy } from './conflictResolver';
 import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
-import { entryFromNode, RemoteIndex } from './remoteIndex';
+import { entryFromNode, RemoteIndex, type RemoteIndexEntry } from './remoteIndex';
 import type { ConflictRecord, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
-
-// Something in a folder that only exists on this computer, so making the folder Cloud only would lose it
-interface LocalOnlyItem {
-    relPath: string;
-    reason: 'ignored' | 'not-a-file' | 'not-in-cloud';
-}
 
 export interface ActiveTransfer {
     id: string;
@@ -58,8 +52,9 @@ export class ProtonDriveSyncEngine {
     private reconcileQueued = false;
     private syncingFolders = new Set<string>();
     private localQueue = new Map<string, Promise<void>>();
-    private exclusionRun: Promise<void> = Promise.resolve();
-    private reportedUnsyncedCopies = new Set<string>();
+    // Availability changes that remove local copies run one at a time on this chain, and local change handling waits
+    // for them: a deletion seen while the records still exist would read as the user deleting synced files.
+    private availabilityRun: Promise<void> = Promise.resolve();
     private readonly index: RemoteIndex;
     private readonly policy: AvailabilityPolicy;
 
@@ -74,10 +69,9 @@ export class ProtonDriveSyncEngine {
         this.policy = new AvailabilityPolicy(this.stateDb.connection, this.index);
         this.watcher = new LocalFolderWatcher(
             () => this.stateDb.getSettings().syncDir,
-            () => {
-                const s = this.stateDb.getSettings();
-                return { ignorePatterns: s.ignorePatterns, excludedFolders: s.excludedFolders };
-            },
+            (relPath) =>
+                matchesIgnorePatterns(relPath, this.stateDb.getSettings().ignorePatterns) ||
+                this.policy.hiddenBy(relPath) !== null,
             async (ev) => {
                 await this.handleLocalFileChange(ev.relPath);
             },
@@ -170,27 +164,6 @@ export class ProtonDriveSyncEngine {
         }
     }
 
-    async listRemoteTopLevelFolders(): Promise<Array<{ name: string; uid: string; excluded: boolean }>> {
-        if (!this.auth.isLoggedIn()) {
-            return [];
-        }
-        const root = await this.getRootFolder();
-        const children = await listFolderChildren(this.sdk, root);
-        const { excludedFolders } = this.stateDb.getSettings();
-
-        return children
-            .filter((c) => c.type === NodeType.Folder)
-            .map((folder) => {
-                const name = getName(folder);
-                return {
-                    name,
-                    uid: folder.uid,
-                    excluded: excludedFolders.includes(name),
-                };
-            })
-            .sort((a, b) => a.name.localeCompare(b.name));
-    }
-
     async relocateSyncFolder(oldSyncDir: string, newSyncDirRaw: string): Promise<string> {
         const home = os.homedir();
         const expanded = newSyncDirRaw.startsWith('~/')
@@ -256,108 +229,7 @@ export class ProtonDriveSyncEngine {
         return resolvedNew;
     }
 
-    // Runs Cloud only removals one at a time, and lets the code that could race them (re-including a folder, local
-    // change handling) wait for them: a deletion seen while the folder's records still exist reads as the user
-    // deleting synced files and would trash the cloud copy.
-    applySelectiveSyncExclusions(): Promise<void> {
-        const run = this.exclusionRun.then(() => this.applySelectiveSyncExclusionsNow());
-        this.exclusionRun = run.catch(() => {});
-        return run;
-    }
-
-    private async applySelectiveSyncExclusionsNow(): Promise<void> {
-        const settings = this.stateDb.getSettings();
-        for (const reported of this.reportedUnsyncedCopies) {
-            if (!settings.excludedFolders.includes(reported)) {
-                this.reportedUnsyncedCopies.delete(reported); // Synced again; report afresh if it goes Cloud only later
-            }
-        }
-        for (const folderName of settings.excludedFolders ?? []) {
-            const trimmed = folderName.trim().replace(/^\/+|\/+$/g, '');
-            // Only a single top-level name: something like '..' or 'a/b' must never select other files to delete
-            if (!trimmed || trimmed === '.' || trimmed === '..' || trimmed.includes('/')) {
-                continue;
-            }
-            this.syncingFolders.delete(trimmed);
-            const localFolderFullPath = path.join(settings.syncDir, trimmed);
-            const lst = await lstat(localFolderFullPath).catch(() => null);
-            if (!lst) {
-                // Records left from before the folder was Cloud only must never read as local deletions later
-                this.stateDb.removeItemByPath(trimmed);
-                continue;
-            }
-            if (lst.isSymbolicLink()) {
-                // Only the link goes; whatever it points to is left alone
-                this.stateDb.removeItemByPath(trimmed);
-                await rm(localFolderFullPath, { force: true }).catch(() => {});
-                this.logCloudOnlyRemoval(trimmed);
-                continue;
-            }
-            if (!lst.isDirectory()) {
-                continue;
-            }
-            if (!this.stateDb.hasItemsUnder(trimmed)) {
-                // Already Cloud only, and something (an app, the user) has put a local folder back: it holds nothing
-                // synced, so it is left as it is
-                this.reportUnsyncedLocalCopy(trimmed, settings);
-                continue;
-            }
-
-            const scan = await this.scanFolderForCloudOnly(trimmed, settings).catch((err: unknown) => {
-                this.logger.warn(`Cloud only: could not check ${trimmed}, keeping it for now: ${String(err)}`);
-                return null;
-            });
-            if (!scan || !this.stateDb.getSettings().excludedFolders.includes(folderName)) {
-                continue; // Switched back to Sync while we looked
-            }
-            if (scan.localOnly) {
-                this.refuseCloudOnly(folderName, trimmed, scan.localOnly, settings);
-                continue;
-            }
-            if (await this.removeScannedCloudOnlyFolder(folderName, trimmed, scan.entries, settings)) {
-                this.logCloudOnlyRemoval(trimmed);
-            }
-        }
-    }
-
-    // Walks a folder about to become Cloud only. It stops at the first item that exists only on this computer, since
-    // deleting the folder would lose it. Otherwise it returns what it saw, in walk order, to delete from.
-    private async scanFolderForCloudOnly(
-        relDir: string,
-        settings: SyncSettings,
-    ): Promise<{ localOnly: LocalOnlyItem | null; entries: Array<{ relPath: string; signature: string }> }> {
-        const entries: Array<{ relPath: string; signature: string }> = [];
-        const walk = async (rel: string): Promise<LocalOnlyItem | null> => {
-            for (const entry of await readdir(path.join(settings.syncDir, rel), { withFileTypes: true })) {
-                const relPath = `${rel}/${entry.name}`;
-                const fullPath = path.join(settings.syncDir, relPath);
-                const st = await lstat(fullPath).catch(() => null);
-                if (!st) {
-                    continue; // Deleted since the listing
-                }
-                entries.push({ relPath, signature: treeEntrySignature(st) });
-                if (st.isFile() && isEngineTempName(entry.name)) {
-                    continue; // Our own in-progress download, safe to drop
-                }
-                if (matchesIgnorePatterns(relPath, settings.ignorePatterns, [])) {
-                    return { relPath, reason: 'ignored' };
-                }
-                if (st.isDirectory()) {
-                    const found = await walk(relPath);
-                    if (found) {
-                        return found;
-                    }
-                } else if (!st.isFile()) {
-                    return { relPath, reason: 'not-a-file' };
-                } else if (!(await this.isUnchangedSyncedCopy(relPath, fullPath, st))) {
-                    return { relPath, reason: 'not-in-cloud' };
-                }
-            }
-            return null;
-        };
-        return { localOnly: await walk(relDir), entries };
-    }
-
+    // Whether a local file is exactly what Proton Drive holds, so removing its local copy loses nothing.
     private async isUnchangedSyncedCopy(
         relPath: string,
         fullPath: string,
@@ -377,84 +249,6 @@ export class ProtonDriveSyncEngine {
         return (await computeLocalFileSha1(fullPath).catch(() => null)) === record.remoteSha1;
     }
 
-    // Deletes a scanned folder from the bottom up, touching only what the scan saw and only while it is unchanged, so
-    // anything saved into the folder meanwhile survives and stops the removal; what is left keeps its records and is
-    // looked at again on the next pass. Each record goes just before its file or folder, so no deletion event can be
-    // taken for the user deleting something synced. Returns whether the whole folder went.
-    private async removeScannedCloudOnlyFolder(
-        folderName: string,
-        relDir: string,
-        entries: Array<{ relPath: string; signature: string }>,
-        settings: SyncSettings,
-    ): Promise<boolean> {
-        // Reverse walk order puts everything in a folder before the folder itself
-        for (const { relPath, signature } of [...entries.reverse(), { relPath: relDir, signature: 'dir' }]) {
-            if (!this.stateDb.getSettings().excludedFolders.includes(folderName)) {
-                return false; // Switched back to Sync: what is left syncs normally
-            }
-            const fullPath = path.join(settings.syncDir, relPath);
-            const st = await lstat(fullPath).catch(() => null);
-            if (!st) {
-                this.stateDb.removeItemByPath(relPath); // Already gone, and its folder is going Cloud only
-                continue;
-            }
-            if (treeEntrySignature(st) !== signature) {
-                return false;
-            }
-            this.stateDb.removeItemByPath(relPath);
-            try {
-                await (st.isDirectory() ? rmdir(fullPath) : unlink(fullPath));
-            } catch {
-                return false; // A folder that is no longer empty: something new was saved into it
-            }
-        }
-        return true;
-    }
-
-    private refuseCloudOnly(folderName: string, relDir: string, localOnly: LocalOnlyItem, settings: SyncSettings): void {
-        this.stateDb.updateSettings({
-            excludedFolders: this.stateDb.getSettings().excludedFolders.filter((f) => f !== folderName),
-        });
-        const why = {
-            ignored: 'matches an ignore pattern, so it was never uploaded',
-            'not-a-file': "isn't a regular file, so it was never uploaded",
-            'not-in-cloud': "isn't in Proton Drive in its current form (new, edited, or not uploaded yet)",
-        }[localOnly.reason];
-        const fix =
-            localOnly.reason === 'not-in-cloud' ? 'Move it out of the folder or wait for it to sync' : 'Move it out of the folder';
-        const message = `${relDir} stays on this computer: ${localOnly.relPath} ${why}, and making the folder Cloud only would delete it. ${fix}, then try again.`;
-        this.stateDb.logActivity({ action: 'error', localRelPath: relDir, details: message });
-        sendDesktopNotification({
-            title: 'Proton Drive: folder kept on this computer',
-            body: message,
-            urgency: 'normal',
-            enabled: settings.notificationsEnabled,
-        });
-    }
-
-    private reportUnsyncedLocalCopy(relDir: string, settings: SyncSettings): void {
-        if (this.reportedUnsyncedCopies.has(relDir)) {
-            return;
-        }
-        this.reportedUnsyncedCopies.add(relDir);
-        const message = `${relDir} is Cloud only, but a local ${relDir} folder exists. It is left as it is and is not synced; move what you need out of it, or switch the folder back to Sync.`;
-        this.stateDb.logActivity({ action: 'sync', localRelPath: relDir, details: message });
-        sendDesktopNotification({
-            title: 'Proton Drive: local folder not synced',
-            body: message,
-            urgency: 'normal',
-            enabled: settings.notificationsEnabled,
-        });
-    }
-
-    private logCloudOnlyRemoval(relDir: string): void {
-        this.stateDb.logActivity({
-            action: 'delete-local',
-            localRelPath: relDir,
-            details: 'Excluded by Selective Sync (removed local copy; kept in Proton Drive cloud)',
-        });
-    }
-
     markFoldersSyncing(folderNames: string[]): void {
         for (const name of folderNames) {
             const trimmed = name.trim().replace(/^\/+|\/+$/g, '');
@@ -464,86 +258,6 @@ export class ProtonDriveSyncEngine {
         }
         if (this.syncingFolders.size > 0 && this.auth.isLoggedIn() && !this.stateDb.getSettings().paused) {
             this.state = 'syncing';
-        }
-    }
-
-    async syncFoldersPriority(folderNames: string[]): Promise<void> {
-        const cleaned = folderNames
-            .map((f) => f.trim().replace(/^\/+|\/+$/g, ''))
-            .filter(Boolean);
-        if (cleaned.length === 0 || !this.auth.isLoggedIn()) {
-            return;
-        }
-        this.markFoldersSyncing(cleaned);
-        await this.exclusionRun;
-        const settings = this.stateDb.getSettings();
-        if (settings.paused) {
-            return;
-        }
-
-        this.state = 'syncing';
-        try {
-            await mkdir(settings.syncDir, { recursive: true });
-            const root = await this.getRootFolder();
-            const children = await listFolderChildren(this.sdk, root);
-            this.index.setRoot(root.uid);
-            this.recordListing(root, '', children);
-            const childByName = new Map<string, NodeEntity>();
-            for (const c of children) {
-                childByName.set(getName(c), c);
-            }
-
-            const remoteMap = new Map<string, NodeEntity>();
-            for (const folderName of cleaned) {
-                const liveSettings = this.stateDb.getSettings();
-                if (liveSettings.paused || liveSettings.excludedFolders.includes(folderName)) {
-                    this.syncingFolders.delete(folderName);
-                    continue;
-                }
-                const remoteFolder = childByName.get(folderName);
-                if (!remoteFolder) {
-                    this.syncingFolders.delete(folderName);
-                    continue;
-                }
-                try {
-                    this.currentAction = `Syncing ${folderName}`;
-                    remoteMap.set(folderName, remoteFolder);
-                    const localFullPath = path.join(liveSettings.syncDir, folderName);
-                    const st = await stat(localFullPath).catch(() => null);
-                    const localInfo = st
-                        ? { isDirectory: st.isDirectory(), size: st.isDirectory() ? 0 : st.size, mtimeMs: st.mtimeMs }
-                        : undefined;
-                    let dbRecord = this.stateDb.getItemByPath(folderName) ?? undefined;
-                    if (!localInfo && dbRecord) {
-                        // Stale record from before the folder was Cloud only: never treat as a local deletion
-                        this.stateDb.removeItemByPath(folderName);
-                        dbRecord = undefined;
-                    }
-                    await this.reconcileSinglePath(
-                        folderName,
-                        remoteFolder,
-                        localInfo,
-                        dbRecord,
-                        remoteMap,
-                        liveSettings,
-                    );
-                    if (remoteFolder.type === NodeType.Folder) {
-                        await this.reconcileDirectoryIncremental(remoteFolder, folderName, remoteMap, liveSettings);
-                    }
-                } finally {
-                    this.syncingFolders.delete(folderName);
-                }
-            }
-        } catch (err) {
-            this.logger.warn(`Priority folder sync encountered error: ${err}`);
-            for (const folderName of cleaned) {
-                this.syncingFolders.delete(folderName);
-            }
-        } finally {
-            if (!this.reconcileRunning && this.syncingFolders.size === 0) {
-                this.currentAction = null;
-                this.state = this.stateDb.getSettings().paused ? 'paused' : 'idle';
-            }
         }
     }
 
@@ -564,12 +278,11 @@ export class ProtonDriveSyncEngine {
 
         this.reconcileRunning = true;
         this.state = 'syncing';
-        this.currentAction = 'Applying selective sync rules...';
+        this.currentAction = 'Starting sync...';
         this.lastError = null;
 
         try {
             await mkdir(settings.syncDir, { recursive: true });
-            await this.applySelectiveSyncExclusions();
             const root = await this.getRootFolder();
             await this.eventsManager.subscribeDriveScope(root.treeEventScopeId);
             this.index.setRoot(root.uid);
@@ -613,25 +326,33 @@ export class ProtonDriveSyncEngine {
         settings: SyncSettings,
     ): Promise<void> {
         const localFullPath = path.join(settings.syncDir, relPath);
+        if (this.policy.hiddenBy(relPath)) {
+            return; // Hidden (or being hidden): never downloaded, uploaded or trashed from here
+        }
 
         // Case 1: Present remotely, not present locally
         if (remoteNode && !localInfo) {
             if (dbRecord) {
                 // Was previously synced, so user deleted it locally -> trash remotely. Look again first: the listing
-                // can predate the record being dropped (e.g. by Cloud only) or the item coming back; either way the
-                // next pass, with a fresh listing, deals with it.
+                // can predate the record being dropped (e.g. by Free up space or Hide) or the item coming back; either
+                // way the next pass, with a fresh listing, deals with it.
                 const stillTracked = this.stateDb.getItemByPath(relPath) !== null;
                 const backLocally = await stat(localFullPath).then(
                     () => true,
                     () => false,
                 );
                 if (stillTracked && !backLocally) {
-                    await this.trashRemoteNodeForDeletedLocal(relPath, remoteNode);
+                    await this.trashForDeletedLocal(relPath, remoteNode);
                 }
                 return;
             }
-            // New remote item -> create locally
+            // New remote item: it comes to this computer only when pinned, and a folder also to hold something pinned
+            // further down (it stays online-only itself). Hidden items never get here (checked above, as isPinned can
+            // be true below a hidden folder).
             if (remoteNode.type === NodeType.Folder) {
+                if (!this.policy.isPinned(relPath) && !this.policy.hasPinnedBelow(relPath)) {
+                    return;
+                }
                 this.watcher.suppressPath(relPath);
                 await mkdir(localFullPath, { recursive: true });
                 const st = await stat(localFullPath);
@@ -653,7 +374,11 @@ export class ProtonDriveSyncEngine {
                     localRelPath: relPath,
                     details: 'Created local folder from Proton Drive',
                 });
-            } else if (remoteNode.type === NodeType.File && !isUnsupportedRemoteNode(remoteNode)) {
+            } else if (
+                remoteNode.type === NodeType.File &&
+                !isUnsupportedRemoteNode(remoteNode) &&
+                this.policy.isPinned(relPath)
+            ) {
                 await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath);
             }
             return;
@@ -1087,16 +812,153 @@ export class ProtonDriveSyncEngine {
         }
     }
 
+    // The user deleted a synced item locally, so its cloud copy goes to the Proton Drive trash. A folder can also hold
+    // things that never were on this computer: online-only, ignored or hidden items, or a node that replaced the one
+    // synced here. Those stay in the cloud: only the items that had local copies are trashed, and the folder is left
+    // online-only.
+    private async trashForDeletedLocal(relPath: string, remoteNode: NodeEntity): Promise<void> {
+        if (remoteNode.type !== NodeType.Folder) {
+            // Checked here too, as callers may have waited on the network since: the record is still there and the
+            // file still missing
+            if (this.stateDb.getItemByPath(relPath) && !(await this.existsLocally(relPath))) {
+                await this.trashRemoteNodeForDeletedLocal(relPath, remoteNode);
+            }
+            return;
+        }
+        // Decide from what the cloud holds right now; without the whole picture, trash nothing this time
+        if (!(await this.indexRemoteSubtree(remoteNode, relPath))) {
+            this.logger.warn(`Not trashing ${relPath} yet: could not list everything in it`);
+            return;
+        }
+        const entries = this.index.listSubtree(relPath);
+        const syncedUid = new Map(this.stateDb.getItemsUnder(relPath).map((item) => [item.localRelPath, item.nodeUid]));
+        const hidden = this.policy.hiddenWithin(relPath);
+        const isWithin = (p: string, dir: string) => p === dir || p.startsWith(`${dir}/`);
+        // Everything that never was on this computer, with every folder above it up to the deleted one
+        const holdsCloudOnly = new Set<string>();
+        for (const entry of entries) {
+            if (syncedUid.get(entry.relPath) === entry.uid && !hidden.some((h) => isWithin(entry.relPath, h))) {
+                continue;
+            }
+            let p = entry.relPath;
+            while (!holdsCloudOnly.has(p)) {
+                holdsCloudOnly.add(p);
+                const slash = p.lastIndexOf('/');
+                if (p === relPath || slash === -1) {
+                    break;
+                }
+                p = p.slice(0, slash);
+            }
+        }
+        if (!holdsCloudOnly.has(relPath)) {
+            // Look again, as listing took a while: only while the record is still there and the folder still missing
+            if (this.stateDb.getItemByPath(relPath)?.nodeUid === remoteNode.uid && !(await this.existsLocally(relPath))) {
+                await this.trashRemoteNodeForDeletedLocal(relPath, remoteNode);
+            }
+            return;
+        }
+
+        // The topmost items that had local copies, along with everything in them (parents come before children)
+        const trashRoots: RemoteIndexEntry[] = [];
+        const rootPaths = new Set<string>();
+        const underARoot = (p: string) => {
+            for (let slash = p.lastIndexOf('/'); slash > 0; slash = p.lastIndexOf('/', slash - 1)) {
+                if (rootPaths.has(p.slice(0, slash))) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        for (const entry of entries) {
+            if (!holdsCloudOnly.has(entry.relPath) && !underARoot(entry.relPath)) {
+                trashRoots.push(entry);
+                rootPaths.add(entry.relPath);
+            }
+        }
+        const resolved: Array<{ relPath: string; node: NodeEntity }> = [];
+        for (const entry of trashRoots) {
+            const node = await this.sdk.getNode(entry.uid).catch(() => null);
+            if (node) {
+                resolved.push({ relPath: entry.relPath, node });
+            }
+        }
+        // As for any trash, and checked last: only while the record is still there and the local item still missing
+        const toTrash: Array<{ relPath: string; node: NodeEntity }> = [];
+        for (const item of resolved) {
+            if (
+                this.stateDb.getItemByPath(item.relPath)?.nodeUid === item.node.uid &&
+                !(await this.existsLocally(item.relPath))
+            ) {
+                toTrash.push(item);
+            }
+        }
+        if (toTrash.length > 0) {
+            await this.trashRemoteNodesForDeletedLocal(toTrash);
+        }
+        if (await this.existsLocally(relPath)) {
+            return; // Back meanwhile: the next pass syncs what is there
+        }
+        // Online-only from now on: no records, so nothing below reads as deleted later, and not pinned, so it isn't
+        // downloaded again
+        this.stateDb.removeItemByPath(relPath);
+        if (this.policy.isPinned(relPath) || this.policy.hasPinnedBelow(relPath)) {
+            this.policy.setPin(remoteNode.uid, 'unpinned', true);
+        }
+        this.stateDb.logActivity({
+            action: 'sync',
+            localRelPath: relPath,
+            details:
+                'Deleted on this computer, so only what was downloaded went to Proton Drive Trash; the folder stays in Proton Drive, online only, with the items that were never on this computer',
+        });
+    }
+
+    // Several locally deleted items in one trash call; each one that went loses its records and its index entries.
+    private async trashRemoteNodesForDeletedLocal(items: Array<{ relPath: string; node: NodeEntity }>): Promise<void> {
+        const byUid = new Map(items.map((item) => [item.node.uid, item]));
+        try {
+            for await (const res of this.sdk.trashNodes(items.map((item) => item.node))) {
+                const item = byUid.get(res.uid);
+                if (!item) {
+                    continue;
+                }
+                if (!res.ok) {
+                    this.logger.warn(`Failed to trash remote node for ${item.relPath}: ${res.error}`);
+                    continue;
+                }
+                this.stateDb.removeItemByPath(item.relPath);
+                this.stateDb.logActivity({
+                    action: 'trash-remote',
+                    localRelPath: item.relPath,
+                    details: 'Moved remote item to Proton Drive Trash after local deletion',
+                });
+                this.index.removeSubtree(res.uid);
+            }
+        } catch (error: unknown) {
+            this.logger.warn(`Failed to trash remote nodes for ${items.map((item) => item.relPath).join(', ')}: ${error}`);
+        }
+    }
+
+    private existsLocally(relPath: string): Promise<boolean> {
+        return lstat(path.join(this.stateDb.getSettings().syncDir, relPath)).then(
+            () => true,
+            () => false,
+        );
+    }
+
     private async handleLocalFileChange(relPath: string): Promise<void> {
         if (!this.auth.isLoggedIn()) {
             return;
         }
         const settings = this.stateDb.getSettings();
-        if (settings.paused || matchesIgnorePatterns(relPath, settings.ignorePatterns, settings.excludedFolders)) {
+        if (
+            settings.paused ||
+            matchesIgnorePatterns(relPath, settings.ignorePatterns) ||
+            this.policy.hiddenBy(relPath) !== null
+        ) {
             return;
         }
 
-        await this.exclusionRun;
+        await this.availabilityRun;
         const existingTask = this.localQueue.get(relPath);
         if (existingTask) {
             await existingTask.catch(() => {});
@@ -1112,7 +974,7 @@ export class ProtonDriveSyncEngine {
                 if (dbRecord) {
                     try {
                         const remoteNode = await this.sdk.getNode(dbRecord.nodeUid);
-                        await this.trashRemoteNodeForDeletedLocal(relPath, remoteNode);
+                        await this.trashForDeletedLocal(relPath, remoteNode);
                     } catch {
                         this.stateDb.removeItemByPath(relPath);
                     }
@@ -1283,20 +1145,33 @@ export class ProtonDriveSyncEngine {
         }
     }
 
-    // Lists and records a remote folder's subtree in the index without touching disk or sync state.
-    private async indexRemoteSubtree(node: NodeEntity, relPath: string): Promise<void> {
-        if (this.index.getByUid(node.uid)?.relPath !== relPath || this.policy.hiddenBy(relPath)) {
-            return;
+    // Lists and records a remote folder's subtree in the index without touching disk or sync state. Returns whether the
+    // whole subtree was recorded: false when paused, when the folder is not indexed at relPath, or when a listing failed
+    // (that is logged, and the rest is still crawled). Nothing is listed below a hidden folder.
+    private async indexRemoteSubtree(node: NodeEntity, relPath: string): Promise<boolean> {
+        if (this.stateDb.getSettings().paused || this.index.getByUid(node.uid)?.relPath !== relPath) {
+            return false;
         }
-        const children = await listFolderChildren(this.sdk, node);
+        if (this.policy.hiddenBy(relPath)) {
+            return true;
+        }
+        let children: NodeEntity[];
+        try {
+            children = await listFolderChildren(this.sdk, node);
+        } catch (error: unknown) {
+            this.logger.warn(`Could not list ${relPath} for the remote index: ${error}`);
+            return false;
+        }
         if (!this.recordListing(node, relPath, children)) {
-            return;
+            return false;
         }
+        let complete = true;
         for (const child of children) {
             if (child.type === NodeType.Folder) {
-                await this.indexRemoteSubtree(child, `${relPath}/${getName(child)}`);
+                complete = (await this.indexRemoteSubtree(child, `${relPath}/${getName(child)}`)) && complete;
             }
         }
+        return complete;
     }
 
     private async reconcileDirectoryIncremental(
@@ -1309,8 +1184,7 @@ export class ProtonDriveSyncEngine {
         if (liveSettings.paused) {
             return;
         }
-        if (prefix && matchesIgnorePatterns(prefix, liveSettings.ignorePatterns, liveSettings.excludedFolders)) {
-            await this.applySelectiveSyncExclusions();
+        if (prefix && (matchesIgnorePatterns(prefix, liveSettings.ignorePatterns) || this.policy.hiddenBy(prefix))) {
             return;
         }
 
@@ -1327,7 +1201,7 @@ export class ProtonDriveSyncEngine {
         for (const child of remoteChildren) {
             const name = getName(child);
             const relPath = prefix ? `${prefix}/${name}` : name;
-            if (!matchesIgnorePatterns(relPath, freshSettings.ignorePatterns, freshSettings.excludedFolders)) {
+            if (!matchesIgnorePatterns(relPath, freshSettings.ignorePatterns)) {
                 remoteChildByName.set(name, child);
                 remoteMap.set(relPath, child);
             }
@@ -1337,7 +1211,7 @@ export class ProtonDriveSyncEngine {
         const localChildByName = new Map<string, { isDirectory: boolean; size: number; mtimeMs: number }>();
         for (const entry of localEntries) {
             const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
-            if (matchesIgnorePatterns(relPath, freshSettings.ignorePatterns, freshSettings.excludedFolders)) {
+            if (matchesIgnorePatterns(relPath, freshSettings.ignorePatterns)) {
                 continue;
             }
             const fullPath = path.join(localDirFullPath, entry.name);
@@ -1358,7 +1232,7 @@ export class ProtonDriveSyncEngine {
             const itemDir = path.posix.dirname(item.localRelPath);
             const expectedDir = prefix || '.';
             if (itemDir === expectedDir) {
-                if (!matchesIgnorePatterns(item.localRelPath, freshSettings.ignorePatterns, freshSettings.excludedFolders)) {
+                if (!matchesIgnorePatterns(item.localRelPath, freshSettings.ignorePatterns)) {
                     dbChildByName.set(path.posix.basename(item.localRelPath), item);
                 }
             }
@@ -1376,12 +1250,14 @@ export class ProtonDriveSyncEngine {
                 return;
             }
             const relPath = prefix ? `${prefix}/${name}` : name;
-            if (matchesIgnorePatterns(relPath, stepSettings.ignorePatterns, stepSettings.excludedFolders)) {
-                await this.applySelectiveSyncExclusions();
+            if (matchesIgnorePatterns(relPath, stepSettings.ignorePatterns)) {
                 continue;
             }
+            if (this.policy.hiddenBy(relPath)) {
+                continue; // Skipped entirely: not downloaded, uploaded or trashed, and its listing is not fetched
+            }
             if (!prefix && this.syncingFolders.has(name)) {
-                // Being handled by syncFoldersPriority right now; avoid concurrent duplicate work
+                // Being synced on its own right now; avoid concurrent duplicate work
                 continue;
             }
 
@@ -1408,22 +1284,12 @@ export class ProtonDriveSyncEngine {
             if (nextSettings.paused) {
                 return;
             }
-            if (matchesIgnorePatterns(sub.relPath, nextSettings.ignorePatterns, nextSettings.excludedFolders)) {
-                await this.applySelectiveSyncExclusions();
+            if (matchesIgnorePatterns(sub.relPath, nextSettings.ignorePatterns) || this.policy.hiddenBy(sub.relPath)) {
                 continue;
             }
             await this.reconcileDirectoryIncremental(sub.node, sub.relPath, remoteMap, nextSettings);
         }
     }
-}
-
-function isEngineTempName(name: string): boolean {
-    return name.startsWith('.proton-drive-tmp-');
-}
-
-function treeEntrySignature(st: { isFile(): boolean; isDirectory(): boolean; size: number; mtimeMs: number }): string {
-    // Directory mtimes are left out: a folder that gains an entry fails to delete because it isn't empty
-    return st.isFile() ? `file:${st.size}:${st.mtimeMs}` : st.isDirectory() ? 'dir' : 'other';
 }
 
 export function formatBytes(bytes: number): string {

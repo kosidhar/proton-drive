@@ -205,6 +205,7 @@ struct SyncSettings {
     notifications_enabled: bool,
     reconcile_interval_sec: u64,
     paused: bool,
+    #[serde(default)]
     excluded_folders: Vec<String>,
     ignore_patterns: Vec<String>,
 }

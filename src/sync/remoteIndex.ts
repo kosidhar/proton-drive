@@ -155,6 +155,13 @@ export class RemoteIndex {
         );
     }
 
+    // The node at a path and everything under it, parents before their children.
+    listSubtree(relPath: string): RemoteIndexEntry[] {
+        return this.db
+            .query(`SELECT * FROM remote_nodes WHERE ${selfOrDescendantWhere('relPath')} ORDER BY relPath ASC`)
+            .all(selfOrDescendant(relPath)) as RemoteIndexEntry[];
+    }
+
     listChildren(relPath: string): RemoteIndexEntry[] {
         const parent = this.getByPath(relPath);
         if (!parent) {
