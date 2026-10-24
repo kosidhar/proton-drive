@@ -61,6 +61,37 @@ describe('RemoteIndex', () => {
         expect(index.getByUid('a')?.parentUid).toBe('z');
     });
 
+    test('replaceChildren keeps the subtrees of siblings that swap names', () => {
+        index.replaceChildren('root', '', [folder('p', 'root', 'X'), folder('q', 'root', 'Y')]);
+        index.replaceChildren('p', 'X', [file('px', 'p', 'X/pf.txt')]);
+        index.replaceChildren('q', 'Y', [file('qy', 'q', 'Y/qf.txt')]);
+
+        index.replaceChildren('root', '', [{ ...folder('p', 'root', 'Y'), name: 'Y' }, { ...folder('q', 'root', 'X'), name: 'X' }]);
+        expect(index.getByPath('Y')?.uid).toBe('p');
+        expect(index.getByPath('X')?.uid).toBe('q');
+        expect(index.getByPath('Y/pf.txt')?.uid).toBe('px');
+        expect(index.getByPath('X/qf.txt')?.uid).toBe('qy');
+        expect(index.getByPath('X/pf.txt')).toBeNull();
+        expect(index.getByPath('Y/qf.txt')).toBeNull();
+    });
+
+    test('replaceChildren keeps subtrees through a chain rename and evicts only a real stale occupant', () => {
+        index.replaceChildren('root', '', [folder('a', 'root', 'A'), folder('b', 'root', 'B'), folder('s', 'root', 'C')]);
+        index.replaceChildren('a', 'A', [file('af', 'a', 'A/af.txt')]);
+        index.replaceChildren('b', 'B', [file('bf', 'b', 'B/bf.txt')]);
+        index.replaceChildren('s', 'C', [file('sf', 's', 'C/sf.txt')]);
+
+        // A -> B and B -> C; the old C ('s') is gone from the listing.
+        index.replaceChildren('root', '', [folder('a', 'root', 'B'), folder('b', 'root', 'C')]);
+        expect(index.getByPath('B/af.txt')?.uid).toBe('af');
+        expect(index.getByPath('C/bf.txt')?.uid).toBe('bf');
+        expect(index.getByPath('A')).toBeNull();
+        expect(index.getByPath('A/af.txt')).toBeNull();
+        expect(index.getByPath('B/bf.txt')).toBeNull();
+        expect(index.getByUid('s')).toBeNull();
+        expect(index.getByUid('sf')).toBeNull();
+    });
+
     test('paths match byte-exactly', () => {
         const nfc = 'café';
         const nfd = 'café';

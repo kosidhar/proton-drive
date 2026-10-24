@@ -36,6 +36,10 @@ export function entryFromNode(node: NodeEntity, parentRelPath: string): RemoteIn
     };
 }
 
+// Temporary home for moved children while replaceChildren sorts out the final paths; no real path starts with U+0001 (SQLite text
+// would also cut a NUL short).
+const PARKING = '\u0001moving';
+
 // A persistent copy of the remote My files tree, keyed by node uid with a unique relative path ('' for the root).
 export class RemoteIndex {
     constructor(private db: Database) {
@@ -70,8 +74,16 @@ export class RemoteIndex {
                     this.removeSubtree(row.uid);
                 }
             }
+            // Park every moved child (with its subtree) at a temporary path first, so siblings that swap names or
+            // rename in a chain are not mistaken for stale occupants of each other's target path.
             for (const child of children) {
-                this.upsert({ ...child, parentUid, relPath: parentRelPath === '' ? child.name : `${parentRelPath}/${child.name}` });
+                const previous = this.getByUid(child.uid);
+                if (previous && previous.relPath !== this.childPath(parentRelPath, child.name)) {
+                    this.relocate(previous.relPath, `${PARKING}/${child.uid}`);
+                }
+            }
+            for (const child of children) {
+                this.upsert({ ...child, parentUid, relPath: this.childPath(parentRelPath, child.name) });
             }
         })();
     }
@@ -86,12 +98,7 @@ export class RemoteIndex {
                 this.removeSubtree(occupant.uid);
             }
             if (previous && previous.relPath !== entry.relPath) {
-                this.db
-                    .query(
-                        `UPDATE remote_nodes SET relPath = $newPath || substr(relPath, length($oldPath) + 1)
-                         WHERE relPath >= $lo AND relPath < $hi`,
-                    )
-                    .run({ $newPath: entry.relPath, $oldPath: previous.relPath, ...rangeBelow(previous.relPath) });
+                this.relocate(previous.relPath, entry.relPath);
             }
             this.db
                 .query(
@@ -111,6 +118,20 @@ export class RemoteIndex {
                     $sha1: entry.sha1,
                 });
         })();
+    }
+
+    private childPath(parentRelPath: string, name: string): string {
+        return parentRelPath === '' ? name : `${parentRelPath}/${name}`;
+    }
+
+    // Rewrites a path and everything under it to start with newPath.
+    private relocate(oldPath: string, newPath: string): void {
+        this.db
+            .query(
+                `UPDATE remote_nodes SET relPath = $newPath || substr(relPath, length($oldPath) + 1)
+                 WHERE ${selfOrDescendantWhere('relPath')}`,
+            )
+            .run({ $newPath: newPath, $oldPath: oldPath, ...selfOrDescendant(oldPath) });
     }
 
     removeSubtree(uid: string): void {
@@ -143,9 +164,4 @@ export class RemoteIndex {
             .query('SELECT * FROM remote_nodes WHERE parentUid = $parentUid ORDER BY relPath ASC')
             .all({ $parentUid: parent.uid }) as RemoteIndexEntry[];
     }
-}
-
-// Strict descendants of a path (not the path itself).
-function rangeBelow(relPath: string) {
-    return { $lo: `${relPath}/`, $hi: `${relPath}0` };
 }
