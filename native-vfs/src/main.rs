@@ -109,6 +109,7 @@ fn run() -> i32 {
     ];
     config.n_threads = Some(4);
     let drive = fs::DriveFs::new(args.backing, daemon::DaemonClient::new(args.socket));
+    let notifier = drive.notifier_slot();
     let session = match Session::new(drive, &mountpoint, &config) {
         Ok(session) => session,
         Err(err) => {
@@ -117,6 +118,8 @@ fn run() -> i32 {
             return 2;
         }
     };
+    // Set before any request is served, so a download's open can always refresh the kernel's attributes
+    let _ = notifier.set(session.notifier());
     // Returns once the kernel ends the session, which an unmount does
     match session.run() {
         Ok(()) => 0,

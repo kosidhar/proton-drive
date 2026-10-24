@@ -2,9 +2,10 @@
 // control_request): GET /vfs/children for listings, POST /vfs/hydrate to download a file an app opened.
 
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -16,7 +17,13 @@ pub const CHILDREN_TIMEOUT: Duration = Duration::from_secs(3);
 /// A download for an open completes or fails within 30 minutes.
 pub const HYDRATE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Problems reaching the daemon go to stderr at most this often.
+/// A daemon whose connection backlog stays full this long isn't serving.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often a waiting request asks whether to give up (a hydrate: whether its opener did).
+const INTERRUPT_CHECK: Duration = Duration::from_millis(500);
+/// After a listing finds the daemon stuck, listings go without it this long.
+const LISTING_BACKOFF: Duration = Duration::from_secs(5);
+/// Listing problems go to stderr at most this often.
 const LOG_EVERY: Duration = Duration::from_secs(60);
 
 /// What a route failed with: the errno to give the kernel, and why.
@@ -24,50 +31,78 @@ const LOG_EVERY: Duration = Duration::from_secs(60);
 pub struct DaemonError {
     pub errno: i32,
     pub message: String,
+    /// The daemon is there but didn't take or answer the request in time, as opposed to gone or refusing
+    pub stuck: bool,
 }
 
 impl DaemonError {
     fn eio(message: impl Into<String>) -> Self {
-        DaemonError { errno: libc::EIO, message: message.into() }
+        DaemonError { errno: libc::EIO, message: message.into(), stuck: false }
     }
+
+    fn stuck(message: impl Into<String>) -> Self {
+        DaemonError { errno: libc::EIO, message: message.into(), stuck: true }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub struct DaemonClient {
     socket: PathBuf,
+    children_timeout: Duration,
+    listing_backoff_until: Mutex<Option<Instant>>,
     last_logged: Mutex<Option<Instant>>,
 }
 
 impl DaemonClient {
     pub fn new(socket: PathBuf) -> Self {
-        DaemonClient { socket, last_logged: Mutex::new(None) }
+        DaemonClient {
+            socket,
+            children_timeout: CHILDREN_TIMEOUT,
+            listing_backoff_until: Mutex::new(None),
+            last_logged: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_children_timeout(mut self, timeout: Duration) -> Self {
+        self.children_timeout = timeout;
+        self
     }
 
     /// The cloud's entries of a folder (relPath inside My files, '' for the top), downloaded ones included.
     pub fn children(&self, rel: &str) -> Result<Vec<Entry>, DaemonError> {
         let target = format!("/vfs/children?path={}", encode_query_value(rel));
-        parse_children(self.request("GET", &target, None, CHILDREN_TIMEOUT)?)
+        parse_children(self.request("GET", &target, None, self.children_timeout, &|| false)?)
     }
 
-    /// The cloud's entries, or none when the daemon can't say: the backing store's entries still show.
+    /// The cloud's entries, or none when the daemon can't say: the backing store's entries still show. Once the
+    /// daemon is found stuck, listings skip it for a few seconds, so a hung daemon doesn't cost every lookup the
+    /// whole timeout (a daemon that is gone fails at once, and is asked again next time).
     pub fn children_or_empty(&self, rel: &str) -> Vec<Entry> {
+        if lock(&self.listing_backoff_until).is_some_and(|until| Instant::now() < until) {
+            return Vec::new();
+        }
         self.children(rel).unwrap_or_else(|err| {
-            self.log(&format!("can't list {rel:?} from the daemon, showing local files only: {}", err.message));
+            if err.stuck {
+                *lock(&self.listing_backoff_until) = Some(Instant::now() + LISTING_BACKOFF);
+            }
+            let mut last = lock(&self.last_logged);
+            if last.is_none_or(|at| at.elapsed() >= LOG_EVERY) {
+                *last = Some(Instant::now());
+                eprintln!("protondrive-vfs: can't list {rel:?} from the daemon, showing local files only: {}", err.message);
+            }
             Vec::new()
         })
     }
 
-    /// Waits for the daemon to download the file into the backing store.
-    pub fn hydrate(&self, rel: &str) -> Result<(), DaemonError> {
+    /// Waits for the daemon to download the file into the backing store, giving up with EINTR as soon as
+    /// `interrupted` says so (it is asked every half second).
+    pub fn hydrate(&self, rel: &str, interrupted: &dyn Fn() -> bool) -> Result<(), DaemonError> {
         let body = serde_json::json!({ "path": rel });
-        self.request("POST", "/vfs/hydrate", Some(&body), HYDRATE_TIMEOUT).map(|_| ())
-    }
-
-    pub fn log(&self, message: &str) {
-        let mut last = self.last_logged.lock().unwrap_or_else(|e| e.into_inner());
-        if last.is_none_or(|at| at.elapsed() >= LOG_EVERY) {
-            *last = Some(Instant::now());
-            eprintln!("protondrive-vfs: {message}");
-        }
+        self.request("POST", "/vfs/hydrate", Some(&body), HYDRATE_TIMEOUT, interrupted).map(|_| ())
     }
 
     fn request(
@@ -76,11 +111,18 @@ impl DaemonClient {
         target: &str,
         body: Option<&serde_json::Value>,
         timeout: Duration,
+        interrupted: &dyn Fn() -> bool,
     ) -> Result<serde_json::Value, DaemonError> {
         let deadline = Instant::now() + timeout;
         let unreachable = |e: std::io::Error| DaemonError::eio(format!("can't reach the daemon ({e})"));
-        let mut stream = UnixStream::connect(&self.socket).map_err(unreachable)?;
-        stream.set_write_timeout(Some(WRITE_TIMEOUT)).map_err(unreachable)?;
+        let mut stream = match connect_within(&self.socket, CONNECT_TIMEOUT.min(timeout)) {
+            Ok(stream) => stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::ETIMEDOUT) => {
+                return Err(DaemonError::stuck("the daemon isn't taking requests"));
+            }
+            Err(e) => return Err(unreachable(e)),
+        };
+        stream.set_write_timeout(Some(WRITE_TIMEOUT.min(timeout))).map_err(unreachable)?;
 
         let payload = body.map(|b| b.to_string()).unwrap_or_default();
         let mut request = format!("{method} {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: application/json\r\n");
@@ -92,7 +134,8 @@ impl DaemonClient {
         stream.write_all(request.as_bytes()).map_err(unreachable)?;
 
         // Read until EOF (Connection: close) or the whole Content-Length, whichever comes first, within the deadline:
-        // a daemon killed or stuck mid-request fails the call instead of holding a FUSE thread
+        // a daemon killed or stuck mid-request fails the call instead of holding a FUSE thread. The reads wake every
+        // half second to ask whether to give up
         let mut raw = Vec::new();
         let mut buf = [0u8; 16 * 1024];
         let mut head_end = None;
@@ -100,15 +143,19 @@ impl DaemonClient {
         while full_length.is_none_or(|len| raw.len() < len) {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(DaemonError::eio(format!("the daemon didn't answer within {timeout:?}")));
+                return Err(DaemonError::stuck(format!("the daemon didn't answer within {timeout:?}")));
             }
-            stream.set_read_timeout(Some(left)).map_err(unreachable)?;
+            stream.set_read_timeout(Some(left.min(INTERRUPT_CHECK))).map_err(unreachable)?;
             match stream.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => raw.extend_from_slice(&buf[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                    return Err(DaemonError::eio(format!("the daemon didn't answer within {timeout:?}")));
+                    if interrupted() {
+                        let message = "the opener stopped waiting".to_string();
+                        return Err(DaemonError { errno: libc::EINTR, message, stuck: false });
+                    }
+                    continue;
                 }
                 Err(e) => return Err(unreachable(e)),
             }
@@ -189,6 +236,44 @@ fn parse_children(body: serde_json::Value) -> Result<Vec<Entry>, DaemonError> {
         .collect())
 }
 
+/// A connection to the Unix socket, or an error once `timeout` passes: a connect to a full backlog (a daemon that is
+/// alive but not accepting) otherwise waits for SO_SNDTIMEO, which std leaves unlimited. A timeout is WouldBlock.
+fn connect_within(path: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
+    let (addr, len) = unix_addr(path)?;
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let timeout = timeout.max(Duration::from_millis(1)); // zero would mean no limit
+    let limit = libc::timeval {
+        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+    };
+    let size = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+    let set = unsafe { libc::setsockopt(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDTIMEO, (&raw const limit).cast(), size) };
+    if set != 0 || unsafe { libc::connect(fd.as_raw_fd(), (&raw const addr).cast(), len) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(UnixStream::from(fd))
+}
+
+/// The address of a Unix socket path, for connect(2).
+fn unix_addr(path: &Path) -> std::io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= addr.sun_path.len() {
+        return Err(std::io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, &src) in addr.sun_path.iter_mut().zip(bytes) {
+        *dst = src as libc::c_char;
+    }
+    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    Ok((addr, len as libc::socklen_t))
+}
+
 fn find_head_end(raw: &[u8]) -> Option<usize> {
     raw.windows(4).position(|w| w == b"\r\n\r\n")
 }
@@ -222,6 +307,7 @@ fn parse_reply(raw: &[u8]) -> Result<serde_json::Value, DaemonError> {
     Err(DaemonError {
         errno: errno_of_code(field("code")),
         message: field("error").map(String::from).unwrap_or_else(|| format!("the daemon answered {status}")),
+        stuck: false,
     })
 }
 
@@ -306,7 +392,8 @@ mod tests {
         let ok = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}trailing";
         assert_eq!(parse_reply(ok).unwrap(), serde_json::json!({ "ok": true }));
         let refused = b"HTTP/1.1 400 Bad Request\r\n\r\n{\"error\":\"Hidden: a\",\"code\":\"EACCES\"}";
-        assert_eq!(parse_reply(refused).unwrap_err(), DaemonError { errno: libc::EACCES, message: "Hidden: a".into() });
+        let hidden = DaemonError { errno: libc::EACCES, message: "Hidden: a".into(), stuck: false };
+        assert_eq!(parse_reply(refused).unwrap_err(), hidden);
         assert_eq!(parse_reply(b"HTTP/1.1 500 Oops\r\n\r\nnot json").unwrap_err().errno, libc::EIO);
         assert_eq!(parse_reply(b"HTTP/1.1 200 OK\r\n\r\nnot json").unwrap_err().errno, libc::EIO);
         assert_eq!(parse_reply(b"garbage").unwrap_err().errno, libc::EIO);
@@ -335,7 +422,7 @@ mod tests {
             let _ = rx.recv(); // holds the connection open until the test ends
         });
         let started = Instant::now();
-        let reply = client.request("POST", "/vfs/hydrate", None, Duration::from_secs(5));
+        let reply = client.request("POST", "/vfs/hydrate", None, Duration::from_secs(5), &|| false);
         let _ = std::fs::remove_file(&client.socket);
         assert_eq!(reply.unwrap(), serde_json::json!({ "ok": true }));
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -349,7 +436,7 @@ mod tests {
             let _ = rx.recv();
         });
         let started = Instant::now();
-        let reply = client.request("GET", "/vfs/children?path=", None, Duration::from_millis(300));
+        let reply = client.request("GET", "/vfs/children?path=", None, Duration::from_millis(300), &|| false);
         let _ = std::fs::remove_file(&client.socket);
         assert_eq!(reply.unwrap_err().errno, libc::EIO);
         assert!(started.elapsed() >= Duration::from_millis(300) && started.elapsed() < Duration::from_secs(2));
@@ -362,7 +449,7 @@ mod tests {
         let client = serve_once("closed", |mut stream| {
             let _ = stream.read(&mut [0u8; 4096]);
         });
-        let reply = client.hydrate("a.txt");
+        let reply = client.hydrate("a.txt", &|| false);
         let _ = std::fs::remove_file(&client.socket);
         assert_eq!(reply.unwrap_err(), DaemonError::eio("the daemon closed the connection without answering"));
     }
@@ -371,6 +458,89 @@ mod tests {
     fn an_unreachable_daemon_is_eio() {
         let client = DaemonClient::new(std::env::temp_dir().join("protondrive-vfs-no-such.sock"));
         assert_eq!(client.children("").unwrap_err().errno, libc::EIO);
-        assert_eq!(client.hydrate("a.txt").unwrap_err().errno, libc::EIO);
+        assert_eq!(client.hydrate("a.txt", &|| false).unwrap_err().errno, libc::EIO);
+    }
+
+    // Runs `call` on its own thread and gives its result, or None if it is still blocked after `limit`
+    fn within<T: Send + 'static>(limit: Duration, call: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(call());
+        });
+        rx.recv_timeout(limit).ok()
+    }
+
+    #[test]
+    fn a_daemon_whose_backlog_is_full_fails_within_the_deadline() {
+        let socket = std::env::temp_dir().join(format!("protondrive-vfs-backlog-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // Never accepted, with the smallest backlog, filled by connections that never get answered
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let (addr, len) = unix_addr(&socket).unwrap();
+        let mut queued = Vec::new();
+        for _ in 0..64 {
+            let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
+            assert!(fd >= 0);
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            if unsafe { libc::connect(fd.as_raw_fd(), (&raw const addr).cast(), len) } != 0 {
+                break; // EAGAIN: the backlog is full
+            }
+            queued.push(fd);
+        }
+        let client = DaemonClient::new(socket.clone()).with_children_timeout(Duration::from_millis(300));
+        let outcome = within(Duration::from_secs(3), move || {
+            let started = Instant::now();
+            (client.children("").map_err(|e| e.errno), started.elapsed())
+        });
+        let _ = std::fs::remove_file(&socket);
+        let (reply, took) = outcome.expect("children() blocked on the full backlog");
+        assert_eq!(reply.unwrap_err(), libc::EIO);
+        assert!(took < Duration::from_secs(1), "took {took:?}");
+        drop((queued, listener));
+    }
+
+    #[test]
+    fn a_listing_that_fails_slowly_backs_off_the_next_ones() {
+        let socket = std::env::temp_dir().join(format!("protondrive-vfs-backoff-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = connections.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new(); // accepted, never answered
+            for stream in listener.incoming() {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+        let client = DaemonClient::new(socket.clone()).with_children_timeout(Duration::from_millis(300));
+        let started = Instant::now();
+        assert!(client.children_or_empty("").is_empty());
+        assert!(client.children_or_empty("Docs").is_empty());
+        let took = started.elapsed();
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = std::fs::remove_file(&socket);
+        assert!(took < Duration::from_millis(900), "the second listing waited too: {took:?}");
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_hydrate_stops_waiting_once_the_opener_is_interrupted() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let client = serve_once("interrupted", move |_stream| {
+            let _ = rx.recv(); // the download goes on and on
+        });
+        let socket = client.socket.clone();
+        let outcome = within(Duration::from_secs(5), move || {
+            let started = Instant::now();
+            let reply = client.hydrate("a.txt", &|| started.elapsed() > Duration::from_millis(300));
+            (reply.map_err(|e| e.errno), started.elapsed())
+        });
+        let _ = std::fs::remove_file(&socket);
+        drop(tx);
+        let (reply, took) = outcome.expect("hydrate kept waiting for an interrupted opener");
+        assert_eq!(reply.unwrap_err(), libc::EINTR);
+        assert!(took < Duration::from_secs(2), "took {took:?}");
     }
 }

@@ -31,38 +31,72 @@ fn folder(name: &str) -> Value {
     json!({ "name": name, "type": "folder", "size": 0, "mtimeMs": 1_700_000_000_000u64 })
 }
 
-/// The daemon's drive routes, as far as the helper's read side uses them: listings from a map, and hydrate copying
-/// FIXTURE into the backing store after 200 ms, through a staging file as the daemon does.
+/// What the fake daemon answers: listings from a map, and hydrate copying FIXTURE into the backing store after a
+/// delay (200 ms unless told otherwise), through a staging file as the daemon does, or refusing with a code.
+struct Fake {
+    children: HashMap<String, Vec<Value>>,
+    hydrate_delay: Duration,
+    refusals: HashMap<String, &'static str>,
+}
+
+impl Fake {
+    fn new(children: HashMap<&str, Vec<Value>>) -> Fake {
+        Fake {
+            children: children.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            hydrate_delay: Duration::from_millis(200),
+            refusals: HashMap::new(),
+        }
+    }
+
+    fn slow(mut self, delay: Duration) -> Fake {
+        self.hydrate_delay = delay;
+        self
+    }
+
+    fn refusing(mut self, path: &str, code: &'static str) -> Fake {
+        self.refusals.insert(path.to_string(), code);
+        self
+    }
+}
+
+#[derive(Default)]
+struct Calls {
+    children: AtomicUsize,
+    hydrates: AtomicUsize,
+}
+
 struct FakeDaemon {
     socket: PathBuf,
-    hydrates: Arc<AtomicUsize>,
+    calls: Arc<Calls>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl FakeDaemon {
-    fn start(socket: &Path, backing: &Path, children: HashMap<&str, Vec<Value>>) -> FakeDaemon {
+    fn start(socket: &Path, backing: &Path, fake: Fake) -> FakeDaemon {
         let listener = UnixListener::bind(socket).unwrap();
-        let hydrates = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(Calls::default());
         let stop = Arc::new(AtomicBool::new(false));
-        let children: Arc<HashMap<String, Vec<Value>>> =
-            Arc::new(children.into_iter().map(|(k, v)| (k.to_string(), v)).collect());
-        let (backing, count, stopping) = (backing.to_path_buf(), hydrates.clone(), stop.clone());
+        let (backing, fake, counted, stopping) = (backing.to_path_buf(), Arc::new(fake), calls.clone(), stop.clone());
         let thread = thread::spawn(move || {
             for stream in listener.incoming() {
                 if stopping.load(Ordering::SeqCst) {
                     break;
                 }
                 let Ok(stream) = stream else { continue };
-                let (backing, children, count) = (backing.clone(), children.clone(), count.clone());
-                thread::spawn(move || serve(stream, &backing, &children, &count));
+                let (backing, fake, counted) = (backing.clone(), fake.clone(), counted.clone());
+                thread::spawn(move || serve(stream, &backing, &fake, &counted));
             }
         });
-        FakeDaemon { socket: socket.to_path_buf(), hydrates, stop, thread: Some(thread) }
+        FakeDaemon { socket: socket.to_path_buf(), calls, stop, thread: Some(thread) }
     }
 
     fn hydrate_calls(&self) -> usize {
-        self.hydrates.load(Ordering::SeqCst)
+        self.calls.hydrates.load(Ordering::SeqCst)
+    }
+
+    fn children_calls(&self) -> usize {
+        self.calls.children.load(Ordering::SeqCst)
     }
 }
 
@@ -95,7 +129,7 @@ fn query_decode(value: &str) -> String {
     String::from_utf8(out).unwrap()
 }
 
-fn serve(mut stream: UnixStream, backing: &Path, children: &HashMap<String, Vec<Value>>, hydrates: &AtomicUsize) {
+fn serve(mut stream: UnixStream, backing: &Path, fake: &Fake, calls: &Calls) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut raw = Vec::new();
     let mut buf = [0u8; 4096];
@@ -119,19 +153,26 @@ fn serve(mut stream: UnixStream, backing: &Path, children: &HashMap<String, Vec<
     let (method, target) = (request_line.next().unwrap_or(""), request_line.next().unwrap_or(""));
     let (status, reply) = match (method, target.split_once('?')) {
         ("GET", Some(("/vfs/children", query))) => {
+            calls.children.fetch_add(1, Ordering::SeqCst);
             let path = query.strip_prefix("path=").map(query_decode).unwrap_or_default();
-            (200, json!({ "entries": children.get(&path).cloned().unwrap_or_default() }))
+            (200, json!({ "entries": fake.children.get(&path).cloned().unwrap_or_default() }))
         }
         ("POST", None) if target == "/vfs/hydrate" => {
-            hydrates.fetch_add(1, Ordering::SeqCst);
+            let n = calls.hydrates.fetch_add(1, Ordering::SeqCst);
             let path = serde_json::from_slice::<Value>(&body).ok().and_then(|b| b["path"].as_str().map(String::from));
-            thread::sleep(Duration::from_millis(200));
+            thread::sleep(fake.hydrate_delay);
             match path {
+                Some(path) if fake.refusals.contains_key(&path) => {
+                    (400, json!({ "error": "Refused", "code": fake.refusals[&path] }))
+                }
                 Some(path) => {
-                    let staging = backing.join(".proton-drive-tmp-hydrate-test");
-                    std::fs::write(&staging, FIXTURE).unwrap();
-                    std::fs::rename(&staging, backing.join(&path)).unwrap();
-                    (200, json!({ "ok": true }))
+                    // The test may be over by now (a slow download outlives a killed opener): no unwraps here
+                    let staging = backing.join(format!(".proton-drive-tmp-hydrate-{n}"));
+                    let placed = std::fs::write(&staging, FIXTURE).and_then(|_| std::fs::rename(&staging, backing.join(&path)));
+                    match placed {
+                        Ok(()) => (200, json!({ "ok": true })),
+                        Err(err) => (400, json!({ "error": err.to_string(), "code": "EIO" })),
+                    }
                 }
                 None => (400, json!({ "error": "Missing path", "code": "EIO" })),
             }
@@ -186,7 +227,11 @@ impl Harness {
     }
 
     fn start_daemon(&mut self, children: HashMap<&str, Vec<Value>>) {
-        self.daemon = Some(FakeDaemon::start(&self.socket, &self.backing, children));
+        self.start_fake(Fake::new(children));
+    }
+
+    fn start_fake(&mut self, fake: Fake) {
+        self.daemon = Some(FakeDaemon::start(&self.socket, &self.backing, fake));
     }
 
     fn daemon(&self) -> &FakeDaemon {
@@ -243,8 +288,14 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        if mounted(&self.mountpoint) && !fusermount(&["-u"], &self.mountpoint) {
-            fusermount(&["-u", "-z"], &self.mountpoint);
+        for _ in 0..5 {
+            if !mounted(&self.mountpoint) {
+                break;
+            }
+            if !fusermount(&["-u"], &self.mountpoint) {
+                fusermount(&["-u", "-z"], &self.mountpoint);
+            }
+            thread::sleep(Duration::from_millis(100));
         }
         if let Some(mut helper) = self.helper.take() {
             let started = Instant::now();
@@ -328,8 +379,10 @@ fn ls_shows_local_and_online_only_entries_without_temp_files() {
     assert_eq!(ls(&h.path("Shared")), ["inner.txt", "more.pdf"]);
     assert_eq!(ls(&h.path("a+b é")), ["deep.txt"]);
     assert_eq!(std::fs::metadata(h.path("local.txt")).unwrap().len(), 5, "the local copy wins");
-    let missing = std::fs::metadata(h.path(".proton-drive-tmp-hydrate-1234")).unwrap_err();
-    assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+    for temp in [".proton-drive-tmp-hydrate-1234", "Shared/.proton-drive-tmp-99-1-x"] {
+        let missing = std::fs::metadata(h.path(temp)).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound, "{temp}");
+    }
     let info = run(Command::new("cat").arg(h.path(".xdg-volume-info")));
     assert_eq!(info.stdout, b"[Volume Info]\nName=Proton Drive\n");
     assert_eq!(h.daemon().hydrate_calls(), 0);
@@ -475,4 +528,91 @@ fn without_the_daemon_local_entries_keep_working() {
     assert_eq!(ls(&h.mountpoint), [".xdg-volume-info", "local.txt"]);
     assert_eq!(run(Command::new("cat").arg(h.path("local.txt"))).stdout, b"local");
     assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+}
+
+#[test]
+fn a_download_bigger_than_its_listed_size_reads_whole_the_first_time() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    // The daemon lists a file without a claimed size as 0
+    h.start_daemon(HashMap::from([("", vec![file("zero.txt", 0), file("short.txt", 5)])]));
+    h.mount();
+
+    for name in ["zero.txt", "short.txt"] {
+        // The kernel now holds the listed size
+        assert!(std::fs::metadata(h.path(name)).unwrap().len() < FIXTURE.len() as u64);
+        let first = run(Command::new("cat").arg(h.path(name)));
+        assert_eq!(String::from_utf8_lossy(&first.stdout), String::from_utf8_lossy(FIXTURE), "{name}");
+    }
+}
+
+#[test]
+fn an_opener_killed_while_its_file_downloads_is_let_go() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    h.start_fake(Fake::new(HashMap::from([("", vec![file("big.iso", 29)])])).slow(Duration::from_secs(10)));
+    h.mount();
+
+    let mut opener =
+        Command::new("cat").arg(h.path("big.iso")).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let started = Instant::now();
+    while h.daemon().hydrate_calls() == 0 {
+        assert!(started.elapsed() < Duration::from_secs(5), "the open never asked for a download");
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_secs(1));
+    opener.kill().unwrap();
+    let killed = Instant::now();
+    while opener.try_wait().unwrap().is_none() {
+        assert!(killed.elapsed() < Duration::from_secs(2), "the killed opener is still stuck in open");
+        thread::sleep(Duration::from_millis(20));
+    }
+    // The mount still answers
+    assert_eq!(ls(&h.mountpoint), [".xdg-volume-info", "big.iso"]);
+}
+
+#[test]
+fn a_sniff_open_never_contacts_the_daemon() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    h.start_daemon(HashMap::from([("", vec![file("photo.jpg", 123_456)])]));
+    h.mount();
+
+    // A readdir fetches the listing without making entries in the kernel. A lookup 0.7 s later is answered from that
+    // listing, and the kernel trusts the entry for 1 s. At 1.2 s the helper's listing has expired but the kernel's
+    // entry hasn't, so the open reaches the helper with no lookup in front of it
+    assert_eq!(std::fs::read_dir(&h.mountpoint).unwrap().count(), 2);
+    thread::sleep(Duration::from_millis(700));
+    std::fs::metadata(h.path("photo.jpg")).unwrap();
+    thread::sleep(Duration::from_millis(500));
+    let before = h.daemon().children_calls();
+    assert_eq!(errno_of_open(&h.path("photo.jpg"), libc::O_RDONLY | libc::O_NOATIME), Some(libc::EACCES));
+    assert_eq!(h.daemon().children_calls(), before, "the sniff refreshed the listing");
+    assert_eq!(h.daemon().hydrate_calls(), 0);
+}
+
+#[test]
+fn a_refused_download_reaches_the_app_as_enoent_eacces_or_eio() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    let names = ["gone.txt", "hidden.txt", "odd.txt"];
+    h.start_fake(
+        Fake::new(HashMap::from([("", names.iter().map(|n| file(n, 5)).collect())]))
+            .refusing("gone.txt", "ENOENT")
+            .refusing("hidden.txt", "EACCES")
+            .refusing("odd.txt", "EXDEV"),
+    );
+    h.mount();
+
+    assert_eq!(errno_of_open(&h.path("gone.txt"), libc::O_RDONLY), Some(libc::ENOENT));
+    assert_eq!(errno_of_open(&h.path("hidden.txt"), libc::O_RDONLY), Some(libc::EACCES));
+    assert_eq!(errno_of_open(&h.path("odd.txt"), libc::O_RDONLY), Some(libc::EIO), "only ENOENT, EACCES and EIO pass");
 }
