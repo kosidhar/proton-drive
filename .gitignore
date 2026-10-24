@@ -3,6 +3,7 @@ dist/
 release/
 build/
 native-gui/target/
+native-vfs/target/
 *.deb
 *.sqlite
 *.sqlite-shm
