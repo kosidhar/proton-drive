@@ -1,0 +1,165 @@
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+
+import { LocalFolderWatcher } from '../src/sync/localWatcher';
+
+async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (predicate()) {
+            return true;
+        }
+        await Bun.sleep(25);
+    }
+    return predicate();
+}
+
+describe('LocalFolderWatcher', () => {
+    let base: string;
+    let root: string;
+    let changes: string[];
+    let excluded: string[];
+    let watcher: LocalFolderWatcher;
+
+    const start = async (debounceMs = 50) => {
+        watcher = new LocalFolderWatcher(
+            () => root,
+            () => ({ ignorePatterns: [], excludedFolders: excluded }),
+            (event) => {
+                changes.push(event.relPath);
+            },
+            debounceMs,
+        );
+        await watcher.start();
+    };
+    const watchedDirs = () => Array.from((watcher as unknown as { watchers: Map<string, unknown> }).watchers.keys());
+    const isWatched = (rel: string) => watchedDirs().includes(path.join(root, rel));
+
+    beforeEach(async () => {
+        base = await mkdtemp(path.join(tmpdir(), 'proton-drive-watcher-test-'));
+        root = path.join(base, 'root');
+        await mkdir(root);
+        changes = [];
+        excluded = [];
+    });
+
+    afterEach(async () => {
+        watcher.stop();
+        await rm(base, { recursive: true, force: true });
+    });
+
+    test('keeps watching a folder that is deleted and created again', async () => {
+        await mkdir(path.join(root, 'Projects'));
+        await start();
+
+        await rm(path.join(root, 'Projects'), { recursive: true });
+        expect(await waitFor(() => changes.includes('Projects'))).toBe(true);
+        await mkdir(path.join(root, 'Projects'));
+        expect(await waitFor(() => changes.filter((c) => c === 'Projects').length === 2 && isWatched('Projects'))).toBe(
+            true,
+        );
+        await writeFile(path.join(root, 'Projects/new.txt'), 'x');
+
+        expect(await waitFor(() => changes.includes('Projects/new.txt'))).toBe(true);
+    });
+
+    test('keeps watching when the folder is replaced faster than the debounce', async () => {
+        await mkdir(path.join(root, 'Projects'));
+        await start(300);
+
+        await rm(path.join(root, 'Projects'), { recursive: true });
+        await mkdir(path.join(root, 'Projects'));
+        expect(await waitFor(() => changes.includes('Projects'))).toBe(true);
+        await writeFile(path.join(root, 'Projects/new.txt'), 'x');
+
+        expect(await waitFor(() => changes.includes('Projects/new.txt'))).toBe(true);
+    });
+
+    test('re-watches nested folders and forgets the deleted ones', async () => {
+        await mkdir(path.join(root, 'A/B'), { recursive: true });
+        await start();
+        expect(isWatched('A/B')).toBe(true);
+
+        await rm(path.join(root, 'A'), { recursive: true });
+        expect(await waitFor(() => !isWatched('A') && !isWatched('A/B'))).toBe(true);
+        await mkdir(path.join(root, 'A/B'), { recursive: true });
+        expect(await waitFor(() => isWatched('A/B'))).toBe(true);
+        await writeFile(path.join(root, 'A/B/f.txt'), 'x');
+
+        expect(await waitFor(() => changes.includes('A/B/f.txt'))).toBe(true);
+    });
+
+    test('watches folders the sync engine replaces, though it suppresses their events', async () => {
+        await mkdir(path.join(root, 'P'));
+        await start();
+
+        watcher.suppressPath('P', 600);
+        await rm(path.join(root, 'P'), { recursive: true });
+        await Bun.sleep(150);
+        await mkdir(path.join(root, 'P'));
+        expect(await waitFor(() => isWatched('P'))).toBe(true);
+        await Bun.sleep(600); // past the suppression
+        await writeFile(path.join(root, 'P/user.txt'), 'x');
+
+        expect(await waitFor(() => changes.includes('P/user.txt'))).toBe(true);
+        expect(changes).not.toContain('P');
+    });
+
+    test('watches a folder again after it was excluded, deleted and synced back', async () => {
+        await mkdir(path.join(root, 'P'));
+        await start();
+
+        excluded = ['P'];
+        await rm(path.join(root, 'P'), { recursive: true });
+        await Bun.sleep(150);
+        excluded = [];
+        watcher.suppressPath('P');
+        watcher.suppressPath('P/sub');
+        await mkdir(path.join(root, 'P/sub'), { recursive: true });
+        expect(await waitFor(() => isWatched('P/sub'))).toBe(true);
+        await writeFile(path.join(root, 'P/sub/user.txt'), 'x');
+
+        expect(await waitFor(() => changes.includes('P/sub/user.txt'))).toBe(true);
+    });
+
+    test('follows a rename and stops reporting under the old name', async () => {
+        await mkdir(path.join(root, 'A'));
+        await start();
+
+        await rename(path.join(root, 'A'), path.join(root, 'B'));
+        expect(await waitFor(() => isWatched('B') && !isWatched('A'))).toBe(true);
+        await writeFile(path.join(root, 'B/f.txt'), 'x');
+
+        expect(await waitFor(() => changes.includes('B/f.txt'))).toBe(true);
+        expect(changes).not.toContain('A/f.txt');
+    });
+
+    test('stops watching a folder moved out of the root, nested folders included', async () => {
+        await mkdir(path.join(root, 'M/deep/deeper'), { recursive: true });
+        await start();
+
+        // A move reports only the moved folder itself, nothing for the folders inside it
+        await rename(path.join(root, 'M/deep'), path.join(base, 'deep'));
+        expect(await waitFor(() => !isWatched('M/deep'))).toBe(true);
+        expect(isWatched('M/deep/deeper')).toBe(false);
+        await writeFile(path.join(base, 'deep/deeper/outside.txt'), 'x');
+        await Bun.sleep(300);
+
+        expect(changes).not.toContain('M/deep/deeper/outside.txt');
+    });
+
+    test('deleting a folder leaves a sibling whose name starts the same alone', async () => {
+        await mkdir(path.join(root, 'A'));
+        await mkdir(path.join(root, 'AB'));
+        await start();
+
+        await rm(path.join(root, 'A'), { recursive: true });
+        expect(await waitFor(() => !isWatched('A'))).toBe(true);
+        expect(isWatched('AB')).toBe(true);
+        await writeFile(path.join(root, 'AB/f.txt'), 'x');
+
+        expect(await waitFor(() => changes.includes('AB/f.txt'))).toBe(true);
+    });
+});

@@ -49,6 +49,8 @@ export class LocalFolderWatcher {
     private watchers = new Map<string, FSWatcher>();
     private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
     private suppressedPaths = new Map<string, number>();
+    private renamedPaths = new Set<string>();
+    private reportablePaths = new Set<string>();
     private running = false;
 
     constructor(
@@ -90,12 +92,25 @@ export class LocalFolderWatcher {
             clearTimeout(timer);
         }
         this.debounceTimers.clear();
+        this.renamedPaths.clear();
+        this.reportablePaths.clear();
         for (const watcher of this.watchers.values()) {
             try {
                 watcher.close();
             } catch {}
         }
         this.watchers.clear();
+    }
+
+    private unwatchTree(dirPath: string): void {
+        for (const [watchedPath, watcher] of this.watchers) {
+            if (watchedPath === dirPath || watchedPath.startsWith(`${dirPath}${path.sep}`)) {
+                try {
+                    watcher.close();
+                } catch {}
+                this.watchers.delete(watchedPath);
+            }
+        }
     }
 
     private async watchDirectoryTree(dirPath: string): Promise<void> {
@@ -120,7 +135,10 @@ export class LocalFolderWatcher {
                     this.handleRawFsEvent(eventType, relPath, fullPath);
                 });
                 watcher.on('error', () => {
-                    this.watchers.delete(dirPath);
+                    // Its subtree goes too, so a path without a watcher never has watched folders under it
+                    if (this.watchers.get(dirPath) === watcher) {
+                        this.unwatchTree(dirPath);
+                    }
                 });
                 this.watchers.set(dirPath, watcher);
             } catch {
@@ -142,14 +160,19 @@ export class LocalFolderWatcher {
         if (!this.running || !relPath || relPath.startsWith('..')) {
             return;
         }
-        if (this.isSuppressed(relPath)) {
-            return;
-        }
+        // Suppression and ignore rules only decide whether the change is reported. Keeping the watchers right has to
+        // happen for every folder, including the ones the sync engine itself creates or deletes (it suppresses those).
         const { ignorePatterns, excludedFolders } = this.getIgnoreConfig();
-        if (matchesIgnorePatterns(relPath, ignorePatterns, excludedFolders)) {
+        const reportable = !this.isSuppressed(relPath) && !matchesIgnorePatterns(relPath, ignorePatterns, excludedFolders);
+        if (!reportable && eventType !== 'rename' && !this.watchers.has(fullPath)) {
             return;
         }
-
+        if (reportable) {
+            this.reportablePaths.add(relPath);
+        }
+        if (eventType === 'rename') {
+            this.renamedPaths.add(relPath);
+        }
         const existingTimer = this.debounceTimers.get(relPath);
         if (existingTimer) {
             clearTimeout(existingTimer);
@@ -157,20 +180,27 @@ export class LocalFolderWatcher {
 
         const timer = setTimeout(async () => {
             this.debounceTimers.delete(relPath);
-            if (!this.running || this.isSuppressed(relPath)) {
+            const renamed = this.renamedPaths.delete(relPath);
+            const report = this.reportablePaths.delete(relPath) && !this.isSuppressed(relPath);
+            if (!this.running) {
                 return;
             }
-            // If a new directory appeared, attach an inotify watcher to it as well
-            try {
-                const st = await stat(fullPath);
-                if (st.isDirectory()) {
-                    await this.watchDirectoryTree(fullPath);
-                }
-            } catch {}
+            // A folder that went away, or was replaced, loses its watchers: a deleted folder's watcher just goes quiet
+            // (no error event), so one recreated at the same path would otherwise never be watched again
+            const st = await stat(fullPath).catch(() => null);
+            const isDirectory = st?.isDirectory() ?? false;
+            if (this.watchers.has(fullPath) && (!isDirectory || renamed)) {
+                this.unwatchTree(fullPath);
+            }
+            if (isDirectory) {
+                await this.watchDirectoryTree(fullPath);
+            }
 
-            try {
-                await this.onLocalChange({ relPath, fullPath, eventType });
-            } catch {}
+            if (report) {
+                try {
+                    await this.onLocalChange({ relPath, fullPath, eventType });
+                } catch {}
+            }
         }, this.debounceMs);
 
         this.debounceTimers.set(relPath, timer);
