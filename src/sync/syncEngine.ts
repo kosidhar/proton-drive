@@ -1,5 +1,5 @@
 import { lstatSync } from 'node:fs';
-import { cp, lstat, mkdir, readdir, rename, rm, stat } from 'node:fs/promises';
+import { cp, lstat, mkdir, readdir, rename, rm, rmdir, stat, unlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -26,8 +26,9 @@ import { getName } from '../sdk/node';
 import { AvailabilityPolicy, type ItemAvailability } from './availability';
 import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
 import { createLocalConflictCopy } from './conflictResolver';
+import { gioTrash, type MoveToDesktopTrash } from './desktopTrash';
 import { readDriveLayout } from './driveMode';
-import { isEngineTempName, removeScannedEntries, scanLocalCopies } from './localCopies';
+import { isEngineTempName, removeScannedEntries, type ScanEntry, scanLocalCopies } from './localCopies';
 import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
 import { entryFromNode, RemoteIndex, type RemoteIndexEntry } from './remoteIndex';
 import type { ConflictRecord, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
@@ -79,9 +80,9 @@ export class ProtonDriveSyncEngine {
     private onlineOnlyCrawlDue = true;
     private syncingFolders = new Set<string>();
     private localQueue = new Map<string, Promise<void>>();
-    // Availability changes (setAvailability, and finishing pending hides) run one at a time on this chain, and local
-    // change handling waits for them: a deletion seen while the records still exist would read as the user deleting
-    // synced files.
+    // Availability changes (setAvailability, and finishing pending hides) and removals after a cloud delete run one at a
+    // time on this chain, and local change handling waits for them: a deletion seen while the records still exist would
+    // read as the user deleting synced files.
     private availabilityRun: Promise<void> = Promise.resolve();
     // How many availability changes were asked for per node uid: a later one supersedes an earlier one on the same item
     // that is still waiting or running (an unhide stops a hide's removal, a pin stops a free's).
@@ -103,7 +104,7 @@ export class ProtonDriveSyncEngine {
         private readonly auth: { isLoggedIn(): boolean },
         private readonly stateDb: SyncStateDatabase,
         private readonly logger: Logger,
-        private readonly options: { backingDir?: string } = {},
+        private readonly options: { backingDir?: string; moveToDesktopTrash?: MoveToDesktopTrash } = {},
     ) {
         this.index = new RemoteIndex(this.stateDb.connection);
         this.policy = new AvailabilityPolicy(this.stateDb.connection, this.index);
@@ -474,15 +475,8 @@ export class ProtonDriveSyncEngine {
         // Case 2: Present locally, not present remotely
         if (localInfo && !remoteNode) {
             if (dbRecord) {
-                // Was previously synced, so it was deleted/trashed on Proton Drive -> remove locally
-                this.watcher.suppressPath(relPath);
-                await rm(localFullPath, { recursive: true, force: true });
-                this.stateDb.removeItemByPath(relPath);
-                this.stateDb.logActivity({
-                    action: 'delete-local',
-                    localRelPath: relPath,
-                    details: 'Removed local item after remote deletion on Proton Drive',
-                });
+                // Was previously synced, so it was deleted or trashed on Proton Drive (a listing can't tell which)
+                await this.removeAfterCloudDelete(relPath, 'deleted');
                 return;
             }
             // New local item -> upload/create on Proton Drive
@@ -1239,15 +1233,7 @@ export class ProtonDriveSyncEngine {
             this.index.removeSubtree(event.nodeUid);
             const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
             if (tracked) {
-                const localFullPath = path.join(this.localRoot(), tracked.localRelPath);
-                this.watcher.suppressPath(tracked.localRelPath);
-                await rm(localFullPath, { recursive: true, force: true }).catch(() => {});
-                this.stateDb.removeItemByNodeUid(event.nodeUid);
-                this.stateDb.logActivity({
-                    action: 'delete-local',
-                    localRelPath: tracked.localRelPath,
-                    details: 'Removed local item via real-time Proton Drive event',
-                });
+                await this.removeAfterCloudDelete(tracked.localRelPath, 'deleted');
             }
             return;
         }
@@ -1257,15 +1243,7 @@ export class ProtonDriveSyncEngine {
                 this.index.removeSubtree(event.nodeUid);
                 const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
                 if (tracked) {
-                    const localFullPath = path.join(this.localRoot(), tracked.localRelPath);
-                    this.watcher.suppressPath(tracked.localRelPath);
-                    await rm(localFullPath, { recursive: true, force: true }).catch(() => {});
-                    this.stateDb.removeItemByNodeUid(event.nodeUid);
-                    this.stateDb.logActivity({
-                        action: 'delete-local',
-                        localRelPath: tracked.localRelPath,
-                        details: 'Removed local item after remote move to Trash',
-                    });
+                    await this.removeAfterCloudDelete(tracked.localRelPath, 'trashed');
                 }
                 return;
             }
@@ -1276,6 +1254,151 @@ export class ProtonDriveSyncEngine {
             // Trigger incremental reconcile
             await this.reconcileNow();
         }
+    }
+
+    // The cloud copy of a synced item is gone: deleted, or moved to the Proton Drive trash. Its local copy goes too, but
+    // only where that loses nothing: unchanged synced copies are removed as Free up space removes them, each record just
+    // before its file. Anything that exists only on this computer (ignored, not a regular file, new or edited) is moved
+    // to the desktop Trash, and the user is told; what can't be moved there stays where it is and uploads again as a new
+    // item. No record under the path is left either way: a record without its file reads as the user deleting it, which
+    // would trash something in the cloud.
+    // It takes its turn on availabilityRun, so it never interleaves with Free up space or Hide (whose putBack could bring
+    // back a record that this then leaves without its file), and local change handling waits for it.
+    private async removeAfterCloudDelete(relPath: string, reason: 'deleted' | 'trashed'): Promise<void> {
+        if (relPath === '') {
+            return; // Never the whole sync folder
+        }
+        await this.inAvailabilityRun(async () => {
+            if (this.stateDb.getItemByPath(relPath)) {
+                await this.removeLocalCopyAfterCloudDelete(relPath, reason);
+            }
+            // Otherwise dealt with meanwhile (by another removal, say): whatever is left syncs as usual
+        });
+    }
+
+    private async removeLocalCopyAfterCloudDelete(relPath: string, reason: 'deleted' | 'trashed'): Promise<void> {
+        const settings = this.stateDb.getSettings();
+        const root = this.localRoot();
+        this.watcher.suppressPath(relPath);
+        const scan = await scanLocalCopies({
+            syncDir: root,
+            relPath,
+            ignorePatterns: settings.ignorePatterns,
+            stopAtFirst: false,
+            isUnchangedSyncedCopy: (rel, fullPath, st) => this.isUnchangedSyncedCopy(rel, fullPath, st),
+        });
+        const { moved, stayed } = await this.whileRemoving(async (records) => {
+            const { kept } = await removeScannedEntries({
+                syncDir: root,
+                entries: scan.entries,
+                keep: new Set(scan.localOnly.map((item) => item.relPath)),
+                mode: 'keep-changed',
+                dropRecord: records.drop,
+                shouldContinue: () => true, // Stopping halfway would leave synced copies behind, unrecorded, to upload
+            });
+            // The cloud copy is gone, so nothing under the path stays recorded, kept things included: dropped before
+            // any of them is moved or removed
+            for (const item of this.stateDb.getItemsUnder(relPath)) {
+                records.drop(item.localRelPath);
+            }
+            return this.clearKeptAfterCloudDelete(root, relPath, scan.entries, kept);
+        });
+        const told: string[] = [];
+        if (moved > 0) {
+            told.push(`${moved} item(s) that existed only on this computer were moved to your Trash.`);
+        }
+        if (stayed > 0) {
+            // Where the user sees it, never the virtual drive's backing store
+            const where = path.join(settings.syncDir, relPath);
+            told.push(`${stayed} item(s) that existed only on this computer were kept at ${where} and will upload again.`);
+        }
+        if (told.length === 0) {
+            this.stateDb.logActivity({
+                action: 'delete-local',
+                localRelPath: relPath,
+                details:
+                    reason === 'trashed'
+                        ? 'Removed local item after it was moved to the Proton Drive Trash'
+                        : 'Removed local item after it was deleted on Proton Drive',
+            });
+            return;
+        }
+        const notice = `${relPath} was removed from Proton Drive. ${told.join(' ')}`;
+        this.stateDb.logActivity({ action: 'delete-local', localRelPath: relPath, details: notice });
+        sendDesktopNotification({
+            title: 'Proton Drive: items only on this computer were kept',
+            body: notice,
+            urgency: 'normal',
+            enabled: settings.notificationsEnabled,
+        });
+    }
+
+    // Clears what a removal after a cloud delete left in relPath (see removeAfterCloudDelete), with its records already
+    // dropped, and says how many things went to the desktop Trash and how many stayed.
+    // - Our own downloads still being written are deleted: what they were fetching is no longer in the cloud.
+    // - The topmost kept things go to the desktop Trash: one with nothing kept inside it, or a folder kept along with
+    //   everything in it, but not a folder that also held removed things and stayed only for what it still holds.
+    // - Folders left empty are removed, one at a time, never recursively.
+    private async clearKeptAfterCloudDelete(
+        root: string,
+        relPath: string,
+        entries: ScanEntry[],
+        kept: string[],
+    ): Promise<{ moved: number; stayed: number }> {
+        const scannedAsFile = new Set(entries.filter((e) => e.signature.startsWith('file:')).map((e) => e.relPath));
+        const isOurDownload = (rel: string) => scannedAsFile.has(rel) && isEngineTempName(path.posix.basename(rel));
+        for (const rel of kept.filter(isOurDownload)) {
+            await unlink(path.join(root, rel)).catch(() => {});
+        }
+        const stillKept = new Set(kept.filter((rel) => !isOurDownload(rel)));
+        // The folders above `rel`, up to and including relPath (everything scanned is relPath or inside it)
+        const foldersAbove = function* (rel: string) {
+            for (let p = rel; p.length > relPath.length; ) {
+                p = p.slice(0, p.lastIndexOf('/'));
+                yield p;
+            }
+        };
+        const holdsRemoved = new Set<string>();
+        const holdsKept = new Set<string>();
+        for (const entry of entries) {
+            for (const folder of foldersAbove(entry.relPath)) {
+                (stillKept.has(entry.relPath) ? holdsKept : holdsRemoved).add(folder);
+            }
+        }
+        const candidates = new Set([...stillKept].filter((rel) => !holdsKept.has(rel) || !holdsRemoved.has(rel)));
+        const topmost = [...candidates].filter((rel) => !Array.from(foldersAbove(rel)).some((p) => candidates.has(p)));
+        let moved = 0;
+        let stayed = 0;
+        for (const rel of topmost.sort()) {
+            const fullPath = path.join(root, rel);
+            const st = await lstat(fullPath).catch(() => null);
+            if (!st || (st.isDirectory() && (await readdir(fullPath).catch(() => null))?.length === 0)) {
+                continue; // Gone meanwhile, or an empty folder: nothing in it to keep
+            }
+            let wasMoved = false;
+            try {
+                wasMoved = await this.moveToDesktopTrash(fullPath);
+            } catch {
+                // Counts as not moved
+            }
+            if (wasMoved) {
+                moved += 1;
+            } else {
+                stayed += 1;
+            }
+        }
+        // Folders left empty, deepest first (kept lists what is in a folder before the folder)
+        for (const rel of kept) {
+            const fullPath = path.join(root, rel);
+            if ((await lstat(fullPath).catch(() => null))?.isDirectory()) {
+                await rmdir(fullPath).catch(() => {}); // Fails, as it should, while anything is still in it
+            }
+        }
+        return { moved, stayed };
+    }
+
+    private get moveToDesktopTrash(): MoveToDesktopTrash {
+        return this.options.moveToDesktopTrash ?? gioTrash;
     }
 
     // The sync pass lists only the folders on this computer, and the crawl of the others runs only now and then, so a

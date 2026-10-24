@@ -1768,4 +1768,235 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(await stat(target).then(() => true, () => false)).toBe(false);
         });
     });
+
+    // Projects is deleted or trashed in the cloud (on the web, or on another device) while this computer holds things
+    // in it that exist nowhere else: they must survive, in the desktop Trash or where they are (issue #16)
+    describe('cloud-side deletes', () => {
+        const activity = () => stateDb.listActivity(500).map((a) => a.details);
+        // Projects downloaded through the engine, so the records are real. The desktop Trash is a fake that records
+        // what it is handed and, when it works, moves it into tempDir/Trash.
+        const downloadedProjects = async (layout: 'plain' | 'virtual', trashWorks = true) => {
+            if (layout === 'virtual') {
+                stateDb.setMeta('driveLayout', 'virtual');
+            }
+            const drive = makeMockDrive();
+            const trashDir = path.join(tempDir, 'Trash');
+            const handedToTrash: string[] = [];
+            const moveToDesktopTrash = async (fullPath: string) => {
+                handedToTrash.push(fullPath);
+                if (!trashWorks) {
+                    return false;
+                }
+                await mkdir(trashDir, { recursive: true });
+                await rename(fullPath, path.join(trashDir, path.basename(fullPath)));
+                return true;
+            };
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash,
+            });
+            drive.add('Projects/readme.txt', 'readme');
+            drive.add('Projects/app/index.ts', 'index');
+            drive.add('Projects/notes.txt', 'synced version');
+            engine.availability.setPin(drive.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            expect(drive.calls.downloads.sort()).toEqual(['Projects/app/index.ts', 'Projects/notes.txt', 'Projects/readme.txt']);
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            const trashed = () => handedToTrash.map((p) => path.relative(engine.localRoot(), p)).sort();
+            return { ...drive, engine, files: localFiles(stateDb, () => engine.localRoot()), local, trashDir, trashed };
+        };
+        type Drive = Awaited<ReturnType<typeof downloadedProjects>>;
+        // An ignored .git, which is never uploaded, and an edit that hasn't uploaded yet
+        const addLocalOnly = async (d: Drive) => {
+            await d.files.writeLocal('Projects/app/.git/HEAD', 'ref: refs/heads/main');
+            await writeFile(d.local('Projects/notes.txt'), 'edited, not uploaded yet');
+        };
+        const goneFromCloud = (d: Drive, relPath: string) => {
+            for (const uid of [...d.nodes.keys()]) {
+                if (uid === `vol~${relPath}` || uid.startsWith(`vol~${relPath}/`)) {
+                    d.nodes.delete(uid);
+                }
+            }
+        };
+        const event = (d: Drive, e: DriveEvent): Promise<void> => (d.engine as any).handleRemoteDriveEvent(e);
+        // The three ways the engine learns of it, each after the cloud stopped listing Projects
+        const cloudDeletes: Array<[string, (d: Drive) => Promise<void>]> = [
+            ['a sync pass that no longer finds it', (d) => d.engine.reconcileNow()],
+            [
+                'a NodeDeleted event',
+                (d) =>
+                    event(d, {
+                        type: DriveEventType.NodeDeleted,
+                        nodeUid: 'vol~Projects',
+                        parentNodeUid: d.root.uid,
+                        treeEventScopeId: 'scope-main',
+                        eventId: 'evt-deleted',
+                    }),
+            ],
+            [
+                'a NodeUpdated event saying it was trashed',
+                (d) =>
+                    event(d, {
+                        type: DriveEventType.NodeUpdated,
+                        nodeUid: 'vol~Projects',
+                        parentNodeUid: d.root.uid,
+                        isTrashed: true,
+                        isShared: false,
+                        treeEventScopeId: 'scope-main',
+                        eventId: 'evt-trashed',
+                    }),
+            ],
+        ];
+
+        for (const layout of ['plain', 'virtual'] as const) {
+            for (const [how, deleteInCloud] of cloudDeletes) {
+                test(`${layout}, ${how}: an ignored .git and an unsynced edit go to the desktop Trash, the rest is removed`, async () => {
+                    const d = await downloadedProjects(layout);
+                    await addLocalOnly(d);
+                    goneFromCloud(d, 'Projects');
+
+                    await deleteInCloud(d);
+
+                    // The topmost local-only things, not the folders holding them
+                    expect(d.trashed()).toEqual(['Projects/app/.git', 'Projects/notes.txt']);
+                    expect(await readFile(path.join(d.trashDir, '.git/HEAD'), 'utf8')).toBe('ref: refs/heads/main');
+                    expect(await readFile(path.join(d.trashDir, 'notes.txt'), 'utf8')).toBe('edited, not uploaded yet');
+                    expect(await d.files.exists('Projects')).toBe(false); // emptied, so removed
+                    expect(d.files.recordCount('Projects')).toBe(0);
+                    expect(activity()).toContain(
+                        'Projects was removed from Proton Drive. 2 item(s) that existed only on this computer were moved to your Trash.',
+                    );
+                    // Nothing is trashed in the cloud or uploaded again afterwards
+                    await d.engine.reconcileNow();
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.calls.uploads).toEqual([]);
+                    expect(await d.files.exists('Projects')).toBe(false);
+                    if (layout === 'virtual') {
+                        expect(await stat(stateDb.getSettings().syncDir).then(() => true, () => false)).toBe(false);
+                    }
+                });
+
+                test(`${layout}, ${how}: a fully synced folder is removed and the desktop Trash is never called`, async () => {
+                    const d = await downloadedProjects(layout);
+                    goneFromCloud(d, 'Projects');
+
+                    await deleteInCloud(d);
+
+                    expect(d.trashed()).toEqual([]);
+                    expect(await d.files.exists('Projects')).toBe(false);
+                    expect(d.files.recordCount('Projects')).toBe(0);
+                    expect(activity().filter((a) => a.includes('was removed from Proton Drive'))).toEqual([]);
+                    await d.engine.reconcileNow();
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.calls.uploads).toEqual([]);
+                });
+
+                test(`${layout}, ${how}: what the desktop Trash can't take stays in place, unrecorded, and uploads again`, async () => {
+                    const d = await downloadedProjects(layout, false);
+                    await addLocalOnly(d);
+                    goneFromCloud(d, 'Projects');
+
+                    await deleteInCloud(d);
+
+                    expect(d.trashed()).toEqual(['Projects/app/.git', 'Projects/notes.txt']);
+                    expect(await readFile(d.local('Projects/app/.git/HEAD'), 'utf8')).toBe('ref: refs/heads/main');
+                    expect(await readFile(d.local('Projects/notes.txt'), 'utf8')).toBe('edited, not uploaded yet');
+                    expect(await d.files.exists('Projects/readme.txt')).toBe(false);
+                    expect(await d.files.exists('Projects/app/index.ts')).toBe(false);
+                    expect(d.files.recordCount('Projects')).toBe(0);
+                    // Where the user sees it: the sync folder, also when the files are in the backing store
+                    const where = path.join(stateDb.getSettings().syncDir, 'Projects');
+                    expect(activity()).toContain(
+                        `Projects was removed from Proton Drive. 2 item(s) that existed only on this computer were kept at ${where} and will upload again.`,
+                    );
+                    // A new local item from now on: the edit uploads (the ignored .git never does), nothing is trashed
+                    await d.engine.reconcileNow();
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.calls.uploads).toEqual(['Projects/notes.txt']);
+                    expect(await readFile(d.local('Projects/app/.git/HEAD'), 'utf8')).toBe('ref: refs/heads/main');
+                });
+            }
+        }
+
+        test('a folder made here and never uploaded goes to the desktop Trash as one item', async () => {
+            const d = await downloadedProjects('plain');
+            await d.files.writeLocal('Projects/drafts/a.txt', 'a');
+            await d.files.writeLocal('Projects/drafts/b.txt', 'b');
+            goneFromCloud(d, 'Projects');
+
+            await event(d, {
+                type: DriveEventType.NodeDeleted,
+                nodeUid: 'vol~Projects',
+                parentNodeUid: d.root.uid,
+                treeEventScopeId: 'scope-main',
+                eventId: 'evt-deleted',
+            });
+
+            expect(d.trashed()).toEqual(['Projects/drafts']);
+            expect((await readdir(path.join(d.trashDir, 'drafts'))).sort()).toEqual(['a.txt', 'b.txt']);
+            expect(await d.files.exists('Projects')).toBe(false);
+            expect(d.files.recordCount('Projects')).toBe(0);
+            expect(activity()).toContain(
+                'Projects was removed from Proton Drive. 1 item(s) that existed only on this computer were moved to your Trash.',
+            );
+        });
+
+        test('a single edited file deleted in the cloud goes to the desktop Trash', async () => {
+            const d = await downloadedProjects('plain');
+            await writeFile(d.local('Projects/notes.txt'), 'edited, not uploaded yet');
+            goneFromCloud(d, 'Projects/notes.txt');
+
+            await event(d, {
+                type: DriveEventType.NodeDeleted,
+                nodeUid: 'vol~Projects/notes.txt',
+                parentNodeUid: 'vol~Projects',
+                treeEventScopeId: 'scope-main',
+                eventId: 'evt-deleted',
+            });
+
+            expect(d.trashed()).toEqual(['Projects/notes.txt']);
+            expect(await readFile(path.join(d.trashDir, 'notes.txt'), 'utf8')).toBe('edited, not uploaded yet');
+            expect(stateDb.getItemByPath('Projects/notes.txt')).toBeNull();
+            expect(await d.files.exists('Projects/readme.txt')).toBe(true); // the rest of the folder is untouched
+            expect(stateDb.getItemByPath('Projects/readme.txt')).not.toBeNull();
+            await d.engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.calls.uploads).toEqual([]);
+        });
+
+        // Interleaved, Free's putBack could bring back a record that the cloud delete then leaves without its file
+        test('a cloud delete arriving while Free up space runs on the folder waits for it, then leaves no records', async () => {
+            const d = await downloadedProjects('plain');
+            await addLocalOnly(d);
+            let cloudDelete: Promise<void> | undefined;
+            let trashedWhileFreeRan: string[] | undefined;
+            const freeUpSpace = (d.engine as any).freeUpSpace.bind(d.engine);
+            (d.engine as any).freeUpSpace = async (...args: unknown[]) => {
+                goneFromCloud(d, 'Projects');
+                cloudDelete = event(d, {
+                    type: DriveEventType.NodeUpdated,
+                    nodeUid: 'vol~Projects',
+                    parentNodeUid: d.root.uid,
+                    isTrashed: true,
+                    isShared: false,
+                    treeEventScopeId: 'scope-main',
+                    eventId: 'evt-trashed',
+                });
+                await Bun.sleep(50); // time enough for the cloud delete to run, were it not waiting its turn
+                trashedWhileFreeRan = d.trashed();
+                return freeUpSpace(...args);
+            };
+
+            await d.engine.setAvailability('Projects', 'free');
+            await cloudDelete;
+
+            expect(trashedWhileFreeRan).toEqual([]);
+            expect(d.trashed()).toEqual(['Projects/app/.git', 'Projects/notes.txt']);
+            expect(await d.files.exists('Projects')).toBe(false);
+            expect(d.files.recordCount('Projects')).toBe(0);
+            await d.engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.calls.uploads).toEqual([]);
+        });
+    });
 });
