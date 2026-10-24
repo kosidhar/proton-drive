@@ -1,4 +1,4 @@
-import { lstatSync } from 'node:fs';
+import { lstatSync, renameSync } from 'node:fs';
 import { cp, lstat, mkdir, readdir, rename, rm, rmdir, stat, unlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -431,6 +431,19 @@ export class ProtonDriveSyncEngine {
                 }
                 return;
             }
+            // Renamed or moved in the cloud, with its local copy still at the old path: that copy moves here, rather
+            // than a new one coming down
+            const recorded = this.stateDb.getItemByNodeUid(remoteNode.uid);
+            if (recorded?.localRelPath === relPath) {
+                return; // Moved here earlier in this pass, after the listing was read: the next look at it syncs it
+            }
+            if (
+                recorded &&
+                (await this.existsLocally(recorded.localRelPath)) &&
+                (await this.followRemoteMove(remoteNode.uid, recorded.localRelPath, relPath))
+            ) {
+                return;
+            }
             if (hiding) {
                 return;
             }
@@ -475,8 +488,8 @@ export class ProtonDriveSyncEngine {
         // Case 2: Present locally, not present remotely
         if (localInfo && !remoteNode) {
             if (dbRecord) {
-                // Was previously synced, so it was deleted or trashed on Proton Drive (a listing can't tell which)
-                await this.removeAfterCloudDelete(relPath, 'deleted');
+                // Was previously synced, so it was renamed or moved on Proton Drive, or deleted or trashed there
+                await this.afterGoneFromCloudPath(relPath);
                 return;
             }
             // New local item -> upload/create on Proton Drive
@@ -1404,6 +1417,133 @@ export class ProtonDriveSyncEngine {
 
     private get moveToDesktopTrash(): MoveToDesktopTrash {
         return this.options.moveToDesktopTrash ?? gioTrash;
+    }
+
+    // A synced item the cloud no longer lists at its path. Renamed or moved there, its local copy follows; deleted or
+    // trashed (a listing can't tell which), or moved where its local copy can't follow (something is already there,
+    // say), it goes as after a cloud delete.
+    private async afterGoneFromCloudPath(relPath: string): Promise<void> {
+        // Looked at again: earlier in this pass it may have been moved away already, found from its new path
+        const record = this.stateDb.getItemByPath(relPath);
+        if (!record) {
+            return;
+        }
+        const now = await this.currentRemotePath(record.nodeUid, relPath);
+        if (now === relPath) {
+            return; // The cloud still has it here after all (a listing that missed it): the next pass looks again
+        }
+        if (now !== null && (await this.followRemoteMove(record.nodeUid, relPath, now))) {
+            return;
+        }
+        await this.removeAfterCloudDelete(relPath, 'deleted');
+    }
+
+    // Where a node is in My files now, for one the listing of `notAt`'s folder no longer shows there: from the remote
+    // index, or else from the cloud, as the index drops a node whose old folder was listed before its new one. Null when
+    // it is gone (deleted, trashed or not found), or its folder is one the index doesn't hold.
+    private async currentRemotePath(uid: string, notAt: string): Promise<string | null> {
+        const indexed = this.index.getByUid(uid);
+        if (indexed && indexed.relPath !== notAt) {
+            return indexed.relPath;
+        }
+        let node: NodeEntity;
+        try {
+            node = await this.sdk.getNode(uid);
+        } catch {
+            return null;
+        }
+        const parent = node.parentUid ? this.index.getByUid(node.parentUid) : null;
+        if (node.trashTime || !parent || parent.type !== 'folder') {
+            return null;
+        }
+        return parent.relPath === '' ? getName(node) : `${parent.relPath}/${getName(node)}`;
+    }
+
+    // A synced item renamed or moved in the cloud: its local copy moves to match, with everything in it (ignored and
+    // unsynced things included), and its records with it, so nothing is downloaded again or lost. Its pin and hide flags
+    // follow the node by themselves. Returns false, having moved nothing, when its local copy isn't at fromRel, something
+    // is already at toRel (on disk or in the records), or toRel is no place for a local copy: hidden, ignored, or in a
+    // folder the remote index doesn't hold. A folder above toRel that isn't on this computer (an online-only one) is
+    // created to hold it; the next pass records it.
+    // It takes its turn on availabilityRun, like the removals, so it never interleaves with one on the same items, and
+    // local change handling waits for it.
+    private async followRemoteMove(nodeUid: string, fromRel: string, toRel: string): Promise<boolean> {
+        if (fromRel === '' || toRel === '' || toRel === fromRel || toRel.startsWith(`${fromRel}/`)) {
+            return false;
+        }
+        return this.inAvailabilityRun(async () => {
+            if (
+                this.stateDb.getItemByPath(fromRel)?.nodeUid !== nodeUid ||
+                this.stateDb.hasItemsUnder(toRel) ||
+                matchesIgnorePatterns(toRel, this.stateDb.getSettings().ignorePatterns) ||
+                this.policy.hiddenBy(toRel)?.hide === 'hidden' ||
+                !(await this.existsLocally(fromRel)) ||
+                (await this.existsLocally(toRel))
+            ) {
+                return false;
+            }
+            const root = this.localRoot();
+            const parentRel = path.posix.dirname(toRel);
+            if (parentRel !== '.' && !(await this.existsLocally(parentRel))) {
+                if (this.index.getByPath(parentRel)?.type !== 'folder') {
+                    return false;
+                }
+                for (let slash = toRel.indexOf('/'); slash !== -1; slash = toRel.indexOf('/', slash + 1)) {
+                    this.watcher.suppressPath(toRel.slice(0, slash));
+                }
+                try {
+                    await mkdir(path.join(root, parentRel), { recursive: true });
+                } catch (error: unknown) {
+                    this.logger.warn(`Could not make ${parentRel} to move ${fromRel} into: ${error}`);
+                    return false;
+                }
+            }
+            this.watcher.suppressPath(fromRel);
+            this.watcher.suppressPath(toRel);
+            const moved = await this.whileRemoving(async (records) => {
+                const oldPaths = this.stateDb.getItemsUnder(fromRel).map((item) => item.localRelPath);
+                // The item and its records move together, with nothing able to run in between: neither path is ever
+                // seen with a record but no file, which reads as the user deleting it. A rename replaces a file already
+                // at the target, so the look for one comes just before it.
+                try {
+                    if (lstatSync(path.join(root, toRel), { throwIfNoEntry: false })) {
+                        return false;
+                    }
+                    renameSync(path.join(root, fromRel), path.join(root, toRel));
+                } catch (error: unknown) {
+                    this.logger.warn(`Could not move ${fromRel} to ${toRel} to follow Proton Drive: ${error}`);
+                    return false;
+                }
+                try {
+                    this.stateDb.renameItemPath(fromRel, toRel);
+                } catch (error: unknown) {
+                    this.logger.warn(`Could not move the records of ${fromRel} to ${toRel}, so it goes back: ${error}`);
+                    try {
+                        renameSync(path.join(root, toRel), path.join(root, fromRel));
+                    } catch {
+                        // Stuck at toRel: its records can't stay at fromRel without it, so it syncs from there as new
+                        for (const oldPath of oldPaths) {
+                            records.drop(oldPath);
+                        }
+                    }
+                    return false;
+                }
+                // Work still under way on the old paths (an upload finishing, say) must not record them again, without
+                // their files
+                for (const oldPath of oldPaths) {
+                    records.drop(oldPath);
+                }
+                return true;
+            });
+            if (moved) {
+                this.stateDb.logActivity({
+                    action: 'sync',
+                    localRelPath: toRel,
+                    details: `Moved locally to follow a rename in Proton Drive: ${fromRel} → ${toRel}`,
+                });
+            }
+            return moved;
+        });
     }
 
     // The sync pass lists only the folders on this computer, and the crawl of the others runs only now and then, so a

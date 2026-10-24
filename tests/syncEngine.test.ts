@@ -2058,4 +2058,240 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.calls.uploads).toEqual([]);
         });
     });
+
+    // Something synced here is renamed or moved in the cloud (on the web, or on another device): its local copy moves
+    // to match, keeping what exists only on this computer, rather than being removed and downloaded again (issue #16)
+    describe('cloud-side renames', () => {
+        const activity = () => stateDb.listActivity(500).map((a) => a.details);
+        const setup = (layout: 'plain' | 'virtual' = 'plain') => {
+            if (layout === 'virtual') {
+                stateDb.setMeta('driveLayout', 'virtual');
+            }
+            const drive = makeMockDrive();
+            const trashDir = path.join(tempDir, 'Trash');
+            const handedToTrash: string[] = [];
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async (fullPath: string) => {
+                    handedToTrash.push(fullPath);
+                    await mkdir(trashDir, { recursive: true });
+                    await rename(fullPath, path.join(trashDir, path.basename(fullPath)));
+                    return true;
+                },
+            });
+            // A rename or move in the cloud keeps the node's uid and changes its name or its parent
+            const moveInCloud = (uid: string, change: { name?: string; parentUid?: string }) => {
+                const node = drive.nodes.get(uid)!;
+                drive.nodes.set(uid, {
+                    ...node,
+                    ...(change.name === undefined ? {} : { name: { ok: true as const, value: change.name } }),
+                    ...(change.parentUid === undefined ? {} : { parentUid: change.parentUid }),
+                });
+            };
+            const files = localFiles(stateDb, () => engine.localRoot());
+            // A record whose file is gone reads as the user deleting it, which trashes the cloud copy
+            const expectEveryRecordHasItsFile = async () => {
+                for (const item of stateDb.getAllItems()) {
+                    expect({ path: item.localRelPath, exists: await files.exists(item.localRelPath) }).toEqual({
+                        path: item.localRelPath,
+                        exists: true,
+                    });
+                }
+            };
+            // Nothing came down, went up, or went to either trash
+            const expectNoTransfers = () => {
+                expect(drive.calls.downloads).toEqual([]);
+                expect(drive.calls.uploads).toEqual([]);
+                expect(drive.calls.trashed).toEqual([]);
+                expect(handedToTrash).toEqual([]);
+            };
+            return {
+                ...drive,
+                engine,
+                files,
+                moveInCloud,
+                expectEveryRecordHasItsFile,
+                expectNoTransfers,
+                local: (rel: string) => path.join(engine.localRoot(), rel),
+                trashed: () => handedToTrash.map((p) => path.relative(engine.localRoot(), p)).sort(),
+                recordedUnder: (rel: string) => stateDb.getItemsUnder(rel).map((item) => item.localRelPath),
+            };
+        };
+
+        // Work sorts after Projects, so the sync pass meets the old path first; Archive sorts before it, so the new one
+        for (const layout of ['plain', 'virtual'] as const) {
+            for (const target of ['Work', 'Archive']) {
+                test(`${layout}: a pinned folder renamed to ${target} in the cloud is moved here with its ignored .git, and nothing is downloaded, uploaded or trashed`, async () => {
+                    const d = setup(layout);
+                    d.add('Projects/readme.txt', 'readme');
+                    d.add('Projects/app/index.ts', 'index');
+                    d.engine.availability.setPin(d.add('Projects').uid, 'pinned', false);
+                    await d.engine.reconcileNow();
+                    expect(d.calls.downloads.sort()).toEqual(['Projects/app/index.ts', 'Projects/readme.txt']);
+                    d.calls.downloads.length = 0;
+                    await d.files.writeLocal('Projects/app/.git/HEAD', 'ref: refs/heads/main');
+
+                    d.moveInCloud('vol~Projects', { name: target });
+                    await d.engine.reconcileNow();
+
+                    expect(await readFile(d.local(`${target}/app/.git/HEAD`), 'utf8')).toBe('ref: refs/heads/main');
+                    expect(await readFile(d.local(`${target}/readme.txt`), 'utf8')).toBe('readme');
+                    expect(await d.files.exists('Projects')).toBe(false);
+                    d.expectNoTransfers();
+                    expect(d.recordedUnder(target)).toEqual([target, `${target}/app`, `${target}/app/index.ts`, `${target}/readme.txt`]);
+                    expect(d.files.recordCount('Projects')).toBe(0);
+                    expect(stateDb.getItemByPath(`${target}/readme.txt`)?.nodeUid).toBe('vol~Projects/readme.txt');
+                    await d.expectEveryRecordHasItsFile();
+                    expect(d.engine.availability.stateOf(target)).toBe('pinned'); // the pin follows the node
+                    expect(activity()).toContain(`Moved locally to follow a rename in Proton Drive: Projects → ${target}`);
+                    // The next sync finds everything in place
+                    await d.engine.reconcileNow();
+                    d.expectNoTransfers();
+                    expect(await readFile(d.local(`${target}/app/.git/HEAD`), 'utf8')).toBe('ref: refs/heads/main');
+                    if (layout === 'virtual') {
+                        expect(await stat(stateDb.getSettings().syncDir).then(() => true, () => false)).toBe(false);
+                    }
+                });
+            }
+        }
+
+        // Renamed where it is: x-notes.txt sorts after notes.txt, so the pass meets the old name first, and a-notes.txt
+        // before it, so the new name first; either way the folder's listing, read before the move, is out of date
+        for (const name of ['x-notes.txt', 'a-notes.txt']) {
+            test(`a pinned file renamed to ${name} in the cloud is moved here with its unsynced edit, which then uploads to the same file`, async () => {
+                const d = setup();
+                d.add('Docs/notes.txt', 'synced version');
+                d.engine.availability.setPin(d.add('Docs').uid, 'pinned', false);
+                await d.engine.reconcileNow();
+                d.calls.downloads.length = 0;
+                await writeFile(d.local('Docs/notes.txt'), 'edited, not uploaded yet');
+
+                d.moveInCloud('vol~Docs/notes.txt', { name });
+                await d.engine.reconcileNow();
+
+                expect(await readFile(d.local(`Docs/${name}`), 'utf8')).toBe('edited, not uploaded yet');
+                expect(await d.files.exists('Docs/notes.txt')).toBe(false);
+                expect(stateDb.getItemByPath(`Docs/${name}`)?.nodeUid).toBe('vol~Docs/notes.txt');
+                d.expectNoTransfers();
+                await d.expectEveryRecordHasItsFile();
+                expect(activity()).toContain(`Moved locally to follow a rename in Proton Drive: Docs/notes.txt → Docs/${name}`);
+                // The edit goes up as a new revision of the renamed file, not as a new one
+                await d.engine.reconcileNow();
+                expect(d.calls.uploads).toEqual([`Docs/${name}`]);
+                expect(d.nodes.get('vol~Docs/notes.txt')?.content).toBe('edited, not uploaded yet');
+                expect(d.calls.downloads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+            });
+        }
+
+        // Docs is synced before Other: a move into Other meets the old path first, a move into Docs the new one
+        for (const [from, to] of [
+            ['Docs/a.txt', 'Other/a.txt'],
+            ['Other/b.txt', 'Docs/b.txt'],
+        ] as const) {
+            test(`a downloaded but unpinned file moved from ${from} to ${to} in the cloud stays downloaded at its new path`, async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                d.add('Other/b.txt', 'b');
+                d.engine.availability.setPin(d.root.uid, 'pinned', false);
+                await d.engine.reconcileNow();
+                d.engine.availability.setPin(d.root.uid, 'unpinned', false); // still on this computer, no longer pinned
+                expect(d.engine.availability.stateOf(from)).toBe('downloaded');
+                d.calls.downloads.length = 0;
+
+                d.moveInCloud(`vol~${from}`, { parentUid: `vol~${path.posix.dirname(to)}` });
+                await d.engine.reconcileNow();
+
+                expect(await readFile(d.local(to), 'utf8')).toBe(path.posix.basename(from, '.txt'));
+                expect(await d.files.exists(from)).toBe(false);
+                expect(d.engine.availability.stateOf(to)).toBe('downloaded');
+                expect(stateDb.getItemByPath(to)?.nodeUid).toBe(`vol~${from}`);
+                expect(stateDb.getItemByPath(from)).toBeNull();
+                d.expectNoTransfers();
+                await d.expectEveryRecordHasItsFile();
+                expect(activity()).toContain(`Moved locally to follow a rename in Proton Drive: ${from} → ${to}`);
+                await d.engine.reconcileNow();
+                d.expectNoTransfers();
+                expect(d.engine.availability.stateOf(to)).toBe('downloaded');
+            });
+        }
+
+        // The folder's own copy can't go where something else already is: the old one goes as after a cloud delete
+        for (const target of ['Work', 'Archive']) {
+            test(`a folder renamed in the cloud to ${target}, which already exists here, goes as a cloud delete and leaves ${target} alone`, async () => {
+                const d = setup();
+                d.add('Projects/readme.txt', 'readme');
+                d.add('Projects/app/index.ts', 'index');
+                d.add('Projects/notes.txt', 'synced version');
+                d.engine.availability.setPin(d.add('Projects').uid, 'pinned', false);
+                await d.engine.reconcileNow();
+                await d.files.writeLocal('Projects/app/.git/HEAD', 'ref: refs/heads/main');
+                await writeFile(d.local('Projects/notes.txt'), 'edited, not uploaded yet');
+                await d.files.writeLocal(`${target}/mine.txt`, 'made here, not uploaded yet');
+
+                d.moveInCloud('vol~Projects', { name: target });
+                await d.engine.reconcileNow();
+
+                // What exists only on this computer goes to the desktop Trash, the unchanged copies are removed
+                expect(d.trashed()).toEqual(['Projects/app/.git', 'Projects/notes.txt']);
+                expect(await readFile(path.join(tempDir, 'Trash/.git/HEAD'), 'utf8')).toBe('ref: refs/heads/main');
+                expect(await d.files.exists('Projects')).toBe(false);
+                expect(d.files.recordCount('Projects')).toBe(0);
+                // Nothing was moved onto the folder already there, and what it held is as it was
+                expect(activity().filter((a) => a.startsWith('Moved locally'))).toEqual([]);
+                expect(await readFile(d.local(`${target}/mine.txt`), 'utf8')).toBe('made here, not uploaded yet');
+                expect(d.calls.trashed).toEqual([]);
+                await d.expectEveryRecordHasItsFile();
+                await d.engine.reconcileNow();
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.calls.uploads).toEqual([`${target}/mine.txt`]); // a new local file, as before
+                expect(await readFile(d.local(`${target}/mine.txt`), 'utf8')).toBe('made here, not uploaded yet');
+            });
+        }
+
+        // A pass alone finds the file gone from Docs before Archive is listed again, so it asks the cloud where it went;
+        // the event lists Archive first, so the remote index already knows
+        for (const how of ['a sync pass', 'a NodeUpdated event'] as const) {
+            test(`a downloaded file moved into an online-only folder in the cloud, found by ${how}, keeps its local copy there`, async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                d.add('Archive/old.txt', 'old');
+                d.engine.availability.setPin(d.add('Docs').uid, 'pinned', false);
+                await d.engine.reconcileNow();
+                expect(await d.files.exists('Archive')).toBe(false);
+                expect(d.engine.remoteIndex.getByPath('Archive/old.txt')).not.toBeNull(); // crawled on the first pass
+                d.calls.downloads.length = 0;
+
+                d.moveInCloud('vol~Docs/a.txt', { parentUid: 'vol~Archive' });
+                if (how === 'a sync pass') {
+                    await d.engine.reconcileNow();
+                } else {
+                    await (d.engine as any).handleRemoteDriveEvent({
+                        type: DriveEventType.NodeUpdated,
+                        nodeUid: 'vol~Docs/a.txt',
+                        parentNodeUid: 'vol~Archive',
+                        isTrashed: false,
+                        isShared: false,
+                        treeEventScopeId: 'scope-main',
+                        eventId: 'evt-moved',
+                    });
+                }
+
+                expect(await readFile(d.local('Archive/a.txt'), 'utf8')).toBe('a');
+                expect(await d.files.exists('Docs/a.txt')).toBe(false);
+                expect(await d.files.exists('Archive/old.txt')).toBe(false); // the rest of Archive stays online-only
+                expect(stateDb.getItemByPath('Archive/a.txt')?.nodeUid).toBe('vol~Docs/a.txt');
+                expect(d.engine.availability.stateOf('Archive/a.txt')).toBe('downloaded');
+                d.expectNoTransfers();
+                await d.expectEveryRecordHasItsFile();
+                expect(activity()).toContain('Moved locally to follow a rename in Proton Drive: Docs/a.txt → Archive/a.txt');
+                // The folder made to hold it is recorded by the next pass, and nothing else in it comes down
+                await d.engine.reconcileNow();
+                expect(stateDb.getItemByPath('Archive')?.nodeUid).toBe('vol~Archive');
+                expect(await d.files.exists('Archive/old.txt')).toBe(false);
+                d.expectNoTransfers();
+                await d.expectEveryRecordHasItsFile();
+            });
+        }
+    });
 });

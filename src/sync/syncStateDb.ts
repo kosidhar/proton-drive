@@ -259,6 +259,33 @@ export class SyncStateDatabase {
         this.db.query(`DELETE FROM synced_items WHERE ${selfOrDescendantWhere('localRelPath')}`).run(selfOrDescendant(localRelPath));
     }
 
+    // Moves the record at a path, and every record under it, to another path, in one transaction (a local copy moved to
+    // follow a rename in the cloud). The root never moves, nor does a path into itself, and records already at the
+    // target are never merged into or overwritten: each of these throws, changing nothing.
+    renameItemPath(fromRel: string, toRel: string): void {
+        if (fromRel === '' || toRel === '') {
+            throw new Error("The root of the sync folder can't be moved");
+        }
+        if (toRel === fromRel) {
+            return;
+        }
+        if (toRel.startsWith(`${fromRel}/`)) {
+            throw new Error(`Can't move ${fromRel} into itself`);
+        }
+        this.db.transaction(() => {
+            if (this.hasItemsUnder(toRel)) {
+                throw new Error(`Already recorded: ${toRel}`);
+            }
+            this.db
+                .query(
+                    `UPDATE synced_items SET localRelPath = $toRel || substr(localRelPath, length($fromRel) + 1),
+                         updatedAt = $updatedAt
+                     WHERE ${selfOrDescendantWhere('localRelPath')}`,
+                )
+                .run({ $toRel: toRel, $fromRel: fromRel, $updatedAt: Date.now(), ...selfOrDescendant(fromRel) });
+        })();
+    }
+
     hasItemsUnder(localRelPath: string): boolean {
         return (
             this.db

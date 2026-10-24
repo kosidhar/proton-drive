@@ -58,4 +58,30 @@ describe('SyncStateDatabase paths', () => {
         expect(stateDb.hasItemsUnder('photos')).toBe(true);
         expect(stateDb.hasItemsUnder('photos/b.jpg')).toBe(true);
     });
+
+    test('renameItemPath moves the path and what is under it, and nothing named alike', () => {
+        const kept = ['AB/z', 'a/q', 'A0/w', 'A.txt'];
+        for (const p of ['A', 'A/x', 'A/B', 'A/B/y', ...kept]) {
+            stateDb.upsertItem(record(p));
+        }
+
+        stateDb.renameItemPath('A', 'Z/A');
+
+        expect(paths()).toEqual(['Z/A', 'Z/A/x', 'Z/A/B', 'Z/A/B/y', ...kept].sort());
+        // Only the path changes
+        expect(stateDb.getItemByPath('Z/A/B/y')?.nodeUid).toBe('uid-A/B/y');
+    });
+
+    test('renameItemPath never moves the root, a path into itself, or onto records already there', () => {
+        for (const p of ['A', 'A/x', 'Z/A/old']) {
+            stateDb.upsertItem(record(p));
+        }
+
+        expect(() => stateDb.renameItemPath('', 'Z')).toThrow();
+        expect(() => stateDb.renameItemPath('A', '')).toThrow();
+        expect(() => stateDb.renameItemPath('A', 'A/x/A')).toThrow();
+        expect(() => stateDb.renameItemPath('A', 'Z/A')).toThrow();
+
+        expect(paths()).toEqual(['A', 'A/x', 'Z/A/old']);
+    });
 });
