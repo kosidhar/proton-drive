@@ -641,6 +641,40 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(calls.trashed).toEqual([]);
         });
 
+        // Proton Docs and Sheets are never downloaded and not in the remote index, but trashing a folder takes them along
+        test('a deleted folder holding a Proton Doc keeps the doc in the cloud', async () => {
+            const { engine, add, root, nodes, calls } = setup();
+            add('Done/a.txt', 'a');
+            Object.assign(add('Done/plan', 'doc'), { mediaType: 'application/vnd.proton.doc' });
+            engine.availability.setPin(root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            expect(calls.downloads).toEqual(['Done/a.txt']);
+
+            await rm(local('Done'), { recursive: true });
+            await engine.reconcileNow();
+
+            expect(calls.trashed).toEqual([['vol~Done/a.txt']]);
+            expect(nodes.has('vol~Done/plan')).toBe(true);
+        });
+
+        test('a wholly downloaded subfolder holding a Proton Sheet is not trashed as one item', async () => {
+            const { engine, add, nodes, calls } = setup();
+            add('Photos/a.jpg', 'a');
+            add('Photos/b.jpg', 'b');
+            add('Photos/Work/w.txt', 'w');
+            Object.assign(add('Photos/Work/budget', 'sheet'), { mediaType: 'application/vnd.proton.sheet' });
+            await engine.reconcileNow();
+            engine.availability.setPin('vol~Photos/a.jpg', 'pinned', false);
+            engine.availability.setPin('vol~Photos/Work', 'pinned', false);
+            await engine.reconcileNow();
+
+            await rm(local('Photos'), { recursive: true });
+            await engine.reconcileNow();
+
+            expect(calls.trashed).toEqual([['vol~Photos/Work/w.txt', 'vol~Photos/a.jpg']]);
+            expect(nodes.has('vol~Photos/Work/budget')).toBe(true);
+        });
+
         test('a deleted folder whose every item was local is trashed whole, as before', async () => {
             const { engine, add, root, nodes, calls } = setup();
             add('Done/a.txt', 'a');

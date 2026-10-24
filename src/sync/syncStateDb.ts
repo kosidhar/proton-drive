@@ -184,6 +184,10 @@ export class SyncStateDatabase {
         this.db.query('INSERT OR REPLACE INTO settings (key, value) VALUES ($key, $value)').run({ $key: key, $value: value });
     }
 
+    deleteMeta(key: string): void {
+        this.db.query('DELETE FROM settings WHERE key = $key').run({ $key: key });
+    }
+
     // The top-level folders the retired Cloud only setting kept off this computer; read only by the migration.
     readLegacyExcludedFolders(): string[] {
         try {

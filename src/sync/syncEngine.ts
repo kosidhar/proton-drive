@@ -23,6 +23,7 @@ import {
 } from '../sdk/fileOps';
 import { getName } from '../sdk/node';
 import { AvailabilityPolicy } from './availability';
+import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
 import { createLocalConflictCopy } from './conflictResolver';
 import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
 import { entryFromNode, RemoteIndex, type RemoteIndexEntry } from './remoteIndex';
@@ -286,6 +287,13 @@ export class ProtonDriveSyncEngine {
             const root = await this.getRootFolder();
             await this.eventsManager.subscribeDriveScope(root.treeEventScopeId);
             this.index.setRoot(root.uid);
+            if (this.stateDb.getMeta(PIN_ROOT_ON_FIRST_SYNC) === '1') {
+                // A fresh install syncs everything, as before
+                this.stateDb.connection.transaction(() => {
+                    this.policy.setPin(root.uid, 'pinned', false);
+                    this.stateDb.deleteMeta(PIN_ROOT_ON_FIRST_SYNC);
+                })();
+            }
 
             // Sync folder-by-folder incrementally so files & folders appear in ~/ProtonDrive
             // and in the GUI dashboard immediately instead of waiting for a full tree scan.
@@ -813,9 +821,9 @@ export class ProtonDriveSyncEngine {
     }
 
     // The user deleted a synced item locally, so its cloud copy goes to the Proton Drive trash. A folder can also hold
-    // things that never were on this computer: online-only, ignored or hidden items, or a node that replaced the one
-    // synced here. Those stay in the cloud: only the items that had local copies are trashed, and the folder is left
-    // online-only.
+    // things that never were on this computer: online-only, ignored or hidden items, Proton Docs and Sheets, or a node
+    // that replaced the one synced here. Those stay in the cloud: only the items that had local copies are trashed, and
+    // the folder is left online-only.
     private async trashForDeletedLocal(relPath: string, remoteNode: NodeEntity): Promise<void> {
         if (remoteNode.type !== NodeType.Folder) {
             // Checked here too, as callers may have waited on the network since: the record is still there and the
@@ -826,7 +834,8 @@ export class ProtonDriveSyncEngine {
             return;
         }
         // Decide from what the cloud holds right now; without the whole picture, trash nothing this time
-        if (!(await this.indexRemoteSubtree(remoteNode, relPath))) {
+        const holdsDocs = new Set<string>(); // folders holding Proton Docs or Sheets, which the index leaves out
+        if (!(await this.indexRemoteSubtree(remoteNode, relPath, holdsDocs))) {
             this.logger.warn(`Not trashing ${relPath} yet: could not list everything in it`);
             return;
         }
@@ -836,11 +845,8 @@ export class ProtonDriveSyncEngine {
         const isWithin = (p: string, dir: string) => p === dir || p.startsWith(`${dir}/`);
         // Everything that never was on this computer, with every folder above it up to the deleted one
         const holdsCloudOnly = new Set<string>();
-        for (const entry of entries) {
-            if (syncedUid.get(entry.relPath) === entry.uid && !hidden.some((h) => isWithin(entry.relPath, h))) {
-                continue;
-            }
-            let p = entry.relPath;
+        const markWithAncestors = (from: string) => {
+            let p = from;
             while (!holdsCloudOnly.has(p)) {
                 holdsCloudOnly.add(p);
                 const slash = p.lastIndexOf('/');
@@ -849,6 +855,14 @@ export class ProtonDriveSyncEngine {
                 }
                 p = p.slice(0, slash);
             }
+        };
+        for (const entry of entries) {
+            if (syncedUid.get(entry.relPath) !== entry.uid || hidden.some((h) => isWithin(entry.relPath, h))) {
+                markWithAncestors(entry.relPath);
+            }
+        }
+        for (const folder of holdsDocs) {
+            markWithAncestors(folder);
         }
         if (!holdsCloudOnly.has(relPath)) {
             // Look again, as listing took a while: only while the record is still there and the folder still missing
@@ -1147,8 +1161,9 @@ export class ProtonDriveSyncEngine {
 
     // Lists and records a remote folder's subtree in the index without touching disk or sync state. Returns whether the
     // whole subtree was recorded: false when paused, when the folder is not indexed at relPath, or when a listing failed
-    // (that is logged, and the rest is still crawled). Nothing is listed below a hidden folder.
-    private async indexRemoteSubtree(node: NodeEntity, relPath: string): Promise<boolean> {
+    // (that is logged, and the rest is still crawled). Nothing is listed below a hidden folder. The index leaves out
+    // Proton Docs and Sheets, so the folders whose listing holds one are added to `unsupportedIn` when given.
+    private async indexRemoteSubtree(node: NodeEntity, relPath: string, unsupportedIn?: Set<string>): Promise<boolean> {
         if (this.stateDb.getSettings().paused || this.index.getByUid(node.uid)?.relPath !== relPath) {
             return false;
         }
@@ -1165,10 +1180,13 @@ export class ProtonDriveSyncEngine {
         if (!this.recordListing(node, relPath, children)) {
             return false;
         }
+        if (unsupportedIn && children.some((child) => entryFromNode(child, relPath) === null)) {
+            unsupportedIn.add(relPath);
+        }
         let complete = true;
         for (const child of children) {
             if (child.type === NodeType.Folder) {
-                complete = (await this.indexRemoteSubtree(child, `${relPath}/${getName(child)}`)) && complete;
+                complete = (await this.indexRemoteSubtree(child, `${relPath}/${getName(child)}`, unsupportedIn)) && complete;
             }
         }
         return complete;

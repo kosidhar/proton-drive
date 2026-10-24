@@ -6,10 +6,14 @@ import type { AvailabilityPolicy } from './availability';
 import type { SyncStateDatabase } from './syncStateDb';
 
 const MIGRATED = 'availabilityMigrated';
+// Set for a fresh install: the engine pins the root at its first sync, once the root's uid is known, so everything is
+// synced as before
+export const PIN_ROOT_ON_FIRST_SYNC = 'pinRootOnFirstSync';
 
 // One time, before the engine first starts with the availability policy: what is synced today stays on this computer
 // (every synced top-level item is pinned), and the old Cloud only folders become online-only (no flag, not hidden).
-// It only writes records and flags, never touches files, and can be run again after a crash at any step.
+// A fresh install (nothing synced, no Cloud only folders) gets its root pinned instead. It only writes records and
+// flags, never touches files, and can be run again after a crash at any step.
 export async function migrateExcludedFolders(
     stateDb: SyncStateDatabase,
     policy: AvailabilityPolicy,
@@ -21,11 +25,12 @@ export async function migrateExcludedFolders(
 
     await backUp(stateDb, `${dbFilePath}.pre-availability.bak`);
 
+    const legacyNames = stateDb.readLegacyExcludedFolders();
+    const fresh = legacyNames.length === 0 && stateDb.getAllItems().length === 0;
     // Old Cloud only folders. A removal that stopped part way left records behind; any whose file is gone would read as
     // the user deleting it, now that nothing skips these folders, and the cloud copy would be trashed.
     const cloudOnly = new Set(
-        stateDb
-            .readLegacyExcludedFolders()
+        legacyNames
             .map((name) => name.trim().replace(/^\/+|\/+$/g, ''))
             .filter((name) => name && name !== '.' && name !== '..' && !name.includes('/')),
     );
@@ -47,6 +52,9 @@ export async function migrateExcludedFolders(
             if (!item.localRelPath.includes('/') && !cloudOnly.has(item.localRelPath)) {
                 policy.setPin(item.nodeUid, 'pinned', false);
             }
+        }
+        if (fresh) {
+            stateDb.setMeta(PIN_ROOT_ON_FIRST_SYNC, '1');
         }
         stateDb.setMeta('excludedFolders', '[]'); // The retired setting, kept in the same table
         stateDb.setMeta(MIGRATED, '1');

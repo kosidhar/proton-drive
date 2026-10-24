@@ -7,8 +7,10 @@ import path from 'node:path';
 import { AvailabilityPolicy } from '../src/sync/availability';
 import { migrateExcludedFolders } from '../src/sync/availabilityMigration';
 import { RemoteIndex, type RemoteIndexEntry } from '../src/sync/remoteIndex';
+import { ProtonDriveSyncEngine } from '../src/sync/syncEngine';
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
 import { localFiles } from './helpers/localFiles';
+import { makeMockDrive } from './helpers/mockDrive';
 
 describe('availability migration', () => {
     let tempDir: string;
@@ -116,5 +118,48 @@ describe('availability migration', () => {
         expect(stateDb.getItemByPath('Archive/kept.txt')).not.toBeNull();
         expect(stateDb.getItemByPath('Archive')).not.toBeNull();
         expect(policy.isPinned('Archive')).toBe(false);
+    });
+
+    // A fresh install keeps today's default of syncing everything: the root gets pinned once its uid is known
+    const engineOnDrive = () => {
+        const drive = makeMockDrive();
+        drive.add('welcome.txt', 'hello');
+        const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger);
+        return { ...drive, engine };
+    };
+
+    test('a fresh install pins the root on its first sync, once', async () => {
+        const { engine, calls } = engineOnDrive();
+
+        await migrateExcludedFolders(stateDb, engine.availability, dbFile);
+        expect(stateDb.getMeta('pinRootOnFirstSync')).toBe('1');
+        await engine.start();
+        await engine.stop();
+
+        expect(calls.downloads).toEqual(['welcome.txt']);
+        expect(engine.availability.stateOf('')).toBe('pinned');
+        expect(stateDb.getMeta('pinRootOnFirstSync')).toBeNull();
+    });
+
+    test('an install with synced items gets no root pin', async () => {
+        const { engine, calls } = engineOnDrive();
+        await localFiles(stateDb).writeSynced('notes.txt', 'synced today');
+
+        await migrateExcludedFolders(stateDb, engine.availability, dbFile);
+        expect(stateDb.getMeta('pinRootOnFirstSync')).toBeNull();
+        await engine.start();
+        await engine.stop();
+
+        expect(calls.downloads).toEqual([]);
+        expect(engine.availability.isPinned('welcome.txt')).toBe(false);
+    });
+
+    test('an install with only Cloud only folders gets no root pin', async () => {
+        const { engine } = engineOnDrive();
+        stateDb.setMeta('excludedFolders', JSON.stringify(['Archive']));
+
+        await migrateExcludedFolders(stateDb, engine.availability, dbFile);
+
+        expect(stateDb.getMeta('pinRootOnFirstSync')).toBeNull();
     });
 });
