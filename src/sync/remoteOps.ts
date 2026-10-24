@@ -4,14 +4,16 @@ import { selfOrDescendant, selfOrDescendantWhere } from './pathRange';
 
 // A change made through the virtual drive that Proton Drive has yet to get. Renames and moves name the node and the path
 // it now has here (the new folder and name are worked out from it when the operation runs); a trash names the node and
-// the path it had.
+// the path Proton Drive has it at (where it was deleted here, unless renames or moves of it before were still pending).
 export type RemoteOp =
     | { id: number; kind: 'rename'; nodeUid: string; toPath: string; attempts: number }
     | { id: number; kind: 'move'; nodeUid: string; toPath: string; attempts: number } // toPath gives the new parent and name
     | { id: number; kind: 'trash'; nodeUid: string; path: string; attempts: number };
 
-// What enqueue takes: an operation without its id and attempts. A rename or move may also say where the node was (the
-// path the cloud still has it at), which the sync pass and local change handling then leave alone too.
+// What enqueue takes: an operation without its id and attempts. A rename or move may also say where the node was here.
+// Each operation keeps, in its `path`, where Proton Drive has the node: the path given, or, while earlier operations on
+// the same node are pending, the one the earliest of them kept (those haven't run, so the cloud still has it there).
+// The sync pass and local change handling leave that path alone too, even once an earlier operation is superseded.
 export type NewRemoteOp =
     | { kind: 'rename' | 'move'; nodeUid: string; toPath: string; fromPath?: string }
     | { kind: 'trash'; nodeUid: string; path: string };
@@ -44,6 +46,10 @@ export class RemoteOpsJournal {
     }
 
     enqueue(op: NewRemoteOp): number {
+        const earliest = this.db
+            .query('SELECT path FROM remote_ops WHERE nodeUid = $nodeUid AND path IS NOT NULL ORDER BY id ASC LIMIT 1')
+            .get({ $nodeUid: op.nodeUid }) as { path: string } | null;
+        const given = op.kind === 'trash' ? op.path : (op.fromPath ?? null);
         const result = this.db
             .query(
                 `INSERT INTO remote_ops (kind, nodeUid, path, toPath, createdAt)
@@ -52,7 +58,7 @@ export class RemoteOpsJournal {
             .run({
                 $kind: op.kind,
                 $nodeUid: op.nodeUid,
-                $path: op.kind === 'trash' ? op.path : (op.fromPath ?? null),
+                $path: earliest?.path ?? given,
                 $toPath: op.kind === 'trash' ? null : op.toPath,
                 $createdAt: Date.now(),
             });
@@ -139,10 +145,12 @@ export class RemoteOpsJournal {
         })();
     }
 
-    // The nodes pending operations are about, and the paths they touch: where a node is going, where it was, and what was
-    // deleted. Until they have run, the sync pass and local change handling leave these alone.
+    // The nodes pending operations are about, and the paths they touch: where a node is going, where Proton Drive has it,
+    // and, for a move, where it is once moved but not yet renamed (an interrupted replay can leave it there). Until they
+    // have run, the sync pass and local change handling leave these alone.
     guard(): { uids: Set<string>; paths: string[] } {
-        const rows = this.db.query('SELECT nodeUid, path, toPath FROM remote_ops').all() as Array<{
+        const rows = this.db.query('SELECT kind, nodeUid, path, toPath FROM remote_ops').all() as Array<{
+            kind: RemoteOp['kind'];
             nodeUid: string;
             path: string | null;
             toPath: string | null;
@@ -155,6 +163,11 @@ export class RemoteOpsJournal {
                 if (p !== null) {
                     paths.add(p);
                 }
+            }
+            if (row.kind === 'move' && row.path !== null && row.toPath !== null) {
+                const slash = row.toPath.lastIndexOf('/');
+                const name = row.path.slice(row.path.lastIndexOf('/') + 1);
+                paths.add(slash === -1 ? name : `${row.toPath.slice(0, slash)}/${name}`);
             }
         }
         return { uids, paths: [...paths] };

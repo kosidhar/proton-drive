@@ -85,6 +85,29 @@ describe('RemoteOpsJournal', () => {
         expect(journal.get(trash)).toEqual({ id: trash, kind: 'trash', nodeUid: 'vol~t', path: 'New/t.txt', attempts: 0 });
     });
 
+    // Review C2: once an earlier operation is superseded, the later one still says where the cloud has the node
+    test('an operation keeps where the cloud has the node while earlier operations on it are pending', () => {
+        const journal = new RemoteOpsJournal(stateDb.connection);
+        const first = journal.enqueue({ kind: 'rename', nodeUid: 'vol~a', toPath: 'Docs/b.txt', fromPath: 'Docs/a.txt' });
+        const second = journal.enqueue({ kind: 'rename', nodeUid: 'vol~a', toPath: 'Docs/c.txt', fromPath: 'Docs/b.txt' });
+        const trash = journal.enqueue({ kind: 'trash', nodeUid: 'vol~a', path: 'Docs/c.txt' });
+        const other = journal.enqueue({ kind: 'trash', nodeUid: 'vol~z', path: 'Docs/z.txt' });
+
+        journal.complete(first);
+        journal.complete(second);
+
+        expect(journal.get(trash)).toMatchObject({ kind: 'trash', path: 'Docs/a.txt' });
+        expect(journal.get(other)).toMatchObject({ kind: 'trash', path: 'Docs/z.txt' });
+        expect(journal.guard().paths.sort()).toEqual(['Docs/a.txt', 'Docs/z.txt']);
+    });
+
+    test('a pending move also guards where the node is once moved but not yet renamed', () => {
+        const journal = new RemoteOpsJournal(stateDb.connection);
+        journal.enqueue({ kind: 'move', nodeUid: 'vol~x', toPath: 'B/y.txt', fromPath: 'A/x.txt' });
+
+        expect(journal.guard().paths.sort()).toEqual(['A/x.txt', 'B/x.txt', 'B/y.txt']);
+    });
+
     test('the paths and nodes pending operations are about, the old place of a move included', () => {
         const journal = new RemoteOpsJournal(stateDb.connection);
         journal.enqueue({ kind: 'move', nodeUid: 'vol~x', toPath: 'B/x.txt', fromPath: 'A/x.txt' });

@@ -162,6 +162,14 @@ export class RemoteIndex {
             .all(selfOrDescendant(relPath)) as RemoteIndexEntry[];
     }
 
+    // The uids that start with a prefix (as a byte range, like pathRange)
+    uidsWithPrefix(prefix: string): string[] {
+        const rows = this.db
+            .query('SELECT uid FROM remote_nodes WHERE uid >= $lo AND uid < $hi')
+            .all({ $lo: prefix, $hi: `${prefix}\uffff` }) as { uid: string }[];
+        return rows.map((row) => row.uid);
+    }
+
     listChildren(relPath: string): RemoteIndexEntry[] {
         const parent = this.getByPath(relPath);
         if (!parent) {

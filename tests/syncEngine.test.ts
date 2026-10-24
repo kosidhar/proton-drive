@@ -2718,7 +2718,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await d.expectEveryRecordHasItsFile();
         });
 
-        test('a move into a new folder made here waits for the folder to upload, then moves into it', async () => {
+        test('a move into a new folder made here makes that folder in Proton Drive, records it, and moves into it', async () => {
             const d = setup();
             d.add('Docs/a.txt', 'a');
             await pinnedAndSynced(d, d.add('Docs').uid);
@@ -2726,17 +2726,14 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
             await d.engine.renameItem('Docs/a.txt', 'Docs/New/a.txt');
             await d.engine.replayRemoteOps();
-            expect(d.calls.moved).toEqual([]);
-            expect(d.journal()).toMatchObject([{ kind: 'move', nodeUid: 'vol~Docs/a.txt', toPath: 'Docs/New/a.txt' }]);
-
-            await d.engine.reconcileNow(); // uploads New, leaving a.txt to the move
-            await d.engine.replayRemoteOps();
 
             const created = d.named('vol~Docs', 'New');
             expect(created.length).toBe(1);
             expect(d.calls.moved).toEqual([{ uid: 'vol~Docs/a.txt', parentUid: created[0]!.uid }]);
             expect(d.journal()).toEqual([]);
+            expect(stateDb.getItemByPath('Docs/New')?.nodeUid).toBe(created[0]!.uid);
             expect(stateDb.getItemByPath('Docs/New/a.txt')?.nodeUid).toBe('vol~Docs/a.txt');
+            expect(d.engine.remoteIndex.getByPath('Docs/New/a.txt')?.uid).toBe('vol~Docs/a.txt');
             await d.engine.reconcileNow();
             expect(d.calls.uploads).toEqual([]);
             expect(d.calls.trashed).toEqual([]);
@@ -2749,11 +2746,13 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             d.add('Docs/a.txt', 'a');
             await pinnedAndSynced(d, d.add('Docs').uid);
             await mkdir(d.local('Docs/New'));
+            d.down.add('getNode'); // offline while both renames happen
 
             await d.engine.renameItem('Docs/a.txt', 'Docs/New/a.txt');
             await d.engine.renameItem('Docs/New', 'Docs/Renamed');
             expect(d.journal()).toMatchObject([{ kind: 'move', nodeUid: 'vol~Docs/a.txt', toPath: 'Docs/Renamed/a.txt' }]);
-            await d.engine.reconcileNow(); // uploads Renamed
+            d.down.clear();
+            await d.engine.reconcileNow();
             await d.engine.replayRemoteOps();
 
             const created = d.named('vol~Docs', 'Renamed');
@@ -2792,10 +2791,14 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             release();
             await d.engine.replayRemoteOps();
 
-            expect(d.journal()).toMatchObject([{ kind: 'move', nodeUid: 'vol~Docs/a.txt', toPath: 'Docs/Renamed/a.txt' }]);
+            // It goes into the folder by its new name, made in Proton Drive for it; nothing under the old name
+            const renamed = d.named('vol~Docs', 'Renamed');
+            expect(renamed.length).toBe(1);
+            expect(d.calls.moved).toEqual([{ uid: 'vol~Docs/a.txt', parentUid: renamed[0]!.uid }]);
+            expect(d.named('vol~Docs', 'New')).toEqual([]);
+            expect(d.journal()).toEqual([]);
             await d.engine.reconcileNow();
-            await d.engine.replayRemoteOps();
-            expect(d.calls.moved).toEqual([{ uid: 'vol~Docs/a.txt', parentUid: d.named('vol~Docs', 'Renamed')[0]!.uid }]);
+            expect(d.calls.moved.length).toBe(1);
             expect(d.calls.trashed).toEqual([]);
             await d.expectEveryRecordHasItsFile();
         });
@@ -2805,13 +2808,16 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             d.add('Docs/a.txt', 'a');
             await pinnedAndSynced(d, d.add('Docs').uid);
             await mkdir(d.local('Docs/New'));
+            d.down.add('getNode'); // offline: the move waits
 
             await d.engine.renameItem('Docs/a.txt', 'Docs/New/a.txt');
             await d.engine.deleteItem('Docs/New/a.txt');
+            d.down.clear();
             await d.engine.replayRemoteOps();
 
             expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
             expect(d.calls.moved).toEqual([]);
+            expect(d.named('vol~Docs', 'New')).toEqual([]); // nothing was made for it
             expect(d.journal()).toEqual([]);
             expect(await d.files.exists('Docs/New/a.txt')).toBe(false);
             expect(await d.files.exists('Docs/New')).toBe(true);
@@ -2975,6 +2981,342 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await d.engine.replayRemoteOps();
             expect(d.calls.renamed).toEqual([]);
             expect(d.calls.trashed).toEqual([]);
+        });
+
+        // Review C1: a listing puts the cloud's view back into the index; the old name must not come back as something
+        // that can be deleted (it is the renamed folder)
+        test('a sync pass while a rename waits keeps the new name in the index, and deleting the old name finds nothing to trash', async () => {
+            const d = setup();
+            d.add('Projects/a.txt', 'a');
+            d.add('Projects/b.txt', 'b');
+            await d.engine.reconcileNow();
+            await d.engine.setAvailability('Projects/a.txt', 'pin');
+            await d.engine.reconcileNow();
+            d.down.add('renameNode');
+            await d.engine.renameItem('Projects', 'Work');
+
+            await d.engine.reconcileNow(); // listings work, the rename doesn't
+
+            expect(d.engine.remoteIndex.getByPath('Work')?.uid).toBe('vol~Projects');
+            expect(d.engine.remoteIndex.getByPath('Work/b.txt')?.uid).toBe('vol~Projects/b.txt');
+            expect(d.engine.remoteIndex.getByPath('Projects')).toBeNull();
+            const error = await d.engine.deleteItem('Projects').then(() => null, (e: Error) => e.message);
+            expect(error).toBe('Not found: Projects');
+            d.down.clear();
+            await d.engine.reconcileNow();
+            await d.engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.calls.renamed).toEqual([{ uid: 'vol~Projects', name: 'Work' }]);
+            expect(await readFile(d.local('Work/a.txt'), 'utf8')).toBe('a');
+            await d.expectEveryRecordHasItsFile();
+        });
+
+        test('while a rename waits for a name taken in the cloud, the old name left in the index is not deletable', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'mine');
+            await pinnedAndSynced(d, d.add('Docs').uid);
+            d.down.add('renameNode');
+            await d.engine.renameItem('Docs/a.txt', 'Docs/b.txt');
+            d.add('Docs/b.txt', 'theirs');
+            await d.engine.reconcileNow(); // the index keeps the cloud's b.txt, and mine where the cloud has it
+
+            const error = await d.engine.deleteItem('Docs/a.txt').then(() => null, (e: Error) => e.message);
+            expect(error).toBe('Not found: Docs/a.txt');
+            await d.engine.replayRemoteOps();
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('mine');
+        });
+
+        // Review C2: the earlier rename is superseded, but the cloud still has the item under its first name
+        test('renamed twice while offline, a new file at the first name is not uploaded onto the renamed item', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'original');
+            await pinnedAndSynced(d, d.add('Docs').uid);
+            d.down.add('renameNode');
+            await d.engine.renameItem('Docs/a.txt', 'Docs/b.txt');
+            await d.engine.renameItem('Docs/b.txt', 'Docs/c.txt');
+            await d.engine.replayRemoteOps();
+            await d.files.writeLocal('Docs/a.txt', 'a new file');
+
+            await (d.engine as any).handleLocalFileChange('Docs/a.txt');
+            expect(d.calls.uploads).toEqual([]);
+            expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('original');
+            d.down.clear();
+            await d.engine.reconcileNow();
+            await d.engine.reconcileNow();
+
+            expect(d.nameOf(d.nodes.get('vol~Docs/a.txt')!)).toBe('c.txt');
+            expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('original');
+            expect(await readFile(d.local('Docs/c.txt'), 'utf8')).toBe('original');
+            expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('a new file');
+            expect(d.named('vol~Docs', 'a.txt').map((n) => n.content)).toEqual(['a new file']);
+            expect(d.calls.trashed).toEqual([]);
+            await d.expectEveryRecordHasItsFile();
+        });
+
+        test('renamed to a backup name, saved anew, then the backup deleted: the new save is neither uploaded onto the old item nor trashed with it', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'original');
+            await pinnedAndSynced(d, d.add('Docs').uid);
+            d.down.add('renameNode');
+            d.down.add('trashNodes');
+            await d.engine.renameItem('Docs/a.txt', 'Docs/a.txt.bak');
+            await d.files.writeLocal('Docs/a.txt', 'new save');
+            await d.engine.deleteItem('Docs/a.txt.bak');
+            await d.engine.replayRemoteOps();
+
+            await (d.engine as any).handleLocalFileChange('Docs/a.txt');
+            expect(d.calls.uploads).toEqual([]);
+            d.down.clear();
+            await d.engine.replayRemoteOps();
+            expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+            await (d.engine as any).handleRemoteDriveEvent({
+                type: DriveEventType.NodeUpdated,
+                nodeUid: 'vol~Docs/a.txt',
+                parentNodeUid: 'vol~Docs',
+                isTrashed: true,
+                isShared: false,
+                treeEventScopeId: 'scope-main',
+                eventId: 'evt-trashed',
+            });
+            await d.engine.reconcileNow();
+
+            expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('new save');
+            expect(d.named('vol~Docs', 'a.txt').map((n) => n.content)).toEqual(['new save']);
+            expect(d.handedToTrash).toEqual([]);
+            await d.expectEveryRecordHasItsFile();
+        });
+
+        // Review C3: the move waits for its folder, which sits under a folder whose rename waits behind the move
+        test('a move into a new folder, then a rename of the folder above it, both reach the cloud', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            await pinnedAndSynced(d, d.add('Docs').uid);
+            await mkdir(d.local('Docs/New'));
+            await d.engine.renameItem('Docs/a.txt', 'Docs/New/a.txt');
+            await d.engine.renameItem('Docs', 'Docs2');
+
+            for (let round = 0; round < 2; round++) {
+                await d.engine.reconcileNow();
+                await d.engine.replayRemoteOps();
+            }
+
+            expect(d.journal()).toEqual([]);
+            expect(d.nameOf(d.nodes.get('vol~Docs')!)).toBe('Docs2');
+            const created = d.named('vol~Docs', 'New');
+            expect(created.length).toBe(1);
+            expect(d.nodes.get('vol~Docs/a.txt')?.parentUid).toBe(created[0]!.uid);
+            expect(await readFile(d.local('Docs2/New/a.txt'), 'utf8')).toBe('a');
+            expect(stateDb.getItemByPath('Docs2/New/a.txt')?.nodeUid).toBe('vol~Docs/a.txt');
+            expect(d.calls.trashed).toEqual([]);
+            await d.expectEveryRecordHasItsFile();
+        });
+
+        // Review I1: the node made by an upload that was still running when the item was deleted or renamed
+        const holdUploadAnswer = (d: ReturnType<typeof setup>) => {
+            let release!: () => void;
+            const answer = new Promise<void>((resolve) => (release = resolve));
+            let started!: () => void;
+            const sent = new Promise<void>((resolve) => (started = resolve));
+            const getFileUploader = (d.sdk as any).getFileUploader.bind(d.sdk);
+            (d.sdk as any).getFileUploader = async (...args: unknown[]) => {
+                const uploader = await getFileUploader(...args);
+                return {
+                    uploadFromStream: async (stream: ReadableStream<Uint8Array>) => {
+                        const controller = await uploader.uploadFromStream(stream); // sent: the node exists
+                        started();
+                        return { completion: async () => (await answer, controller.completion()) };
+                    },
+                };
+            };
+            return { release: () => release(), sent };
+        };
+        for (const how of ['deleted', 'renamed over another file'] as const) {
+            test(`a new file ${how} through the drive while its first upload runs leaves nothing behind in the cloud`, async () => {
+                const d = setup();
+                d.add('report.txt', 'v1');
+                await pinnedAndSynced(d, d.root.uid);
+                const name = how === 'deleted' ? 'tmp.txt' : '.report.txt.tmp';
+                await d.files.writeLocal(name, 'v2');
+                const held = holdUploadAnswer(d);
+                const upload: Promise<void> = (d.engine as any).handleLocalFileChange(name);
+                await held.sent;
+
+                if (how === 'deleted') {
+                    await d.engine.deleteItem(name);
+                } else {
+                    await d.engine.renameItem(name, 'report.txt');
+                }
+                held.release();
+                await upload;
+                await d.engine.replayRemoteOps();
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+
+                expect(d.named(d.root.uid, name)).toEqual([]);
+                expect(await d.files.exists(name)).toBe(false);
+                expect(d.engine.remoteIndex.getByPath(name)).toBeNull();
+                expect(d.calls.trashed.length).toBe(1);
+                if (how === 'renamed over another file') {
+                    expect(d.nodes.get('vol~report.txt')?.content).toBe('v2');
+                }
+                await d.expectEveryRecordHasItsFile();
+            });
+        }
+
+        test('a new folder renamed while it is being made in the cloud ends up there once, under its new name', async () => {
+            const d = setup();
+            d.add('keep.txt', 'k');
+            await pinnedAndSynced(d, d.root.uid);
+            await mkdir(d.local('New Folder'));
+            let release!: () => void;
+            const answer = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const making = new Promise<void>((resolve) => (entered = resolve));
+            const createFolder = (d.sdk as any).createFolder.bind(d.sdk);
+            (d.sdk as any).createFolder = async (...args: unknown[]) => {
+                entered();
+                await answer;
+                return createFolder(...args);
+            };
+            const upload: Promise<void> = (d.engine as any).handleLocalFileChange('New Folder');
+            await making;
+
+            await d.engine.renameItem('New Folder', 'Photos');
+            release();
+            await upload;
+            (d.sdk as any).createFolder = createFolder;
+            await (d.engine as any).handleLocalFileChange('Photos'); // the watcher reports the renamed folder
+            await d.engine.reconcileNow();
+            await d.engine.reconcileNow();
+
+            const top = [...d.nodes.values()].filter((n) => n.parentUid === d.root.uid && n.uid !== d.root.uid).map((n) => d.nameOf(n));
+            expect(top.sort()).toEqual(['Photos', 'keep.txt']);
+            expect(d.engine.remoteIndex.getByPath('New Folder')).toBeNull();
+            expect((await readdir(d.local(''))).sort()).toEqual(['Photos', 'keep.txt']);
+            expect(d.calls.trashed).toEqual([]);
+            await d.expectEveryRecordHasItsFile();
+        });
+
+        // Review I2
+        test('an online-only file moved into a new folder made here stays in listings until it is in the cloud, and nothing downloads', async () => {
+            const d = setup();
+            d.add('Docs/x.txt', 'x');
+            await d.engine.reconcileNow();
+            await mkdir(d.local('New'));
+            d.down.add('getNode'); // the replay can't run yet
+
+            await d.engine.renameItem('Docs/x.txt', 'New/x.txt');
+            await d.engine.replayRemoteOps();
+
+            expect(d.engine.remoteIndex.getByPath('New/x.txt')?.uid).toBe('vol~Docs/x.txt');
+            expect(d.engine.remoteIndex.getByPath('Docs/x.txt')).toBeNull();
+            // The folder made here stands in the index for one Proton Drive doesn't have yet: never acted on as a node
+            const pin = await d.engine.setAvailability('New', 'pin').then(() => null, (e: Error) => e.message);
+            expect(pin).toBe('Not in Proton Drive: New');
+            await d.engine.reconcileNow(); // lists Docs (x.txt still there in the cloud) and uploads New
+            expect(d.engine.remoteIndex.getByPath('New/x.txt')?.uid).toBe('vol~Docs/x.txt');
+            expect(d.engine.remoteIndex.getByPath('Docs/x.txt')).toBeNull();
+            d.down.clear();
+            await d.engine.replayRemoteOps();
+
+            const created = d.named(d.root.uid, 'New');
+            expect(created.length).toBe(1);
+            expect(d.nodes.get('vol~Docs/x.txt')?.parentUid).toBe(created[0]!.uid);
+            expect(d.engine.remoteIndex.getByPath('New/x.txt')?.uid).toBe('vol~Docs/x.txt');
+            expect(d.engine.remoteIndex.getByPath('New')?.uid).toBe(created[0]!.uid);
+            expect(d.calls.downloads).toEqual([]);
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.engine.availability.stateOf('New/x.txt')).toBe('online-only');
+        });
+
+        // Review I3: a folder that reached the cloud only through the upload of a file in it
+        test('a folder made in the cloud for the upload of a file in it is renamed there with it, and nothing moves back', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            await pinnedAndSynced(d, d.add('Docs').uid);
+            await d.files.writeLocal('Docs/New/f.txt', 'f');
+            await (d.engine as any).handleLocalFileChange('Docs/New/f.txt');
+
+            await d.engine.renameItem('Docs/New', 'Docs/Renamed');
+            await d.engine.reconcileNow();
+            await d.engine.reconcileNow();
+
+            expect((await readdir(d.local('Docs'))).sort()).toEqual(['Renamed', 'a.txt']);
+            expect(await readdir(d.local('Docs/Renamed'))).toEqual(['f.txt']);
+            const renamed = d.named('vol~Docs', 'Renamed');
+            expect(renamed.length).toBe(1);
+            expect(d.named(renamed[0]!.uid, 'f.txt').length).toBe(1);
+            expect(d.named('vol~Docs', 'New')).toEqual([]);
+            expect(d.calls.trashed).toEqual([]);
+            await d.expectEveryRecordHasItsFile();
+        });
+
+        test('renaming a folder that has no record of its own, but holds recorded items, takes those items along in the cloud', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            await pinnedAndSynced(d, d.add('Docs').uid);
+            await d.files.writeLocal('Docs/New/f.txt', 'f');
+            await (d.engine as any).handleLocalFileChange('Docs/New/f.txt');
+            const fRecord = stateDb.getItemByPath('Docs/New/f.txt')!;
+            const f = fRecord.nodeUid;
+            // As an earlier version left it: the folder itself neither recorded nor in the remote index
+            stateDb.removeItemByPath('Docs/New');
+            stateDb.upsertItem(fRecord);
+            d.engine.remoteIndex.removeSubtree(d.named('vol~Docs', 'New')[0]!.uid);
+
+            await d.engine.renameItem('Docs/New', 'Docs/Renamed');
+            await d.engine.reconcileNow();
+            await d.engine.reconcileNow();
+
+            // The emptied folder of the old name stays in Proton Drive (and so here): only a folder recorded as synced is
+            // renamed there with it
+            expect(await d.files.exists('Docs/New/f.txt')).toBe(false);
+            expect(await readdir(d.local('Docs/Renamed'))).toEqual(['f.txt']);
+            const renamed = d.named('vol~Docs', 'Renamed');
+            expect(renamed.length).toBe(1);
+            expect(d.nodes.get(f)?.parentUid).toBe(renamed[0]!.uid);
+            expect(d.calls.trashed).toEqual([]);
+            await d.expectEveryRecordHasItsFile();
+        });
+
+        test('a file can replace an online-only file in a folder that is not on this computer', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            d.add('Archive/b.txt', 'b');
+            await pinnedAndSynced(d, d.add('Docs').uid);
+
+            await d.engine.renameItem('Docs/a.txt', 'Archive/b.txt');
+            await d.engine.reconcileNow();
+
+            expect(await readFile(d.local('Archive/b.txt'), 'utf8')).toBe('a');
+            expect(d.nodes.get('vol~Archive/b.txt')?.content).toBe('a');
+            expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+            await d.expectEveryRecordHasItsFile();
+        });
+
+        // The remote index shows pending moves as done, so a folder's listing there can miss what the cloud still holds in
+        // it: a local delete of the folder must not be judged from that
+        test('a folder deleted on disk while a move out of it waits is not trashed until the move has reached the cloud', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            d.add('Docs/b.txt', 'b');
+            d.add('Other/x.txt', 'x');
+            await pinnedAndSynced(d, d.root.uid);
+            d.down.add('moveNodes');
+            await d.engine.renameItem('Docs/a.txt', 'Other/a.txt');
+            await rm(d.local('Docs'), { recursive: true }); // not through the drive
+
+            await d.engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([]);
+            d.down.clear();
+            await d.engine.reconcileNow();
+            await d.engine.reconcileNow();
+
+            expect(d.nodes.get('vol~Docs/a.txt')?.parentUid).toBe('vol~Other');
+            expect(await readFile(d.local('Other/a.txt'), 'utf8')).toBe('a');
+            expect(d.calls.trashed).toEqual([['vol~Docs']]); // the folder, with only b.txt in it by then
+            await d.expectEveryRecordHasItsFile();
         });
 
         // Its records moved, and its rename went into the journal, but the item itself had not moved yet: its records would

@@ -336,11 +336,20 @@ export async function ensureRemoteFolder(
     parentNode: NodeEntity | string,
     folderName: string,
 ): Promise<NodeEntity> {
+    return (await createRemoteFolder(sdk, parentNode, folderName)).node;
+}
+
+// Like ensureRemoteFolder, also saying whether the folder was made now (false when one of that name was already there)
+export async function createRemoteFolder(
+    sdk: ProtonDriveClient,
+    parentNode: NodeEntity | string,
+    folderName: string,
+): Promise<{ node: NodeEntity; created: boolean }> {
     try {
-        return await sdk.createFolder(parentNode, folderName);
+        return { node: await sdk.createFolder(parentNode, folderName), created: true };
     } catch (error: unknown) {
         if (error instanceof NodeWithSameNameExistsValidationError && error.existingNodeUid) {
-            return await sdk.getNode(error.existingNodeUid);
+            return { node: await sdk.getNode(error.existingNodeUid), created: false };
         }
         throw error;
     }
