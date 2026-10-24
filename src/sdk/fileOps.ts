@@ -276,6 +276,9 @@ export async function downloadDriveNodeToLocal(options: {
     const parentDir = path.dirname(localPath);
     await mkdir(parentDir, { recursive: true });
 
+    // Asked for before the temp file exists (creating the writer creates it), so failing here (offline, say) leaves none
+    const downloader = await sdk.getFileRevisionDownloader(revision.uid);
+
     const tempPath = path.join(parentDir, `.proton-drive-tmp-${process.pid}-${Date.now()}-${path.basename(localPath)}`);
     const tempFile = Bun.file(tempPath);
     const writer = tempFile.writer();
@@ -293,12 +296,10 @@ export async function downloadDriveNodeToLocal(options: {
         locked: false,
     };
 
-    const downloader = await sdk.getFileRevisionDownloader(revision.uid);
-    const controller = downloader.downloadToStream(writableStream, (downloadedBytes) => {
-        onProgress?.(downloadedBytes, expectedSize);
-    });
-
     try {
+        const controller = downloader.downloadToStream(writableStream, (downloadedBytes) => {
+            onProgress?.(downloadedBytes, expectedSize);
+        });
         await controller.completion();
         await writer.end();
 
@@ -326,6 +327,11 @@ export async function downloadDriveNodeToLocal(options: {
         };
     } catch (error) {
         logger.error(`Failed downloading ${getName(remoteNode)} to ${localPath}`, error);
+        try {
+            await writer.end(); // closes the temp file if the stream left it open
+        } catch {
+            // Closed already
+        }
         await unlink(tempPath).catch(() => {});
         throw error;
     }

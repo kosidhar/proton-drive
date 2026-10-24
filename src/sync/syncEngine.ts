@@ -34,12 +34,16 @@ import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
 import { createLocalConflictCopy, formatConflictFileName } from './conflictResolver';
 import { gioTrash, type MoveToDesktopTrash } from './desktopTrash';
 import { readDriveLayout } from './driveMode';
+import { DriveOpError, type VfsEntry } from './driveOps';
 import { isEngineTempName, removeScannedEntries, type ScanEntry, scanLocalCopies } from './localCopies';
 import { moveWithoutReplacing } from './localMove';
 import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
 import { entryFromNode, RemoteIndex, type RemoteIndexEntry } from './remoteIndex';
 import { type RemoteOp, RemoteOpsJournal } from './remoteOps';
 import type { ConflictRecord, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
+import { forgetFailedThumbnail } from './thumbnailCache';
+
+export { DriveOpError, type DriveOpErrorCode, type VfsEntry } from './driveOps';
 
 export interface ActiveTransfer {
     id: string;
@@ -60,6 +64,8 @@ const MAX_UNEXPECTED_FAILURES = 10;
 // Uid prefix of the remote index entries that stand for folders made here that Proton Drive doesn't have yet, holding
 // what a pending move puts in them (see applyPendingOpsToIndex). Never a node: never resolved, moved or trashed.
 const PROVISIONAL = 'provisional:';
+// How long a download for the virtual drive (an app opening an online-only file) may take before the user is told
+const SLOW_DOWNLOAD_NOTICE_MS = 2000;
 
 export type EngineState = 'idle' | 'syncing' | 'paused' | 'unauthenticated' | 'error';
 
@@ -124,6 +130,9 @@ export class ProtonDriveSyncEngine {
     private replayRun: Promise<void> | null = null;
     private replayAgain = false;
     private replayAfterPass = false;
+    // Downloads for the virtual drive under way, by path: a second open of the same file waits for the same one
+    private hydrations = new Map<string, Promise<void>>();
+    private slowDownloadNoticeMs = SLOW_DOWNLOAD_NOTICE_MS;
 
     constructor(
         private readonly sdk: ProtonDriveClient,
@@ -131,7 +140,12 @@ export class ProtonDriveSyncEngine {
         private readonly auth: { isLoggedIn(): boolean },
         private readonly stateDb: SyncStateDatabase,
         private readonly logger: Logger,
-        private readonly options: { backingDir?: string; moveToDesktopTrash?: MoveToDesktopTrash } = {},
+        private readonly options: {
+            backingDir?: string;
+            moveToDesktopTrash?: MoveToDesktopTrash;
+            // Deletes GNOME's failed-thumbnail record of a file by its path under the mount (see thumbnailCache)
+            forgetFailedThumbnail?: (mountFullPath: string) => Promise<void>;
+        } = {},
     ) {
         this.index = new RemoteIndex(this.stateDb.connection);
         this.policy = new AvailabilityPolicy(this.stateDb.connection, this.index);
@@ -1763,9 +1777,12 @@ export class ProtonDriveSyncEngine {
     // operations (see replayRemoteOps), so it also works offline. Replacing an existing file (an editor's atomic save)
     // keeps the replaced file's identity: the new content uploads as a new revision of it, and the file that replaced it
     // goes to the Proton Drive trash if it was ever uploaded. Only a file on this computer can replace, and only a file.
-    // Moving into an ignored name takes the item out of what is synced: Proton Drive keeps it where it was.
-    // Rejects with `Not found: <path>`, `Already exists: <path>`, `Hidden: <path>` or `Invalid path: <path>`.
-    async renameItem(fromRel: string, toRel: string): Promise<void> {
+    // Moving into an ignored name takes the item out of what is synced: Proton Drive keeps it where it was. With
+    // noReplace, nothing that is at toRel (here or only in Proton Drive) is ever replaced.
+    // Rejects with a DriveOpError: `Not found: <path>` (ENOENT), `Already exists: <path>` (EEXIST), `Hidden: <path>`
+    // (EACCES), or EXDEV for an online-only file replacing another (it has no local copy to put there: mv then copies it,
+    // which downloads it, and deletes it); with `Invalid path: <path>` for a path that climbs out of My files.
+    async renameItem(fromRel: string, toRel: string, opts: { noReplace?: boolean } = {}): Promise<void> {
         const from = normalizeDrivePath(fromRel);
         const to = normalizeDrivePath(toRel);
         if (from === '' || to === '') {
@@ -1777,14 +1794,14 @@ export class ProtonDriveSyncEngine {
         if (to.startsWith(`${from}/`)) {
             throw new Error(`Can't move ${from} into itself`);
         }
-        await this.inAvailabilityRun(() => this.renameLocally(from, to));
+        await this.inAvailabilityRun(() => this.renameLocally(from, to, opts.noReplace === true));
         void this.replayRemoteOps();
     }
 
     // Deletes an item of My files through the virtual drive: its local copy (everything in it, things that exist only on
     // this computer included, as the user asked), its records and its index entries go at once, and Proton Drive moves it
     // to its trash from the journal, downloading nothing. An ignored item is only ever local, so only its local copy goes.
-    // Rejects with `Not found: <path>`, `Hidden: <path>` or `Invalid path: <path>`.
+    // Rejects with a DriveOpError, `Not found: <path>` (ENOENT) or `Hidden: <path>` (EACCES), or `Invalid path: <path>`.
     async deleteItem(relPath: string): Promise<void> {
         const rel = normalizeDrivePath(relPath);
         if (rel === '') {
@@ -1792,6 +1809,193 @@ export class ProtonDriveSyncEngine {
         }
         await this.inAvailabilityRun(() => this.deleteLocally(rel));
         void this.replayRemoteOps();
+    }
+
+    // A folder's listing for the virtual drive: what the remote index holds in it, as this computer sees it, online-only
+    // and downloaded items alike (the helper merges it with the backing store), sorted by name. Left out are hidden items
+    // (and those being hidden), ignored names, and entries that a pending rename, move or delete takes away from there
+    // (see liveIndexEntry); Proton Docs and Sheets aren't indexed. A folder made here that Proton Drive doesn't have yet
+    // is listed as the folder it is. A folder the index doesn't hold lists nothing.
+    vfsChildren(relPath: string): VfsEntry[] {
+        const rel = normalizeDrivePath(relPath);
+        const ignorePatterns = this.stateDb.getSettings().ignorePatterns;
+        const folder = this.liveIndexEntry(rel);
+        if (
+            !folder ||
+            folder.type !== 'folder' ||
+            matchesIgnorePatterns(rel, ignorePatterns) ||
+            this.policy.hiddenBy(rel) !== null
+        ) {
+            return [];
+        }
+        // The folder is where its entry is, so only a child's own pending operation can take the child away
+        const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
+        const entries: VfsEntry[] = [];
+        for (const child of this.index.listChildren(rel)) {
+            if (
+                takesAway(latest.get(child.uid), child) ||
+                matchesIgnorePatterns(child.relPath, ignorePatterns) ||
+                this.policy.hiddenBy(child.relPath) !== null
+            ) {
+                continue;
+            }
+            entries.push({ name: child.name, type: child.type, size: child.size, mtimeMs: child.mtimeMs });
+        }
+        return entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    }
+
+    // Downloads an online-only file into the backing store, for the virtual drive to open it (an app opened it). Calls for
+    // the same path while one runs get that one; a file already here resolves at once. The download takes its turn on
+    // availabilityRun, so a rename, move or delete of it (through the drive, or in the cloud) waits for it, rather than
+    // the download putting it back at its old path. The user is told when it takes over 2 s, and when it fails; once it
+    // is here, GNOME's failed-thumbnail record of it goes, so its thumbnail shows. Rejects with a DriveOpError:
+    // `Hidden: <path>` (EACCES) for an item hidden or being hidden, `Not in Proton Drive: <path>` (ENOENT), `Not a file:
+    // <path>` (EIO), or the download's error (EIO); with `Invalid path: <path>` for a path that climbs out of My files.
+    hydrate(relPath: string): Promise<void> {
+        let rel: string;
+        try {
+            rel = normalizeDrivePath(relPath);
+        } catch (error: unknown) {
+            return Promise.reject(error);
+        }
+        const running = this.hydrations.get(rel);
+        if (running) {
+            return running;
+        }
+        const run = this.hydrateNow(rel).finally(() => {
+            this.hydrations.delete(rel);
+        });
+        this.hydrations.set(rel, run);
+        return run;
+    }
+
+    private async hydrateNow(rel: string): Promise<void> {
+        const name = path.posix.basename(rel);
+        // From the moment the app is kept waiting, its wait for a turn included
+        const slowNotice = setTimeout(() => {
+            sendDesktopNotification({
+                title: `Downloading ${name}…`,
+                body: 'It opens once it is on this computer.',
+                urgency: 'low',
+                enabled: this.stateDb.getSettings().notificationsEnabled,
+            });
+        }, this.slowDownloadNoticeMs);
+        try {
+            if (await this.inAvailabilityRun(() => this.hydrateInTurn(rel))) {
+                await this.forgetFailedThumbnailOf(rel);
+            }
+        } catch (error: unknown) {
+            const failure = error instanceof DriveOpError ? error : new DriveOpError('EIO', messageOf(error), { cause: error });
+            // A download that failed (not a refusal: hidden, not there, or not a file)
+            if (failure.code === 'EIO' && !failure.message.startsWith('Not a file:')) {
+                this.logger.warn(`Could not download ${rel} for an app to open it: ${failure.message}`);
+                const cause = failure.cause ?? error;
+                sendDesktopNotification({
+                    title: `Couldn't open ${name}`,
+                    body:
+                        cause instanceof ConnectionError || cause instanceof AbortError
+                            ? `${name} can't be downloaded while Proton Drive is unreachable. Try again once you are back online.`
+                            : `${name} could not be downloaded: ${failure.message}`,
+                    urgency: 'normal',
+                    enabled: this.stateDb.getSettings().notificationsEnabled,
+                });
+            }
+            throw failure;
+        } finally {
+            clearTimeout(slowNotice);
+        }
+    }
+
+    // The part of hydrate that runs in its turn: everything is looked at again here, as a rename, delete or hide may have
+    // run while it waited. Returns whether it downloaded the file (false when a local copy was already there).
+    private async hydrateInTurn(rel: string): Promise<boolean> {
+        this.recoverLocalMove();
+        if (await this.existsLocally(rel)) {
+            return false;
+        }
+        if (this.policy.hiddenBy(rel) !== null) {
+            throw new DriveOpError('EACCES', `Hidden: ${rel}`);
+        }
+        // An ignored item is never in Proton Drive; an entry that a pending operation takes elsewhere isn't what is at
+        // this path here (downloading it would put a second copy of it here)
+        const entry = matchesIgnorePatterns(rel, this.stateDb.getSettings().ignorePatterns) ? null : this.liveIndexEntry(rel);
+        if (!entry) {
+            throw new DriveOpError('ENOENT', `Not in Proton Drive: ${rel}`);
+        }
+        // A provisional entry is a folder made here, never a node to ask about
+        if (isProvisional(entry.uid) || entry.type !== 'file') {
+            throw new DriveOpError('EIO', `Not a file: ${rel}`);
+        }
+        if (!this.auth.isLoggedIn()) {
+            throw new DriveOpError('EIO', 'Sign in to Proton Drive to download it');
+        }
+        let node: NodeEntity;
+        try {
+            node = await this.sdk.getNode(entry.uid);
+        } catch (error: unknown) {
+            if (error instanceof ValidationError) {
+                throw new DriveOpError('ENOENT', `Not in Proton Drive: ${rel}`, { cause: error });
+            }
+            throw new DriveOpError('EIO', messageOf(error), { cause: error });
+        }
+        if (node.trashTime) {
+            throw new DriveOpError('ENOENT', `Not in Proton Drive: ${rel}`);
+        }
+        if (node.type !== NodeType.File || isUnsupportedRemoteNode(node)) {
+            throw new DriveOpError('EIO', `Not a file: ${rel}`);
+        }
+        // The folders above it that aren't on this computer (online-only) are made to hold it, and go again if the
+        // download fails; the next sync records the ones that stay
+        const madeFrom = await this.firstMissingAncestor(rel);
+        for (let slash = rel.indexOf('/'); slash !== -1; slash = rel.indexOf('/', slash + 1)) {
+            this.watcher.suppressPath(rel.slice(0, slash));
+        }
+        try {
+            await this.observingLocal((since) => this.downloadRemoteToLocal(rel, node, path.join(this.localRoot(), rel), since));
+            if (!(await this.existsLocally(rel))) {
+                throw new Error(`${rel} could not be downloaded`);
+            }
+        } catch (error: unknown) {
+            if (madeFrom !== null) {
+                await this.removeEmptyFolders(parentOf(rel), madeFrom);
+            }
+            throw new DriveOpError('EIO', messageOf(error), { cause: error });
+        }
+        return true;
+    }
+
+    // The topmost folder above relPath missing on this computer, or null when they are all here
+    private async firstMissingAncestor(relPath: string): Promise<string | null> {
+        for (let slash = relPath.indexOf('/'); slash !== -1; slash = relPath.indexOf('/', slash + 1)) {
+            const folder = relPath.slice(0, slash);
+            if (!(await this.existsLocally(folder))) {
+                return folder;
+            }
+        }
+        return null;
+    }
+
+    // Removes the folders from `from` up to `upTo` (both included) while they are empty
+    private async removeEmptyFolders(from: string, upTo: string): Promise<void> {
+        for (let folder = from; isWithin(folder, upTo); folder = parentOf(folder)) {
+            try {
+                await rmdir(path.join(this.localRoot(), folder));
+            } catch {
+                return; // Not empty (something was put there meanwhile), or gone already
+            }
+            if (folder === upTo) {
+                return;
+            }
+        }
+    }
+
+    private async forgetFailedThumbnailOf(rel: string): Promise<void> {
+        const mountFullPath = path.join(this.stateDb.getSettings().syncDir, rel);
+        try {
+            await (this.options.forgetFailedThumbnail ?? forgetFailedThumbnail)(mountFullPath);
+        } catch (error: unknown) {
+            this.logger.warn(`Could not clear the failed thumbnail of ${mountFullPath}: ${error}`);
+        }
     }
 
     // Sends the journalled renames, moves and deletes to Proton Drive, in the order they were made (spec §5.2). A network
@@ -1859,11 +2063,11 @@ export class ProtonDriveSyncEngine {
         }
     }
 
-    private async renameLocally(fromRel: string, toRel: string): Promise<void> {
+    private async renameLocally(fromRel: string, toRel: string, noReplace: boolean): Promise<void> {
         this.recoverLocalMove();
         for (const p of [fromRel, toRel]) {
             if (this.policy.hiddenBy(p)?.hide === 'hidden') {
-                throw new Error(`Hidden: ${p}`);
+                throw new DriveOpError('EACCES', `Hidden: ${p}`);
             }
         }
         const root = this.localRoot();
@@ -1875,7 +2079,7 @@ export class ProtonDriveSyncEngine {
         // operation takes elsewhere isn't what is at its path here
         const sourceEntry = ignoredFrom ? null : this.liveIndexEntry(fromRel);
         if (!source && !sourceEntry) {
-            throw new Error(`Not found: ${fromRel}`);
+            throw new DriveOpError('ENOENT', `Not found: ${fromRel}`);
         }
         const sourceUid = ignoredFrom ? null : (this.stateDb.getItemByPath(fromRel)?.nodeUid ?? nodeUidOf(sourceEntry));
         const target = lstatSync(path.join(root, toRel), { throwIfNoEntry: false });
@@ -1884,15 +2088,22 @@ export class ProtonDriveSyncEngine {
         const parentRel = parentOf(toRel);
         const parent = parentRel === '' ? null : lstatSync(path.join(root, parentRel), { throwIfNoEntry: false });
         if (parentRel !== '' && (parent ? !parent.isDirectory() : this.liveIndexEntry(parentRel)?.type !== 'folder')) {
-            throw new Error(`Not found: ${parentRel}`);
+            throw new DriveOpError('ENOENT', `Not found: ${parentRel}`);
         }
         const replacing = Boolean(target || targetRecord || targetEntry);
+        if (replacing && noReplace) {
+            throw new DriveOpError('EEXIST', `Already exists: ${toRel}`);
+        }
         const targetUid = !replacing || ignoredTo ? null : (targetRecord?.nodeUid ?? nodeUidOf(targetEntry));
         if (replacing) {
             // Only a file on this computer replaces, and only a file
             const targetIsFile = target ? target.isFile() : (targetRecord?.type ?? targetEntry?.type) === 'file';
+            if (!source && sourceEntry?.type === 'file' && targetIsFile) {
+                // Online-only, it has no local copy to put in the target's place: mv copies it instead (downloading it)
+                throw new DriveOpError('EXDEV', `Can't replace ${toRel} with ${fromRel}, which isn't on this computer`);
+            }
             if (!source?.isFile() || !targetIsFile) {
-                throw new Error(`Already exists: ${toRel}`);
+                throw new DriveOpError('EEXIST', `Already exists: ${toRel}`);
             }
         }
         if (source && parentRel !== '' && !parent) {
@@ -1996,14 +2207,14 @@ export class ProtonDriveSyncEngine {
     private async deleteLocally(relPath: string): Promise<void> {
         this.recoverLocalMove();
         if (this.policy.hiddenBy(relPath)?.hide === 'hidden') {
-            throw new Error(`Hidden: ${relPath}`);
+            throw new DriveOpError('EACCES', `Hidden: ${relPath}`);
         }
         const root = this.localRoot();
         const ignored = matchesIgnorePatterns(relPath, this.stateDb.getSettings().ignorePatterns);
         const local = lstatSync(path.join(root, relPath), { throwIfNoEntry: false });
         const entry = ignored ? null : this.liveIndexEntry(relPath);
         if (!local && !entry) {
-            throw new Error(`Not found: ${relPath}`);
+            throw new DriveOpError('ENOENT', `Not found: ${relPath}`);
         }
         const toTrash = ignored ? new Map<string, string>() : this.trashTargets(relPath, entry);
         this.watcher.suppressPath(relPath);
@@ -2197,8 +2408,7 @@ export class ProtonDriveSyncEngine {
         const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
         if (latest.size > 0) {
             for (let node: RemoteIndexEntry | null = entry; node; node = node.parentUid ? this.index.getByUid(node.parentUid) : null) {
-                const op = latest.get(node.uid);
-                if (op && (op.kind === 'trash' || op.toPath !== node.relPath)) {
+                if (takesAway(latest.get(node.uid), node)) {
                     return null;
                 }
                 if (node.relPath === '') {
@@ -2310,7 +2520,7 @@ export class ProtonDriveSyncEngine {
         }
         if (!moved) {
             this.restoreLocalStep(snapshot);
-            throw failure ?? new Error(`Already exists: ${toRel}`);
+            throw driveOpErrorOf(failure, toRel);
         }
         this.stateDb.deleteMeta(LOCAL_MOVE_IN_PROGRESS);
     }
@@ -3437,6 +3647,24 @@ function normalizeDrivePath(relPath: string): string {
 
 function isProvisional(uid: string): boolean {
     return uid.startsWith(PROVISIONAL);
+}
+
+// Whether a node's latest pending operation takes it away from where its index entry is: deleted, or moved elsewhere
+function takesAway(op: RemoteOp | undefined, entry: RemoteIndexEntry): boolean {
+    return op !== undefined && (op.kind === 'trash' || op.toPath !== entry.relPath);
+}
+
+// Why the file system step of a local move failed, as a drive operation error where its errno means something to the
+// drive (null is something having taken toRel since the look at it)
+function driveOpErrorOf(failure: unknown, toRel: string): unknown {
+    const code = (failure as NodeJS.ErrnoException | null)?.code;
+    if (failure === null || code === 'EEXIST' || code === 'ENOTEMPTY') {
+        return new DriveOpError('EEXIST', `Already exists: ${toRel}`, { cause: failure ?? undefined });
+    }
+    if (code === 'ENOENT') {
+        return new DriveOpError('ENOENT', messageOf(failure), { cause: failure });
+    }
+    return failure;
 }
 
 // The node an index entry stands for; none for a provisional one

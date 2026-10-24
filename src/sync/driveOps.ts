@@ -1,0 +1,26 @@
+// What the virtual drive asks of the daemon over the control socket, and how a drive operation fails.
+
+// An item of a folder's listing in the drive, from the remote index: a file or folder Proton Drive has, whether or not
+// it is on this computer too
+export interface VfsEntry {
+    name: string;
+    type: 'file' | 'folder';
+    size: number;
+    mtimeMs: number;
+}
+
+// The errno a drive operation fails with, for the FUSE helper to return: ENOENT for a path that isn't there, EACCES for
+// a hidden one, EEXIST for a target in the way, EXDEV for a rename that has to be done as copy and delete (an online-only
+// file replacing another), EIO for anything else (a failed download, say)
+export type DriveOpErrorCode = 'ENOENT' | 'EEXIST' | 'EACCES' | 'EIO' | 'EXDEV';
+
+export class DriveOpError extends Error {
+    constructor(
+        readonly code: DriveOpErrorCode,
+        message: string,
+        options?: { cause?: unknown },
+    ) {
+        super(message, options);
+        this.name = 'DriveOpError';
+    }
+}

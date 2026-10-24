@@ -14,11 +14,13 @@ import {
     ValidationError,
 } from '@protontech/drive-sdk';
 
+import * as notifications from '../src/linux/notifications';
 import type { Manager as EventsManager } from '../src/sdk/events/manager';
 import { computeLocalFileSha1, detectMediaType, THIRD_PARTY_DISCLOSURE } from '../src/sdk/fileOps';
 import { PIN_ROOT_ON_FIRST_SYNC } from '../src/sync/availabilityMigration';
 import { entryFromNode } from '../src/sync/remoteIndex';
 import { createLocalConflictCopy, formatConflictFileName } from '../src/sync/conflictResolver';
+import { DriveOpError } from '../src/sync/driveOps';
 import { matchesIgnorePatterns } from '../src/sync/localWatcher';
 import { type AvailabilityResult, LOCAL_MOVE_IN_PROGRESS, ProtonDriveSyncEngine } from '../src/sync/syncEngine';
 import { RemoteOpsJournal } from '../src/sync/remoteOps';
@@ -3342,6 +3344,484 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.calls.uploads).toEqual([]);
             expect(stateDb.getMeta(LOCAL_MOVE_IN_PROGRESS)).toBeNull();
             await d.expectEveryRecordHasItsFile();
+        });
+    });
+    describe('the virtual drive', () => {
+        const setup = () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const drive = makeMockDrive();
+            const backingDir = path.join(tempDir, 'files');
+            const forgotten: string[] = [];
+            // A new engine on the same database and drive is what a restart of the daemon gives
+            const start = () =>
+                new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                    backingDir,
+                    moveToDesktopTrash: async () => false,
+                    forgetFailedThumbnail: async (mountFullPath: string) => {
+                        forgotten.push(mountFullPath);
+                    },
+                });
+            return {
+                ...drive,
+                engine: start(),
+                restart: start,
+                files: localFiles(stateDb, () => backingDir),
+                forgotten,
+                local: (rel: string) => path.join(backingDir, rel),
+                mountPath: (rel: string) => path.join(stateDb.getSettings().syncDir, rel),
+                journal: () => new RemoteOpsJournal(stateDb.connection).pending(),
+                named: (parentUid: string, name: string) =>
+                    [...drive.nodes.values()].filter((n) => n.parentUid === parentUid && drive.nameOf(n) === name && n.uid !== drive.root.uid),
+                tempFilesIn: async (rel: string) =>
+                    (await readdir(path.join(backingDir, rel)).catch(() => [] as string[])).filter((n) => n.startsWith('.proton-drive-tmp-')),
+            };
+        };
+        // How a drive operation failed (its errno code and message), or null when it didn't
+        const failure = (p: Promise<unknown>) =>
+            p.then(
+                () => null,
+                (e: unknown) => ({
+                    code: (e as { code?: string }).code,
+                    message: (e as Error).message,
+                    driveOpError: e instanceof DriveOpError,
+                }),
+            );
+        const until = async (cond: () => boolean) => {
+            for (let i = 0; i < 400 && !cond(); i++) {
+                await Bun.sleep(5);
+            }
+            expect(cond()).toBe(true);
+        };
+        // Downloads that wait until released, so a test can act while one runs
+        const slowDownloads = (d: ReturnType<typeof setup>) => {
+            const sdk = d.sdk as any;
+            const real = sdk.getFileRevisionDownloader;
+            let release!: () => void;
+            const released = new Promise<void>((resolve) => {
+                release = resolve;
+            });
+            let started = 0;
+            sdk.getFileRevisionDownloader = async (revisionUid: string) => {
+                started += 1;
+                const downloader = await real(revisionUid);
+                return {
+                    downloadToStream: (writable: WritableStream, onProgress?: (bytes: number) => void) => {
+                        const inner = downloader.downloadToStream(writable, onProgress);
+                        return {
+                            completion: async () => {
+                                await released;
+                                await inner.completion();
+                            },
+                        };
+                    },
+                };
+            };
+            return { release, started: () => started, restore: () => (sdk.getFileRevisionDownloader = real) };
+        };
+
+        describe('vfsChildren', () => {
+            test('lists online-only and downloaded items with their size and mtime, leaving out hidden items and a remote .git', async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'aaa');
+                d.add('Docs/b.txt', 'bb');
+                d.add('Docs/.git/HEAD', 'ref: refs/heads/main');
+                d.add('Docs/Private/secret.txt', 's');
+                d.add('Docs/Sub/c.txt', 'c');
+                await d.engine.reconcileNow();
+                await d.engine.setAvailability('Docs/b.txt', 'pin');
+                expect((await d.engine.setAvailability('Docs/Private', 'hide')).state).toBe('hidden');
+                // Proton Drive has the .git folder, and the remote index with it; this computer ignores it
+                expect(d.engine.remoteIndex.getByPath('Docs/.git')).not.toBeNull();
+                const mtimeOf = (rel: string) => d.engine.remoteIndex.getByPath(rel)!.mtimeMs;
+
+                expect(d.engine.vfsChildren('Docs')).toEqual([
+                    { name: 'Sub', type: 'folder', size: 0, mtimeMs: mtimeOf('Docs/Sub') },
+                    {
+                        name: 'a.txt',
+                        type: 'file',
+                        size: 3,
+                        mtimeMs: d.nodes.get('vol~Docs/a.txt')!.activeRevision!.claimedModificationTime!.getTime(),
+                    },
+                    { name: 'b.txt', type: 'file', size: 2, mtimeMs: mtimeOf('Docs/b.txt') },
+                ]);
+                expect(d.engine.availability.stateOf('Docs/a.txt')).toBe('online-only');
+                expect(await readFile(d.local('Docs/b.txt'), 'utf8')).toBe('bb');
+                expect(d.engine.vfsChildren('')).toEqual([{ name: 'Docs', type: 'folder', size: 0, mtimeMs: mtimeOf('Docs') }]);
+                expect(d.engine.vfsChildren('/Docs/Sub/')).toEqual([
+                    { name: 'c.txt', type: 'file', size: 1, mtimeMs: mtimeOf('Docs/Sub/c.txt') },
+                ]);
+                // Nothing in a hidden folder, an ignored one, one Proton Drive doesn't have (or not yet), or a file
+                expect(d.engine.vfsChildren('Docs/Private')).toEqual([]);
+                expect(d.engine.vfsChildren('Docs/.git')).toEqual([]);
+                expect(d.engine.vfsChildren('Nowhere')).toEqual([]);
+                expect(d.engine.vfsChildren('Docs/a.txt')).toEqual([]);
+                expect(d.calls.downloads).toEqual(['Docs/b.txt']);
+            });
+
+            test('an index entry that a pending rename left behind (its new name taken in the cloud) is neither listed nor downloaded', async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'mine');
+                d.add('Docs/keep.txt', 'keep');
+                await d.engine.reconcileNow();
+                d.down.add('renameNode');
+                await d.engine.renameItem('Docs/a.txt', 'Docs/b.txt');
+                expect(d.engine.vfsChildren('Docs').map((e) => e.name)).toEqual(['b.txt', 'keep.txt']);
+                d.add('Docs/b.txt', 'theirs'); // made on the web meanwhile
+                const engine = d.restart(); // its first pass lists the folders that aren't on this computer again
+                await engine.reconcileNow();
+                // The cloud's b.txt has that name in the index; mine is left where the cloud has it, as a ghost
+                expect(engine.remoteIndex.getByPath('Docs/b.txt')?.uid).toBe('vol~Docs/b.txt');
+                expect(engine.remoteIndex.getByPath('Docs/a.txt')?.uid).toBe('vol~Docs/a.txt');
+
+                expect(engine.vfsChildren('Docs').map((e) => e.name)).toEqual(['b.txt', 'keep.txt']);
+                expect(engine.vfsChildren('Docs').find((e) => e.name === 'b.txt')?.size).toBe('theirs'.length);
+                expect(await failure(engine.hydrate('Docs/a.txt'))).toEqual({
+                    code: 'ENOENT',
+                    message: 'Not in Proton Drive: Docs/a.txt',
+                    driveOpError: true,
+                });
+                expect(d.calls.downloads).toEqual([]);
+                expect(await d.files.exists('Docs/a.txt')).toBe(false);
+                expect(stateDb.getItemByPath('Docs/a.txt')).toBeNull();
+                expect(d.journal()).toMatchObject([{ kind: 'rename', nodeUid: 'vol~Docs/a.txt', toPath: 'Docs/b.txt' }]);
+            });
+
+            test('a folder made here that Proton Drive does not have yet is listed as a folder with what was moved into it, and its uid is never looked up', async () => {
+                const d = setup();
+                d.add('Docs/x.txt', 'x');
+                await d.engine.reconcileNow();
+                await mkdir(d.local('New'));
+                d.down.add('getNode'); // the replay can't run yet
+                await d.engine.renameItem('Docs/x.txt', 'New/x.txt');
+                const provisional = d.engine.remoteIndex.getByPath('New')!;
+                expect(provisional.uid.startsWith('provisional:')).toBe(true);
+                const getNode = spyOn(d.sdk, 'getNode');
+
+                expect(d.engine.vfsChildren('')).toEqual([
+                    { name: 'Docs', type: 'folder', size: 0, mtimeMs: d.engine.remoteIndex.getByPath('Docs')!.mtimeMs },
+                    { name: 'New', type: 'folder', size: 0, mtimeMs: provisional.mtimeMs },
+                ]);
+                expect(d.engine.vfsChildren('New')).toEqual([
+                    { name: 'x.txt', type: 'file', size: 1, mtimeMs: d.engine.remoteIndex.getByPath('New/x.txt')!.mtimeMs },
+                ]);
+                expect(d.engine.vfsChildren('Docs')).toEqual([]);
+
+                // The folder is here: nothing to download
+                await d.engine.hydrate('New');
+                // Not here (gone from disk, still in the index): a folder is never downloaded, and its provisional uid is
+                // never asked about
+                await rm(d.local('New'), { recursive: true });
+                expect(await failure(d.engine.hydrate('New'))).toEqual({ code: 'EIO', message: 'Not a file: New', driveOpError: true });
+                await mkdir(d.local('New'));
+                // Offline: the download of what is in it fails, leaving nothing behind
+                expect(await failure(d.engine.hydrate('New/x.txt'))).toMatchObject({ code: 'EIO', driveOpError: true });
+                expect(await d.files.exists('New/x.txt')).toBe(false);
+                expect(stateDb.getItemByPath('New/x.txt')).toBeNull();
+
+                d.down.clear();
+                await d.engine.hydrate('New/x.txt');
+
+                expect(await readFile(d.local('New/x.txt'), 'utf8')).toBe('x');
+                expect(stateDb.getItemByPath('New/x.txt')?.nodeUid).toBe('vol~Docs/x.txt');
+                expect(d.engine.availability.stateOf('New/x.txt')).toBe('downloaded');
+                expect(getNode.mock.calls.map(([uid]) => uid)).not.toContainEqual(expect.stringMatching(/^provisional:/));
+                expect(getNode.mock.calls.length).toBeGreaterThan(0);
+                getNode.mockRestore();
+                // Then the folder reaches Proton Drive, and the file is moved into it there, not uploaded again
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+                const created = d.named(d.root.uid, 'New');
+                expect(created.length).toBe(1);
+                expect(d.nodes.get('vol~Docs/x.txt')?.parentUid).toBe(created[0]!.uid);
+                expect(d.calls.downloads).toEqual(['Docs/x.txt']);
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.journal()).toEqual([]);
+                expect(d.engine.availability.stateOf('New/x.txt')).toBe('downloaded');
+            });
+        });
+
+        describe('hydrate', () => {
+            test('downloads a file once for concurrent calls, records it, and forgets its failed thumbnail', async () => {
+                const d = setup();
+                d.add('Docs/été/a b.txt', 'hello');
+                d.add('Docs/other.txt', 'other');
+                await d.engine.reconcileNow();
+                expect(d.engine.availability.stateOf('Docs/été/a b.txt')).toBe('online-only');
+
+                const first = d.engine.hydrate('Docs/été/a b.txt');
+                const second = d.engine.hydrate('Docs/été/a b.txt');
+                expect(second).toBe(first); // the same download
+                await Promise.all([first, second]);
+
+                expect(d.calls.downloads).toEqual(['Docs/été/a b.txt']);
+                expect(await readFile(d.local('Docs/été/a b.txt'), 'utf8')).toBe('hello');
+                expect(stateDb.getItemByPath('Docs/été/a b.txt')?.nodeUid).toBe('vol~Docs/été/a b.txt');
+                expect(d.engine.availability.stateOf('Docs/été/a b.txt')).toBe('downloaded');
+                expect(d.forgotten).toEqual([d.mountPath('Docs/été/a b.txt')]);
+                expect(await d.files.exists('Docs/other.txt')).toBe(false);
+                expect(await d.tempFilesIn('Docs/été')).toEqual([]);
+                // Once it is here, asking again resolves at once
+                const again = d.engine.hydrate('Docs/été/a b.txt');
+                expect(again).not.toBe(first);
+                await again;
+                expect(d.calls.downloads).toEqual(['Docs/été/a b.txt']);
+                expect(d.forgotten.length).toBe(1);
+                // The next syncs take it as synced: nothing goes up, comes down or goes to the trash
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+                expect(d.calls.downloads).toEqual(['Docs/été/a b.txt']);
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.engine.availability.stateOf('Docs/été/a b.txt')).toBe('downloaded');
+                expect(await d.files.exists('Docs/other.txt')).toBe(false);
+            });
+
+            test('refuses a hidden item (EACCES), and a path Proton Drive does not have or that is ignored (ENOENT), downloading nothing', async () => {
+                const d = setup();
+                d.add('Private/secret.txt', 's');
+                d.add('Docs/a.txt', 'a');
+                d.add('Docs/movie.part', 'p');
+                await d.engine.reconcileNow();
+                await d.engine.setAvailability('Private', 'hide');
+
+                expect(await failure(d.engine.hydrate('Private/secret.txt'))).toEqual({
+                    code: 'EACCES',
+                    message: 'Hidden: Private/secret.txt',
+                    driveOpError: true,
+                });
+                expect(await failure(d.engine.hydrate('Docs/nope.txt'))).toEqual({
+                    code: 'ENOENT',
+                    message: 'Not in Proton Drive: Docs/nope.txt',
+                    driveOpError: true,
+                });
+                expect(await failure(d.engine.hydrate('Docs/movie.part'))).toEqual({
+                    code: 'ENOENT',
+                    message: 'Not in Proton Drive: Docs/movie.part',
+                    driveOpError: true,
+                });
+                expect(d.calls.downloads).toEqual([]);
+                expect(await d.files.exists('Private')).toBe(false);
+                expect(await d.files.exists('Docs')).toBe(false);
+                expect(d.forgotten).toEqual([]);
+            });
+
+            test('a failed download rejects with EIO and leaves no temp file, no record and no folder; a later try works', async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'hello');
+                d.add('Docs/keep.txt', 'keep');
+                d.add('Other/b.txt', 'b');
+                await d.engine.reconcileNow();
+                await d.engine.setAvailability('Docs/keep.txt', 'pin'); // so Docs is a folder on this computer
+                const sdk = d.sdk as any;
+                const real = sdk.getFileRevisionDownloader;
+
+                // Offline before the download starts
+                d.failNext('getFileRevisionDownloader');
+                expect(await failure(d.engine.hydrate('Docs/a.txt'))).toEqual({
+                    code: 'EIO',
+                    message: 'Network unreachable',
+                    driveOpError: true,
+                });
+                expect(await d.tempFilesIn('Docs')).toEqual([]); // looked at now: a later try can reuse the same temp name
+                // The connection drops half way through
+                sdk.getFileRevisionDownloader = async () => ({
+                    downloadToStream: (writable: WritableStream) => {
+                        const writer = writable.getWriter() as unknown as { write(bytes: Uint8Array): unknown };
+                        return {
+                            completion: async () => {
+                                writer.write(Buffer.from('hel'));
+                                throw new ConnectionError('Connection dropped');
+                            },
+                        };
+                    },
+                });
+                expect(await failure(d.engine.hydrate('Docs/a.txt'))).toEqual({
+                    code: 'EIO',
+                    message: 'Connection dropped',
+                    driveOpError: true,
+                });
+                expect(await d.tempFilesIn('Docs')).toEqual([]);
+                // In a folder that isn't on this computer: the folder made to hold it goes too
+                expect(await failure(d.engine.hydrate('Other/b.txt'))).toMatchObject({ code: 'EIO', driveOpError: true });
+                sdk.getFileRevisionDownloader = real;
+                // Proton Drive can't be asked about it
+                d.failNext('getNode');
+                expect(await failure(d.engine.hydrate('Docs/a.txt'))).toMatchObject({ code: 'EIO', driveOpError: true });
+
+                expect(await d.tempFilesIn('Docs')).toEqual([]);
+                expect(await d.files.exists('Docs/a.txt')).toBe(false);
+                expect(await d.files.exists('Other')).toBe(false);
+                expect(stateDb.getItemByPath('Docs/a.txt')).toBeNull();
+                expect(stateDb.getItemByPath('Other/b.txt')).toBeNull();
+                expect(d.engine.availability.stateOf('Docs/a.txt')).toBe('online-only');
+                expect(d.forgotten).toEqual([]);
+
+                await d.engine.hydrate('Docs/a.txt');
+                await d.engine.hydrate('Other/b.txt');
+
+                expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('hello');
+                expect(await readFile(d.local('Other/b.txt'), 'utf8')).toBe('b');
+                expect(await d.tempFilesIn('Docs')).toEqual([]);
+                expect(await d.tempFilesIn('Other')).toEqual([]);
+                await d.engine.reconcileNow();
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test('tells the user when a download takes a while, and when it fails', async () => {
+                stateDb.updateSettings({ notificationsEnabled: true });
+                const notices: string[] = [];
+                const notify = spyOn(notifications, 'sendDesktopNotification').mockImplementation((n) => {
+                    notices.push(n.title);
+                });
+                try {
+                    const d = setup();
+                    d.add('Docs/big.mov', 'big');
+                    d.add('Docs/small.txt', 'small');
+                    d.add('Docs/lost.txt', 'lost');
+                    d.add('Docs/Sub/x.txt', 'x');
+                    await d.engine.reconcileNow();
+                    (d.engine as any).slowDownloadNoticeMs = 40;
+
+                    await d.engine.hydrate('Docs/small.txt'); // quick: no notice
+                    await Bun.sleep(80);
+                    expect(notices).toEqual([]);
+
+                    const slow = slowDownloads(d);
+                    const big = d.engine.hydrate('Docs/big.mov');
+                    await until(() => notices.length > 0);
+                    expect(notices).toEqual(['Downloading big.mov…']);
+                    slow.release();
+                    await big;
+                    await Bun.sleep(80);
+                    expect(notices).toEqual(['Downloading big.mov…']);
+
+                    d.failNext('getFileRevisionDownloader');
+                    expect(await failure(d.engine.hydrate('Docs/lost.txt'))).toMatchObject({ code: 'EIO' });
+                    expect(notices).toEqual(['Downloading big.mov…', "Couldn't open lost.txt"]);
+                    // Refusals are not download failures: no notice
+                    expect(await failure(d.engine.hydrate('Docs/nope.txt'))).toMatchObject({ code: 'ENOENT' });
+                    expect(await failure(d.engine.hydrate('Docs/Sub'))).toMatchObject({ code: 'EIO', message: 'Not a file: Docs/Sub' });
+                    expect(notices.length).toBe(2);
+                } finally {
+                    notify.mockRestore();
+                }
+            });
+
+            test('a rename through the drive waits for a running hydrate of the same file, and nothing comes back at the old name', async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'hello');
+                await d.engine.reconcileNow();
+                const slow = slowDownloads(d);
+
+                const hydrating = d.engine.hydrate('Docs/a.txt');
+                await until(() => slow.started() === 1);
+                const renaming = d.engine.renameItem('Docs/a.txt', 'Docs/b.txt');
+                await Bun.sleep(30);
+                expect(d.engine.remoteIndex.getByPath('Docs/a.txt')?.uid).toBe('vol~Docs/a.txt'); // still waiting its turn
+                slow.release();
+                await hydrating;
+                await renaming;
+
+                expect(await readFile(d.local('Docs/b.txt'), 'utf8')).toBe('hello');
+                expect(await d.files.exists('Docs/a.txt')).toBe(false);
+                expect(stateDb.getItemByPath('Docs/b.txt')?.nodeUid).toBe('vol~Docs/a.txt');
+                expect(stateDb.getItemByPath('Docs/a.txt')).toBeNull();
+                await d.engine.replayRemoteOps();
+                await d.engine.reconcileNow();
+                expect(d.calls.renamed).toEqual([{ uid: 'vol~Docs/a.txt', name: 'b.txt' }]);
+                expect(d.calls.downloads).toEqual(['Docs/a.txt']);
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+                expect(await d.files.exists('Docs/a.txt')).toBe(false);
+            });
+        });
+
+        describe('drive operation errors', () => {
+            test('renameItem with noReplace refuses an existing target (EEXIST), here or only in Proton Drive, and changes nothing', async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                d.add('Docs/online.txt', 'o');
+                await d.engine.reconcileNow();
+                await d.engine.setAvailability('Docs/a.txt', 'pin');
+                await d.files.writeLocal('Docs/local.txt', 'l');
+
+                for (const [from, to] of [
+                    ['Docs/a.txt', 'Docs/local.txt'],
+                    ['Docs/a.txt', 'Docs/online.txt'],
+                    ['Docs/online.txt', 'Docs/local.txt'],
+                ] as const) {
+                    expect(await failure(d.engine.renameItem(from, to, { noReplace: true }))).toEqual({
+                        code: 'EEXIST',
+                        message: `Already exists: ${to}`,
+                        driveOpError: true,
+                    });
+                }
+                expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('a');
+                expect(await readFile(d.local('Docs/local.txt'), 'utf8')).toBe('l');
+                expect(stateDb.getItemByPath('Docs/a.txt')?.nodeUid).toBe('vol~Docs/a.txt');
+                expect(d.engine.remoteIndex.getByPath('Docs/online.txt')?.uid).toBe('vol~Docs/online.txt');
+                expect(d.journal()).toEqual([]);
+
+                // Nothing in the way: renamed as usual
+                await d.engine.renameItem('Docs/a.txt', 'Docs/c.txt', { noReplace: true });
+                expect(await readFile(d.local('Docs/c.txt'), 'utf8')).toBe('a');
+                // Without noReplace a file still replaces another
+                await d.engine.renameItem('Docs/c.txt', 'Docs/local.txt');
+                expect(await readFile(d.local('Docs/local.txt'), 'utf8')).toBe('a');
+            });
+
+            test('an online-only file renamed over an existing file is refused with EXDEV (mv then copies it), and nothing changes', async () => {
+                const d = setup();
+                d.add('Docs/online.txt', 'o');
+                d.add('Docs/other.txt', 'x');
+                await d.engine.reconcileNow();
+                await d.files.writeLocal('Docs/local.txt', 'l');
+
+                expect(await failure(d.engine.renameItem('Docs/online.txt', 'Docs/local.txt'))).toMatchObject({
+                    code: 'EXDEV',
+                    driveOpError: true,
+                });
+                expect(await failure(d.engine.renameItem('Docs/online.txt', 'Docs/other.txt'))).toMatchObject({
+                    code: 'EXDEV',
+                    driveOpError: true,
+                });
+
+                expect(await readFile(d.local('Docs/local.txt'), 'utf8')).toBe('l');
+                expect(d.engine.remoteIndex.getByPath('Docs/online.txt')?.uid).toBe('vol~Docs/online.txt');
+                expect(d.engine.remoteIndex.getByPath('Docs/other.txt')?.uid).toBe('vol~Docs/other.txt');
+                expect(stateDb.getItemByPath('Docs/other.txt')).toBeNull();
+                expect(d.journal()).toEqual([]);
+                await d.engine.replayRemoteOps();
+                await d.engine.reconcileNow();
+                expect(d.calls.renamed).toEqual([]);
+                expect(d.calls.moved).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.calls.downloads).toEqual([]);
+            });
+
+            test('drive operations fail with errno codes: ENOENT for an unknown path, EACCES for a hidden one, EEXIST for a folder in the way', async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                d.add('Docs/Sub/b.txt', 'b');
+                d.add('Private/s.txt', 's');
+                await d.engine.reconcileNow();
+                await d.engine.setAvailability('Docs/a.txt', 'pin');
+                await d.engine.setAvailability('Private', 'hide');
+                const expectCode = async (p: Promise<unknown>, code: string, message: string) =>
+                    expect(await failure(p)).toEqual({ code, message, driveOpError: true });
+
+                await expectCode(d.engine.renameItem('Docs/nope.txt', 'Docs/x.txt'), 'ENOENT', 'Not found: Docs/nope.txt');
+                await expectCode(d.engine.renameItem('Docs/a.txt', 'Nowhere/a.txt'), 'ENOENT', 'Not found: Nowhere');
+                await expectCode(d.engine.deleteItem('Docs/nope.txt'), 'ENOENT', 'Not found: Docs/nope.txt');
+                await expectCode(d.engine.renameItem('Private/s.txt', 'Docs/s.txt'), 'EACCES', 'Hidden: Private/s.txt');
+                await expectCode(d.engine.renameItem('Docs/a.txt', 'Private/a.txt'), 'EACCES', 'Hidden: Private/a.txt');
+                await expectCode(d.engine.deleteItem('Private'), 'EACCES', 'Hidden: Private');
+                await expectCode(d.engine.renameItem('Docs/a.txt', 'Docs/Sub'), 'EEXIST', 'Already exists: Docs/Sub');
+                expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('a');
+                expect(d.journal()).toEqual([]);
+            });
         });
     });
 });

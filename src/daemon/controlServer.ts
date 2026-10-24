@@ -3,10 +3,11 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
+import { DriveOpError } from '../sync/driveOps';
 import type { AvailabilityAction, ProtonDriveSyncEngine } from '../sync/syncEngine';
 
-// Pin, free, hide and unhide change what is on disk, so they are reachable only through this user-only Unix socket and
-// never through the unauthenticated TCP API.
+// Pin, free, hide and unhide change what is on disk, and so do the virtual drive's hydrate, rename and delete, so they
+// are reachable only through this user-only Unix socket and never through the unauthenticated TCP API.
 
 const ACTIONS: readonly string[] = ['pin', 'free', 'hide', 'unhide'] satisfies AvailabilityAction[];
 
@@ -21,7 +22,10 @@ export function defaultControlSocketPath(): string {
 
 export interface ControlServerOptions {
     socketPath: string;
-    engine: Pick<ProtonDriveSyncEngine, 'setAvailability' | 'availabilityOf'>;
+    engine: Pick<
+        ProtonDriveSyncEngine,
+        'setAvailability' | 'availabilityOf' | 'vfsChildren' | 'hydrate' | 'renameItem' | 'deleteItem'
+    >;
 }
 
 // 'live' when something accepts connections on the socket, 'stale' when it refuses or is gone
@@ -65,6 +69,71 @@ function jsonError(message: string, status = 400): Response {
     return Response.json({ error: message }, { status });
 }
 
+function messageOf(err: unknown): string {
+    return err instanceof Error ? err.message : String(err);
+}
+
+// The drive's routes answer an error with the errno for the helper to return: the engine's own code, EIO otherwise
+function driveError(err: unknown, status = 400): Response {
+    return Response.json({ error: messageOf(err), code: err instanceof DriveOpError ? err.code : 'EIO' }, { status });
+}
+
+async function jsonBody(req: Request): Promise<Record<string, unknown> | null> {
+    try {
+        const body: unknown = await req.json();
+        return body !== null && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>) : null;
+    } catch {
+        return null;
+    }
+}
+
+type DriveEngine = ControlServerOptions['engine'];
+
+// GET /vfs/children?path=, POST /vfs/hydrate {path}, POST /vfs/rename {from, to, noReplace?}, POST /vfs/delete {path}.
+// Paths are paths of My files, UTF-8 as they are ('' is the top); each answers { ok: true } or 400 { error, code }.
+async function driveRoute(req: Request, route: string, engine: DriveEngine): Promise<Response> {
+    if (route === '/vfs/children') {
+        if (req.method !== 'GET') return driveError(new Error('Method not allowed'), 405);
+        const relPath = new URL(req.url).searchParams.get('path');
+        if (relPath === null) return driveError(new Error('Missing path'));
+        try {
+            return Response.json({ entries: engine.vfsChildren(relPath) });
+        } catch (err) {
+            return driveError(err);
+        }
+    }
+    if (req.method !== 'POST') return driveError(new Error('Method not allowed'), 405);
+    const body = await jsonBody(req);
+    if (!body) return driveError(new Error('Invalid JSON body'));
+    try {
+        switch (route) {
+            case '/vfs/hydrate':
+                if (typeof body.path !== 'string') return driveError(new Error('Missing path'));
+                // Waits for the whole download: the helper gives up after its own limit (30 minutes)
+                await engine.hydrate(body.path);
+                break;
+            case '/vfs/rename':
+                if (typeof body.from !== 'string' || typeof body.to !== 'string') {
+                    return driveError(new Error('Missing from or to'));
+                }
+                if (body.noReplace !== undefined && typeof body.noReplace !== 'boolean') {
+                    return driveError(new Error('noReplace must be true or false'));
+                }
+                await engine.renameItem(body.from, body.to, { noReplace: body.noReplace === true });
+                break;
+            case '/vfs/delete':
+                if (typeof body.path !== 'string') return driveError(new Error('Missing path'));
+                await engine.deleteItem(body.path);
+                break;
+        }
+        return Response.json({ ok: true });
+    } catch (err) {
+        return driveError(err);
+    }
+}
+
+const DRIVE_ROUTES: readonly string[] = ['/vfs/children', '/vfs/hydrate', '/vfs/rename', '/vfs/delete'];
+
 export async function startControlServer(opts: ControlServerOptions): Promise<{ stop(): void }> {
     const { socketPath, engine } = opts;
     const dir = path.dirname(socketPath);
@@ -72,10 +141,18 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
     chmodSync(dir, 0o700);
     await removeStaleSocket(socketPath);
 
+    // Bun closes a connection idle for 10 s by default, and a hydrate waits on its download for as long as it takes
+    // (server.timeout(req, 0) doesn't lift that on a Unix socket); the clients give up by themselves. Bun's types offer
+    // idleTimeout only with a port, but it applies to a Unix socket too.
+    const noIdleTimeout: object = { idleTimeout: 0 };
     const server = Bun.serve({
         unix: socketPath,
+        ...noIdleTimeout,
         async fetch(req) {
             const url = new URL(req.url);
+            if (DRIVE_ROUTES.includes(url.pathname)) {
+                return driveRoute(req, url.pathname, engine);
+            }
             if (url.pathname !== '/availability') {
                 return jsonError('Not found', 404);
             }
