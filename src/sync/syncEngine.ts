@@ -22,9 +22,10 @@ import {
     uploadLocalFileToDrive,
 } from '../sdk/fileOps';
 import { getName } from '../sdk/node';
-import { AvailabilityPolicy } from './availability';
+import { AvailabilityPolicy, type ItemAvailability } from './availability';
 import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
 import { createLocalConflictCopy } from './conflictResolver';
+import { isEngineTempName, removeScannedEntries, scanLocalCopies } from './localCopies';
 import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
 import { entryFromNode, RemoteIndex, type RemoteIndexEntry } from './remoteIndex';
 import type { ConflictRecord, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
@@ -40,6 +41,16 @@ export interface ActiveTransfer {
 
 export type EngineState = 'idle' | 'syncing' | 'paused' | 'unauthenticated' | 'error';
 
+export type AvailabilityAction = 'pin' | 'free' | 'hide' | 'unhide';
+const AVAILABILITY_ACTIONS: readonly string[] = ['pin', 'free', 'hide', 'unhide'] satisfies AvailabilityAction[];
+export interface AvailabilityResult {
+    state: ItemAvailability;
+    // What Free up space left on this computer (things not in Proton Drive yet, or the folders holding them)
+    kept: string[];
+    // Why a hide was refused, or null
+    refused: string | null;
+}
+
 export class ProtonDriveSyncEngine {
     private state: EngineState = 'idle';
     private currentAction: string | null = null;
@@ -53,9 +64,13 @@ export class ProtonDriveSyncEngine {
     private reconcileQueued = false;
     private syncingFolders = new Set<string>();
     private localQueue = new Map<string, Promise<void>>();
-    // Availability changes that remove local copies run one at a time on this chain, and local change handling waits
-    // for them: a deletion seen while the records still exist would read as the user deleting synced files.
+    // Availability changes (setAvailability, and finishing pending hides) run one at a time on this chain, and local
+    // change handling waits for them: a deletion seen while the records still exist would read as the user deleting
+    // synced files.
     private availabilityRun: Promise<void> = Promise.resolve();
+    // How many availability changes were asked for per node uid: a later one supersedes an earlier one on the same item
+    // that is still waiting or running (an unhide stops a hide's removal, a pin stops a free's).
+    private availabilityAsks = new Map<string, number>();
     private readonly index: RemoteIndex;
     private readonly policy: AvailabilityPolicy;
 
@@ -72,7 +87,7 @@ export class ProtonDriveSyncEngine {
             () => this.stateDb.getSettings().syncDir,
             (relPath) =>
                 matchesIgnorePatterns(relPath, this.stateDb.getSettings().ignorePatterns) ||
-                this.policy.hiddenBy(relPath) !== null,
+                this.policy.hiddenBy(relPath)?.hide === 'hidden', // a folder being hidden still uploads its changes
             async (ev) => {
                 await this.handleLocalFileChange(ev.relPath);
             },
@@ -299,6 +314,8 @@ export class ProtonDriveSyncEngine {
             // and in the GUI dashboard immediately instead of waiting for a full tree scan.
             const remoteMap = new Map<string, NodeEntity>();
             await this.reconcileDirectoryIncremental(root, '', remoteMap, this.stateDb.getSettings());
+            // Hides that were waiting for uploads finish once those are done
+            await this.completePendingHides();
 
             this.lastSyncAt = Date.now();
             if (this.syncingFolders.size === 0) {
@@ -334,12 +351,19 @@ export class ProtonDriveSyncEngine {
         settings: SyncSettings,
     ): Promise<void> {
         const localFullPath = path.join(settings.syncDir, relPath);
-        if (this.policy.hiddenBy(relPath)) {
-            return; // Hidden (or being hidden): never downloaded, uploaded or trashed from here
+        const hiddenBy = this.policy.hiddenBy(relPath);
+        if (hiddenBy?.hide === 'hidden') {
+            return; // Hidden: never downloaded, uploaded or trashed from here
         }
+        // Being hidden: its local changes still upload, so the hide can finish, but nothing new comes down and nothing
+        // is trashed
+        const hiding = hiddenBy !== null;
 
         // Case 1: Present remotely, not present locally
         if (remoteNode && !localInfo) {
+            if (hiding) {
+                return;
+            }
             if (dbRecord) {
                 // Was previously synced, so user deleted it locally -> trash remotely. Look again first: the listing
                 // can predate the record being dropped (e.g. by Free up space or Hide) or the item coming back; either
@@ -507,7 +531,9 @@ export class ProtonDriveSyncEngine {
                     const parentNode = await this.ensureParentFolderNode(relPath, remoteMap);
                     await this.uploadLocalToRemote(relPath, localFullPath, parentNode, remoteNode.uid);
                 } else if (!localChangedSinceSync && remoteChangedSinceSync) {
-                    await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath);
+                    if (!hiding) {
+                        await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath);
+                    }
                 } else if (localChangedSinceSync && remoteChangedSinceSync) {
                     await this.handleFileConflict(
                         relPath,
@@ -983,12 +1009,17 @@ export class ProtonDriveSyncEngine {
         if (
             settings.paused ||
             matchesIgnorePatterns(relPath, settings.ignorePatterns) ||
-            this.policy.hiddenBy(relPath) !== null
+            this.policy.hiddenBy(relPath)?.hide === 'hidden'
         ) {
             return;
         }
 
         await this.availabilityRun;
+        // Looked at again: a hide may have finished meanwhile. One still waiting keeps uploading, but trashes nothing.
+        const hiddenBy = this.policy.hiddenBy(relPath);
+        if (hiddenBy?.hide === 'hidden') {
+            return;
+        }
         const existingTask = this.localQueue.get(relPath);
         if (existingTask) {
             await existingTask.catch(() => {});
@@ -1001,7 +1032,7 @@ export class ProtonDriveSyncEngine {
 
             if (!st) {
                 // Local item was deleted
-                if (dbRecord) {
+                if (dbRecord && !hiddenBy) {
                     try {
                         const remoteNode = await this.sdk.getNode(dbRecord.nodeUid);
                         await this.trashForDeletedLocal(relPath, remoteNode);
@@ -1106,6 +1137,350 @@ export class ProtonDriveSyncEngine {
         return this.policy;
     }
 
+    // Pin, free, hide or unhide an item of My files by its path ('' is the whole drive, for pin and free only). The
+    // changes run one at a time on availabilityRun, in the order asked; asking again about the same item supersedes
+    // what is still waiting or running for it. A pin's download runs after its turn, so other changes and local change
+    // handling don't wait for it. Rejects with `Not in Proton Drive: <path>` for a path the remote index doesn't hold.
+    async setAvailability(relPath: string, action: AvailabilityAction): Promise<AvailabilityResult> {
+        if (!AVAILABILITY_ACTIONS.includes(action)) {
+            throw new Error(`Unknown availability action: ${action}`);
+        }
+        if (relPath === '' && (action === 'hide' || action === 'unhide')) {
+            throw new Error(`Can't ${action} the whole of Proton Drive: only pin and free apply to it`);
+        }
+        const asked = this.askAvailability(this.index.getByPath(relPath)?.uid);
+        const pinned: { stillAsked: (() => boolean) | null } = { stillAsked: null };
+        const result = await this.inAvailabilityRun(async () => {
+            const entry = this.index.getByPath(relPath);
+            if (!entry) {
+                throw new Error(`Not in Proton Drive: ${relPath}`);
+            }
+            // The path may lead to another node by now (a move in the cloud); then this ask is about that one
+            const ask = asked && asked.uid === entry.uid ? asked.n : this.askAvailability(entry.uid)!.n;
+            const current = () => this.availabilityAsks.get(entry.uid) === ask;
+            if (!current()) {
+                return this.availabilityResult(relPath); // Asked again since: the later ask decides
+            }
+            switch (action) {
+                case 'pin':
+                    this.stateDb.connection.transaction(() => {
+                        if (relPath === '') {
+                            this.stateDb.deleteMeta(PIN_ROOT_ON_FIRST_SYNC); // An explicit choice wins over the default
+                        }
+                        this.policy.setPin(entry.uid, 'pinned', true);
+                    })();
+                    pinned.stillAsked = current;
+                    return this.availabilityResult(relPath);
+                case 'free':
+                    return this.freeUpSpace(relPath, entry.uid, current);
+                case 'hide':
+                    return this.hide(relPath, entry.uid, current, false);
+                case 'unhide':
+                    return this.unhide(relPath, entry.uid);
+            }
+        });
+        if (!pinned.stillAsked?.()) {
+            return result; // Not a pin, or asked again since (a free, say): no download
+        }
+        await this.downloadPinned(relPath);
+        return this.availabilityResult(relPath);
+    }
+
+    private askAvailability(uid: string | undefined): { uid: string; n: number } | null {
+        if (!uid) {
+            return null;
+        }
+        const n = (this.availabilityAsks.get(uid) ?? 0) + 1;
+        this.availabilityAsks.set(uid, n);
+        return { uid, n };
+    }
+
+    private inAvailabilityRun<T>(step: () => Promise<T>): Promise<T> {
+        const run = this.availabilityRun.then(step);
+        this.availabilityRun = run.then(
+            () => {},
+            () => {},
+        );
+        return run;
+    }
+
+    private availabilityResult(relPath: string, kept: string[] = [], refused: string | null = null): AvailabilityResult {
+        return { state: this.policy.stateOf(relPath), kept, refused };
+    }
+
+    // Drops records for a removal of local copies (each just before its file goes). The records are kept aside so
+    // that one whose file stayed after all, because it changed at the very last moment, can be put back: without it an
+    // edit would read as a conflict on the next sync, which the keep-remote strategy settles by overwriting it.
+    private recordDropper() {
+        const dropped = new Map<string, SyncedItemRecord>();
+        return {
+            drop: (relPath: string) => {
+                const record = this.stateDb.getItemByPath(relPath);
+                if (record) {
+                    dropped.set(relPath, record);
+                }
+                this.stateDb.removeItemByPath(relPath);
+            },
+            putBack: async (stayed: string[]) => {
+                for (const relPath of stayed) {
+                    const record = dropped.get(relPath);
+                    if (record && !this.stateDb.getItemByPath(relPath) && (await this.existsLocally(relPath))) {
+                        this.stateDb.upsertItem(record);
+                    }
+                }
+            },
+        };
+    }
+
+    // Drops the records at or below relPath whose local copies are gone: any of them would read as the user deleting
+    // that item, and trash it in the cloud.
+    private async dropRecordsWithoutFiles(relPath: string): Promise<void> {
+        for (const item of this.stateDb.getItemsUnder(relPath)) {
+            if (!(await this.existsLocally(item.localRelPath))) {
+                this.stateDb.removeItemByPath(item.localRelPath);
+            }
+        }
+    }
+
+    // Brings a just pinned item down now: its folders as plain local folders (online-only in the app) and then the
+    // item, or its whole subtree. It is marked as syncing meanwhile, so the full sync leaves it alone. A failure is
+    // logged; the pin stands and the next sync tries again.
+    private async downloadPinned(relPath: string): Promise<void> {
+        const settings = this.stateDb.getSettings();
+        if (settings.paused || !this.auth.isLoggedIn()) {
+            return; // The next sync brings it down
+        }
+        if (relPath === '') {
+            await this.reconcileNow();
+            return;
+        }
+        this.markFoldersSyncing([relPath]);
+        try {
+            const entry = this.index.getByPath(relPath);
+            if (!entry) {
+                return;
+            }
+            const node = await this.sdk.getNode(entry.uid);
+            for (let slash = relPath.indexOf('/'); slash !== -1; slash = relPath.indexOf('/', slash + 1)) {
+                this.watcher.suppressPath(relPath.slice(0, slash));
+            }
+            const localFullPath = path.join(settings.syncDir, relPath);
+            await mkdir(path.dirname(localFullPath), { recursive: true });
+            const st = await stat(localFullPath).catch(() => null);
+            const localInfo = st
+                ? { isDirectory: st.isDirectory(), size: st.isDirectory() ? 0 : st.size, mtimeMs: st.mtimeMs }
+                : undefined;
+            const remoteMap = new Map<string, NodeEntity>([[relPath, node]]);
+            this.currentAction = `Syncing ${relPath}`;
+            await this.reconcileSinglePath(
+                relPath,
+                node,
+                localInfo,
+                this.stateDb.getItemByPath(relPath) ?? undefined,
+                remoteMap,
+                settings,
+            );
+            const isLocalFolder = await stat(localFullPath).then(
+                (s) => s.isDirectory(),
+                () => false,
+            );
+            if (node.type === NodeType.Folder && isLocalFolder) {
+                await this.reconcileDirectoryIncremental(node, relPath, remoteMap, settings);
+            }
+        } catch (error: unknown) {
+            this.logger.warn(`Could not download ${relPath} now; the next sync tries again: ${error}`);
+        } finally {
+            this.syncingFolders.delete(relPath);
+            if (!this.reconcileRunning && this.syncingFolders.size === 0) {
+                this.currentAction = null;
+                this.state = this.stateDb.getSettings().paused ? 'paused' : 'idle';
+            }
+        }
+    }
+
+    // Free up space: the item becomes online-only, and its local copies go where they are exactly what Proton Drive
+    // holds. Anything else (ignored, not a regular file, new or edited, or changed while this runs) stays, with its
+    // record, and the user is told.
+    private async freeUpSpace(relPath: string, uid: string, current: () => boolean): Promise<AvailabilityResult> {
+        this.stateDb.connection.transaction(() => {
+            if (relPath === '') {
+                this.stateDb.deleteMeta(PIN_ROOT_ON_FIRST_SYNC); // An explicit choice wins over the default
+            }
+            this.policy.setPin(uid, 'unpinned', true);
+        })();
+        const settings = this.stateDb.getSettings();
+        const scan = await scanLocalCopies({
+            syncDir: settings.syncDir,
+            relPath,
+            ignorePatterns: settings.ignorePatterns,
+            stopAtFirst: false,
+            isUnchangedSyncedCopy: (rel, fullPath, st) => this.isUnchangedSyncedCopy(rel, fullPath, st),
+        });
+        if (!current()) {
+            return this.availabilityResult(relPath); // Asked again while it was being looked at: that ask decides
+        }
+        const records = this.recordDropper();
+        const { kept } = await removeScannedEntries({
+            syncDir: settings.syncDir,
+            entries: scan.entries,
+            keep: new Set(scan.localOnly.map((item) => item.relPath)),
+            mode: 'keep-changed',
+            dropRecord: records.drop,
+            shouldContinue: () => current() && !this.policy.isPinned(relPath),
+        });
+        await records.putBack(kept);
+        if (scan.entries.length > kept.length) {
+            this.stateDb.logActivity({
+                action: 'delete-local',
+                localRelPath: relPath || '/',
+                details: 'Freed up space (removed the local copies; kept in Proton Drive)',
+            });
+        }
+        // The kept things themselves, not the folders holding them, and not the engine's own downloads in progress
+        const stayed = kept
+            .filter((p) => !isEngineTempName(path.posix.basename(p)) && !kept.some((q) => q.startsWith(`${p}/`)))
+            .sort();
+        if (stayed.length > 0) {
+            const message = `${stayed.length} item(s) in ${relPath || 'your Proton Drive folder'} stayed on this computer because they aren't in Proton Drive yet (e.g. ${stayed[0]})`;
+            this.stateDb.logActivity({ action: 'sync', localRelPath: relPath || '/', details: message });
+            sendDesktopNotification({
+                title: 'Proton Drive: some items stayed on this computer',
+                body: message,
+                urgency: 'normal',
+                enabled: settings.notificationsEnabled,
+            });
+        }
+        return this.availabilityResult(relPath, kept);
+    }
+
+    // Hide: refused while the item holds something that can never be uploaded (ignored, or not a regular file); waits
+    // as 'hiding' while it holds new or edited files, which keep uploading; otherwise it is flagged hidden and its local
+    // copies go, all or nothing. `rerun` is a pending hide being tried again after a sync.
+    private async hide(
+        relPath: string,
+        uid: string,
+        current: () => boolean,
+        rerun: boolean,
+    ): Promise<AvailabilityResult> {
+        if (this.policy.hiddenBy(relPath)?.hide === 'hidden') {
+            return this.availabilityResult(relPath); // Already hidden, by itself or by a folder above
+        }
+        const settings = this.stateDb.getSettings();
+        const scan = await scanLocalCopies({
+            syncDir: settings.syncDir,
+            relPath,
+            ignorePatterns: settings.ignorePatterns,
+            stopAtFirst: false,
+            isUnchangedSyncedCopy: (rel, fullPath, st) => this.isUnchangedSyncedCopy(rel, fullPath, st),
+        });
+        // Looked at again, as the scan took a while: asked again (an unhide, say), moved, or no longer waiting to be
+        // hidden means it stops here, having changed nothing
+        if (
+            !current() ||
+            this.index.getByUid(uid)?.relPath !== relPath ||
+            (rerun && !this.hasOwnHide(relPath, 'pending'))
+        ) {
+            return this.availabilityResult(relPath);
+        }
+        const blocker = scan.localOnly.find((item) => item.reason !== 'not-in-cloud');
+        if (blocker) {
+            const refused = `Can't hide ${relPath}: ${blocker.relPath} exists only on this computer`;
+            if (this.hasOwnHide(relPath)) {
+                this.policy.setHide(uid, null); // A hide that was waiting can no longer happen
+            }
+            this.stateDb.logActivity({ action: 'error', localRelPath: relPath, details: refused });
+            if (rerun) {
+                sendDesktopNotification({
+                    title: 'Proton Drive: folder not hidden',
+                    body: refused,
+                    urgency: 'normal',
+                    enabled: settings.notificationsEnabled,
+                });
+            }
+            return this.availabilityResult(relPath, [], refused);
+        }
+        if (scan.localOnly.length > 0) {
+            this.policy.setHide(uid, 'pending'); // Waits for the uploads; the sync after them finishes it
+            return this.availabilityResult(relPath);
+        }
+        this.policy.setHide(uid, 'hidden');
+        const records = this.recordDropper();
+        const removal = await removeScannedEntries({
+            syncDir: settings.syncDir,
+            entries: scan.entries,
+            keep: new Set(),
+            mode: 'all-or-nothing',
+            dropRecord: records.drop,
+            shouldContinue: () =>
+                current() && this.index.getByUid(uid)?.relPath === relPath && this.hasOwnHide(relPath, 'hidden'),
+        });
+        await records.putBack(removal.kept);
+        if (!removal.complete) {
+            // Something changed, or it was called off: what is left waits as hiding, and is looked at again later
+            if (this.hasOwnHide(relPath, 'hidden')) {
+                this.policy.setHide(uid, 'pending');
+            }
+            return this.availabilityResult(relPath);
+        }
+        // Its local copy is gone, so no record under it may be left (say, for a file deleted while it was hiding)
+        await this.dropRecordsWithoutFiles(relPath);
+        this.stateDb.logActivity({
+            action: 'delete-local',
+            localRelPath: relPath,
+            details: 'Hidden from this computer (removed the local copy; kept in Proton Drive)',
+        });
+        return this.availabilityResult(relPath);
+    }
+
+    // Whether the item itself (not a folder above it) carries a hide flag, of the given kind if one is given.
+    private hasOwnHide(relPath: string, hide?: 'pending' | 'hidden'): boolean {
+        const hidden = this.policy.hiddenBy(relPath);
+        return hidden !== null && hidden.relPath === relPath && (hide === undefined || hidden.hide === hide);
+    }
+
+    // Unhide: the item comes back online-only. Records whose local copies are gone are dropped first: once the flag is
+    // cleared they would read as the user deleting those files, and trash them in the cloud. Nothing listed it while it
+    // was hidden, so its part of the remote index is read again.
+    private async unhide(relPath: string, uid: string): Promise<AvailabilityResult> {
+        if (!this.hasOwnHide(relPath)) {
+            return this.availabilityResult(relPath); // Not hidden, or hidden by a folder above, which is what to unhide
+        }
+        await this.dropRecordsWithoutFiles(relPath);
+        this.stateDb.connection.transaction(() => {
+            this.policy.setHide(uid, null);
+            if (this.policy.isPinned(relPath)) {
+                this.policy.setPin(uid, 'unpinned', true); // Online-only, even inside a pinned folder
+            }
+        })();
+        try {
+            await this.indexRemoteSubtree(await this.sdk.getNode(uid), relPath);
+        } catch (error: unknown) {
+            this.logger.warn(`Could not read ${relPath} again for the remote index: ${error}`);
+        }
+        return this.availabilityResult(relPath);
+    }
+
+    // Tries again every hide that was waiting for uploads, once a sync has run.
+    private async completePendingHides(): Promise<void> {
+        if (this.policy.pendingHides().length === 0) {
+            return;
+        }
+        await this.inAvailabilityRun(async () => {
+            for (const relPath of this.policy.pendingHides()) {
+                const uid = this.index.getByPath(relPath)?.uid;
+                if (!uid || this.stateDb.getSettings().paused) {
+                    continue;
+                }
+                const ask = this.availabilityAsks.get(uid);
+                try {
+                    await this.hide(relPath, uid, () => this.availabilityAsks.get(uid) === ask, true);
+                } catch (error: unknown) {
+                    this.logger.warn(`Could not finish hiding ${relPath}; trying again after the next sync: ${error}`);
+                }
+            }
+        });
+    }
+
     private async getRootFolder(): Promise<NodeEntity> {
         if (!this.rootNode) {
             this.rootNode = await this.sdk.getMyFilesRootFolder();
@@ -1183,7 +1558,7 @@ export class ProtonDriveSyncEngine {
         if (this.stateDb.getSettings().paused || this.index.getByUid(node.uid)?.relPath !== relPath) {
             return false;
         }
-        if (this.policy.hiddenBy(relPath)) {
+        if (this.policy.hiddenBy(relPath)?.hide === 'hidden') {
             return true;
         }
         let children: NodeEntity[];
@@ -1218,7 +1593,10 @@ export class ProtonDriveSyncEngine {
         if (liveSettings.paused) {
             return;
         }
-        if (prefix && (matchesIgnorePatterns(prefix, liveSettings.ignorePatterns) || this.policy.hiddenBy(prefix))) {
+        if (
+            prefix &&
+            (matchesIgnorePatterns(prefix, liveSettings.ignorePatterns) || this.policy.hiddenBy(prefix)?.hide === 'hidden')
+        ) {
             return;
         }
 
@@ -1287,11 +1665,11 @@ export class ProtonDriveSyncEngine {
             if (matchesIgnorePatterns(relPath, stepSettings.ignorePatterns)) {
                 continue;
             }
-            if (this.policy.hiddenBy(relPath)) {
+            if (this.policy.hiddenBy(relPath)?.hide === 'hidden') {
                 continue; // Skipped entirely: not downloaded, uploaded or trashed, and its listing is not fetched
             }
-            if (!prefix && this.syncingFolders.has(name)) {
-                // Being synced on its own right now; avoid concurrent duplicate work
+            if (this.syncingFolders.has(relPath)) {
+                // Being synced on its own right now (just pinned); avoid concurrent duplicate work
                 continue;
             }
 
@@ -1318,7 +1696,10 @@ export class ProtonDriveSyncEngine {
             if (nextSettings.paused) {
                 return;
             }
-            if (matchesIgnorePatterns(sub.relPath, nextSettings.ignorePatterns) || this.policy.hiddenBy(sub.relPath)) {
+            if (
+                matchesIgnorePatterns(sub.relPath, nextSettings.ignorePatterns) ||
+                this.policy.hiddenBy(sub.relPath)?.hide === 'hidden'
+            ) {
                 continue;
             }
             await this.reconcileDirectoryIncremental(sub.node, sub.relPath, remoteMap, nextSettings);

@@ -26,62 +26,102 @@ export function treeEntrySignature(st: { isFile(): boolean; isDirectory(): boole
     return st.isFile() ? `file:${st.size}:${st.mtimeMs}` : st.isDirectory() ? 'dir' : 'other';
 }
 
-// Walks a folder whose local copy is about to go. It stops at the first item that exists only on this computer, since
-// removing the folder would lose it. Otherwise it returns what it saw, the folder itself first and then in walk order,
-// to remove from.
+// Walks an item whose local copy is about to go (a folder, a single file, or '' for the whole sync folder, which is
+// never itself removed). It notes everything that exists only on this computer, since removing it would lose it:
+// with stopAtFirst it stops at the first such item, otherwise it reports them all (an ignored folder once, without
+// walking into it). It also returns what it saw, the item itself first and then in walk order, to remove from.
 export async function scanLocalCopies(opts: {
     syncDir: string;
     relPath: string;
     ignorePatterns: string[];
+    stopAtFirst: boolean;
     isUnchangedSyncedCopy(relPath: string, fullPath: string, st: Stats): Promise<boolean>;
 }): Promise<{ localOnly: LocalOnlyItem[]; entries: ScanEntry[] }> {
-    const entries: ScanEntry[] = [{ relPath: opts.relPath, signature: 'dir' }];
-    const walk = async (rel: string): Promise<LocalOnlyItem | null> => {
-        for (const entry of await readdir(path.join(opts.syncDir, rel), { withFileTypes: true })) {
-            const relPath = `${rel}/${entry.name}`;
-            const fullPath = path.join(opts.syncDir, relPath);
-            const st = await lstat(fullPath).catch(() => null);
-            if (!st) {
-                continue; // Deleted since the listing
-            }
+    const entries: ScanEntry[] = [];
+    const localOnly: LocalOnlyItem[] = [];
+    // Returns true once the scan should stop
+    const found = (item: LocalOnlyItem) => {
+        localOnly.push(item);
+        return opts.stopAtFirst;
+    };
+    const visit = async (relPath: string): Promise<boolean> => {
+        const fullPath = path.join(opts.syncDir, relPath);
+        const st = await lstat(fullPath).catch(() => null);
+        if (!st) {
+            return false; // Deleted since the listing, or never here
+        }
+        if (relPath !== '') {
             entries.push({ relPath, signature: treeEntrySignature(st) });
-            if (st.isFile() && isEngineTempName(entry.name)) {
-                continue; // Our own in-progress download, safe to drop
+            if (st.isFile() && isEngineTempName(path.posix.basename(relPath))) {
+                return false; // Our own download in progress: removed only while it stays unchanged
             }
             if (matchesIgnorePatterns(relPath, opts.ignorePatterns)) {
-                return { relPath, reason: 'ignored' };
-            }
-            if (st.isDirectory()) {
-                const found = await walk(relPath);
-                if (found) {
-                    return found;
-                }
-            } else if (!st.isFile()) {
-                return { relPath, reason: 'not-a-file' };
-            } else if (!(await opts.isUnchangedSyncedCopy(relPath, fullPath, st))) {
-                return { relPath, reason: 'not-in-cloud' };
+                return found({ relPath, reason: 'ignored' });
             }
         }
-        return null;
+        if (st.isDirectory()) {
+            for (const entry of await readdir(fullPath)) {
+                if (await visit(relPath ? `${relPath}/${entry}` : entry)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (!st.isFile()) {
+            return found({ relPath, reason: 'not-a-file' });
+        }
+        if (!(await opts.isUnchangedSyncedCopy(relPath, fullPath, st))) {
+            return found({ relPath, reason: 'not-in-cloud' });
+        }
+        return false;
     };
-    const found = await walk(opts.relPath);
-    return { localOnly: found ? [found] : [], entries };
+    await visit(opts.relPath);
+    return { localOnly, entries };
 }
 
-// Removes scanned items from the bottom up, touching only what the scan saw and only while it is unchanged, so anything
-// saved meanwhile survives and stops the removal; what is left keeps its records and is looked at again later. Each
-// record is dropped just before its file or folder, so no deletion event can be taken for the user deleting something
-// synced. Nothing is removed recursively. Returns whether everything went.
+// Removes scanned items from the bottom up, touching only what the scan saw and only while it is unchanged. Each
+// record is dropped just before its file or folder (which is looked at once more in between), so no deletion can be
+// taken for the user deleting something synced, and no record outlives its file. A folder's record (which takes the
+// records below it along) goes only once the folder is empty, so things kept inside it keep theirs. Nothing is
+// removed recursively.
+// - 'all-or-nothing' stops at the first item in `keep`, changed since the scan, or not empty; what is left keeps its
+//   records and is looked at again later.
+// - 'keep-changed' leaves those in place and carries on with the rest.
+// `kept` lists what was left in place on purpose; `complete` says whether everything went.
 export async function removeScannedEntries(opts: {
     syncDir: string;
     entries: ScanEntry[];
+    keep: Set<string>;
+    mode: 'all-or-nothing' | 'keep-changed';
     dropRecord(relPath: string): void;
     shouldContinue(): boolean;
-}): Promise<{ complete: boolean }> {
+}): Promise<{ complete: boolean; kept: string[] }> {
+    const kept: string[] = [];
+    const isKept = (relPath: string) => {
+        for (let p = relPath; ; p = p.slice(0, p.lastIndexOf('/'))) {
+            if (opts.keep.has(p)) {
+                return true;
+            }
+            if (!p.includes('/')) {
+                return false;
+            }
+        }
+    };
+    // Returns whether to carry on after leaving an item in place
+    const leave = (relPath: string) => {
+        kept.push(relPath);
+        return opts.mode === 'keep-changed';
+    };
     // Reverse walk order puts everything in a folder before the folder itself
     for (const { relPath, signature } of [...opts.entries].reverse()) {
         if (!opts.shouldContinue()) {
-            return { complete: false }; // Called off: what is left syncs normally
+            return { complete: false, kept }; // Called off: what is left syncs normally
+        }
+        if (isKept(relPath)) {
+            if (opts.keep.has(relPath) && !leave(relPath)) {
+                return { complete: false, kept };
+            }
+            continue;
         }
         const fullPath = path.join(opts.syncDir, relPath);
         const st = await lstat(fullPath).catch(() => null);
@@ -90,14 +130,42 @@ export async function removeScannedEntries(opts: {
             continue;
         }
         if (treeEntrySignature(st) !== signature) {
-            return { complete: false };
+            if (!leave(relPath)) {
+                return { complete: false, kept };
+            }
+            continue;
+        }
+        if (st.isDirectory()) {
+            const inside = await readdir(fullPath).catch(() => null);
+            if (inside === null || inside.length > 0) {
+                // Holds something kept, or something new saved into it meanwhile
+                if (!leave(relPath)) {
+                    return { complete: false, kept };
+                }
+                continue;
+            }
         }
         opts.dropRecord(relPath);
+        // Looked at once more now that its record is gone: a file written to right then stays (the caller can put its
+        // record back)
+        const now = await lstat(fullPath).catch(() => null);
+        if (now && treeEntrySignature(now) !== signature) {
+            if (!leave(relPath)) {
+                return { complete: false, kept };
+            }
+            continue;
+        }
         try {
             await (st.isDirectory() ? rmdir(fullPath) : unlink(fullPath));
-        } catch {
-            return { complete: false }; // A folder that is no longer empty: something new was saved into it
+        } catch (error: unknown) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+                continue; // Gone already
+            }
+            // A folder that is no longer empty: something new was saved into it
+            if (!leave(relPath)) {
+                return { complete: false, kept };
+            }
         }
     }
-    return { complete: true };
+    return { complete: kept.length === 0, kept };
 }

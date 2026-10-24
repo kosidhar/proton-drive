@@ -113,6 +113,29 @@ export function makeMockDrive() {
                 },
             };
         },
+        // A new revision of an existing file (an edit), recorded among the uploads by path
+        getFileRevisionUploader: async (nodeUid: string, metadata: { expectedSha1: string }) => {
+            calls.uploads.push(pathOf(nodeUid));
+            return {
+                uploadFromStream: async (stream: ReadableStream<Uint8Array>) => {
+                    const buf = Buffer.from(await new Response(stream).arrayBuffer());
+                    const current = nodes.get(nodeUid);
+                    if (!current) throw new Error(`Node ${nodeUid} not found`);
+                    nodes.set(
+                        nodeUid,
+                        makeMockNode({
+                            uid: nodeUid,
+                            parentUid: current.parentUid,
+                            nameStr: nameOf(current),
+                            type: NodeType.File,
+                            sha1: metadata.expectedSha1,
+                            content: buf.toString('utf8'),
+                        }),
+                    );
+                    return { completion: async () => ({ nodeUid }) };
+                },
+            };
+        },
         trashNodes: async function* (trash: NodeEntity[]) {
             calls.trashed.push(trash.map((n) => n.uid));
             for (const n of trash) {
