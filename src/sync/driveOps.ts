@@ -11,8 +11,9 @@ export interface VfsEntry {
 
 // The errno a drive operation fails with, for the FUSE helper to return: ENOENT for a path that isn't there, EACCES for
 // a hidden one, EEXIST for a target in the way, EXDEV for a rename that has to be done as copy and delete (an online-only
-// file replacing another), EIO for anything else (a failed download, say)
-export type DriveOpErrorCode = 'ENOENT' | 'EEXIST' | 'EACCES' | 'EIO' | 'EXDEV';
+// file replacing another), ENOTEMPTY for a folder that a delete only if empty (rmdir) finds something in, EIO for
+// anything else (a failed download, say)
+export type DriveOpErrorCode = 'ENOENT' | 'EEXIST' | 'EACCES' | 'EIO' | 'EXDEV' | 'ENOTEMPTY';
 
 export class DriveOpError extends Error {
     constructor(

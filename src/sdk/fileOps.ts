@@ -251,12 +251,7 @@ export async function downloadDriveNodeToLocal(options: {
     if (!revision) {
         throw new Error(`Remote file ${getName(remoteNode)} (${remoteNode.uid}) has no active revision`);
     }
-
     const expectedSha1 = revision.claimedDigests?.sha1;
-    const sha1Verified = Boolean(revision.claimedDigests?.sha1Verified);
-    const expectedSize = revision.claimedSize ?? 0;
-    const claimedMtime = revision.claimedModificationTime ?? remoteNode.modificationTime;
-    const mtimeMs = claimedMtime instanceof Date ? claimedMtime.getTime() : Date.now();
 
     // Check if local file already exists with identical SHA1
     const existingStat = await stat(localPath).catch(() => null);
@@ -276,12 +271,59 @@ export async function downloadDriveNodeToLocal(options: {
     const parentDir = path.dirname(localPath);
     await mkdir(parentDir, { recursive: true });
 
-    // Asked for before the temp file exists (creating the writer creates it), so failing here (offline, say) leaves none
-    const downloader = await sdk.getFileRevisionDownloader(revision.uid);
-
     const tempPath = path.join(parentDir, `.proton-drive-tmp-${process.pid}-${Date.now()}-${path.basename(localPath)}`);
-    const tempFile = Bun.file(tempPath);
-    const writer = tempFile.writer();
+    const downloaded = await downloadRevisionToFile({ sdk, logger, remoteNode, revision, filePath: tempPath, onProgress });
+    try {
+        await rename(tempPath, localPath);
+    } catch (error) {
+        logger.error(`Failed downloading ${getName(remoteNode)} to ${localPath}`, error);
+        await unlink(tempPath).catch(() => {});
+        throw error;
+    }
+    const mtimeDate = new Date(downloaded.mtimeMs);
+    await utimes(localPath, mtimeDate, mtimeDate).catch(() => {});
+
+    const finalStat = await stat(localPath);
+    return {
+        status: 'downloaded',
+        localPath,
+        sha1: downloaded.sha1,
+        size: finalStat.size,
+        mtimeMs: finalStat.mtimeMs,
+    };
+}
+
+// Downloads a revision of a file into exactly `filePath`, a new file it creates, and checks it against the SHA1 the
+// revision claims (when verified), without putting it anywhere: the caller places it. `onStart` is called once the
+// content has started coming. Returns its SHA1 (the claimed one when there is one, as the records keep it), its size,
+// and the modified time the cloud gives it, for the caller to set once it is placed. On any failure the file goes and
+// the error is thrown.
+export async function downloadRevisionToFile(options: {
+    sdk: ProtonDriveClient;
+    logger: Logger;
+    remoteNode: NodeEntity;
+    filePath: string;
+    revision?: Revision;
+    onStart?: () => void;
+    onProgress?: (downloadedBytes: number, totalBytes: number) => void;
+}): Promise<{ sha1: string; size: number; mtimeMs: number }> {
+    const { sdk, logger, remoteNode, filePath, onStart, onProgress } = options;
+    if (isUnsupportedRemoteNode(remoteNode)) {
+        throw new Error(`${getName(remoteNode)} is a Proton Docs or Sheets document, which only opens on the web`);
+    }
+    const revision = options.revision ?? remoteNode.activeRevision;
+    if (!revision) {
+        throw new Error(`Remote file ${getName(remoteNode)} (${remoteNode.uid}) has no active revision`);
+    }
+    const expectedSha1 = revision.claimedDigests?.sha1;
+    const sha1Verified = Boolean(revision.claimedDigests?.sha1Verified);
+    const expectedSize = revision.claimedSize ?? 0;
+    const claimedMtime = revision.claimedModificationTime ?? remoteNode.modificationTime;
+    const mtimeMs = claimedMtime instanceof Date ? claimedMtime.getTime() : Date.now();
+
+    // Asked for before the file exists (creating the writer creates it), so failing here (offline, say) leaves none
+    const downloader = await sdk.getFileRevisionDownloader(revision.uid);
+    const writer = Bun.file(filePath).writer();
 
     const writableStream: WritableStream = {
         // @ts-expect-error Bun FileSink writer compatibility with WritableStream
@@ -291,7 +333,7 @@ export async function downloadDriveNodeToLocal(options: {
         },
         abort: async () => {
             await writer.end();
-            await unlink(tempPath).catch(() => {});
+            await unlink(filePath).catch(() => {});
         },
         locked: false,
     };
@@ -300,39 +342,26 @@ export async function downloadDriveNodeToLocal(options: {
         const controller = downloader.downloadToStream(writableStream, (downloadedBytes) => {
             onProgress?.(downloadedBytes, expectedSize);
         });
+        onStart?.();
         await controller.completion();
         await writer.end();
 
-        if (expectedSha1) {
-            const actualSha1 = await computeLocalFileSha1(tempPath);
-            if (actualSha1 !== expectedSha1 && sha1Verified) {
-                throw new IntegrityError('Downloaded file SHA1 mismatch', {
-                    computedSha1: actualSha1,
-                    expectedSha1,
-                });
-            }
+        const actualSha1 = await computeLocalFileSha1(filePath);
+        if (expectedSha1 && actualSha1 !== expectedSha1 && sha1Verified) {
+            throw new IntegrityError('Downloaded file SHA1 mismatch', {
+                computedSha1: actualSha1,
+                expectedSha1,
+            });
         }
-
-        await rename(tempPath, localPath);
-        const mtimeDate = new Date(mtimeMs);
-        await utimes(localPath, mtimeDate, mtimeDate).catch(() => {});
-
-        const finalStat = await stat(localPath);
-        return {
-            status: 'downloaded',
-            localPath,
-            sha1: expectedSha1 ?? (await computeLocalFileSha1(localPath)),
-            size: finalStat.size,
-            mtimeMs: finalStat.mtimeMs,
-        };
+        return { sha1: expectedSha1 ?? actualSha1, size: (await stat(filePath)).size, mtimeMs };
     } catch (error) {
-        logger.error(`Failed downloading ${getName(remoteNode)} to ${localPath}`, error);
+        logger.error(`Failed downloading ${getName(remoteNode)} to ${filePath}`, error);
         try {
-            await writer.end(); // closes the temp file if the stream left it open
+            await writer.end(); // closes the file if the stream left it open
         } catch {
             // Closed already
         }
-        await unlink(tempPath).catch(() => {});
+        await unlink(filePath).catch(() => {});
         throw error;
     }
 }
