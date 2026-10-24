@@ -1,4 +1,4 @@
-import { type DriveEvent, type NodeEntity, NodeType, type ProtonDriveClient } from '@protontech/drive-sdk';
+import { type DriveEvent, type NodeEntity, NodeType, type ProtonDriveClient, ValidationError } from '@protontech/drive-sdk';
 
 import type { Manager as EventsManager } from '../../src/sdk/events/manager';
 import { makeMockNode } from './mockNodes';
@@ -59,7 +59,7 @@ export function makeMockDrive() {
         getMyFilesRootFolder: async () => root,
         getNode: async (uid: string) => {
             const found = nodes.get(uid);
-            if (!found) throw new Error(`Node ${uid} not found`);
+            if (!found) throw new ValidationError('Item not found'); // as the SDK says it
             return found;
         },
         iterateFolderChildren: async function* (parent: NodeEntity | string) {

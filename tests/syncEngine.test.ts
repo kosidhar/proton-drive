@@ -5,11 +5,13 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import {
+    ConnectionError,
     type DriveEvent,
     DriveEventType,
     type NodeEntity,
     NodeType,
     type ProtonDriveClient,
+    ValidationError,
 } from '@protontech/drive-sdk';
 
 import type { Manager as EventsManager } from '../src/sdk/events/manager';
@@ -109,7 +111,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             getMyFilesRootFolder: async () => rootNode,
             getNode: async (uid: string) => {
                 const found = remoteNodes.get(uid);
-                if (!found) throw new Error(`Node ${uid} not found`);
+                if (!found) throw new ValidationError('Item not found');
                 return found;
             },
             iterateFolderChildren: async function* (parent: NodeEntity | string) {
@@ -249,7 +251,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 getMyFilesRootFolder: async () => rootNode,
                 getNode: async (uid: string) => {
                     const found = remoteNodes.get(uid);
-                    if (!found) throw new Error(`Node ${uid} not found`);
+                    if (!found) throw new ValidationError('Item not found');
                     return found;
                 },
                 iterateFolderChildren: async function* (parent: NodeEntity | string) {
@@ -2291,6 +2293,145 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(await d.files.exists('Archive/old.txt')).toBe(false);
                 d.expectNoTransfers();
                 await d.expectEveryRecordHasItsFile();
+            });
+        }
+
+        // The upload of a new file in the folder finishes after the folder moved: a record at the old path would have no
+        // file, and once that path is in use again it reads as the user deleting the file, which trashes the cloud copy
+        test('a new file still uploading when its folder follows a cloud rename is not recorded at the old path, and renaming back trashes nothing', async () => {
+            const d = setup();
+            d.add('Projects/readme.txt', 'readme');
+            d.engine.availability.setPin(d.add('Projects').uid, 'pinned', false);
+            await d.engine.reconcileNow();
+            // The cloud has taken the new file, but its answer is still on the way back
+            let release!: () => void;
+            const answer = new Promise<void>((resolve) => (release = resolve));
+            let started!: () => void;
+            const uploading = new Promise<void>((resolve) => (started = resolve));
+            const sdk = d.sdk as any;
+            const getFileUploader = sdk.getFileUploader;
+            sdk.getFileUploader = async (...args: unknown[]) => {
+                const uploader = await getFileUploader(...args);
+                return {
+                    uploadFromStream: async (stream: unknown) => {
+                        const result = await uploader.uploadFromStream(stream);
+                        started();
+                        await answer;
+                        return result;
+                    },
+                };
+            };
+            await d.files.writeLocal('Projects/video.mp4', 'only here so far');
+            const localChange: Promise<void> = (d.engine as any).handleLocalFileChange('Projects/video.mp4');
+            await uploading;
+
+            d.moveInCloud('vol~Projects', { name: 'Work' });
+            await d.engine.reconcileNow();
+            expect(await readFile(d.local('Work/video.mp4'), 'utf8')).toBe('only here so far');
+            release();
+            await localChange;
+
+            expect(stateDb.getItemByPath('Projects/video.mp4')).toBeNull();
+            await d.expectEveryRecordHasItsFile();
+            // Renamed back: the folder follows again, and nothing goes to either trash
+            d.moveInCloud('vol~Projects', { name: 'Projects' });
+            await d.engine.reconcileNow();
+            await d.engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.trashed()).toEqual([]);
+            expect(await readFile(d.local('Projects/video.mp4'), 'utf8')).toBe('only here so far');
+            expect(await readFile(d.local('Projects/readme.txt'), 'utf8')).toBe('readme');
+            await d.expectEveryRecordHasItsFile();
+        });
+
+        // Only the cloud saying the item isn't there makes it gone: offline, rate limited or unreadable, it may as well
+        // have moved, and removing it would lose what a later look would have followed
+        test('a move whose cloud lookup fails for another reason than not found is still followed, and nothing is removed', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            d.add('Other/b.txt', 'b');
+            d.engine.availability.setPin(d.root.uid, 'pinned', false);
+            await d.engine.reconcileNow();
+            d.calls.downloads.length = 0;
+            const getNode = d.sdk.getNode.bind(d.sdk);
+            (d.sdk as any).getNode = async (uid: string) => {
+                if (uid === 'vol~Docs/a.txt') throw new ConnectionError('Network unreachable');
+                return getNode(uid);
+            };
+
+            d.moveInCloud('vol~Docs/a.txt', { parentUid: 'vol~Other' });
+            await d.engine.reconcileNow();
+
+            // Left alone where it was, the copy is found from its new path later in the same pass
+            expect(await readFile(d.local('Other/a.txt'), 'utf8')).toBe('a');
+            expect(await d.files.exists('Docs/a.txt')).toBe(false);
+            d.expectNoTransfers();
+            await d.expectEveryRecordHasItsFile();
+            expect(activity()).toContain('Moved locally to follow a rename in Proton Drive: Docs/a.txt → Other/a.txt');
+        });
+
+        test('an item gone from the cloud listing stays while the cloud cannot say where it is, and goes once it says not found', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            d.engine.availability.setPin(d.add('Docs').uid, 'pinned', false);
+            await d.engine.reconcileNow();
+            const getNode = d.sdk.getNode.bind(d.sdk);
+            (d.sdk as any).getNode = async (uid: string) => {
+                if (uid === 'vol~Docs/a.txt') throw new ConnectionError('Network unreachable');
+                return getNode(uid);
+            };
+            d.nodes.delete('vol~Docs/a.txt');
+
+            await d.engine.reconcileNow();
+            expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('a');
+            expect(stateDb.getItemByPath('Docs/a.txt')).not.toBeNull();
+
+            (d.sdk as any).getNode = getNode; // says not found, as the SDK does
+            await d.engine.reconcileNow();
+            expect(await d.files.exists('Docs/a.txt')).toBe(false);
+            expect(stateDb.getItemByPath('Docs/a.txt')).toBeNull();
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.trashed()).toEqual([]);
+        });
+
+        // Something made at the new path in the instant before the move must survive it, and the move is refused:
+        // a-notes.txt sorts before notes.txt, so the pass meets the new name first, x-notes.txt after, so the old one
+        for (const name of ['a-notes.txt', 'x-notes.txt']) {
+            test(`a file made at ${name} just before a cloud rename moves notes.txt there is never replaced`, async () => {
+                const d = setup();
+                d.add('Docs/notes.txt', 'synced version');
+                d.engine.availability.setPin(d.add('Docs').uid, 'pinned', false);
+                await d.engine.reconcileNow();
+                // Made after every look at the new path, just as the move starts
+                const engine = d.engine as any;
+                const whileRemoving = engine.whileRemoving.bind(engine);
+                let madeOnce = false;
+                engine.whileRemoving = (removal: unknown) => {
+                    if (!madeOnce) {
+                        madeOnce = true;
+                        writeFileSync(d.local(`Docs/${name}`), 'made here meanwhile');
+                    }
+                    return whileRemoving(removal);
+                };
+
+                d.moveInCloud('vol~Docs/notes.txt', { name });
+                await d.engine.reconcileNow();
+
+                expect(madeOnce).toBe(true);
+                expect(await readFile(d.local(`Docs/${name}`), 'utf8')).toBe('made here meanwhile');
+                expect(activity().filter((a) => a.startsWith('Moved locally'))).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+                await d.expectEveryRecordHasItsFile();
+                // The next pass meets it as a clash with the cloud file, and keeps it as a conflict copy
+                await d.engine.reconcileNow();
+                const kept: string[] = [];
+                for (const entry of await readdir(d.local('Docs'))) {
+                    if ((await readFile(d.local(`Docs/${entry}`), 'utf8')) === 'made here meanwhile') {
+                        kept.push(entry);
+                    }
+                }
+                expect(kept.length).toBe(1);
+                expect(d.calls.trashed).toEqual([]);
             });
         }
     });

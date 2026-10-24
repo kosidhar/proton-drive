@@ -1,4 +1,4 @@
-import { lstatSync, renameSync } from 'node:fs';
+import { lstatSync } from 'node:fs';
 import { cp, lstat, mkdir, readdir, rename, rm, rmdir, stat, unlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,6 +10,7 @@ import {
     type NodeEntity,
     NodeType,
     type ProtonDriveClient,
+    ValidationError,
 } from '@protontech/drive-sdk';
 
 import { sendDesktopNotification } from '../linux/notifications';
@@ -29,6 +30,7 @@ import { createLocalConflictCopy } from './conflictResolver';
 import { gioTrash, type MoveToDesktopTrash } from './desktopTrash';
 import { readDriveLayout } from './driveMode';
 import { isEngineTempName, removeScannedEntries, type ScanEntry, scanLocalCopies } from './localCopies';
+import { moveWithoutReplacing } from './localMove';
 import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
 import { entryFromNode, RemoteIndex, type RemoteIndexEntry } from './remoteIndex';
 import type { ConflictRecord, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
@@ -87,13 +89,14 @@ export class ProtonDriveSyncEngine {
     // How many availability changes were asked for per node uid: a later one supersedes an earlier one on the same item
     // that is still waiting or running (an unhide stops a hide's removal, a pin stops a free's).
     private availabilityAsks = new Map<string, number>();
-    // Local copies removed by Free up space or Hide (see recordSynced). While a removal runs, the paths it has dropped
-    // records for are in runningRemovals; when it ends they become a batch numbered by localRemovals, the count of
-    // finished removals. A batch is kept while some work that began before it is still running (workSince counts the
-    // running work by the count it began at).
+    // Local copies removed by Free up space, Hide or a cloud delete, or moved away to follow a cloud rename (see
+    // recordSynced). While a removal runs, the paths it has dropped records for, and the subtrees it moved away, are in
+    // runningRemovals; when it ends they become a batch numbered by localRemovals, the count of finished removals. A
+    // batch is kept while some work that began before it is still running (workSince counts the running work by the
+    // count it began at).
     private localRemovals = 0;
-    private runningRemovals = new Set<Set<string>>();
-    private removalBatches: Array<{ n: number; paths: Set<string> }> = [];
+    private runningRemovals = new Set<TakenAway>();
+    private removalBatches: Array<{ n: number; takenAway: TakenAway }> = [];
     private workSince = new Map<number, number>();
     private readonly index: RemoteIndex;
     private readonly policy: AvailabilityPolicy;
@@ -480,6 +483,11 @@ export class ProtonDriveSyncEngine {
                 !isUnsupportedRemoteNode(remoteNode) &&
                 this.policy.isPinned(relPath)
             ) {
+                // Looked at again, as the listing was read a while ago: a download would replace whatever was put here
+                // since (such as what stopped a move here); the next pass syncs it as something on both sides
+                if (await this.existsLocally(relPath)) {
+                    return;
+                }
                 await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
             }
             return;
@@ -1071,21 +1079,25 @@ export class ProtonDriveSyncEngine {
     }
 
     // Writes a sync record for work that began when `since` removals of local copies had finished (see observingLocal).
-    // Work that looked at a file before Free up space or Hide removed it (an upload, a download, a hash) can finish
-    // after the removal, and a record left without its file reads as the user deleting it, which trashes the cloud
-    // copy. So the record is not written for a path:
-    // - whose record a running removal has dropped: its file is about to go;
+    // Work that looked at a file before Free up space, Hide or a cloud delete removed it, or before a cloud rename moved
+    // its folder away (an upload, a download, a hash), can finish after that, and a record left without its file reads
+    // as the user deleting it, which trashes the cloud copy. So the record is not written for a path:
+    // - that a running removal has taken away (dropped its record, or moved away the subtree it is in): its file is
+    //   about to go, or has gone;
     // - that a removal finished since the work began took away, if it is still gone.
     // Anything else is written as usual, a missing file included: that is the user deleting or renaming it while it
     // synced, which the next look at it takes to the cloud. Checked and written with nothing able to run in between.
     private recordSynced(item: Omit<SyncedItemRecord, 'updatedAt'>, since: number): void {
         const relPath = item.localRelPath;
-        for (const dropped of this.runningRemovals) {
-            if (dropped.has(relPath)) {
+        for (const takenAway of this.runningRemovals) {
+            if (isTakenAway(takenAway, relPath)) {
                 return;
             }
         }
-        if (this.removalBatches.some((batch) => batch.n > since && batch.paths.has(relPath)) && !this.localItemExists(relPath)) {
+        if (
+            this.removalBatches.some((batch) => batch.n > since && isTakenAway(batch.takenAway, relPath)) &&
+            !this.localItemExists(relPath)
+        ) {
             return;
         }
         this.stateDb.upsertItem(item);
@@ -1128,18 +1140,23 @@ export class ProtonDriveSyncEngine {
 
     // Runs a removal of local copies. Its `drop` drops a record just before the file goes, noting the path for
     // recordSynced and keeping the record so that one whose file stayed after all can be put back with `putBack`.
+    // `dropSubtree` notes a whole subtree whose local copy moved away, dropping any record left in it (none put back).
     private async whileRemoving<T>(
-        removal: (records: { drop(relPath: string): void; putBack(stayed: string[]): Promise<void> }) => Promise<T>,
+        removal: (records: {
+            drop(relPath: string): void;
+            dropSubtree(relPath: string): void;
+            putBack(stayed: string[]): Promise<void>;
+        }) => Promise<T>,
     ): Promise<T> {
-        const dropped = new Set<string>();
-        this.runningRemovals.add(dropped);
+        const takenAway: TakenAway = { paths: new Set(), subtrees: new Set() };
+        this.runningRemovals.add(takenAway);
         try {
-            return await removal(this.recordDropper(dropped));
+            return await removal(this.recordDropper(takenAway));
         } finally {
-            this.runningRemovals.delete(dropped);
+            this.runningRemovals.delete(takenAway);
             this.localRemovals += 1;
-            if (dropped.size > 0) {
-                this.removalBatches.push({ n: this.localRemovals, paths: dropped });
+            if (takenAway.paths.size > 0 || takenAway.subtrees.size > 0) {
+                this.removalBatches.push({ n: this.localRemovals, takenAway });
             }
             this.pruneRemovalBatches();
         }
@@ -1429,8 +1446,10 @@ export class ProtonDriveSyncEngine {
             return;
         }
         const now = await this.currentRemotePath(record.nodeUid, relPath);
-        if (now === relPath) {
-            return; // The cloud still has it here after all (a listing that missed it): the next pass looks again
+        if (now === undefined || now === relPath) {
+            // The cloud couldn't be asked (offline, say), or still has it here after all (a listing that missed it):
+            // left as it is for the next pass, as removing it could lose what that one would follow
+            return;
         }
         if (now !== null && (await this.followRemoteMove(record.nodeUid, relPath, now))) {
             return;
@@ -1440,8 +1459,9 @@ export class ProtonDriveSyncEngine {
 
     // Where a node is in My files now, for one the listing of `notAt`'s folder no longer shows there: from the remote
     // index, or else from the cloud, as the index drops a node whose old folder was listed before its new one. Null when
-    // it is gone (deleted, trashed or not found), or its folder is one the index doesn't hold.
-    private async currentRemotePath(uid: string, notAt: string): Promise<string | null> {
+    // it is gone (the cloud says it isn't there, or that it is trashed), or its folder is one the index doesn't hold;
+    // undefined when the cloud couldn't say (offline, rate limited, unreadable).
+    private async currentRemotePath(uid: string, notAt: string): Promise<string | null | undefined> {
         const indexed = this.index.getByUid(uid);
         if (indexed && indexed.relPath !== notAt) {
             return indexed.relPath;
@@ -1449,8 +1469,13 @@ export class ProtonDriveSyncEngine {
         let node: NodeEntity;
         try {
             node = await this.sdk.getNode(uid);
-        } catch {
-            return null;
+        } catch (error: unknown) {
+            // The SDK says ValidationError when the API has no such node; failing to load one is another error
+            if (error instanceof ValidationError) {
+                return null;
+            }
+            this.logger.warn(`Could not ask Proton Drive where ${notAt} went; looking again next sync: ${error}`);
+            return undefined;
         }
         const parent = node.parentUid ? this.index.getByUid(node.parentUid) : null;
         if (node.trashTime || !parent || parent.type !== 'folder') {
@@ -1501,15 +1526,13 @@ export class ProtonDriveSyncEngine {
             this.watcher.suppressPath(fromRel);
             this.watcher.suppressPath(toRel);
             const moved = await this.whileRemoving(async (records) => {
-                const oldPaths = this.stateDb.getItemsUnder(fromRel).map((item) => item.localRelPath);
                 // The item and its records move together, with nothing able to run in between: neither path is ever
-                // seen with a record but no file, which reads as the user deleting it. A rename replaces a file already
-                // at the target, so the look for one comes just before it.
+                // seen with a record but no file, which reads as the user deleting it. Something that appeared at toRel
+                // since the look above is never replaced.
                 try {
-                    if (lstatSync(path.join(root, toRel), { throwIfNoEntry: false })) {
+                    if (!moveWithoutReplacing(path.join(root, fromRel), path.join(root, toRel))) {
                         return false;
                     }
-                    renameSync(path.join(root, fromRel), path.join(root, toRel));
                 } catch (error: unknown) {
                     this.logger.warn(`Could not move ${fromRel} to ${toRel} to follow Proton Drive: ${error}`);
                     return false;
@@ -1518,21 +1541,21 @@ export class ProtonDriveSyncEngine {
                     this.stateDb.renameItemPath(fromRel, toRel);
                 } catch (error: unknown) {
                     this.logger.warn(`Could not move the records of ${fromRel} to ${toRel}, so it goes back: ${error}`);
+                    let back = false;
                     try {
-                        renameSync(path.join(root, toRel), path.join(root, fromRel));
+                        back = moveWithoutReplacing(path.join(root, toRel), path.join(root, fromRel));
                     } catch {
+                        // Counts as not back
+                    }
+                    if (!back) {
                         // Stuck at toRel: its records can't stay at fromRel without it, so it syncs from there as new
-                        for (const oldPath of oldPaths) {
-                            records.drop(oldPath);
-                        }
+                        records.dropSubtree(fromRel);
                     }
                     return false;
                 }
-                // Work still under way on the old paths (an upload finishing, say) must not record them again, without
-                // their files
-                for (const oldPath of oldPaths) {
-                    records.drop(oldPath);
-                }
+                // Work still under way anywhere in the old subtree (a new file still uploading, say) must not record its
+                // old path once done: that record would have no file
+                records.dropSubtree(fromRel);
                 return true;
             });
             if (moved) {
@@ -1685,7 +1708,7 @@ export class ProtonDriveSyncEngine {
     // Drops records for a removal of local copies (each just before its file goes). The records are kept aside so
     // that one whose file stayed after all, because it changed at the very last moment, can be put back: without it an
     // edit would read as a conflict on the next sync, which the keep-remote strategy settles by overwriting it.
-    private recordDropper(droppedPaths: Set<string>) {
+    private recordDropper(takenAway: TakenAway) {
         const dropped = new Map<string, SyncedItemRecord>();
         return {
             drop: (relPath: string) => {
@@ -1693,7 +1716,11 @@ export class ProtonDriveSyncEngine {
                 if (record) {
                     dropped.set(relPath, record);
                 }
-                droppedPaths.add(relPath);
+                takenAway.paths.add(relPath);
+                this.stateDb.removeItemByPath(relPath);
+            },
+            dropSubtree: (relPath: string) => {
+                takenAway.subtrees.add(relPath);
                 this.stateDb.removeItemByPath(relPath);
             },
             putBack: async (stayed: string[]) => {
@@ -2204,6 +2231,25 @@ export class ProtonDriveSyncEngine {
             await this.reconcileDirectoryIncremental(sub.node, sub.relPath, remoteMap, nextSettings, since, onlineOnly);
         }
     }
+}
+
+// What one removal of local copies took away: paths whose records it dropped, and whole subtrees it moved away (a move
+// can't list everything in them: an ignored node_modules can be huge).
+interface TakenAway {
+    paths: Set<string>;
+    subtrees: Set<string>;
+}
+
+function isTakenAway(takenAway: TakenAway, relPath: string): boolean {
+    if (takenAway.paths.has(relPath)) {
+        return true;
+    }
+    for (const subtree of takenAway.subtrees) {
+        if (relPath === subtree || relPath.startsWith(`${subtree}/`)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 export function formatBytes(bytes: number): string {
