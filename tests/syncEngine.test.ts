@@ -3997,6 +3997,87 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
         });
 
+        describe("a local file at an online-only file's path", () => {
+            // What the drive shows there is the online-only file, so a file written there (an O_TRUNC open, a truncate,
+            // or a deferred write-open) is the user's edit of it
+            const editThroughTheDrive = async (via: 'pass' | 'watcher', cloudChangedMeanwhile: boolean) => {
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                d.add('Docs/other.txt', 'o');
+                await d.engine.reconcileNow();
+                expect(d.engine.remoteIndex.getByPath('Docs/doc.txt')?.uid).toBe('vol~Docs/doc.txt');
+                expect(d.engine.availability.stateOf('Docs/doc.txt')).toBe('online-only');
+                if (cloudChangedMeanwhile) {
+                    // Another device edits it; the drive still shows the version the index has
+                    const node = d.nodes.get('vol~Docs/doc.txt')!;
+                    d.nodes.set(
+                        node.uid,
+                        makeMockNode({ uid: node.uid, parentUid: node.parentUid, nameStr: 'doc.txt', type: NodeType.File, content: 'theirs' }),
+                    );
+                }
+                await d.files.writeLocal('Docs/doc.txt', 'mine');
+                if (via === 'watcher') {
+                    await (d.engine as any).handleLocalFileChange('Docs');
+                    await (d.engine as any).handleLocalFileChange('Docs/doc.txt');
+                }
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+                return d;
+            };
+            const cloudNamesIn = (d: ReturnType<typeof setup>, parentUid: string) =>
+                [...d.nodes.values()].filter((n) => n.parentUid === parentUid).map((n) => d.nameOf(n)).sort();
+
+            for (const via of ['pass', 'watcher'] as const) {
+                const first = via === 'pass' ? 'a sync pass' : 'the watcher';
+                test(`seen by ${first} first, it uploads as a new revision of that file, with no conflict copy and nothing downloaded`, async () => {
+                    const d = await editThroughTheDrive(via, false);
+
+                    expect(d.named('vol~Docs', 'doc.txt').map((n) => n.uid)).toEqual(['vol~Docs/doc.txt']);
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('mine');
+                    expect(cloudNamesIn(d, 'vol~Docs')).toEqual(['doc.txt', 'other.txt']);
+                    expect(d.calls.uploads).toEqual(['Docs/doc.txt']);
+                    expect(d.calls.downloads).toEqual([]);
+                    expect(d.calls.trashed).toEqual([]);
+                    expect((await readdir(d.local('Docs'))).sort()).toEqual(['doc.txt']);
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('mine');
+                    expect(stateDb.getItemByPath('Docs/doc.txt')?.nodeUid).toBe('vol~Docs/doc.txt');
+                    expect(d.engine.availability.stateOf('Docs/other.txt')).toBe('online-only');
+                });
+
+                test(`seen by ${first} first after another device changed the file, it meets the conflict handling, never overwriting that change`, async () => {
+                    const d = await editThroughTheDrive(via, true);
+
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                    const names = cloudNamesIn(d, 'vol~Docs');
+                    const copy = names.find((n) => n.startsWith('doc (conflict '));
+                    expect(names.length).toBe(3);
+                    expect(copy).toBeDefined();
+                    expect(d.named('vol~Docs', copy!)[0]?.content).toBe('mine');
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
+                    expect(await readFile(d.local(`Docs/${copy}`), 'utf8')).toBe('mine');
+                    expect(d.calls.trashed).toEqual([]);
+                });
+            }
+
+            test('in the plain layout, where the online-only file never showed, a file of that name stays a conflict', async () => {
+                const drive = makeMockDrive();
+                const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger);
+                const files = localFiles(stateDb);
+                drive.add('Docs/doc.txt', 'old');
+                await engine.reconcileNow();
+                expect(engine.availability.stateOf('Docs/doc.txt')).toBe('online-only');
+                await files.writeLocal('Docs/doc.txt', 'mine');
+                await engine.reconcileNow();
+                await engine.reconcileNow();
+
+                expect(drive.nodes.get('vol~Docs/doc.txt')?.content).toBe('old');
+                const names = [...drive.nodes.values()].filter((n) => n.parentUid === 'vol~Docs').map((n) => drive.nameOf(n));
+                expect(names.length).toBe(2);
+                expect(names.some((n) => n.startsWith('doc (conflict '))).toBe(true);
+                expect(await readFile(path.join(files.syncDir(), 'Docs/doc.txt'), 'utf8')).toBe('old');
+            });
+        });
+
         describe('drive operation errors', () => {
             test('renameItem with noReplace refuses an existing target (EEXIST), here or only in Proton Drive, and changes nothing', async () => {
                 const d = setup();
