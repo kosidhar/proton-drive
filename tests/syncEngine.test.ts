@@ -3951,6 +3951,52 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
         });
 
+        describe('saving into an online-only folder', () => {
+            // The drive makes the folder in the backing store to hold a file saved into it: that folder is the cloud's
+            // own, never a new one, and the rest of what is in it stays online-only
+            const saveInto = async (reported: (d: ReturnType<typeof setup>) => Promise<void>) => {
+                const d = setup();
+                d.add('A/x.txt', 'x');
+                d.add('A/y.txt', 'y');
+                d.add('A/Sub/z.txt', 'z');
+                await d.engine.reconcileNow();
+                expect(d.engine.availability.stateOf('A')).toBe('online-only');
+                expect(await d.files.exists('A')).toBe(false);
+
+                await d.files.writeLocal('A/new.txt', 'new');
+                await reported(d);
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+
+                expect(d.named(d.root.uid, 'A').map((n) => n.uid)).toEqual(['vol~A']);
+                const inA = [...d.nodes.values()].filter((n) => n.parentUid === 'vol~A').map((n) => d.nameOf(n));
+                expect(inA.sort()).toEqual(['Sub', 'new.txt', 'x.txt', 'y.txt']);
+                expect(d.named('vol~A', 'new.txt')[0]?.content).toBe('new');
+                expect(d.calls.uploads).toEqual(['A/new.txt']);
+                expect(stateDb.getItemByPath('A')?.nodeUid).toBe('vol~A');
+                expect(d.engine.remoteIndex.getByPath('A')?.uid).toBe('vol~A');
+                expect(d.engine.vfsChildren('A').map((e) => e.name)).toEqual(['Sub', 'new.txt', 'x.txt', 'y.txt']);
+                expect((await readdir(d.local('A'))).sort()).toEqual(['new.txt']);
+                expect(d.engine.availability.stateOf('A/x.txt')).toBe('online-only');
+                expect(d.engine.availability.stateOf('A/Sub')).toBe('online-only');
+                expect(d.calls.downloads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.calls.renamed).toEqual([]);
+                expect(d.calls.moved).toEqual([]);
+            };
+
+            test('a file saved into a folder only Proton Drive has uploads into that folder after a sync pass', async () => {
+                await saveInto(async () => {});
+            });
+
+            test('the watcher reporting the folder made for it, then the file, adopts the cloud folder too', async () => {
+                await saveInto(async (d) => {
+                    await (d.engine as any).handleLocalFileChange('A');
+                    await (d.engine as any).handleLocalFileChange('A/new.txt');
+                });
+            });
+        });
+
         describe('drive operation errors', () => {
             test('renameItem with noReplace refuses an existing target (EEXIST), here or only in Proton Drive, and changes nothing', async () => {
                 const d = setup();

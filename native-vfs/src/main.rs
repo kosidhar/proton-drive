@@ -9,6 +9,7 @@ mod fs;
 mod inodes;
 mod listing;
 mod readers;
+mod trash;
 
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
@@ -100,6 +101,8 @@ fn run() -> i32 {
         return 2;
     }
 
+    // The kernel has already applied the app's umask to what it creates; the helper's own mustn't apply on top
+    unsafe { libc::umask(0) };
     let mut config = Config::default();
     config.mount_options = vec![
         MountOption::FSName("protondrive".into()),

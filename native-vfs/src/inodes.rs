@@ -1,5 +1,6 @@
-// Inode numbers for the paths of the drive. A number stays with its path for the life of the mount and is never
-// given to another path, so the kernel's forget needs no bookkeeping here.
+// Inode numbers for the paths of the drive. A number stays with its item for the life of the mount, following it when
+// it is renamed through the drive, and is never given to another item, so the kernel's forget needs no bookkeeping
+// here.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -37,6 +38,34 @@ impl Inodes {
     pub fn path_of(&self, ino: u64) -> Option<PathBuf> {
         self.by_ino.get(&ino).cloned()
     }
+
+    /// `from` and everything under it now live at `to`, keeping their numbers; whatever had `to`'s numbers was
+    /// replaced, and its numbers go stale.
+    pub fn rename(&mut self, from: &Path, to: &Path) {
+        self.remove(to);
+        let moving: Vec<(PathBuf, u64)> =
+            self.by_path.iter().filter(|(p, _)| p.starts_with(from)).map(|(p, &ino)| (p.clone(), ino)).collect();
+        for (old, ino) in moving {
+            let Ok(rest) = old.strip_prefix(from) else { continue };
+            let new = if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) };
+            self.by_path.remove(&old);
+            self.by_path.insert(new.clone(), ino);
+            self.by_ino.insert(ino, new);
+        }
+    }
+
+    /// `rel` and everything under it are gone: their numbers go stale, and an item made there later gets new ones.
+    pub fn remove(&mut self, rel: &Path) {
+        if rel.as_os_str().is_empty() {
+            return; // the root stays
+        }
+        let gone: Vec<PathBuf> = self.by_path.keys().filter(|p| p.starts_with(rel)).cloned().collect();
+        for path in gone {
+            if let Some(ino) = self.by_path.remove(&path) {
+                self.by_ino.remove(&ino);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -64,5 +93,36 @@ mod tests {
     #[test]
     fn an_unknown_number_has_no_path() {
         assert_eq!(Inodes::new().path_of(42), None);
+    }
+
+    #[test]
+    fn a_rename_carries_the_numbers_of_everything_under_it() {
+        let mut inodes = Inodes::new();
+        let docs = inodes.ino_of(Path::new("Docs"));
+        let deep = inodes.ino_of(Path::new("Docs/Sub/a.txt"));
+        let neighbour = inodes.ino_of(Path::new("Docsx"));
+        inodes.rename(Path::new("Docs"), Path::new("Work"));
+        assert_eq!(inodes.path_of(docs), Some(PathBuf::from("Work")));
+        assert_eq!(inodes.path_of(deep), Some(PathBuf::from("Work/Sub/a.txt")));
+        assert_eq!(inodes.ino_of(Path::new("Work/Sub/a.txt")), deep);
+        assert_eq!(inodes.path_of(neighbour), Some(PathBuf::from("Docsx")), "only whole path components match");
+        assert_ne!(inodes.ino_of(Path::new("Docs")), docs, "the old path is free for a new item");
+    }
+
+    #[test]
+    fn a_replaced_target_and_a_removed_item_go_stale() {
+        let mut inodes = Inodes::new();
+        let tmp = inodes.ino_of(Path::new("doc.txt.tmp"));
+        let doc = inodes.ino_of(Path::new("doc.txt"));
+        inodes.rename(Path::new("doc.txt.tmp"), Path::new("doc.txt"));
+        assert_eq!(inodes.path_of(tmp), Some(PathBuf::from("doc.txt")));
+        assert_eq!(inodes.path_of(doc), None);
+        let sub = inodes.ino_of(Path::new("Docs/a.txt"));
+        inodes.remove(Path::new("Docs"));
+        assert_eq!(inodes.path_of(sub), None);
+        let again = inodes.ino_of(Path::new("Docs/a.txt"));
+        assert!(again != sub && again != doc && again != tmp, "numbers are never reused");
+        inodes.remove(Path::new(""));
+        assert_eq!(inodes.path_of(ROOT_INO), Some(PathBuf::new()));
     }
 }
