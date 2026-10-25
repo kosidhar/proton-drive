@@ -114,7 +114,7 @@ impl Listing {
 #[derive(Clone)]
 enum Handle {
     File(Arc<File>),
-    /// An online-only file opened for writing, not downloaded until something reads or writes through it
+    /// An online-only file opened write-only, not downloaded until something writes through it
     Deferred(Arc<Deferred>),
     VolumeInfo,
     /// A .trashinfo in the trash folder's info/
@@ -123,8 +123,9 @@ enum Handle {
     Dir(Arc<Vec<DirRow>>),
 }
 
-/// An online-only file opened for writing. It is downloaded only when something first reads or writes through it:
-/// truncate(1) opens for writing and then cuts the file to nothing, which needs nothing from the cloud.
+/// An online-only file opened write-only. It is downloaded only when something first writes through it (or cuts it to
+/// a size short of what it is): truncate(1) opens write-only and then cuts the file to nothing, which needs nothing
+/// from the cloud. A write-only open never reads, so the kernel's stale idea of the size can't cut a read short.
 struct Deferred {
     ino: u64,
     flags: i32,
@@ -460,12 +461,13 @@ impl State {
         }
     }
 
-    /// Runs on its own thread: waits for the daemon's download, then opens the file it placed in the backing store.
-    fn hydrate_and_open(&self, ino: u64, tid: u32, rel: PathBuf, reply: ReplyOpen) {
+    /// Runs on its own thread: waits for the daemon's download, then opens the file it placed in the backing store as
+    /// the app asked (read-only, or read-write).
+    fn hydrate_and_open(&self, ino: u64, tid: u32, rel: PathBuf, flags: i32, reply: ReplyOpen) {
         if let Err(errno) = self.hydrate(tid, &rel) {
             return reply.error(errno);
         }
-        match open_backing(&self.backing.join(&rel), libc::O_RDONLY) {
+        match open_backing(&self.backing.join(&rel), flags) {
             Ok(file) => {
                 self.refresh_size(ino);
                 reply.opened(self.add_handle(Handle::File(Arc::new(file))), FopenFlags::empty())
@@ -1047,8 +1049,8 @@ impl Filesystem for DriveFs {
                 if !s.online_entry(parent, name).is_some_and(|e| e.kind == Kind::File) {
                     return reply.error(Errno::ENOENT);
                 }
-                if writing {
-                    // Downloaded by the first read or write through it, if one comes (see Deferred)
+                if flags.acc_mode() == OpenAccMode::O_WRONLY {
+                    // Downloaded by the first write through it, if one comes (see Deferred)
                     let deferred = Deferred {
                         ino: ino.0,
                         flags: flags.0,
@@ -1057,12 +1059,13 @@ impl Filesystem for DriveFs {
                     };
                     return reply.opened(s.add_handle(Handle::Deferred(Arc::new(deferred))), FopenFlags::empty());
                 }
-                // Never on a session thread: the download can take minutes. If the thread can't start, the dropped
-                // reply answers EIO
+                // Read-only or read-write, it is downloaded as it opens, so the first read sees all of it. Never on a
+                // session thread: the download can take minutes. If the thread can't start, the dropped reply answers
+                // EIO
                 let (state, tid) = (self.state.clone(), req.pid());
                 let _ = std::thread::Builder::new()
                     .name("hydrate".into())
-                    .spawn(move || state.hydrate_and_open(ino.0, tid, rel, reply));
+                    .spawn(move || state.hydrate_and_open(ino.0, tid, rel, flags.0, reply));
             }
         }
     }
@@ -1130,7 +1133,7 @@ impl Filesystem for DriveFs {
 
     fn read(
         &self,
-        req: &Request,
+        _req: &Request,
         _ino: INodeNo,
         fh: FileHandle,
         offset: u64,
@@ -1148,13 +1151,7 @@ impl Filesystem for DriveFs {
                 reply.data(&VOLUME_INFO_CONTENT[start..end])
             }
             Some(Handle::TrashInfo(id)) => reply.data(&s.trash.read_info(id, offset, size)),
-            Some(Handle::Deferred(deferred)) => {
-                let tid = req.pid();
-                s.on_worker("download", move |s| match s.settle(fh, &deferred, tid, false) {
-                    Ok(file) => reply_read(&file, offset, size, reply),
-                    Err(errno) => reply.error(errno),
-                });
-            }
+            // A deferred open is write-only
             _ => reply.error(Errno::EBADF),
         }
     }

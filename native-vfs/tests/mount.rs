@@ -796,8 +796,8 @@ fn truncating_an_online_only_file_empties_it_here_without_a_download() {
     // A shell redirect opens with O_TRUNC
     assert_ok(&sh(": > \"$1\"", &[&h.path("redirected.txt")]), "redirect");
     assert_eq!(std::fs::metadata(h.backing.join("redirected.txt")).unwrap().len(), 0);
-    // Opened for writing and closed untouched: nothing to download
-    assert_ok(&sh("exec 3<> \"$1\"", &[&h.path("opened.txt")]), "open read-write");
+    // Opened write-only (for appending, so not truncated) and closed untouched: nothing to download
+    assert_ok(&sh("exec 3>> \"$1\"", &[&h.path("opened.txt")]), "open write-only");
     assert!(!h.backing.join("opened.txt").exists());
     assert_eq!(h.daemon().hydrate_calls(), 0);
     // Cut to a size short of what it is: that part has to come from the cloud first
@@ -1067,4 +1067,25 @@ fn gio_trash_deletes_through_the_daemon_and_leaves_the_trash_empty() {
     let list = run(Command::new("gio").args(["trash", "--list"]));
     let listed = String::from_utf8_lossy(&list.stdout);
     assert!(!listed.contains(h.mountpoint.to_str().unwrap()), "{listed}");
+}
+
+#[test]
+fn a_read_write_open_of_an_online_only_file_downloads_it_whole_at_open() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    // The daemon lists a file without a claimed size as 0
+    h.start_daemon(HashMap::from([("", vec![file("zero.txt", 0), file("short.txt", 5)])]));
+    h.mount();
+
+    for (i, name) in ["zero.txt", "short.txt"].into_iter().enumerate() {
+        // The kernel now holds the listed size
+        assert!(std::fs::metadata(h.path(name)).unwrap().len() < FIXTURE.len() as u64);
+        let mut opened = std::fs::OpenOptions::new().read(true).write(true).open(h.path(name)).unwrap();
+        assert_eq!(h.daemon().hydrate_calls(), i + 1, "{name} is downloaded as it opens");
+        let mut first = Vec::new();
+        opened.read_to_end(&mut first).unwrap();
+        assert_eq!(String::from_utf8_lossy(&first), String::from_utf8_lossy(FIXTURE), "{name}");
+    }
 }
