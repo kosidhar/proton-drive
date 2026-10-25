@@ -54,6 +54,10 @@ function makeFake(rejectWith?: string) {
             if (relPath === 'missing.txt') throw new DriveOpError('ENOENT', `Not found: ${relPath}`);
             if (relPath === 'Full' && opts?.onlyIfEmpty) throw new DriveOpError('ENOTEMPTY', `Not empty: ${relPath}`);
         },
+        async truncateItem(relPath: string): Promise<void> {
+            driveCalls.push(['truncate', relPath]);
+            if (relPath === 'local.txt') throw new DriveOpError('EEXIST', `Already exists: ${relPath}`);
+        },
     };
     return engine;
 }
@@ -210,6 +214,20 @@ describe('drive routes', () => {
         ]);
     });
 
+    test('POST /vfs/truncate passes the path through', async () => {
+        const { socketPath, engine } = await start();
+        const truncated = await post(socketPath, '/vfs/truncate', { path: 'Docs/été.txt' });
+        expect(truncated.status).toBe(200);
+        expect(await truncated.json()).toEqual({ ok: true });
+        const refused = await post(socketPath, '/vfs/truncate', { path: 'local.txt' });
+        expect(refused.status).toBe(400);
+        expect(await refused.json()).toEqual({ error: 'Already exists: local.txt', code: 'EEXIST' });
+        expect(engine.driveCalls).toEqual([
+            ['truncate', 'Docs/été.txt'],
+            ['truncate', 'local.txt'],
+        ]);
+    });
+
     test("an engine error is 400 with its message and code, and any other error is code EIO", async () => {
         const { socketPath } = await start();
         const expectError = async (res: Response, error: string, code: string) => {
@@ -244,6 +262,7 @@ describe('drive routes', () => {
             await post(socketPath, '/vfs/rename', { from: 'a', to: 'b', noReplace: 'yes' }),
             await post(socketPath, '/vfs/delete', { path: 7 }),
             await post(socketPath, '/vfs/delete', { path: 'Full', onlyIfEmpty: 1 }),
+            await post(socketPath, '/vfs/truncate', { path: 3 }),
         ];
         for (const res of bad) {
             expect(res.status).toBe(400);
@@ -253,6 +272,7 @@ describe('drive routes', () => {
         expect((await call(socketPath, '/vfs/hydrate?path=a')).status).toBe(405);
         expect((await call(socketPath, '/vfs/rename')).status).toBe(405);
         expect((await call(socketPath, '/vfs/delete')).status).toBe(405);
+        expect((await call(socketPath, '/vfs/truncate')).status).toBe(405);
         expect((await call(socketPath, '/vfs/elsewhere')).status).toBe(404);
         expect(engine.driveCalls).toEqual([]);
     });

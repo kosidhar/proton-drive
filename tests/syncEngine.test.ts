@@ -3997,9 +3997,18 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
         });
 
-        describe("a local file at an online-only file's path", () => {
-            // What the drive shows there is the online-only file, so a file written there (an O_TRUNC open, a truncate,
-            // or a deferred write-open) is the user's edit of it
+        describe('editing an online-only file through the drive', () => {
+            // The drive turns an online-only file into an empty local one (an O_TRUNC open, a truncate) through POST
+            // /vfs/truncate, which keeps what the drive showed then as the baseline the new content is an edit of
+            const changeInCloud = (d: ReturnType<typeof setup>, uid: string, content: string) => {
+                const node = d.nodes.get(uid)!;
+                d.nodes.set(uid, makeMockNode({ uid, parentUid: node.parentUid, nameStr: d.nameOf(node), type: NodeType.File, content }));
+            };
+            const truncatedAndWritten = async (d: ReturnType<typeof setup>, rel: string, content: string) => {
+                await d.engine.truncateItem(rel);
+                expect(await readFile(d.local(rel), 'utf8')).toBe('');
+                await writeFile(d.local(rel), content);
+            };
             const editThroughTheDrive = async (via: 'pass' | 'watcher', cloudChangedMeanwhile: boolean) => {
                 const d = setup();
                 d.add('Docs/doc.txt', 'old');
@@ -4007,15 +4016,10 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.engine.reconcileNow();
                 expect(d.engine.remoteIndex.getByPath('Docs/doc.txt')?.uid).toBe('vol~Docs/doc.txt');
                 expect(d.engine.availability.stateOf('Docs/doc.txt')).toBe('online-only');
+                await truncatedAndWritten(d, 'Docs/doc.txt', 'mine');
                 if (cloudChangedMeanwhile) {
-                    // Another device edits it; the drive still shows the version the index has
-                    const node = d.nodes.get('vol~Docs/doc.txt')!;
-                    d.nodes.set(
-                        node.uid,
-                        makeMockNode({ uid: node.uid, parentUid: node.parentUid, nameStr: 'doc.txt', type: NodeType.File, content: 'theirs' }),
-                    );
+                    changeInCloud(d, 'vol~Docs/doc.txt', 'theirs'); // another device, after the drive showed it
                 }
-                await d.files.writeLocal('Docs/doc.txt', 'mine');
                 if (via === 'watcher') {
                     await (d.engine as any).handleLocalFileChange('Docs');
                     await (d.engine as any).handleLocalFileChange('Docs/doc.txt');
@@ -4026,6 +4030,16 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             };
             const cloudNamesIn = (d: ReturnType<typeof setup>, parentUid: string) =>
                 [...d.nodes.values()].filter((n) => n.parentUid === parentUid).map((n) => d.nameOf(n)).sort();
+            const expectConflictKeptTheirs = async (d: ReturnType<typeof setup>) => {
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                expect(d.calls.uploads).not.toContain('Docs/doc.txt');
+                const copies = cloudNamesIn(d, 'vol~Docs').filter((n) => n.startsWith('doc (conflict '));
+                expect(copies.length).toBeGreaterThan(0);
+                for (const copy of copies) {
+                    expect(d.named('vol~Docs', copy)[0]?.content).toBe('mine');
+                }
+                expect(d.calls.trashed).toEqual([]);
+            };
 
             for (const via of ['pass', 'watcher'] as const) {
                 const first = via === 'pass' ? 'a sync pass' : 'the watcher';
@@ -4035,29 +4049,192 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(d.named('vol~Docs', 'doc.txt').map((n) => n.uid)).toEqual(['vol~Docs/doc.txt']);
                     expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('mine');
                     expect(cloudNamesIn(d, 'vol~Docs')).toEqual(['doc.txt', 'other.txt']);
-                    expect(d.calls.uploads).toEqual(['Docs/doc.txt']);
+                    expect(d.calls.uploads.filter((u) => u === 'Docs/doc.txt').length).toBeGreaterThan(0);
+                    expect(d.calls.uploads.every((u) => u === 'Docs/doc.txt')).toBe(true);
                     expect(d.calls.downloads).toEqual([]);
                     expect(d.calls.trashed).toEqual([]);
                     expect((await readdir(d.local('Docs'))).sort()).toEqual(['doc.txt']);
                     expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('mine');
                     expect(stateDb.getItemByPath('Docs/doc.txt')?.nodeUid).toBe('vol~Docs/doc.txt');
+                    expect(stateDb.getEditBaseline('Docs/doc.txt')).toBeNull(); // consumed by the record
                     expect(d.engine.availability.stateOf('Docs/other.txt')).toBe('online-only');
                 });
 
                 test(`seen by ${first} first after another device changed the file, it meets the conflict handling, never overwriting that change`, async () => {
                     const d = await editThroughTheDrive(via, true);
 
-                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
-                    const names = cloudNamesIn(d, 'vol~Docs');
-                    const copy = names.find((n) => n.startsWith('doc (conflict '));
-                    expect(names.length).toBe(3);
-                    expect(copy).toBeDefined();
-                    expect(d.named('vol~Docs', copy!)[0]?.content).toBe('mine');
+                    await expectConflictKeptTheirs(d);
                     expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
-                    expect(await readFile(d.local(`Docs/${copy}`), 'utf8')).toBe('mine');
-                    expect(d.calls.trashed).toEqual([]);
+                });
+
+                // Review C1: with the prompt strategy no record is made, and a later pass must still not take the
+                // changed cloud for what the drive showed
+                test(`seen by ${first} first after another device changed the file, with conflicts left to the user, no later pass overwrites that change`, async () => {
+                    stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                    const d = await editThroughTheDrive(via, true);
+
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                    expect(d.calls.uploads).toEqual([]);
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('mine');
+                    expect(stateDb.listConflicts().map((c) => c.localRelPath)).toContain('Docs/doc.txt');
                 });
             }
+
+            test('a keep-both cut short after the conflict copy is made still never overwrites the cloud change', async () => {
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                await d.engine.reconcileNow();
+                await truncatedAndWritten(d, 'Docs/doc.txt', 'mine');
+                changeInCloud(d, 'vol~Docs/doc.txt', 'theirs');
+                d.failNext('getFileRevisionDownloader'); // the conflict copy is made, then the download fails
+
+                await d.engine.reconcileNow();
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+
+                await expectConflictKeptTheirs(d);
+            });
+
+            test('with no checksum in the cloud, what the drive showed is compared by size and time', async () => {
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                d.add('Docs/same.txt', 'same');
+                for (const uid of ['vol~Docs/doc.txt', 'vol~Docs/same.txt']) {
+                    const node = d.nodes.get(uid)!;
+                    d.nodes.set(uid, { ...node, activeRevision: { ...node.activeRevision!, claimedDigests: undefined } } as any);
+                }
+                await d.engine.reconcileNow();
+                expect(d.engine.remoteIndex.getByPath('Docs/doc.txt')?.sha1).toBeNull();
+                await truncatedAndWritten(d, 'Docs/doc.txt', 'mine');
+                await truncatedAndWritten(d, 'Docs/same.txt', 'edited');
+                // Another device writes doc.txt again, still with no checksum: only its size and time changed
+                const node = d.nodes.get('vol~Docs/doc.txt')!;
+                const later = new Date(node.modificationTime.getTime() + 60_000);
+                d.nodes.set('vol~Docs/doc.txt', {
+                    ...node,
+                    content: 'theirs!',
+                    modificationTime: later,
+                    activeRevision: { ...node.activeRevision!, claimedDigests: undefined, claimedModificationTime: later, claimedSize: 7 },
+                } as any);
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs!');
+                expect(d.calls.uploads).not.toContain('Docs/doc.txt');
+                expect(cloudNamesIn(d, 'vol~Docs').some((n) => n.startsWith('doc (conflict '))).toBe(true);
+                // Unchanged by size and time: an edit, as with a checksum
+                expect(d.named('vol~Docs', 'same.txt').map((n) => n.uid)).toEqual(['vol~Docs/same.txt']);
+                expect(d.nodes.get('vol~Docs/same.txt')?.content).toBe('edited');
+            });
+
+            test('with no baseline, a local file where the drive shows an online-only file is a new file: a conflict', async () => {
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                await d.engine.reconcileNow();
+                await d.files.writeLocal('Docs/doc.txt', 'mine'); // made while the daemon was down, say, or a stray merge
+
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('old');
+                expect(cloudNamesIn(d, 'vol~Docs').some((n) => n.startsWith('doc (conflict '))).toBe(true);
+                expect(d.calls.uploads).not.toContain('Docs/doc.txt');
+            });
+
+            test('the baseline follows renames through the drive, goes with deletes, and outlives a restart', async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                d.add('Docs/b.txt', 'b');
+                d.add('Docs/c.txt', 'c');
+                await d.engine.reconcileNow();
+                await truncatedAndWritten(d, 'Docs/a.txt', 'A');
+                await truncatedAndWritten(d, 'Docs/b.txt', 'B');
+                await truncatedAndWritten(d, 'Docs/c.txt', 'C');
+
+                await d.engine.renameItem('Docs/a.txt', 'Docs/a2.txt');
+                await d.engine.replayRemoteOps();
+                expect(stateDb.getEditBaseline('Docs/a.txt')).toBeNull();
+                expect(stateDb.getEditBaseline('Docs/a2.txt')?.nodeUid).toBe('vol~Docs/a.txt');
+                await d.engine.renameItem('Docs', 'Work');
+                await d.engine.replayRemoteOps();
+                expect(stateDb.getEditBaseline('Work/a2.txt')?.nodeUid).toBe('vol~Docs/a.txt');
+                expect(stateDb.getEditBaseline('Work/b.txt')?.nodeUid).toBe('vol~Docs/b.txt');
+                await d.engine.deleteItem('Work/c.txt');
+                expect(stateDb.getEditBaseline('Work/c.txt')).toBeNull();
+
+                const restarted = d.restart();
+                await restarted.replayRemoteOps();
+                await restarted.reconcileNow();
+                await restarted.reconcileNow();
+                expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('A');
+                expect(d.nameOf(d.nodes.get('vol~Docs/a.txt')!)).toBe('a2.txt');
+                expect(d.nodes.get('vol~Docs/b.txt')?.content).toBe('B');
+                expect(cloudNamesIn(d, 'vol~Docs').sort()).toEqual(['a2.txt', 'b.txt']);
+                expect(d.calls.downloads).toEqual([]);
+            });
+
+            test('a baseline whose file is gone is dropped at the next pass', async () => {
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                await d.engine.reconcileNow();
+                await d.engine.truncateItem('Docs/doc.txt');
+                await rm(d.local('Docs/doc.txt'));
+
+                await d.engine.reconcileNow();
+
+                expect(stateDb.getEditBaseline('Docs/doc.txt')).toBeNull();
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('old');
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test('POST /vfs/truncate makes an empty local file of an online-only file only, keeping its baseline', async () => {
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                d.add('Docs/pinned.txt', 'p');
+                d.add('Docs/Sub/x.txt', 'x');
+                d.add('Private/s.txt', 's');
+                await d.engine.reconcileNow();
+                await d.engine.setAvailability('Docs/pinned.txt', 'pin');
+                await d.engine.setAvailability('Private', 'hide');
+                const socketPath = path.join(tempDir, 'sock', 'control.sock');
+                const server = await startControlServer({ socketPath, engine: d.engine });
+                const truncate = async (rel: string) => {
+                    const res = await fetch('http://localhost/vfs/truncate', {
+                        unix: socketPath,
+                        method: 'POST',
+                        body: JSON.stringify({ path: rel }),
+                    } as RequestInit);
+                    return { status: res.status, body: await res.json() };
+                };
+                try {
+                    expect(await truncate('Docs/doc.txt')).toEqual({ status: 200, body: { ok: true } });
+                    expect(await truncate('Docs/doc.txt')).toEqual({
+                        status: 400,
+                        body: { error: 'Already exists: Docs/doc.txt', code: 'EEXIST' },
+                    });
+                    expect(await truncate('Docs/pinned.txt')).toEqual({
+                        status: 400,
+                        body: { error: 'Already exists: Docs/pinned.txt', code: 'EEXIST' },
+                    });
+                    expect(await truncate('Private/s.txt')).toEqual({ status: 400, body: { error: 'Hidden: Private/s.txt', code: 'EACCES' } });
+                    expect(await truncate('Docs/Sub')).toEqual({ status: 400, body: { error: 'Not found: Docs/Sub', code: 'ENOENT' } });
+                    expect(await truncate('Docs/nope.txt')).toEqual({ status: 400, body: { error: 'Not found: Docs/nope.txt', code: 'ENOENT' } });
+                } finally {
+                    server.stop();
+                }
+                expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('');
+                expect(await readFile(d.local('Docs/pinned.txt'), 'utf8')).toBe('p');
+                expect(await d.files.exists('Docs/Sub')).toBe(false);
+                expect(stateDb.getEditBaseline('Docs/doc.txt')).toMatchObject({
+                    nodeUid: 'vol~Docs/doc.txt',
+                    sha1: d.engine.remoteIndex.getByPath('Docs/doc.txt')!.sha1,
+                    size: 3,
+                });
+                expect(stateDb.getEditBaseline('Docs/pinned.txt')).toBeNull();
+                expect(stateDb.getItemByPath('Docs/doc.txt')).toBeNull(); // not a record: gone, it reads as nothing
+                expect(d.calls.downloads).toEqual(['Docs/pinned.txt']);
+            });
 
             test('in the plain layout, where the online-only file never showed, a file of that name stays a conflict', async () => {
                 const drive = makeMockDrive();

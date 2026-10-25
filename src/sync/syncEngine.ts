@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { lstatSync, renameSync, statSync, utimesSync } from 'node:fs';
-import { cp, lstat, mkdir, readdir, rename, rm, rmdir, stat, unlink } from 'node:fs/promises';
+import { cp, lstat, mkdir, readdir, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -29,7 +29,7 @@ import {
     listFolderChildren,
     uploadLocalFileToDrive,
 } from '../sdk/fileOps';
-import { getName } from '../sdk/node';
+import { getClaimedSize, getName } from '../sdk/node';
 import { AvailabilityPolicy, type ItemAvailability } from './availability';
 import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
 import { createLocalConflictCopy, formatConflictFileName } from './conflictResolver';
@@ -41,7 +41,7 @@ import { moveWithoutReplacing } from './localMove';
 import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
 import { entryFromNode, RemoteIndex, type RemoteIndexEntry } from './remoteIndex';
 import { type RemoteOp, RemoteOpsJournal } from './remoteOps';
-import type { ConflictRecord, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
+import type { ConflictRecord, EditBaseline, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
 import { forgetFailedThumbnail } from './thumbnailCache';
 
 export { DriveOpError, type DriveOpErrorCode, type VfsEntry } from './driveOps';
@@ -174,38 +174,20 @@ export class ProtonDriveSyncEngine {
             : this.stateDb.getSettings().syncDir;
     }
 
-    private inVirtualLayout(): boolean {
-        return readDriveLayout(this.stateDb) === 'virtual' && Boolean(this.options.backingDir);
-    }
-
-    // In the virtual layout the drive shows an online-only file wherever the index has one, so a local file with no
-    // record at its path (an O_TRUNC open or a truncate through the drive leaves one there) is the user's edit of the
-    // file shown: that index entry, or null. Never in the plain layout, where the user never saw it.
-    private shownOnlineOnlyFile(relPath: string, entry: RemoteIndexEntry | null | undefined): RemoteIndexEntry | null {
-        if (!entry || entry.type !== 'file' || isProvisional(entry.uid) || !this.inVirtualLayout()) {
-            return null;
-        }
-        const ignorePatterns = this.stateDb.getSettings().ignorePatterns;
-        if (matchesIgnorePatterns(relPath, ignorePatterns) || this.policy.hiddenBy(relPath) !== null) {
-            return null;
-        }
-        return this.stateDb.getItemByPath(relPath) ? null : entry;
-    }
-
-    // The node an index entry stands for, if Proton Drive still has it where the entry says; null when it doesn't (gone
-    // or moved). A network failure isn't an answer: it throws.
-    private async nodeStillAt(entry: RemoteIndexEntry): Promise<NodeEntity | null> {
+    // The node a drive edit baseline stands for, if Proton Drive still has it where the drive showed it; null when it
+    // doesn't (gone or moved). A network failure isn't an answer: it throws.
+    private async nodeStillAt(baseline: EditBaseline): Promise<NodeEntity | null> {
         let node: NodeEntity;
         try {
-            node = await this.sdk.getNode(entry.uid);
+            node = await this.sdk.getNode(baseline.nodeUid);
         } catch (error: unknown) {
             if (isTransient(error)) {
                 throw error;
             }
             return null;
         }
-        const there = !node.trashTime && node.type === NodeType.File && node.parentUid === entry.parentUid;
-        return there && getName(node) === entry.name ? node : null;
+        const there = !node.trashTime && node.type === NodeType.File && node.parentUid === baseline.parentUid;
+        return there && getName(node) === path.posix.basename(baseline.relPath) ? node : null;
     }
 
     getStatus() {
@@ -438,6 +420,7 @@ export class ProtonDriveSyncEngine {
                     this.stateDb.deleteMeta(PIN_ROOT_ON_FIRST_SYNC);
                 })();
             }
+            await this.inAvailabilityRun(async () => this.dropStaleEditBaselines());
             // Changes made through the drive reach Proton Drive before the pass looks at it
             await this.runReplay();
 
@@ -495,7 +478,6 @@ export class ProtonDriveSyncEngine {
         remoteMap: Map<string, NodeEntity>,
         settings: SyncSettings,
         since: number,
-        shown?: RemoteIndexEntry,
     ): Promise<void> {
         if (this.awaitsRemoteOp(relPath, remoteNode?.uid)) {
             return; // A rename, move or delete through the drive is on its way to Proton Drive: looked at once it is there
@@ -700,13 +682,15 @@ export class ProtonDriveSyncEngine {
                     return;
                 }
 
-                // With no record, in the virtual layout, the online-only file the drive showed here is what it is an
-                // edit of: a new revision of it if the cloud still has that, the conflict handling if the cloud changed
-                const shownFile = dbRecord ? null : this.shownOnlineOnlyFile(relPath, shown);
-                const baseline =
-                    dbRecord ?? (shownFile?.uid === remoteNode.uid ? recordFromIndexEntry(shownFile, relPath) : undefined);
-                const localChangedSinceSync = !baseline || localSha1 !== baseline.localSha1;
-                const remoteChangedSinceSync = !baseline || remoteSha1 !== baseline.remoteSha1;
+                // With no record, a file the drive turned from online-only into local (POST /vfs/truncate) is an edit
+                // of the version the drive showed then: a new revision of it if the cloud still has that, the conflict
+                // handling if the cloud changed since or has another node there. Without a baseline it is a new file.
+                const edit = dbRecord ? null : this.stateDb.getEditBaseline(relPath);
+                const editOfThis = edit?.nodeUid === remoteNode.uid ? edit : null;
+                const localChangedSinceSync = !dbRecord || localSha1 !== dbRecord.localSha1;
+                const remoteChangedSinceSync = dbRecord
+                    ? remoteSha1 !== dbRecord.remoteSha1
+                    : !editOfThis || cloudChangedSince(editOfThis, remoteSha1, remoteMtimeMs, getClaimedSize(remoteNode) ?? 0);
 
                 if (localChangedSinceSync && !remoteChangedSinceSync) {
                     const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
@@ -1444,13 +1428,13 @@ export class ProtonDriveSyncEngine {
                     void this.replayRemoteOps(); // A move into it may have been waiting for it
                 }
             } else if (st.isFile()) {
-                const shown = dbRecord ? null : this.shownOnlineOnlyFile(relPath, this.liveIndexEntry(relPath));
-                const shownNode = shown ? await this.nodeStillAt(shown) : null;
-                if (shown && shownNode) {
+                const edit = dbRecord ? null : this.stateDb.getEditBaseline(relPath);
+                const edited = edit ? await this.nodeStillAt(edit) : null;
+                if (edited) {
                     // An edit of the online-only file the drive showed: decided as a sync pass decides it
                     const localInfo = { isDirectory: false, size: st.size, mtimeMs: st.mtimeMs };
                     const now = this.stateDb.getSettings();
-                    await this.reconcileSinglePath(relPath, shownNode, localInfo, undefined, remoteMap, now, since, shown);
+                    await this.reconcileSinglePath(relPath, edited, localInfo, undefined, remoteMap, now, since);
                 } else {
                     await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, dbRecord?.nodeUid);
                 }
@@ -1866,6 +1850,61 @@ export class ProtonDriveSyncEngine {
         }
         await this.inAvailabilityRun(() => this.deleteLocally(rel, opts.onlyIfEmpty === true));
         void this.replayRemoteOps();
+    }
+
+    // Turns an online-only file into an empty local one for the virtual drive (an app opened it with O_TRUNC, or cut it
+    // to nothing), downloading nothing. What the drive showed of it, its index entry, is kept as the baseline that the
+    // file's new content is an edit of (see EditBaseline): a new revision of that node while the cloud still has that
+    // version, the conflict handling once it doesn't. The empty file is never put over anything that appeared meanwhile.
+    // Rejects with a DriveOpError: `Not found: <path>` (ENOENT) for anything but an online-only file, `Hidden: <path>`
+    // (EACCES), `Already exists: <path>` (EEXIST) when it is on this computer; or with `Invalid path: <path>`.
+    async truncateItem(relPath: string): Promise<void> {
+        const rel = normalizeDrivePath(relPath);
+        await this.inAvailabilityRun(() => this.truncateLocally(rel));
+    }
+
+    private async truncateLocally(rel: string): Promise<void> {
+        if (rel !== '' && this.policy.hiddenBy(rel) !== null) {
+            throw new DriveOpError('EACCES', `Hidden: ${rel}`);
+        }
+        const fullPath = path.join(this.localRoot(), rel);
+        if (rel !== '' && lstatSync(fullPath, { throwIfNoEntry: false })) {
+            throw new DriveOpError('EEXIST', `Already exists: ${rel}`);
+        }
+        const ignored = matchesIgnorePatterns(rel, this.stateDb.getSettings().ignorePatterns);
+        const entry = rel === '' || ignored ? null : this.liveIndexEntry(rel);
+        if (!entry || entry.type !== 'file' || isProvisional(entry.uid)) {
+            throw new DriveOpError('ENOENT', `Not found: ${rel}`);
+        }
+        await mkdir(path.dirname(fullPath), { recursive: true });
+        // First, so that whoever sees the file (the watcher, a pass) finds what it is an edit of
+        this.stateDb.recordEditBaseline({
+            relPath: rel,
+            nodeUid: entry.uid,
+            parentUid: entry.parentUid,
+            sha1: entry.sha1,
+            mtimeMs: entry.mtimeMs,
+            size: entry.size,
+        });
+        try {
+            await writeFile(fullPath, '', { flag: 'wx' });
+        } catch (error: unknown) {
+            this.stateDb.dropEditBaselines(rel);
+            if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+                throw new DriveOpError('EEXIST', `Already exists: ${rel}`, { cause: error });
+            }
+            throw error;
+        }
+    }
+
+    // A baseline whose file has gone (deleted outside the drive, say) stands for nothing any more: a file put there later
+    // is a new one. Takes its turn on availabilityRun, so it never races truncateItem.
+    private dropStaleEditBaselines(): void {
+        for (const baseline of this.stateDb.listEditBaselines()) {
+            if (!this.localItemExists(baseline.relPath)) {
+                this.stateDb.dropEditBaselines(baseline.relPath);
+            }
+        }
     }
 
     // A folder's listing for the virtual drive: what the remote index holds in it, as this computer sees it, online-only
@@ -2377,6 +2416,13 @@ export class ProtonDriveSyncEngine {
                 if (source) {
                     this.moveLocalOrUndo(fromRel, toRel, replacing, snapshot);
                 }
+                // An edit baseline follows its file, unless the file now stands for the target (its record) or leaves
+                // what is synced
+                if (keepsTarget || ignoredTo) {
+                    this.stateDb.dropEditBaselines(fromRel);
+                } else {
+                    this.stateDb.moveEditBaselines(fromRel, toRel);
+                }
                 // Work still under way anywhere in the old subtree (an upload, say) must not record its old path once
                 // done; a node it makes follows the item (see adoptStrayNode)
                 records.dropSubtree(fromRel);
@@ -2421,6 +2467,7 @@ export class ProtonDriveSyncEngine {
                 // their files
                 this.stateDb.connection.transaction(() => {
                     records.dropSubtree(relPath);
+                    this.stateDb.dropEditBaselines(relPath);
                     if (entry) {
                         this.index.removeSubtree(entry.uid);
                     }
@@ -3724,10 +3771,6 @@ export class ProtonDriveSyncEngine {
 
         this.currentAction = `Listing /my-files/${prefix || ''}`;
         const remoteChildren = await listFolderChildren(this.sdk, folderNode);
-        // What the drive showed in the folder until this listing, which replaces it (see shownOnlineOnlyFile)
-        const shownBefore = new Map(
-            this.inVirtualLayout() ? this.index.listChildren(prefix).map((entry) => [entry.name, entry]) : [],
-        );
         // Record the whole listing (ignored children too) before any child is reconciled
         this.recordListing(folderNode, prefix, remoteChildren);
         const freshSettings = this.stateDb.getSettings();
@@ -3803,8 +3846,7 @@ export class ProtonDriveSyncEngine {
             const localChild = localChildByName.get(name);
             const dbRecord = dbChildByName.get(name);
 
-            const shown = shownBefore.get(name);
-            await this.reconcileSinglePath(relPath, remoteChild, localChild, dbRecord, remoteMap, stepSettings, since, shown);
+            await this.reconcileSinglePath(relPath, remoteChild, localChild, dbRecord, remoteMap, stepSettings, since);
 
             const resolvedFolderNode = remoteMap.get(relPath) ?? remoteChild;
             const localStillExists = await stat(path.join(this.localRoot(), relPath))
@@ -3913,6 +3955,15 @@ function messageOf(error: unknown): string {
 // The network or the server, which a later try may get past (a rate limit is a ServerError too)
 function isTransient(error: unknown): boolean {
     return error instanceof ConnectionError || error instanceof AbortError || error instanceof ServerError;
+}
+
+// Whether the cloud's file has changed since the drive showed it. Two missing checksums don't make it the same: then its
+// time and size must match too.
+function cloudChangedSince(edit: EditBaseline, sha1: string | null, mtimeMs: number, size: number): boolean {
+    if (edit.sha1 !== null) {
+        return sha1 !== edit.sha1;
+    }
+    return sha1 !== null || mtimeMs !== edit.mtimeMs || size !== edit.size;
 }
 
 // A record for a file only the remote index knows (online-only), as replaced through the drive: its node, and what the

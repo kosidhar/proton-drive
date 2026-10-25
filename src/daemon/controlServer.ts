@@ -24,7 +24,7 @@ export interface ControlServerOptions {
     socketPath: string;
     engine: Pick<
         ProtonDriveSyncEngine,
-        'setAvailability' | 'availabilityOf' | 'vfsChildren' | 'hydrate' | 'renameItem' | 'deleteItem'
+        'setAvailability' | 'availabilityOf' | 'vfsChildren' | 'hydrate' | 'renameItem' | 'deleteItem' | 'truncateItem'
     >;
 }
 
@@ -90,8 +90,9 @@ async function jsonBody(req: Request): Promise<Record<string, unknown> | null> {
 type DriveEngine = ControlServerOptions['engine'];
 
 // GET /vfs/children?path=, POST /vfs/hydrate {path}, POST /vfs/rename {from, to, noReplace?}, POST /vfs/delete {path,
-// onlyIfEmpty?} (onlyIfEmpty is rmdir). Paths are paths of My files, UTF-8 as they are ('' is the top); each answers
-// { entries } or { ok: true }, or 400 { error, code }.
+// onlyIfEmpty?} (onlyIfEmpty is rmdir), POST /vfs/truncate {path} (an online-only file made an empty local one). Paths
+// are paths of My files, UTF-8 as they are ('' is the top); each answers { entries } or { ok: true }, or 400 { error,
+// code }.
 async function driveRoute(req: Request, route: string, engine: DriveEngine): Promise<Response> {
     if (route === '/vfs/children') {
         if (req.method !== 'GET') return driveError(new Error('Method not allowed'), 405);
@@ -129,6 +130,10 @@ async function driveRoute(req: Request, route: string, engine: DriveEngine): Pro
                 }
                 await engine.deleteItem(body.path, { onlyIfEmpty: body.onlyIfEmpty === true });
                 break;
+            case '/vfs/truncate':
+                if (typeof body.path !== 'string') return driveError(new Error('Missing path'));
+                await engine.truncateItem(body.path);
+                break;
         }
         return Response.json({ ok: true });
     } catch (err) {
@@ -136,7 +141,7 @@ async function driveRoute(req: Request, route: string, engine: DriveEngine): Pro
     }
 }
 
-const DRIVE_ROUTES: readonly string[] = ['/vfs/children', '/vfs/hydrate', '/vfs/rename', '/vfs/delete'];
+const DRIVE_ROUTES: readonly string[] = ['/vfs/children', '/vfs/hydrate', '/vfs/rename', '/vfs/delete', '/vfs/truncate'];
 
 export async function startControlServer(opts: ControlServerOptions): Promise<{ stop(): void }> {
     const { socketPath, engine } = opts;

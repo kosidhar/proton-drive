@@ -22,6 +22,19 @@ export interface SyncedItemRecord {
     updatedAt: number;
 }
 
+// What the virtual drive showed of an online-only file when it turned it into a local one (POST /vfs/truncate): the
+// local file's content is an edit of that version of that node. Kept apart from the records, so a file that goes away
+// never reads as the user deleting something synced.
+export interface EditBaseline {
+    relPath: string;
+    nodeUid: string;
+    parentUid: string | null;
+    sha1: string | null;
+    mtimeMs: number;
+    size: number;
+    createdAt: number;
+}
+
 export interface ConflictRecord {
     id: number;
     localRelPath: string;
@@ -135,6 +148,18 @@ export class SyncStateDatabase {
                 value TEXT NOT NULL
             )
         `);
+
+        this.db.run(`
+            CREATE TABLE IF NOT EXISTS drive_edit_baselines (
+                relPath TEXT PRIMARY KEY,
+                nodeUid TEXT NOT NULL,
+                parentUid TEXT,
+                sha1 TEXT,
+                mtimeMs INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                createdAt INTEGER NOT NULL
+            )
+        `);
     }
 
     getSettings(): SyncSettings {
@@ -198,8 +223,10 @@ export class SyncStateDatabase {
         }
     }
 
+    // A record written for a path consumes the edit baseline there: the record is what it syncs by from then on
     upsertItem(item: Omit<SyncedItemRecord, 'updatedAt'> & { updatedAt?: number }): void {
         const updatedAt = item.updatedAt ?? Date.now();
+        this.db.query('DELETE FROM drive_edit_baselines WHERE relPath = $relPath').run({ $relPath: item.localRelPath });
         this.db
             .query(`
                 INSERT OR REPLACE INTO synced_items (
@@ -283,6 +310,53 @@ export class SyncStateDatabase {
                      WHERE ${selfOrDescendantWhere('localRelPath')}`,
                 )
                 .run({ $toRel: toRel, $fromRel: fromRel, $updatedAt: Date.now(), ...selfOrDescendant(fromRel) });
+        })();
+    }
+
+    recordEditBaseline(baseline: Omit<EditBaseline, 'createdAt'>): void {
+        this.db
+            .query(
+                `INSERT OR REPLACE INTO drive_edit_baselines (relPath, nodeUid, parentUid, sha1, mtimeMs, size, createdAt)
+                 VALUES ($relPath, $nodeUid, $parentUid, $sha1, $mtimeMs, $size, $createdAt)`,
+            )
+            .run({
+                $relPath: baseline.relPath,
+                $nodeUid: baseline.nodeUid,
+                $parentUid: baseline.parentUid,
+                $sha1: baseline.sha1,
+                $mtimeMs: Math.round(baseline.mtimeMs),
+                $size: baseline.size,
+                $createdAt: Date.now(),
+            });
+    }
+
+    getEditBaseline(relPath: string): EditBaseline | null {
+        const row = this.db.query('SELECT * FROM drive_edit_baselines WHERE relPath = $relPath').get({ $relPath: relPath });
+        return (row as EditBaseline | null) ?? null;
+    }
+
+    listEditBaselines(): EditBaseline[] {
+        return this.db.query('SELECT * FROM drive_edit_baselines ORDER BY relPath ASC').all() as EditBaseline[];
+    }
+
+    // The baselines at a path and under it
+    dropEditBaselines(relPath: string): void {
+        this.db.query(`DELETE FROM drive_edit_baselines WHERE ${selfOrDescendantWhere('relPath')}`).run(selfOrDescendant(relPath));
+    }
+
+    // The baselines at a path and under it now go with what is at toRel; any that were there go
+    moveEditBaselines(fromRel: string, toRel: string): void {
+        if (fromRel === toRel) {
+            return;
+        }
+        this.db.transaction(() => {
+            this.dropEditBaselines(toRel);
+            this.db
+                .query(
+                    `UPDATE drive_edit_baselines SET relPath = $toRel || substr(relPath, length($fromRel) + 1)
+                     WHERE ${selfOrDescendantWhere('relPath')}`,
+                )
+                .run({ $toRel: toRel, $fromRel: fromRel, ...selfOrDescendant(fromRel) });
         })();
     }
 
