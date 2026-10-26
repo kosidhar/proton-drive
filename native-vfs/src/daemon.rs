@@ -1,6 +1,7 @@
 // The daemon's drive routes, over HTTP/1.1 on its user-only control socket (the same client shape as the GUI's
-// control_request): GET /vfs/children for listings, POST /vfs/hydrate to download a file an app opened, and POST
-// /vfs/rename and /vfs/delete for renames and deletes through the drive, which the daemon carries out whole.
+// control_request): GET /vfs/children for listings, POST /vfs/hydrate to download a file an app opened, POST
+// /vfs/truncate to make an online-only file an empty local one, and POST /vfs/rename and /vfs/delete for renames and
+// deletes through the drive, which the daemon carries out whole.
 
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -17,7 +18,8 @@ use crate::listing::{Entry, Kind};
 pub const CHILDREN_TIMEOUT: Duration = Duration::from_secs(3);
 /// A download for an open completes or fails within 30 minutes.
 pub const HYDRATE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-/// A rename or delete waits its turn in the daemon's queue, but changes only this computer: no network.
+/// A rename, delete or truncate waits its turn in the daemon's queue, but changes only this computer: no network. One
+/// that takes longer still happens in the daemon afterwards (nothing cancels it), though the app has been told EIO.
 pub const CHANGE_TIMEOUT: Duration = Duration::from_secs(60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// A daemon whose connection backlog stays full this long isn't serving.
@@ -28,6 +30,16 @@ const INTERRUPT_CHECK: Duration = Duration::from_millis(500);
 const LISTING_BACKOFF: Duration = Duration::from_secs(5);
 /// Listing problems go to stderr at most this often.
 const LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// What a delete through the drive is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Removal {
+    Unlink,
+    /// Only a folder that holds nothing, here or in the cloud
+    Rmdir,
+    /// A Move to Trash: what exists only on this computer goes to the desktop Trash rather than away
+    Trash,
+}
 
 /// What a route failed with: the errno to give the kernel, and why.
 #[derive(Debug, PartialEq, Eq)]
@@ -118,14 +130,23 @@ impl DaemonClient {
         self.request("POST", "/vfs/rename", Some(&body), CHANGE_TIMEOUT, &|| false).map(|_| ())
     }
 
-    /// Deletes an item of the drive, everything in it included, and moves it to the cloud's trash later on. With
-    /// `only_if_empty` (rmdir), a folder holding anything, here or in the cloud, refuses it with ENOTEMPTY.
-    pub fn delete(&self, rel: &str, only_if_empty: bool) -> Result<(), DaemonError> {
+    /// Deletes an item of the drive, everything in it included, and moves it to the cloud's trash later on. An rmdir
+    /// of a folder holding anything, here or in the cloud, is refused with ENOTEMPTY.
+    pub fn delete(&self, rel: &str, removal: Removal) -> Result<(), DaemonError> {
         let mut body = serde_json::json!({ "path": rel });
-        if only_if_empty {
-            body["onlyIfEmpty"] = serde_json::Value::Bool(true);
+        match removal {
+            Removal::Unlink => {}
+            Removal::Rmdir => body["onlyIfEmpty"] = serde_json::Value::Bool(true),
+            Removal::Trash => body["trash"] = serde_json::Value::Bool(true),
         }
         self.request("POST", "/vfs/delete", Some(&body), CHANGE_TIMEOUT, &|| false).map(|_| ())
+    }
+
+    /// Makes an online-only file an empty local one, with nothing downloaded; the daemon keeps what the drive showed
+    /// of it as what its new content is an edit of. EEXIST when it is on this computer already.
+    pub fn truncate(&self, rel: &str) -> Result<(), DaemonError> {
+        let body = serde_json::json!({ "path": rel });
+        self.request("POST", "/vfs/truncate", Some(&body), CHANGE_TIMEOUT, &|| false).map(|_| ())
     }
 
     fn request(
@@ -508,8 +529,10 @@ mod tests {
         let (client, bodies) = serve_recording("changes", "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}");
         assert_eq!(client.rename("a.txt", "Docs/b.txt", false), Ok(()));
         assert_eq!(client.rename("a.txt", "b.txt", true), Ok(()));
-        assert_eq!(client.delete("Docs", false), Ok(()));
-        assert_eq!(client.delete("Docs", true), Ok(()));
+        assert_eq!(client.delete("Docs", Removal::Unlink), Ok(()));
+        assert_eq!(client.delete("Docs", Removal::Rmdir), Ok(()));
+        assert_eq!(client.delete("Docs", Removal::Trash), Ok(()));
+        assert_eq!(client.truncate("Docs/a.txt"), Ok(()));
         let _ = std::fs::remove_file(&client.socket);
         let got: Vec<serde_json::Value> = bodies.try_iter().collect();
         assert_eq!(
@@ -519,6 +542,8 @@ mod tests {
                 serde_json::json!({ "from": "a.txt", "to": "b.txt", "noReplace": true }),
                 serde_json::json!({ "path": "Docs" }),
                 serde_json::json!({ "path": "Docs", "onlyIfEmpty": true }),
+                serde_json::json!({ "path": "Docs", "trash": true }),
+                serde_json::json!({ "path": "Docs/a.txt" }),
             ]
         );
     }
@@ -529,7 +554,7 @@ mod tests {
         let (client, _) = serve_recording("refused", reply);
         let refused = client.rename("a", "b", false).unwrap_err();
         assert_eq!((refused.errno, refused.message.as_str()), (libc::EXDEV, "Can't replace b"));
-        assert_eq!(client.delete("Docs", true).unwrap_err().errno, libc::EXDEV);
+        assert_eq!(client.delete("Docs", Removal::Rmdir).unwrap_err().errno, libc::EXDEV);
         let _ = std::fs::remove_file(&client.socket);
     }
 
@@ -539,7 +564,8 @@ mod tests {
         assert_eq!(client.children("").unwrap_err().errno, libc::EIO);
         assert_eq!(client.hydrate("a.txt", &|| false).unwrap_err().errno, libc::EIO);
         assert_eq!(client.rename("a.txt", "b.txt", false).unwrap_err().errno, libc::EIO);
-        assert_eq!(client.delete("a.txt", false).unwrap_err().errno, libc::EIO);
+        assert_eq!(client.delete("a.txt", Removal::Unlink).unwrap_err().errno, libc::EIO);
+        assert_eq!(client.truncate("a.txt").unwrap_err().errno, libc::EIO);
     }
 
     // Runs `call` on its own thread and gives its result, or None if it is still blocked after `limit`

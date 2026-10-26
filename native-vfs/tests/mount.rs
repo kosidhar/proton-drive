@@ -40,6 +40,9 @@ struct Fake {
     hydrate_delay: Duration,
     refusals: HashMap<String, &'static str>,
     rename_refusals: HashMap<String, &'static str>,
+    /// Renames from these refused with EXDEV while they have no local copy, as the daemon refuses an online-only file
+    /// replacing another
+    exdev_while_online: Vec<String>,
 }
 
 impl Fake {
@@ -49,6 +52,7 @@ impl Fake {
             hydrate_delay: Duration::from_millis(200),
             refusals: HashMap::new(),
             rename_refusals: HashMap::new(),
+            exdev_while_online: Vec::new(),
         }
     }
 
@@ -67,6 +71,11 @@ impl Fake {
         self.rename_refusals.insert(from.to_string(), code);
         self
     }
+
+    fn exdev_while_online(mut self, from: &str) -> Fake {
+        self.exdev_while_online.push(from.to_string());
+        self
+    }
 }
 
 #[derive(Default)]
@@ -75,6 +84,7 @@ struct Calls {
     hydrates: AtomicUsize,
     renames: Mutex<Vec<Value>>,
     deletes: Mutex<Vec<Value>>,
+    truncates: Mutex<Vec<String>>,
 }
 
 struct FakeDaemon {
@@ -117,6 +127,10 @@ impl FakeDaemon {
 
     fn deletes(&self) -> Vec<Value> {
         self.calls.deletes.lock().unwrap().clone()
+    }
+
+    fn truncates(&self) -> Vec<String> {
+        self.calls.truncates.lock().unwrap().clone()
     }
 }
 
@@ -186,6 +200,15 @@ fn serve(mut stream: UnixStream, backing: &Path, fake: &Fake, calls: &Calls) {
                 Err(code) => (400, json!({ "error": "Refused", "code": code })),
             }
         }
+        ("POST", None) if target == "/vfs/truncate" => {
+            let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let path = body["path"].as_str().unwrap_or("").to_string();
+            calls.truncates.lock().unwrap().push(path.clone());
+            match fake_truncate(backing, fake, &path) {
+                Ok(()) => (200, json!({ "ok": true })),
+                Err(code) => (400, json!({ "error": "Refused", "code": code })),
+            }
+        }
         ("POST", None) if target == "/vfs/delete" => {
             let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             calls.deletes.lock().unwrap().push(body.clone());
@@ -247,6 +270,9 @@ fn fake_rename(backing: &Path, fake: &Fake, from: &str, to: &str, no_replace: bo
     if let Some(code) = fake.rename_refusals.get(from) {
         return Err(code);
     }
+    if fake.exdev_while_online.iter().any(|f| f == from) && backing.join(from).symlink_metadata().is_err() {
+        return Err("EXDEV");
+    }
     if backing.join(from).symlink_metadata().is_ok() {
         let target = backing.join(to);
         std::fs::create_dir_all(target.parent().unwrap()).map_err(|_| "EIO")?;
@@ -270,6 +296,22 @@ fn fake_rename(backing: &Path, fake: &Fake, from: &str, to: &str, no_replace: bo
         children.insert(format!("{to}{}", &key[from.len()..]), entries);
     }
     Ok(())
+}
+
+// The daemon's truncate: an online-only file listed here gets an empty local file, parents and all
+fn fake_truncate(backing: &Path, fake: &Fake, path: &str) -> Result<(), &'static str> {
+    let children = fake.children.lock().unwrap();
+    if backing.join(path).symlink_metadata().is_ok() {
+        return Err("EEXIST");
+    }
+    let (parent, name) = split_path(path);
+    let listed = children.get(parent).is_some_and(|e| e.iter().any(|e| e["name"] == name && e["type"] == "file"));
+    if !listed {
+        return Err("ENOENT");
+    }
+    let target = backing.join(path);
+    std::fs::create_dir_all(target.parent().unwrap()).map_err(|_| "EIO")?;
+    std::fs::File::create_new(&target).map(|_| ()).map_err(|_| "EIO")
 }
 
 // The daemon's delete: the local copy and the listing entry go; with onlyIfEmpty, only a folder holding nothing
@@ -789,13 +831,14 @@ fn truncating_an_online_only_file_empties_it_here_without_a_download() {
     h.start_daemon(HashMap::from([("", names.iter().map(|n| online(n)).collect())]));
     h.mount();
 
-    // truncate(1) opens for writing without O_TRUNC, then ftruncates
+    // truncate(1) opens for writing without O_TRUNC, then ftruncates; the daemon makes the empty file
     assert_ok(&run(Command::new("truncate").args(["-s", "0"]).arg(h.path("online.txt"))), "truncate");
     assert_eq!(std::fs::metadata(h.backing.join("online.txt")).unwrap().len(), 0);
     assert_eq!(std::fs::metadata(h.path("online.txt")).unwrap().len(), 0);
     // A shell redirect opens with O_TRUNC
     assert_ok(&sh(": > \"$1\"", &[&h.path("redirected.txt")]), "redirect");
     assert_eq!(std::fs::metadata(h.backing.join("redirected.txt")).unwrap().len(), 0);
+    assert_eq!(h.daemon().truncates(), ["online.txt", "redirected.txt"]);
     // Opened write-only (for appending, so not truncated) and closed untouched: nothing to download
     assert_ok(&sh("exec 3>> \"$1\"", &[&h.path("opened.txt")]), "open write-only");
     assert!(!h.backing.join("opened.txt").exists());
@@ -804,6 +847,7 @@ fn truncating_an_online_only_file_empties_it_here_without_a_download() {
     assert_ok(&run(Command::new("truncate").args(["-s", "4"]).arg(h.path("cut.txt"))), "truncate -s 4");
     assert_eq!(h.daemon().hydrate_calls(), 1);
     assert_eq!(std::fs::read(h.backing.join("cut.txt")).unwrap(), &FIXTURE[..4]);
+    assert_eq!(h.daemon().truncates().len(), 2);
 }
 
 #[test]
@@ -956,25 +1000,112 @@ fn saving_into_an_online_only_folder_makes_that_folder_here() {
 }
 
 #[test]
-fn a_rename_the_daemon_answers_exdev_falls_back_to_copy_and_delete() {
+fn an_online_only_file_replacing_another_is_downloaded_then_renamed_over_it() {
     if !enabled() {
         return;
     }
     let mut h = Harness::new();
     h.start_fake(
         Fake::new(HashMap::from([("", vec![file("a.txt", FIXTURE.len() as u64), file("b.txt", 3)])]))
-            .refusing_rename("a.txt", "EXDEV"),
+            .exdev_while_online("a.txt"),
     );
     h.mount();
 
     let mv = run(Command::new("mv").arg(h.path("a.txt")).arg(h.path("b.txt")));
     assert_ok(&mv, "mv");
-    assert_eq!(h.daemon().renames(), [json!({ "from": "a.txt", "to": "b.txt" })]);
-    // mv deleted the target, copied the file over (downloading it), and deleted the original
-    assert_eq!(h.daemon().deletes(), [json!({ "path": "b.txt" }), json!({ "path": "a.txt" })]);
-    assert_eq!(std::fs::read(h.backing.join("b.txt")).unwrap(), FIXTURE);
+    // EXDEV, the download, then the same rename again: never mv's delete-then-copy, which loses the target
+    let rename = json!({ "from": "a.txt", "to": "b.txt" });
+    assert_eq!(h.daemon().renames(), [rename.clone(), rename]);
     assert_eq!(h.daemon().hydrate_calls(), 1);
+    assert_eq!(h.daemon().deletes(), Vec::<Value>::new());
+    assert_eq!(std::fs::read(h.backing.join("b.txt")).unwrap(), FIXTURE);
     assert_eq!(ls(&h.mountpoint), [".xdg-volume-info", "b.txt"]);
+}
+
+#[test]
+fn offline_an_online_only_file_replacing_another_fails_and_the_target_stays() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    std::fs::write(h.backing.join("local.txt"), b"only here").unwrap();
+    h.start_fake(
+        Fake::new(HashMap::from([("", vec![file("a.txt", FIXTURE.len() as u64), file("local.txt", 9)])]))
+            .exdev_while_online("a.txt")
+            .refusing("a.txt", "EIO"),
+    );
+    h.mount();
+
+    let mv = run(Command::new("mv").arg(h.path("a.txt")).arg(h.path("local.txt")));
+    assert!(!mv.status.success());
+    assert_eq!(h.daemon().renames(), [json!({ "from": "a.txt", "to": "local.txt" })]);
+    assert_eq!(h.daemon().hydrate_calls(), 1);
+    assert_eq!(h.daemon().deletes(), Vec::<Value>::new());
+    assert_eq!(std::fs::read(h.backing.join("local.txt")).unwrap(), b"only here");
+    assert_eq!(ls(&h.mountpoint), [".xdg-volume-info", "a.txt", "local.txt"]);
+}
+
+#[test]
+fn appending_to_an_online_only_file_listed_short_lands_at_its_real_end() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    h.start_daemon(HashMap::from([("", vec![file("log.txt", 5)])]));
+    h.mount();
+    assert_eq!(std::fs::metadata(h.path("log.txt")).unwrap().len(), 5);
+
+    assert_ok(&sh("echo more >> \"$1\"", &[&h.path("log.txt")]), "append");
+    let expected = [FIXTURE, b"more\n"].concat();
+    let appended = std::fs::read(h.backing.join("log.txt")).unwrap();
+    assert_eq!(String::from_utf8_lossy(&appended), String::from_utf8_lossy(&expected));
+}
+
+#[test]
+fn changing_an_online_only_file_by_path_downloads_it_first() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    let names = ["cut.txt", "touched.txt", "private.txt"];
+    h.start_daemon(HashMap::from([("", names.iter().map(|n| file(n, FIXTURE.len() as u64)).collect())]));
+    h.mount();
+
+    // truncate(2) to a size short of what it is
+    assert_eq!(errno_of(unsafe { libc::truncate(c_path(&h.path("cut.txt")).as_ptr(), 4) }), None);
+    assert_eq!(std::fs::read(h.backing.join("cut.txt")).unwrap(), &FIXTURE[..4]);
+    assert_ok(&run(Command::new("touch").arg(h.path("touched.txt"))), "touch");
+    assert_eq!(std::fs::read(h.backing.join("touched.txt")).unwrap(), FIXTURE);
+    assert_ok(&run(Command::new("chmod").arg("600").arg(h.path("private.txt"))), "chmod");
+    assert_eq!(std::fs::metadata(h.backing.join("private.txt")).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::read(h.backing.join("private.txt")).unwrap(), FIXTURE);
+    assert_eq!(h.daemon().hydrate_calls(), 3);
+    assert_eq!(h.daemon().truncates(), Vec::<String>::new());
+}
+
+#[test]
+fn what_was_looked_up_in_a_renamed_folder_is_found_under_its_new_name() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    std::fs::create_dir(h.backing.join("Folder")).unwrap();
+    std::fs::write(h.backing.join("Folder/child.txt"), b"child").unwrap();
+    h.start_daemon(HashMap::from([("", vec![folder("Folder")]), ("Folder", vec![file("online.txt", 5)])]));
+    h.mount();
+    assert_eq!(std::fs::metadata(h.path("Folder/child.txt")).unwrap().len(), 5);
+    let dir = std::fs::File::open(h.path("Folder")).unwrap();
+
+    assert_ok(&run(Command::new("mv").arg(h.path("Folder")).arg(h.path("Renamed"))), "mv");
+    // Past the kernel's cache, the folder still open is asked about by its number, which must mean Renamed now
+    thread::sleep(Duration::from_millis(1200));
+    for name in ["child.txt", "online.txt"] {
+        let name = CString::new(name).unwrap();
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let found = unsafe { libc::fstatat(std::os::fd::AsRawFd::as_raw_fd(&dir), name.as_ptr(), &mut st, 0) };
+        assert_eq!(errno_of(found), None, "{name:?}");
+    }
+    assert_eq!(std::fs::metadata(h.path("Renamed/child.txt")).unwrap().len(), 5);
 }
 
 #[test]
@@ -1058,7 +1189,8 @@ fn gio_trash_deletes_through_the_daemon_and_leaves_the_trash_empty() {
             .env_remove("GIO_USE_PORTALS"));
         assert_ok(&trashed, "gio trash");
     }
-    assert_eq!(h.daemon().deletes(), [json!({ "path": "online.txt" }), json!({ "path": "Folder" })]);
+    let trashed = [json!({ "path": "online.txt", "trash": true }), json!({ "path": "Folder", "trash": true })];
+    assert_eq!(h.daemon().deletes(), trashed);
     assert_eq!(h.daemon().hydrate_calls(), 0);
     assert_eq!(h.daemon().renames(), Vec::<Value>::new());
     assert_eq!(ls(&trash.join("info")), Vec::<String>::new());
@@ -1088,4 +1220,29 @@ fn a_read_write_open_of_an_online_only_file_downloads_it_whole_at_open() {
         opened.read_to_end(&mut first).unwrap();
         assert_eq!(String::from_utf8_lossy(&first), String::from_utf8_lossy(FIXTURE), "{name}");
     }
+}
+
+#[test]
+fn an_open_file_deleted_or_replaced_through_the_drive_still_changes_through_its_descriptor() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    std::fs::write(h.backing.join("gone.txt"), b"going").unwrap();
+    std::fs::write(h.backing.join("replaced.txt"), b"old content").unwrap();
+    h.start_daemon(HashMap::new());
+    h.mount();
+    let rw = |name: &str| std::fs::OpenOptions::new().read(true).write(true).open(h.path(name)).unwrap();
+
+    let gone = rw("gone.txt");
+    assert_ok(&run(Command::new("rm").arg(h.path("gone.txt"))), "rm");
+    gone.set_len(2).expect("ftruncate on a deleted file");
+    gone.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600)).expect("fchmod on a deleted file");
+    assert_eq!(gone.metadata().unwrap().len(), 2);
+
+    let replaced = rw("replaced.txt");
+    assert_ok(&sh("printf new > \"$1\" && mv \"$1\" \"$2\"", &[&h.path("save.tmp"), &h.path("replaced.txt")]), "save");
+    replaced.set_len(3).expect("ftruncate on a replaced file");
+    assert_eq!(replaced.metadata().unwrap().len(), 3);
+    assert_eq!(std::fs::read(h.backing.join("replaced.txt")).unwrap(), b"new");
 }

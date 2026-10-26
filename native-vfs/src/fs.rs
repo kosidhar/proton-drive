@@ -21,7 +21,7 @@ use fuser::{
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 
-use crate::daemon::{DaemonClient, DaemonError};
+use crate::daemon::{DaemonClient, DaemonError, Removal};
 use crate::inodes::{Inodes, ROOT_INO};
 use crate::listing::{self, Entry, Kind, VOLUME_INFO_CONTENT, VOLUME_INFO_NAME};
 use crate::readers::{classify_open, opener_interrupted, process_comm, Reader};
@@ -31,6 +31,8 @@ use crate::trash::{TrashArea, TrashNode};
 const TTL: Duration = Duration::from_secs(1);
 /// How long a folder's merged listing serves lookups, getattrs and readdirs.
 const LISTING_TTL: Duration = Duration::from_secs(1);
+/// How often a use of a deferred open that waits for another asks whether its own app gave up.
+const SETTLE_CHECK: Duration = Duration::from_millis(500);
 
 pub struct DriveFs {
     state: Arc<State>,
@@ -78,7 +80,8 @@ struct State {
     /// Folders whose listing is being fetched, and the signal that one fetch is done
     fetching: Mutex<HashSet<PathBuf>>,
     fetched: Condvar,
-    handles: Mutex<HashMap<u64, Handle>>,
+    /// Each open's inode number and what it is
+    handles: Mutex<HashMap<u64, (u64, Handle)>>,
     notifier: Arc<OnceLock<Notifier>>,
     /// Kernel entries to drop, as (folder, name), for the thread that tells the kernel
     invalidations: Sender<(u64, OsString)>,
@@ -215,27 +218,34 @@ fn time_spec(time: Option<TimeOrNow>) -> libc::timespec {
     libc::timespec { tv_sec: tv_sec as libc::time_t, tv_nsec: tv_nsec as _ }
 }
 
-/// Applies a setattr to a backing file or folder, through the app's open file when there is one (its path may have
-/// moved on).
-fn apply_change(path: &Path, file: Option<&File>, change: &AttrChange) -> std::io::Result<()> {
+/// What a setattr is applied to: an open file (whose path may have moved on), or a backing path.
+enum Target<'a> {
+    File(&'a File),
+    Path(&'a Path),
+}
+
+/// Applies a setattr to a backing file or folder.
+fn apply_change(target: Target, change: &AttrChange) -> std::io::Result<()> {
     if let Some(size) = change.size {
-        match file {
-            Some(file) => file.set_len(size)?,
-            None => OpenOptions::new().write(true).custom_flags(libc::O_NOFOLLOW).open(path)?.set_len(size)?,
+        match target {
+            Target::File(file) => file.set_len(size)?,
+            Target::Path(path) => {
+                OpenOptions::new().write(true).custom_flags(libc::O_NOFOLLOW).open(path)?.set_len(size)?;
+            }
         }
     }
     if let Some(mode) = change.mode {
         let permissions = Permissions::from_mode(mode & 0o7777);
-        match file {
-            Some(file) => file.set_permissions(permissions)?,
-            None => std::fs::set_permissions(path, permissions)?,
+        match target {
+            Target::File(file) => file.set_permissions(permissions)?,
+            Target::Path(path) => std::fs::set_permissions(path, permissions)?,
         }
     }
     if change.atime.is_some() || change.mtime.is_some() {
         let times = [time_spec(change.atime), time_spec(change.mtime)];
-        let done = match file {
-            Some(file) => unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) },
-            None => {
+        let done = match target {
+            Target::File(file) => unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) },
+            Target::Path(path) => {
                 let path = CString::new(path.as_os_str().as_bytes())?;
                 unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) }
             }
@@ -271,14 +281,23 @@ impl State {
         lock(&self.inodes).ino_of(rel)
     }
 
-    fn add_handle(&self, handle: Handle) -> FileHandle {
+    fn add_handle(&self, ino: u64, handle: Handle) -> FileHandle {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        lock(&self.handles).insert(fh, handle);
+        lock(&self.handles).insert(fh, (ino, handle));
         FileHandle(fh)
     }
 
     fn handle(&self, fh: FileHandle) -> Option<Handle> {
-        lock(&self.handles).get(&fh.0).cloned()
+        lock(&self.handles).get(&fh.0).map(|(_, handle)| handle.clone())
+    }
+
+    /// A file an app still has open under that number: what a change by number reaches once the item's path has gone
+    /// (deleted or replaced through the drive)
+    fn open_file_of(&self, ino: u64) -> Option<Arc<File>> {
+        lock(&self.handles).values().find_map(|(of, handle)| match handle {
+            Handle::File(file) if *of == ino => Some(file.clone()),
+            _ => None,
+        })
     }
 
     fn is_trash_path(&self, rel: &Path) -> bool {
@@ -470,7 +489,7 @@ impl State {
         match open_backing(&self.backing.join(&rel), flags) {
             Ok(file) => {
                 self.refresh_size(ino);
-                reply.opened(self.add_handle(Handle::File(Arc::new(file))), FopenFlags::empty())
+                reply.opened(self.add_handle(ino, Handle::File(Arc::new(file))), FopenFlags::empty())
             }
             Err(err) => {
                 eprintln!("protondrive-vfs: {rel:?} was downloaded but won't open: {err}");
@@ -485,9 +504,15 @@ impl State {
         match self.resolve(rel) {
             Some(Node::Local(meta)) if meta.is_dir() => Ok(()),
             Some(Node::Online(entry)) if entry.kind == Kind::Folder => {
+                // The folders missing here, deepest first, down from the nearest one that is
+                let missing: Vec<&Path> = rel
+                    .ancestors()
+                    .take_while(|p| !is_root(p) && std::fs::symlink_metadata(self.backing.join(p)).is_err())
+                    .collect();
                 std::fs::DirBuilder::new().recursive(true).mode(0o755).create(self.backing.join(rel))?;
-                if let Some(parent) = rel.parent() {
-                    self.forget_listing(parent);
+                // Each folder made changes the listing it is in
+                for made in missing {
+                    self.forget_listing(made.parent().unwrap_or(Path::new("")));
                 }
                 Ok(())
             }
@@ -497,19 +522,23 @@ impl State {
         }
     }
 
-    /// An online-only file about to be cut to nothing: an empty file here stands for it, with nothing from the cloud.
-    /// One already here is left as it is.
+    /// An online-only file about to be cut to nothing: the daemon puts an empty file in its place, with nothing from
+    /// the cloud, and keeps what the drive showed of it as what its new content is an edit of. One already here (a
+    /// download that finished meanwhile, say) is the file that gets cut. Never on a session thread.
     fn make_empty(&self, rel: &Path) -> Result<(), Errno> {
-        let parent = rel.parent().ok_or(Errno::ENOENT)?;
-        self.backing_folder(parent)?;
-        OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .custom_flags(libc::O_NOFOLLOW)
-            .mode(0o644)
-            .open(self.backing.join(rel))?;
-        self.forget_listing(parent);
+        // An online-only entry came from a UTF-8 listing, so its path is UTF-8
+        let Some(rel_str) = rel.to_str() else { return Err(Errno::EIO) };
+        match self.daemon.truncate(rel_str) {
+            Ok(()) => {}
+            Err(err) if err.errno == libc::EEXIST => {}
+            Err(err) => {
+                let allowed = [libc::ENOENT, libc::EACCES, libc::EIO];
+                return Err(self.refused(&format!("empty {rel_str:?}"), err, &allowed));
+            }
+        }
+        if let Some(parent) = rel.parent() {
+            self.forget_listing(parent); // it is local now
+        }
         Ok(())
     }
 
@@ -522,13 +551,22 @@ impl State {
             match &*state {
                 Settling::Open(file) => return Ok(file.clone()),
                 Settling::Failed(errno) => return Err(*errno),
-                Settling::Busy => state = deferred.settled.wait(state).unwrap_or_else(|e| e.into_inner()),
                 Settling::Pending => break,
+                // Another use is settling it: this one gives up as soon as its own app does
+                Settling::Busy if opener_interrupted(tid) => return Err(Errno::EINTR),
+                Settling::Busy => {
+                    state = match deferred.settled.wait_timeout(state, SETTLE_CHECK) {
+                        Ok((state, _)) => state,
+                        Err(poisoned) => poisoned.into_inner().0,
+                    };
+                }
             }
         }
         *state = Settling::Busy;
         drop(state);
+        let guard = SettleGuard { deferred };
         let outcome = self.settle_now(deferred, tid, empty);
+        std::mem::forget(guard);
         let mut state = lock(&deferred.state);
         *state = match &outcome {
             Ok(file) => Settling::Open(file.clone()),
@@ -539,7 +577,7 @@ impl State {
         drop(state);
         if let Ok(file) = &outcome {
             // Later uses of this open go straight to the file
-            if let Some(handle) = lock(&self.handles).get_mut(&fh.0) {
+            if let Some((_, handle)) = lock(&self.handles).get_mut(&fh.0) {
                 *handle = Handle::File(file.clone());
             }
         }
@@ -571,14 +609,21 @@ impl State {
         Ok(Arc::new(file))
     }
 
-    /// Applies a setattr to the backing store and answers with the attributes that result.
+    /// Applies a setattr to the backing store and answers with the attributes that result: through the app's open
+    /// file when the kernel names one, otherwise by path; and once the path has gone (the item deleted or replaced
+    /// through the drive), through a file the app still has open under that number.
     fn reply_after_change(&self, ino: INodeNo, file: Option<&File>, change: &AttrChange, reply: ReplyAttr) {
-        let Some(rel) = self.path_of(ino) else { return reply.error(Errno::ENOENT) };
-        let path = self.backing.join(&rel);
-        let meta = apply_change(&path, file, change).and_then(|()| match file {
-            Some(file) => file.metadata(),
-            None => std::fs::symlink_metadata(&path),
-        });
+        let meta = match (file, self.path_of(ino)) {
+            (Some(file), _) => apply_change(Target::File(file), change).and_then(|()| file.metadata()),
+            (None, Some(rel)) => {
+                let path = self.backing.join(rel);
+                apply_change(Target::Path(&path), change).and_then(|()| std::fs::symlink_metadata(&path))
+            }
+            (None, None) => match self.open_file_of(ino.0) {
+                Some(file) => apply_change(Target::File(&file), change).and_then(|()| file.metadata()),
+                None => return reply.error(Errno::ENOENT),
+            },
+        };
         match meta {
             Ok(meta) => reply.attr(&TTL, &self.attr(ino.0, &Node::Local(meta))),
             Err(err) => reply.error(err.into()),
@@ -592,7 +637,9 @@ impl State {
         let _ = std::thread::Builder::new().name(name.into()).spawn(move || work(&state));
     }
 
-    /// The errno for a rename or delete the daemon refused: its own, when it is one this call can give.
+    /// The errno for a rename, delete or truncate the daemon refused: its own, when it is one this call can give. A
+    /// daemon that didn't answer in time gives EIO here, though what was asked still happens there later: nothing
+    /// cancels it once it is in the daemon's queue.
     fn refused(&self, what: &str, err: DaemonError, allowed: &[i32]) -> Errno {
         let errno = if allowed.contains(&err.errno) { err.errno } else { libc::EIO };
         if errno == libc::EIO {
@@ -614,16 +661,16 @@ impl State {
     }
 
     /// Unlink and rmdir: the daemon deletes the item (rmdir only an empty folder), here and later in the cloud.
-    fn delete(self: &Arc<Self>, rel: PathBuf, only_if_empty: bool, reply: ReplyEmpty) {
+    fn delete(self: &Arc<Self>, rel: PathBuf, removal: Removal, reply: ReplyEmpty) {
         // The daemon's paths are UTF-8: one that isn't can't be synced, renamed or deleted through the drive
         let Some(rel_str) = rel.to_str().map(String::from) else { return reply.error(Errno::EILSEQ) };
-        self.on_worker("delete", move |s| match s.daemon.delete(&rel_str, only_if_empty) {
+        self.on_worker("delete", move |s| match s.daemon.delete(&rel_str, removal) {
             Ok(()) => {
                 s.removed(&rel);
                 reply.ok()
             }
             Err(err) => {
-                let allowed: &[i32] = if only_if_empty {
+                let allowed: &[i32] = if removal == Removal::Rmdir {
                     &[libc::ENOENT, libc::EACCES, libc::ENOTEMPTY, libc::EIO]
                 } else {
                     &[libc::ENOENT, libc::EACCES, libc::EIO]
@@ -634,10 +681,11 @@ impl State {
     }
 
     /// GIO's Move to Trash: the item it moves into the trash folder's files/ is deleted through the daemon, which
-    /// keeps it in the cloud's trash. files/ stays empty.
+    /// keeps it in the cloud's trash and moves what exists only on this computer to the desktop Trash. files/ stays
+    /// empty.
     fn trash_item(self: &Arc<Self>, from: PathBuf, files_ino: u64, name: OsString, reply: ReplyEmpty) {
         let Some(from_str) = from.to_str().map(String::from) else { return reply.error(Errno::EILSEQ) };
-        self.on_worker("trash", move |s| match s.daemon.delete(&from_str, false) {
+        self.on_worker("trash", move |s| match s.daemon.delete(&from_str, Removal::Trash) {
             Ok(()) => {
                 s.removed(&from);
                 let dropped = s.trash.trashed(&name);
@@ -682,6 +730,19 @@ impl Drop for FetchDone<'_> {
     fn drop(&mut self) {
         lock(&self.state.fetching).remove(self.rel);
         self.state.fetched.notify_all();
+    }
+}
+
+/// Gives a deferred open back to the next use if settling it stops short (a panic): it is no longer busy, and its
+/// waiters wake.
+struct SettleGuard<'a> {
+    deferred: &'a Deferred,
+}
+
+impl Drop for SettleGuard<'_> {
+    fn drop(&mut self) {
+        *lock(&self.deferred.state) = Settling::Pending;
+        self.deferred.settled.notify_all();
     }
 }
 
@@ -766,11 +827,25 @@ impl Filesystem for DriveFs {
         reply: ReplyAttr,
     ) {
         let s = &self.state;
-        let Some(rel) = s.path_of(ino) else { return reply.error(Errno::ENOENT) };
         // Everything in the drive is the user's: owner and group can only be "changed" to what they are
         if uid.is_some_and(|u| u != s.uid) || gid.is_some_and(|g| g != s.gid) {
             return reply.error(Errno::EPERM);
         }
+        let change = AttrChange { mode, size, atime, mtime };
+        // Through the app's open file (ftruncate), whatever became of its path
+        match fh.map(|fh| (fh, s.handle(fh))) {
+            Some((_, Some(Handle::File(file)))) => return s.reply_after_change(ino, Some(&file), &change, reply),
+            Some((fh, Some(Handle::Deferred(deferred)))) => {
+                let tid = req.pid();
+                return s.on_worker("download", move |s| match s.settle(fh, &deferred, tid, size == Some(0)) {
+                    Ok(file) => s.reply_after_change(ino, Some(&file), &change, reply),
+                    Err(errno) => reply.error(errno),
+                });
+            }
+            _ => {}
+        }
+        // Deleted or replaced through the drive: still changed through a file the app has open (fchmod, say)
+        let Some(rel) = s.path_of(ino) else { return s.reply_after_change(ino, None, &change, reply) };
         if s.is_trash_path(&rel) {
             // GIO sets a .trashinfo's owner and mode as it writes one: only a size means anything there
             let resized = match (s.trash.info_name(&rel), size) {
@@ -786,19 +861,6 @@ impl Filesystem for DriveFs {
         if is_volume_info(&rel) {
             return reply.error(Errno::EPERM);
         }
-        let change = AttrChange { mode, size, atime, mtime };
-        // Through the app's open file (ftruncate)
-        match fh.map(|fh| (fh, s.handle(fh))) {
-            Some((_, Some(Handle::File(file)))) => return s.reply_after_change(ino, Some(&file), &change, reply),
-            Some((fh, Some(Handle::Deferred(deferred)))) => {
-                let tid = req.pid();
-                return s.on_worker("download", move |s| match s.settle(fh, &deferred, tid, size == Some(0)) {
-                    Ok(file) => s.reply_after_change(ino, Some(&file), &change, reply),
-                    Err(errno) => reply.error(errno),
-                });
-            }
-            _ => {}
-        }
         match s.resolve(&rel) {
             Some(Node::Local(_)) => s.reply_after_change(ino, None, &change, reply),
             // Made here to take the change, as when a file is saved into it
@@ -806,10 +868,12 @@ impl Filesystem for DriveFs {
                 Ok(()) => s.reply_after_change(ino, None, &change, reply),
                 Err(errno) => reply.error(errno),
             },
-            Some(Node::Online(_)) if size == Some(0) => match s.make_empty(&rel) {
-                Ok(()) => s.reply_after_change(ino, None, &change, reply),
-                Err(errno) => reply.error(errno),
-            },
+            Some(Node::Online(_)) if size == Some(0) => {
+                s.on_worker("truncate", move |s| match s.make_empty(&rel) {
+                    Ok(()) => s.reply_after_change(ino, None, &change, reply),
+                    Err(errno) => reply.error(errno),
+                });
+            }
             // Anything else changes the file as it is in the cloud, which must be here first
             Some(Node::Online(_)) => {
                 if classify_open(&process_comm(req.pid()).unwrap_or_default(), 0) == Reader::Background {
@@ -902,7 +966,7 @@ impl Filesystem for DriveFs {
         if is_volume_info(&rel) {
             return reply.error(Errno::EPERM);
         }
-        s.delete(rel, false, reply);
+        s.delete(rel, Removal::Unlink, reply);
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -918,12 +982,12 @@ impl Filesystem for DriveFs {
         if is_volume_info(&rel) {
             return reply.error(Errno::EPERM);
         }
-        s.delete(rel, true, reply);
+        s.delete(rel, Removal::Rmdir, reply);
     }
 
     fn rename(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         newparent: INodeNo,
@@ -979,14 +1043,28 @@ impl Filesystem for DriveFs {
         let (Some(from_str), Some(to_str)) = (from.to_str().map(String::from), to.to_str().map(String::from)) else {
             return reply.error(Errno::EILSEQ); // the daemon's paths are UTF-8
         };
-        s.on_worker("rename", move |s| match s.daemon.rename(&from_str, &to_str, no_replace) {
-            Ok(()) => {
-                s.moved(&from, &to);
-                reply.ok()
+        let tid = req.pid();
+        s.on_worker("rename", move |s| {
+            let mut renamed = s.daemon.rename(&from_str, &to_str, no_replace);
+            // An online-only file can't take another's place without its content here, and mv would answer EXDEV by
+            // deleting the target before copying, which loses it if the copy then fails: downloaded first, the rename
+            // keeps the target's identity (a new revision of it)
+            let exdev = renamed.as_ref().is_err_and(|err| err.errno == libc::EXDEV);
+            if exdev && matches!(s.resolve(&from), Some(Node::Online(entry)) if entry.kind == Kind::File) {
+                if let Err(errno) = s.hydrate(tid, &from) {
+                    return reply.error(errno);
+                }
+                renamed = s.daemon.rename(&from_str, &to_str, no_replace);
             }
-            Err(err) => {
-                let allowed = [libc::ENOENT, libc::EEXIST, libc::EACCES, libc::EXDEV, libc::EIO];
-                reply.error(s.refused(&format!("rename {from_str:?} to {to_str:?}"), err, &allowed))
+            match renamed {
+                Ok(()) => {
+                    s.moved(&from, &to);
+                    reply.ok()
+                }
+                Err(err) => {
+                    let allowed = [libc::ENOENT, libc::EEXIST, libc::EACCES, libc::EXDEV, libc::EIO];
+                    reply.error(s.refused(&format!("rename {from_str:?} to {to_str:?}"), err, &allowed))
+                }
             }
         });
     }
@@ -1002,7 +1080,7 @@ impl Filesystem for DriveFs {
                     if let (true, Some(name)) = (truncate, rel.file_name()) {
                         let _ = s.trash.resize_info(name, 0);
                     }
-                    reply.opened(s.add_handle(Handle::TrashInfo(id)), FopenFlags::empty())
+                    reply.opened(s.add_handle(ino.0, Handle::TrashInfo(id)), FopenFlags::empty())
                 }
                 Some(_) => reply.error(Errno::EISDIR),
                 None => reply.error(Errno::ENOENT),
@@ -1012,12 +1090,12 @@ impl Filesystem for DriveFs {
             if writing || truncate {
                 return reply.error(Errno::EACCES);
             }
-            return reply.opened(s.add_handle(Handle::VolumeInfo), FopenFlags::empty());
+            return reply.opened(s.add_handle(ino.0, Handle::VolumeInfo), FopenFlags::empty());
         }
         let path = s.backing.join(&rel);
         // Whatever the listing said a moment ago, a backing file opens as it is
         match open_backing(&path, flags.0) {
-            Ok(file) => return reply.opened(s.add_handle(Handle::File(Arc::new(file))), FopenFlags::empty()),
+            Ok(file) => return reply.opened(s.add_handle(ino.0, Handle::File(Arc::new(file))), FopenFlags::empty()),
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => return reply.error(err.into()),
             Err(_) => {}
         }
@@ -1028,10 +1106,12 @@ impl Filesystem for DriveFs {
             if !s.online_entry(parent, name).is_some_and(|e| e.kind == Kind::File) {
                 return reply.error(Errno::ENOENT);
             }
-            return match s.make_empty(&rel).and_then(|()| open_backing(&path, flags.0).map_err(Errno::from)) {
-                Ok(file) => reply.opened(s.add_handle(Handle::File(Arc::new(file))), FopenFlags::empty()),
-                Err(errno) => reply.error(errno),
-            };
+            return s.on_worker("truncate", move |s| {
+                match s.make_empty(&rel).and_then(|()| open_backing(&path, flags.0).map_err(Errno::from)) {
+                    Ok(file) => reply.opened(s.add_handle(ino.0, Handle::File(Arc::new(file))), FopenFlags::empty()),
+                    Err(errno) => reply.error(errno),
+                }
+            });
         }
         // Who is opening comes first: a background reader or a sniff mustn't even refresh the listing. An opener whose
         // comm can't be read counts as an app
@@ -1057,7 +1137,7 @@ impl Filesystem for DriveFs {
                         state: Mutex::new(Settling::Pending),
                         settled: Condvar::new(),
                     };
-                    return reply.opened(s.add_handle(Handle::Deferred(Arc::new(deferred))), FopenFlags::empty());
+                    return reply.opened(s.add_handle(ino.0, Handle::Deferred(Arc::new(deferred))), FopenFlags::empty());
                 }
                 // Read-only or read-write, it is downloaded as it opens, so the first read sees all of it. Never on a
                 // session thread: the download can take minutes. If the thread can't start, the dropped reply answers
@@ -1098,8 +1178,10 @@ impl Filesystem for DriveFs {
             });
             return match created {
                 Ok((id, node)) => {
-                    let attr = s.attr(s.ino_of(&rel), &node);
-                    reply.created(&TTL, &attr, Generation(0), s.add_handle(Handle::TrashInfo(id)), FopenFlags::empty())
+                    let ino = s.ino_of(&rel);
+                    let attr = s.attr(ino, &node);
+                    let fh = s.add_handle(ino, Handle::TrashInfo(id));
+                    reply.created(&TTL, &attr, Generation(0), fh, FopenFlags::empty())
                 }
                 Err(errno) => reply.error(errno),
             };
@@ -1123,8 +1205,9 @@ impl Filesystem for DriveFs {
         match opened.and_then(|file| file.metadata().map(|meta| (file, meta))) {
             Ok((file, meta)) => {
                 s.forget_listing(&parent_rel);
-                let attr = s.attr(s.ino_of(&rel), &Node::Local(meta));
-                let fh = s.add_handle(Handle::File(Arc::new(file)));
+                let ino = s.ino_of(&rel);
+                let attr = s.attr(ino, &Node::Local(meta));
+                let fh = s.add_handle(ino, Handle::File(Arc::new(file)));
                 reply.created(&TTL, &attr, Generation(0), fh, FopenFlags::empty())
             }
             Err(err) => reply.error(err.into()),
@@ -1215,7 +1298,7 @@ impl Filesystem for DriveFs {
         let s = &self.state;
         let closed = lock(&s.handles).remove(&fh.0);
         let dropped = match closed {
-            Some(Handle::TrashInfo(id)) => s.trash.close_info(id),
+            Some((_, Handle::TrashInfo(id))) => s.trash.close_info(id),
             _ => None,
         };
         reply.ok();
@@ -1247,7 +1330,7 @@ impl Filesystem for DriveFs {
             rows.push(DirRow { ino: inodes.ino_of(&rel.join(&name)), kind, name });
         }
         drop(inodes);
-        reply.opened(s.add_handle(Handle::Dir(Arc::new(rows))), FopenFlags::empty());
+        reply.opened(s.add_handle(ino.0, Handle::Dir(Arc::new(rows))), FopenFlags::empty());
     }
 
     fn readdir(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
@@ -1296,62 +1379,183 @@ mod tests {
     use std::io::{Read, Write};
     use std::sync::atomic::AtomicUsize;
 
-    // A drive over a temp backing dir, with a daemon that takes 300 ms to list `a.txt` in any folder and counts the
-    // listings it is asked for
-    fn drive_with_slow_daemon(name: &str) -> (DriveFs, PathBuf, Arc<AtomicUsize>) {
-        let root = std::env::temp_dir().join(format!("protondrive-vfs-fs-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("backing")).unwrap();
-        let socket = root.join("d.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let fetches = Arc::new(AtomicUsize::new(0));
-        let counted = fetches.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                counted.fetch_add(1, Ordering::SeqCst);
-                std::thread::spawn(move || {
-                    let _ = stream.read(&mut [0u8; 4096]);
-                    std::thread::sleep(Duration::from_millis(300)); // a slow listing
-                    let body = r#"{"entries":[{"name":"a.txt","type":"file","size":1,"mtimeMs":0}]}"#;
-                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
-                });
+    /// A daemon on a temp socket that holds every request until the gate opens, then lists `a.txt` in any folder, or
+    /// downloads a file by writing it into the backing store. It counts listings and downloads.
+    struct Gated {
+        drive: DriveFs,
+        root: PathBuf,
+        listings: Arc<AtomicUsize>,
+        downloads: Arc<AtomicUsize>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Gated {
+        fn new(name: &str) -> Gated {
+            let root = std::env::temp_dir().join(format!("protondrive-vfs-fs-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let backing = root.join("backing");
+            std::fs::create_dir_all(&backing).unwrap();
+            let socket = root.join("d.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let (listings, downloads) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let gate = Arc::new((Mutex::new(false), Condvar::new()));
+            let (counted_listings, counted_downloads, gated, placed) =
+                (listings.clone(), downloads.clone(), gate.clone(), backing.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let (listings, downloads, gate, backing) =
+                        (counted_listings.clone(), counted_downloads.clone(), gated.clone(), placed.clone());
+                    std::thread::spawn(move || {
+                        let mut raw = Vec::new();
+                        let mut buf = [0u8; 4096];
+                        while let Ok(n @ 1..) = stream.read(&mut buf) {
+                            raw.extend_from_slice(&buf[..n]);
+                            let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                            let head = String::from_utf8_lossy(&raw[..end]).to_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse().ok()))
+                                .unwrap_or(0);
+                            if raw.len() >= end + 4 + len {
+                                break;
+                            }
+                        }
+                        let request = String::from_utf8_lossy(&raw).to_string();
+                        let download = request.starts_with("POST /vfs/hydrate");
+                        (if download { &downloads } else { &listings }).fetch_add(1, Ordering::SeqCst);
+                        let (open, opened) = &*gate;
+                        let mut is_open = open.lock().unwrap();
+                        while !*is_open {
+                            is_open = opened.wait(is_open).unwrap();
+                        }
+                        drop(is_open);
+                        let body = if download {
+                            let path = request.split("\"path\":\"").nth(1).and_then(|r| r.split('"').next());
+                            let path = path.unwrap_or("");
+                            let _ = std::fs::write(backing.join(path), b"downloaded");
+                            r#"{"ok":true}"#.to_string()
+                        } else {
+                            r#"{"entries":[{"name":"a.txt","type":"file","size":1,"mtimeMs":0}]}"#.to_string()
+                        };
+                        let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                    });
+                }
+            });
+            Gated { drive: DriveFs::new(backing, DaemonClient::new(socket)), root, listings, downloads, gate }
+        }
+
+        fn open(&self) {
+            let (open, opened) = &*self.gate;
+            *open.lock().unwrap() = true;
+            opened.notify_all();
+        }
+
+        // Until `count` reaches `n`: the requests have reached the daemon and wait at the gate
+        fn until(&self, count: &AtomicUsize, n: usize) {
+            let started = Instant::now();
+            while count.load(Ordering::SeqCst) < n {
+                assert!(started.elapsed() < Duration::from_secs(5), "the request never came");
+                std::thread::sleep(Duration::from_millis(5));
             }
+        }
+
+        fn deferred(&self, rel: &str) -> Arc<Deferred> {
+            let ino = self.drive.state.ino_of(Path::new(rel));
+            let state = Mutex::new(Settling::Pending);
+            Arc::new(Deferred { ino, flags: libc::O_WRONLY, state, settled: Condvar::new() })
+        }
+    }
+
+    impl Drop for Gated {
+        fn drop(&mut self) {
+            self.open();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    // Runs `call` on its own thread and gives its result, or None if it is still blocked after `limit`
+    fn within<T: Send + 'static>(limit: Duration, call: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(call());
         });
-        (DriveFs::new(root.join("backing"), DaemonClient::new(socket)), root, fetches)
+        rx.recv_timeout(limit).ok()
     }
 
     #[test]
     fn lookups_in_one_folder_share_a_single_listing_fetch() {
-        let (drive, root, fetches) = drive_with_slow_daemon("shared");
+        let g = Gated::new("shared");
         let lookups: Vec<_> = (0..4)
             .map(|_| {
-                let state = drive.state.clone();
+                let state = g.drive.state.clone();
                 std::thread::spawn(move || state.listing(Path::new("")).get(OsStr::new("a.txt")).is_some())
             })
             .collect();
+        g.until(&g.listings, 1);
+        g.open();
         let found: Vec<bool> = lookups.into_iter().map(|t| t.join().unwrap()).collect();
-        let _ = std::fs::remove_dir_all(&root);
         assert_eq!(found, [true; 4]);
-        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(g.listings.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn a_listing_read_while_the_drive_changed_isnt_kept() {
-        let (drive, root, fetches) = drive_with_slow_daemon("epoch");
-        let state = drive.state.clone();
+        let g = Gated::new("epoch");
+        let state = g.drive.state.clone();
         let fetch = std::thread::spawn(move || state.listing(Path::new("")).get(OsStr::new("a.txt")).is_some());
-        std::thread::sleep(Duration::from_millis(100)); // the fetch is waiting for the daemon
-        drive.state.forget_listings(&[Path::new("a.txt")]);
-        let answered = fetch.join().unwrap();
-        let kept = drive.state.fresh_listing(Path::new("")).is_some();
-        drive.state.listing(Path::new(""));
-        let kept_next = drive.state.fresh_listing(Path::new("")).is_some();
-        let _ = std::fs::remove_dir_all(&root);
-        assert!(answered, "the fetch still answers its own caller");
-        assert!(!kept, "but what it read may predate the change");
-        assert!(kept_next);
-        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        g.until(&g.listings, 1); // the fetch is waiting for the daemon
+        g.drive.state.forget_listings(&[Path::new("a.txt")]);
+        g.open();
+        assert!(fetch.join().unwrap(), "the fetch still answers its own caller");
+        assert!(g.drive.state.fresh_listing(Path::new("")).is_none(), "but what it read may predate the change");
+        g.drive.state.listing(Path::new(""));
+        assert!(g.drive.state.fresh_listing(Path::new("")).is_some());
+        assert_eq!(g.listings.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn uses_of_a_deferred_open_that_come_at_once_download_it_once() {
+        let g = Gated::new("settle-once");
+        let deferred = g.deferred("a.txt");
+        let uses: Vec<_> = (0..2)
+            .map(|_| {
+                let (state, deferred) = (g.drive.state.clone(), deferred.clone());
+                std::thread::spawn(move || state.settle(FileHandle(0), &deferred, 0, false).is_ok())
+            })
+            .collect();
+        g.until(&g.downloads, 1);
+        g.open();
+        let settled: Vec<bool> = uses.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(settled, [true, true]);
+        assert_eq!(g.downloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_use_waiting_on_another_gives_up_as_soon_as_its_own_app_does() {
+        let g = Gated::new("settle-interrupted");
+        let deferred = g.deferred("a.txt");
+        let (state, first_use) = (g.drive.state.clone(), deferred.clone());
+        let first = std::thread::spawn(move || state.settle(FileHandle(0), &first_use, 0, false).is_ok());
+        g.until(&g.downloads, 1);
+        // A thread that is gone counts as an app that gave up
+        let (state, second_use) = (g.drive.state.clone(), deferred.clone());
+        let started = Instant::now();
+        let second =
+            within(Duration::from_secs(5), move || state.settle(FileHandle(0), &second_use, u32::MAX, false).err());
+        assert_eq!(second, Some(Some(Errno::EINTR)), "the waiting use stayed stuck");
+        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+        g.open();
+        assert!(first.join().unwrap());
+    }
+
+    #[test]
+    fn a_settle_cut_short_leaves_the_open_to_the_next_use() {
+        let ino = 7;
+        let state = Mutex::new(Settling::Busy);
+        let deferred = Deferred { ino, flags: libc::O_WRONLY, state, settled: Condvar::new() };
+        drop(SettleGuard { deferred: &deferred }); // as a panic in settle_now would
+        assert!(matches!(*lock(&deferred.state), Settling::Pending));
     }
 
     #[test]

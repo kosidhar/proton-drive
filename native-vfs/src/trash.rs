@@ -29,7 +29,6 @@ pub enum TrashNode {
 
 pub struct TrashArea {
     name: String,
-    ttl: Duration,
     inner: Mutex<Inner>,
 }
 
@@ -93,13 +92,7 @@ impl Inner {
 
 impl TrashArea {
     pub fn new(uid: u32) -> Self {
-        TrashArea { name: format!(".Trash-{uid}"), ttl: INFO_TTL, inner: Mutex::new(Inner::default()) }
-    }
-
-    #[cfg(test)]
-    fn with_ttl(mut self, ttl: Duration) -> Self {
-        self.ttl = ttl;
-        self
+        TrashArea { name: format!(".Trash-{uid}"), inner: Mutex::new(Inner::default()) }
     }
 
     /// The trash folder's name at the top of the drive.
@@ -139,9 +132,8 @@ impl TrashArea {
     // A trasher that never finished leaves nothing behind for long
     fn inner(&self) -> MutexGuard<'_, Inner> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let ttl = self.ttl;
-        inner.infos.retain(|_, info| info.created.elapsed() < ttl);
-        inner.trashed.retain(|_, at| at.elapsed() < ttl);
+        inner.infos.retain(|_, info| info.created.elapsed() < INFO_TTL);
+        inner.trashed.retain(|_, at| at.elapsed() < INFO_TTL);
         inner
     }
 
@@ -404,12 +396,19 @@ mod tests {
 
     #[test]
     fn what_a_trasher_leaves_behind_expires() {
-        let trash = TrashArea::new(1000).with_ttl(Duration::from_millis(30));
+        let trash = TrashArea::new(1000);
         trash.create_info(os("h.trashinfo"), true, false).unwrap();
+        trash.create_info(os("fresh.trashinfo"), true, false).unwrap();
         assert_eq!(trash.trashed(os("i")), None);
-        assert_eq!(info_names(&trash), ["h.trashinfo"]);
-        std::thread::sleep(Duration::from_millis(60));
-        assert!(info_names(&trash).is_empty());
+        assert_eq!(info_names(&trash), ["fresh.trashinfo", "h.trashinfo"]);
+        // Made a minute and a bit ago, as far as the trash area can tell
+        let long_ago = Instant::now().checked_sub(INFO_TTL + Duration::from_secs(1)).unwrap();
+        {
+            let mut inner = trash.inner.lock().unwrap();
+            inner.infos.get_mut(os("h.trashinfo")).unwrap().created = long_ago;
+            *inner.trashed.get_mut(os("i")).unwrap() = long_ago;
+        }
+        assert_eq!(info_names(&trash), ["fresh.trashinfo"]);
         assert!(trash.inner().trashed.is_empty());
     }
 }
