@@ -11,6 +11,7 @@ import {
     DEFAULT_SDK_VERSION,
     downloadDriveNodeToLocal,
     getClaimedSize,
+    getConfig,
     getName,
     init as initSdkRuntime,
     listFolderChildren,
@@ -20,6 +21,8 @@ import {
     uploadLocalFileToDrive,
 } from '../sdk';
 import { DAEMON_NOT_RUNNING_MESSAGE, runAvailabilityCommand } from './availabilityCommands';
+import { daemonRunning, MOVING_FILES_MESSAGE, pendingMoveMarker } from './daemonProbe';
+import { defaultControlSocketPath } from '../daemon/controlServer';
 import { migrateExcludedFolders } from '../sync/availabilityMigration';
 import { backingDirFor } from '../sync/driveMode';
 import { formatBytes, ProtonDriveSyncEngine } from '../sync/syncEngine';
@@ -27,14 +30,23 @@ import { SyncStateDatabase } from '../sync/syncStateDb';
 
 const DAEMON_BASE_URL = `http://${DEFAULT_DAEMON_HOST}:${DEFAULT_DAEMON_PORT}`;
 
+// The daemon runs when its control socket accepts a connection, or else its TCP API answers
 async function isDaemonRunning(): Promise<boolean> {
-    try {
-        const res = await fetch(`${DAEMON_BASE_URL}/api/status`, {
-            signal: AbortSignal.timeout(1000),
-        });
-        return res.ok;
-    } catch {
-        return false;
+    return daemonRunning({ socketPath: defaultControlSocketPath(), statusUrl: `${DAEMON_BASE_URL}/api/status` });
+}
+
+// The state database, found without starting the SDK runtime (which a refusal never needs)
+function stateDbPathFromConfig(): string {
+    const config = getConfig({ appVersion: DEFAULT_APP_VERSION, sdkVersion: DEFAULT_SDK_VERSION, clientUidPrefix: DEFAULT_CLIENT_UID_PREFIX });
+    return path.join(config.appDir, 'ubuntu-sync-state.sqlite');
+}
+
+// An engine of the CLI's own is never run while files are moving between the sync folder and the backing store: the
+// half not moved yet would read as deleted. Only the daemon finishes that move.
+function refuseWhileMoving(): void {
+    if (pendingMoveMarker(stateDbPathFromConfig()) !== null) {
+        console.error(MOVING_FILES_MESSAGE);
+        process.exit(2);
     }
 }
 
@@ -48,6 +60,26 @@ async function daemonSyncDir(): Promise<string | null> {
     } catch {
         return null;
     }
+}
+
+// POST /conflicts/resolve on the daemon's control socket; throws with the daemon's own message when it refuses
+async function resolveConflictOnDaemon(id: number, choice: string): Promise<{ localRelPath: string }> {
+    let res: Response;
+    try {
+        res = await fetch('http://localhost/conflicts/resolve', {
+            unix: defaultControlSocketPath(),
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id, choice }),
+        } as RequestInit & { unix: string });
+    } catch {
+        throw new Error(`The daemon is running, but its control socket ${defaultControlSocketPath()} didn't answer`);
+    }
+    const body = (await res.json().catch(() => ({}))) as { error?: string; conflict?: { localRelPath?: string } };
+    if (!res.ok) {
+        throw new Error(body.error ?? `The daemon refused to resolve conflict #${id} (HTTP ${res.status})`);
+    }
+    return { localRelPath: body.conflict?.localRelPath ?? '?' };
 }
 
 async function runAvailabilityCli(action: 'pin' | 'free' | 'hide' | 'unhide' | 'status', target: string | undefined): Promise<void> {
@@ -267,10 +299,16 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
 
     if (cmd === 'sync') {
         if (await isDaemonRunning()) {
-            await fetch(`${DAEMON_BASE_URL}/api/sync`, { method: 'POST' });
+            const res = await fetch(`${DAEMON_BASE_URL}/api/sync`, { method: 'POST' }).catch((err: unknown) => {
+                throw new Error(`The daemon is running, but its API at ${DAEMON_BASE_URL} didn't answer: ${err instanceof Error ? err.message : String(err)}`);
+            });
+            if (!res.ok) {
+                throw new Error(`The daemon refused to sync (HTTP ${res.status})`);
+            }
             console.log('Triggered immediate synchronization pass on running daemon.');
             return;
         }
+        refuseWhileMoving();
         const runtime = await createStandaloneRuntime(verboseFlag);
         try {
             if (!runtime.auth.isLoggedIn()) {
@@ -339,15 +377,26 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
 
     if (cmd === 'conflicts') {
         const sub = args[1];
+        if (sub === 'resolve') {
+            const id = Number(args[2]);
+            const choice = args[3] as 'keep-both' | 'keep-local' | 'keep-remote';
+            if (!id || !['keep-both', 'keep-local', 'keep-remote'].includes(choice)) {
+                throw new Error('Usage: proton-drive-ubuntu conflicts resolve <id> <keep-both|keep-local|keep-remote>');
+            }
+            // A running daemon resolves it with its own engine, over the user-only control socket
+            if (await isDaemonRunning()) {
+                const resolved = await resolveConflictOnDaemon(id, choice);
+                console.log(`Conflict #${id} (${resolved.localRelPath}) resolved with ${choice}.`);
+                return;
+            }
+            refuseWhileMoving();
+        }
         const runtime = await createStandaloneRuntime(verboseFlag);
         try {
             const stateDb = new SyncStateDatabase(path.join(runtime.config.appDir, 'ubuntu-sync-state.sqlite'));
             if (sub === 'resolve') {
                 const id = Number(args[2]);
                 const choice = args[3] as 'keep-both' | 'keep-local' | 'keep-remote';
-                if (!id || !['keep-both', 'keep-local', 'keep-remote'].includes(choice)) {
-                    throw new Error('Usage: proton-drive-ubuntu conflicts resolve <id> <keep-both|keep-local|keep-remote>');
-                }
                 const engine = new ProtonDriveSyncEngine(
                     runtime.sdk,
                     runtime.eventsManager,
