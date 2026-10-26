@@ -2322,6 +2322,136 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
     });
 
+    // #47: a file uploaded from this computer was recorded but left out of the remote index until a later pass listed its
+    // folder, so freeing it right away hid it from the drive ("Not in Proton Drive"). An upload, a new node or a new
+    // revision, now goes into the index at once, as a listing would put it there.
+    describe('an upload is in the remote index at once (#47)', () => {
+        const setup = (layout: 'plain' | 'virtual') => {
+            if (layout === 'virtual') stateDb.setMeta('driveLayout', 'virtual');
+            const drive = makeMockDrive();
+            const backingDir = path.join(tempDir, 'files');
+            const localRoot = layout === 'virtual' ? backingDir : stateDb.getSettings().syncDir;
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                backingDir,
+            });
+            return { ...drive, engine, localRoot, files: localFiles(stateDb, () => localRoot), local: (rel: string) => path.join(localRoot, rel) };
+        };
+        const sha1Of = (content: string) => new Bun.CryptoHasher('sha1').update(content).digest('hex');
+        // Freed right after its upload, a file is online-only: the drive lists it, status says so, and an open brings it back
+        const freedRightAway = async (d: ReturnType<typeof setup>, folder: string, name: string, content: string) => {
+            const rel = `${folder}/${name}`;
+            const entry = d.engine.remoteIndex.getByPath(rel);
+            expect(entry).toMatchObject({ type: 'file', name, size: Buffer.byteLength(content), sha1: sha1Of(content) });
+            expect((await d.engine.setAvailability(folder, 'free')).state).toBe('online-only');
+            expect(await d.files.exists(rel)).toBe(false);
+            expect(d.engine.vfsChildren(folder)).toContainEqual({ name, type: 'file', size: Buffer.byteLength(content), mtimeMs: entry!.mtimeMs });
+            expect(await d.engine.availabilityOf(rel)).toBe('online-only');
+            await d.engine.hydrate(rel);
+            expect(await readFile(d.local(rel), 'utf8')).toBe(content);
+            expect(d.calls.trashed).toEqual([]);
+        };
+
+        for (const layout of ['plain', 'virtual'] as const) {
+            test(`${layout}: a file the watcher uploads, freed right away, stays in the drive as online-only`, async () => {
+                const d = setup(layout);
+                await d.engine.reconcileNow(); // an empty drive
+                const content = 'written through the drive, then freed';
+                await d.files.writeLocal('fod2-test/a.txt', content);
+
+                await (d.engine as any).handleLocalFileChange('fod2-test');
+                await (d.engine as any).handleLocalFileChange('fod2-test/a.txt');
+
+                expect(d.calls.uploads).toEqual(['fod2-test/a.txt']);
+                await freedRightAway(d, 'fod2-test', 'a.txt', content);
+            });
+
+            test(`${layout}: a file a sync pass uploads, freed right away, stays in the drive as online-only`, async () => {
+                const d = setup(layout);
+                const content = 'new on this computer';
+                await d.files.writeLocal('Docs/n.txt', content);
+
+                await d.engine.reconcileNow();
+
+                expect(d.calls.uploads).toEqual(['Docs/n.txt']);
+                await freedRightAway(d, 'Docs', 'n.txt', content);
+            });
+
+            test(`${layout}: the folders made on the way for a file are in the index with it`, async () => {
+                const d = setup(layout);
+                await d.engine.reconcileNow();
+                const content = 'deep';
+                await d.files.writeLocal('A/B/c.txt', content);
+
+                await (d.engine as any).handleLocalFileChange('A/B/c.txt'); // only the file: its folders are made for it
+
+                expect(d.engine.vfsChildren('').map((e) => e.name)).toEqual(['A']);
+                expect(d.engine.vfsChildren('A').map((e) => e.name)).toEqual(['B']);
+                await freedRightAway(d, 'A/B', 'c.txt', content);
+                expect(d.engine.vfsChildren('A').map((e) => e.name)).toEqual(['B']);
+            });
+
+            test(`${layout}: a new revision, from the watcher or a pass, updates the size, time and checksum in the index`, async () => {
+                const d = setup(layout);
+                await d.engine.reconcileNow();
+                await d.files.writeLocal('a.txt', 'v1');
+                await (d.engine as any).handleLocalFileChange('a.txt');
+                const uid = d.engine.remoteIndex.getByPath('a.txt')!.uid;
+                const edit = async (content: string, at: number) => {
+                    await writeFile(d.local('a.txt'), content);
+                    await utimes(d.local('a.txt'), at, at);
+                    return { uid, size: Buffer.byteLength(content), sha1: sha1Of(content), mtimeMs: at * 1000 };
+                };
+
+                const second = await edit('the second version', 1_700_000_000);
+                await (d.engine as any).handleLocalFileChange('a.txt');
+                expect(d.engine.remoteIndex.getByPath('a.txt')).toMatchObject(second);
+
+                const third = await edit('a third version, longer still', 1_700_000_100);
+                await d.engine.reconcileNow(); // lists the root first, then uploads
+                expect(d.engine.remoteIndex.getByPath('a.txt')).toMatchObject(third);
+                expect(d.calls.uploads).toEqual(['a.txt', 'a.txt', 'a.txt']);
+            });
+        }
+
+        test('a new revision of a node the index dropped meanwhile (a cloud delete event) does not put it back', async () => {
+            const d = setup('virtual');
+            await d.engine.reconcileNow();
+            await d.files.writeLocal('a.txt', 'v1');
+            await (d.engine as any).handleLocalFileChange('a.txt');
+            d.engine.remoteIndex.removeSubtree(d.engine.remoteIndex.getByPath('a.txt')!.uid); // as a NodeDeleted event does
+
+            await d.files.writeLocal('a.txt', 'v2, uploaded as the delete arrives');
+            await (d.engine as any).handleLocalFileChange('a.txt');
+
+            expect(d.calls.uploads).toEqual(['a.txt', 'a.txt']);
+            expect(d.engine.remoteIndex.getByPath('a.txt')).toBeNull();
+        });
+
+        test('a conflict copy is in the index once uploaded', async () => {
+            const d = setup('virtual');
+            d.add('Docs/doc.txt', 'base');
+            await d.engine.reconcileNow();
+            await d.engine.setAvailability('Docs', 'pin');
+            expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('base');
+            // Both sides change: the cloud on another device, the local copy here
+            const node = d.nodes.get('vol~Docs/doc.txt')!;
+            d.nodes.set(node.uid, makeMockNode({ uid: node.uid, parentUid: node.parentUid, nameStr: 'doc.txt', type: NodeType.File, content: 'cloud edit' }));
+            await d.files.writeLocal('Docs/doc.txt', 'my edit');
+
+            await d.engine.reconcileNow();
+
+            const copy = stateDb.getAllItems().find((i) => i.localRelPath.startsWith('Docs/doc (conflict '));
+            expect(copy).toBeDefined();
+            expect(d.engine.remoteIndex.getByPath(copy!.localRelPath)).toMatchObject({
+                uid: copy!.nodeUid,
+                type: 'file',
+                size: Buffer.byteLength('my edit'),
+                sha1: sha1Of('my edit'),
+            });
+            await freedRightAway(d, 'Docs', path.posix.basename(copy!.localRelPath), 'my edit');
+        });
+    });
+
     // Projects is deleted or trashed in the cloud (on the web, or on another device) while this computer holds things
     // in it that exist nowhere else: they must survive, in the desktop Trash or where they are (issue #16)
     describe('cloud-side deletes', () => {

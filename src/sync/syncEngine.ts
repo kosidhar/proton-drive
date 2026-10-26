@@ -1288,6 +1288,9 @@ export class ProtonDriveSyncEngine {
                 },
             });
 
+            if (result.nodeUid && (result.status === 'uploaded' || result.status === 'updated-revision')) {
+                this.indexUploaded(result.nodeUid, parentNode.uid, path.posix.basename(relPath), result);
+            }
             // A name taken by another file (with 'skip') is left to the caller
             if (result.nodeUid && result.status !== 'skipped') {
                 const item: Omit<SyncedItemRecord, 'updatedAt'> = {
@@ -3266,6 +3269,31 @@ export class ProtonDriveSyncEngine {
             this.indexWrite(() => this.index.upsert(entry));
         } catch (error: unknown) {
             this.logger.warn(`Failed to add ${relPath} to the remote index: ${error}`);
+        }
+    }
+
+    // A file just uploaded, as a new node or a new revision, goes into the remote index at once, as a listing of its folder
+    // would put it there (#47): Free up space, status, the drive's listings and an open then see it without waiting for
+    // the next pass to list that folder. Its size, time and checksum are what the upload claimed. A new revision updates
+    // the node's entry where it is (it doesn't rename the node), and only while the index has it: one dropped meanwhile,
+    // deleted in the cloud, isn't put back. A new node goes into its folder, if the index has that folder (if not, the
+    // listing that adds the folder adds the file too).
+    private indexUploaded(uid: string, parentUid: string, name: string, result: UploadResult): void {
+        const claimed = { size: result.size, mtimeMs: new Date(result.mtimeMs).getTime(), sha1: result.sha1 };
+        const known = this.index.getByUid(uid);
+        const parent = known || result.status !== 'uploaded' ? null : this.index.getByUid(parentUid);
+        let entry: RemoteIndexEntry;
+        if (known) {
+            entry = { ...known, ...claimed };
+        } else if (parent?.type === 'folder') {
+            entry = { uid, parentUid, relPath: joinRel(parent.relPath, name), name, type: 'file', ...claimed };
+        } else {
+            return;
+        }
+        try {
+            this.indexWrite(() => this.index.upsert(entry));
+        } catch (error: unknown) {
+            this.logger.warn(`Failed to add ${entry.relPath} to the remote index: ${error}`);
         }
     }
 
