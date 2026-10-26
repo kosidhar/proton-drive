@@ -523,6 +523,7 @@ export async function startSyncDaemon(options: {
             socketPath: defaultControlSocketPath(),
             engine,
             mountAgain: () => drive.mountAgain(),
+            driveMove: (action, from, to) => drive.resolveMove(action, from, to),
         });
     } catch (err) {
         runtime.logger.error(`Control socket unavailable, availability actions are disabled: ${String(err)}`);

@@ -342,7 +342,7 @@ describe('DriveController at start', () => {
         expect(readDriveLayout(s.stateDb)).toBe('plain');
         expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBeNull();
         expect(s.supervisors.filter((x) => x.events.includes('start'))).toEqual([]);
-        expect(s.controller.status()).toEqual({ mode: 'plain', mounted: false, reason: 'move-failed', error: 'EACCES: permission denied' });
+        expect(s.controller.status()).toMatchObject({ mode: 'plain', mounted: false, reason: 'move-failed', error: 'EACCES: permission denied' });
         expect(() => s.engine.vfsChildren('')).not.toThrow(); // not held
     });
 
@@ -430,115 +430,7 @@ describe('DriveController: a store already holding one of the sync folder\'s nam
     });
 });
 
-describe('DriveController: every failed move has a way out', () => {
-    // Switched off, the move out of the store stops part way (one disk, so no copy is involved)
-    const stuckMovingOut = async () => {
-        const s = setup();
-        s.leftVirtual();
-        const before = snapshot(s.backingDir);
-        let failing = false;
-        const flaky: MoveSeams = {
-            onStep: (step) => {
-                if (step === 'entry' && failing) throw new Error('EIO: i/o error');
-            },
-        };
-        const started = await s.boot({ moveSeams: flaky });
-        failing = true;
-        await expect(started.controller.setVirtualDriveWanted(false)).rejects.toThrow('EIO');
-        expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBe('plain');
-        expect(started.controller.status()).toMatchObject({ reason: 'move-failed', error: 'EIO: i/o error' });
-        expect(() => started.engine.vfsChildren('')).toThrow('Proton Drive is busy moving files');
-        return { s, before, ...started, recover: () => (failing = false) };
-    };
-
-    test('switching back moves everything back toward the drive and mounts it', async () => {
-        const { s, before, controller, engine, recover } = await stuckMovingOut();
-        recover();
-        await controller.setVirtualDriveWanted(true);
-        expect(readDriveLayout(s.stateDb)).toBe('virtual');
-        expect(snapshot(s.backingDir)).toEqual(before);
-        expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBeNull();
-        expect(controller.status()).toEqual({ mode: 'virtual', mounted: true, reason: null });
-        expect(() => engine.vfsChildren('')).not.toThrow();
-    });
-
-    test('switching off again retries the move out', async () => {
-        const { s, before, controller, recover } = await stuckMovingOut();
-        recover();
-        await controller.setVirtualDriveWanted(false);
-        expect(readDriveLayout(s.stateDb)).toBe('plain');
-        expect(snapshot(s.syncDir)).toEqual(before);
-        expect(controller.status()).toEqual({ mode: 'plain', mounted: false, reason: 'switched-off' });
-    });
-
-    test('Mount again after a move out that failed retries it, and then says the drive is switched off', async () => {
-        const { s, before, controller, recover } = await stuckMovingOut();
-        recover();
-        await controller.mountAgain();
-        expect(readDriveLayout(s.stateDb)).toBe('plain');
-        expect(snapshot(s.syncDir)).toEqual(before);
-        expect(controller.status()).toEqual({ mode: 'plain', mounted: false, reason: 'switched-off' });
-    });
-
-    for (const seenAs of ['another device', 'a cross-device refusal'] as const) {
-    test(`switching back while a move out to another disk is stuck (${seenAs}) asks to free space there, and moves nothing more`, async () => {
-        const s = setup();
-        s.leftVirtual();
-        const before = snapshot(s.backingDir, { folderTimes: false });
-        let full = false;
-        let copies = 0;
-        const { copyFileSync } = await import('node:fs');
-        const otherDisk: MoveSeams = {
-            // A bind mount: one device number, yet rename(2) refuses
-            deviceOf: (p) => (seenAs === 'another device' && p.startsWith(s.syncDir) ? 2 : 1),
-            moveSameDisk: () => {
-                throw exdev();
-            },
-            copyFile: (from, to) => {
-                if (full && ++copies > 2) throw enospc();
-                copyFileSync(from, to);
-            },
-        };
-        const { controller } = await s.boot({ moveSeams: otherDisk });
-        full = true;
-        await expect(controller.setVirtualDriveWanted(false)).rejects.toThrow(/ENOSPC/);
-        expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBe('plain');
-        const copiesWhenStuck = copies;
-
-        await expect(controller.setVirtualDriveWanted(true)).rejects.toThrow(/Free space on the disk holding .*ProtonDrive/);
-        expect(copies).toBe(copiesWhenStuck);
-        expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBe('plain');
-        expect(s.stateDb.getMeta('virtualDriveWanted')).toBe('0');
-        expect(controller.status()).toMatchObject({ reason: 'move-failed' });
-
-        full = false; // space freed: the move out finishes
-        await controller.setVirtualDriveWanted(false);
-        expect(readDriveLayout(s.stateDb)).toBe('plain');
-        expect(snapshot(s.syncDir, { folderTimes: false })).toEqual(before);
-    });
-    }
-
-    test('Mount again retries a move into the drive that failed and was undone, then mounts', async () => {
-        const s = setup({ wanted: false });
-        s.fillTree(s.syncDir);
-        const before = snapshot(s.syncDir);
-        let failing = true;
-        const { controller } = await s.boot({
-            moveSeams: {
-                onStep: (step) => {
-                    if (step === 'entry' && failing) throw new Error('EIO: i/o error');
-                },
-            },
-        });
-        await expect(controller.setVirtualDriveWanted(true)).rejects.toThrow('EIO');
-        expect(readDriveLayout(s.stateDb)).toBe('plain');
-        failing = false;
-        await controller.mountAgain();
-        expect(readDriveLayout(s.stateDb)).toBe('virtual');
-        expect(snapshot(s.backingDir)).toEqual(before);
-        expect(controller.status()).toEqual({ mode: 'virtual', mounted: true, reason: null });
-    });
-
+describe('DriveController: the switch when things go wrong', () => {
     test('a switch that waits too long for the engine changes nothing, not even the setting, and says why', async () => {
         const s = setup({ loggedIn: true, wanted: false, holdTimeoutMs: 50 });
         s.fillTree(s.syncDir);
@@ -571,7 +463,7 @@ describe('DriveController: every failed move has a way out', () => {
         await expect(controller.setVirtualDriveWanted(false)).rejects.toThrow(/sshfs/);
         expect(readDriveLayout(s.stateDb)).toBe('virtual');
         expect(s.supervisors).toHaveLength(2); // the drive runs again on the store
-        expect(controller.status()).toEqual({ mode: 'virtual', mounted: true, reason: null });
+        expect(controller.status()).toMatchObject({ mode: 'virtual', mounted: true, reason: null });
     });
 });
 
@@ -679,7 +571,7 @@ describe('DriveController: switching the virtual drive on and off', () => {
         });
         await expect(controller.setVirtualDriveWanted(true)).rejects.toThrow('EACCES: permission denied');
         expect(snapshot(s.syncDir)).toEqual(before);
-        expect(controller.status()).toEqual({ mode: 'plain', mounted: false, reason: 'move-failed', error: 'EACCES: permission denied' });
+        expect(controller.status()).toMatchObject({ mode: 'plain', mounted: false, reason: 'move-failed', error: 'EACCES: permission denied' });
         await controller.setVirtualDriveWanted(false);
         expect(controller.status()).toEqual({ mode: 'plain', mounted: false, reason: 'switched-off' });
     });
@@ -712,6 +604,29 @@ describe('DriveController: relocating the drive folder', () => {
             [s.syncDir, ['start', 'stop', 'release']],
             [target, ['start']],
         ]);
+    });
+
+    test('files that appear in the new folder while the drive is being unmounted keep it from mounting there (m3)', async () => {
+        const s = setup();
+        s.leftVirtual();
+        const store = snapshot(s.backingDir);
+        const { controller } = await s.boot();
+        const target = path.join(s.root, 'Elsewhere');
+        const release = s.supervisors[0]!.release.bind(s.supervisors[0]!);
+        s.supervisors[0]!.release = async () => {
+            s.put(path.join(target, 'saved meanwhile.txt'), "an app's"); // after the first look, before the mount
+            return release();
+        };
+
+        await expect(controller.relocate(target)).rejects.toThrow(`Choose an empty folder, or a new one: ${target} already holds files`);
+
+        expect(s.stateDb.getSettings().syncDir).toBe(s.syncDir);
+        expect(s.supervisors.map((x) => [x.mountpoint, x.events])).toEqual([
+            [s.syncDir, ['start', 'stop', 'release']],
+            [s.syncDir, ['start']],
+        ]);
+        expect(readFileSync(path.join(target, 'saved meanwhile.txt'), 'utf8')).toBe("an app's");
+        expect(snapshot(s.backingDir)).toEqual(store);
     });
 
     test('the folder it already is, however it is written, changes nothing and leaves the drive mounted', async () => {
@@ -773,72 +688,6 @@ describe('DriveController: a new folder must be missing or empty (S30)', () => {
     }
 });
 
-describe('POST /api/settings with a relocation that stopped (I2)', () => {
-    const serve = (s: ReturnType<typeof setup>) => {
-        const server = Bun.serve({
-            port: 0,
-            hostname: '127.0.0.1',
-            fetch: (req) => settingsRoute(req, { stateDb: s.stateDb, drive: s.controller, engine: s.engine }),
-        });
-        cleanups.push(() => void server.stop(true));
-        return (body: unknown) =>
-            fetch(`http://127.0.0.1:${server.port}/api/settings`, { method: 'POST', body: JSON.stringify(body) }).then(async (r) => ({
-                status: r.status,
-                json: (await r.json()) as { error?: string; settings?: { syncDir: string } },
-            }));
-    };
-    const stopped = async () => {
-        const s = setup({ wanted: false });
-        s.fillTree(s.syncDir);
-        const before = snapshot(s.syncDir);
-        let failing = true;
-        await s.boot({
-            moveSeams: {
-                onStep: (step) => {
-                    if (step === 'entry' && failing) throw new Error('EIO: i/o error');
-                },
-            },
-        });
-        const post = serve(s);
-        const to = path.join(s.root, 'Elsewhere');
-        expect((await post({ syncDir: to })).status).toBe(500);
-        expect(s.stateDb.getMeta(SYNC_DIR_MOVING)).not.toBeNull();
-        return { s, before, post, to, recover: () => (failing = false) };
-    };
-
-    test('asking for the folder it started from (the setting as it still is) moves everything back', async () => {
-        const { s, before, post, to, recover } = await stopped();
-        recover();
-        const res = await post({ syncDir: s.syncDir, notificationsEnabled: false });
-        expect(res.status).toBe(200);
-        expect(res.json.settings?.syncDir).toBe(s.syncDir);
-        expect(snapshot(s.syncDir)).toEqual(before);
-        expect(readdirSync(to)).toEqual([]);
-        expect(s.stateDb.getMeta(SYNC_DIR_MOVING)).toBeNull();
-        expect(() => s.engine.vfsChildren('')).not.toThrow();
-    });
-
-    test('asking for the folder it was moving to finishes the move', async () => {
-        const { s, before, post, to, recover } = await stopped();
-        recover();
-        const res = await post({ syncDir: to });
-        expect(res.status).toBe(200);
-        expect(res.json.settings?.syncDir).toBe(to);
-        expect(snapshot(to)).toEqual(before);
-        expect(readdirSync(s.syncDir)).toEqual([]);
-    });
-
-    test('the folder it already is, written differently, with nothing stopped, changes nothing', async () => {
-        const s = setup({ wanted: false });
-        await s.boot();
-        const post = serve(s);
-        const res = await post({ syncDir: `${s.syncDir}/`, notificationsEnabled: true });
-        expect(res.status).toBe(200);
-        expect(res.json.settings?.syncDir).toBe(s.syncDir);
-        expect(s.stateDb.getSettings().notificationsEnabled).toBe(true);
-    });
-});
-
 describe('DriveController: a plain relocation cut short', () => {
     test('is finished at the next start, before the files move to match the mode', async () => {
         const s = setup({ wanted: false });
@@ -875,7 +724,7 @@ describe('DriveController: a plain relocation cut short', () => {
         expect(controller.status()).toMatchObject({ reason: 'move-failed', error: 'EIO: i/o error' });
         expect(() => engine.vfsChildren('')).toThrow('Proton Drive is busy moving files');
         expect(s.stateDb.getSettings().syncDir).toBe(s.syncDir);
-        await expect(controller.relocate(path.join(s.root, 'Third'))).rejects.toThrow(/back to/);
+        await expect(controller.relocate(path.join(s.root, 'Third'))).rejects.toThrow(/Move the Proton Drive folder back, or finish moving it/);
 
         failing = false;
         await controller.stop();
@@ -885,30 +734,267 @@ describe('DriveController: a plain relocation cut short', () => {
         expect(readdirSync(s.syncDir)).toEqual([]);
         expect(() => restarted.engine.vfsChildren('')).not.toThrow();
     });
+});
 
-    test('a relocation that stops part way is undone by relocating back to the old folder', async () => {
-        const s = setup({ wanted: false });
-        s.fillTree(s.syncDir);
-        const before = snapshot(s.syncDir);
-        let failing = true;
-        const { engine, controller } = await s.boot({
+// S31: finishing, retrying or moving back a move that stopped is an explicit action, over the control socket, never
+// implied by a settings save, the switch or Mount again (a daemon start still finishes an interrupted move)
+describe('Explicit actions for a move that stopped (S31)', () => {
+    const over = (s: ReturnType<typeof setup>) => {
+        const socketPath = path.join(s.root, 'control.sock');
+        const settings = Bun.serve({
+            port: 0,
+            hostname: '127.0.0.1',
+            fetch: (req) => settingsRoute(req, { stateDb: s.stateDb, drive: s.controller, engine: s.engine }),
+        });
+        cleanups.push(() => void settings.stop(true));
+        const json = async (r: Response) => ({ status: r.status, json: (await r.json()) as Record<string, unknown> });
+        return {
+            start: async () => {
+                const server = await startControlServer({
+                    socketPath,
+                    engine: s.engine,
+                    mountAgain: () => s.controller.mountAgain(),
+                    driveMove: (action, from, to) => s.controller.resolveMove(action, from, to),
+                });
+                cleanups.push(() => server.stop());
+            },
+            saveSettings: (body: unknown) =>
+                fetch(`http://127.0.0.1:${settings.port}/api/settings`, { method: 'POST', body: JSON.stringify(body) }).then(json),
+            move: (body: unknown) =>
+                fetch('http://localhost/drive/move', { unix: socketPath, method: 'POST', body: JSON.stringify(body) } as RequestInit).then(json),
+            mountAgain: () => fetch('http://localhost/vfs/mount', { unix: socketPath, method: 'POST' } as RequestInit).then(json),
+        };
+    };
+
+    // Switched off, the move out of the store stops part way (one disk, so no copy is involved)
+    const stuckMovingOut = async () => {
+        const s = setup();
+        s.leftVirtual();
+        const before = snapshot(s.backingDir);
+        let failing = false;
+        const started = await s.boot({
             moveSeams: {
                 onStep: (step) => {
                     if (step === 'entry' && failing) throw new Error('EIO: i/o error');
                 },
             },
         });
-        const to = path.join(s.root, 'Elsewhere');
-        await expect(controller.relocate(to)).rejects.toThrow('EIO');
-        expect(readdirSync(to).length).toBeGreaterThan(0); // part of it went
+        const api = over(s);
+        await api.start();
+        failing = true;
+        expect((await api.saveSettings({ virtualDriveWanted: false })).json.switchError).toBe('EIO: i/o error');
+        expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBe('plain');
+        expect(() => started.engine.vfsChildren('')).toThrow('Proton Drive is busy moving files');
+        return { s, before, api, ...started, recover: () => (failing = false) };
+    };
 
-        failing = false;
-        expect(await controller.relocate(s.syncDir)).toBe(s.syncDir);
+    test('a stuck layout move is named in the status with its actions; the switch and Mount again refuse, pointing to them', async () => {
+        const { s, api, controller } = await stuckMovingOut();
+        expect(controller.status()).toMatchObject({
+            reason: 'move-failed',
+            error: 'EIO: i/o error',
+            move: { kind: 'layout', from: s.backingDir, to: s.syncDir, error: 'EIO: i/o error', actions: ['finish', 'move-back'] },
+        });
+        const switched = await api.saveSettings({ virtualDriveWanted: true, notificationsEnabled: true });
+        expect(switched.status).toBe(200);
+        expect(String(switched.json.switchError)).toMatch(/Finish moving files, or Move files back/);
+        expect(s.stateDb.getSettings().notificationsEnabled).toBe(true); // the rest is saved
+        expect(s.stateDb.getMeta('virtualDriveWanted')).toBe('0');
+        const mounted = await api.mountAgain();
+        expect(mounted.status).toBe(400);
+        expect(String(mounted.json.error)).toMatch(/Finish moving files, or Move files back/);
+        expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBe('plain');
+    });
+
+    test('finish completes the move out', async () => {
+        const { s, before, api, controller, engine, recover } = await stuckMovingOut();
+        recover();
+        expect(await api.move({ action: 'finish' })).toEqual({ status: 200, json: { ok: true } });
+        expect(readDriveLayout(s.stateDb)).toBe('plain');
+        expect(snapshot(s.syncDir)).toEqual(before);
+        expect(controller.status()).toEqual({ mode: 'plain', mounted: false, reason: 'switched-off' });
+        expect(() => engine.vfsChildren('')).not.toThrow();
+    });
+
+    test('move back returns the files to the drive, mounts it, and the switch shows it on', async () => {
+        const { s, before, api, controller, recover } = await stuckMovingOut();
+        recover();
+        expect((await api.move({ action: 'move-back' })).status).toBe(200);
+        expect(readDriveLayout(s.stateDb)).toBe('virtual');
+        expect(snapshot(s.backingDir)).toEqual(before);
+        expect(s.stateDb.getMeta('virtualDriveWanted')).toBe('1');
+        expect(controller.status()).toEqual({ mode: 'virtual', mounted: true, reason: null });
+    });
+
+    for (const seenAs of ['another device', 'a cross-device refusal'] as const) {
+        test(`moving back while a move out to another disk is stuck (${seenAs}) asks to free space there and moves nothing more`, async () => {
+            const s = setup();
+            s.leftVirtual();
+            const before = snapshot(s.backingDir, { folderTimes: false });
+            let full = false;
+            let copies = 0;
+            const { copyFileSync } = await import('node:fs');
+            const { controller } = await s.boot({
+                moveSeams: {
+                    // A bind mount: one device number, yet rename(2) refuses
+                    deviceOf: (p) => (seenAs === 'another device' && p.startsWith(s.syncDir) ? 2 : 1),
+                    moveSameDisk: () => {
+                        throw exdev();
+                    },
+                    copyFile: (from, to) => {
+                        if (full && ++copies > 2) throw enospc();
+                        copyFileSync(from, to);
+                    },
+                },
+            });
+            const api = over(s);
+            await api.start();
+            full = true;
+            expect(String((await api.saveSettings({ virtualDriveWanted: false })).json.switchError)).toMatch(/ENOSPC/);
+            const copiesWhenStuck = copies;
+            if (seenAs === 'another device') {
+                expect(controller.status().move?.actions).toEqual(['finish']);
+            }
+
+            const back = await api.move({ action: 'move-back' });
+            expect(back.status).toBe(seenAs === 'another device' ? 409 : 500);
+            expect(String(back.json.error)).toMatch(/Free space on the disk holding .*ProtonDrive/);
+            expect(copies).toBe(copiesWhenStuck);
+            expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBe('plain');
+            expect(s.stateDb.getMeta('virtualDriveWanted')).toBe('0');
+
+            full = false; // space freed
+            expect((await api.move({ action: 'finish' })).status).toBe(200);
+            expect(readDriveLayout(s.stateDb)).toBe('plain');
+            expect(snapshot(s.syncDir, { folderTimes: false })).toEqual(before);
+        });
+    }
+
+    test('a move into the drive that failed and was undone offers retry; Mount again refuses until then', async () => {
+        const s = setup({ wanted: false });
+        s.fillTree(s.syncDir);
+        const before = snapshot(s.syncDir);
+        let failures = 1; // the move in fails once; the undo goes through
+        const { controller } = await s.boot({
+            moveSeams: {
+                onStep: (step) => {
+                    if (step === 'entry' && failures > 0) {
+                        failures--;
+                        throw new Error('EIO: i/o error');
+                    }
+                },
+            },
+        });
+        const api = over(s);
+        await api.start();
+        expect((await api.saveSettings({ virtualDriveWanted: true })).json.switchError).toBe('EIO: i/o error');
+        expect(readDriveLayout(s.stateDb)).toBe('plain');
+        expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBeNull();
+        expect(controller.status().move).toEqual({ kind: 'layout', from: s.syncDir, to: s.backingDir, error: 'EIO: i/o error', actions: ['retry'] });
+        const mounted = await api.mountAgain();
+        expect(mounted.status).toBe(400);
+        expect(String(mounted.json.error)).toMatch(/what can be done: retry/);
+        expect((await api.move({ action: 'retry' })).status).toBe(200);
+        expect(readDriveLayout(s.stateDb)).toBe('virtual');
+        expect(snapshot(s.backingDir)).toEqual(before);
+        expect(controller.status()).toEqual({ mode: 'virtual', mounted: true, reason: null });
+    });
+
+    test('with nothing waiting, or a malformed action, the route refuses and changes nothing', async () => {
+        const s = setup({ wanted: false });
+        await s.boot();
+        const api = over(s);
+        await api.start();
+        expect(await api.move({ action: 'finish' })).toEqual({
+            status: 409,
+            json: { error: 'Nothing is waiting to be finished or moved back', move: null },
+        });
+        expect((await api.move({ action: 'replace' })).status).toBe(400);
+        expect((await api.move({ action: 'retry', from: 3 })).status).toBe(400);
+    });
+
+    // A relocation of the plain folder stops part way (an injected I/O error)
+    const stoppedRelocation = async () => {
+        const s = setup({ wanted: false });
+        s.fillTree(s.syncDir);
+        const before = snapshot(s.syncDir);
+        let failing = true;
+        await s.boot({
+            moveSeams: {
+                onStep: (step) => {
+                    if (step === 'entry' && failing) throw new Error('EIO: i/o error');
+                },
+            },
+        });
+        const api = over(s);
+        await api.start();
+        const to = path.join(s.root, 'Elsewhere');
+        const moved = await api.saveSettings({ syncDir: to });
+        expect(moved.status).toBe(200);
+        expect(moved.json.folderError).toBe('EIO: i/o error');
+        expect(s.stateDb.getMeta(SYNC_DIR_MOVING)).not.toBeNull();
+        return { s, before, api, to, recover: () => (failing = false) };
+    };
+
+    test('a settings save naming the folder as it is stored changes nothing on disk, and saves the rest', async () => {
+        const { s, api, to } = await stoppedRelocation();
+        const old = snapshot(s.syncDir);
+        const moved = snapshot(to);
+        const res = await api.saveSettings({ syncDir: s.syncDir, notificationsEnabled: true, conflictStrategy: 'keep-local' });
+        expect(res.status).toBe(200);
+        expect(res.json).toMatchObject({ ok: true, folderError: null });
+        expect(snapshot(s.syncDir)).toEqual(old);
+        expect(snapshot(to)).toEqual(moved);
+        expect(s.stateDb.getMeta(SYNC_DIR_MOVING)).not.toBeNull();
+        expect(s.stateDb.getSettings()).toMatchObject({ notificationsEnabled: true, conflictStrategy: 'keep-local', syncDir: s.syncDir });
+        expect(s.controller.status().move).toEqual({
+            kind: 'relocation',
+            from: s.syncDir,
+            to,
+            error: 'EIO: i/o error',
+            actions: ['move-back', 'retry'],
+        });
+    });
+
+    test('move back and retry must name the stopped relocation exactly; move back then restores the old folder', async () => {
+        const { s, before, api, to, recover } = await stoppedRelocation();
+        const current = { kind: 'relocation', from: s.syncDir, to, error: 'EIO: i/o error', actions: ['move-back', 'retry'] };
+        for (const body of [{ action: 'move-back', from: to, to: s.syncDir }, { action: 'move-back' }, { action: 'retry', from: s.syncDir }]) {
+            const res = await api.move(body);
+            expect([body, res.status]).toEqual([body, 409]);
+            expect(res.json.move).toEqual(current);
+        }
+        expect((await api.move({ action: 'finish', from: s.syncDir, to })).status).toBe(409); // not a relocation's action
+        expect(s.stateDb.getMeta(SYNC_DIR_MOVING)).not.toBeNull();
+
+        recover();
+        expect((await api.move({ action: 'move-back', from: `${s.syncDir}/`, to })).status).toBe(200);
         expect(snapshot(s.syncDir)).toEqual(before);
         expect(readdirSync(to)).toEqual([]);
         expect(s.stateDb.getSettings().syncDir).toBe(s.syncDir);
         expect(s.stateDb.getMeta(SYNC_DIR_MOVING)).toBeNull();
-        expect(controller.status()).toEqual({ mode: 'plain', mounted: false, reason: 'switched-off' });
-        expect(() => engine.vfsChildren('')).not.toThrow();
+        expect(s.controller.status()).toEqual({ mode: 'plain', mounted: false, reason: 'switched-off' });
+    });
+
+    test('retry finishes the stopped relocation', async () => {
+        const { s, before, api, to, recover } = await stoppedRelocation();
+        recover();
+        expect((await api.move({ action: 'retry', from: s.syncDir, to })).status).toBe(200);
+        expect(s.stateDb.getSettings().syncDir).toBe(to);
+        expect(snapshot(to)).toEqual(before);
+        expect(readdirSync(s.syncDir)).toEqual([]);
+    });
+
+    test('a folder that is refused still lets the rest of the settings save', async () => {
+        const s = setup({ wanted: false });
+        s.fillTree(s.syncDir);
+        await s.boot();
+        const api = over(s);
+        const busy = path.join(s.root, 'Documents');
+        s.put(path.join(busy, 'mine.txt'), "the user's own");
+        const res = await api.saveSettings({ syncDir: busy, notificationsEnabled: true, ignorePatterns: ['*.bak'] });
+        expect(res.status).toBe(200);
+        expect(res.json).toMatchObject({ ok: true, folderError: `Choose an empty folder, or a new one: ${busy} already holds files` });
+        expect(s.stateDb.getSettings()).toMatchObject({ notificationsEnabled: true, ignorePatterns: ['*.bak'], syncDir: s.syncDir });
     });
 });

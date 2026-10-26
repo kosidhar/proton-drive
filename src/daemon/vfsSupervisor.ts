@@ -45,6 +45,21 @@ export interface VfsStatus {
     mounted: boolean;
     reason: VfsReason;
     error?: string; // why the move stopped, with move-failed
+    move?: DriveMove; // a move that stopped, and what can be done about it (POST /drive/move on the control socket)
+}
+
+// finish: complete a layout move toward where it was going; move-back: move the files back where they came from;
+// retry: try a move that failed again (a relocation, or a move into the drive that was undone)
+export type DriveMoveAction = 'finish' | 'move-back' | 'retry';
+
+// A move that stopped: a relocation of the sync folder, or files moving between the sync folder and the drive's store
+// (from and to are the folders the files are moving between), with the error and the actions available now
+export interface DriveMove {
+    kind: 'relocation' | 'layout';
+    from: string;
+    to: string;
+    error: string | null;
+    actions: DriveMoveAction[];
 }
 
 export interface VfsTiming {
@@ -145,7 +160,7 @@ export function notMountableReason(status: VfsStatus): string {
         case 'moving':
             return 'Proton Drive is busy moving files';
         case 'move-failed':
-            return `Moving the files failed: ${status.error ?? 'unknown error'}`;
+            return `Moving the files failed: ${status.error ?? 'unknown error'}${status.move ? ` (what can be done: ${status.move.actions.join(', ')})` : ''}`;
         default:
             return "Proton Drive is a plain folder: its files haven't moved into the virtual drive";
     }

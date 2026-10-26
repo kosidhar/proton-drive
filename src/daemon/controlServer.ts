@@ -5,11 +5,13 @@ import path from 'node:path';
 
 import { DriveOpError } from '../sync/driveOps';
 import type { AvailabilityAction, ProtonDriveSyncEngine } from '../sync/syncEngine';
+import type { DriveMoveAction } from './vfsSupervisor';
 
 // Pin, free, hide and unhide change what is on disk, and so do the virtual drive's hydrate, rename and delete, so they
 // are reachable only through this user-only Unix socket and never through the unauthenticated TCP API.
 
 const ACTIONS: readonly string[] = ['pin', 'free', 'hide', 'unhide'] satisfies AvailabilityAction[];
+const MOVE_ACTIONS: readonly string[] = ['finish', 'move-back', 'retry'] satisfies DriveMoveAction[];
 
 export function defaultControlSocketPath(): string {
     const runtimeDir = process.env.XDG_RUNTIME_DIR;
@@ -28,6 +30,9 @@ export interface ControlServerOptions {
     >;
     // Mount again (the tray and the app): absent while Proton Drive is a plain folder
     mountAgain?: () => Promise<void>;
+    // Finish, move back or retry a move that stopped (see DriveController.resolveMove); its errors may carry an HTTP
+    // status and the move waiting now
+    driveMove?: (action: DriveMoveAction, from?: string, to?: string) => Promise<void>;
 }
 
 // 'live' when something accepts connections on the socket, 'stale' when it refuses or is gone
@@ -170,6 +175,31 @@ async function mountRoute(req: Request, mountAgain: ControlServerOptions['mountA
     }
 }
 
+// POST /drive/move {action: 'finish' | 'move-back' | 'retry', from?, to?}: acts on a move that stopped, as /api/status
+// vfs.move lists it (a relocation needs its from and to). { ok: true }; 400 for a malformed request; 409 { error, move }
+// when the action can't be taken now (nothing waiting, another move, not possible), with the move waiting now (or null);
+// 500 { error, move } when the move failed again. Moving files is never reachable from the TCP API.
+async function driveMoveRoute(req: Request, driveMove: ControlServerOptions['driveMove']): Promise<Response> {
+    if (req.method !== 'POST') return jsonError('Method not allowed', 405);
+    if (!driveMove) return jsonError('Not found', 404);
+    const body = await jsonBody(req);
+    if (!body) return jsonError('Invalid JSON body');
+    if (typeof body.action !== 'string' || !MOVE_ACTIONS.includes(body.action)) {
+        return jsonError(`Unknown action: ${String(body.action)}`);
+    }
+    if ((body.from !== undefined && typeof body.from !== 'string') || (body.to !== undefined && typeof body.to !== 'string')) {
+        return jsonError('from and to must be folder paths');
+    }
+    try {
+        await driveMove(body.action as DriveMoveAction, body.from as string | undefined, body.to as string | undefined);
+        return Response.json({ ok: true });
+    } catch (err) {
+        const refused = err as { status?: unknown; move?: unknown };
+        const status = typeof refused.status === 'number' ? refused.status : 500;
+        return Response.json({ error: messageOf(err), move: refused.move ?? null }, { status });
+    }
+}
+
 export async function startControlServer(opts: ControlServerOptions): Promise<{ stop(): void }> {
     const { socketPath, engine } = opts;
     const dir = path.dirname(socketPath);
@@ -191,6 +221,9 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
             }
             if (url.pathname === '/vfs/mount') {
                 return mountRoute(req, opts.mountAgain);
+            }
+            if (url.pathname === '/drive/move') {
+                return driveMoveRoute(req, opts.driveMove);
             }
             if (url.pathname !== '/availability') {
                 return jsonError('Not found', 404);
