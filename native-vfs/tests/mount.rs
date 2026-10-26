@@ -249,13 +249,14 @@ fn serve(mut stream: UnixStream, backing: &Path, fake: &Fake, calls: &Calls) {
     );
 }
 
-/// A change's body as the test checks it: the helper's deadline (which must be about a minute from now) taken out, or
+/// A change's body as the test checks it: the helper's deadline (which must be 55 s from now) taken out, or
 /// left in, marked, when it is missing or wrong, so the test's comparison fails.
 fn without_deadline(raw: &[u8]) -> Value {
     let mut body: Value = serde_json::from_slice(raw).unwrap_or(Value::Null);
     let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
     let deadline = body.as_object_mut().and_then(|b| b.remove("deadlineMs")).and_then(|d| d.as_u64());
-    if !deadline.is_some_and(|d| d > now_ms + 50_000 && d <= now_ms + 61_000) {
+    // The helper's 60 s, less the margin it leaves for a change that starts just in time to finish
+    if !deadline.is_some_and(|d| d > now_ms + 50_000 && d <= now_ms + 55_000) {
         body["deadlineMs"] = json!(format!("missing or wrong: {deadline:?}"));
     }
     body

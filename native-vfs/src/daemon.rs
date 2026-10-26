@@ -19,9 +19,12 @@ pub const CHILDREN_TIMEOUT: Duration = Duration::from_secs(3);
 /// A download for an open completes or fails within 30 minutes.
 pub const HYDRATE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// A rename, delete or truncate waits its turn in the daemon's queue, but changes only this computer: no network. Each
-/// goes with the time this limit runs out (deadlineMs), and the daemon refuses one whose turn comes later, so a change
-/// the app was told failed (EIO) never happens afterwards.
+/// goes with a deadline (deadlineMs) a little short of this limit, and the daemon refuses one whose turn comes later,
+/// so a change the app was told failed (EIO) never happens afterwards.
 pub const CHANGE_TIMEOUT: Duration = Duration::from_secs(60);
+/// What the deadline leaves of CHANGE_TIMEOUT for a change whose turn starts just before it, so it is done (and
+/// answered) before the helper gives up.
+const DEADLINE_MARGIN: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// A daemon whose connection backlog stays full this long isn't serving.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -133,7 +136,7 @@ impl DaemonClient {
 
     /// A change of the drive, with the deadline after which the daemon must not make it any more.
     fn change(&self, route: &str, mut body: serde_json::Value) -> Result<(), DaemonError> {
-        let deadline = std::time::SystemTime::now() + CHANGE_TIMEOUT;
+        let deadline = std::time::SystemTime::now() + (CHANGE_TIMEOUT - DEADLINE_MARGIN);
         let deadline_ms = deadline.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
         body["deadlineMs"] = serde_json::Value::from(deadline_ms);
         self.request("POST", route, Some(&body), CHANGE_TIMEOUT, &|| false).map(|_| ())
@@ -536,14 +539,15 @@ mod tests {
     fn renames_and_deletes_send_their_flags_only_when_set_and_always_a_deadline() {
         let (client, bodies) = serve_recording("changes", "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}");
         let now_ms = || std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        let earliest = now_ms() + CHANGE_TIMEOUT.as_millis() as u64;
+        let ahead = (CHANGE_TIMEOUT - DEADLINE_MARGIN).as_millis() as u64;
+        let earliest = now_ms() + ahead;
         assert_eq!(client.rename("a.txt", "Docs/b.txt", false), Ok(()));
         assert_eq!(client.rename("a.txt", "b.txt", true), Ok(()));
         assert_eq!(client.delete("Docs", Removal::Unlink), Ok(()));
         assert_eq!(client.delete("Docs", Removal::Rmdir), Ok(()));
         assert_eq!(client.delete("Docs", Removal::Trash), Ok(()));
         assert_eq!(client.truncate("Docs/a.txt"), Ok(()));
-        let latest = now_ms() + CHANGE_TIMEOUT.as_millis() as u64;
+        let latest = now_ms() + ahead;
         let _ = std::fs::remove_file(&client.socket);
         let mut got: Vec<serde_json::Value> = bodies.try_iter().collect();
         // When the helper stops waiting, so the daemon never does it later
