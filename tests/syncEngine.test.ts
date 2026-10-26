@@ -1726,6 +1726,61 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
     });
 
+    // Issue #30: moving the plain sync folder to a new place must never replace anything already there
+    describe('relocating the plain sync folder', () => {
+        const setup = (loggedIn = true) => {
+            const drive = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => loggedIn }, stateDb, drive.logger);
+            return { ...drive, engine, oldDir: stateDb.getSettings().syncDir, newDir: path.join(tempDir, 'Elsewhere') };
+        };
+
+        test('a folder already in the new place is merged into, and a file already there steps aside; nothing is replaced', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'synced a');
+            d.add('top.txt', 'synced top');
+            d.engine.availability.setPin(d.root.uid, 'pinned', false);
+            await d.engine.start({ backgroundInitialReconcile: false });
+            await d.engine.reconcileNow();
+            await mkdir(path.join(d.newDir, 'Docs'), { recursive: true });
+            await writeFile(path.join(d.newDir, 'Docs', 'a.txt'), 'was already there');
+            await writeFile(path.join(d.newDir, 'Docs', 'mine.txt'), 'mine');
+            await writeFile(path.join(d.newDir, 'top.txt'), 'top already there');
+            const records = stateDb.getAllItems();
+
+            expect(await d.engine.relocateSyncFolder(d.oldDir, d.newDir)).toBe(d.newDir);
+
+            const at = (rel: string) => readFile(path.join(d.newDir, rel), 'utf8');
+            expect(await at('Docs/a.txt')).toBe('synced a');
+            expect(await at('Docs/mine.txt')).toBe('mine');
+            expect(await at('top.txt')).toBe('synced top');
+            const conflicts = (await readdir(path.join(d.newDir, 'Docs'))).filter((n) => n.includes('conflict'));
+            expect(await Promise.all(conflicts.map((n) => at(`Docs/${n}`)))).toEqual(['was already there']);
+            const topConflicts = (await readdir(d.newDir)).filter((n) => n.includes('conflict'));
+            expect(await Promise.all(topConflicts.map((n) => at(n)))).toEqual(['top already there']);
+            expect(await readdir(d.oldDir)).toEqual([]);
+            expect(stateDb.getSettings().syncDir).toBe(d.newDir);
+            expect(stateDb.getAllItems()).toEqual(records);
+
+            // The next pass (started by the relocation) finds every synced file where its record says: nothing is
+            // trashed or uploaded over
+            await d.engine.holdForMove(); // waits for that pass
+            d.engine.releaseHold();
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.calls.uploads.sort()).toEqual([...conflicts.map((n) => `Docs/${n}`), 'Docs/mine.txt', ...topConflicts].sort());
+            await d.engine.stop();
+        });
+
+        test('a new folder inside the old one, or holding it, is refused and nothing moves', async () => {
+            const d = setup(false);
+            await mkdir(d.oldDir, { recursive: true });
+            await writeFile(path.join(d.oldDir, 'a.txt'), 'a');
+            await expect(d.engine.relocateSyncFolder(d.oldDir, path.join(d.oldDir, 'Sub'))).rejects.toThrow(/inside/);
+            await expect(d.engine.relocateSyncFolder(d.oldDir, tempDir)).rejects.toThrow(/inside/);
+            expect(await readdir(d.oldDir)).toEqual(['a.txt']);
+            expect(stateDb.getSettings().syncDir).toBe(d.oldDir);
+        });
+    });
+
     describe('virtual layout', () => {
         test('the engine works entirely in the backing dir and never creates anything in the sync folder', async () => {
             const backingDir = path.join(tempDir, 'files');

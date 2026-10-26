@@ -21,7 +21,15 @@ import path from 'node:path';
 
 import { formatConflictFileName } from '../src/sync/conflictResolver';
 import { readDriveLayout } from '../src/sync/driveMode';
-import { DifferentDiskError, LAYOUT_MOVING, type MoveSeams, moveToLayout } from '../src/sync/layoutMigration';
+import {
+    DifferentDiskError,
+    finishRelocation,
+    LAYOUT_MOVING,
+    type MoveSeams,
+    moveToLayout,
+    relocateFiles,
+    SYNC_DIR_MOVING,
+} from '../src/sync/layoutMigration';
 import { mergeInto } from '../src/sync/localMerge';
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
 
@@ -529,5 +537,101 @@ describe('mergeInto', () => {
         expect(readdirSync(to).sort()).toEqual(
             ['copy.txt', 'linked.txt', 'other.txt', formatConflictFileName('touched.txt', when), 'touched.txt'].sort(),
         );
+    });
+});
+
+// Issue #30: the plain sync folder moved to a new place, by the same mover
+describe('relocateFiles', () => {
+    const acrossDisks = (extra: MoveSeams = {}): MoveSeams => ({
+        moveSameDisk: () => {
+            throw exdev();
+        },
+        ...extra,
+    });
+    const relocation = (s: ReturnType<typeof setup>) => {
+        const to = path.join(s.root, 'Elsewhere');
+        const relocate = (seams?: MoveSeams) =>
+            relocateFiles({ stateDb: s.stateDb, from: s.syncDir, to, logger: s.logger, now: when, seams });
+        return { to, relocate };
+    };
+
+    test('across disks: copied and verified file by file, sources removed, the new folder saved', async () => {
+        const s = setup();
+        s.fillTree(s.syncDir);
+        s.record('Docs/report.odt');
+        const before = snapshot(s.syncDir);
+        const records = s.stateDb.getAllItems();
+        const { to, relocate } = relocation(s);
+
+        await relocate(acrossDisks());
+
+        expect(snapshot(to)).toEqual(before);
+        expect(readdirSync(s.syncDir)).toEqual([]);
+        expect(s.stateDb.getSettings().syncDir).toBe(to);
+        expect(s.stateDb.getMeta(SYNC_DIR_MOVING)).toBeNull();
+        expect(s.stateDb.getAllItems()).toEqual(records);
+    });
+
+    test('a crash part way is finished at the next start, which saves the new folder', async () => {
+        const s = setup();
+        s.fillTree(s.syncDir);
+        const before = snapshot(s.syncDir, { folderTimes: false });
+        const { to, relocate } = relocation(s);
+        let n = 0;
+        const crash = acrossDisks({
+            onStep: (step) => {
+                if (step === 'placed' && ++n === 2) throw new Error('killed');
+            },
+        });
+        await expect(relocate(crash)).rejects.toThrow('killed');
+        expect(s.stateDb.getSettings().syncDir).toBe(s.syncDir);
+        expect(JSON.parse(s.stateDb.getMeta(SYNC_DIR_MOVING)!)).toEqual({ from: s.syncDir, to });
+
+        expect(await finishRelocation({ stateDb: s.stateDb, logger: s.logger, seams: acrossDisks() })).toBe(true);
+        expect(snapshot(to, { folderTimes: false })).toEqual(before);
+        expect(readdirSync(s.syncDir)).toEqual([]);
+        expect(s.stateDb.getSettings().syncDir).toBe(to);
+        expect(s.stateDb.getMeta(SYNC_DIR_MOVING)).toBeNull();
+        expect(await finishRelocation({ stateDb: s.stateDb, logger: s.logger })).toBe(false);
+    });
+
+    test('running out of space stops with every file whole in one place or the other, and the move still marked', async () => {
+        const s = setup();
+        s.fillTree(s.syncDir);
+        const before = snapshot(s.syncDir);
+        const { to, relocate } = relocation(s);
+        let copies = 0;
+        const { copyFileSync } = await import('node:fs');
+        await expect(
+            relocate(
+                acrossDisks({
+                    copyFile: (from, dest) => {
+                        if (++copies === 2) {
+                            writeFileSync(dest, 'part');
+                            throw enospc();
+                        }
+                        copyFileSync(from, dest);
+                    },
+                }),
+            ),
+        ).rejects.toThrow(/ENOSPC/);
+        expect(s.stateDb.getSettings().syncDir).toBe(s.syncDir);
+        expect(s.stateDb.getMeta(SYNC_DIR_MOVING)).not.toBeNull();
+        const moved = snapshot(to);
+        const left = snapshot(s.syncDir);
+        for (const [rel, entry] of Object.entries(before)) {
+            if (!entry.startsWith('dir')) expect([rel, left[rel] ?? moved[rel]]).toEqual([rel, entry]);
+        }
+        expect(Object.keys(moved).filter((rel) => rel.includes('.proton-drive-tmp-move-'))).toEqual([]);
+    });
+
+    test('a record whose file was already gone is dropped, so the file comes back rather than being trashed', async () => {
+        const s = setup();
+        s.put(path.join(s.syncDir, 'here.txt'), 'here');
+        s.record('here.txt');
+        s.record('deleted while the app was closed.txt');
+        const { relocate } = relocation(s);
+        await relocate();
+        expect(s.stateDb.getAllItems().map((r) => r.localRelPath)).toEqual(['here.txt']);
     });
 });

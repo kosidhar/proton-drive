@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { lstatSync, renameSync, statSync, utimesSync } from 'node:fs';
-import { cp, lstat, mkdir, readdir, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readdir, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -36,10 +36,12 @@ import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
 import { createLocalConflictCopy, formatConflictFileName } from './conflictResolver';
 import { gioTrash, type MoveToDesktopTrash } from './desktopTrash';
 import { readDriveLayout } from './driveMode';
+import { relocateFiles, SYNC_DIR_MOVING } from './layoutMigration';
 import { DriveOpError, type VfsEntry } from './driveOps';
 import { isEngineTempName, removeScannedEntries, type ScanEntry, scanLocalCopies } from './localCopies';
 import { moveWithoutReplacing } from './localMove';
 import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
+import { pathsOverlap } from './mountPoint';
 import { entryFromNode, RemoteIndex, type RemoteIndexEntry } from './remoteIndex';
 import { type RemoteOp, RemoteOpsJournal } from './remoteOps';
 import type { ConflictRecord, EditBaseline, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
@@ -80,6 +82,8 @@ const SLOW_DOWNLOAD_NOTICE_MS = 2000;
 const HYDRATE_STAGING_PREFIX = '.proton-drive-tmp-hydrate-';
 // What everything that would touch the files answers while they move between the sync folder and the backing store
 const BUSY_MOVING = 'Proton Drive is busy moving files';
+// How long moving the sync folder waits for what the engine is doing (an upload, a download) before giving up
+const RELOCATE_HOLD_TIMEOUT_MS = 60_000;
 
 export type EngineState = 'idle' | 'syncing' | 'paused' | 'unauthenticated' | 'error';
 
@@ -383,51 +387,30 @@ export class ProtonDriveSyncEngine {
             this.stateDb.updateSettings({ syncDir: resolvedNew });
             return resolvedNew;
         }
-
-        // Stop watcher on old directory before moving files so we never interpret relocation as local deletion
-        this.watcher.stop();
-        await mkdir(resolvedNew, { recursive: true });
-
-        // Move existing synced files/folders from oldSyncDir -> newSyncDir (instant rename on same filesystem, or copy+rm across disks)
-        const oldEntries = await readdir(resolvedOld).catch(() => [] as string[]);
-        for (const entryName of oldEntries) {
-            const srcPath = path.join(resolvedOld, entryName);
-            const destPath = path.join(resolvedNew, entryName);
-            if (srcPath === resolvedNew || resolvedNew.startsWith(`${srcPath}${path.sep}`)) {
-                continue;
-            }
-            try {
-                await rename(srcPath, destPath);
-            } catch {
-                try {
-                    await cp(srcPath, destPath, { recursive: true, force: true });
-                    await rm(srcPath, { recursive: true, force: true });
-                } catch (err) {
-                    this.logger.warn(`Failed relocating ${srcPath} -> ${destPath}: ${String(err)}`);
-                }
-            }
+        if (pathsOverlap(resolvedNew, resolvedOld)) {
+            throw new Error(`${resolvedNew} and ${resolvedOld} are inside one another; choose a folder outside the current Proton Drive folder`);
         }
 
-        // Persist the normalized new syncDir in SQLite
-        this.stateDb.updateSettings({ syncDir: resolvedNew });
-
-        // Safety check: any DB record whose file is not present in resolvedNew must have its DB record cleared
-        // so reconcileSinglePath downloads it from Proton Drive rather than treating it as locally deleted!
-        for (const item of this.stateDb.getAllItems()) {
-            const targetPath = path.join(resolvedNew, item.localRelPath);
-            const st = await stat(targetPath).catch(() => null);
-            if (!st) {
-                this.stateDb.removeItemByPath(item.localRelPath);
+        // Nothing may look at the files while they move: a half-moved folder reads as files deleted here. A move that
+        // can't finish stays marked, with the engine held, for the next start to finish (see finishRelocation).
+        try {
+            await this.holdForMove({ timeoutMs: RELOCATE_HOLD_TIMEOUT_MS });
+            this.recoverLocalMove();
+            await relocateFiles({ stateDb: this.stateDb, from: resolvedOld, to: resolvedNew, logger: this.logger });
+        } catch (error: unknown) {
+            if (this.stateDb.getMeta(SYNC_DIR_MOVING) === null) {
+                this.releaseHold(); // Nothing moved
+                await this.start({ backgroundInitialReconcile: true });
             }
+            throw error;
         }
-
+        this.releaseHold();
         this.stateDb.logActivity({
             action: 'sync',
             localRelPath: '/',
             details: `Relocated local sync folder from ${resolvedOld} to ${resolvedNew}`,
         });
-
-        await this.watcher.start();
+        await this.start({ backgroundInitialReconcile: true });
         return resolvedNew;
     }
 

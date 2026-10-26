@@ -22,7 +22,7 @@ import { startControlServer } from '../src/daemon/controlServer';
 import { DriveController, type DriveSupervisor } from '../src/daemon/driveController';
 import type { VfsStatus } from '../src/daemon/vfsSupervisor';
 import { readDriveLayout } from '../src/sync/driveMode';
-import { LAYOUT_MOVING, type MoveSeams } from '../src/sync/layoutMigration';
+import { LAYOUT_MOVING, type MoveSeams, SYNC_DIR_MOVING } from '../src/sync/layoutMigration';
 import { moveWithoutReplacing } from '../src/sync/localMove';
 import { LOCAL_MOVE_IN_PROGRESS, ProtonDriveSyncEngine } from '../src/sync/syncEngine';
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
@@ -551,5 +551,49 @@ describe('DriveController: relocating the drive folder', () => {
         }
         expect(s.stateDb.getSettings().syncDir).toBe(s.syncDir);
         expect(s.supervisors.map((x) => x.events)).toEqual([['start']]);
+    });
+});
+
+describe('DriveController: a plain relocation cut short', () => {
+    test('is finished at the next start, before the files move to match the mode', async () => {
+        const s = setup({ wanted: false });
+        s.fillTree(s.syncDir);
+        const before = snapshot(s.syncDir);
+        const to = path.join(s.root, 'Elsewhere');
+        // Cut short: one entry moved, the rest still in the old folder, the setting not yet saved
+        mkdirSync(to);
+        moveWithoutReplacing(path.join(s.syncDir, 'Docs'), path.join(to, 'Docs'));
+        s.stateDb.setMeta(SYNC_DIR_MOVING, JSON.stringify({ from: s.syncDir, to }));
+
+        const { controller } = await s.boot();
+
+        expect(s.stateDb.getSettings().syncDir).toBe(to);
+        expect(snapshot(to)).toEqual(before);
+        expect(readdirSync(s.syncDir)).toEqual([]);
+        expect(s.stateDb.getMeta(SYNC_DIR_MOVING)).toBeNull();
+        expect(controller.status()).toEqual({ mode: 'plain', mounted: false, reason: 'switched-off' });
+    });
+
+    test('a relocation that stops part way keeps the engine held, saying why, until a start finishes it', async () => {
+        const s = setup({ wanted: false });
+        s.fillTree(s.syncDir);
+        const { engine, controller } = await s.boot();
+        const to = path.join(s.root, 'Elsewhere');
+        // A read-only folder in the way of one entry stops the move there
+        mkdirSync(path.join(to, 'Docs'), { recursive: true });
+        chmodSync(path.join(s.syncDir, 'Docs'), 0o555);
+
+        await expect(controller.relocate(to)).rejects.toThrow(/EACCES|permission/i);
+        expect(controller.status()).toMatchObject({ reason: 'move-failed' });
+        expect(() => engine.vfsChildren('')).toThrow('Proton Drive is busy moving files');
+        expect(s.stateDb.getSettings().syncDir).toBe(s.syncDir);
+
+        chmodSync(path.join(s.syncDir, 'Docs'), 0o755);
+        await controller.stop();
+        await engine.stop();
+        const restarted = await s.boot();
+        expect(s.stateDb.getSettings().syncDir).toBe(to);
+        expect(readdirSync(s.syncDir)).toEqual([]);
+        expect(() => restarted.engine.vfsChildren('')).not.toThrow();
     });
 });

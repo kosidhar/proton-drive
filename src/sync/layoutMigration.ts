@@ -36,6 +36,8 @@ import type { SyncStateDatabase } from './syncStateDb';
 // Meta key set while the files move: the layout they are moving to. Found set at start, the move is finished before
 // anything looks at the files.
 export const LAYOUT_MOVING = 'layoutMoving';
+// Meta key set while the plain sync folder's files move to a new sync folder: { from, to }, the same way
+export const SYNC_DIR_MOVING = 'syncDirMoving';
 // A copy in progress, beside where it goes (the sync ignores, and the drive hides, every .proton-drive-tmp-* name)
 const COPY_PREFIX = '.proton-drive-tmp-move-';
 // Rounds of moving what is in the source folder: an app may save into the sync folder while its files move out
@@ -130,6 +132,61 @@ export async function moveToLayout(opts: {
     })();
     logger.info(target === 'virtual' ? `Moved the files in ${syncDir} into ${backingDir}` : `Moved the files in ${backingDir} into ${syncDir}`);
     return 'moved';
+}
+
+// Moves the plain sync folder's files into a new folder, never replacing anything there (see Mover), and saves it as the
+// sync folder. Records stay as they are, except those whose file was already gone, which are dropped so that the file
+// comes back rather than reading as deleted here. The engine must be held meanwhile. Throws when the files can't all
+// move, with the move still marked (meta syncDirMoving) for finishRelocation to finish at the next start.
+export async function relocateFiles(opts: {
+    stateDb: SyncStateDatabase;
+    from: string;
+    to: string;
+    logger: Logger;
+    now?: Date;
+    seams?: MoveSeams;
+}): Promise<void> {
+    const { stateDb, from, to, logger } = opts;
+    if (pathsOverlap(from, to)) {
+        throw new Error(`${to} and ${from} are inside one another; choose a folder outside the current Proton Drive folder`);
+    }
+    mkdirSync(to, { recursive: true });
+    stateDb.setMeta(SYNC_DIR_MOVING, JSON.stringify({ from, to }));
+    const mover = new Mover({ logger, now: opts.now ?? new Date(), allowCopy: true, seams: opts.seams ?? {} });
+    const left = existsSync(from) ? mover.moveAll(from, to) : [];
+    if (left.length > 0) {
+        logger.warn(`Left in ${from}, as they can't move to another disk: ${left.join(', ')}`);
+    }
+    const gone = stateDb.getAllItems().filter((item) => !lstatSync(path.join(to, item.localRelPath), { throwIfNoEntry: false }));
+    stateDb.connection.transaction(() => {
+        for (const item of gone) {
+            stateDb.removeItemByPath(item.localRelPath);
+        }
+        stateDb.updateSettings({ syncDir: to });
+        stateDb.deleteMeta(SYNC_DIR_MOVING);
+    })();
+    logger.info(`Moved the files in ${from} into ${to}, the new Proton Drive folder`);
+}
+
+// Finishes a relocation cut short (meta syncDirMoving); answers whether there was one. Throws as relocateFiles does.
+export async function finishRelocation(opts: { stateDb: SyncStateDatabase; logger: Logger; seams?: MoveSeams }): Promise<boolean> {
+    const raw = opts.stateDb.getMeta(SYNC_DIR_MOVING);
+    if (raw === null) {
+        return false;
+    }
+    let intent: { from?: unknown; to?: unknown } = {};
+    try {
+        intent = JSON.parse(raw) as typeof intent;
+    } catch {
+        // Reported below
+    }
+    if (typeof intent.from !== 'string' || typeof intent.to !== 'string') {
+        // Where the files went is unknown: nothing may look at them until someone does
+        throw new Error(`Can't tell where the Proton Drive folder was moving (${raw})`);
+    }
+    opts.logger.info(`Finishing moving the Proton Drive folder from ${intent.from} to ${intent.to}, cut short last time`);
+    await relocateFiles({ stateDb: opts.stateDb, from: intent.from, to: intent.to, logger: opts.logger, seams: opts.seams });
+    return true;
 }
 
 // Files moved into a mount would go into the drive, that is into the backing store they are moving out of

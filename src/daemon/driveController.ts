@@ -4,7 +4,14 @@ import path from 'node:path';
 import type { Logger } from '@protontech/drive-sdk';
 
 import { type DriveLayout, readDriveLayout, virtualDriveWanted } from '../sync/driveMode';
-import { DifferentDiskError, LAYOUT_MOVING, type MoveSeams, moveToLayout } from '../sync/layoutMigration';
+import {
+    DifferentDiskError,
+    finishRelocation,
+    LAYOUT_MOVING,
+    type MoveSeams,
+    moveToLayout,
+    SYNC_DIR_MOVING,
+} from '../sync/layoutMigration';
 import { pathsOverlap } from '../sync/mountPoint';
 import { type ProtonDriveSyncEngine, resolveSyncDirInput } from '../sync/syncEngine';
 import type { SyncStateDatabase } from '../sync/syncStateDb';
@@ -62,14 +69,23 @@ export class DriveController {
         return status.reason === null && this.differentDisk ? { ...status, reason: 'different-disk' } : status;
     }
 
-    // Before the engine starts: finishes a move cut short (meta layoutMoving), runs beforeLayoutMove, then moves the
-    // files to match the mode. The engine is held throughout, and stays held if a move out of the backing store can't
-    // finish (start() then does nothing): the next start finishes it.
+    // Before the engine starts: finishes a move cut short (a relocation of the plain folder, meta syncDirMoving, or a
+    // layout move, meta layoutMoving), runs beforeLayoutMove, then moves the files to match the mode. The engine is held
+    // throughout, and stays held if a move out of the backing store or a relocation can't finish (start() then does
+    // nothing): the next start finishes it.
     async settleAtStart(beforeLayoutMove?: () => Promise<void>): Promise<void> {
         const { stateDb, engine, logger } = this.opts;
         this.moving = true;
         try {
             await engine.holdForMove();
+            try {
+                await finishRelocation({ stateDb, logger, seams: this.opts.moveSeams });
+            } catch (error: unknown) {
+                logger.error(`Could not finish moving the Proton Drive folder: ${messageOf(error)}`);
+                this.moveError = messageOf(error);
+                this.stuck = true;
+                return;
+            }
             const pending = stateDb.getMeta(LAYOUT_MOVING);
             if (pending !== null) {
                 logger.info(`Finishing moving the files to the ${pending} layout, cut short last time`);
@@ -138,7 +154,16 @@ export class DriveController {
         this.moving = true;
         try {
             if (readDriveLayout(stateDb) !== 'virtual') {
-                return await engine.relocateSyncFolder(oldDir, newDir);
+                try {
+                    return await engine.relocateSyncFolder(oldDir, newDir);
+                } catch (error: unknown) {
+                    if (stateDb.getMeta(SYNC_DIR_MOVING) !== null) {
+                        // Cut short with the engine held: the next start finishes it
+                        this.moveError = messageOf(error);
+                        this.stuck = true;
+                    }
+                    throw error;
+                }
             }
             const stillMounted = await this.releaseMountPoint();
             if (stillMounted) throw new Error(stillMounted);
