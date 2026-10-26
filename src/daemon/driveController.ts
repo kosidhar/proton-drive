@@ -10,6 +10,8 @@ import {
     LAYOUT_MOVING,
     type MoveSeams,
     moveToLayout,
+    pendingRelocation,
+    relocateFiles,
     SYNC_DIR_MOVING,
 } from '../sync/layoutMigration';
 import { pathsOverlap } from '../sync/mountPoint';
@@ -19,7 +21,9 @@ import { notMountableReason, unsupervisedStatus, type VfsSupervisor, type VfsSta
 
 // Runs the drive as the user's choice and the system allow (the mode rule): the files move between the sync folder and
 // the backing store to match, at every start and when the user switches the virtual drive, with the engine held and
-// the drive unmounted meanwhile; and while the files are in the backing store, the helper is supervised.
+// the drive unmounted meanwhile; and while the files are in the backing store, the helper is supervised. A move that
+// fails always has a way out: switching again (either way), Mount again, the next start, or for a relocation, moving
+// the folder back.
 
 export type DriveSupervisor = Pick<VfsSupervisor, 'start' | 'stop' | 'mountAgain' | 'status' | 'release'>;
 
@@ -47,7 +51,8 @@ function messageOf(error: unknown): string {
 export class DriveController {
     private supervisor: DriveSupervisor | null = null;
     private moving = false;
-    // A move that couldn't finish and is still marked: the engine stays held until a start finishes it
+    // A move that couldn't finish and is still marked (layoutMoving or syncDirMoving): the engine stays held until it
+    // is finished or undone
     private stuck = false;
     private moveError: string | null = null;
     private differentDisk = false;
@@ -60,8 +65,10 @@ export class DriveController {
         const { stateDb, fuseOk } = this.opts;
         const mode = readDriveLayout(stateDb);
         if (this.moving) return { mode, mounted: false, reason: 'moving' };
+        const live = this.supervisor?.status();
+        if (live?.mounted) return live; // mounted again since a move failed: that is what matters now
         if (this.moveError !== null) return { mode, mounted: false, reason: 'move-failed', error: this.moveError };
-        if (this.supervisor) return this.supervisor.status();
+        if (live) return live;
         if (mode === 'virtual' && fuseOk) {
             return { mode, mounted: false, reason: this.driveStarted ? 'mount-point-busy' : 'starting' };
         }
@@ -72,7 +79,7 @@ export class DriveController {
     // Before the engine starts: finishes a move cut short (a relocation of the plain folder, meta syncDirMoving, or a
     // layout move, meta layoutMoving), runs beforeLayoutMove, then moves the files to match the mode. The engine is held
     // throughout, and stays held if a move out of the backing store or a relocation can't finish (start() then does
-    // nothing): the next start finishes it.
+    // nothing) until it is finished or undone.
     async settleAtStart(beforeLayoutMove?: () => Promise<void>): Promise<void> {
         const { stateDb, engine, logger } = this.opts;
         this.moving = true;
@@ -118,31 +125,47 @@ export class DriveController {
         await this.superviseIfVirtual();
     }
 
-    // The Settings switch: saves the choice, then moves the files to match it (with the engine held and the drive
-    // unmounted meanwhile) and starts the engine and the drive again. Throws when the move failed (status says why).
+    // The Settings switch: moves the files to match the choice (with the engine held and the drive unmounted meanwhile)
+    // and starts the engine and the drive again; the choice is saved once the engine is held. Allowed while a layout
+    // move that failed is still marked: it then finishes that move, or moves the files back. Throws when the move
+    // failed (the status says why until it is resolved).
     async setVirtualDriveWanted(wanted: boolean): Promise<void> {
-        this.refuseWhileBusy();
-        this.opts.stateDb.setMeta('virtualDriveWanted', wanted ? '1' : '0');
-        const target = this.target();
-        if (target === readDriveLayout(this.opts.stateDb)) {
+        if (this.moving) throw new Error(BUSY);
+        this.refuseWhileRelocationStopped();
+        const { stateDb } = this.opts;
+        const save = () => stateDb.setMeta('virtualDriveWanted', wanted ? '1' : '0');
+        const target: DriveLayout = wanted && this.opts.fuseOk ? 'virtual' : 'plain';
+        if (!this.layoutMovePending() && target === readDriveLayout(stateDb)) {
             // FUSE can't run the drive, or the files are where the choice wants them already: an earlier move that
             // failed (and was undone) is no longer what the status is about
+            save();
             this.moveError = null;
             this.differentDisk = false;
             return;
         }
-        await this.switchTo(target);
+        await this.switchTo(target, save);
         if (this.moveError !== null) throw new Error(this.moveError);
     }
 
     // A new sync folder. In the virtual layout no file moves: the drive is unmounted, the old mount point becomes a
     // normal folder again, and the drive mounts at the new one. In the plain layout the engine moves the files. A folder
-    // overlapping the app's own files is refused.
+    // overlapping the app's own files, or inside the old one or holding it, is refused. While a relocation that failed
+    // is still marked, only moving back to the old folder (undoing it) or to the new one again is allowed.
     async relocate(raw: string): Promise<string> {
-        this.refuseWhileBusy();
+        if (this.moving) throw new Error(BUSY);
         const { stateDb, engine, appDir, backingDir } = this.opts;
-        const oldDir = stateDb.getSettings().syncDir;
         const newDir = resolveSyncDirInput(raw);
+        const stopped = this.stuck ? pendingRelocation(stateDb) : null;
+        if (stopped) {
+            if (newDir === path.resolve(stopped.from) || newDir === path.resolve(stopped.to)) {
+                return this.resumeRelocation(stopped, newDir);
+            }
+            throw new Error(this.relocationStopped(stopped));
+        }
+        if (this.stuck) {
+            throw new Error(`Moving the files stopped (${this.moveError}); switch the virtual drive again, or restart Proton Drive, to finish first`);
+        }
+        const oldDir = stateDb.getSettings().syncDir;
         if (newDir === path.resolve(oldDir)) {
             return oldDir;
         }
@@ -151,6 +174,9 @@ export class DriveController {
                 throw new Error(`${newDir} overlaps ${dir}, where Proton Drive keeps its own files; choose another folder`);
             }
         }
+        if (pathsOverlap(newDir, oldDir)) {
+            throw new Error(`${newDir} and ${oldDir} are inside one another; choose a folder outside the current Proton Drive folder`);
+        }
         this.moving = true;
         try {
             if (readDriveLayout(stateDb) !== 'virtual') {
@@ -158,7 +184,7 @@ export class DriveController {
                     return await engine.relocateSyncFolder(oldDir, newDir);
                 } catch (error: unknown) {
                     if (stateDb.getMeta(SYNC_DIR_MOVING) !== null) {
-                        // Cut short with the engine held: the next start finishes it
+                        // Cut short with the engine held: moving back, or the next start, finishes it
                         this.moveError = messageOf(error);
                         this.stuck = true;
                     }
@@ -179,8 +205,15 @@ export class DriveController {
         }
     }
 
+    // Mount again: after a move that failed (still marked, or undone), tries it again first
     async mountAgain(): Promise<void> {
         if (this.moving) throw new Error(BUSY);
+        this.refuseWhileRelocationStopped();
+        const target = this.target();
+        if (this.layoutMovePending() || (this.moveError !== null && target !== readDriveLayout(this.opts.stateDb))) {
+            await this.switchTo(target);
+            if (this.moveError !== null) throw new Error(this.moveError);
+        }
         if (!this.supervisor) throw new Error(notMountableReason(this.status()));
         await this.supervisor.mountAgain();
     }
@@ -194,24 +227,53 @@ export class DriveController {
         return virtualDriveWanted(this.opts.stateDb) && this.opts.fuseOk ? 'virtual' : 'plain';
     }
 
-    private refuseWhileBusy(): void {
-        if (this.moving) throw new Error(BUSY);
-        if (this.stuck) {
-            throw new Error(`Moving the files stopped (${this.moveError}); restart Proton Drive to finish moving them`);
-        }
+    private layoutMovePending(): boolean {
+        return this.opts.stateDb.getMeta(LAYOUT_MOVING) !== null;
     }
 
-    private async switchTo(target: DriveLayout): Promise<void> {
+    private relocationStopped(stopped: { from: string; to: string }): string {
+        return `Moving the Proton Drive folder to ${stopped.to} stopped (${this.moveError}); move it back to ${stopped.from}, or to ${stopped.to} again`;
+    }
+
+    private refuseWhileRelocationStopped(): void {
+        const stopped = this.stuck ? pendingRelocation(this.opts.stateDb) : null;
+        if (stopped) throw new Error(`${this.relocationStopped(stopped)} first`);
+    }
+
+    // Moving back to the old folder (undoing it: everything in the new folder goes back) or on to the new one
+    private async resumeRelocation(stopped: { from: string; to: string }, newDir: string): Promise<string> {
+        const { stateDb, engine, logger } = this.opts;
+        const [from, to] = newDir === path.resolve(stopped.from) ? [stopped.to, stopped.from] : [stopped.from, stopped.to];
+        this.moving = true;
+        try {
+            await relocateFiles({ stateDb, from, to, logger, seams: this.opts.moveSeams });
+        } catch (error: unknown) {
+            this.moveError = messageOf(error);
+            throw error;
+        } finally {
+            this.moving = false;
+        }
+        this.stuck = false;
+        this.moveError = null;
+        engine.releaseHold();
+        await engine.start({ backgroundInitialReconcile: true });
+        return to;
+    }
+
+    private async switchTo(target: DriveLayout, onceHeld?: () => void): Promise<void> {
         const { engine } = this.opts;
         this.moving = true;
         try {
             try {
                 await engine.holdForMove({ timeoutMs: this.opts.holdTimeoutMs ?? HOLD_TIMEOUT_MS });
             } catch (error: unknown) {
-                await engine.start({ backgroundInitialReconcile: true }); // nothing moved: it runs on as it was
+                this.moveError = messageOf(error); // nothing moved and nothing saved: the status says why
+                await engine.start({ backgroundInitialReconcile: true });
                 throw error;
             }
-            engine.recoverLocalMove();
+            onceHeld?.();
+            // Never on a half-moved tree: it ran before that move began
+            if (!this.layoutMovePending()) engine.recoverLocalMove();
             await this.moveTo(target);
         } finally {
             this.moving = false;
@@ -225,7 +287,8 @@ export class DriveController {
 
     // With the engine held: moves the files. A move into the backing store that can't finish is undone (they came by
     // renames, so they go back the same way) and the folder stays plain; a move out that can't finish stays marked, and
-    // the engine held, for the next start to finish. The drive is unmounted before files move out of the store.
+    // the engine held, until a switch, Mount again or the next start finishes it or moves the files back. The drive is
+    // unmounted before files move out of the store.
     private async moveTo(target: DriveLayout): Promise<void> {
         const { stateDb, logger } = this.opts;
         this.moveError = null;
@@ -240,6 +303,7 @@ export class DriveController {
         }
         try {
             this.differentDisk = (await this.move(target)) === 'different-disk';
+            this.stuck = false;
             return;
         } catch (error: unknown) {
             logger.error(`Could not move the files to the ${target} layout: ${messageOf(error)}`);
@@ -267,7 +331,7 @@ export class DriveController {
 
     private fail(message: string): void {
         this.moveError = message;
-        this.stuck = this.opts.stateDb.getMeta(LAYOUT_MOVING) !== null;
+        this.stuck = this.layoutMovePending();
     }
 
     private move(target: DriveLayout) {

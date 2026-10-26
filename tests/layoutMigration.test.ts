@@ -209,16 +209,145 @@ describe('moveToLayout: plain to virtual', () => {
         expect(s.logs.some((l) => l.startsWith('warn') && l.includes('disk'))).toBe(true);
     });
 
-    test('a rename refused as cross-device before anything moved is a different disk too, and nothing moves', async () => {
+    test('a rename refused as cross-device stops with the move still marked; moving back restores everything', async () => {
         const s = setup();
         s.fillTree(s.syncDir);
         const before = snapshot(s.syncDir);
 
-        expect(await s.move('virtual', { moveSameDisk: () => { throw exdev(); } })).toBe('different-disk');
+        await expect(s.move('virtual', { moveSameDisk: () => { throw exdev(); } })).rejects.toBeInstanceOf(DifferentDiskError);
+        expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBe('virtual');
 
+        expect(await s.move('plain')).toBe('moved');
         expect(snapshot(s.syncDir)).toEqual(before);
         expect(readDriveLayout(s.stateDb)).toBe('plain');
         expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBeNull();
+    });
+
+    // A copy already in the store is dropped from the sync folder; a cross-device refusal after that must not read as
+    // "nothing moved", or the file would be left only in the store, where its record reads as a deletion (C1)
+    test('a cross-device refusal after an identical copy was dropped is never taken for nothing moved', async () => {
+        const s = setup();
+        for (const n of ['a', 'b', 'c', 'd', 'e', 'f']) s.put(path.join(s.syncDir, `${n}.txt`), `content ${n}`);
+        const first = readdirSync(s.syncDir)[0]!;
+        s.put(path.join(s.backingDir, first), `content ${first[0]}`);
+        s.record(first);
+        const before = snapshot(s.syncDir);
+
+        await expect(s.move('virtual', { moveSameDisk: () => { throw exdev(); } })).rejects.toBeInstanceOf(DifferentDiskError);
+        expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBe('virtual');
+        expect(await s.move('plain')).toBe('moved');
+        expect(snapshot(s.syncDir)).toEqual(before);
+        expect(readdirSync(s.backingDir)).toEqual([]);
+    });
+
+    test('refuses while something is mounted at the sync folder, moving nothing', async () => {
+        const s = setup();
+        s.fillTree(s.syncDir);
+        const before = snapshot(s.syncDir);
+        const mounted: MoveSeams = {
+            readMountInfo: () => `99 30 0:99 / ${s.syncDir} rw,nosuid - fuse.protondrive protondrive rw\n`,
+        };
+        await expect(s.move('virtual', mounted)).rejects.toThrow(/mounted/);
+        expect(snapshot(s.syncDir)).toEqual(before);
+        expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBeNull();
+    });
+
+    test('the folders it changed are synced to disk before the layout flips', async () => {
+        const s = setup();
+        s.fillTree(s.syncDir);
+        const synced: string[] = [];
+        const seams: MoveSeams = {
+            fsyncDir: (dir) => {
+                expect(readDriveLayout(s.stateDb)).toBe('plain');
+                synced.push(dir.toString());
+            },
+        };
+        expect(await s.move('virtual', seams)).toBe('moved');
+        expect(synced).toContain(s.syncDir);
+        expect(synced).toContain(s.backingDir);
+    });
+
+    test('a read-only folder made writable to move is read-only again after a crash and a resume', async () => {
+        const s = setup();
+        s.put(path.join(s.syncDir, 'Locked', 'a.txt'), 'a');
+        chmodSync(path.join(s.syncDir, 'Locked'), 0o555);
+        let crashed = false;
+        const crash: MoveSeams = {
+            onStep: (step) => {
+                if (step === 'opened' && !crashed) {
+                    crashed = true;
+                    throw new Error('killed');
+                }
+            },
+        };
+        await expect(s.move('virtual', crash)).rejects.toThrow('killed');
+        expect(await s.move('virtual')).toBe('moved');
+        expect(modeOf(path.join(s.backingDir, 'Locked'))).toBe(0o555);
+        expect(readFileSync(path.join(s.backingDir, 'Locked', 'a.txt'), 'utf8')).toBe('a');
+    });
+
+    test('names and link targets that are not UTF-8 move byte for byte', async () => {
+        const s = setup();
+        const odd = (...parts: Array<string | number[]>) =>
+            Buffer.concat(parts.map((p) => (typeof p === 'string' ? Buffer.from(p) : Buffer.from(p))));
+        const sync = Buffer.from(s.syncDir);
+        writeFileSync(odd(s.syncDir, '/bad-', [0xff, 0xfe], '.txt'), 'odd bytes');
+        mkdirSync(path.join(s.syncDir, 'Docs'));
+        writeFileSync(odd(s.syncDir, '/Docs/inner-', [0xff], '.txt'), 'inner');
+        symlinkSync(odd('tgt-', [0xff]), odd(s.syncDir, '/ln'));
+        s.put(path.join(s.backingDir, 'Docs', 'other.txt'), 'x'); // Docs is merged, not renamed
+        const names = (dir: Buffer) => readdirSync(dir, { encoding: 'buffer' }).map((b) => b.toString('hex')).sort();
+        const before = { top: names(sync), docs: names(odd(s.syncDir, '/Docs')) };
+
+        expect(await s.move('virtual')).toBe('moved');
+        const store = Buffer.from(s.backingDir);
+        expect(names(store)).toEqual(before.top);
+        expect(names(odd(s.backingDir, '/Docs')).filter((h) => h !== Buffer.from('other.txt').toString('hex'))).toEqual(before.docs);
+        expect((readlinkSync(odd(s.backingDir, '/ln'), { encoding: 'buffer' }) as Buffer).toString('hex')).toBe(odd('tgt-', [0xff]).toString('hex'));
+
+        rmSync(path.join(s.backingDir, 'Docs', 'other.txt'));
+        expect(await s.move('plain', { moveSameDisk: () => { throw exdev(); } })).toBe('moved');
+        expect(names(sync)).toEqual(before.top);
+        expect(names(odd(s.syncDir, '/Docs'))).toEqual(before.docs);
+        expect(readFileSync(odd(s.syncDir, '/bad-', [0xff, 0xfe], '.txt'), 'utf8')).toBe('odd bytes');
+        expect((readlinkSync(odd(s.syncDir, '/ln'), { encoding: 'buffer' }) as Buffer).toString('hex')).toBe(odd('tgt-', [0xff]).toString('hex'));
+    });
+
+    test('a long name taken in the store gets a conflict name that fits, never splitting a character', async () => {
+        const s = setup();
+        const long = `${'L'.repeat(246)}.txt`; // 250 bytes
+        const accented = `${'é'.repeat(125)}`; // 250 bytes, two per character
+        for (const name of [long, accented]) {
+            s.put(path.join(s.syncDir, name), 'synced');
+            s.put(path.join(s.backingDir, name), 'was in the store', 1_600_000_000);
+        }
+        expect(await s.move('virtual')).toBe('moved');
+        const stored = readdirSync(s.backingDir, { encoding: 'buffer' });
+        expect(stored).toHaveLength(4);
+        for (const name of stored) {
+            expect(name.length).toBeLessThanOrEqual(255);
+            expect(Buffer.from(name.toString('utf8')).equals(name)).toBe(true); // still valid UTF-8
+        }
+        expect(readFileSync(path.join(s.backingDir, long), 'utf8')).toBe('synced');
+        expect(readFileSync(path.join(s.backingDir, accented), 'utf8')).toBe('synced');
+        const kept = stored.map((b) => b.toString()).filter((n) => n.includes('(conflict '));
+        expect(kept.map((n) => readFileSync(path.join(s.backingDir, n), 'utf8'))).toEqual(['was in the store', 'was in the store']);
+        expect(kept.some((n) => n.endsWith('.txt'))).toBe(true);
+    });
+
+    test('a step aside cut short between its link and unlink leaves one conflict name, not two', async () => {
+        const s = setup();
+        s.put(path.join(s.syncDir, 'a.txt'), 'synced');
+        s.put(path.join(s.backingDir, 'a.txt'), 'was in the store', 1_600_000_000);
+        // What the step aside leaves when it dies between link(2) and unlink(2), in an earlier run
+        const earlier = formatConflictFileName('a.txt', new Date(2026, 0, 1, 10, 0, 0));
+        linkSync(path.join(s.backingDir, 'a.txt'), path.join(s.backingDir, earlier));
+        s.stateDb.setMeta(LAYOUT_MOVING, 'virtual');
+
+        expect(await s.move('virtual')).toBe('moved');
+        expect(readdirSync(s.backingDir).sort()).toEqual([earlier, 'a.txt'].sort());
+        expect(readFileSync(path.join(s.backingDir, 'a.txt'), 'utf8')).toBe('synced');
+        expect(readFileSync(path.join(s.backingDir, earlier), 'utf8')).toBe('was in the store');
     });
 
     test('a cross-device refusal after something moved stops with the move still marked, for the caller to undo', async () => {
@@ -420,7 +549,7 @@ describe('moveToLayout: virtual to plain', () => {
             await virtualWith(s);
             const before = snapshot(s.backingDir, { folderTimes: false });
             let copies = 0;
-            let partial = '';
+            let partial: Buffer = Buffer.alloc(0);
             const { copyFileSync } = await import('node:fs');
             const crash = acrossDisks({
                 copyFile: (from, to) => {
@@ -434,8 +563,8 @@ describe('moveToLayout: virtual to plain', () => {
             await expect(s.move('plain', crash)).rejects.toThrow('killed');
             // A real crash mid-copy leaves the partial copy where it was being written
             writeFileSync(partial, 'half');
-            expect(path.dirname(partial).startsWith(s.syncDir)).toBe(true);
-            expect(path.basename(partial)).toStartWith('.proton-drive-tmp-');
+            expect(path.dirname(partial.toString()).startsWith(s.syncDir)).toBe(true);
+            expect(path.basename(partial.toString())).toStartWith('.proton-drive-tmp-');
 
             expect(await s.move('plain', acrossDisks())).toBe('moved');
             expect(snapshot(s.syncDir, { folderTimes: false })).toEqual(before);
@@ -502,6 +631,86 @@ describe('moveToLayout: virtual to plain', () => {
             expect(readdirSync(s.backingDir)).toEqual([]);
         });
 
+        test('a destination that rounds times to 2 s and refuses chmod (exFAT, FAT) takes every file, even after a crash', async () => {
+            const s = setup();
+            await virtualWith(s);
+            const before = snapshot(s.backingDir, { folderTimes: false });
+            const fat: MoveSeams = {
+                setTimes: (p, atime, mtime) => utimesSync(p, Math.round(atime / 2) * 2, Math.round(mtime / 2) * 2),
+                setMode: () => {
+                    throw Object.assign(new Error('EPERM: operation not permitted, chmod'), { code: 'EPERM' });
+                },
+            };
+            let n = 0;
+            const crash = acrossDisks({
+                ...fat,
+                onStep: (step) => {
+                    if (step === 'placed' && ++n === 2) throw new Error('killed');
+                },
+            });
+            await expect(s.move('plain', crash)).rejects.toThrow('killed');
+            expect(await s.move('plain', acrossDisks(fat))).toBe('moved');
+            // Every file whole and once: contents and links as they were (times and modes as the disk allows)
+            const after = snapshot(s.syncDir, { folderTimes: false });
+            const content = (snap: Record<string, string>) =>
+                Object.fromEntries(Object.entries(snap).map(([k, v]) => [k, v.startsWith('file') ? v.split(' ').slice(-1)[0] : v.split(' ')[0]]));
+            expect(content(after)).toEqual(content(before));
+            expect(readdirSync(s.backingDir)).toEqual([]);
+            expect(s.logs.some((l) => l.startsWith('warn') && l.includes('EPERM'))).toBe(true);
+        });
+
+        test('a read-only folder whose copy was cut short between making it and opening its source resumes', async () => {
+            const s = setup();
+            mkdirSync(s.backingDir, { recursive: true });
+            s.put(path.join(s.backingDir, 'Locked', 'Inner', 'a.txt'), 'a');
+            chmodSync(path.join(s.backingDir, 'Locked', 'Inner'), 0o555);
+            chmodSync(path.join(s.backingDir, 'Locked'), 0o555);
+            s.stateDb.setMeta('driveLayout', 'virtual');
+            // Cut short as Locked is made, then (Locked being there) as Inner is made
+            for (let run = 0; run < 2; run++) {
+                const crash = acrossDisks({
+                    onStep: (step) => {
+                        if (step === 'made') throw new Error('killed');
+                    },
+                });
+                await expect(s.move('plain', crash)).rejects.toThrow('killed');
+            }
+            expect(await s.move('plain', acrossDisks())).toBe('moved');
+            expect(readFileSync(path.join(s.syncDir, 'Locked', 'Inner', 'a.txt'), 'utf8')).toBe('a');
+            expect(modeOf(path.join(s.syncDir, 'Locked'))).toBe(0o555);
+            expect(modeOf(path.join(s.syncDir, 'Locked', 'Inner'))).toBe(0o555);
+            expect(readdirSync(s.backingDir)).toEqual([]);
+        });
+
+        test('a read-only folder holding a fifo is left behind with the fifo, and the move completes', async () => {
+            const s = setup();
+            mkdirSync(s.backingDir, { recursive: true });
+            s.put(path.join(s.backingDir, 'Locked', 'a.txt'), 'a');
+            expect(Bun.spawnSync(['mkfifo', path.join(s.backingDir, 'Locked', 'pipe')]).exitCode).toBe(0);
+            chmodSync(path.join(s.backingDir, 'Locked'), 0o555);
+            s.stateDb.setMeta('driveLayout', 'virtual');
+
+            expect(await s.move('plain', acrossDisks())).toBe('moved');
+            expect(readDriveLayout(s.stateDb)).toBe('plain');
+            expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBeNull();
+            expect(readFileSync(path.join(s.syncDir, 'Locked', 'a.txt'), 'utf8')).toBe('a');
+            expect(lstatSync(path.join(s.backingDir, 'Locked', 'pipe')).isFIFO()).toBe(true);
+            expect(modeOf(path.join(s.backingDir, 'Locked'))).toBe(0o555);
+            expect(modeOf(path.join(s.syncDir, 'Locked'))).toBe(0o555);
+            expect(s.logs.some((l) => l.startsWith('warn') && l.includes('Locked'))).toBe(true);
+            expect(await s.move('plain', acrossDisks())).toBe('already');
+        });
+
+        test('a long name copied across disks keeps its name', async () => {
+            const s = setup();
+            mkdirSync(s.backingDir, { recursive: true });
+            const long = `${'M'.repeat(251)}.txt`;
+            s.put(path.join(s.backingDir, long), 'synced');
+            s.stateDb.setMeta('driveLayout', 'virtual');
+            expect(await s.move('plain', acrossDisks())).toBe('moved');
+            expect(readFileSync(path.join(s.syncDir, long), 'utf8')).toBe('synced');
+        });
+
         test('a fifo is left where it is and logged; everything else moves', async () => {
             const s = setup();
             mkdirSync(s.backingDir, { recursive: true });
@@ -528,14 +737,17 @@ describe('mergeInto', () => {
         linkSync(path.join(from, 'linked.txt'), path.join(to, 'linked.txt'));
         s.put(path.join(from, 'copy.txt'), 'same', 1_700_000_000);
         s.put(path.join(to, 'copy.txt'), 'same', 1_700_000_000);
+        // The same bytes with another time (a disk that rounds times) are the same file too
         s.put(path.join(from, 'touched.txt'), 'same', 1_700_000_000);
-        s.put(path.join(to, 'touched.txt'), 'same', 1_700_000_001);
-        for (const name of ['linked.txt', 'copy.txt', 'touched.txt']) {
+        s.put(path.join(to, 'touched.txt'), 'same', 1_700_000_002);
+        s.put(path.join(from, 'differs.txt'), 'abcd', 1_700_000_000);
+        s.put(path.join(to, 'differs.txt'), 'abce', 1_700_000_000);
+        for (const name of ['linked.txt', 'copy.txt', 'touched.txt', 'differs.txt']) {
             mergeInto(path.join(from, name), path.join(to, name), { now: when });
         }
         expect(readdirSync(from)).toEqual([]);
         expect(readdirSync(to).sort()).toEqual(
-            ['copy.txt', 'linked.txt', 'other.txt', formatConflictFileName('touched.txt', when), 'touched.txt'].sort(),
+            ['copy.txt', 'differs.txt', formatConflictFileName('differs.txt', when), 'linked.txt', 'other.txt', 'touched.txt'].sort(),
         );
     });
 });

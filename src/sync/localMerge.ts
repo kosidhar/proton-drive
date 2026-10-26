@@ -1,37 +1,63 @@
 import { accessSync, closeSync, constants, lstatSync, openSync, readdirSync, readlinkSync, readSync, rmdirSync, type Stats, unlinkSync } from 'node:fs';
-import path from 'node:path';
 
-import { formatConflictFileName } from './conflictResolver';
+import { conflictMark } from './conflictResolver';
 import { moveWithoutReplacing } from './localMove';
+
+// Paths here are bytes: a name that isn't valid UTF-8 must move as it is, and a string can't hold it
+const SLASH = 0x2f;
+const NAME_MAX = 255; // bytes in one name
+const CONFLICT = Buffer.from(' (conflict ');
+
+export function bytesOf(p: string | Buffer): Buffer {
+    return typeof p === 'string' ? Buffer.from(p) : p;
+}
+
+export function joinBytes(dir: Buffer, name: Buffer): Buffer {
+    return Buffer.concat([dir, Buffer.from([SLASH]), name]);
+}
+
+export function parentOf(p: Buffer): Buffer {
+    const slash = p.lastIndexOf(SLASH);
+    return slash > 0 ? p.subarray(0, slash) : Buffer.from(slash === 0 ? '/' : '.');
+}
+
+export function nameOf(p: Buffer): Buffer {
+    return p.subarray(p.lastIndexOf(SLASH) + 1);
+}
 
 export interface MergeOptions {
     now?: Date; // the time in conflict names
     // Moves an entry to a path that must be free, never replacing what is there; false when the path is taken.
     // moveWithoutReplacing unless given (moving files between disks copies them).
-    move?: (from: string, to: string) => boolean;
+    move?: (from: Buffer, to: Buffer) => boolean;
     // Which entry keeps a name both have: the one already there (the default: the incoming one gets a conflict name),
     // or the incoming one (the one there steps aside to a conflict name)
     keepsName?: 'existing' | 'incoming';
     // A source folder still holding something once merged is left for a later round instead of failing (ENOTEMPTY)
     leaveNonEmptyFolders?: boolean;
+    // Runs before entries move out of a source folder into the folder already there (stats from before), so that both
+    // can be made writable
+    openFolders?: (from: Buffer, fromStat: Stats, to: Buffer, toStat: Stats) => void;
+    // Runs after a folder's entries change here (an entry dropped, stepped aside or removed), with that folder
+    changed?: (dir: Buffer) => void;
     // For tests: runs as an emptied source folder is about to go
     beforeRmdir?: (folder: string) => void;
 }
 
 // Moves an entry to a path, never replacing anything there: a folder already at the path is merged into, entry by
-// entry, and when both have a name, one of them gets a conflict name (see keepsName). A second name of the same file,
-// or an identical copy of it, is dropped rather than kept twice. Answers where conflict-named entries went. Throws when
-// something can't be moved; what wasn't moved stays put.
-export function mergeInto(from: string, to: string, opts: MergeOptions = {}): string[] {
-    const renamed: string[] = [];
-    mergeEntry(from, to, opts.now ?? new Date(), renamed, opts);
-    return renamed;
+// entry, and when both have a name, one of them gets a conflict name (see keepsName) that fits in a name. A second name
+// of the same file, or a copy with the same bytes, is dropped rather than kept twice. Answers where conflict-named
+// entries went. Throws when something can't be moved; what wasn't moved stays put.
+export function mergeInto(from: string | Buffer, to: string | Buffer, opts: MergeOptions = {}): string[] {
+    const renamed: Buffer[] = [];
+    mergeEntry(bytesOf(from), bytesOf(to), opts.now ?? new Date(), renamed, opts);
+    return renamed.map((p) => p.toString());
 }
 
-function mergeEntry(from: string, to: string, now: Date, renamed: string[], opts: MergeOptions): void {
+function mergeEntry(from: Buffer, to: Buffer, now: Date, renamed: Buffer[], opts: MergeOptions): void {
     const move = opts.move ?? moveWithoutReplacing;
     // moveWithoutReplacing undoes a move it can't finish without saying why; this says why first
-    accessSync(path.dirname(from), constants.W_OK | constants.X_OK);
+    accessSync(parentOf(from), constants.W_OK | constants.X_OK);
     for (let attempt = 0; attempt < 3; attempt++) {
         const there = lstatSync(to, { throwIfNoEntry: false });
         if (!there) {
@@ -41,55 +67,100 @@ function mergeEntry(from: string, to: string, now: Date, renamed: string[], opts
         }
         const coming = lstatSync(from);
         if (there.isDirectory() && coming.isDirectory()) {
-            for (const name of readdirSync(from)) {
-                mergeEntry(path.join(from, name), path.join(to, name), now, renamed, opts);
+            opts.openFolders?.(from, coming, to, there);
+            for (const name of readdirSync(from, { encoding: 'buffer' })) {
+                mergeEntry(joinBytes(from, name), joinBytes(to, name), now, renamed, opts);
             }
-            opts.beforeRmdir?.(from);
+            opts.beforeRmdir?.(from.toString());
             try {
                 rmdirSync(from); // ENOTEMPTY if something new arrived: then this folder isn't merged yet
             } catch (error: unknown) {
                 if (!opts.leaveNonEmptyFolders || (error as NodeJS.ErrnoException).code !== 'ENOTEMPTY') throw error;
+                return;
             }
+            opts.changed?.(parentOf(from));
             return;
         }
         if (sameContent(from, coming, to, there)) {
             unlinkSync(from); // what is there already holds every byte of it (a move cut short by a crash leaves this)
+            opts.changed?.(parentOf(from));
             return;
         }
         if (opts.keepsName === 'incoming') {
             // Beside it, in the same folder: a plain rename that never replaces
-            renamed.push(moveToConflictName(to, to, now, moveWithoutReplacing));
+            renamed.push(moveToConflictName(to, to, now, moveWithoutReplacing, opts));
             continue;
         }
-        renamed.push(moveToConflictName(from, to, now, move));
+        renamed.push(moveToConflictName(from, to, now, move, opts));
         return;
     }
     throw new Error(`Could not move ${from} to ${to}: its name keeps changing`);
 }
 
-function moveToConflictName(from: string, to: string, now: Date, move: (from: string, to: string) => boolean): string {
-    const name = formatConflictFileName(path.basename(to), now);
-    const dot = name.lastIndexOf('.');
-    const [stem, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ''];
+// Moves an entry to a free conflict name of `to`, beside it. One whose earlier move there was cut short between link(2)
+// and unlink(2) already has a conflict name in that folder: only this name of it goes.
+function moveToConflictName(entry: Buffer, to: Buffer, now: Date, move: (from: Buffer, to: Buffer) => boolean, opts: MergeOptions): Buffer {
+    const dir = parentOf(to);
+    const st = lstatSync(entry);
+    if (!st.isDirectory() && st.nlink > 1) {
+        const twin = conflictTwin(dir, entry, st);
+        if (twin) {
+            unlinkSync(entry);
+            opts.changed?.(parentOf(entry));
+            return twin;
+        }
+    }
     for (let n = 0; n < 1000; n++) {
-        const candidate = path.join(path.dirname(to), n === 0 ? name : `${stem}-${n}${ext}`);
-        if (move(from, candidate)) return candidate;
+        const candidate = joinBytes(dir, conflictName(nameOf(to), now, n));
+        if (move(entry, candidate)) {
+            opts.changed?.(dir);
+            opts.changed?.(parentOf(entry));
+            return candidate;
+        }
     }
     throw new Error(`No free conflict name for ${to}`);
 }
 
-// Two names of one file, two links to the same place, or two files with the same size, time and bytes (never folders)
-function sameContent(a: string, aStat: Stats, b: string, bStat: Stats): boolean {
-    if (aStat.isDirectory() || bStat.isDirectory()) return false;
-    if (aStat.dev === bStat.dev && aStat.ino === bStat.ino) return true;
-    if (aStat.isSymbolicLink() && bStat.isSymbolicLink()) return readlinkSync(a) === readlinkSync(b);
-    if (!aStat.isFile() || !bStat.isFile() || aStat.size !== bStat.size || Math.abs(aStat.mtimeMs - bStat.mtimeMs) >= 1) {
-        return false;
+function conflictTwin(dir: Buffer, entry: Buffer, st: Stats): Buffer | null {
+    for (const name of readdirSync(dir, { encoding: 'buffer' })) {
+        if (!name.includes(CONFLICT)) continue;
+        const other = joinBytes(dir, name);
+        const ost = lstatSync(other, { throwIfNoEntry: false });
+        if (ost && ost.dev === st.dev && ost.ino === st.ino && !other.equals(entry)) return other;
     }
-    return sameBytes(a, b);
+    return null;
 }
 
-function sameBytes(a: string, b: string): boolean {
+// formatConflictFileName (with -<n> for the n-th taken), in bytes, its stem shortened to fit NAME_MAX without
+// splitting a UTF-8 sequence
+export function conflictName(name: Buffer, now: Date, n = 0): Buffer {
+    const dot = name.lastIndexOf(0x2e);
+    const hasExt = dot > 0 && dot < name.length - 1;
+    const mark = Buffer.from(`${conflictMark(now)}${n > 0 ? `-${n}` : ''}`);
+    let [stem, ext] = hasExt ? [name.subarray(0, dot), name.subarray(dot)] : [name, Buffer.alloc(0)];
+    if (mark.length + ext.length >= NAME_MAX) {
+        [stem, ext] = [name, Buffer.alloc(0)]; // an extension too long to keep is kept as part of the stem
+    }
+    const room = NAME_MAX - mark.length - ext.length;
+    if (stem.length > room) {
+        let end = room;
+        while (end > 0 && (stem[end]! & 0xc0) === 0x80) end--; // not in the middle of a character
+        stem = stem.subarray(0, end);
+    }
+    return Buffer.concat([stem, mark, ext]);
+}
+
+// Two names of one file, two links to the same place, or two files with the same bytes (never folders)
+function sameContent(a: Buffer, aStat: Stats, b: Buffer, bStat: Stats): boolean {
+    if (aStat.isDirectory() || bStat.isDirectory()) return false;
+    if (aStat.dev === bStat.dev && aStat.ino === bStat.ino) return true;
+    if (aStat.isSymbolicLink() && bStat.isSymbolicLink()) {
+        return (readlinkSync(a, { encoding: 'buffer' }) as Buffer).equals(readlinkSync(b, { encoding: 'buffer' }) as Buffer);
+    }
+    return aStat.isFile() && bStat.isFile() && aStat.size === bStat.size && sameBytes(a, b);
+}
+
+export function sameBytes(a: string | Buffer, b: string | Buffer): boolean {
     const [fa, fb] = [openSync(a, 'r'), openSync(b, 'r')];
     try {
         const [ba, bb] = [Buffer.alloc(1 << 16), Buffer.alloc(1 << 16)];

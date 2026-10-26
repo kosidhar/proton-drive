@@ -1,4 +1,4 @@
-import { linkSync, lstatSync, renameSync, unlinkSync } from 'node:fs';
+import { linkSync, lstatSync, type PathLike, renameSync, unlinkSync } from 'node:fs';
 
 // Moves a file or folder to a path that must be free, never replacing what is there, and says whether it moved; it
 // throws when the move itself fails. rename(2) would replace a file at the new path, so a file is hard-linked there
@@ -6,7 +6,7 @@ import { linkSync, lstatSync, renameSync, unlinkSync } from 'node:fs';
 // supported, a look just before the rename has to do. A folder is renamed: that fails onto anything but an empty
 // folder, and an empty folder holds nothing to lose. Synchronous, so the caller can move records along with it with
 // nothing running in between.
-export function moveWithoutReplacing(from: string, to: string): boolean {
+export function moveWithoutReplacing(from: PathLike, to: PathLike): boolean {
     if (!lstatSync(from).isDirectory()) {
         try {
             linkSync(from, to);
@@ -31,7 +31,7 @@ export function moveWithoutReplacing(from: string, to: string): boolean {
     return renameIfFree(from, to);
 }
 
-function renameIfFree(from: string, to: string): boolean {
+function renameIfFree(from: PathLike, to: PathLike): boolean {
     if (lstatSync(to, { throwIfNoEntry: false })) {
         return false;
     }

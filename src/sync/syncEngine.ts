@@ -36,7 +36,7 @@ import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
 import { createLocalConflictCopy, formatConflictFileName } from './conflictResolver';
 import { gioTrash, type MoveToDesktopTrash } from './desktopTrash';
 import { readDriveLayout } from './driveMode';
-import { relocateFiles, SYNC_DIR_MOVING } from './layoutMigration';
+import { type MoveSeams, relocateFiles, SYNC_DIR_MOVING } from './layoutMigration';
 import { DriveOpError, type VfsEntry } from './driveOps';
 import { isEngineTempName, removeScannedEntries, type ScanEntry, scanLocalCopies } from './localCopies';
 import { moveWithoutReplacing } from './localMove';
@@ -168,6 +168,7 @@ export class ProtonDriveSyncEngine {
             moveToDesktopTrash?: MoveToDesktopTrash;
             // Deletes GNOME's failed-thumbnail record of a file by its path under the mount (see thumbnailCache)
             forgetFailedThumbnail?: (mountFullPath: string) => Promise<void>;
+            moveSeams?: MoveSeams; // for tests: moving the sync folder
         } = {},
     ) {
         this.index = new RemoteIndex(this.stateDb.connection);
@@ -396,7 +397,13 @@ export class ProtonDriveSyncEngine {
         try {
             await this.holdForMove({ timeoutMs: RELOCATE_HOLD_TIMEOUT_MS });
             this.recoverLocalMove();
-            await relocateFiles({ stateDb: this.stateDb, from: resolvedOld, to: resolvedNew, logger: this.logger });
+            await relocateFiles({
+                stateDb: this.stateDb,
+                from: resolvedOld,
+                to: resolvedNew,
+                logger: this.logger,
+                seams: this.options.moveSeams,
+            });
         } catch (error: unknown) {
             if (this.stateDb.getMeta(SYNC_DIR_MOVING) === null) {
                 this.releaseHold(); // Nothing moved

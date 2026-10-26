@@ -1759,12 +1759,12 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(await Promise.all(topConflicts.map((n) => at(n)))).toEqual(['top already there']);
             expect(await readdir(d.oldDir)).toEqual([]);
             expect(stateDb.getSettings().syncDir).toBe(d.newDir);
-            expect(stateDb.getAllItems()).toEqual(records);
 
             // The next pass (started by the relocation) finds every synced file where its record says: nothing is
-            // trashed or uploaded over
+            // trashed or uploaded over, and the records of the synced files are as they were
             await d.engine.holdForMove(); // waits for that pass
             d.engine.releaseHold();
+            expect(records.map((r) => stateDb.getItemByPath(r.localRelPath)?.nodeUid)).toEqual(records.map((r) => r.nodeUid));
             expect(d.calls.trashed).toEqual([]);
             expect(d.calls.uploads.sort()).toEqual([...conflicts.map((n) => `Docs/${n}`), 'Docs/mine.txt', ...topConflicts].sort());
             await d.engine.stop();
