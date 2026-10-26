@@ -36,7 +36,7 @@ import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
 import { createLocalConflictCopy, formatConflictFileName } from './conflictResolver';
 import { gioTrash, type MoveToDesktopTrash } from './desktopTrash';
 import { readDriveLayout } from './driveMode';
-import { type MoveSeams, relocateFiles, SYNC_DIR_MOVING } from './layoutMigration';
+import { LAYOUT_MOVING, type MoveSeams, relocateFiles, SYNC_DIR_MOVING } from './layoutMigration';
 import { DriveOpError, type VfsEntry } from './driveOps';
 import { isEngineTempName, removeScannedEntries, type ScanEntry, scanLocalCopies } from './localCopies';
 import { moveWithoutReplacing } from './localMove';
@@ -168,6 +168,8 @@ export class ProtonDriveSyncEngine {
     // inFlight counts what started before, which the move waits for
     private held = false;
     private inFlight = 0;
+    // The move marker last found set (see holding), so that it is logged once
+    private markerSeen: string | null = null;
     // Conflicts being resolved by hand right now, so that a second request for the same one is refused
     private readonly resolvingConflicts = new Set<number>();
 
@@ -265,7 +267,7 @@ export class ProtonDriveSyncEngine {
     }
 
     async start(options: { backgroundInitialReconcile?: boolean } = {}): Promise<void> {
-        if (this.held) {
+        if (this.holding()) {
             return; // Started again once the files have moved
         }
         await this.tracked(() => this.startNow(options));
@@ -342,6 +344,22 @@ export class ProtonDriveSyncEngine {
 
     releaseHold(): void {
         this.held = false;
+    }
+
+    // Held for a move (holdForMove), or the files are moving now or a move was cut short (meta layoutMoving or
+    // syncDirMoving): an engine that was never held, such as the CLI's own while the daemon is stopped, finds them half
+    // moved, and the half not moved yet would read as deleted here. The daemon finishes such a move with its engine held
+    // and starts it once the marker is gone. Said once per marker found.
+    private holding(): boolean {
+        if (this.held) {
+            return true;
+        }
+        const marker = [LAYOUT_MOVING, SYNC_DIR_MOVING].find((key) => this.stateDb.getMeta(key) !== null) ?? null;
+        if (marker !== null && marker !== this.markerSeen) {
+            this.logger.warn(`Proton Drive is moving files (${marker} is set): not syncing until the Proton Drive app finishes the move`);
+        }
+        this.markerSeen = marker;
+        return marker !== null;
     }
 
     private idleForMove(): boolean {
@@ -468,7 +486,7 @@ export class ProtonDriveSyncEngine {
     }
 
     async reconcileNow(): Promise<void> {
-        if (this.held) {
+        if (this.holding()) {
             return; // The pass after the move, at start(), looks at everything
         }
         if (!this.auth.isLoggedIn()) {
@@ -942,7 +960,7 @@ export class ProtonDriveSyncEngine {
         conflictId: number,
         choice: 'keep-both' | 'keep-local' | 'keep-remote',
     ): Promise<ConflictRecord> {
-        if (this.held) {
+        if (this.holding()) {
             throw new Error(BUSY_MOVING);
         }
         return this.tracked(() => this.resolveConflictNow(conflictId, choice));
@@ -1553,7 +1571,7 @@ export class ProtonDriveSyncEngine {
     }
 
     private async handleLocalFileChange(relPath: string): Promise<void> {
-        if (this.held || !this.auth.isLoggedIn()) {
+        if (this.holding() || !this.auth.isLoggedIn()) {
             return;
         }
         await this.tracked(() => this.handleLocalFileChangeNow(relPath));
@@ -1654,7 +1672,7 @@ export class ProtonDriveSyncEngine {
     }
 
     private async handleRemoteDriveEvent(event: DriveEvent): Promise<void> {
-        if (this.held) {
+        if (this.holding()) {
             return; // The pass after the move, at start(), catches up
         }
         await this.tracked(() => this.handleRemoteDriveEventNow(event));
@@ -2099,7 +2117,7 @@ export class ProtonDriveSyncEngine {
 
     // Drive changes and availability changes made while the files move would touch a half-moved tree
     private refuseWhileHeld(): void {
-        if (this.held) {
+        if (this.holding()) {
             throw new DriveOpError('EIO', BUSY_MOVING);
         }
     }
@@ -2488,7 +2506,7 @@ export class ProtonDriveSyncEngine {
     }
 
     private runReplay(): Promise<void> {
-        if (this.held) {
+        if (this.holding()) {
             return Promise.resolve(); // Sent after the move, by the pass at start()
         }
         if (this.replayRun) {
@@ -3605,7 +3623,7 @@ export class ProtonDriveSyncEngine {
     // what is still waiting or running for it. A pin's download runs after its turn, so other changes and local change
     // handling don't wait for it. Rejects with `Not in Proton Drive: <path>` for a path the remote index doesn't hold.
     async setAvailability(relPath: string, action: AvailabilityAction): Promise<AvailabilityResult> {
-        if (this.held) {
+        if (this.holding()) {
             throw new Error(BUSY_MOVING);
         }
         return this.tracked(() => this.setAvailabilityNow(relPath, action));

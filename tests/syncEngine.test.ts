@@ -1920,6 +1920,68 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await d.engine.stop();
         });
 
+        // Final review I-1: an engine that was never held (the CLI's own, with the daemon stopped) finds the files half
+        // moved. Nothing in it may look at them while a move marker is set: the half not yet moved reads as deleted.
+        for (const marker of ['layoutMoving', 'syncDirMoving'] as const) {
+            test(`an engine never held does nothing while ${marker} is set, and logs it once`, async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                d.add('Docs/b.txt', 'b');
+                d.engine.availability.setPin(d.add('Docs').uid, 'pinned', false);
+                await d.engine.reconcileNow();
+                expect(await d.files.exists('Docs/a.txt')).toBe(true);
+                // A move out of the backing store cut short: a.txt is in the sync folder already, b.txt isn't yet
+                const syncDir = stateDb.getSettings().syncDir;
+                stateDb.setMeta(marker, marker === 'layoutMoving' ? 'plain' : JSON.stringify({ from: syncDir, to: path.join(tempDir, 'New') }));
+                await mkdir(path.join(syncDir, 'Docs'), { recursive: true });
+                await rename(path.join(tempDir, 'files', 'Docs/a.txt'), path.join(syncDir, 'Docs/a.txt'));
+                const records = stateDb.getAllItems().length;
+                const listings = d.listing.calls;
+
+                // A fresh engine on the same database, as `protondrive sync` or `conflicts resolve` builds one
+                const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                    backingDir: path.join(tempDir, 'files'),
+                });
+                try {
+                    const warnings = d.warnings.length;
+                    await engine.reconcileNow();
+                    await engine.start({ backgroundInitialReconcile: false });
+                    await engine.replayRemoteOps();
+                    await (engine as any).handleLocalFileChange('Docs/a.txt');
+                    await d.events.listener?.('drive', {
+                        type: DriveEventType.NodeDeleted,
+                        nodeUid: 'vol~Docs/b.txt',
+                        parentNodeUid: 'vol~Docs',
+                        treeEventScopeId: 's',
+                        eventId: 'e1',
+                    });
+                    const refusal = (p: Promise<unknown>) => p.then(() => 'done', (e: Error) => e.message);
+                    const refusals = [
+                        await refusal(engine.resolveConflictManually(1, 'keep-local')),
+                        await refusal(engine.deleteItem('Docs/b.txt')),
+                        await refusal(engine.setAvailability('Docs', 'free')),
+                    ];
+
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.calls.uploads).toEqual([]);
+                    expect(d.listing.calls).toBe(listings);
+                    expect(stateDb.getAllItems()).toHaveLength(records);
+                    expect(await d.files.exists('Docs/b.txt')).toBe(true);
+                    expect(refusals).toEqual([busy.message, busy.message, busy.message]);
+                    expect(d.warnings.slice(warnings).filter((w) => /moving files/.test(w))).toHaveLength(1);
+
+                    // Once the move is done (the daemon finishes it), the engine works again
+                    stateDb.deleteMeta(marker);
+                    await rename(path.join(syncDir, 'Docs/a.txt'), path.join(tempDir, 'files', 'Docs/a.txt'));
+                    await engine.reconcileNow();
+                    expect(d.listing.calls).toBeGreaterThan(listings);
+                    expect(d.calls.trashed).toEqual([]);
+                } finally {
+                    await engine.stop();
+                }
+            });
+        }
+
         test('a hold that waits too long gives up, leaving the engine as it was', async () => {
             const d = setup();
             d.add('Docs/a.txt', 'a');
