@@ -21,7 +21,7 @@ import {
     uploadLocalFileToDrive,
 } from '../sdk';
 import { DAEMON_NOT_RUNNING_MESSAGE, runAvailabilityCommand } from './availabilityCommands';
-import { controlSocketDirProblem, daemonRunning, MOVING_FILES_MESSAGE, pendingMoveMarker } from './daemonProbe';
+import { controlSocketDirProblem, daemonRunning, MOVING_FILES_MESSAGE, pendingMoveMarker, syncPassError } from './daemonProbe';
 import { defaultControlSocketPath } from '../daemon/controlServer';
 import { migrateExcludedFolders } from '../sync/availabilityMigration';
 import { backingDirFor } from '../sync/driveMode';
@@ -332,6 +332,11 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
             await migrateExcludedFolders(stateDb, engine.availability, stateDbPath, engine.localRoot());
             console.log(`Syncing ${stateDb.getSettings().syncDir} with Proton Drive...`);
             await engine.reconcileNow();
+            const failed = syncPassError(engine.getStatus());
+            if (failed !== null) {
+                stateDb.close();
+                throw new Error(failed);
+            }
             const stats = stateDb.getSummaryStats();
             console.log(
                 `Sync complete: ${stats.totalFiles} files (${formatBytes(stats.totalBytes)}), ${stats.totalFolders} folders.`,

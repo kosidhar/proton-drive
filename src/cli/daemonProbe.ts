@@ -72,3 +72,9 @@ export function pendingMoveMarker(dbPath: string): string | null {
         stateDb.close();
     }
 }
+
+// What a standalone sync pass ended with, as the CLI reports it: the engine's reason when the pass held (the files
+// missing from the folder) or failed, else null
+export function syncPassError(status: { state: string; lastError: string | null }): string | null {
+    return status.state === 'error' ? (status.lastError ?? 'The sync failed') : null;
+}

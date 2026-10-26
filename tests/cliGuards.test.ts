@@ -5,7 +5,14 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { runAvailabilityCommand } from '../src/cli/availabilityCommands';
-import { controlSocketAccepts, controlSocketDirProblem, daemonRunning, MOVING_FILES_MESSAGE, pendingMoveMarker } from '../src/cli/daemonProbe';
+import {
+    controlSocketAccepts,
+    controlSocketDirProblem,
+    daemonRunning,
+    MOVING_FILES_MESSAGE,
+    pendingMoveMarker,
+    syncPassError,
+} from '../src/cli/daemonProbe';
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
 
 // Final review I-1: the CLI runs an engine of its own only when no daemon runs, and never while files are moving
@@ -211,4 +218,15 @@ describe('a move that the daemon has to finish', () => {
         expect(out.stderr).toContain("isn't private to you");
         expect(out.code).toBe(1);
     }, 30_000);
+});
+
+// Addendum 2: a standalone `protondrive sync` whose pass held (the files missing) or failed says so, and fails
+describe('what a standalone sync reports', () => {
+    test('a held or failed pass is an error with the engine\'s reason; a finished one is not', () => {
+        const missing = "Proton Drive's files are missing from /home/u/ProtonDrive. Nothing was deleted in Proton Drive.";
+        expect(syncPassError({ state: 'error', lastError: missing })).toBe(missing);
+        expect(syncPassError({ state: 'error', lastError: null })).toBe('The sync failed');
+        expect(syncPassError({ state: 'idle', lastError: null })).toBeNull();
+        expect(syncPassError({ state: 'paused', lastError: null })).toBeNull();
+    });
 });
