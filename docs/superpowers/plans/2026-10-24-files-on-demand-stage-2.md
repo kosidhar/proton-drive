@@ -596,7 +596,7 @@
      - Confirm that `pdb "SELECT key, value FROM settings WHERE key IN ('driveLayout', 'layoutMoving', 'syncDirMoving', 'localMoveInProgress');"` prints only `driveLayout|plain`.
      - Then go to step 3.
   2. **Only if the Stage 2 daemon won't start: move the files back by hand.**
-     - Check that no Proton Drive process runs: `pgrep -a protondrive` prints nothing.
+     - Check that no Proton Drive process runs: `pgrep -a protondrive` must print nothing (no daemon, app or helper). If it prints anything, choose **Quit Proton Drive** in the tray menu, or close the app (`pkill -x protondrive-gui`, so that it can't start the daemon again) and then run `curl -s -X POST http://127.0.0.1:49152/api/quit`; check again. A daemon still running would read the moves below as deletes.
      - Back up the database, and look at its markers:
        ```sh
        pdb "VACUUM INTO '$APP/ubuntu-sync-state.pre-rollback.sqlite'"
@@ -641,4 +641,4 @@
      ```
      - The first must print `0|0`. The second must print only `driveLayout|plain`.
      - If the Stage 2 daemon can't run at all, don't install `main`: keep the Stage 2 binaries installed and investigate.
-     - Otherwise quit the daemon through the API while it is idle, back up the database again (`pdb "VACUUM INTO '$APP/ubuntu-sync-state.pre-main.sqlite'"`), and install the `main` binaries.
+     - Otherwise, with the daemon idle, quit Proton Drive (the tray's **Quit Proton Drive**, or close the app and then run `curl -s -X POST http://127.0.0.1:49152/api/quit`). Check that `pgrep -a protondrive` prints nothing, back up the database again (`pdb "VACUUM INTO '$APP/ubuntu-sync-state.pre-main.sqlite'"`), and install the `main` binaries.

@@ -81,7 +81,12 @@ warn_about_store() {
     Drive ran. To get them back into that folder, either:
       - reinstall Proton Drive, switch off "Show online-only files in Files (virtual drive)" in Settings, wait until
         the files are back, then uninstall again (the safe way); or
-      - move them by hand, for ~/ProtonDrive, then record that they are back (python3 needs no sqlite3 command):
+      - move them by hand, for ~/ProtonDrive. First quit Proton Drive, which may still be running from the removed
+        files (choose Quit Proton Drive in its tray menu, or close the app, then run the curl line), and check that
+        pgrep prints nothing, or the moves below read as deletes. Then record that the files are back (python3 needs
+        no sqlite3 command):
+          curl -s -X POST http://127.0.0.1:49152/api/quit
+          pgrep -a protondrive           # must print nothing
           fusermount3 -u -z ~/ProtonDrive; chmod 755 ~/ProtonDrive
           find "$store" -mindepth 1 -maxdepth 1 -exec mv -n -t ~/ProtonDrive {} +
           find "$store" -mindepth 1      # must print nothing: anything left has a name already taken
