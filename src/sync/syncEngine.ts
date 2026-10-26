@@ -2424,10 +2424,11 @@ export class ProtonDriveSyncEngine {
                         // The replaced file keeps its identity, marked as changed here, so the next look uploads its new
                         // content as a new revision of it. A target being edited through the drive with no record yet
                         // keeps its edit baseline instead: what the drive showed decides, not the index, which may
-                        // have moved on to another device's change since
+                        // have moved on to another device's change since, or to another node altogether (which the
+                        // baseline then doesn't match: the conflict handling)
                         const edit = targetRecord ? null : this.stateDb.getEditBaseline(toRel);
                         this.stateDb.removeItemByPath(fromRel);
-                        if (edit?.nodeUid !== targetUid) {
+                        if (!edit) {
                             const base =
                                 targetRecord?.nodeUid === targetUid ? targetRecord : recordFromIndexEntry(targetEntry!, toRel);
                             this.stateDb.upsertItem({

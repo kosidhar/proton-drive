@@ -4245,6 +4245,30 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(copies.map((c) => d.named('vol~Docs', c)[0]?.content)).toContain('mine again');
             });
 
+            // Review R1: the cloud's file was replaced by another node meanwhile; the save must not land on it unseen
+            test('an atomic save over an edit still in conflict, whose cloud file became another node, never overwrites that node', async () => {
+                stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                await d.engine.reconcileNow();
+                await truncatedAndWritten(d, 'Docs/doc.txt', 'mine');
+                // Another device replaces the file with a new node of the same name
+                d.nodes.delete('vol~Docs/doc.txt');
+                d.nodes.set('vol~other', makeMockNode({ uid: 'vol~other', parentUid: 'vol~Docs', nameStr: 'doc.txt', type: NodeType.File, content: 'theirs' }));
+                await d.engine.reconcileNow(); // the conflict is queued, with no record; the index now has vol~other
+                await writeFile(d.local('Docs/doc.txt.new'), 'mine again');
+                await d.engine.renameItem('Docs/doc.txt.new', 'Docs/doc.txt');
+                await d.engine.replayRemoteOps();
+                expect(stateDb.getEditBaseline('Docs/doc.txt')?.nodeUid).toBe('vol~Docs/doc.txt');
+                expect(stateDb.getItemByPath('Docs/doc.txt')).toBeNull();
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+
+                expect(d.nodes.get('vol~other')?.content).toBe('theirs');
+                expect(d.calls.uploads).toEqual([]);
+                expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('mine again');
+            });
+
             // Review N5: deleted outside the drive and reported by the watcher
             test('the watcher reporting the file gone drops its baseline', async () => {
                 const d = setup();
