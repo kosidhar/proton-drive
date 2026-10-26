@@ -237,6 +237,9 @@ struct AccountInfo {
 struct DaemonStatus {
     state: String,
     current_action: Option<String>,
+    /// Why the state is "error" (the last pass failed, or the files are missing from the folder)
+    #[serde(default)]
+    last_error: Option<String>,
     logged_in: bool,
     sync_dir: String,
     active_transfers: Vec<ActiveTransfer>,
@@ -438,6 +441,12 @@ fn item_rel_path(remote_path: &str, name: &str) -> String {
     } else {
         format!("{dir}/{name}")
     }
+}
+
+/// The status pill for a sync error: the daemon's reason when it gives one (such as the files missing from the
+/// folder), shortened to fit with the full text on hover.
+fn sync_error_text(status: &DaemonStatus) -> String {
+    status.last_error.as_deref().map(str::trim).filter(|e| !e.is_empty()).unwrap_or("Sync Error").to_string()
 }
 
 /// What the daemon's control socket answers to an availability action.
@@ -1944,7 +1953,7 @@ impl ProtonDriveNativeApp {
                         .unwrap_or("Syncing...");
                     (PROTON_PURPLE_HOVER, act.to_string())
                 } else if self.status.state == "error" {
-                    (STATUS_DANGER, "Sync Error".to_string())
+                    (STATUS_DANGER, sync_error_text(&self.status))
                 } else {
                     (STATUS_SUCCESS, "Up to date".to_string())
                 };
@@ -6355,6 +6364,25 @@ mod tests {
         assert_eq!(move_action_label("move-back"), Some("Move files back"));
         assert_eq!(move_action_label("retry"), Some("Try again"));
         assert_eq!(move_action_label("explode"), None);
+    }
+
+    // #45: the engine holds with its files missing from the folder, and the status pill says why (full text on hover)
+    #[test]
+    fn a_sync_error_shows_the_daemons_reason() {
+        let missing = "Proton Drive's files are missing from /home/u/ProtonDrive. Nothing was deleted in Proton Drive.";
+        let status: DaemonStatus = serde_json::from_str(&format!(
+            r#"{{"state":"error","currentAction":null,"loggedIn":true,"syncDir":"/home/u/ProtonDrive","activeTransfers":[],
+                "lastError":"{missing}",
+                "stats":{{"totalFiles":1,"totalFolders":0,"totalBytes":3,"unresolvedConflicts":0,"errorItems":0}},
+                "settings":{{"syncDir":"/home/u/ProtonDrive","conflictStrategy":"keep-both","notificationsEnabled":true,
+                            "reconcileIntervalSec":120,"paused":false,"ignorePatterns":[".git"]}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(sync_error_text(&status), missing);
+        let unexplained = DaemonStatus { state: "error".into(), ..Default::default() };
+        assert_eq!(sync_error_text(&unexplained), "Sync Error");
+        let blank = DaemonStatus { state: "error".into(), last_error: Some("  ".into()), ..Default::default() };
+        assert_eq!(sync_error_text(&blank), "Sync Error");
     }
 
     #[test]
