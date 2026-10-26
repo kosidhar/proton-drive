@@ -321,8 +321,9 @@ export async function downloadRevisionToFile(options: {
     const claimedMtime = revision.claimedModificationTime ?? remoteNode.modificationTime;
     const mtimeMs = claimedMtime instanceof Date ? claimedMtime.getTime() : Date.now();
 
-    // Asked for before the file exists (creating the writer creates it), so failing here (offline, say) leaves none
-    const downloader = await sdk.getFileRevisionDownloader(revision.uid);
+    // The file first: a downloader holds one of the SDK's few download slots until its download ends, so it is asked
+    // for only once there is a file to download into (a file that can't be opened would otherwise keep the slot for
+    // ever, and enough of those stop every download). Failing after this, the file goes again (see the catch).
     const writer = Bun.file(filePath).writer();
 
     const writableStream: WritableStream = {
@@ -339,6 +340,7 @@ export async function downloadRevisionToFile(options: {
     };
 
     try {
+        const downloader = await sdk.getFileRevisionDownloader(revision.uid);
         const controller = downloader.downloadToStream(writableStream, (downloadedBytes) => {
             onProgress?.(downloadedBytes, expectedSize);
         });
