@@ -4255,6 +4255,82 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
         });
 
+        // #21: the watcher used to upload such a file as a new revision of the cloud's, overwriting it unseen
+        describe('a new local file where Proton Drive has a file of that name', () => {
+            const conflictNames = (nodes: Map<string, { parentUid?: string }>, nameOf: (n: any) => string, parentUid: string) =>
+                [...nodes.values()].filter((n) => n.parentUid === parentUid).map((n) => nameOf(n)).filter((n) => n.includes(' (conflict '));
+
+            for (const strategy of ['keep-both', 'prompt'] as const) {
+                test(`reported by the watcher, it meets the conflict handling (${strategy}) as a pass would, never a new revision`, async () => {
+                    stateDb.updateSettings({ conflictStrategy: strategy });
+                    const d = setup();
+                    d.add('Docs/doc.txt', 'old');
+                    await d.engine.reconcileNow();
+                    await d.files.writeLocal('Docs/doc.txt', 'mine'); // no baseline: made while the daemon was down, say
+
+                    await (d.engine as any).handleLocalFileChange('Docs');
+                    await (d.engine as any).handleLocalFileChange('Docs/doc.txt');
+                    await d.engine.reconcileNow();
+
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('old');
+                    expect(d.calls.uploads).not.toContain('Docs/doc.txt');
+                    if (strategy === 'keep-both') {
+                        expect(conflictNames(d.nodes, d.nameOf, 'vol~Docs').length).toBe(1);
+                    } else {
+                        expect(stateDb.listConflicts().map((c) => c.localRelPath)).toContain('Docs/doc.txt');
+                        expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('mine');
+                    }
+                });
+            }
+
+            test('one the index has yet to hear of, found by the upload being refused, meets the conflict handling too', async () => {
+                const d = setup();
+                d.add('Docs/keep.txt', 'k');
+                await d.engine.reconcileNow();
+                await d.engine.setAvailability('Docs', 'pin');
+                await d.engine.reconcileNow();
+                d.add('Docs/late.txt', 'cloud'); // since the last listing
+                await d.files.writeLocal('Docs/late.txt', 'mine');
+
+                await (d.engine as any).handleLocalFileChange('Docs/late.txt');
+
+                expect(d.nodes.get('vol~Docs/late.txt')?.content).toBe('cloud');
+                expect(conflictNames(d.nodes, d.nameOf, 'vol~Docs').length).toBe(1);
+                expect(await readFile(d.local('Docs/late.txt'), 'utf8')).toBe('cloud');
+            });
+
+            test('the same content is simply recorded, and a name nobody has uploads as a new file', async () => {
+                const d = setup();
+                d.add('Docs/same.txt', 'same');
+                await d.engine.reconcileNow();
+                await d.files.writeLocal('Docs/same.txt', 'same');
+                await d.files.writeLocal('Docs/new.txt', 'new');
+
+                await (d.engine as any).handleLocalFileChange('Docs/same.txt');
+                await (d.engine as any).handleLocalFileChange('Docs/new.txt');
+
+                expect(stateDb.getItemByPath('Docs/same.txt')?.nodeUid).toBe('vol~Docs/same.txt');
+                expect(d.calls.uploads).toEqual(['Docs/new.txt']);
+                expect(conflictNames(d.nodes, d.nameOf, 'vol~Docs')).toEqual([]);
+            });
+
+            test('in the plain layout too', async () => {
+                const drive = makeMockDrive();
+                const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger);
+                const files = localFiles(stateDb);
+                drive.add('Docs/doc.txt', 'old');
+                await engine.reconcileNow();
+                await files.writeLocal('Docs/doc.txt', 'mine');
+
+                await (engine as any).handleLocalFileChange('Docs');
+                await (engine as any).handleLocalFileChange('Docs/doc.txt');
+
+                expect(drive.nodes.get('vol~Docs/doc.txt')?.content).toBe('old');
+                expect(drive.calls.uploads).not.toContain('Docs/doc.txt');
+                expect(conflictNames(drive.nodes, drive.nameOf, 'vol~Docs').length).toBe(1);
+            });
+        });
+
         describe('drive operation errors', () => {
             test('renameItem with noReplace refuses an existing target (EEXIST), here or only in Proton Drive, and changes nothing', async () => {
                 const d = setup();

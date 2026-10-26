@@ -27,6 +27,7 @@ import {
     downloadRevisionToFile,
     isUnsupportedRemoteNode,
     listFolderChildren,
+    type UploadResult,
     uploadLocalFileToDrive,
 } from '../sdk/fileOps';
 import { getClaimedSize, getName } from '../sdk/node';
@@ -174,20 +175,37 @@ export class ProtonDriveSyncEngine {
             : this.stateDb.getSettings().syncDir;
     }
 
-    // The node a drive edit baseline stands for, if Proton Drive still has it where the drive showed it; null when it
-    // doesn't (gone or moved). A network failure isn't an answer: it throws.
-    private async nodeStillAt(baseline: EditBaseline): Promise<NodeEntity | null> {
+    // The file Proton Drive has at a path, as far as this computer knows: the node of its edit baseline, or else of its
+    // index entry, if it is still there. A network failure isn't an answer: it throws.
+    private async cloudFileAt(relPath: string): Promise<NodeEntity | null> {
+        const edit = this.stateDb.getEditBaseline(relPath);
+        const entry = this.liveIndexEntry(relPath);
+        const known = [
+            edit && { uid: edit.nodeUid, parentUid: edit.parentUid },
+            entry?.type === 'file' && !isProvisional(entry.uid) && { uid: entry.uid, parentUid: entry.parentUid },
+        ];
+        for (const node of known) {
+            const there = node ? await this.nodeStillAt(node.uid, node.parentUid, relPath) : null;
+            if (there) {
+                return there;
+            }
+        }
+        return null;
+    }
+
+    // A file node, if Proton Drive still has it at that path; null when it doesn't (gone or moved).
+    private async nodeStillAt(uid: string, parentUid: string | null, relPath: string): Promise<NodeEntity | null> {
         let node: NodeEntity;
         try {
-            node = await this.sdk.getNode(baseline.nodeUid);
+            node = await this.sdk.getNode(uid);
         } catch (error: unknown) {
             if (isTransient(error)) {
                 throw error;
             }
             return null;
         }
-        const there = !node.trashTime && node.type === NodeType.File && node.parentUid === baseline.parentUid;
-        return there && getName(node) === path.posix.basename(baseline.relPath) ? node : null;
+        const there = !node.trashTime && node.type === NodeType.File && node.parentUid === parentUid;
+        return there && getName(node) === path.posix.basename(relPath) ? node : null;
     }
 
     getStatus() {
@@ -930,7 +948,8 @@ export class ProtonDriveSyncEngine {
         parentNode: NodeEntity,
         since: number,
         existingNodeUid?: string,
-    ): Promise<void> {
+        collisionMode: 'new-revision' | 'skip' = 'new-revision',
+    ): Promise<UploadResult> {
         const transferId = `ul:${relPath}`;
         const st = await stat(localFullPath);
         this.activeTransfers.set(transferId, {
@@ -950,7 +969,7 @@ export class ProtonDriveSyncEngine {
                 localPath: localFullPath,
                 remoteName: path.basename(relPath),
                 existingNodeUid,
-                collisionMode: 'new-revision',
+                collisionMode,
                 onProgress: (uploadedBytes, totalBytes) => {
                     const current = this.activeTransfers.get(transferId);
                     if (current) {
@@ -960,7 +979,8 @@ export class ProtonDriveSyncEngine {
                 },
             });
 
-            if (result.nodeUid) {
+            // A name taken by another file (with 'skip') is left to the caller
+            if (result.nodeUid && result.status !== 'skipped') {
                 const item: Omit<SyncedItemRecord, 'updatedAt'> = {
                     localRelPath: relPath,
                     nodeUid: result.nodeUid,
@@ -987,6 +1007,7 @@ export class ProtonDriveSyncEngine {
                     bytesTransferred: result.size,
                 });
             }
+            return result;
         } catch (error: unknown) {
             const msg = error instanceof Error ? error.message : String(error);
             this.stateDb.setItemStatus(relPath, 'error', msg);
@@ -1427,16 +1448,25 @@ export class ProtonDriveSyncEngine {
                 if (this.journal.hasPending()) {
                     void this.replayRemoteOps(); // A move into it may have been waiting for it
                 }
+            } else if (st.isFile() && dbRecord) {
+                await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, dbRecord.nodeUid);
             } else if (st.isFile()) {
-                const edit = dbRecord ? null : this.stateDb.getEditBaseline(relPath);
-                const edited = edit ? await this.nodeStillAt(edit) : null;
-                if (edited) {
-                    // An edit of the online-only file the drive showed: decided as a sync pass decides it
-                    const localInfo = { isDirectory: false, size: st.size, mtimeMs: st.mtimeMs };
+                // No record: where Proton Drive has a file of that name, it is decided as a sync pass decides it (an
+                // edit of what the drive showed, with a baseline; the conflict handling otherwise), never by uploading
+                // over it. Such a file found only by its upload being refused goes the same way.
+                const localInfo = { isDirectory: false, size: st.size, mtimeMs: st.mtimeMs };
+                const decideAsAPass = (remoteNode: NodeEntity) => {
                     const now = this.stateDb.getSettings();
-                    await this.reconcileSinglePath(relPath, edited, localInfo, undefined, remoteMap, now, since);
+                    return this.reconcileSinglePath(relPath, remoteNode, localInfo, undefined, remoteMap, now, since);
+                };
+                const there = await this.cloudFileAt(relPath);
+                if (there) {
+                    await decideAsAPass(there);
                 } else {
-                    await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, dbRecord?.nodeUid);
+                    const result = await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, undefined, 'skip');
+                    if (result.status === 'skipped' && result.nodeUid) {
+                        await decideAsAPass(await this.sdk.getNode(result.nodeUid));
+                    }
                 }
             }
         });
