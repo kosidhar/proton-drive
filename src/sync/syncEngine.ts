@@ -622,7 +622,13 @@ export class ProtonDriveSyncEngine {
                     void this.replayRemoteOps(); // A move into it may have been waiting for it
                 }
             } else {
-                await this.uploadLocalToRemote(relPath, localFullPath, parentNode, since);
+                // A file of that name that Proton Drive got after the listing is found by the upload being refused, and
+                // judged as if listed (the conflict handling, or its edit baseline), never uploaded over as a revision
+                const result = await this.uploadLocalToRemote(relPath, localFullPath, parentNode, since, undefined, 'skip');
+                if (result.status === 'skipped' && result.nodeUid) {
+                    const there = await this.sdk.getNode(result.nodeUid);
+                    await this.reconcileSinglePath(relPath, there, localInfo, undefined, remoteMap, settings, since);
+                }
             }
             return;
         }

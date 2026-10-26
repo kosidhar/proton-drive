@@ -4472,6 +4472,126 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(drive.calls.uploads).not.toContain('Docs/doc.txt');
                 expect(conflictNames(drive.nodes, drive.nameOf, 'vol~Docs').length).toBe(1);
             });
+
+            // #23: a sync pass whose listing of the folder came before another device uploaded a file of that name used
+            // to upload over that file, as the API's same-name refusal turned the upload into a new revision of it.
+            // `appear` puts the cloud file there as the pass starts uploading (its listing is older).
+            const appearsAsItUploads = (sdk: ProtonDriveClient, name: string, appear: () => void) => {
+                const getFileUploader = (sdk as any).getFileUploader.bind(sdk);
+                let appeared = false;
+                (sdk as any).getFileUploader = async (parent: unknown, uploading: string, ...rest: unknown[]) => {
+                    if (!appeared && uploading === name) {
+                        appeared = true;
+                        appear();
+                    }
+                    return getFileUploader(parent, uploading, ...rest);
+                };
+            };
+            const pinnedDocs = async (d: ReturnType<typeof setup>) => {
+                d.add('Docs/keep.txt', 'k');
+                await d.engine.reconcileNow();
+                await d.engine.setAvailability('Docs', 'pin');
+                await d.engine.reconcileNow();
+            };
+
+            for (const strategy of ['keep-both', 'prompt'] as const) {
+                test(`found by a pass's upload, after its listing, it meets the conflict handling (${strategy}), never a new revision`, async () => {
+                    stateDb.updateSettings({ conflictStrategy: strategy });
+                    const d = setup();
+                    await pinnedDocs(d);
+                    await d.files.writeLocal('Docs/late.txt', 'mine');
+                    appearsAsItUploads(d.sdk, 'late.txt', () => d.add('Docs/late.txt', 'theirs'));
+
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(d.nodes.get('vol~Docs/late.txt')?.content).toBe('theirs');
+                    expect(d.calls.uploads).not.toContain('Docs/late.txt');
+                    const copies = conflictNames(d.nodes, d.nameOf, 'vol~Docs');
+                    if (strategy === 'keep-both') {
+                        // Both kept: theirs at the name, mine as a conflict copy, here and in Proton Drive
+                        expect(copies.length).toBe(1);
+                        expect(d.named('vol~Docs', copies[0]!)[0]?.content).toBe('mine');
+                        expect(await readFile(d.local('Docs/late.txt'), 'utf8')).toBe('theirs');
+                        expect(await readFile(d.local(`Docs/${copies[0]}`), 'utf8')).toBe('mine');
+                    } else {
+                        expect(copies).toEqual([]);
+                        expect(stateDb.listConflicts().map((c) => c.localRelPath)).toContain('Docs/late.txt');
+                        expect(await readFile(d.local('Docs/late.txt'), 'utf8')).toBe('mine');
+                    }
+                    expect(d.calls.trashed).toEqual([]);
+                });
+            }
+
+            test("found by a pass's upload in the plain layout too", async () => {
+                const drive = makeMockDrive();
+                const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger);
+                const files = localFiles(stateDb);
+                drive.add('Docs/keep.txt', 'k');
+                await engine.reconcileNow();
+                await files.writeLocal('Docs/late.txt', 'mine');
+                appearsAsItUploads(drive.sdk, 'late.txt', () => drive.add('Docs/late.txt', 'theirs'));
+
+                await engine.reconcileNow();
+
+                expect(drive.nodes.get('vol~Docs/late.txt')?.content).toBe('theirs');
+                expect(drive.calls.uploads).not.toContain('Docs/late.txt');
+                expect(conflictNames(drive.nodes, drive.nameOf, 'vol~Docs').length).toBe(1);
+            });
+
+            test('a pass still uploads an edit of a recorded file as a new revision of it', async () => {
+                const d = setup();
+                await pinnedDocs(d);
+                await writeFile(d.local('Docs/keep.txt'), 'edited');
+
+                await d.engine.reconcileNow();
+
+                expect(d.nodes.get('vol~Docs/keep.txt')?.content).toBe('edited');
+                expect(d.calls.uploads).toEqual(['Docs/keep.txt']);
+                expect(conflictNames(d.nodes, d.nameOf, 'vol~Docs')).toEqual([]);
+            });
+
+            // A file with an edit baseline (made from an online-only file through the drive) whose cloud file the pass
+            // didn't list: the file found by the upload is judged by the baseline, as when listed
+            for (const found of ['the one the drive showed, moved back', 'a new one from another device'] as const) {
+                test(`with an edit baseline, the file a pass's upload finds after its listing is judged by it (${found})`, async () => {
+                    stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+                    const d = setup();
+                    d.add('Docs/doc.txt', 'old');
+                    d.add('Docs/other.txt', 'o');
+                    await d.engine.reconcileNow();
+                    await d.engine.truncateItem('Docs/doc.txt');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    const shown = d.nodes.get('vol~Docs/doc.txt')!;
+                    if (found === 'a new one from another device') {
+                        d.nodes.delete(shown.uid);
+                        appearsAsItUploads(d.sdk, 'doc.txt', () =>
+                            d.nodes.set(
+                                'vol~theirs',
+                                makeMockNode({ uid: 'vol~theirs', parentUid: 'vol~Docs', nameStr: 'doc.txt', type: NodeType.File, content: 'theirs' }),
+                            ),
+                        );
+                    } else {
+                        d.nodes.set(shown.uid, { ...shown, parentUid: d.root.uid }); // moved out, and back once listed
+                        appearsAsItUploads(d.sdk, 'doc.txt', () => d.nodes.set(shown.uid, shown));
+                    }
+
+                    await d.engine.reconcileNow();
+
+                    if (found === 'a new one from another device') {
+                        expect(d.nodes.get('vol~theirs')?.content).toBe('theirs');
+                        expect(d.calls.uploads).not.toContain('Docs/doc.txt');
+                        const copies = conflictNames(d.nodes, d.nameOf, 'vol~Docs');
+                        expect(copies.length).toBe(1);
+                        expect(d.named('vol~Docs', copies[0]!)[0]?.content).toBe('mine');
+                    } else {
+                        expect(d.nodes.get(shown.uid)?.content).toBe('mine'); // a new revision of it
+                        expect(d.calls.uploads).toEqual(['Docs/doc.txt']);
+                        expect(conflictNames(d.nodes, d.nameOf, 'vol~Docs')).toEqual([]);
+                    }
+                    expect(d.calls.trashed).toEqual([]);
+                });
+            }
         });
 
         // S22: Move to Trash through the drive keeps what exists only on this computer, as a cloud delete does (#16)
