@@ -3989,6 +3989,35 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await saveInto(async () => {});
             });
 
+            for (const via of ['pass', 'watcher'] as const) {
+                test(`a file saved two online-only folders down goes into those very folders (${via})`, async () => {
+                    const d = setup();
+                    d.add('A/B/x.txt', 'x');
+                    d.add('A/y.txt', 'y');
+                    await d.engine.reconcileNow();
+                    expect(await d.files.exists('A')).toBe(false);
+
+                    await d.files.writeLocal('A/B/new.txt', 'new'); // the drive makes A and B to hold it
+                    if (via === 'watcher') {
+                        for (const rel of ['A', 'A/B', 'A/B/new.txt']) {
+                            await (d.engine as any).handleLocalFileChange(rel);
+                        }
+                    }
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(d.named(d.root.uid, 'A').map((n) => n.uid)).toEqual(['vol~A']);
+                    expect(d.named('vol~A', 'B').map((n) => n.uid)).toEqual(['vol~A/B']);
+                    expect(d.named('vol~A/B', 'new.txt')[0]?.content).toBe('new');
+                    expect(d.calls.uploads).toEqual(['A/B/new.txt']);
+                    expect(await readdir(d.local('A'))).toEqual(['B']);
+                    expect(await readdir(d.local('A/B'))).toEqual(['new.txt']);
+                    expect(d.engine.availability.stateOf('A/B/x.txt')).toBe('online-only');
+                    expect(d.calls.downloads).toEqual([]);
+                    expect(d.calls.trashed).toEqual([]);
+                });
+            }
+
             test('the watcher reporting the folder made for it, then the file, adopts the cloud folder too', async () => {
                 await saveInto(async (d) => {
                     await (d.engine as any).handleLocalFileChange('A');
