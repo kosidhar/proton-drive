@@ -624,10 +624,10 @@ export class ProtonDriveSyncEngine {
             } else {
                 // A file of that name that Proton Drive got after the listing is found by the upload being refused, and
                 // judged as if listed (the conflict handling, or its edit baseline), never uploaded over as a revision
-                const result = await this.uploadLocalToRemote(relPath, localFullPath, parentNode, since, undefined, 'skip');
-                if (result.status === 'skipped' && result.nodeUid) {
-                    const there = await this.sdk.getNode(result.nodeUid);
-                    await this.reconcileSinglePath(relPath, there, localInfo, undefined, remoteMap, settings, since);
+                const there = await this.uploadNewFile(relPath, localFullPath, parentNode, since);
+                if (there) {
+                    const dbRecordNow = this.recordOf(relPath, there.uid);
+                    await this.reconcileSinglePath(relPath, there, localInfo, dbRecordNow, remoteMap, settings, since);
                 }
             }
             return;
@@ -1026,6 +1026,51 @@ export class ProtonDriveSyncEngine {
         } finally {
             this.activeTransfers.delete(transferId);
         }
+    }
+
+    // Uploads a local file with no record as a new file, never over a cloud file of that name (#21, #23): returns the
+    // file whose name the upload was refused for, for the caller to judge as a pass would, or null once uploaded. One
+    // trashed or gone by the time it is read holds that name no more: the upload is tried once again.
+    private async uploadNewFile(
+        relPath: string,
+        localFullPath: string,
+        parentNode: NodeEntity,
+        since: number,
+    ): Promise<NodeEntity | null> {
+        for (let attempt = 1; ; attempt++) {
+            const result = await this.uploadLocalToRemote(relPath, localFullPath, parentNode, since, undefined, 'skip');
+            if (result.status !== 'skipped' || !result.nodeUid) {
+                return null;
+            }
+            const there = await this.liveNode(result.nodeUid);
+            if (there) {
+                return there;
+            }
+            if (attempt === 2) {
+                this.logger.warn(`Not uploading ${relPath} yet: Proton Drive refuses its name for an item that is gone`);
+                return null;
+            }
+        }
+    }
+
+    // A node as Proton Drive has it now; null when it is gone or in its trash. A network failure isn't an answer: it
+    // throws.
+    private async liveNode(uid: string): Promise<NodeEntity | null> {
+        try {
+            const node = await this.sdk.getNode(uid);
+            return node.trashTime ? null : node;
+        } catch (error: unknown) {
+            if (error instanceof ValidationError) {
+                return null;
+            }
+            throw error;
+        }
+    }
+
+    // The record at a path, if it stands for that node
+    private recordOf(relPath: string, nodeUid: string): SyncedItemRecord | undefined {
+        const record = this.stateDb.getItemByPath(relPath);
+        return record?.nodeUid === nodeUid ? record : undefined;
     }
 
     private async trashRemoteNodeForDeletedLocal(relPath: string, remoteNode: NodeEntity): Promise<void> {
@@ -1462,18 +1507,12 @@ export class ProtonDriveSyncEngine {
                 // edit of what the drive showed, with a baseline; the conflict handling otherwise), never by uploading
                 // over it. Such a file found only by its upload being refused goes the same way.
                 const localInfo = { isDirectory: false, size: st.size, mtimeMs: st.mtimeMs };
-                const decideAsAPass = (remoteNode: NodeEntity) => {
-                    const now = this.stateDb.getSettings();
-                    return this.reconcileSinglePath(relPath, remoteNode, localInfo, undefined, remoteMap, now, since);
-                };
-                const there = await this.cloudFileAt(relPath);
+                const there =
+                    (await this.cloudFileAt(relPath)) ?? (await this.uploadNewFile(relPath, fullPath, parentNode, since));
                 if (there) {
-                    await decideAsAPass(there);
-                } else {
-                    const result = await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, undefined, 'skip');
-                    if (result.status === 'skipped' && result.nodeUid) {
-                        await decideAsAPass(await this.sdk.getNode(result.nodeUid));
-                    }
+                    const now = this.stateDb.getSettings();
+                    const dbRecordNow = this.recordOf(relPath, there.uid); // Recorded meanwhile, by a pass
+                    await this.reconcileSinglePath(relPath, there, localInfo, dbRecordNow, remoteMap, now, since);
                 }
             }
         });

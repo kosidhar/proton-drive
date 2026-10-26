@@ -4539,6 +4539,87 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(conflictNames(drive.nodes, drive.nameOf, 'vol~Docs').length).toBe(1);
             });
 
+            // Recorded meanwhile (uploaded from here by the watcher while the pass waited, or the other way round), the
+            // file the refusal names is the recorded file: a later change to it is an edit, not a conflict
+            for (const via of ['a pass', 'the watcher'] as const) {
+                test(`found by ${via}'s upload, a file recorded meanwhile at that name takes the change as an edit of it`, async () => {
+                    stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+                    const d = setup();
+                    await pinnedDocs(d);
+                    await d.files.writeLocal('Docs/late.txt', 'v2');
+                    appearsAsItUploads(d.sdk, 'late.txt', () => {
+                        const sha1 = d.add('Docs/late.txt', 'v1').activeRevision!.claimedDigests!.sha1!;
+                        stateDb.upsertItem({
+                            localRelPath: 'Docs/late.txt',
+                            nodeUid: 'vol~Docs/late.txt',
+                            parentNodeUid: 'vol~Docs',
+                            type: 'file',
+                            localSha1: sha1,
+                            remoteSha1: sha1,
+                            localMtimeMs: 0,
+                            remoteMtimeMs: 0,
+                            size: 2,
+                            syncStatus: 'synced',
+                            lastError: null,
+                        });
+                    });
+
+                    if (via === 'a pass') {
+                        await d.engine.reconcileNow();
+                    } else {
+                        await (d.engine as any).handleLocalFileChange('Docs/late.txt');
+                    }
+
+                    expect(d.nodes.get('vol~Docs/late.txt')?.content).toBe('v2');
+                    expect(conflictNames(d.nodes, d.nameOf, 'vol~Docs')).toEqual([]);
+                    expect(await readFile(d.local('Docs/late.txt'), 'utf8')).toBe('v2');
+                });
+            }
+
+            // A file whose name the upload was refused for, but that is trashed or gone by the time it is read, holds
+            // nothing at that name: never a conflict with it, or a download of it
+            for (const via of ['a pass', 'the watcher'] as const) {
+                for (const how of ['trashed', 'deleted'] as const) {
+                    test(`found by ${via}'s upload but ${how} when read, a cloud file is no conflict: the local file uploads as new`, async () => {
+                        stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+                        const d = setup();
+                        await pinnedDocs(d);
+                        await d.files.writeLocal('Docs/late.txt', 'mine');
+                        appearsAsItUploads(d.sdk, 'late.txt', () => d.add('Docs/late.txt', 'theirs'));
+                        const getNode = d.sdk.getNode.bind(d.sdk);
+                        let gone: NodeEntity | null = null;
+                        (d.sdk as any).getNode = async (uid: string) => {
+                            if (uid !== 'vol~Docs/late.txt') {
+                                return getNode(uid);
+                            }
+                            if (!gone) {
+                                // Read once as it refused the name, then out of the folder
+                                gone = d.nodes.get(uid)!;
+                                d.nodes.delete(uid);
+                                return gone;
+                            }
+                            if (how === 'deleted') {
+                                throw new ValidationError('Item not found');
+                            }
+                            return { ...gone, trashTime: new Date() };
+                        };
+
+                        if (via === 'a pass') {
+                            await d.engine.reconcileNow();
+                        } else {
+                            await (d.engine as any).handleLocalFileChange('Docs/late.txt');
+                        }
+
+                        const record = stateDb.getItemByPath('Docs/late.txt');
+                        expect(record?.nodeUid).toStartWith('vol~uploaded');
+                        expect(d.nodes.get(record!.nodeUid)?.content).toBe('mine');
+                        expect(await readFile(d.local('Docs/late.txt'), 'utf8')).toBe('mine');
+                        expect(conflictNames(d.nodes, d.nameOf, 'vol~Docs')).toEqual([]);
+                        expect(d.calls.downloads).toEqual(['Docs/keep.txt']);
+                    });
+                }
+            }
+
             test('a pass still uploads an edit of a recorded file as a new revision of it', async () => {
                 const d = setup();
                 await pinnedDocs(d);
