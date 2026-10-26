@@ -1870,15 +1870,17 @@ export class ProtonDriveSyncEngine {
     // Deletes an item of My files through the virtual drive: its local copy (everything in it, things that exist only on
     // this computer included, as the user asked), its records and its index entries go at once, and Proton Drive moves it
     // to its trash from the journal, downloading nothing. An ignored item is only ever local, so only its local copy goes.
-    // With onlyIfEmpty (rmdir), only a folder that holds nothing, here or in Proton Drive, is deleted.
+    // With onlyIfEmpty (rmdir), only a folder that holds nothing, here or in Proton Drive, is deleted. With trash (Move
+    // to Trash through the drive), what exists only on this computer (never uploaded, or changed since) goes to the
+    // desktop Trash rather than away, as after a cloud delete, and the user is told.
     // Rejects with a DriveOpError: `Not found: <path>` (ENOENT), `Hidden: <path>` (EACCES), with onlyIfEmpty `Not empty:
     // <path>` (ENOTEMPTY) or `Not a folder: <path>` (EIO); or with `Invalid path: <path>`.
-    async deleteItem(relPath: string, opts: { onlyIfEmpty?: boolean } = {}): Promise<void> {
+    async deleteItem(relPath: string, opts: { onlyIfEmpty?: boolean; trash?: boolean } = {}): Promise<void> {
         const rel = normalizeDrivePath(relPath);
         if (rel === '') {
             throw new Error("The whole of Proton Drive can't be deleted");
         }
-        await this.inAvailabilityRun(() => this.deleteLocally(rel, opts.onlyIfEmpty === true));
+        await this.inAvailabilityRun(() => this.deleteLocally(rel, opts.onlyIfEmpty === true, opts.trash === true));
         void this.replayRemoteOps();
     }
 
@@ -2468,7 +2470,7 @@ export class ProtonDriveSyncEngine {
         });
     }
 
-    private async deleteLocally(relPath: string, onlyIfEmpty: boolean): Promise<void> {
+    private async deleteLocally(relPath: string, onlyIfEmpty: boolean, trash: boolean): Promise<void> {
         this.recoverLocalMove();
         if (this.policy.hiddenBy(relPath)?.hide === 'hidden') {
             throw new DriveOpError('EACCES', `Hidden: ${relPath}`);
@@ -2490,6 +2492,19 @@ export class ProtonDriveSyncEngine {
         }
         const toTrash = ignored ? new Map<string, string>() : this.trashTargets(relPath, entry);
         this.watcher.suppressPath(relPath);
+        // For a Move to Trash, what is only here is told apart from unchanged synced copies while the records still say
+        // which those are
+        const scan =
+            trash && local
+                ? await scanLocalCopies({
+                      syncDir: root,
+                      relPath,
+                      ignorePatterns: this.stateDb.getSettings().ignorePatterns,
+                      stopAtFirst: false,
+                      isUnchangedSyncedCopy: (rel, fullPath, st) => this.isUnchangedSyncedCopy(rel, fullPath, st),
+                  })
+                : null;
+        let kept = { moved: 0, stayed: 0 };
         await this.whileRemoving(
             async (records) => {
                 // Records first, in one transaction with the index and the journalled trash: a crash before the files
@@ -2513,17 +2528,46 @@ export class ProtonDriveSyncEngine {
                             ? new DriveOpError('ENOTEMPTY', `Not empty: ${relPath}`, { cause: error })
                             : error;
                     });
+                } else if (scan) {
+                    // Unchanged synced copies go (their records already have), the rest to the desktop Trash
+                    const removal = await removeScannedEntries({
+                        syncDir: root,
+                        entries: scan.entries,
+                        keep: new Set(scan.localOnly.map((item) => item.relPath)),
+                        mode: 'keep-changed',
+                        dropRecord: () => {},
+                        shouldContinue: () => true,
+                    });
+                    kept = await this.clearKeptAfterCloudDelete(root, relPath, scan.entries, removal.kept);
                 } else if (local) {
                     await rm(path.join(root, relPath), { recursive: true, force: true });
                 }
             },
             { from: relPath, to: null },
         );
+        const told: string[] = [];
+        if (kept.moved > 0) {
+            told.push(`${kept.moved} item(s) that existed only on this computer were moved to your Trash.`);
+        }
+        if (kept.stayed > 0) {
+            const where = path.join(this.stateDb.getSettings().syncDir, relPath);
+            told.push(`${kept.stayed} item(s) that existed only on this computer were kept at ${where} and will upload again.`);
+        }
+        const deleted =
+            toTrash.size > 0 ? 'Deleted on this computer; it goes to Proton Drive Trash' : 'Deleted on this computer';
         this.stateDb.logActivity({
             action: 'delete-local',
             localRelPath: relPath,
-            details: toTrash.size > 0 ? 'Deleted on this computer; it goes to Proton Drive Trash' : 'Deleted on this computer',
+            details: told.length > 0 ? `${deleted}. ${told.join(' ')}` : deleted,
         });
+        if (told.length > 0) {
+            sendDesktopNotification({
+                title: 'Proton Drive: items only on this computer were kept',
+                body: `${relPath} was moved to the Trash. ${told.join(' ')}`,
+                urgency: 'normal',
+                enabled: this.stateDb.getSettings().notificationsEnabled,
+            });
+        }
     }
 
     // Whether a folder holds anything: on this computer, in Proton Drive as this computer sees it (hidden and ignored items

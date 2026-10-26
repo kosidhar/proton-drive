@@ -4331,6 +4331,65 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
         });
 
+        // S22: Move to Trash through the drive keeps what exists only on this computer, as a cloud delete does (#16)
+        describe('a delete through the drive that is a Move to Trash', () => {
+            const withDesktopTrash = () => {
+                stateDb.setMeta('driveLayout', 'virtual');
+                const drive = makeMockDrive();
+                const backingDir = path.join(tempDir, 'files');
+                const desktopTrash = path.join(tempDir, 'desktop-trash');
+                const handed: string[] = [];
+                // Stands in for gio trash: never the real one in tests
+                const moveToDesktopTrash = async (fullPath: string) => {
+                    handed.push(path.relative(backingDir, fullPath));
+                    await mkdir(desktopTrash, { recursive: true });
+                    await rename(fullPath, path.join(desktopTrash, path.basename(fullPath)));
+                    return true;
+                };
+                const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                    backingDir,
+                    moveToDesktopTrash,
+                });
+                return { ...drive, engine, handed, desktopTrash, local: (rel: string) => path.join(backingDir, rel), files: localFiles(stateDb, () => backingDir) };
+            };
+
+            test('content only on this computer goes to the desktop Trash, synced content goes, and the cloud copy goes to its trash', async () => {
+                const d = withDesktopTrash();
+                d.add('Folder/a.txt', 'a');
+                d.add('Folder/edited.txt', 'e');
+                await d.engine.reconcileNow();
+                await d.engine.setAvailability('Folder', 'pin');
+                await d.engine.reconcileNow();
+                await writeFile(d.local('Folder/new.txt'), 'never uploaded');
+                await writeFile(d.local('Folder/edited.txt'), 'changed since');
+
+                await d.engine.deleteItem('Folder', { trash: true });
+
+                expect(d.handed.sort()).toEqual(['Folder/edited.txt', 'Folder/new.txt']);
+                expect(await readFile(path.join(d.desktopTrash, 'new.txt'), 'utf8')).toBe('never uploaded');
+                expect(await readFile(path.join(d.desktopTrash, 'edited.txt'), 'utf8')).toBe('changed since');
+                expect(await d.files.exists('Folder')).toBe(false);
+                expect(d.files.recordCount('Folder')).toBe(0);
+                expect(stateDb.listActivity(5).map((a) => a.details).join('\n')).toContain('moved to your Trash');
+                await d.engine.replayRemoteOps();
+                expect(d.calls.trashed).toEqual([['vol~Folder']]);
+            });
+
+            test('a plain delete still removes everything, as the user asked', async () => {
+                const d = withDesktopTrash();
+                d.add('Folder/a.txt', 'a');
+                await d.engine.reconcileNow();
+                await d.engine.setAvailability('Folder', 'pin');
+                await d.engine.reconcileNow();
+                await writeFile(d.local('Folder/new.txt'), 'never uploaded');
+
+                await d.engine.deleteItem('Folder');
+
+                expect(d.handed).toEqual([]);
+                expect(await d.files.exists('Folder')).toBe(false);
+            });
+        });
+
         describe('drive operation errors', () => {
             test('renameItem with noReplace refuses an existing target (EEXIST), here or only in Proton Drive, and changes nothing', async () => {
                 const d = setup();

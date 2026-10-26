@@ -90,9 +90,9 @@ async function jsonBody(req: Request): Promise<Record<string, unknown> | null> {
 type DriveEngine = ControlServerOptions['engine'];
 
 // GET /vfs/children?path=, POST /vfs/hydrate {path}, POST /vfs/rename {from, to, noReplace?}, POST /vfs/delete {path,
-// onlyIfEmpty?} (onlyIfEmpty is rmdir), POST /vfs/truncate {path} (an online-only file made an empty local one). Paths
-// are paths of My files, UTF-8 as they are ('' is the top); each answers { entries } or { ok: true }, or 400 { error,
-// code }.
+// onlyIfEmpty?, trash?} (onlyIfEmpty is rmdir, trash a Move to Trash), POST /vfs/truncate {path} (an online-only file
+// made an empty local one). Paths are paths of My files, UTF-8 as they are ('' is the top); each answers { entries } or
+// { ok: true }, or 400 { error, code }.
 async function driveRoute(req: Request, route: string, engine: DriveEngine): Promise<Response> {
     if (route === '/vfs/children') {
         if (req.method !== 'GET') return driveError(new Error('Method not allowed'), 405);
@@ -128,7 +128,10 @@ async function driveRoute(req: Request, route: string, engine: DriveEngine): Pro
                 if (body.onlyIfEmpty !== undefined && typeof body.onlyIfEmpty !== 'boolean') {
                     return driveError(new Error('onlyIfEmpty must be true or false'));
                 }
-                await engine.deleteItem(body.path, { onlyIfEmpty: body.onlyIfEmpty === true });
+                if (body.trash !== undefined && typeof body.trash !== 'boolean') {
+                    return driveError(new Error('trash must be true or false'));
+                }
+                await engine.deleteItem(body.path, { onlyIfEmpty: body.onlyIfEmpty === true, trash: body.trash === true });
                 break;
             case '/vfs/truncate':
                 if (typeof body.path !== 'string') return driveError(new Error('Missing path'));

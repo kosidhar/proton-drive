@@ -49,7 +49,7 @@ function makeFake(rejectWith?: string) {
             if (toRel === 'taken.txt') throw new DriveOpError('EEXIST', `Already exists: ${toRel}`);
             if (fromRel === 'online-only.txt') throw new DriveOpError('EXDEV', `Not on this computer: ${fromRel}`);
         },
-        async deleteItem(relPath: string, opts?: { onlyIfEmpty?: boolean }): Promise<void> {
+        async deleteItem(relPath: string, opts?: { onlyIfEmpty?: boolean; trash?: boolean }): Promise<void> {
             driveCalls.push(['delete', relPath, opts]);
             if (relPath === 'missing.txt') throw new DriveOpError('ENOENT', `Not found: ${relPath}`);
             if (relPath === 'Full' && opts?.onlyIfEmpty) throw new DriveOpError('ENOTEMPTY', `Not empty: ${relPath}`);
@@ -196,7 +196,7 @@ describe('drive routes', () => {
         expect(engine.driveCalls).toEqual([['hydrate', 'Docs/été/a é.txt']]);
     });
 
-    test('POST /vfs/rename passes noReplace through, and POST /vfs/delete passes onlyIfEmpty through', async () => {
+    test('POST /vfs/rename passes noReplace through, and POST /vfs/delete passes onlyIfEmpty and trash through', async () => {
         const { socketPath, engine } = await start();
         const renamed = await post(socketPath, '/vfs/rename', { from: 'a é.txt', to: 'Docs/b é.txt', noReplace: true });
         expect(renamed.status).toBe(200);
@@ -206,11 +206,13 @@ describe('drive routes', () => {
         expect(deleted.status).toBe(200);
         expect(await deleted.json()).toEqual({ ok: true });
         expect((await post(socketPath, '/vfs/delete', { path: 'Docs/été', onlyIfEmpty: true })).status).toBe(200);
+        expect((await post(socketPath, '/vfs/delete', { path: 'Docs/old', trash: true })).status).toBe(200);
         expect(engine.driveCalls).toEqual([
             ['rename', 'a é.txt', 'Docs/b é.txt', { noReplace: true }],
             ['rename', 'x', 'y', { noReplace: false }],
-            ['delete', 'Docs/b é.txt', { onlyIfEmpty: false }],
-            ['delete', 'Docs/été', { onlyIfEmpty: true }],
+            ['delete', 'Docs/b é.txt', { onlyIfEmpty: false, trash: false }],
+            ['delete', 'Docs/été', { onlyIfEmpty: true, trash: false }],
+            ['delete', 'Docs/old', { onlyIfEmpty: false, trash: true }],
         ]);
     });
 
@@ -263,6 +265,7 @@ describe('drive routes', () => {
             await post(socketPath, '/vfs/delete', { path: 7 }),
             await post(socketPath, '/vfs/delete', { path: 'Full', onlyIfEmpty: 1 }),
             await post(socketPath, '/vfs/truncate', { path: 3 }),
+            await post(socketPath, '/vfs/delete', { path: 'Docs', trash: 'yes' }),
         ];
         for (const res of bad) {
             expect(res.status).toBe(400);
