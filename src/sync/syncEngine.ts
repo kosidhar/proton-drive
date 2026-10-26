@@ -117,7 +117,13 @@ const FILES_MISSING_CACHE_MS = 1000;
 // restart of the daemon, and a pass that fails or is cut short leaves the look to the next one.
 export const FILES_HOLD = 'filesHold';
 
-// A confirmation that missing files were deleted on purpose, with nothing missing or not what the user was shown: 409
+// What the user can do about the files missing from the folder, besides waiting for them (POST /sync/files-missing):
+// delete them from Proton Drive too (confirmFilesMissingDeleted), or keep them there, online-only
+// (keepFilesMissingOnlineOnly)
+export type FilesMissingAction = 'delete-in-cloud' | 'keep-online-only';
+export const FILES_MISSING_ACTIONS: readonly string[] = ['delete-in-cloud', 'keep-online-only'] satisfies FilesMissingAction[];
+
+// A choice about missing files (FilesMissingAction) with nothing missing, or not what the user was shown: 409
 export class FilesMissingRefused extends Error {
     readonly status = 409;
     constructor(message: string) {
@@ -708,13 +714,64 @@ export class ProtonDriveSyncEngine {
     }
 
     // The user says the missing files were deleted on purpose (the GUI's "Delete them from Proton Drive too", POST
-    // /sync/files-missing {root, names}): the hold ends, and the next sync pass takes those items for deletes, moving them
-    // to the Proton Drive trash. That pass uses the confirmation up: anything else missing after it is held again.
-    // `expected` is what the user was shown (filesMissing's root and names): it must still be exactly what is missing,
-    // in any order, or the confirmation is refused, as what would be deleted is no longer what the user agreed to.
-    // Answers what was confirmed. Throws FilesMissingRefused (409) when nothing is held, for a mismatch, or while the
-    // files move between the sync folder and the backing store.
+    // /sync/files-missing {action: 'delete-in-cloud', root, names}): the hold ends, and the next sync pass takes those
+    // items for deletes, moving them to the Proton Drive trash: through the tree, or by their recorded nodes where the
+    // pass can't reach them (see trashConfirmedOutOfReach). That pass uses the confirmation up: anything else missing
+    // after it is held again. `expected` is what the user was shown (filesMissing's root and names): it must still be
+    // exactly what is missing, in any order, or the confirmation is refused, as what would be deleted is no longer what
+    // the user agreed to. Answers what was confirmed. Throws FilesMissingRefused (409) when nothing is held, for a
+    // mismatch, or while the files move between the sync folder and the backing store.
     async confirmFilesMissingDeleted(expected: { root: string; names: string[] }): Promise<FilesMissingStatus> {
+        const { root, missing } = this.shownMissing(expected, 'nothing was deleted');
+        this.missingConfirmed = { root, names: new Set(missing.names) };
+        this.endFilesHold();
+        const details = `The ${missing.items} item(s) missing from ${this.shownPlace()} (${listNames(missing.names)}) were deleted on purpose: they go to the Proton Drive trash`;
+        this.logger.warn(details);
+        this.stateDb.logActivity({ action: 'sync', localRelPath: '/', details });
+        void this.reconcileNow();
+        return missing;
+    }
+
+    // The user keeps the missing items in Proton Drive, online-only (the GUI's "Keep them online-only", POST
+    // /sync/files-missing {action: 'keep-online-only', root, names}; #50): nothing is deleted, on this computer or in
+    // Proton Drive. Their records go (records before files: there are no files), so nothing of them reads as deleted
+    // later; and what of them was kept on this device stops being kept (an explicit unpin, as Free up space gives), so
+    // nothing comes down again. They show as online-only, in the drive and in My files, and the hold ends. `expected` is
+    // checked as for confirmFilesMissingDeleted. Answers what was kept. Throws FilesMissingRefused (409) when nothing is
+    // held, for a mismatch, or while the files move between the sync folder and the backing store.
+    async keepFilesMissingOnlineOnly(expected: { root: string; names: string[] }): Promise<FilesMissingStatus> {
+        const { missing } = this.shownMissing(expected, 'nothing was changed');
+        const notMarked: string[] = []; // pinned, but with no uid to unpin them by
+        this.stateDb.connection.transaction(() => {
+            for (const name of missing.names) {
+                if (this.policy.isPinned(name) || this.policy.hasPinnedBelow(name)) {
+                    const uid = this.stateDb.getItemByPath(name)?.nodeUid ?? this.index.getByPath(name)?.uid;
+                    if (uid && !isProvisional(uid)) {
+                        this.policy.setPin(uid, 'unpinned', true);
+                    } else {
+                        notMarked.push(name);
+                    }
+                }
+                this.stateDb.removeItemByPath(name);
+            }
+        })();
+        if (notMarked.length > 0) {
+            this.logger.warn(
+                `${listNames(notMarked)} may download again: Proton Drive's listing doesn't have them yet, so they couldn't be marked online-only`,
+            );
+        }
+        this.endFilesHold();
+        const details = `The ${missing.items} item(s) missing from ${this.shownPlace()} (${listNames(missing.names)}) stay in Proton Drive, online-only: nothing was deleted`;
+        this.logger.info(details);
+        this.stateDb.logActivity({ action: 'sync', localRelPath: '/', details });
+        void this.reconcileNow();
+        return missing;
+    }
+
+    // What is missing now, checked against what the user was shown (`expected`, filesMissing's root and names) before
+    // acting on it: the folder held, and the hold's names, in any order. Throws FilesMissingRefused (409) when nothing is
+    // held, for a mismatch (saying `nothingDone`), or while the files move between the sync folder and the backing store.
+    private shownMissing(expected: { root: string; names: string[] }, nothingDone: string): { root: string; missing: FilesMissingStatus } {
         if (this.holding()) {
             throw new FilesMissingRefused(BUSY_MOVING);
         }
@@ -727,16 +784,10 @@ export class ProtonDriveSyncEngine {
         const sorted = (names: readonly string[]) => JSON.stringify([...names].sort());
         if (expected.root !== missing.root || sorted(expected.names) !== sorted(missing.names)) {
             throw new FilesMissingRefused(
-                `What is missing from ${this.shownPlace()} has changed (now ${listNames(missing.names)}): nothing was deleted; look again`,
+                `What is missing from ${this.shownPlace()} has changed (now ${listNames(missing.names)}): ${nothingDone}; look again`,
             );
         }
-        this.missingConfirmed = { root: hold.root, names: new Set(missing.names) };
-        this.endFilesHold();
-        const details = `The ${missing.items} item(s) missing from ${this.shownPlace()} (${listNames(missing.names)}) were deleted on purpose: they go to the Proton Drive trash`;
-        this.logger.warn(details);
-        this.stateDb.logActivity({ action: 'sync', localRelPath: '/', details });
-        void this.reconcileNow();
-        return missing;
+        return { root: hold.root, missing };
     }
 
     // What would make something in the local root is refused while the files are missing from it
@@ -925,6 +976,9 @@ export class ProtonDriveSyncEngine {
             await this.observingLocal((since) =>
                 this.reconcileDirectoryIncremental(root, '', remoteMap, this.stateDb.getSettings(), since, onlineOnly),
             );
+            if (confirmation !== null) {
+                await this.trashConfirmedOutOfReach(confirmation);
+            }
             // Hides that were waiting for uploads finish once those are done
             await this.completePendingHides();
             // Last, so nothing on this computer waits behind it
@@ -1616,6 +1670,49 @@ export class ProtonDriveSyncEngine {
     private recordOf(relPath: string, nodeUid: string): SyncedItemRecord | undefined {
         const record = this.stateDb.getItemByPath(relPath);
         return record?.nodeUid === nodeUid ? record : undefined;
+    }
+
+    // #50: what the user confirmed as deleted (confirmFilesMissingDeleted) that this pass couldn't reach through the tree.
+    // A record whose folders above have none, as a file opened through the virtual drive has, sits under a folder the
+    // pass doesn't go into (online-only here), so it was never looked at, and the hold came back for ever. Each such
+    // item, still recorded and still missing, goes as the pass would have taken it (see trashForDeletedLocal), by its
+    // recorded node; one gone from Proton Drive already just loses its records. Nothing outside what was confirmed. A
+    // folder goes only from where its record says it is, as its trash is decided from a listing of it at that path; one
+    // moved in the cloud meanwhile is left as it is, record and all.
+    private async trashConfirmedOutOfReach(confirmation: { root: string; names: Set<string> }): Promise<void> {
+        if (confirmation.root !== this.localRoot()) {
+            return;
+        }
+        const ignorePatterns = this.stateDb.getSettings().ignorePatterns;
+        const left: SyncedItemRecord[] = [];
+        for (const name of confirmation.names) {
+            for (const record of this.stateDb.getItemsUnder(name)) {
+                const rel = record.localRelPath; // parents come before what is in them
+                if (
+                    left.some((item) => isWithin(rel, item.localRelPath)) || // goes with its folder
+                    matchesIgnorePatterns(rel, ignorePatterns) ||
+                    this.policy.hiddenBy(rel)?.hide === 'hidden' ||
+                    (await this.existsLocally(rel))
+                ) {
+                    continue;
+                }
+                left.push(record);
+            }
+        }
+        for (const record of left) {
+            const rel = record.localRelPath;
+            if (this.stateDb.getItemByPath(rel)?.nodeUid !== record.nodeUid) {
+                continue; // Changed meanwhile
+            }
+            const node = await this.liveNode(record.nodeUid);
+            if (node === null) {
+                this.stateDb.removeItemByPath(rel); // Gone from Proton Drive already, or in its trash
+            } else if (node.type === NodeType.Folder && (node.parentUid !== record.parentNodeUid || getName(node) !== path.posix.basename(rel))) {
+                this.logger.warn(`Not trashing ${rel}: it has moved in Proton Drive meanwhile`);
+            } else {
+                await this.trashForDeletedLocal(rel, node);
+            }
+        }
     }
 
     private async trashRemoteNodeForDeletedLocal(relPath: string, remoteNode: NodeEntity): Promise<void> {

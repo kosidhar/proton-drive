@@ -4,7 +4,14 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { DriveOpError } from '../sync/driveOps';
-import { type AvailabilityAction, ConflictRefusedError, FilesMissingRefused, type ProtonDriveSyncEngine } from '../sync/syncEngine';
+import {
+    type AvailabilityAction,
+    ConflictRefusedError,
+    FILES_MISSING_ACTIONS,
+    type FilesMissingAction,
+    FilesMissingRefused,
+    type ProtonDriveSyncEngine,
+} from '../sync/syncEngine';
 import type { ConflictRecord } from '../sync/syncStateDb';
 import { parseSettingsRequest, type SettingsChange } from './settingsValidation';
 import type { DriveMoveAction } from './vfsSupervisor';
@@ -48,10 +55,14 @@ export interface ControlServerOptions {
     // Resolve a conflict by hand (see ProtonDriveSyncEngine.resolveConflictManually); throws ConflictRefusedError for an
     // unknown or already resolved one
     resolveConflict?: (id: number, choice: 'keep-both' | 'keep-local' | 'keep-remote') => Promise<ConflictRecord>;
-    // The user says the files missing from the folder, as they were shown (the status's filesMissing root and names),
-    // were deleted on purpose (see ProtonDriveSyncEngine.confirmFilesMissingDeleted); throws FilesMissingRefused when
-    // nothing is missing, or something else than what was shown
-    confirmFilesMissingDeleted?: (expected: { root: string; names: string[] }) => Promise<{ root: string; names: string[]; items: number }>;
+    // What the user chose about the files missing from the folder, as they were shown (the status's filesMissing root
+    // and names): they were deleted on purpose (see ProtonDriveSyncEngine.confirmFilesMissingDeleted), or they stay in
+    // Proton Drive, online-only (keepFilesMissingOnlineOnly); throws FilesMissingRefused when nothing is missing, or
+    // something else than what was shown
+    resolveFilesMissing?: (
+        action: FilesMissingAction,
+        expected: { root: string; names: string[] },
+    ) => Promise<{ root: string; names: string[]; items: number }>;
 }
 
 // 'live' when something accepts connections on the socket, 'stale' when it refuses or is gone
@@ -294,25 +305,28 @@ async function resolveConflictRoute(req: Request, resolveConflict: ControlServer
     }
 }
 
-// POST /sync/files-missing {action: 'delete-in-cloud', root, names}: the files missing from the folder (the engine holds
-// while they are) were deleted on purpose, so the next sync pass moves them to the Proton Drive trash. root and names are
-// what the user was shown (filesMissing in /api/status), which must still be exactly what is missing, as /drive/move
-// names its move by from and to. 200 { ok: true, root, names, items } with what was confirmed; 400 { error, code:
-// 'EINVAL' } for a malformed request; 409 { error, code: 'EEXIST' } when nothing is missing, or something else than
-// what was shown; 500 { error, code: 'EIO' } otherwise. Never reachable from the TCP API.
-async function filesMissingRoute(req: Request, confirm: ControlServerOptions['confirmFilesMissingDeleted']): Promise<Response> {
+// POST /sync/files-missing {action, root, names}: what to do about the files missing from the folder (the engine holds
+// while they are). 'delete-in-cloud': they were deleted on purpose, so the next sync pass moves them to the Proton Drive
+// trash. 'keep-online-only': they stay in Proton Drive, online-only, and nothing is deleted. root and names are what
+// the user was shown (filesMissing in /api/status), which must still be exactly what is missing, as /drive/move names
+// its move by from and to. 200 { ok: true, root, names, items } with what was done; 400 { error, code: 'EINVAL' } for a
+// malformed request; 409 { error, code: 'EEXIST' } when nothing is missing, or something else than what was shown; 500
+// { error, code: 'EIO' } otherwise. Never reachable from the TCP API.
+async function filesMissingRoute(req: Request, resolve: ControlServerOptions['resolveFilesMissing']): Promise<Response> {
     const invalid = (message: string) => Response.json({ error: message, code: 'EINVAL' }, { status: 400 });
     if (req.method !== 'POST') return jsonError('Method not allowed', 405);
-    if (!confirm) return jsonError('Not found', 404);
+    if (!resolve) return jsonError('Not found', 404);
     const body = await jsonBody(req);
-    if (!body || body.action !== 'delete-in-cloud') return invalid('action must be delete-in-cloud');
-    const { root, names } = body;
+    if (!body || typeof body.action !== 'string' || !FILES_MISSING_ACTIONS.includes(body.action)) {
+        return invalid(`action must be one of ${FILES_MISSING_ACTIONS.join(', ')}`);
+    }
+    const { action, root, names } = body;
     if (typeof root !== 'string' || !root) return invalid('root must be the folder the files are missing from');
     if (!Array.isArray(names) || names.length === 0 || !names.every((name) => typeof name === 'string' && name !== '')) {
         return invalid('names must be the items missing');
     }
     try {
-        return Response.json({ ok: true, ...(await confirm({ root, names: names as string[] })) });
+        return Response.json({ ok: true, ...(await resolve(action as FilesMissingAction, { root, names: names as string[] })) });
     } catch (err) {
         if (err instanceof FilesMissingRefused) {
             return Response.json({ error: err.message, code: 'EEXIST' }, { status: 409 });
@@ -353,7 +367,7 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
                 return resolveConflictRoute(req, opts.resolveConflict);
             }
             if (url.pathname === '/sync/files-missing') {
-                return filesMissingRoute(req, opts.confirmFilesMissingDeleted);
+                return filesMissingRoute(req, opts.resolveFilesMissing);
             }
             if (url.pathname === '/remote/mkdir') {
                 return remoteMkdirRoute(req, opts.remoteMkdir);

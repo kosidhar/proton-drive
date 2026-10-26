@@ -801,11 +801,29 @@ fn resolve_conflict_at(socket: &std::path::Path, id: u64, choice: &str) -> Resul
     control_request_at(socket, "POST", "/conflicts/resolve", Some(&body), RESOLVE_READ_TIMEOUT).map(|_| ())
 }
 
-/// POST /sync/files-missing {action: "delete-in-cloud", root, names}: the files missing from the folder, as the user was
-/// shown them, were deleted on purpose, so the daemon's next sync moves them to the Proton Drive trash. The daemon
-/// refuses (409) if that is no longer what is missing.
-fn files_missing_delete_at(socket: &std::path::Path, root: &str, names: &[String]) -> Result<(), String> {
-    let body = serde_json::json!({ "action": "delete-in-cloud", "root": root, "names": names });
+/// What the user does about the files missing from the folder, besides waiting for them (the action of POST
+/// /sync/files-missing).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MissingChoice {
+    /// They were deleted on purpose: the daemon's next sync moves them to the Proton Drive trash too.
+    DeleteInCloud,
+    /// They stay in Proton Drive, online-only: nothing is deleted, and nothing is downloaded again (#50).
+    KeepOnlineOnly,
+}
+
+impl MissingChoice {
+    fn action(self) -> &'static str {
+        match self {
+            MissingChoice::DeleteInCloud => "delete-in-cloud",
+            MissingChoice::KeepOnlineOnly => "keep-online-only",
+        }
+    }
+}
+
+/// POST /sync/files-missing {action, root, names}: what to do about the files missing from the folder, as the user was
+/// shown them. The daemon refuses (409) if that is no longer what is missing.
+fn files_missing_resolve_at(socket: &std::path::Path, choice: MissingChoice, root: &str, names: &[String]) -> Result<(), String> {
+    let body = serde_json::json!({ "action": choice.action(), "root": root, "names": names });
     control_request_at(socket, "POST", "/sync/files-missing", Some(&body), DRIVE_READ_TIMEOUT).map(|_| ())
 }
 
@@ -966,8 +984,8 @@ enum WorkerCommand {
     LoadConflicts,
     ResolveConflict { id: u64, choice: String },
     SetAvailability { path: String, action: String },
-    /// The files missing from the folder, as shown, were deleted on purpose (POST /sync/files-missing)
-    ConfirmFilesMissing { root: String, names: Vec<String> },
+    /// What to do about the files missing from the folder, as shown (POST /sync/files-missing)
+    ResolveFilesMissing { choice: MissingChoice, root: String, names: Vec<String> },
 }
 
 /// Set once in `main` when the app only renders a screenshot: nothing that changes anything is ever sent then, and
@@ -1036,7 +1054,7 @@ enum WorkerEvent {
     VirtualDriveSwitched(Result<SettingsReply, String>),
     /// Mount again or an action on a stopped move finished, or why not
     DriveDone(Result<(), String>),
-    /// The confirmation that the missing files were deleted on purpose went through, or why not
+    /// What was asked about the missing files (deleted on purpose, or kept online-only) went through, or why not
     FilesMissingDone(Result<(), String>),
 }
 
@@ -1386,8 +1404,14 @@ impl ProtonDriveNativeApp {
                 _ => "/home/u/ProtonDrive".to_string(),
             }
         };
-        // As after a restore by copy that has yet to finish: a folder still missing, and one file deeper down
-        let message = format!("1284 items are missing from {}. Nothing was deleted in Proton Drive.", shown_folder(&root));
+        // As after a restore by copy that has yet to finish: a folder still missing, and one file deeper down. Where, as
+        // the daemon says it: the drive's storage in the virtual layout (lay --drive-status first), else the folder
+        let place = if status.vfs.as_ref().is_some_and(|v| v.mode == "virtual") {
+            "the drive's storage".to_string()
+        } else {
+            shown_folder(&root)
+        };
+        let message = format!("1284 items are missing from {place}. Nothing was deleted in Proton Drive.");
         status.state = "error".into();
         status.last_error = Some(message.clone());
         let names = vec!["Documents".into(), "Photos/2024/IMG_2041.jpg".into()];
@@ -3024,9 +3048,7 @@ impl ProtonDriveNativeApp {
                                 if confirm == PendingConfirm::VirtualDriveOff {
                                     self.send_drive_command(WorkerCommand::SetVirtualDrive(false));
                                 } else if let PendingConfirm::DeleteMissing { root, names, .. } = &confirm {
-                                    self.files_missing_working = true;
-                                    self.files_missing_error = None;
-                                    let _ = self.tx.send(WorkerCommand::ConfirmFilesMissing { root: root.clone(), names: names.clone() });
+                                    self.resolve_files_missing(MissingChoice::DeleteInCloud, root.clone(), names.clone());
                                 } else {
                                     self.send_availability(action_path.clone(), action);
                                 }
@@ -3064,12 +3086,15 @@ impl ProtonDriveNativeApp {
     }
 
     /// Above every tab while the daemon holds because the files are missing from the folder: what is missing, that
-    /// nothing was deleted, and, behind a confirmation, deleting them from Proton Drive too. Keeping waiting is the
-    /// default: it needs nothing.
+    /// nothing was deleted, and what can be done besides waiting, which is the default and needs nothing. Keeping them
+    /// online-only deletes nothing, so it asks nothing: the banner says what it does. Deleting them from Proton Drive too
+    /// asks first. In the virtual layout (the files were in the drive's hidden storage) keeping them online-only is the
+    /// default; in the plain layout the files are often on a disk that isn't connected, so waiting stays the default.
     fn render_files_missing(&mut self, ui: &mut egui::Ui) {
         let Some(fm) = self.status.files_missing.clone() else {
             return;
         };
+        let virtual_layout = self.status.vfs.as_ref().is_some_and(|v| v.mode == "virtual");
         Frame::NONE
             .fill(Color32::from_rgba_unmultiplied(239, 68, 68, 26))
             .stroke(Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(239, 68, 68, 110)))
@@ -3091,30 +3116,74 @@ impl ProtonDriveNativeApp {
                     missing_names(&fm)
                 );
                 ui.add(egui::Label::new(RichText::new(detail).size(12.5).color(TEXT_MUTED())).wrap());
+                ui.add_space(2.0);
+                let keep_says = if virtual_layout {
+                    "Keep them online-only to stop waiting: they stay in Proton Drive, and the drive shows them as online-only. Nothing is deleted."
+                } else {
+                    "Keep them online-only to stop waiting: they stay in Proton Drive, shown as online-only in My files, and aren't downloaded again. Nothing is deleted."
+                };
+                ui.add(egui::Label::new(RichText::new(keep_says).size(12.5).color(TEXT_MUTED())).wrap());
                 if let Some(error) = &self.files_missing_error {
                     ui.add_space(2.0);
                     ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
                 }
                 ui.add_space(8.0);
                 let working = self.files_missing_working;
-                let clicked = proton_button(
-                    ui,
-                    Vec2::new(250.0, 32.0),
-                    "Delete them from Proton Drive too",
-                    BG_CARD_ALT(),
-                    btn_secondary_hover_bg(),
-                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                    if working { TEXT_MUTED() } else { STATUS_DANGER },
-                    12.5,
-                )
-                .on_hover_text("Asks first. While they are missing, nothing is deleted in Proton Drive.")
-                .clicked();
-                if clicked && !working {
-                    self.pending_confirm =
-                        Some(PendingConfirm::DeleteMissing { root: fm.root.clone(), names: fm.names.clone(), items: fm.items });
+                let mut chosen = None;
+                ui.horizontal(|ui| {
+                    let keep_text = if working { TEXT_MUTED() } else if virtual_layout { Color32::WHITE } else { TEXT_PRIMARY() };
+                    let keep = if virtual_layout {
+                        proton_button(ui, Vec2::new(190.0, 32.0), "Keep them online-only", PROTON_PURPLE, PROTON_PURPLE_HOVER, None, keep_text, 12.5)
+                    } else {
+                        proton_button(
+                            ui,
+                            Vec2::new(190.0, 32.0),
+                            "Keep them online-only",
+                            BG_CARD_ALT(),
+                            btn_secondary_hover_bg(),
+                            Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                            keep_text,
+                            12.5,
+                        )
+                    };
+                    if keep.on_hover_text("Nothing is deleted, on this computer or in Proton Drive").clicked() {
+                        chosen = Some(MissingChoice::KeepOnlineOnly);
+                    }
+                    ui.add_space(4.0);
+                    if proton_button(
+                        ui,
+                        Vec2::new(250.0, 32.0),
+                        "Delete them from Proton Drive too",
+                        BG_CARD_ALT(),
+                        btn_secondary_hover_bg(),
+                        Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                        if working { TEXT_MUTED() } else { STATUS_DANGER },
+                        12.5,
+                    )
+                    .on_hover_text("Asks first. While they are missing, nothing is deleted in Proton Drive.")
+                    .clicked()
+                    {
+                        chosen = Some(MissingChoice::DeleteInCloud);
+                    }
+                });
+                match chosen {
+                    _ if working => {}
+                    Some(MissingChoice::KeepOnlineOnly) => self.resolve_files_missing(MissingChoice::KeepOnlineOnly, fm.root.clone(), fm.names.clone()),
+                    Some(MissingChoice::DeleteInCloud) => {
+                        self.pending_confirm =
+                            Some(PendingConfirm::DeleteMissing { root: fm.root.clone(), names: fm.names.clone(), items: fm.items });
+                    }
+                    None => {}
                 }
             });
         ui.add_space(14.0);
+    }
+
+    /// Asks the daemon to do what the user chose about the missing files, as they were shown.
+    fn resolve_files_missing(&mut self, choice: MissingChoice, root: String, names: Vec<String>) {
+        self.files_missing_working = true;
+        self.files_missing_error = None;
+        let _ = self.tx.send(WorkerCommand::ResolveFilesMissing { choice, root, names });
     }
 
     /// One frame of the window's contents: sidebar, header, the current tab and anything floating over them.
@@ -5222,8 +5291,8 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
             WorkerCommand::ResolveConflict { id, choice } => off_thread(&tx, &ctx, move || {
                 WorkerEvent::ConflictResolved(resolve_conflict_at(&control_socket_path(), id, &choice))
             }),
-            WorkerCommand::ConfirmFilesMissing { root, names } => off_thread(&tx, &ctx, move || {
-                WorkerEvent::FilesMissingDone(files_missing_delete_at(&control_socket_path(), &root, &names))
+            WorkerCommand::ResolveFilesMissing { choice, root, names } => off_thread(&tx, &ctx, move || {
+                WorkerEvent::FilesMissingDone(files_missing_resolve_at(&control_socket_path(), choice, &root, &names))
             }),
         }
     }
@@ -6340,8 +6409,8 @@ mod tests {
                     WorkerCommand::SetVirtualDrive(on) => Some(format!("virtual drive {on}")),
                     WorkerCommand::MountAgain => Some("mount again".to_string()),
                     WorkerCommand::DriveMove { action, from, to } => Some(format!("{action} {from} -> {to}")),
-                    WorkerCommand::ConfirmFilesMissing { root, names } => {
-                        Some(format!("files missing: delete in cloud {root} {}", names.join(", ")))
+                    WorkerCommand::ResolveFilesMissing { choice, root, names } => {
+                        Some(format!("files missing: {} {root} {}", choice.action(), names.join(", ")))
                     }
                     _ => None,
                 })
@@ -6872,7 +6941,8 @@ mod tests {
             WorkerCommand::DriveMove { action: "finish".into(), from: "a".into(), to: "b".into() },
             WorkerCommand::ResolveConflict { id: 1, choice: "keep-both".into() },
             WorkerCommand::SetAvailability { path: "x".into(), action: "pin".into() },
-            WorkerCommand::ConfirmFilesMissing { root: "/r".into(), names: vec!["Docs".into()] },
+            WorkerCommand::ResolveFilesMissing { choice: MissingChoice::DeleteInCloud, root: "/r".into(), names: vec!["Docs".into()] },
+            WorkerCommand::ResolveFilesMissing { choice: MissingChoice::KeepOnlineOnly, root: "/r".into(), names: vec!["Docs".into()] },
         ];
         for cmd in &writes {
             assert!(!allowed_in_screenshot_mode(cmd));
@@ -6885,6 +6955,12 @@ mod tests {
     // them from Proton Drive too takes a confirmation, with keeping waiting as the default
     const MISSING: &str = "Proton Drive's files are missing from /home/u/ProtonDrive. Nothing was deleted in Proton Drive.";
     const DELETE_TOO: &str = "Delete them from Proton Drive too";
+    // #50: or keep them in Proton Drive, online-only, which deletes nothing; the default in the virtual layout
+    const KEEP: &str = "Keep them online-only";
+    const KEEP_SAYS_PLAIN: &str =
+        "Keep them online-only to stop waiting: they stay in Proton Drive, shown as online-only in My files, and aren't downloaded again. Nothing is deleted.";
+    const KEEP_SAYS_VIRTUAL: &str =
+        "Keep them online-only to stop waiting: they stay in Proton Drive, and the drive shows them as online-only. Nothing is deleted.";
 
     fn held(h: &mut Harness) {
         h.app.status.state = "error".into();
@@ -6903,6 +6979,7 @@ mod tests {
             h.app.tab = tab;
             h.frames(3);
             assert!(h.text_at(DELETE_TOO).is_some(), "{tab:?}");
+            assert!(h.text_at(KEEP).is_some(), "{tab:?}");
             assert!(h.text_at("Docs and Photos are missing. Proton Drive waits for them to come back and syncs nothing meanwhile.").is_some(), "{tab:?}");
         }
     }
@@ -6934,7 +7011,7 @@ mod tests {
         h.app.status.files_missing.as_mut().unwrap().names = vec!["Photos".into()];
         h.click(h.text_at("Delete from Proton Drive").expect("the dialog is painted"));
         assert_eq!(h.app.pending_confirm, None);
-        assert_eq!(h.sent(), vec!["files missing: delete in cloud /home/u/ProtonDrive Docs, Photos".to_string()]);
+        assert_eq!(h.sent(), vec!["files missing: delete-in-cloud /home/u/ProtonDrive Docs, Photos".to_string()]);
         assert!(h.app.files_missing_working);
         // Nothing more is sent while it runs
         h.click(h.text_at(DELETE_TOO).unwrap());
@@ -6947,18 +7024,65 @@ mod tests {
     }
 
     #[test]
-    fn the_confirmation_posts_delete_in_cloud_on_the_control_socket() {
-        let reply: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 61\r\n\r\n{\"ok\":true,\"root\":\"/home/u/ProtonDrive\",\"names\":[],\"items\":0}";
-        let (sock, server) = serve_once(reply);
-        files_missing_delete_at(&sock, "/home/u/ProtonDrive", &["Docs".to_string(), "Photos/p2.jpg".to_string()]).unwrap();
-        let seen = server.join().unwrap();
-        assert!(seen.starts_with("POST /sync/files-missing HTTP/1.1\r\n"), "{seen}");
-        let body: serde_json::Value = serde_json::from_str(seen.split_once("\r\n\r\n").unwrap().1).unwrap();
-        assert_eq!(
-            body,
-            serde_json::json!({ "action": "delete-in-cloud", "root": "/home/u/ProtonDrive", "names": ["Docs", "Photos/p2.jpg"] })
-        );
-        let _ = std::fs::remove_file(&sock);
+    fn both_choices_post_their_action_with_what_was_shown_on_the_control_socket() {
+        for (choice, action) in [(MissingChoice::DeleteInCloud, "delete-in-cloud"), (MissingChoice::KeepOnlineOnly, "keep-online-only")] {
+            let reply: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 61\r\n\r\n{\"ok\":true,\"root\":\"/home/u/ProtonDrive\",\"names\":[],\"items\":0}";
+            let (sock, server) = serve_once(reply);
+            files_missing_resolve_at(&sock, choice, "/home/u/ProtonDrive", &["Docs".to_string(), "Photos/p2.jpg".to_string()]).unwrap();
+            let seen = server.join().unwrap();
+            assert!(seen.starts_with("POST /sync/files-missing HTTP/1.1\r\n"), "{seen}");
+            let body: serde_json::Value = serde_json::from_str(seen.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body, serde_json::json!({ "action": action, "root": "/home/u/ProtonDrive", "names": ["Docs", "Photos/p2.jpg"] }));
+            let _ = std::fs::remove_file(&sock);
+        }
+    }
+
+    #[test]
+    fn keeping_them_online_only_sends_at_once_what_was_shown_and_says_what_happens_first() {
+        let mut h = Harness::new("/my-files");
+        held(&mut h);
+        // Said before it is clicked: it deletes nothing, so it asks nothing
+        assert!(h.text_at(KEEP_SAYS_PLAIN).is_some());
+        h.click(h.text_at(KEEP).expect("keep online-only is offered"));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), vec!["files missing: keep-online-only /home/u/ProtonDrive Docs, Photos".to_string()]);
+        assert!(h.app.files_missing_working);
+        // Nothing more is sent while it runs, by either button
+        h.click(h.text_at(KEEP).unwrap());
+        h.click(h.text_at(DELETE_TOO).unwrap());
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+
+        let refused = "What is missing from ~/ProtonDrive has changed (now Photos): nothing was changed; look again";
+        h.event(WorkerEvent::FilesMissingDone(Err(refused.into())));
+        assert!(!h.app.files_missing_working);
+        assert!(h.text_at(refused).is_some());
+        // What is shown now is what is sent
+        h.app.status.files_missing.as_mut().unwrap().names = vec!["Photos".into()];
+        h.frames(2);
+        h.click(h.text_at(KEEP).unwrap());
+        assert_eq!(h.sent(), vec!["files missing: keep-online-only /home/u/ProtonDrive Photos".to_string()]);
+    }
+
+    #[test]
+    fn keep_online_only_is_the_default_in_the_virtual_layout_and_delete_never_is() {
+        let mut h = Harness::new("/my-files");
+        h.app.status.vfs = Some(vfs("virtual", true, None));
+        held(&mut h);
+        assert!(h.text_at(KEEP_SAYS_VIRTUAL).is_some());
+        assert_eq!(h.fill_under(h.text_at(KEEP).unwrap()), Some(PROTON_PURPLE));
+        let delete = h.fill_under(h.text_at(DELETE_TOO).unwrap());
+        assert!(delete != Some(PROTON_PURPLE) && delete != Some(STATUS_DANGER), "{delete:?}");
+        h.click(h.text_at(KEEP).unwrap());
+        assert_eq!(h.sent(), vec!["files missing: keep-online-only /home/u/ProtonDrive Docs, Photos".to_string()]);
+
+        // The plain layout offers it too, not as the default (there the files are often on a disk not connected)
+        let mut h = Harness::new("/my-files");
+        h.app.status.vfs = Some(vfs("plain", false, Some("switched-off")));
+        held(&mut h);
+        assert!(h.text_at(KEEP_SAYS_PLAIN).is_some());
+        assert_ne!(h.fill_under(h.text_at(KEEP).unwrap()), Some(PROTON_PURPLE));
+        assert_ne!(h.fill_under(h.text_at(DELETE_TOO).unwrap()), Some(PROTON_PURPLE));
     }
 
     #[test]
@@ -7055,7 +7179,7 @@ mod tests {
             // The daemon gets the folder as it is, not as shown
             h.click(h.text_at(DELETE_TOO).unwrap());
             h.click(h.text_at("Delete from Proton Drive").unwrap());
-            assert_eq!(h.sent(), vec![format!("files missing: delete in cloud {home}/ProtonDrive Docs, Photos")]);
+            assert_eq!(h.sent(), vec![format!("files missing: delete-in-cloud {home}/ProtonDrive Docs, Photos")]);
         }
     }
 

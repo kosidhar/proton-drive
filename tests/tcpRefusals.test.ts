@@ -76,6 +76,10 @@ describe('What the TCP API refuses, and how the daemon is wired (#32, #33, #36)'
                     calls.push(['files-missing', expected]);
                     return { root: '/r', names: ['Docs'], items: 1 };
                 },
+                keepFilesMissingOnlineOnly: async (expected: unknown) => {
+                    calls.push(['files-missing kept', expected]);
+                    return { root: '/r', names: ['Photos'], items: 2 };
+                },
             } as never,
             drive: { mountAgain: async () => void calls.push(['mount']), resolveMove: async () => {}, relocate: async (to: string) => to, setVirtualDriveWanted: async () => {}, status: () => ({}) as never } as never,
             stateDb,
@@ -108,12 +112,19 @@ describe('What the TCP API refuses, and how the daemon is wired (#32, #33, #36)'
             names: ['Docs'],
             items: 1,
         });
+        expect((await post('/sync/files-missing', { action: 'keep-online-only', root: '/r', names: ['Photos'] })).json).toEqual({
+            ok: true,
+            root: '/r',
+            names: ['Photos'],
+            items: 2,
+        });
         expect(calls).toEqual([
             ['signIn'],
             ['signOut'],
             ['resolve', 3, 'keep-local'],
             ['mkdir', '/my-files', 'New'],
             ['files-missing', { root: '/r', names: ['Docs'] }],
+            ['files-missing kept', { root: '/r', names: ['Photos'] }],
         ]);
     });
 

@@ -9,7 +9,7 @@ import { driveSettings } from './settingsRoute';
 export function controlServerOptions(deps: {
     socketPath: string;
     engine: ControlServerOptions['engine'] &
-        Pick<ProtonDriveSyncEngine, 'resolveConflictManually' | 'reconcileNow' | 'confirmFilesMissingDeleted'>;
+        Pick<ProtonDriveSyncEngine, 'resolveConflictManually' | 'reconcileNow' | 'confirmFilesMissingDeleted' | 'keepFilesMissingOnlineOnly'>;
     drive: Pick<DriveController, 'mountAgain' | 'resolveMove' | 'relocate' | 'setVirtualDriveWanted' | 'status'>;
     stateDb: SyncStateDatabase;
     signIn: NonNullable<ControlServerOptions['login']>;
@@ -26,7 +26,8 @@ export function controlServerOptions(deps: {
         login: deps.signIn,
         logout: deps.signOut,
         resolveConflict: (id, choice) => engine.resolveConflictManually(id, choice),
-        confirmFilesMissingDeleted: (expected) => engine.confirmFilesMissingDeleted(expected),
+        resolveFilesMissing: (action, expected) =>
+            action === 'keep-online-only' ? engine.keepFilesMissingOnlineOnly(expected) : engine.confirmFilesMissingDeleted(expected),
         remoteMkdir: deps.makeRemoteFolder,
     };
 }

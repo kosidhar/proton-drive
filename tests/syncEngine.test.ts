@@ -2687,6 +2687,231 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(JSON.stringify(status.filesMissing)).not.toContain(d.localRoot);
             expect(stateDb.listActivity(50).map((a) => a.details).join('\n')).not.toContain(`missing from ${d.localRoot}`);
         });
+
+        // #50: a file opened on demand is recorded without records for the folders above it. With the store emptied, the
+        // hold is on its top-level folder, which has no record: a confirmation's pass never reached the file, trashed
+        // nothing, and the next pass held again, for ever. A confirmation now trashes what it names by its recorded node
+        // when the pass can't reach it; or the user keeps them in Proton Drive, online-only, which deletes nothing.
+        // Photos/2024 holds p.jpg, opened once (so recorded alone), and q.jpg, never on this computer; then the files go
+        const openedOnly = async (d: ReturnType<typeof setup>) => {
+            d.add('Photos/2024/p.jpg', 'p');
+            d.add('Photos/2024/q.jpg', 'q');
+            await d.engine.reconcileNow();
+            await d.engine.hydrate('Photos/2024/p.jpg');
+            expect(stateDb.getAllItems().map((item) => item.localRelPath)).toEqual(['Photos/2024/p.jpg']);
+            await rm(d.localRoot, { recursive: true, force: true });
+            await mkdir(d.localRoot);
+            await d.engine.reconcileNow();
+            expect(d.engine.getStatus()).toMatchObject({ state: 'error', filesMissing: { root: d.shown, names: ['Photos'], items: 1 } });
+            expect(d.calls.trashed).toEqual([]);
+        };
+        // Keeps what the status says is missing in Proton Drive, online-only, as the app does
+        const keepShown = (d: ReturnType<typeof setup>, engine = d.engine) =>
+            engine.keepFilesMissingOnlineOnly(engine.getStatus().filesMissing!);
+        // The pass a choice started has run
+        const settled = async (d: ReturnType<typeof setup>) => {
+            await d.engine.holdForMove();
+            d.engine.releaseHold();
+        };
+
+        for (const layout of ['plain', 'virtual'] as const) {
+            test(`${layout}: deleting a file opened on demand, recorded without its folders, trashes exactly that node, for good`, async () => {
+                const d = setup(layout);
+                await openedOnly(d);
+
+                expect(await confirmShown(d)).toMatchObject({ names: ['Photos'], items: 1 });
+                await settled(d);
+
+                expect(d.calls.trashed).toEqual([['vol~Photos/2024/p.jpg']]);
+                expect(d.nodes.has('vol~Photos/2024/q.jpg')).toBe(true); // never on this computer: it stays
+                expect(d.nodes.has('vol~Photos/2024')).toBe(true);
+                expect(stateDb.getAllItems()).toEqual([]);
+                expect(d.engine.getStatus()).toMatchObject({ state: 'idle', lastError: null, filesMissing: null });
+                expect(stateDb.getMeta(FILES_HOLD)).toBeNull();
+                // For good: no hold again, nothing more trashed
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+                expect(d.engine.getStatus()).toMatchObject({ state: 'idle', lastError: null, filesMissing: null });
+                expect(d.calls.trashed).toEqual([['vol~Photos/2024/p.jpg']]);
+            });
+
+            test(`${layout}: keeping a file opened on demand online-only drops its record, leaves the cloud alone, and lists it`, async () => {
+                const d = setup(layout);
+                await openedOnly(d);
+
+                expect(await keepShown(d)).toMatchObject({ root: d.shown, names: ['Photos'], items: 1 });
+                // At once: the hold is over and the record gone (records before files: there are none)
+                expect(d.engine.getStatus().filesMissing).toBeNull();
+                expect(stateDb.getAllItems()).toEqual([]);
+                await settled(d);
+                await d.engine.reconcileNow();
+
+                expect(d.calls.trashed).toEqual([]);
+                expect([...d.nodes.keys()].filter((uid) => uid.startsWith('vol~Photos')).sort()).toEqual([
+                    'vol~Photos',
+                    'vol~Photos/2024',
+                    'vol~Photos/2024/p.jpg',
+                    'vol~Photos/2024/q.jpg',
+                ]);
+                expect(d.calls.downloads).toEqual(['Photos/2024/p.jpg']); // the one open, before: nothing comes down again
+                expect(d.engine.getStatus()).toMatchObject({ state: 'idle', lastError: null, filesMissing: null });
+                expect(stateDb.getMeta(FILES_HOLD)).toBeNull();
+                // Online-only: the drive lists it, My files says so, and an open brings it back
+                expect(d.engine.vfsChildren('').map((e) => e.name)).toEqual(['Photos']);
+                expect(d.engine.vfsChildren('Photos/2024').map((e) => e.name)).toEqual(['p.jpg', 'q.jpg']);
+                expect(d.engine.availability.stateOf('Photos/2024/p.jpg')).toBe('online-only');
+                expect(d.engine.availability.stateOf('Photos')).toBe('online-only');
+                expect(await d.files.exists('Photos/2024/p.jpg')).toBe(false);
+                await d.engine.hydrate('Photos/2024/p.jpg');
+                expect(await readFile(path.join(d.localRoot, 'Photos/2024/p.jpg'), 'utf8')).toBe('p');
+                expect(stateDb.listActivity(50).some((a) => a.details.includes('online-only'))).toBe(true);
+            });
+        }
+
+        for (const moved of [false, true]) {
+            test(`virtual: a folder recorded without the folder above it goes by its node too${moved ? ', but not once moved on the web' : ''}`, async () => {
+                const d = setup('virtual');
+                await openedOnly(d);
+                // Made through the drive, say: Photos/2024 has a record, Photos still has none
+                const folder = d.nodes.get('vol~Photos/2024')!;
+                stateDb.upsertItem({
+                    localRelPath: 'Photos/2024',
+                    nodeUid: folder.uid,
+                    parentNodeUid: 'vol~Photos',
+                    type: 'folder',
+                    localSha1: null,
+                    remoteSha1: null,
+                    localMtimeMs: 0,
+                    remoteMtimeMs: 0,
+                    size: 0,
+                    syncStatus: 'synced',
+                    lastError: null,
+                });
+                if (moved) {
+                    d.add('Elsewhere');
+                    d.nodes.set(folder.uid, { ...folder, parentUid: 'vol~Elsewhere' });
+                }
+                await d.engine.reconcileNow();
+                expect(d.engine.getStatus().filesMissing).toMatchObject({ names: ['Photos'], items: 2 });
+
+                await confirmShown(d);
+                await settled(d);
+
+                if (moved) {
+                    // A listing of it at Photos/2024 would not be the folder's: nothing goes, and its record stays
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.warnings).toContain('Not trashing Photos/2024: it has moved in Proton Drive meanwhile');
+                    expect(stateDb.getItemByPath('Photos/2024')).not.toBeNull();
+                } else {
+                    // As a pass takes a folder deleted here: what was on this computer goes, q.jpg (never here) stays
+                    expect(d.calls.trashed).toEqual([['vol~Photos/2024/p.jpg']]);
+                    expect(d.nodes.has('vol~Photos/2024/q.jpg')).toBe(true);
+                    expect(stateDb.getAllItems()).toEqual([]);
+                    expect(d.engine.getStatus()).toMatchObject({ state: 'idle', filesMissing: null });
+                }
+            });
+        }
+
+        test('plain: kept online-only, what was kept on this device (here the whole drive) is not downloaded again', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            d.add('Photos/p.jpg', 'p');
+            d.engine.availability.setPin(d.root.uid, 'pinned', false); // as a fresh install has it
+            await d.engine.reconcileNow();
+            expect(await d.files.exists('Photos/p.jpg')).toBe(true);
+            await rm(d.localRoot, { recursive: true, force: true });
+            await d.engine.reconcileNow();
+            expect(d.engine.getStatus().filesMissing).toMatchObject({ names: ['Docs', 'Photos'], items: 4 });
+
+            await keepShown(d);
+            await settled(d);
+            await d.engine.reconcileNow();
+
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.calls.downloads.sort()).toEqual(['Docs/a.txt', 'Photos/p.jpg']); // the first sync only
+            expect(await readdir(d.localRoot)).toEqual([]);
+            expect(stateDb.getAllItems()).toEqual([]);
+            expect(d.engine.availability.stateOf('Docs')).toBe('online-only');
+            expect(d.engine.availability.stateOf('Photos/p.jpg')).toBe('online-only');
+            expect(d.engine.getStatus()).toMatchObject({ state: 'idle', lastError: null, filesMissing: null });
+            // Something new in the cloud still comes down, as the whole drive is still kept
+            d.add('New.txt', 'n');
+            await d.engine.reconcileNow();
+            expect(await d.files.exists('New.txt')).toBe(true);
+        });
+
+        test('plain: a restore from an older backup without some files can keep those online-only', async () => {
+            const d = setup();
+            const copyBack = await lost(d);
+            await copyBack('Docs');
+            await copyBack('Photos', { onlyTheFolder: true });
+            await copyBack('Photos/p.jpg'); // the backup predates p2.jpg
+            await d.engine.reconcileNow();
+            await d.engine.reconcileNow();
+            expect(d.engine.getStatus()).toMatchObject(held(d, ['Photos/p2.jpg'], 1));
+
+            expect(await keepShown(d)).toMatchObject({ names: ['Photos/p2.jpg'], items: 1 });
+            await settled(d);
+            await d.engine.reconcileNow();
+
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.nodes.has('vol~Photos/p2.jpg')).toBe(true);
+            expect(await d.files.exists('Photos/p2.jpg')).toBe(false); // Photos is kept on this device, p2.jpg isn't
+            expect(d.calls.downloads.filter((p) => p === 'Photos/p2.jpg')).toEqual(['Photos/p2.jpg']); // the first sync only
+            expect(stateDb.getItemByPath('Photos/p2.jpg')).toBeNull();
+            expect(stateDb.getItemByPath('Photos/p.jpg')).not.toBeNull();
+            expect(d.engine.availability.stateOf('Photos/p2.jpg')).toBe('online-only');
+            expect(d.engine.getStatus()).toMatchObject({ state: 'idle', lastError: null, filesMissing: null });
+            // A delete after that is the user's, as ever
+            await rm(path.join(d.localRoot, 'Photos/p.jpg'));
+            await d.engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([['vol~Photos/p.jpg']]);
+        });
+
+        test('keeping them online-only must name exactly what is missing: anything else is refused (409) and changes nothing', async () => {
+            const d = setup();
+            await synced(d);
+            const records = stateDb.getAllItems();
+            await rm(path.join(d.localRoot, 'Docs'), { recursive: true });
+            await rm(path.join(d.localRoot, 'Photos'), { recursive: true });
+            await d.engine.reconcileNow();
+
+            for (const wrong of [
+                { root: d.shown, names: ['Docs'] },
+                { root: d.shown, names: ['Docs', 'Photos', 'Notes'] },
+                { root: path.join(tempDir, 'Elsewhere'), names: ['Docs', 'Photos'] },
+            ]) {
+                await expect(d.engine.keepFilesMissingOnlineOnly(wrong)).rejects.toMatchObject({ status: 409 });
+            }
+            expect(stateDb.getAllItems()).toEqual(records);
+            expect(d.engine.availability.stateOf('Docs')).toBe('pinned');
+            await d.engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.engine.getStatus()).toMatchObject({ state: 'error', filesMissing: { names: ['Docs', 'Photos'], items: 5 } });
+
+            // The same names in another order are the same choice
+            expect(await d.engine.keepFilesMissingOnlineOnly({ root: d.shown, names: ['Photos', 'Docs'] })).toMatchObject({
+                names: ['Docs', 'Photos'],
+            });
+            await settled(d);
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.engine.getStatus()).toMatchObject({ state: 'idle', filesMissing: null });
+        });
+
+        test('keeping them online-only with nothing missing, or while the files move, is refused (409)', async () => {
+            const d = setup();
+            await expect(d.engine.keepFilesMissingOnlineOnly({ root: d.shown, names: ['Docs'] })).rejects.toMatchObject({ status: 409 });
+            await lost(d);
+            stateDb.setMeta(LAYOUT_MOVING, 'virtual');
+            const engine = d.restart();
+            await expect(engine.keepFilesMissingOnlineOnly({ root: d.shown, names: ['Docs', 'Photos'] })).rejects.toMatchObject({
+                status: 409,
+                message: 'Proton Drive is busy moving files',
+            });
+            stateDb.deleteMeta(LAYOUT_MOVING);
+            expect(stateDb.getAllItems().length).toBeGreaterThan(0);
+            expect(engine.getStatus().filesMissing).toMatchObject({ names: ['Docs', 'Photos'] });
+        });
     });
 
     // #47: a file uploaded from this computer was recorded but left out of the remote index until a later pass listed its
