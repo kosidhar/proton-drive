@@ -49,6 +49,48 @@ else
   SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 fi
 
+# Where the app keeps its data (src/sdk/config.ts): $PROTON_DRIVE_CACHE_DIR, else $XDG_DATA_HOME (or ~/.local/share)
+# /proton-drive-ubuntu; under sudo, the invoking user's
+proton_app_dir() {
+  if [ -n "${PROTON_DRIVE_CACHE_DIR:-}" ]; then
+    echo "$PROTON_DRIVE_CACHE_DIR"
+    return
+  fi
+  local home="$HOME" data="${XDG_DATA_HOME:-}"
+  if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+    home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    data=""
+  fi
+  echo "${data:-$home/.local/share}/proton-drive-ubuntu"
+}
+
+# The virtual drive keeps the files in a hidden store while it is on. An uninstall never deletes or moves them: it
+# says where they are and how to get them back into a plain folder.
+warn_about_store() {
+  local app store db
+  app="$(proton_app_dir)"
+  store="$app/files"
+  db="$app/ubuntu-sync-state.sqlite"
+  [ -d "$store" ] || return 0
+  [ -n "$(find "$store" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] || return 0
+  cat <<WARNING
+
+!!! Your Proton Drive files are still in the virtual drive's hidden store. Nothing there was deleted:
+      $store
+    The virtual drive was on, so your Proton Drive folder (by default ~/ProtonDrive) showed them only while Proton
+    Drive ran. To get them back into that folder, either:
+      - reinstall Proton Drive, switch off "Show online-only files in Files (virtual drive)" in Settings, wait until
+        the files are back, then uninstall again (the safe way); or
+      - move them by hand, for ~/ProtonDrive (sqlite3: sudo apt install sqlite3):
+          fusermount3 -u -z ~/ProtonDrive; chmod 755 ~/ProtonDrive
+          find "$store" -mindepth 1 -maxdepth 1 -exec mv -n -t ~/ProtonDrive {} +
+          find "$store" -mindepth 1      # must print nothing: anything left has a name already taken
+          sqlite3 "$db" "INSERT OR REPLACE INTO settings (key, value) VALUES ('driveLayout', 'plain'), ('virtualDriveWanted', '0'); DELETE FROM settings WHERE key = 'layoutMoving';"
+    Don't install an older version of Proton Drive until the files are back: it knows nothing of the store, takes the
+    empty folder for files you deleted, and moves them to the Proton Drive trash.
+WARNING
+}
+
 if [ "$UNINSTALL" -eq 1 ]; then
   echo "==> Uninstalling Proton Drive from $PREFIX..."
   systemctl --user disable --now protondrive.service 2>/dev/null || true
@@ -61,6 +103,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
   command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$PREFIX/share/applications" 2>/dev/null || true
   command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f "$PREFIX/share/icons/hicolor" 2>/dev/null || true
   echo "==> Uninstalled Proton Drive."
+  warn_about_store
   exit 0
 fi
 
