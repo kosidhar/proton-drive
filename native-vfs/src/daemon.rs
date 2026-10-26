@@ -111,7 +111,7 @@ impl DaemonClient {
             let mut last = lock(&self.last_logged);
             if last.is_none_or(|at| at.elapsed() >= LOG_EVERY) {
                 *last = Some(Instant::now());
-                eprintln!("protondrive-vfs: can't list {rel:?} from the daemon, showing local files only: {}", err.message);
+                log!("protondrive-vfs: can't list {rel:?} from the daemon, showing local files only: {}", err.message);
             }
             Vec::new()
         })

@@ -4,6 +4,15 @@
 // protondrive-vfs --mountpoint <dir> --backing <dir> --socket <path>
 // Exit 0: the session ended because the drive was unmounted (eject). 2: the mount failed. 1: any other error.
 
+/// A line on stderr, which is the daemon's vfs.log: a write that fails (a full disk, say) is dropped, never a panic as
+/// with eprintln!, which on a session thread would end the drive.
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod daemon;
 mod fs;
 mod inodes;
@@ -80,24 +89,24 @@ fn run() -> i32 {
     let args = match parse_args(std::env::args_os().skip(1)) {
         Ok(args) => args,
         Err(msg) => {
-            eprintln!("protondrive-vfs: {msg}\n{USAGE}");
+            log!("protondrive-vfs: {msg}\n{USAGE}");
             return 1;
         }
     };
     if !args.backing.is_dir() {
-        eprintln!("protondrive-vfs: the backing store {} isn't a folder", args.backing.display());
+        log!("protondrive-vfs: the backing store {} isn't a folder", args.backing.display());
         return 1;
     }
     // Missing, or a dead mount ("Transport endpoint is not connected"), fails here
     let mountpoint = match args.mountpoint.canonicalize() {
         Ok(path) => path,
         Err(err) => {
-            eprintln!("protondrive-vfs: can't mount on {}: {err}", args.mountpoint.display());
+            log!("protondrive-vfs: can't mount on {}: {err}", args.mountpoint.display());
             return 2;
         }
     };
     if already_mounted(&std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default(), &mountpoint) {
-        eprintln!("protondrive-vfs: {} is already mounted", mountpoint.display());
+        log!("protondrive-vfs: {} is already mounted", mountpoint.display());
         return 2;
     }
 
@@ -117,7 +126,7 @@ fn run() -> i32 {
         Ok(session) => session,
         Err(err) => {
             // fusermount3's own message ends with a newline
-            eprintln!("protondrive-vfs: can't mount on {}: {}", mountpoint.display(), err.to_string().trim_end());
+            log!("protondrive-vfs: can't mount on {}: {}", mountpoint.display(), err.to_string().trim_end());
             return 2;
         }
     };
@@ -127,7 +136,7 @@ fn run() -> i32 {
     match session.run() {
         Ok(()) => 0,
         Err(err) => {
-            eprintln!("protondrive-vfs: the drive stopped: {err}");
+            log!("protondrive-vfs: the drive stopped: {err}");
             1
         }
     }

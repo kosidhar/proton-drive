@@ -176,6 +176,27 @@ fn is_root(rel: &Path) -> bool {
     rel.as_os_str().is_empty()
 }
 
+/// A failed call to the daemon: the errno for the app, and the line for the log, written once the app has its reply.
+struct Failure {
+    errno: Errno,
+    line: Option<String>,
+}
+
+impl Failure {
+    fn log(&self) {
+        if let Some(line) = &self.line {
+            log!("{line}");
+        }
+    }
+}
+
+/// The errno for a change the daemon refused: its own, when it is one this call can give, else EIO, which is logged.
+fn refusal(what: &str, err: DaemonError, allowed: &[i32]) -> Failure {
+    let errno = if allowed.contains(&err.errno) { err.errno } else { libc::EIO };
+    let line = (errno == libc::EIO).then(|| format!("protondrive-vfs: couldn't {what}: {}", err.message));
+    Failure { errno: Errno::from_i32(errno), line }
+}
+
 fn is_volume_info(rel: &Path) -> bool {
     rel == Path::new(VOLUME_INFO_NAME)
 }
@@ -454,17 +475,25 @@ impl State {
     /// Asks the daemon to download an online-only file into the backing store, giving up with EINTR as soon as
     /// thread `tid` (the app waiting for it) does: the daemon keeps downloading, so a later use finds the file here.
     fn hydrate(&self, tid: u32, rel: &Path) -> Result<(), Errno> {
+        self.hydrate_unlogged(tid, rel).map_err(|failure| {
+            failure.log();
+            failure.errno
+        })
+    }
+
+    /// hydrate, leaving the failure for the caller to log once it has replied.
+    fn hydrate_unlogged(&self, tid: u32, rel: &Path) -> Result<(), Failure> {
         // An online-only entry came from a UTF-8 listing, so its path is UTF-8
-        let Some(rel_str) = rel.to_str() else { return Err(Errno::EIO) };
+        let Some(rel_str) = rel.to_str() else { return Err(Failure { errno: Errno::EIO, line: None }) };
         if let Err(err) = self.daemon.hydrate(rel_str, &|| opener_interrupted(tid)) {
             if err.errno == libc::EINTR {
-                eprintln!("protondrive-vfs: stopped waiting for {rel_str:?}: the app waiting for it gave up");
-                return Err(Errno::EINTR);
+                let line = format!("protondrive-vfs: stopped waiting for {rel_str:?}: the app waiting for it gave up");
+                return Err(Failure { errno: Errno::EINTR, line: Some(line) });
             }
-            eprintln!("protondrive-vfs: couldn't download {rel_str:?}: {}", err.message);
             // Only what open(2) can sensibly report from a download
             let errno = if matches!(err.errno, libc::ENOENT | libc::EACCES) { err.errno } else { libc::EIO };
-            return Err(Errno::from_i32(errno));
+            let line = format!("protondrive-vfs: couldn't download {rel_str:?}: {}", err.message);
+            return Err(Failure { errno: Errno::from_i32(errno), line: Some(line) });
         }
         if let Some(parent) = rel.parent() {
             self.forget_listing(parent); // it is local now
@@ -483,8 +512,9 @@ impl State {
     /// Runs on its own thread: waits for the daemon's download, then opens the file it placed in the backing store as
     /// the app asked (read-only, or read-write).
     fn hydrate_and_open(&self, ino: u64, tid: u32, rel: PathBuf, flags: i32, reply: ReplyOpen) {
-        if let Err(errno) = self.hydrate(tid, &rel) {
-            return reply.error(errno);
+        if let Err(failure) = self.hydrate_unlogged(tid, &rel) {
+            reply.error(failure.errno);
+            return failure.log();
         }
         match open_backing(&self.backing.join(&rel), flags) {
             Ok(file) => {
@@ -492,8 +522,8 @@ impl State {
                 reply.opened(self.add_handle(ino, Handle::File(Arc::new(file))), FopenFlags::empty())
             }
             Err(err) => {
-                eprintln!("protondrive-vfs: {rel:?} was downloaded but won't open: {err}");
-                reply.error(Errno::EIO)
+                reply.error(Errno::EIO);
+                log!("protondrive-vfs: {rel:?} was downloaded but won't open: {err}");
             }
         }
     }
@@ -606,7 +636,7 @@ impl State {
             self.hydrate(tid, &rel)?;
         }
         let file = open_backing(&path, deferred.flags).map_err(|err| {
-            eprintln!("protondrive-vfs: {rel:?} is here now but won't open: {err}");
+            log!("protondrive-vfs: {rel:?} is here now but won't open: {err}");
             Errno::EIO
         })?;
         if !empty {
@@ -647,11 +677,16 @@ impl State {
     /// daemon that didn't answer in time gives EIO here; the deadline sent with the call makes it refuse the change
     /// if its turn comes after that, so nothing happens behind the app's back.
     fn refused(&self, what: &str, err: DaemonError, allowed: &[i32]) -> Errno {
-        let errno = if allowed.contains(&err.errno) { err.errno } else { libc::EIO };
-        if errno == libc::EIO {
-            eprintln!("protondrive-vfs: couldn't {what}: {}", err.message);
-        }
-        Errno::from_i32(errno)
+        let failure = refusal(what, err, allowed);
+        failure.log();
+        failure.errno
+    }
+
+    /// refused, answering the app first: the reply never waits for the log.
+    fn reply_refused(&self, reply: ReplyEmpty, what: &str, err: DaemonError, allowed: &[i32]) {
+        let failure = refusal(what, err, allowed);
+        reply.error(failure.errno);
+        failure.log();
     }
 
     /// A rename through the drive, which the daemon carries out whole. Never on a session thread.
@@ -712,7 +747,7 @@ impl State {
                 } else {
                     &[libc::ENOENT, libc::EACCES, libc::EIO]
                 };
-                reply.error(s.refused(&format!("delete {rel_str:?}"), err, allowed))
+                s.reply_refused(reply, &format!("delete {rel_str:?}"), err, allowed)
             }
         });
     }
@@ -735,7 +770,7 @@ impl State {
             }
             Err(err) => {
                 let allowed = [libc::ENOENT, libc::EACCES, libc::EIO];
-                reply.error(s.refused(&format!("move {from_str:?} to the trash"), err, &allowed))
+                s.reply_refused(reply, &format!("move {from_str:?} to the trash"), err, &allowed)
             }
         });
     }

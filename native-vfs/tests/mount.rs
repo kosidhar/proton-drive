@@ -413,6 +413,11 @@ impl Harness {
 
     fn mount(&mut self) {
         let log = std::fs::File::create(self.root.join("helper.log")).unwrap();
+        self.mount_with_stderr(Stdio::from(log));
+    }
+
+    /// Mounts with the helper's stderr going where given (its log, normally)
+    fn mount_with_stderr(&mut self, stderr: Stdio) {
         let helper = Command::new(env!("CARGO_BIN_EXE_protondrive-vfs"))
             .arg("--mountpoint")
             .arg(&self.mountpoint)
@@ -421,7 +426,7 @@ impl Harness {
             .arg("--socket")
             .arg(&self.socket)
             .stdout(Stdio::null())
-            .stderr(log)
+            .stderr(stderr)
             .spawn()
             .unwrap();
         self.helper = Some(helper);
@@ -697,6 +702,32 @@ fn without_the_daemon_local_entries_keep_working() {
     assert_eq!(ls(&h.mountpoint), [".xdg-volume-info", "local.txt"]);
     assert_eq!(run(Command::new("cat").arg(h.path("local.txt"))).stdout, b"local");
     assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+}
+
+// Final review M-1: with no daemon, every listing logs that it shows local files only; with stderr unwritable (a full
+// disk under vfs.log) that write fails, and eprintln! panicked the session thread, ending the drive (exit 101)
+#[test]
+fn an_unwritable_log_never_takes_the_drive_down() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    std::fs::write(h.backing.join("local.txt"), b"local").unwrap();
+    let full = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
+    h.mount_with_stderr(Stdio::from(full));
+
+    for _ in 0..3 {
+        assert_eq!(ls(&h.mountpoint), [".xdg-volume-info", "local.txt"]);
+        assert_eq!(run(Command::new("cat").arg(h.path("local.txt"))).stdout, b"local");
+    }
+    // The daemon comes up, and refuses to download an online-only file: that failure is logged too, after the reply
+    h.start_fake(Fake::new(HashMap::from([("", vec![file("remote.txt", 5)])])).refusing("remote.txt", "EIO"));
+    thread::sleep(Duration::from_millis(1100)); // the listing cached without the daemon goes stale
+    assert_eq!(errno_of_open(&h.path("remote.txt"), libc::O_RDONLY), Some(libc::EIO));
+    assert_eq!(h.daemon().hydrate_calls(), 1);
+    assert_eq!(ls(&h.mountpoint), [".xdg-volume-info", "local.txt", "remote.txt"]);
+    assert!(h.helper.as_mut().unwrap().try_wait().unwrap().is_none(), "the helper is still serving");
+    assert_eq!(h.eject().code(), Some(0));
 }
 
 #[test]
