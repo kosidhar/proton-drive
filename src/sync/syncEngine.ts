@@ -2691,7 +2691,9 @@ export class ProtonDriveSyncEngine {
 
     // What goes to the Proton Drive trash for a delete of relPath: the item itself if Proton Drive has it, and whatever was
     // moved into it whose move hasn't reached Proton Drive yet (it isn't in the item there yet). A folder made here that
-    // never reached Proton Drive holds only such things, or things that are still where they were there.
+    // never reached Proton Drive holds only such things, or things that are still where they were there. A pending move
+    // to relPath itself is no reason: its node is the item (then it is that already), or is hidden behind it, as the
+    // cloud has another node at that name, which is what the user deleted.
     private trashTargets(relPath: string, entry: RemoteIndexEntry | null): Map<string, string> {
         const targets = new Map<string, string>();
         const own = this.stateDb.getItemByPath(relPath)?.nodeUid ?? nodeUidOf(entry);
@@ -2703,7 +2705,7 @@ export class ProtonDriveSyncEngine {
             }
         }
         for (const op of this.latestOpPerNode()) {
-            if (op.kind !== 'trash' && isWithin(op.toPath, relPath) && !targets.has(op.nodeUid)) {
+            if (op.kind !== 'trash' && op.toPath.startsWith(`${relPath}/`) && !targets.has(op.nodeUid)) {
                 targets.set(op.nodeUid, op.toPath);
             }
         }

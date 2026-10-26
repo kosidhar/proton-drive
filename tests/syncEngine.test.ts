@@ -5145,6 +5145,47 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(d.calls.trashed).toEqual([]);
             });
 
+            // #28: the delete used to trash the hidden item too, as its pending rename goes to that name
+            test('deleting a file another device put where a pending rename goes trashes that file only', async () => {
+                const d = setup({ slashFreeUids: true });
+                d.add('a.txt', 'A');
+                await d.engine.reconcileNow();
+                d.down.add('renameNode');
+                await d.engine.renameItem('a.txt', 'x.txt');
+                d.add('x.txt', 'X'); // another device, before the rename reaches Proton Drive
+                await d.engine.reconcileNow();
+                expect(d.engine.remoteIndex.getByPath('x.txt')?.uid).toBe(d.uid('x.txt'));
+
+                await d.engine.deleteItem('x.txt');
+
+                expect(d.journal().filter((op) => op.kind === 'trash').map((op) => op.nodeUid)).toEqual([d.uid('x.txt')]);
+                d.down.clear();
+                await d.engine.replayRemoteOps();
+                expect(d.journal()).toEqual([]);
+                expect(d.calls.trashed).toEqual([[d.uid('x.txt')]]);
+                expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('A'); // its rename lands as it can (#27)
+            });
+
+            // What was moved into a deleted folder is deleted with it, though Proton Drive doesn't have it in there yet
+            test('deleting a folder made here that an online-only file was moved into trashes that file', async () => {
+                const d = setup({ slashFreeUids: true });
+                d.add('Docs/a.txt', 'a');
+                await d.engine.reconcileNow();
+                await mkdir(d.local('New'));
+                d.down.add('getNode'); // the move waits
+                await d.engine.renameItem('Docs/a.txt', 'New/a.txt');
+
+                await d.engine.deleteItem('New');
+
+                expect(d.journal().filter((op) => op.kind === 'trash').map((op) => op.nodeUid)).toEqual([d.uid('Docs/a.txt')]);
+                d.down.clear();
+                await d.engine.replayRemoteOps();
+                expect(d.journal()).toEqual([]);
+                expect(d.calls.trashed).toEqual([[d.uid('Docs/a.txt')]]);
+                expect(d.calls.moved).toEqual([]);
+                expect(d.named(d.root.uid, 'New')).toEqual([]);
+            });
+
             // Its folder's new name taken in the cloud too, a renamed file goes back into the folder where it was, both
             // where Proton Drive still has them (deep enough that the path of what was in a folder is no deeper)
             test('a renamed folder and a renamed file in it, both with their names taken in the cloud, stay where they were', async () => {
