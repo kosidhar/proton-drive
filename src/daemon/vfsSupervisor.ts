@@ -100,7 +100,8 @@ export interface VfsSupervisorOptions {
     logger: Logger;
     mergeStray(fullPath: string): Promise<void>;
     spawn?: typeof Bun.spawn;
-    run?: (cmd: string[]) => Promise<number>;
+    // Runs a command (fusermount3) and answers its exit code; it warns of a failure itself unless asked to be quiet
+    run?: (cmd: string[], opts?: { quiet?: boolean }) => Promise<number>;
     // Seams for tests: the text of /proc/self/mountinfo (read as latin1), and stat of the mount point
     readMountInfo?: () => string;
     stat?: (p: string) => Stats;
@@ -199,12 +200,14 @@ export function mergeStrayInto(
     return mergeInto(strayPath, path.join(backingDir, rel), { now, beforeRmdir });
 }
 
-async function runCommand(cmd: string[], logger: Logger): Promise<number> {
+// Runs a command, killed after 10 s, and answers its exit code. A failure is logged with what the command said, unless
+// `quiet` (its caller says it all in one line).
+export async function runCommand(cmd: string[], logger: Logger, opts: { quiet?: boolean } = {}): Promise<number> {
     const proc = Bun.spawn(cmd, { stdin: 'ignore', stdout: 'ignore', stderr: 'pipe' });
     const timer = setTimeout(() => proc.kill('SIGKILL'), 10_000);
     try {
         const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
-        if (code !== 0) logger.warn(`${cmd.join(' ')} failed (${code}): ${stderr.trim()}`);
+        if (code !== 0 && !opts.quiet) logger.warn(`${cmd.join(' ')} failed (${code}): ${stderr.trim()}`);
         return code;
     } finally {
         clearTimeout(timer);
@@ -239,7 +242,7 @@ async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boo
 export class VfsSupervisor {
     private readonly timing: VfsTiming;
     private readonly spawn: typeof Bun.spawn;
-    private readonly run: (cmd: string[]) => Promise<number>;
+    private readonly run: (cmd: string[], opts?: { quiet?: boolean }) => Promise<number>;
     private readonly readMountInfo: () => string;
     private readonly stat: (p: string) => Stats;
     private readonly logger: Logger;
@@ -260,7 +263,7 @@ export class VfsSupervisor {
         this.timing = { ...DEFAULT_VFS_TIMING, ...opts.timing };
         this.logger = opts.logger;
         this.spawn = opts.spawn ?? Bun.spawn;
-        this.run = opts.run ?? ((cmd) => runCommand(cmd, this.logger));
+        this.run = opts.run ?? ((cmd, runOpts) => runCommand(cmd, this.logger, runOpts));
         this.readMountInfo = opts.readMountInfo ?? readMountInfo;
         this.stat = opts.stat ?? ((p) => statSync(p));
     }
@@ -675,9 +678,12 @@ export class VfsSupervisor {
                         ? `its mount didn't show within ${Math.round(this.timing.nudgeWaitMs / 1000)} s`
                         : `protondrive-vfs stopped (${helper.signalCode ? `signal ${helper.signalCode}` : `exit code ${helper.exitCode}`})`,
                 );
-            } else if (!(await this.unmountNudge(at, false))) {
-                problems.push(`fusermount3 -u ${at} failed, so it was unmounted lazily`);
-                await this.unmountNudge(at, true);
+            } else {
+                const failed = await this.unmountNudge(at, false);
+                if (failed) {
+                    problems.push(`fusermount3 -u ${at} failed (${failed}), so it was unmounted lazily`);
+                    await this.unmountNudge(at, true);
+                }
             }
         } catch (err) {
             problems.push(messageOf(err));
@@ -701,15 +707,20 @@ export class VfsSupervisor {
         return problems.length > 0 ? problems.join('; ') : null;
     }
 
-    // fusermount3 -u on the nudge's mount point, never anything else; lazily with -z. Bounded. Answers whether it went.
-    private async unmountNudge(target: string, lazy: boolean): Promise<boolean> {
+    // fusermount3 -u on the nudge's mount point, never anything else; lazily with -z. Bounded, and quiet: the nudge says
+    // what went wrong in its one line. Answers why the mount is still there, or null once it is gone.
+    private async unmountNudge(target: string, lazy: boolean): Promise<string | null> {
         const cmd = lazy ? ['fusermount3', '-u', '-z', target] : ['fusermount3', '-u', target];
+        let code: number | undefined;
         try {
-            const code = await answerWithin(this.run(cmd), this.timing.unmountWaitMs);
-            return code === 0 && (await this.waitUntil(() => !mountsAt(this.readMountInfo(), target).includes(OUR_FSTYPE), this.timing.unmountWaitMs));
-        } catch {
-            return false;
+            code = await answerWithin(this.run(cmd, { quiet: true }), this.timing.unmountWaitMs);
+        } catch (err) {
+            return messageOf(err);
         }
+        if (code === undefined) return `no answer within ${this.timing.unmountWaitMs} ms`;
+        if (code !== 0) return `exit code ${code}`;
+        const gone = await this.waitUntil(() => !mountsAt(this.readMountInfo(), target).includes(OUR_FSTYPE), this.timing.unmountWaitMs);
+        return gone ? null : 'still mounted';
     }
 
     private clearRestart(): void {

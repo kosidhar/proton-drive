@@ -28,6 +28,7 @@ import {
     mergeStrayInto,
     mountsAt,
     notMountableReason,
+    runCommand,
     unsupervisedStatus,
     VfsSupervisor,
     type VfsTiming,
@@ -148,6 +149,7 @@ interface FakeNudge {
     exitsOnUnmount?: boolean;
     diesOn?: 'any-kill' | 'sigkill' | 'never';
     spawnThrows?: boolean;
+    exitsWith?: number; // exits with this code before it mounts
     unmountGate?: Promise<void>;
 }
 
@@ -189,6 +191,7 @@ function harness(opts: {
     let nextId = 100;
     let spawnThrows = opts.spawnThrows ?? 0;
     const runs: string[][] = [];
+    const quietRuns: boolean[] = []; // for each run, whether it was asked to log nothing itself
     const procs: FakeProc[] = [];
     const spawns: SpawnCall[] = [];
     const merged: Array<{ path: string; mountsThen: number }> = [];
@@ -253,8 +256,9 @@ function harness(opts: {
             }
             return proc;
         }) as unknown as typeof Bun.spawn,
-        async run(cmd: string[]) {
+        async run(cmd: string[], o?: { quiet?: boolean }) {
             runs.push(cmd);
+            quietRuns.push(o?.quiet === true);
             await opts.runGate;
             if (cmd[0] === 'fusermount3' && cmd[cmd.length - 1] === nudgeMnt && nudgeMnt !== target) return unmountNudge(cmd);
             // fusermount3 resolves the parent but not the last component: a symlink's path isn't in mtab
@@ -298,7 +302,9 @@ function harness(opts: {
         if (fake.spawnThrows) throw Object.assign(new Error('ENOENT: no such file or directory, posix_spawn'), { code: 'ENOENT' });
         const proc = new FakeProc(5000 + nudgeProcs.length, fake.diesOn ?? 'any-kill');
         nudgeProcs.push(proc);
-        if (fake.mounts !== false) {
+        if (fake.exitsWith !== undefined) {
+            setTimeout(() => proc.finish(fake.exitsWith!), 10);
+        } else if (fake.mounts !== false) {
             setTimeout(() => {
                 if (proc.alive) mounts.push(mountLine(nextId++, nudgeMnt, 'fuse.protondrive', 'protondrive'));
             }, 10);
@@ -328,6 +334,7 @@ function harness(opts: {
         logPath,
         mounts,
         runs,
+        quietRuns,
         procs,
         spawns,
         merged,
@@ -1002,8 +1009,11 @@ describe('VfsSupervisor: the nudge that shows the drive in Files (#49)', () => {
 
         expect(h.nudgeSpawns.map((s) => s.driveMounts)).toEqual([1, 1, 1]);
         expect(h.nudgeRuns()).toEqual([unmountNudge(h), unmountNudge(h), unmountNudge(h)]);
-        // The drive's own unmount after the crash was its own, never the nudge's
+        // The drive's own unmount after the crash was its own, never the nudge's, and logs as ever
         expect(h.runs.filter((cmd) => cmd[cmd.length - 1] === h.target)).toEqual([fusermount(h.target)]);
+        expect(h.runs.map((cmd, i) => [cmd[cmd.length - 1], h.quietRuns[i]])).toEqual(
+            h.runs.map((cmd) => [cmd[cmd.length - 1], cmd[cmd.length - 1] === h.nudgeMnt]),
+        );
         expect(problems(h).filter((l) => l.includes('nudge'))).toEqual([]);
     });
 
@@ -1042,16 +1052,32 @@ describe('VfsSupervisor: the nudge that shows the drive in Files (#49)', () => {
     });
 
     test('a nudge that fails is logged once and ignored, and always cleans up', async () => {
-        const cases: Array<{ what: string; nudge: FakeNudge; runs: (h: H) => string[][]; killed: string[] }> = [
-            { what: 'its helper cannot start', nudge: { spawnThrows: true }, runs: () => [], killed: [] },
+        type Case = { what: string; nudge: FakeNudge; runs: (h: H) => string[][]; killed: string[]; says: (h: H) => string };
+        const cases: Case[] = [
+            { what: 'its helper cannot start', nudge: { spawnThrows: true }, runs: () => [], killed: [], says: () => 'posix_spawn' },
             // Stuck before its mount: killed at the bound
-            { what: 'its mount never shows', nudge: { mounts: false }, runs: () => [], killed: ['SIGKILL'] },
+            {
+                what: 'its mount never shows',
+                nudge: { mounts: false },
+                runs: () => [],
+                killed: ['SIGKILL'],
+                says: () => "its mount didn't show within",
+            },
+            // Its mount failed (exit code 2): nothing to unmount or kill
+            {
+                what: 'its helper exits before it mounts',
+                nudge: { exitsWith: 2 },
+                runs: () => [],
+                killed: [],
+                says: () => 'protondrive-vfs stopped (exit code 2)',
+            },
             // Busy (something looks into it): unmounted lazily instead
             {
                 what: 'fusermount3 -u fails',
                 nudge: { plainUnmountFails: true },
                 runs: (h) => [unmountNudge(h), lazyUnmountNudge(h)],
                 killed: [],
+                says: (h) => `fusermount3 -u ${h.nudgeMnt} failed (exit code 1), so it was unmounted lazily`,
             },
             // Its session lingers after the unmount: killed
             {
@@ -1059,6 +1085,7 @@ describe('VfsSupervisor: the nudge that shows the drive in Files (#49)', () => {
                 nudge: { exitsOnUnmount: false, diesOn: 'sigkill' },
                 runs: (h) => [unmountNudge(h)],
                 killed: ['SIGKILL'],
+                says: () => "its helper didn't exit after the unmount",
             },
         ];
         for (const c of cases) {
@@ -1072,7 +1099,10 @@ describe('VfsSupervisor: the nudge that shows the drive in Files (#49)', () => {
             expect(existsSync(h.nudgeDir)).toBe(false);
             await Bun.sleep(50);
             expect({ what: c.what, warnings: nudgeWarnings(h).length }).toEqual({ what: c.what, warnings: 1 });
+            expect({ what: c.what, says: nudgeWarnings(h)[0]!.includes(c.says(h)) }).toEqual({ what: c.what, says: true });
             expect(problems(h)).toEqual(nudgeWarnings(h));
+            // The one line: its commands log nothing themselves (in production, runCommand would add its own warning)
+            expect({ what: c.what, quiet: h.quietRuns }).toEqual({ what: c.what, quiet: h.runs.map(() => true) });
             // The drive is untouched, and shows mounted
             expect(h.runs.flat()).not.toContain(h.mountpoint);
             expect(driveMounted(h)).toBe(1);
@@ -1141,6 +1171,18 @@ describe('VfsSupervisor: the nudge that shows the drive in Files (#49)', () => {
         expect(h.nudgeProcs.every((p) => !p.alive)).toBe(true);
         expect(existsSync(h.nudgeDir)).toBe(false);
         expect(driveMounted(h)).toBe(0);
+    });
+
+    test('runCommand warns of a failed command with its stderr, unless asked to be quiet', async () => {
+        const logs: string[] = [];
+        const logger = { debug: () => {}, info: () => {}, warn: (m: string) => logs.push(m), error: (m: string) => logs.push(m) };
+        const failing = ['sh', '-c', 'echo busy >&2; exit 3'];
+        expect(await runCommand(failing, logger, { quiet: true })).toBe(3);
+        expect(logs).toEqual([]);
+        expect(await runCommand(failing, logger)).toBe(3);
+        expect(logs).toEqual(['sh -c echo busy >&2; exit 3 failed (3): busy']);
+        expect(await runCommand(['true'], logger)).toBe(0);
+        expect(logs).toHaveLength(1);
     });
 
     test('the nudge waits 5 s for its mount by default', () => {
