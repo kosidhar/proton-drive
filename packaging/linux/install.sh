@@ -81,10 +81,12 @@ warn_about_store() {
     Drive ran. To get them back into that folder, either:
       - reinstall Proton Drive, switch off "Show online-only files in Files (virtual drive)" in Settings, wait until
         the files are back, then uninstall again (the safe way); or
-      - move them by hand, for ~/ProtonDrive (sqlite3: sudo apt install sqlite3):
+      - move them by hand, for ~/ProtonDrive, then record that they are back (python3 needs no sqlite3 command):
           fusermount3 -u -z ~/ProtonDrive; chmod 755 ~/ProtonDrive
           find "$store" -mindepth 1 -maxdepth 1 -exec mv -n -t ~/ProtonDrive {} +
           find "$store" -mindepth 1      # must print nothing: anything left has a name already taken
+          python3 -c 'import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); db.executemany("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", [("driveLayout", "plain"), ("virtualDriveWanted", "0")]); db.execute("DELETE FROM settings WHERE key = ?", ("layoutMoving",)); db.commit()' "$db"
+          # or, with the sqlite3 command instead of python3:
           sqlite3 "$db" "INSERT OR REPLACE INTO settings (key, value) VALUES ('driveLayout', 'plain'), ('virtualDriveWanted', '0'); DELETE FROM settings WHERE key = 'layoutMoving';"
     Don't install an older version of Proton Drive until the files are back: it knows nothing of the store, takes the
     empty folder for files you deleted, and moves them to the Proton Drive trash.
