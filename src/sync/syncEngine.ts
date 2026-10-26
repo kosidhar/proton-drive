@@ -47,6 +47,13 @@ import { forgetFailedThumbnail } from './thumbnailCache';
 
 export { DriveOpError, type DriveOpErrorCode, type VfsEntry } from './driveOps';
 
+// A sync folder path as the user typed it: '~' and '~/...' are the home folder
+export function resolveSyncDirInput(raw: string): string {
+    const home = os.homedir();
+    const expanded = raw.startsWith('~/') ? path.join(home, raw.slice(2)) : raw === '~' ? home : raw;
+    return path.resolve(expanded);
+}
+
 export interface ActiveTransfer {
     id: string;
     direction: 'upload' | 'download';
@@ -71,6 +78,8 @@ const SLOW_DOWNLOAD_NOTICE_MS = 2000;
 // Name prefix of the files those downloads go to before they are put in place, at the root of the backing store (the
 // virtual drive hides every .proton-drive-tmp-* name, and the sync ignores them)
 const HYDRATE_STAGING_PREFIX = '.proton-drive-tmp-hydrate-';
+// What everything that would touch the files answers while they move between the sync folder and the backing store
+const BUSY_MOVING = 'Proton Drive is busy moving files';
 
 export type EngineState = 'idle' | 'syncing' | 'paused' | 'unauthenticated' | 'error';
 
@@ -139,6 +148,10 @@ export class ProtonDriveSyncEngine {
     private hydrations = new Map<string, Promise<void>>();
     private hydrateStaging = new Set<string>(); // their staging files
     private slowDownloadNoticeMs = SLOW_DOWNLOAD_NOTICE_MS;
+    // Held while the files move between the sync folder and the backing store (see holdForMove): nothing new starts, and
+    // inFlight counts what started before, which the move waits for
+    private held = false;
+    private inFlight = 0;
 
     constructor(
         private readonly sdk: ProtonDriveClient,
@@ -233,6 +246,13 @@ export class ProtonDriveSyncEngine {
     }
 
     async start(options: { backgroundInitialReconcile?: boolean } = {}): Promise<void> {
+        if (this.held) {
+            return; // Started again once the files have moved
+        }
+        await this.tracked(() => this.startNow(options));
+    }
+
+    private async startNow(options: { backgroundInitialReconcile?: boolean }): Promise<void> {
         const settings = this.stateDb.getSettings();
         await mkdir(this.localRoot(), { recursive: true });
         this.recoverLocalMove();
@@ -278,6 +298,53 @@ export class ProtonDriveSyncEngine {
         this.state = 'idle';
     }
 
+    // Stops the engine for a move of the files between the sync folder and the backing store, and waits until nothing
+    // that touches them runs any more: a sync pass, a replay, a drive change or download, an availability change, a
+    // local or cloud change being handled. Until releaseHold(), nothing new starts (start() does nothing, a pass or a
+    // replay asked for doesn't run, a drive change or availability change is refused with BUSY_MOVING). Waiting longer
+    // than timeoutMs gives up, throwing, with the hold released (the caller starts the engine again).
+    async holdForMove(opts: { timeoutMs?: number } = {}): Promise<void> {
+        this.held = true;
+        const deadline = Date.now() + (opts.timeoutMs ?? Number.POSITIVE_INFINITY);
+        for (;;) {
+            await this.stop();
+            const chainSettled = await settlesWithin(this.availabilityRun, Math.max(0, Math.min(deadline - Date.now(), 200)));
+            if (chainSettled && this.idleForMove()) {
+                await this.stop(); // A start that finished meanwhile started the watcher
+                return;
+            }
+            if (Date.now() >= deadline) {
+                this.held = false;
+                throw new Error('Proton Drive is still busy syncing; try again in a moment');
+            }
+            await sleep(20);
+        }
+    }
+
+    releaseHold(): void {
+        this.held = false;
+    }
+
+    private idleForMove(): boolean {
+        return (
+            this.inFlight === 0 &&
+            !this.reconcileRunning &&
+            this.replayRun === null &&
+            this.localQueue.size === 0 &&
+            this.hydrations.size === 0
+        );
+    }
+
+    // Work that touches the files, counted for holdForMove
+    private async tracked<T>(work: () => Promise<T>): Promise<T> {
+        this.inFlight += 1;
+        try {
+            return await work();
+        } finally {
+            this.inFlight -= 1;
+        }
+    }
+
     async setPaused(paused: boolean): Promise<void> {
         this.stateDb.updateSettings({ paused });
         if (paused) {
@@ -300,12 +367,7 @@ export class ProtonDriveSyncEngine {
 
     async relocateSyncFolder(oldSyncDir: string, newSyncDirRaw: string): Promise<string> {
         const home = os.homedir();
-        const expanded = newSyncDirRaw.startsWith('~/')
-            ? path.join(home, newSyncDirRaw.slice(2))
-            : newSyncDirRaw === '~'
-              ? home
-              : newSyncDirRaw;
-        const resolvedNew = path.resolve(expanded);
+        const resolvedNew = resolveSyncDirInput(newSyncDirRaw);
         const resolvedOld = path.resolve(oldSyncDir);
 
         if (resolvedNew === '/' || resolvedNew === home) {
@@ -402,6 +464,9 @@ export class ProtonDriveSyncEngine {
     }
 
     async reconcileNow(): Promise<void> {
+        if (this.held) {
+            return; // The pass after the move, at start(), looks at everything
+        }
         if (!this.auth.isLoggedIn()) {
             this.state = 'unauthenticated';
             return;
@@ -870,6 +935,16 @@ export class ProtonDriveSyncEngine {
     }
 
     async resolveConflictManually(
+        conflictId: number,
+        choice: 'keep-both' | 'keep-local' | 'keep-remote',
+    ): Promise<ConflictRecord> {
+        if (this.held) {
+            throw new Error(BUSY_MOVING);
+        }
+        return this.tracked(() => this.resolveConflictNow(conflictId, choice));
+    }
+
+    private async resolveConflictNow(
         conflictId: number,
         choice: 'keep-both' | 'keep-local' | 'keep-remote',
     ): Promise<ConflictRecord> {
@@ -1457,9 +1532,13 @@ export class ProtonDriveSyncEngine {
     }
 
     private async handleLocalFileChange(relPath: string): Promise<void> {
-        if (!this.auth.isLoggedIn()) {
+        if (this.held || !this.auth.isLoggedIn()) {
             return;
         }
+        await this.tracked(() => this.handleLocalFileChangeNow(relPath));
+    }
+
+    private async handleLocalFileChangeNow(relPath: string): Promise<void> {
         const settings = this.stateDb.getSettings();
         if (
             settings.paused ||
@@ -1554,6 +1633,13 @@ export class ProtonDriveSyncEngine {
     }
 
     private async handleRemoteDriveEvent(event: DriveEvent): Promise<void> {
+        if (this.held) {
+            return; // The pass after the move, at start(), catches up
+        }
+        await this.tracked(() => this.handleRemoteDriveEventNow(event));
+    }
+
+    private async handleRemoteDriveEventNow(event: DriveEvent): Promise<void> {
         const settings = this.stateDb.getSettings();
         if (settings.paused || !this.auth.isLoggedIn()) {
             return;
@@ -1932,6 +2018,7 @@ export class ProtonDriveSyncEngine {
         toRel: string,
         opts: { noReplace?: boolean; deadlineMs?: number } = {},
     ): Promise<void> {
+        this.refuseWhileHeld();
         const from = normalizeDrivePath(fromRel);
         const to = normalizeDrivePath(toRel);
         if (from === '' || to === '') {
@@ -1962,6 +2049,7 @@ export class ProtonDriveSyncEngine {
         relPath: string,
         opts: { onlyIfEmpty?: boolean; trash?: boolean; deadlineMs?: number } = {},
     ): Promise<void> {
+        this.refuseWhileHeld();
         const rel = normalizeDrivePath(relPath);
         if (rel === '') {
             throw new Error("The whole of Proton Drive can't be deleted");
@@ -1980,11 +2068,19 @@ export class ProtonDriveSyncEngine {
     // Rejects with a DriveOpError: `Not found: <path>` (ENOENT) for anything but an online-only file, `Hidden: <path>`
     // (EACCES), `Already exists: <path>` (EEXIST) when it is on this computer; or with `Invalid path: <path>`.
     async truncateItem(relPath: string, opts: { deadlineMs?: number } = {}): Promise<void> {
+        this.refuseWhileHeld();
         const rel = normalizeDrivePath(relPath);
         await this.inAvailabilityRun(() => {
             this.inTime(opts.deadlineMs, rel);
             return this.truncateLocally(rel);
         });
+    }
+
+    // Drive changes and availability changes made while the files move would touch a half-moved tree
+    private refuseWhileHeld(): void {
+        if (this.held) {
+            throw new DriveOpError('EIO', BUSY_MOVING);
+        }
     }
 
     // A drive change carries the time the helper stops waiting for it (it has told the app EIO by then): one whose turn
@@ -2045,6 +2141,7 @@ export class ProtonDriveSyncEngine {
     // (see liveIndexEntry); Proton Docs and Sheets aren't indexed. A folder made here that Proton Drive doesn't have yet
     // is listed as the folder it is. A folder the index doesn't hold lists nothing.
     vfsChildren(relPath: string): VfsEntry[] {
+        this.refuseWhileHeld();
         const rel = normalizeDrivePath(relPath);
         const ignorePatterns = this.stateDb.getSettings().ignorePatterns;
         const folder = this.liveIndexEntry(rel);
@@ -2082,6 +2179,7 @@ export class ProtonDriveSyncEngine {
     hydrate(relPath: string): Promise<void> {
         let rel: string;
         try {
+            this.refuseWhileHeld();
             rel = normalizeDrivePath(relPath);
         } catch (error: unknown) {
             return Promise.reject(error);
@@ -2369,6 +2467,9 @@ export class ProtonDriveSyncEngine {
     }
 
     private runReplay(): Promise<void> {
+        if (this.held) {
+            return Promise.resolve(); // Sent after the move, by the pass at start()
+        }
         if (this.replayRun) {
             this.replayAgain = true; // What was journalled meanwhile goes too
             return this.replayRun;
@@ -3026,9 +3127,10 @@ export class ProtonDriveSyncEngine {
 
     // A crash between a local move's transaction (records moved, cloud change journalled) and the move itself leaves the
     // records at the new path without the item: once the change reached Proton Drive, they would read as the user
-    // deleting it there, which trashes it. So the move is finished on the next start. Whatever happens, no record is left
-    // where nothing is: if the item can't be put there, it syncs as a new one from where it is (nothing lost or trashed).
-    private recoverLocalMove(): void {
+    // deleting it there, which trashes it. So the move is finished on the next start, and before the files move between
+    // the sync folder and the backing store. Whatever happens, no record is left where nothing is: if the item can't be
+    // put there, it syncs as a new one from where it is (nothing lost or trashed).
+    recoverLocalMove(): void {
         const raw = this.stateDb.getMeta(LOCAL_MOVE_IN_PROGRESS);
         if (raw === null) {
             return;
@@ -3482,6 +3584,13 @@ export class ProtonDriveSyncEngine {
     // what is still waiting or running for it. A pin's download runs after its turn, so other changes and local change
     // handling don't wait for it. Rejects with `Not in Proton Drive: <path>` for a path the remote index doesn't hold.
     async setAvailability(relPath: string, action: AvailabilityAction): Promise<AvailabilityResult> {
+        if (this.held) {
+            throw new Error(BUSY_MOVING);
+        }
+        return this.tracked(() => this.setAvailabilityNow(relPath, action));
+    }
+
+    private async setAvailabilityNow(relPath: string, action: AvailabilityAction): Promise<AvailabilityResult> {
         if (!AVAILABILITY_ACTIONS.includes(action)) {
             throw new Error(`Unknown availability action: ${action}`);
         }
@@ -4132,6 +4241,23 @@ interface LocalStepSnapshot {
     ops: unknown[];
     indexRoots: string[];
     index: RemoteIndexEntry[];
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Whether the promise settled within ms; its timer never outlives it
+async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([
+            promise.then(() => true),
+            new Promise<boolean>((resolve) => (timer = setTimeout(() => resolve(false), ms))),
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 // A path from the virtual drive as a path of My files: no slash at either end, and no empty, '.' or '..' segment, so

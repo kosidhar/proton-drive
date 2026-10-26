@@ -26,12 +26,25 @@ export { mountsAt } from '../sync/mountPoint';
 // session is unmounted, files saved into the bare folder are merged into the backing store), restarts a crashed
 // helper, and unmounts on shutdown. While unmounted the mount point is 0555, so nothing new lands in it.
 
-export type VfsReason = 'ejected' | 'crashed' | 'fuse-unavailable' | 'switched-off' | 'starting' | 'mount-point-busy' | null;
+// different-disk: the sync folder is on another disk than the backing store, so its files can't move there by renames;
+// moving: files are moving between the sync folder and the backing store; move-failed: that move stopped (see error)
+export type VfsReason =
+    | 'ejected'
+    | 'crashed'
+    | 'fuse-unavailable'
+    | 'switched-off'
+    | 'starting'
+    | 'mount-point-busy'
+    | 'different-disk'
+    | 'moving'
+    | 'move-failed'
+    | null;
 
 export interface VfsStatus {
     mode: 'virtual' | 'plain';
     mounted: boolean;
     reason: VfsReason;
+    error?: string; // why the move stopped, with move-failed
 }
 
 export interface VfsTiming {
@@ -127,6 +140,12 @@ export function notMountableReason(status: VfsStatus): string {
             return "The virtual drive can't run: FUSE or protondrive-vfs isn't available on this system";
         case 'mount-point-busy':
             return "The virtual drive can't run: the daemon's control socket is unavailable";
+        case 'different-disk':
+            return "The virtual drive can't run: the Proton Drive folder is on another disk than the app's data";
+        case 'moving':
+            return 'Proton Drive is busy moving files';
+        case 'move-failed':
+            return `Moving the files failed: ${status.error ?? 'unknown error'}`;
         default:
             return "Proton Drive is a plain folder: its files haven't moved into the virtual drive";
     }
@@ -246,6 +265,14 @@ export class VfsSupervisor {
         await this.serially(() => this.shutdown()).catch((err: unknown) => {
             this.logger.error(`Could not stop the drive cleanly: ${messageOf(err)}`);
         });
+    }
+
+    // Unmounts the drive and leaves it unmounted, whether this session's helper or an earlier one mounted it: the files
+    // are about to move out of the backing store into the bare folder. Answers why something is still mounted there
+    // (a mount that isn't ours, or one that won't go), or null.
+    async release(): Promise<string | null> {
+        await this.stop();
+        return this.serially(() => this.clearOurMounts()).catch((err: unknown) => messageOf(err));
     }
 
     private serially<T>(task: () => Promise<T>): Promise<T> {

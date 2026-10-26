@@ -1775,6 +1775,105 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
     });
 
+    // While files move between the sync folder and the backing store, nothing in the engine may look at them: a half-moved
+    // tree reads as files deleted here, which trashes them in the cloud
+    describe('holding the engine for a layout move', () => {
+        const setup = () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const drive = makeMockDrive();
+            const backingDir = path.join(tempDir, 'files');
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                backingDir,
+            });
+            // Cloud listings, counted, and held up while `gate` is set
+            const listing = { calls: 0, gate: null as Promise<void> | null };
+            const iterate = drive.sdk.iterateFolderChildren.bind(drive.sdk);
+            (drive.sdk as { iterateFolderChildren: unknown }).iterateFolderChildren = async function* (
+                parent: Parameters<typeof iterate>[0],
+            ) {
+                listing.calls += 1;
+                if (listing.gate) await listing.gate;
+                yield* iterate(parent);
+            };
+            // The engine's listener for cloud events, kept after it unsubscribes: an event already on its way still arrives
+            type Listener = Parameters<EventsManager['addEventListener']>[0];
+            const events = { listener: null as Listener | null };
+            const addEventListener = drive.eventsManager.addEventListener.bind(drive.eventsManager);
+            (drive.eventsManager as { addEventListener: unknown }).addEventListener = (cb: Listener) => {
+                events.listener = cb;
+                return addEventListener(cb);
+            };
+            const holdUpListings = () => {
+                let release!: () => void;
+                listing.gate = new Promise<void>((resolve) => (release = resolve));
+                return () => {
+                    listing.gate = null;
+                    release();
+                };
+            };
+            return { ...drive, engine, listing, events, holdUpListings, files: localFiles(stateDb, () => backingDir) };
+        };
+        const busy = { code: 'EIO', message: 'Proton Drive is busy moving files' };
+
+        test('waits for a running pass; while held, passes, starts and drive changes do nothing and are refused', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            d.engine.availability.setPin(d.add('Docs').uid, 'pinned', false);
+            await d.engine.start({ backgroundInitialReconcile: false });
+            await d.engine.reconcileNow();
+            const release = d.holdUpListings();
+            const pass = d.engine.reconcileNow();
+            let held = false;
+            const hold = d.engine.holdForMove().then(() => (held = true));
+            await Bun.sleep(50);
+            expect(held).toBe(false);
+            release();
+            await pass;
+            await hold;
+
+            const callsWhenHeld = d.listing.calls;
+            await d.engine.reconcileNow();
+            await d.engine.start({ backgroundInitialReconcile: false });
+            await d.engine.replayRemoteOps();
+            expect(d.listing.calls).toBe(callsWhenHeld);
+            await expect(d.engine.renameItem('Docs/a.txt', 'Docs/b.txt')).rejects.toMatchObject(busy);
+            await expect(d.engine.deleteItem('Docs/a.txt')).rejects.toMatchObject(busy);
+            await expect(d.engine.truncateItem('Docs/new.txt')).rejects.toMatchObject(busy);
+            await expect(d.engine.hydrate('Docs/a.txt')).rejects.toMatchObject(busy);
+            expect(() => d.engine.vfsChildren('Docs')).toThrow(busy.message);
+            await expect(d.engine.setAvailability('Docs', 'free')).rejects.toThrow(busy.message);
+            await d.events.listener!('drive', {
+                type: DriveEventType.NodeDeleted,
+                nodeUid: 'vol~Docs/a.txt',
+                parentNodeUid: 'vol~Docs',
+                treeEventScopeId: 's',
+                eventId: 'e1',
+            });
+            expect(await d.files.exists('Docs/a.txt')).toBe(true);
+            expect(stateDb.getItemByPath('Docs/a.txt')).not.toBeNull();
+
+            d.engine.releaseHold();
+            await d.engine.start({ backgroundInitialReconcile: false });
+            expect(d.listing.calls).toBeGreaterThan(callsWhenHeld);
+            await d.engine.renameItem('Docs/a.txt', 'Docs/b.txt');
+            expect(await d.files.exists('Docs/b.txt')).toBe(true);
+            await d.engine.stop();
+        });
+
+        test('a hold that waits too long gives up, leaving the engine as it was', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            const release = d.holdUpListings();
+            const pass = d.engine.reconcileNow();
+            await expect(d.engine.holdForMove({ timeoutMs: 50 })).rejects.toThrow(/still busy/);
+            release();
+            await pass;
+            const calls = d.listing.calls;
+            await d.engine.reconcileNow();
+            expect(d.listing.calls).toBeGreaterThan(calls);
+        });
+    });
+
     // Projects is deleted or trashed in the cloud (on the web, or on another device) while this computer holds things
     // in it that exist nowhere else: they must survive, in the desktop Trash or where they are (issue #16)
     describe('cloud-side deletes', () => {

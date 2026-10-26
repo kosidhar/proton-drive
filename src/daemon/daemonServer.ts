@@ -14,20 +14,13 @@ import {
     THIRD_PARTY_DISCLOSURE,
 } from '../sdk';
 import { migrateExcludedFolders } from '../sync/availabilityMigration';
-import { backingDirFor, readDriveLayout, virtualDriveWanted } from '../sync/driveMode';
+import { backingDirFor, virtualDriveWanted } from '../sync/driveMode';
 import { ProtonDriveSyncEngine } from '../sync/syncEngine';
 import { SyncStateDatabase } from '../sync/syncStateDb';
 import { defaultControlSocketPath, startControlServer } from './controlServer';
+import { DriveController } from './driveController';
 import { isTrustedLocalRequest } from './requestGuard';
-import {
-    findHelper,
-    fuseAvailable,
-    mergeStrayInto,
-    notMountableReason,
-    unsupervisedStatus,
-    VfsSupervisor,
-    type VfsStatus,
-} from './vfsSupervisor';
+import { findHelper, fuseAvailable, mergeStrayInto, VfsSupervisor } from './vfsSupervisor';
 
 export const DEFAULT_DAEMON_PORT = Number(process.env.PROTON_DRIVE_DAEMON_PORT || 49152);
 export const DEFAULT_DAEMON_HOST = '127.0.0.1';
@@ -93,13 +86,35 @@ export async function startSyncDaemon(options: {
         { backingDir: backingDirFor(runtime.config.appDir) },
     );
 
-    // Before the first sync with the availability policy, so what is synced today stays downloaded. A failure stops
-    // the start: syncing unmigrated would leave old Cloud only records that read as local deletions.
-    if ((await migrateExcludedFolders(stateDb, engine.availability, stateDbPath, engine.localRoot())) === 'migrated') {
-        runtime.logger.info('Migrated Cloud only folders to the availability policy');
-    }
-    await engine.start({ backgroundInitialReconcile: true });
-    ensureSystemTrayIndicator();
+    // The drive: the files move between the sync folder and the backing store to match the mode, and the helper runs
+    // while they are in the store. FUSE and the helper are looked for once, here, so /api/status stays cheap.
+    const appDir = runtime.config.appDir;
+    const backingDir = backingDirFor(appDir);
+    const helperPath = findHelper();
+    const drive = new DriveController({
+        stateDb,
+        engine,
+        appDir,
+        backingDir,
+        logger: runtime.logger,
+        fuseOk: fuseAvailable(helperPath),
+        makeSupervisor: (mountpoint) =>
+            new VfsSupervisor({
+                mountpoint,
+                backingDir,
+                appDir,
+                socketPath: defaultControlSocketPath(),
+                helperPath: helperPath ?? 'protondrive-vfs', // spawned only when FUSE and the helper were found
+                logPath: path.join(appDir, 'vfs.log'),
+                logger: runtime.logger,
+                // A file saved into the bare folder while the drive was down: the engine uploads it as a new local file
+                mergeStray: async (fullPath) => {
+                    for (const renamed of mergeStrayInto(fullPath, mountpoint, backingDir)) {
+                        runtime.logger.warn(`A stray in ${mountpoint} took a name already in the drive; kept it as ${renamed}`);
+                    }
+                },
+            }),
+    });
 
     let cachedAccount: ProtonAccountInfo | null = null;
     let lastAccountFetchMs = 0;
@@ -235,6 +250,7 @@ export async function startSyncDaemon(options: {
     }
 
     const settings = stateDb.getSettings();
+    let controlServer: { stop(): void } | null = null;
     const reconcileTimer = setInterval(() => {
         const s = stateDb.getSettings();
         if (runtime.auth.isLoggedIn()) {
@@ -245,18 +261,19 @@ export async function startSyncDaemon(options: {
         }
     }, Math.max(30, settings.reconcileIntervalSec) * 1000);
 
-    // The drive: only once the files are in the backing store (driveLayout virtual); moving them there is a later step.
-    // FUSE and the helper are looked for once, here, so /api/status stays cheap.
-    const backingDir = backingDirFor(runtime.config.appDir);
-    const helperPath = findHelper();
-    const layout = readDriveLayout(stateDb);
-    const fuseOk = fuseAvailable(helperPath);
-    let vfsSupervisor: VfsSupervisor | null = null;
-    let vfsFixedStatus: VfsStatus = unsupervisedStatus(layout, virtualDriveWanted(stateDb), fuseOk);
-    if (layout === 'virtual' && !fuseOk) {
-        runtime.logger.error(`The drive can't be mounted: FUSE or protondrive-vfs isn't available (helper: ${helperPath ?? 'not found'})`);
-    }
+    // Unmounts first, while the daemon still answers the helper; bounded, so it never holds up the shutdown
+    const stop = async () => {
+        clearInterval(reconcileTimer);
+        await drive.stop();
+        server.stop();
+        controlServer?.stop();
+        await engine.stop();
+        stateDb.close();
+        await runtime.dispose();
+    };
 
+    // Listening before any file moves: a second daemon fails here (the port is taken) instead of moving files too, and
+    // the app sees this one answer, busy, rather than starting another
     let lastRejectionLogAt = 0;
     const server = Bun.serve({
         hostname: host,
@@ -299,7 +316,8 @@ export async function startSyncDaemon(options: {
                     const systemd = await getSystemdServiceStatus();
                     return Response.json({
                         ...engine.getStatus(),
-                        vfs: vfsSupervisor?.status() ?? vfsFixedStatus,
+                        vfs: drive.status(),
+                        virtualDriveWanted: virtualDriveWanted(stateDb),
                         account: cachedAccount,
                         appVersion: runtime.config.appVersion,
                         sdkVersion: runtime.config.sdkVersion,
@@ -403,10 +421,13 @@ export async function startSyncDaemon(options: {
 
                 if (req.method === 'POST' && pathname === '/api/settings') {
                     const prev = stateDb.getSettings();
-                    const body = (await req.json()) as Record<string, unknown>;
-                    if (typeof body.syncDir === 'string' && body.syncDir.trim() && body.syncDir.trim() !== prev.syncDir) {
-                        const relocated = await engine.relocateSyncFolder(prev.syncDir, body.syncDir.trim());
-                        body.syncDir = relocated;
+                    const { virtualDriveWanted: wanted, syncDir, ...body } = (await req.json()) as Record<string, unknown>;
+                    if (wanted !== undefined && typeof wanted !== 'boolean') {
+                        return Response.json({ error: 'virtualDriveWanted must be true or false' }, { status: 400 });
+                    }
+                    // The sync folder changes only by moving there (or, for the drive, mounting there)
+                    if (typeof syncDir === 'string' && syncDir.trim() && syncDir.trim() !== prev.syncDir) {
+                        body.syncDir = await drive.relocate(syncDir.trim());
                     }
                     const updated = stateDb.updateSettings(body);
                     if (
@@ -415,7 +436,16 @@ export async function startSyncDaemon(options: {
                     ) {
                         void engine.reconcileNow();
                     }
-                    return Response.json({ ok: true, settings: stateDb.getSettings() });
+                    // Moves the files, and throws (answered 500 with the error) when that fails
+                    if (typeof wanted === 'boolean' && wanted !== virtualDriveWanted(stateDb)) {
+                        await drive.setVirtualDriveWanted(wanted);
+                    }
+                    return Response.json({
+                        ok: true,
+                        settings: stateDb.getSettings(),
+                        virtualDriveWanted: virtualDriveWanted(stateDb),
+                        vfs: drive.status(),
+                    });
                 }
 
                 // Remote browser endpoints
@@ -499,56 +529,29 @@ export async function startSyncDaemon(options: {
         },
     });
 
+    // A move cut short is finished, then the files move to match the mode, all before the engine starts. The
+    // availability migration runs in between, on a whole tree, before the first sync with the availability policy (so
+    // what is synced today stays downloaded); its failure stops the start, as syncing unmigrated would leave old Cloud
+    // only records that read as local deletions.
+    await drive.settleAtStart(async () => {
+        if ((await migrateExcludedFolders(stateDb, engine.availability, stateDbPath, engine.localRoot())) === 'migrated') {
+            runtime.logger.info('Migrated Cloud only folders to the availability policy');
+        }
+    });
+    await engine.start({ backgroundInitialReconcile: true }); // does nothing while a move that stopped holds it
+    ensureSystemTrayIndicator();
+
     // The only way to pin, free, hide or unhide: a user-only Unix socket, never the TCP API above
-    let controlServer: { stop(): void } | null = null;
     try {
         controlServer = await startControlServer({
             socketPath: defaultControlSocketPath(),
             engine,
-            mountAgain: async () => {
-                if (!vfsSupervisor) throw new Error(notMountableReason(vfsFixedStatus));
-                await vfsSupervisor.mountAgain();
-            },
+            mountAgain: () => drive.mountAgain(),
         });
     } catch (err) {
         runtime.logger.error(`Control socket unavailable, availability actions are disabled: ${String(err)}`);
     }
-
-    if (layout === 'virtual' && fuseOk && !controlServer) {
-        // The helper can't reach this daemon, and a socket held by another daemon means that one runs the drive:
-        // starting here would unmount it
-        runtime.logger.error('Not mounting the drive: the control socket is unavailable');
-        vfsFixedStatus = { mode: 'virtual', mounted: false, reason: 'mount-point-busy' };
-    } else if (layout === 'virtual' && helperPath && fuseOk) {
-        const mountpoint = settings.syncDir;
-        vfsSupervisor = new VfsSupervisor({
-            mountpoint,
-            backingDir,
-            appDir: runtime.config.appDir,
-            socketPath: defaultControlSocketPath(),
-            helperPath,
-            logPath: path.join(runtime.config.appDir, 'vfs.log'),
-            logger: runtime.logger,
-            // A file saved into the bare folder while the drive was down: the engine uploads it as a new local file
-            mergeStray: async (fullPath) => {
-                for (const renamed of mergeStrayInto(fullPath, mountpoint, backingDir)) {
-                    runtime.logger.warn(`A stray in ${mountpoint} took a name already in the drive; kept it as ${renamed}`);
-                }
-            },
-        });
-        await vfsSupervisor.start();
-    }
-
-    const stop = async () => {
-        clearInterval(reconcileTimer);
-        // Unmount first, while the daemon still answers the helper; bounded, so it never holds up the shutdown
-        await vfsSupervisor?.stop();
-        server.stop();
-        controlServer?.stop();
-        await engine.stop();
-        stateDb.close();
-        await runtime.dispose();
-    };
+    await drive.startDrive(controlServer !== null);
 
     return {
         url: `http://${host}:${server.port}`,
