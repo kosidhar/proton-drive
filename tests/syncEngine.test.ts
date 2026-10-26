@@ -2768,6 +2768,36 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
         }
 
+        // I1: a file moved or renamed on the web during the hold is not where the user deleted it: never trashed there
+        for (const layout of ['plain', 'virtual'] as const) {
+            for (const how of ['moved', 'renamed'] as const) {
+                test(`${layout}: a file opened on demand and ${how} on the web during the hold is never trashed; its record goes`, async () => {
+                    const d = setup(layout);
+                    await openedOnly(d);
+                    const file = d.nodes.get('vol~Photos/2024/p.jpg')!;
+                    if (how === 'moved') {
+                        d.nodes.set(file.uid, { ...file, parentUid: d.add('Archive').uid });
+                    } else {
+                        d.nodes.set(file.uid, { ...file, name: { ok: true as const, value: 'renamed.jpg' } });
+                    }
+
+                    await confirmShown(d);
+                    await settled(d);
+
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.nodes.get(file.uid)).toBeDefined();
+                    expect(d.warnings).toContain('Not trashing Photos/2024/p.jpg: it moved in Proton Drive meanwhile, so it stays there');
+                    expect(stateDb.getAllItems()).toEqual([]);
+                    expect(d.engine.getStatus()).toMatchObject({ state: 'idle', lastError: null, filesMissing: null });
+                    // And for good: the next pass holds on nothing, and trashes nothing
+                    await d.engine.reconcileNow();
+                    expect(d.engine.getStatus()).toMatchObject({ state: 'idle', lastError: null, filesMissing: null });
+                    expect(stateDb.getMeta(FILES_HOLD)).toBeNull();
+                    expect(d.calls.trashed).toEqual([]);
+                });
+            }
+        }
+
         for (const moved of [false, true]) {
             test(`virtual: a folder recorded without the folder above it goes by its node too${moved ? ', but not once moved on the web' : ''}`, async () => {
                 const d = setup('virtual');
@@ -2798,10 +2828,18 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await settled(d);
 
                 if (moved) {
-                    // A listing of it at Photos/2024 would not be the folder's: nothing goes, and its record stays
+                    // Not where the user deleted it any more: it stays in Proton Drive where it went, its records go, and
+                    // nothing holds again
                     expect(d.calls.trashed).toEqual([]);
-                    expect(d.warnings).toContain('Not trashing Photos/2024: it has moved in Proton Drive meanwhile');
-                    expect(stateDb.getItemByPath('Photos/2024')).not.toBeNull();
+                    expect(d.nodes.get(folder.uid)?.parentUid).toBe('vol~Elsewhere');
+                    expect(d.nodes.has('vol~Photos/2024/p.jpg')).toBe(true);
+                    expect(d.warnings).toContain('Not trashing Photos/2024: it moved in Proton Drive meanwhile, so it stays there');
+                    expect(stateDb.getAllItems()).toEqual([]);
+                    expect(d.engine.getStatus()).toMatchObject({ state: 'idle', filesMissing: null });
+                    await d.engine.reconcileNow();
+                    expect(d.engine.getStatus()).toMatchObject({ state: 'idle', lastError: null, filesMissing: null });
+                    expect(stateDb.getMeta(FILES_HOLD)).toBeNull();
+                    expect(d.calls.trashed).toEqual([]);
                 } else {
                     // As a pass takes a folder deleted here: what was on this computer goes, q.jpg (never here) stays
                     expect(d.calls.trashed).toEqual([['vol~Photos/2024/p.jpg']]);
@@ -2811,6 +2849,31 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 }
             });
         }
+
+        test('virtual: kept online-only, a name with no uid known is unpinned through the records under it', async () => {
+            const d = setup('virtual');
+            d.add('Photos/2024/p.jpg', 'p');
+            d.add('Photos/2024/q.jpg', 'q');
+            await d.engine.reconcileNow();
+            await d.engine.hydrate('Photos/2024/p.jpg');
+            d.engine.availability.setPin(d.root.uid, 'pinned', false); // the whole drive kept on this device since
+            d.engine.remoteIndex.removeSubtree('vol~Photos'); // and Photos no longer in the listing kept here
+            await rm(d.localRoot, { recursive: true, force: true });
+            await mkdir(d.localRoot);
+            await d.engine.reconcileNow();
+            expect(d.engine.getStatus().filesMissing).toMatchObject({ names: ['Photos'], items: 1 });
+
+            await keepShown(d);
+            await settled(d);
+            await d.engine.reconcileNow();
+
+            expect(d.calls.trashed).toEqual([]);
+            // p.jpg, kept online-only, is not downloaded again, though everything around it is kept on this device
+            expect(d.calls.downloads.filter((p) => p === 'Photos/2024/p.jpg')).toEqual(['Photos/2024/p.jpg']); // the open
+            expect(await d.files.exists('Photos/2024/p.jpg')).toBe(false);
+            expect(d.engine.availability.stateOf('Photos/2024/p.jpg')).toBe('online-only');
+            expect(d.engine.getStatus()).toMatchObject({ state: 'idle', filesMissing: null });
+        });
 
         test('plain: kept online-only, what was kept on this device (here the whole drive) is not downloaded again', async () => {
             const d = setup();

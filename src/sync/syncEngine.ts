@@ -741,7 +741,6 @@ export class ProtonDriveSyncEngine {
     // held, for a mismatch, or while the files move between the sync folder and the backing store.
     async keepFilesMissingOnlineOnly(expected: { root: string; names: string[] }): Promise<FilesMissingStatus> {
         const { missing } = this.shownMissing(expected, 'nothing was changed');
-        const notMarked: string[] = []; // pinned, but with no uid to unpin them by
         this.stateDb.connection.transaction(() => {
             for (const name of missing.names) {
                 if (this.policy.isPinned(name) || this.policy.hasPinnedBelow(name)) {
@@ -749,17 +748,15 @@ export class ProtonDriveSyncEngine {
                     if (uid && !isProvisional(uid)) {
                         this.policy.setPin(uid, 'unpinned', true);
                     } else {
-                        notMarked.push(name);
+                        // Not in the listing kept here (nor recorded itself): each recorded item under it, by its own uid
+                        for (const item of this.stateDb.getItemsUnder(name)) {
+                            this.policy.setPin(item.nodeUid, 'unpinned', true);
+                        }
                     }
                 }
                 this.stateDb.removeItemByPath(name);
             }
         })();
-        if (notMarked.length > 0) {
-            this.logger.warn(
-                `${listNames(notMarked)} may download again: Proton Drive's listing doesn't have them yet, so they couldn't be marked online-only`,
-            );
-        }
         this.endFilesHold();
         const details = `The ${missing.items} item(s) missing from ${this.shownPlace()} (${listNames(missing.names)}) stay in Proton Drive, online-only: nothing was deleted`;
         this.logger.info(details);
@@ -1676,9 +1673,10 @@ export class ProtonDriveSyncEngine {
     // A record whose folders above have none, as a file opened through the virtual drive has, sits under a folder the
     // pass doesn't go into (online-only here), so it was never looked at, and the hold came back for ever. Each such
     // item, still recorded and still missing, goes as the pass would have taken it (see trashForDeletedLocal), by its
-    // recorded node; one gone from Proton Drive already just loses its records. Nothing outside what was confirmed. A
-    // folder goes only from where its record says it is, as its trash is decided from a listing of it at that path; one
-    // moved in the cloud meanwhile is left as it is, record and all.
+    // recorded node; one gone from Proton Drive already just loses its records. Nothing outside what was confirmed. An
+    // item goes only from where its record says it is (its parent and name): one moved or renamed in the cloud meanwhile
+    // isn't where the user deleted it, so it stays in Proton Drive where it went, and only its records go, as when the
+    // pass finds an item moved away (so nothing holds on it again).
     private async trashConfirmedOutOfReach(confirmation: { root: string; names: Set<string> }): Promise<void> {
         if (confirmation.root !== this.localRoot()) {
             return;
@@ -1707,8 +1705,14 @@ export class ProtonDriveSyncEngine {
             const node = await this.liveNode(record.nodeUid);
             if (node === null) {
                 this.stateDb.removeItemByPath(rel); // Gone from Proton Drive already, or in its trash
-            } else if (node.type === NodeType.Folder && (node.parentUid !== record.parentNodeUid || getName(node) !== path.posix.basename(rel))) {
-                this.logger.warn(`Not trashing ${rel}: it has moved in Proton Drive meanwhile`);
+            } else if (node.parentUid !== record.parentNodeUid || getName(node) !== path.posix.basename(rel)) {
+                this.stateDb.removeItemByPath(rel);
+                this.logger.warn(`Not trashing ${rel}: it moved in Proton Drive meanwhile, so it stays there`);
+                this.stateDb.logActivity({
+                    action: 'sync',
+                    localRelPath: rel,
+                    details: 'Not moved to the Proton Drive trash: it moved in Proton Drive meanwhile, so it stays there',
+                });
             } else {
                 await this.trashForDeletedLocal(rel, node);
             }

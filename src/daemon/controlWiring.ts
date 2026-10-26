@@ -26,8 +26,19 @@ export function controlServerOptions(deps: {
         login: deps.signIn,
         logout: deps.signOut,
         resolveConflict: (id, choice) => engine.resolveConflictManually(id, choice),
-        resolveFilesMissing: (action, expected) =>
-            action === 'keep-online-only' ? engine.keepFilesMissingOnlineOnly(expected) : engine.confirmFilesMissingDeleted(expected),
+        // Only the exact delete action reaches the delete: an action not wired here reaches nothing
+        resolveFilesMissing: async (action, expected) => {
+            switch (action) {
+                case 'delete-in-cloud':
+                    return engine.confirmFilesMissingDeleted(expected);
+                case 'keep-online-only':
+                    return engine.keepFilesMissingOnlineOnly(expected);
+                default: {
+                    const unknown: never = action;
+                    throw new Error(`Unknown action: ${String(unknown)}`);
+                }
+            }
+        },
         remoteMkdir: deps.makeRemoteFolder,
     };
 }

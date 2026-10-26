@@ -128,6 +128,40 @@ describe('What the TCP API refuses, and how the daemon is wired (#32, #33, #36)'
         ]);
     });
 
+    // #50 m2: only the exact delete action reaches the delete; an action the wiring doesn't know reaches nothing
+    test('an action the wiring does not know never reaches the delete, nor anything else', async () => {
+        const dir = mkdtempSync(path.join(os.tmpdir(), 'pd-wiring-'));
+        cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+        const stateDb = new SyncStateDatabase(path.join(dir, 'state.sqlite'));
+        cleanups.push(() => stateDb.close());
+        const calls: string[] = [];
+        const options = controlServerOptions({
+            socketPath: path.join(dir, 'control.sock'),
+            engine: {
+                confirmFilesMissingDeleted: async () => {
+                    calls.push('delete');
+                    return { root: '/r', names: ['Docs'], items: 1 };
+                },
+                keepFilesMissingOnlineOnly: async () => {
+                    calls.push('keep');
+                    return { root: '/r', names: ['Docs'], items: 1 };
+                },
+            } as never,
+            drive: {} as never,
+            stateDb,
+            signIn: async () => ({ signInUrl: '' }),
+            signOut: async () => {},
+            makeRemoteFolder: async (_parent, name) => ({ uid: 'u', name }),
+        });
+        for (const action of ['trash-everything', 'DELETE-IN-CLOUD', '', 'delete-in-cloud ']) {
+            await expect(options.resolveFilesMissing!(action as never, { root: '/r', names: ['Docs'] })).rejects.toThrow('Unknown action');
+        }
+        expect(calls).toEqual([]);
+        await options.resolveFilesMissing!('delete-in-cloud', { root: '/r', names: ['Docs'] });
+        await options.resolveFilesMissing!('keep-online-only', { root: '/r', names: ['Docs'] });
+        expect(calls).toEqual(['delete', 'keep']);
+    });
+
     test('the mkdir route checks its body and reports a failure', async () => {
         const dir = mkdtempSync(path.join(os.tmpdir(), 'pd-mkdir-'));
         cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
