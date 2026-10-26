@@ -1528,7 +1528,7 @@ export class ProtonDriveSyncEngine {
             });
 
             if (result.nodeUid && (result.status === 'uploaded' || result.status === 'updated-revision')) {
-                this.indexUploaded(result.nodeUid, parentNode.uid, path.posix.basename(relPath), result);
+                this.indexUploaded(result.nodeUid, parentNode.uid, result.remoteName, result);
             }
             // A name taken by another file (with 'skip') is left to the caller
             if (result.nodeUid && result.status !== 'skipped') {
