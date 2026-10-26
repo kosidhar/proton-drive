@@ -47,27 +47,43 @@ pub fn process_comm(tid: u32) -> Option<String> {
     Some(comm.trim_end_matches('\n').to_string())
 }
 
-/// Whether the opener has given up waiting: its thread has a signal pending that it doesn't block, or it is gone.
-/// The kernel would say so with FUSE_INTERRUPT, but fuser can't receive it; and once an open is with the helper, even
-/// SIGKILL waits for its answer. A fatal signal shows up as SIGKILL pending on each of the process's threads.
+/// Whether the opener has given up waiting: its thread has a signal pending, unblocked, that ends it or makes it stop
+/// waiting (see GIVING_UP), or it is gone. The kernel would say so with FUSE_INTERRUPT, but fuser can't receive it;
+/// and once an open is with the helper, even SIGKILL waits for its answer. A fatal signal shows up as SIGKILL pending on
+/// each of the process's threads.
 pub fn opener_interrupted(tid: u32) -> bool {
     if tid == 0 {
         return false; // a request the kernel made itself has no opener to watch
     }
     match std::fs::read_to_string(format!("/proc/{tid}/status")) {
         Ok(status) => unblocked_signal_pending(&status),
-        Err(_) => true,
+        Err(err) => gone(&err),
     }
 }
 
-/// From /proc/<tid>/status: (SigPnd | ShdPnd) & !SigBlk, each a hex mask.
+/// Whether reading a thread's /proc status failed because the thread is gone. Anything else (out of file
+/// descriptors, say) says nothing about the app, which is left waiting.
+fn gone(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// The signals that mean the opener gave up: SIGKILL (what any fatal signal becomes for each thread), and SIGHUP,
+/// SIGINT, SIGQUIT and SIGTERM. Others (a job-control stop, SIGCHLD, SIGURG, SIGWINCH...) would only cost the app a
+/// spurious EINTR. Bit n-1 of a mask is signal n.
+const GIVING_UP: u64 = bit(libc::SIGHUP) | bit(libc::SIGINT) | bit(libc::SIGQUIT) | bit(libc::SIGKILL) | bit(libc::SIGTERM);
+
+const fn bit(signal: i32) -> u64 {
+    1 << (signal - 1)
+}
+
+/// From /proc/<tid>/status: (SigPnd | ShdPnd) & GIVING_UP & !SigBlk, each a hex mask.
 fn unblocked_signal_pending(status: &str) -> bool {
     let mask = |field: &str| {
         let value = status.lines().find_map(|l| l.strip_prefix(field))?;
         u64::from_str_radix(value.trim(), 16).ok()
     };
     match (mask("SigPnd:"), mask("ShdPnd:"), mask("SigBlk:")) {
-        (Some(own), Some(shared), Some(blocked)) => (own | shared) & !blocked != 0,
+        (Some(own), Some(shared), Some(blocked)) => (own | shared) & GIVING_UP & !blocked != 0,
         _ => false,
     }
 }
@@ -133,6 +149,52 @@ mod tests {
         assert!(unblocked_signal_pending(&status(NONE, "0000000000000002", "0000000000000004")));
         assert!(!unblocked_signal_pending(&status(NONE, "0000000000000002", "0000000000000002")));
         assert!(!unblocked_signal_pending("Name:\tcat\n"));
+    }
+
+    // Final review M-2: only a signal that ends the opener or makes it stop waiting is a reason to give up; a job-control
+    // stop, SIGCHLD from a child, SIGURG, SIGWINCH and the like came with a spurious EINTR to the app
+    #[test]
+    fn only_kill_int_term_hup_and_quit_count() {
+        const NONE: &str = "0000000000000000";
+        let mask = |sig: i32| format!("{:016x}", 1u64 << (sig - 1));
+        for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGKILL, libc::SIGTERM] {
+            assert!(unblocked_signal_pending(&status(&mask(sig), NONE, NONE)), "signal {sig} for the thread");
+            assert!(unblocked_signal_pending(&status(NONE, &mask(sig), NONE)), "signal {sig} for the process");
+        }
+        for sig in [
+            libc::SIGTSTP,
+            libc::SIGTTIN,
+            libc::SIGTTOU,
+            libc::SIGCONT,
+            libc::SIGCHLD,
+            libc::SIGURG,
+            libc::SIGWINCH,
+            libc::SIGUSR1,
+            libc::SIGUSR2,
+            libc::SIGALRM,
+            libc::SIGPIPE,
+            libc::SIGIO,
+            libc::SIGPROF,
+        ] {
+            assert!(!unblocked_signal_pending(&status(&mask(sig), NONE, NONE)), "signal {sig} for the thread");
+            assert!(!unblocked_signal_pending(&status(NONE, &mask(sig), NONE)), "signal {sig} for the process");
+        }
+        // One that counts among others that don't still counts, unless it is blocked
+        let mixed = format!("{:016x}", (1u64 << (libc::SIGCHLD - 1)) | (1u64 << (libc::SIGTERM - 1)));
+        assert!(unblocked_signal_pending(&status(&mixed, NONE, NONE)));
+        assert!(!unblocked_signal_pending(&status(&mixed, NONE, &mask(libc::SIGTERM))));
+    }
+
+    #[test]
+    fn only_a_thread_that_is_gone_counts_when_its_status_cant_be_read() {
+        use std::io::{Error, ErrorKind};
+        assert!(gone(&Error::from(ErrorKind::NotFound)));
+        assert!(gone(&Error::from_raw_os_error(libc::ENOENT)));
+        assert!(gone(&Error::from_raw_os_error(libc::ESRCH)));
+        // Out of file descriptors, say: nothing says the app gave up
+        for errno in [libc::EMFILE, libc::ENFILE, libc::EACCES, libc::EIO, libc::ENOMEM] {
+            assert!(!gone(&Error::from_raw_os_error(errno)), "errno {errno}");
+        }
     }
 
     #[test]
