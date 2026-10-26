@@ -9,6 +9,7 @@ import {
     emptyFolderNeeded,
     finishRelocation,
     holdsFiles,
+    unsafeFolderReason,
     LAYOUT_MOVING,
     type MoveSeams,
     moveToLayout,
@@ -192,6 +193,10 @@ export class DriveController {
         }
         if (pathsOverlap(newDir, oldDir)) {
             throw new Error(`${newDir} and ${oldDir} are inside one another; choose a folder outside the current Proton Drive folder`);
+        }
+        const unsafe = unsafeFolderReason(newDir);
+        if (unsafe !== null) {
+            throw new Error(unsafe);
         }
         // Then everything in it comes from the old folder: a move that stops can be moved back exactly, nothing
         // unrelated is pulled into the drive (the stray merge would take it into the store), and nothing of the user's

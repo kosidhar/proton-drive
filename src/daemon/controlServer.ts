@@ -33,6 +33,8 @@ export interface ControlServerOptions {
     // Finish, move back or retry a move that stopped (see DriveController.resolveMove); its errors may carry an HTTP
     // status and the move waiting now
     driveMove?: (action: DriveMoveAction, from?: string, to?: string) => Promise<void>;
+    // Change the drive folder and the virtual drive switch (see driveSettings in settingsRoute.ts); answers the response
+    driveSettings?: (change: { syncDir?: string; virtualDriveWanted?: boolean }) => Promise<Response>;
 }
 
 // 'live' when something accepts connections on the socket, 'stale' when it refuses or is gone
@@ -200,6 +202,25 @@ async function driveMoveRoute(req: Request, driveMove: ControlServerOptions['dri
     }
 }
 
+// POST /drive/settings {syncDir?, virtualDriveWanted?}: moves the Proton Drive folder and switches the virtual drive on
+// or off, which move every file: reachable only here, never through the TCP API. Answers 200 { ok: true, settings,
+// virtualDriveWanted, vfs, folderError, switchError } (an error is null or why that change was refused or failed); 400
+// { error, code } for a malformed request.
+async function driveSettingsRoute(req: Request, driveSettings: ControlServerOptions['driveSettings']): Promise<Response> {
+    const invalid = (message: string) => Response.json({ error: message, code: 'EINVAL' }, { status: 400 });
+    if (req.method !== 'POST') return jsonError('Method not allowed', 405);
+    if (!driveSettings) return jsonError('Not found', 404);
+    const body = await jsonBody(req);
+    if (!body) return invalid('Invalid JSON body');
+    const unknown = Object.keys(body).filter((key) => key !== 'syncDir' && key !== 'virtualDriveWanted');
+    if (unknown.length > 0) return invalid(`Unknown setting: ${unknown.join(', ')}`);
+    if (body.syncDir !== undefined && typeof body.syncDir !== 'string') return invalid('syncDir must be a folder path');
+    if (body.virtualDriveWanted !== undefined && typeof body.virtualDriveWanted !== 'boolean') {
+        return invalid('virtualDriveWanted must be true or false');
+    }
+    return driveSettings({ syncDir: body.syncDir as string | undefined, virtualDriveWanted: body.virtualDriveWanted as boolean | undefined });
+}
+
 export async function startControlServer(opts: ControlServerOptions): Promise<{ stop(): void }> {
     const { socketPath, engine } = opts;
     const dir = path.dirname(socketPath);
@@ -224,6 +245,9 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
             }
             if (url.pathname === '/drive/move') {
                 return driveMoveRoute(req, opts.driveMove);
+            }
+            if (url.pathname === '/drive/settings') {
+                return driveSettingsRoute(req, opts.driveSettings);
             }
             if (url.pathname !== '/availability') {
                 return jsonError('Not found', 404);

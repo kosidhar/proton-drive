@@ -19,11 +19,11 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { startControlServer } from '../src/daemon/controlServer';
-import { settingsRoute } from '../src/daemon/settingsRoute';
+import { driveSettings, settingsRoute } from '../src/daemon/settingsRoute';
 import { DriveController, type DriveSupervisor } from '../src/daemon/driveController';
 import type { VfsStatus } from '../src/daemon/vfsSupervisor';
 import { readDriveLayout } from '../src/sync/driveMode';
-import { LAYOUT_MOVING, type MoveSeams, SYNC_DIR_MOVING } from '../src/sync/layoutMigration';
+import { LAYOUT_MOVING, type MoveSeams, SYNC_DIR_MOVING, unsafeFolderReason } from '../src/sync/layoutMigration';
 import { moveWithoutReplacing } from '../src/sync/localMove';
 import { LOCAL_MOVE_IN_PROGRESS, ProtonDriveSyncEngine } from '../src/sync/syncEngine';
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
@@ -672,6 +672,7 @@ describe('DriveController: a new folder must be missing or empty (S30)', () => {
             const before = snapshot(where);
             const to = path.join(s.root, 'Documents');
             s.put(path.join(to, 'mine.txt'), "the user's own");
+            chmodSync(to, 0o755); // whatever the umask: a folder others can write is refused before it is looked into
 
             await expect(controller.relocate(to)).rejects.toThrow(`Choose an empty folder, or a new one: ${to} already holds files`);
 
@@ -755,11 +756,14 @@ describe('Explicit actions for a move that stopped (S31)', () => {
                     engine: s.engine,
                     mountAgain: () => s.controller.mountAgain(),
                     driveMove: (action, from, to) => s.controller.resolveMove(action, from, to),
+                    driveSettings: (change) => driveSettings(change, { stateDb: s.stateDb, drive: s.controller, engine: s.engine }),
                 });
                 cleanups.push(() => server.stop());
             },
             saveSettings: (body: unknown) =>
                 fetch(`http://127.0.0.1:${settings.port}/api/settings`, { method: 'POST', body: JSON.stringify(body) }).then(json),
+            driveSettings: (body: unknown) =>
+                fetch('http://localhost/drive/settings', { unix: socketPath, method: 'POST', body: JSON.stringify(body) } as RequestInit).then(json),
             move: (body: unknown) =>
                 fetch('http://localhost/drive/move', { unix: socketPath, method: 'POST', body: JSON.stringify(body) } as RequestInit).then(json),
             mountAgain: () => fetch('http://localhost/vfs/mount', { unix: socketPath, method: 'POST' } as RequestInit).then(json),
@@ -782,7 +786,7 @@ describe('Explicit actions for a move that stopped (S31)', () => {
         const api = over(s);
         await api.start();
         failing = true;
-        expect((await api.saveSettings({ virtualDriveWanted: false })).json.switchError).toBe('EIO: i/o error');
+        expect((await api.driveSettings({ virtualDriveWanted: false })).json.switchError).toBe('EIO: i/o error');
         expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBe('plain');
         expect(() => started.engine.vfsChildren('')).toThrow('Proton Drive is busy moving files');
         return { s, before, api, ...started, recover: () => (failing = false) };
@@ -795,10 +799,9 @@ describe('Explicit actions for a move that stopped (S31)', () => {
             error: 'EIO: i/o error',
             move: { kind: 'layout', from: s.backingDir, to: s.syncDir, error: 'EIO: i/o error', actions: ['finish', 'move-back'] },
         });
-        const switched = await api.saveSettings({ virtualDriveWanted: true, notificationsEnabled: true });
+        const switched = await api.driveSettings({ virtualDriveWanted: true });
         expect(switched.status).toBe(200);
         expect(String(switched.json.switchError)).toMatch(/Finish moving files, or Move files back/);
-        expect(s.stateDb.getSettings().notificationsEnabled).toBe(true); // the rest is saved
         expect(s.stateDb.getMeta('virtualDriveWanted')).toBe('0');
         const mounted = await api.mountAgain();
         expect(mounted.status).toBe(400);
@@ -850,7 +853,7 @@ describe('Explicit actions for a move that stopped (S31)', () => {
             const api = over(s);
             await api.start();
             full = true;
-            expect(String((await api.saveSettings({ virtualDriveWanted: false })).json.switchError)).toMatch(/ENOSPC/);
+            expect(String((await api.driveSettings({ virtualDriveWanted: false })).json.switchError)).toMatch(/ENOSPC/);
             const copiesWhenStuck = copies;
             if (seenAs === 'another device') {
                 expect(controller.status().move?.actions).toEqual(['finish']);
@@ -887,7 +890,7 @@ describe('Explicit actions for a move that stopped (S31)', () => {
         });
         const api = over(s);
         await api.start();
-        expect((await api.saveSettings({ virtualDriveWanted: true })).json.switchError).toBe('EIO: i/o error');
+        expect((await api.driveSettings({ virtualDriveWanted: true })).json.switchError).toBe('EIO: i/o error');
         expect(readDriveLayout(s.stateDb)).toBe('plain');
         expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBeNull();
         expect(controller.status().move).toEqual({ kind: 'layout', from: s.syncDir, to: s.backingDir, error: 'EIO: i/o error', actions: ['retry'] });
@@ -929,7 +932,7 @@ describe('Explicit actions for a move that stopped (S31)', () => {
         const api = over(s);
         await api.start();
         const to = path.join(s.root, 'Elsewhere');
-        const moved = await api.saveSettings({ syncDir: to });
+        const moved = await api.driveSettings({ syncDir: to });
         expect(moved.status).toBe(200);
         expect(moved.json.folderError).toBe('EIO: i/o error');
         expect(s.stateDb.getMeta(SYNC_DIR_MOVING)).not.toBeNull();
@@ -985,16 +988,134 @@ describe('Explicit actions for a move that stopped (S31)', () => {
         expect(readdirSync(s.syncDir)).toEqual([]);
     });
 
-    test('a folder that is refused still lets the rest of the settings save', async () => {
+    test('a folder that is refused changes nothing', async () => {
         const s = setup({ wanted: false });
         s.fillTree(s.syncDir);
         await s.boot();
         const api = over(s);
+        await api.start();
         const busy = path.join(s.root, 'Documents');
         s.put(path.join(busy, 'mine.txt'), "the user's own");
-        const res = await api.saveSettings({ syncDir: busy, notificationsEnabled: true, ignorePatterns: ['*.bak'] });
+        chmodSync(busy, 0o755);
+        const res = await api.driveSettings({ syncDir: busy });
         expect(res.status).toBe(200);
         expect(res.json).toMatchObject({ ok: true, folderError: `Choose an empty folder, or a new one: ${busy} already holds files` });
-        expect(s.stateDb.getSettings()).toMatchObject({ notificationsEnabled: true, ignorePatterns: ['*.bak'], syncDir: s.syncDir });
+        expect(s.stateDb.getSettings().syncDir).toBe(s.syncDir);
+    });
+});
+
+describe('The drive folder and the virtual drive change only over the control socket (#31)', () => {
+    const over = (s: ReturnType<typeof setup>) => {
+        const socketPath = path.join(s.root, 'control.sock');
+        const deps = { stateDb: s.stateDb, drive: s.controller, engine: s.engine };
+        const tcp = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: (req) => settingsRoute(req, deps) });
+        cleanups.push(() => void tcp.stop(true));
+        const json = async (r: Response) => ({ status: r.status, json: (await r.json()) as Record<string, unknown> });
+        return {
+            start: async () => {
+                const server = await startControlServer({ socketPath, engine: s.engine, driveSettings: (change) => driveSettings(change, deps) });
+                cleanups.push(() => server.stop());
+            },
+            tcp: (body: unknown) => fetch(`http://127.0.0.1:${tcp.port}/api/settings`, { method: 'POST', body: JSON.stringify(body) }).then(json),
+            socket: (body: unknown, raw?: string) =>
+                fetch('http://localhost/drive/settings', { unix: socketPath, method: 'POST', body: raw ?? JSON.stringify(body) } as RequestInit).then(json),
+        };
+    };
+
+    test('TCP refuses a changed folder and a changed switch, saves the rest, and moves nothing', async () => {
+        const s = setup({ wanted: false });
+        s.fillTree(s.syncDir);
+        await s.boot();
+        const before = snapshot(s.syncDir);
+        const api = over(s);
+        const to = path.join(s.root, 'Elsewhere');
+        const res = await api.tcp({ syncDir: to, virtualDriveWanted: true, notificationsEnabled: true, ignorePatterns: ['*.bak'] });
+        expect(res.status).toBe(200);
+        expect(res.json).toMatchObject({ ok: true, code: 'EACCES', virtualDriveWanted: false });
+        expect(String(res.json.folderError)).toMatch(/Proton Drive app/);
+        expect(String(res.json.switchError)).toMatch(/Proton Drive app/);
+        expect(s.stateDb.getSettings()).toMatchObject({ syncDir: s.syncDir, notificationsEnabled: true, ignorePatterns: ['*.bak'] });
+        expect(s.stateDb.getMeta('virtualDriveWanted')).toBe('0');
+        expect(snapshot(s.syncDir)).toEqual(before);
+        expect(existsSync(to)).toBe(false);
+        expect(s.supervisors).toEqual([]);
+    });
+
+    test('TCP ignores an unchanged folder, however written, and an unchanged switch', async () => {
+        const s = setup({ wanted: false });
+        await s.boot();
+        const api = over(s);
+        const res = await api.tcp({ syncDir: `${s.syncDir}/`, virtualDriveWanted: false, conflictStrategy: 'keep-local' });
+        expect(res.json).toMatchObject({ ok: true, folderError: null, switchError: null });
+        expect(res.json.code).toBeUndefined();
+        expect(s.stateDb.getSettings()).toMatchObject({ syncDir: s.syncDir, conflictStrategy: 'keep-local' });
+    });
+
+    test('TCP still rejects a malformed switch', async () => {
+        const s = setup({ wanted: false });
+        await s.boot();
+        expect((await over(s).tcp({ virtualDriveWanted: 'yes' })).status).toBe(400);
+    });
+
+    test('the socket relocates the folder and switches the drive', async () => {
+        const s = setup({ wanted: false });
+        s.fillTree(s.syncDir);
+        await s.boot();
+        const before = snapshot(s.syncDir);
+        const api = over(s);
+        await api.start();
+        const to = path.join(s.root, 'Elsewhere');
+        const moved = await api.socket({ syncDir: to });
+        expect(moved).toMatchObject({ status: 200, json: { ok: true, folderError: null, switchError: null } });
+        expect(s.stateDb.getSettings().syncDir).toBe(to);
+        expect(snapshot(to)).toEqual(before);
+        expect(modeOf(to)).toBe(0o700); // made by the daemon for the user alone
+        expect(await api.socket({ syncDir: `${to}/` })).toMatchObject({ json: { folderError: null } }); // unchanged
+
+        expect((await api.socket({ virtualDriveWanted: true })).json).toMatchObject({ switchError: null, virtualDriveWanted: true });
+        expect(readDriveLayout(s.stateDb)).toBe('virtual');
+    });
+
+    test('the socket refuses a malformed request with 400 { error, code }', async () => {
+        const s = setup({ wanted: false });
+        await s.boot();
+        const api = over(s);
+        await api.start();
+        for (const body of [{ syncDir: 3 }, { virtualDriveWanted: 'yes' }, { notificationsEnabled: true }, [1]]) {
+            const res = await api.socket(body);
+            expect([body, res.status, res.json.code]).toEqual([body, 400, 'EINVAL']);
+        }
+        expect((await api.socket(null, 'not json')).status).toBe(400);
+    });
+
+    test('an existing folder others can write is refused, one made closed is taken, and S30 still holds', async () => {
+        const s = setup({ wanted: false });
+        s.fillTree(s.syncDir);
+        await s.boot();
+        const before = snapshot(s.syncDir);
+        const api = over(s);
+        await api.start();
+        const open = path.join(s.root, 'Open');
+        mkdirSync(open);
+        for (const mode of [0o777, 0o770, 0o707]) {
+            chmodSync(open, mode);
+            const res = await api.socket({ syncDir: open });
+            expect([mode, res.json.folderError]).toEqual([mode, `${open} can be changed by other users; choose a folder only you can write to, or run chmod go-w on it`]);
+        }
+        expect(snapshot(s.syncDir)).toEqual(before);
+        expect(s.stateDb.getSettings().syncDir).toBe(s.syncDir);
+
+        chmodSync(open, 0o755);
+        s.put(path.join(open, 'mine.txt'), "the user's own");
+        expect((await api.socket({ syncDir: open })).json.folderError).toBe(`Choose an empty folder, or a new one: ${open} already holds files`);
+        rmSync(path.join(open, 'mine.txt'));
+        expect((await api.socket({ syncDir: open })).json.folderError).toBeNull();
+        expect(s.stateDb.getSettings().syncDir).toBe(open);
+    });
+
+    test('a folder owned by another user is refused', () => {
+        const s = setup();
+        expect(unsafeFolderReason(s.root, (process.getuid?.() ?? 0) + 1)).toBe(`${s.root} belongs to another user; choose a folder that you own`);
+        expect(unsafeFolderReason(path.join(s.root, 'missing'), (process.getuid?.() ?? 0) + 1)).toBeNull();
     });
 });

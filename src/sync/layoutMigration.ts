@@ -173,7 +173,7 @@ export async function relocateFiles(opts: {
     if (stateDb.getMeta(SYNC_DIR_MOVING) === null && holdsFiles(to)) {
         throw new Error(emptyFolderNeeded(to));
     }
-    mkdirSync(to, { recursive: true });
+    mkdirSync(to, { recursive: true, mode: 0o700 }); // for the user alone, as unsafeFolderReason wants it
     refuseCaseClashes(from, to, opts.seams ?? {}, logger);
     stateDb.setMeta(SYNC_DIR_MOVING, JSON.stringify({ from, to }));
     const mover = new Mover({ stateDb, logger, now: opts.now ?? new Date(), allowCopy: true, seams: opts.seams ?? {}, from, to });
@@ -303,6 +303,20 @@ export function holdsFiles(dir: string): boolean {
         if (errnoOf(error) === 'ENOENT') return false;
         throw error;
     }
+}
+
+// An existing folder a sync folder moves to must be the user's own and closed to others, as the daemon may be asked
+// by a program other than the user's app: files moved into a folder another user can write are theirs to read or delete
+export function unsafeFolderReason(dir: string, uid: number | undefined = process.getuid?.()): string | null {
+    const stat = statSync(dir, { throwIfNoEntry: false });
+    if (!stat || uid === undefined) return null; // a missing folder is made by the daemon, for the user alone
+    if (stat.uid !== uid) {
+        return `${dir} belongs to another user; choose a folder that you own`;
+    }
+    if ((stat.mode & 0o022) !== 0) {
+        return `${dir} can be changed by other users; choose a folder only you can write to, or run chmod go-w on it`;
+    }
+    return null;
 }
 
 export function emptyFolderNeeded(dir: string): string {

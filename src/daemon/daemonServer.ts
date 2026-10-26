@@ -20,7 +20,7 @@ import { SyncStateDatabase } from '../sync/syncStateDb';
 import { defaultControlSocketPath, startControlServer } from './controlServer';
 import { DriveController } from './driveController';
 import { isTrustedLocalRequest } from './requestGuard';
-import { settingsRoute } from './settingsRoute';
+import { driveSettings, settingsRoute } from './settingsRoute';
 import { findHelper, fuseAvailable, mergeStrayInto, VfsSupervisor } from './vfsSupervisor';
 
 export const DEFAULT_DAEMON_PORT = Number(process.env.PROTON_DRIVE_DAEMON_PORT || 49152);
@@ -517,13 +517,14 @@ export async function startSyncDaemon(options: {
     await engine.start({ backgroundInitialReconcile: true }); // does nothing while a move that stopped holds it
     ensureSystemTrayIndicator();
 
-    // The only way to pin, free, hide or unhide: a user-only Unix socket, never the TCP API above
+    // The only way to pin, free, hide or unhide, and to change the drive folder or the virtual drive: a user-only Unix socket, never the TCP API above
     try {
         controlServer = await startControlServer({
             socketPath: defaultControlSocketPath(),
             engine,
             mountAgain: () => drive.mountAgain(),
             driveMove: (action, from, to) => drive.resolveMove(action, from, to),
+            driveSettings: (change) => driveSettings(change, { stateDb, drive, engine }),
         });
     } catch (err) {
         runtime.logger.error(`Control socket unavailable, availability actions are disabled: ${String(err)}`);
