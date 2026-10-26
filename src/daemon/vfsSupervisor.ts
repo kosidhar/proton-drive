@@ -8,6 +8,7 @@ import {
     openSync,
     readdirSync,
     renameSync,
+    rmSync,
     statSync,
     writeSync,
     type Stats,
@@ -19,7 +20,7 @@ import type { Logger } from '@protontech/drive-sdk';
 import type { DriveLayout } from '../sync/driveMode';
 import { makeUserFolder } from '../sync/layoutMigration';
 import { mergeInto } from '../sync/localMerge';
-import { canonicalPath, mountsAt, pathsOverlap, readMountInfo } from '../sync/mountPoint';
+import { canonicalPath, mountsAt, mountsUnder, pathsOverlap, readMountInfo } from '../sync/mountPoint';
 
 export { mountsAt } from '../sync/mountPoint';
 
@@ -70,6 +71,7 @@ export interface VfsTiming {
     stopWaitMs: number; // for the helper to exit at shutdown, and again after each signal
     mountPollMs: number; // first look for the new mount; it doubles up to 2 s
     mountTimeoutMs: number; // a helper whose mount hasn't shown by then is killed, and counted as a crash
+    nudgeWaitMs: number; // for the nudge's mount to show (see nudge)
 }
 
 export const DEFAULT_VFS_TIMING: VfsTiming = {
@@ -79,6 +81,7 @@ export const DEFAULT_VFS_TIMING: VfsTiming = {
     stopWaitMs: 2000,
     mountPollMs: 100,
     mountTimeoutMs: 30_000,
+    nudgeWaitMs: 5000,
 };
 
 // FSName and Subtype "protondrive": how our own mounts show in mountinfo
@@ -102,6 +105,9 @@ export interface VfsSupervisorOptions {
     readMountInfo?: () => string;
     stat?: (p: string) => Stats;
     timing?: Partial<VfsTiming>;
+    // Nudge the desktop's mount monitors each time the drive mounts (#49; see nudge). The daemon asks for it; tests
+    // that don't ask see only the drive's own helper and commands.
+    nudge?: boolean;
 }
 
 function errnoOf(err: unknown): string | undefined {
@@ -207,6 +213,16 @@ async function runCommand(cmd: string[], logger: Logger): Promise<number> {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+// What the promise answered within ms, or undefined; its timer never outlives it
+async function answerWithin<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([promise, new Promise<undefined>((resolve) => (timer = setTimeout(() => resolve(undefined), ms)))]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 // Whether the promise settled within ms; its timer never outlives it
 async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -236,6 +252,9 @@ export class VfsSupervisor {
     private stopping = false;
     // Starting, restarting, mounting again and stopping run one at a time, in order
     private queue: Promise<unknown> = Promise.resolve();
+    // The nudge running now (never two at once), and whether the drive mounted again meanwhile, which takes one more
+    private nudging: Promise<void> | null = null;
+    private nudgeAgain = false;
 
     constructor(private readonly opts: VfsSupervisorOptions) {
         this.timing = { ...DEFAULT_VFS_TIMING, ...opts.timing };
@@ -283,6 +302,8 @@ export class VfsSupervisor {
         await this.serially(() => this.shutdown()).catch((err: unknown) => {
             this.logger.error(`Could not stop the drive cleanly: ${messageOf(err)}`);
         });
+        // A nudge on its way is bounded, and ends with nothing mounted
+        await this.nudging;
     }
 
     // Unmounts the drive and leaves it unmounted, whether this session's helper or an earlier one mounted it: the files
@@ -482,6 +503,7 @@ export class VfsSupervisor {
             if (this.mounts().includes(OUR_FSTYPE)) {
                 this.state = { mounted: true, reason: null };
                 this.logger.info(`Mounted the drive at ${this.opts.mountpoint}`);
+                this.nudge();
                 return;
             }
             const left = giveUpAt - Date.now();
@@ -582,6 +604,111 @@ export class VfsSupervisor {
             chmodSync(this.opts.mountpoint, 0o555);
         } catch (err) {
             if (errnoOf(err) !== 'ENOENT') this.logger.warn(`Could not make ${this.opts.mountpoint} read-only: ${messageOf(err)}`);
+        }
+    }
+
+    // #49: GLib's mount monitor (GUnixMountMonitor) misses the attach of a FUSE mount made through fusermount3, though
+    // the kernel signals it, and sees only detaches; so Files (through gvfs's volume monitors) showed the drive in its
+    // sidebar only at the next mount change anywhere, minutes later. A detach makes every monitor look again, and find
+    // the drive. So once the drive shows mounted, the same helper mounts a tiny private drive at a hidden path in the
+    // control socket's own dir (GLib never shows a mount under a dot folder), with an empty store and no daemon to ask
+    // (the helper doesn't need one), and it is unmounted at once. Best effort: every step is bounded, it always ends
+    // unmounted with its folders removed, it never touches the drive or holds up its status, and a failure is logged
+    // once. Never two at once: a mount meanwhile takes one more after it.
+    private nudge(): void {
+        if (!this.opts.nudge) return;
+        if (this.nudging) {
+            this.nudgeAgain = true;
+            return;
+        }
+        const run = async () => {
+            try {
+                do {
+                    this.nudgeAgain = false;
+                    const problem = await this.nudgeOnce().catch((err: unknown) => messageOf(err));
+                    if (problem) this.logger.warn(`Could not nudge Files to show the drive in its sidebar (it may show there late): ${problem}`);
+                } while (this.nudgeAgain && !this.stopping);
+            } finally {
+                this.nudging = null; // in the same step as the last look at nudgeAgain, so no mount is missed
+            }
+        };
+        this.nudging = run();
+    }
+
+    // One nudge; answers what went wrong, or null
+    private async nudgeOnce(): Promise<string | null> {
+        const dir = path.join(canonicalPath(path.dirname(this.opts.socketPath)), '.nudge');
+        const at = path.join(dir, 'mnt');
+        const store = path.join(dir, 'store');
+        for (const ours of [this.opts.mountpoint, this.opts.appDir, this.opts.backingDir]) {
+            if (pathsOverlap(dir, ours)) return `${dir} overlaps ${ours}`;
+        }
+        const mountedIn = () => mountsUnder(this.readMountInfo(), dir);
+        // A nudge cut short (the daemon killed meanwhile) may have left its mount, which goes first; anything else
+        // mounted there is left alone, and stops the nudge
+        const left = mountedIn();
+        const foreign = left.find(([p, fstype]) => p !== at || fstype !== OUR_FSTYPE);
+        if (foreign) return `something else (${foreign[1]}) is mounted at ${foreign[0]}`;
+        if (left.length > 0) await this.unmountNudge(at, true);
+        if (mountedIn().length > 0) return `${at} is still mounted`;
+        const problems: string[] = [];
+        let proc: HelperProcess | null = null;
+        try {
+            // Made afresh, so it is a private folder of ours with an empty store (a link there is removed, not followed)
+            rmSync(dir, { recursive: true, force: true });
+            for (const folder of [dir, at, store]) {
+                mkdirSync(folder, { mode: 0o700 });
+                chmodSync(folder, 0o700);
+            }
+            proc = this.spawn([this.opts.helperPath, '--mountpoint', at, '--backing', store, '--socket', path.join(dir, 'no-daemon.sock')], {
+                stdin: 'ignore',
+                stdout: 'ignore',
+                stderr: 'ignore',
+            });
+            const helper = proc;
+            const alive = () => helper.exitCode === null && helper.signalCode === null;
+            const shown = () => mountsAt(this.readMountInfo(), at).includes(OUR_FSTYPE);
+            await this.waitUntil(() => shown() || !alive(), this.timing.nudgeWaitMs);
+            if (!shown()) {
+                problems.push(
+                    alive()
+                        ? `its mount didn't show within ${Math.round(this.timing.nudgeWaitMs / 1000)} s`
+                        : `protondrive-vfs stopped (${helper.signalCode ? `signal ${helper.signalCode}` : `exit code ${helper.exitCode}`})`,
+                );
+            } else if (!(await this.unmountNudge(at, false))) {
+                problems.push(`fusermount3 -u ${at} failed, so it was unmounted lazily`);
+                await this.unmountNudge(at, true);
+            }
+        } catch (err) {
+            problems.push(messageOf(err));
+        } finally {
+            // Always: its helper gone (its session ends with the unmount), nothing mounted, and its folders removed
+            if (proc) {
+                const helper = proc;
+                if (!(await settlesWithin(helper.exited, this.timing.stopWaitMs))) {
+                    if (problems.length === 0) problems.push("its helper didn't exit after the unmount, so it was killed");
+                    helper.kill('SIGKILL');
+                    await settlesWithin(helper.exited, this.timing.stopWaitMs);
+                }
+            }
+            if (mountsAt(this.readMountInfo(), at).length > 0) await this.unmountNudge(at, true);
+            if (mountedIn().length > 0) {
+                problems.push(`${at} could not be unmounted`);
+            } else {
+                rmSync(dir, { recursive: true, force: true });
+            }
+        }
+        return problems.length > 0 ? problems.join('; ') : null;
+    }
+
+    // fusermount3 -u on the nudge's mount point, never anything else; lazily with -z. Bounded. Answers whether it went.
+    private async unmountNudge(target: string, lazy: boolean): Promise<boolean> {
+        const cmd = lazy ? ['fusermount3', '-u', '-z', target] : ['fusermount3', '-u', target];
+        try {
+            const code = await answerWithin(this.run(cmd), this.timing.unmountWaitMs);
+            return code === 0 && (await this.waitUntil(() => !mountsAt(this.readMountInfo(), target).includes(OUR_FSTYPE), this.timing.unmountWaitMs));
+        } catch {
+            return false;
         }
     }
 

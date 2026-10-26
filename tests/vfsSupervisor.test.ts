@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import {
     chmodSync,
     existsSync,
+    lstatSync,
     mkdirSync,
     mkdtempSync,
     readdirSync,
@@ -32,6 +33,7 @@ import {
     type VfsTiming,
 } from '../src/daemon/vfsSupervisor';
 import { formatConflictFileName } from '../src/sync/conflictResolver';
+import { mountsUnder } from '../src/sync/mountPoint';
 
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => {
@@ -104,7 +106,15 @@ class FakeProc {
     }
 }
 
-const FAST: VfsTiming = { restartDelaysMs: [20, 40, 60], crashWindowMs: 60_000, unmountWaitMs: 300, stopWaitMs: 100, mountPollMs: 5, mountTimeoutMs: 10_000 };
+const FAST: VfsTiming = {
+    restartDelaysMs: [20, 40, 60],
+    crashWindowMs: 60_000,
+    unmountWaitMs: 300,
+    stopWaitMs: 100,
+    mountPollMs: 5,
+    mountTimeoutMs: 10_000,
+    nudgeWaitMs: 200,
+};
 
 interface SpawnCall {
     cmd: string[];
@@ -113,6 +123,32 @@ interface SpawnCall {
     mode: number;
     entries: string[];
     mountsAtSpawn: number;
+}
+
+// A spawn of the nudge's helper (#49), and what was there when it started
+interface NudgeSpawnCall {
+    cmd: string[];
+    stdout: unknown;
+    stderr: unknown;
+    dirMode: number; // of the nudge's own folder beside the control socket
+    dirIsLink: boolean;
+    mountpointMode: number;
+    mountpointEntries: string[];
+    storeEntries: string[];
+    socketExists: boolean;
+    driveMounts: number; // the drive's own mounts in mountinfo then
+    nudgesAlive: number; // nudge helpers still running then
+}
+
+// How the nudge's fake helper behaves: whether its mount shows, whether fusermount3 -u (without -z) on it fails,
+// whether it exits once unmounted, which signals end it, whether it can't be started, and a gate its unmount waits on
+interface FakeNudge {
+    mounts?: boolean;
+    plainUnmountFails?: boolean;
+    exitsOnUnmount?: boolean;
+    diesOn?: 'any-kill' | 'sigkill' | 'never';
+    spawnThrows?: boolean;
+    unmountGate?: Promise<void>;
 }
 
 // A supervisor over temp dirs with a fake helper: spawning it "mounts" (a fuse.protondrive line in a fake mountinfo),
@@ -132,6 +168,7 @@ function harness(opts: {
     linkedMountpoint?: boolean; // the sync folder is a symlink to the folder mounted on
     paths?: (root: string) => { mountpoint?: string; backing?: string; appDir?: string };
     runGate?: Promise<void>; // fusermount3 doesn't return until this settles
+    nudge?: FakeNudge; // the supervisor nudges (#49), with this fake helper for it
 } = {}) {
     const root = tempRoot();
     const custom = opts.paths?.(root) ?? {};
@@ -158,6 +195,15 @@ function harness(opts: {
     const logs: string[] = [];
     const ours = (line: string) => line.includes(' - fuse.protondrive ');
     const at = (line: string) => line.split(' ')[4] === target.replace(/ /g, '\\040');
+    // The nudge (#49): a hidden folder beside the control socket, holding the nudge's mount point and empty store
+    const nudgeDir = path.join(root, '.nudge');
+    const nudgeMnt = path.join(nudgeDir, 'mnt');
+    const nudgeStore = path.join(nudgeDir, 'store');
+    const nudgeProcs: FakeProc[] = [];
+    const nudgeSpawns: NudgeSpawnCall[] = [];
+    const atNudge = (line: string) => line.split(' ')[4] === nudgeMnt.replace(/ /g, '\\040');
+    const modeIfThere = (p: string) => (existsSync(p) ? modeOf(p) : -1);
+    const entriesIfThere = (p: string) => (existsSync(p) ? readdirSync(p) : []);
     const removeOneOurs = () => {
         for (let i = mounts.length - 1; i >= 0; i--) {
             if (at(mounts[i]!) && ours(mounts[i]!)) {
@@ -185,6 +231,7 @@ function harness(opts: {
             mergeStrayInto(fullPath, mountpoint, backing);
         },
         spawn: ((cmd: string[], o: { stdout: unknown; stderr: unknown }) => {
+            if (cmd[4] === nudgeStore) return spawnNudge(cmd, o); // the nudge's helper, by its store
             const entries = existsSync(mountpoint) ? readdirSync(mountpoint) : [];
             spawns.push({
                 cmd,
@@ -209,6 +256,7 @@ function harness(opts: {
         async run(cmd: string[]) {
             runs.push(cmd);
             await opts.runGate;
+            if (cmd[0] === 'fusermount3' && cmd[cmd.length - 1] === nudgeMnt && nudgeMnt !== target) return unmountNudge(cmd);
             // fusermount3 resolves the parent but not the last component: a symlink's path isn't in mtab
             if (cmd[0] !== 'fusermount3' || cmd[cmd.length - 1] !== target) return 1;
             removeOneOurs();
@@ -221,6 +269,7 @@ function harness(opts: {
         readMountInfo: () => mounts.join('\n') + '\n',
         stat: opts.stat ? (p: string) => opts.stat!(p, runs) : undefined,
         timing: { ...FAST, ...opts.timing },
+        nudge: opts.nudge !== undefined,
     });
     cleanups.push(() => supervisor.stop());
     // The user ejects the drive in Files: the kernel ends the session, the helper exits 0
@@ -230,7 +279,70 @@ function harness(opts: {
     };
     // The helper dies (exit code, or a signal), leaving its mount behind dead
     const crash = (code: number | null = 1, signal: string | null = null) => procs[procs.length - 1]!.finish(code, signal);
-    return { root, appDir, mountpoint, target, backing, logPath, mounts, runs, procs, spawns, merged, logs, supervisor, eject, crash };
+    // The nudge's helper mounts a moment after it starts, as the drive's does, and its session ends with its unmount
+    function spawnNudge(cmd: string[], o: { stdout: unknown; stderr: unknown }) {
+        const fake = opts.nudge ?? {};
+        nudgeSpawns.push({
+            cmd,
+            stdout: o.stdout,
+            stderr: o.stderr,
+            dirMode: modeIfThere(nudgeDir),
+            dirIsLink: lstatSync(nudgeDir, { throwIfNoEntry: false })?.isSymbolicLink() ?? false,
+            mountpointMode: modeIfThere(nudgeMnt),
+            mountpointEntries: entriesIfThere(nudgeMnt),
+            storeEntries: entriesIfThere(nudgeStore),
+            socketExists: existsSync(cmd[6]!),
+            driveMounts: mounts.filter(at).length,
+            nudgesAlive: nudgeProcs.filter((p) => p.alive).length,
+        });
+        if (fake.spawnThrows) throw Object.assign(new Error('ENOENT: no such file or directory, posix_spawn'), { code: 'ENOENT' });
+        const proc = new FakeProc(5000 + nudgeProcs.length, fake.diesOn ?? 'any-kill');
+        nudgeProcs.push(proc);
+        if (fake.mounts !== false) {
+            setTimeout(() => {
+                if (proc.alive) mounts.push(mountLine(nextId++, nudgeMnt, 'fuse.protondrive', 'protondrive'));
+            }, 10);
+        }
+        return proc;
+    }
+    async function unmountNudge(cmd: string[]): Promise<number> {
+        const fake = opts.nudge ?? {};
+        await fake.unmountGate;
+        if (fake.plainUnmountFails && !cmd.includes('-z')) return 1; // busy
+        const i = mounts.findIndex((line) => atNudge(line) && ours(line));
+        if (i < 0) return 1; // not mounted
+        mounts.splice(i, 1);
+        if (fake.exitsOnUnmount !== false) {
+            for (const proc of nudgeProcs) proc.finish(0);
+        }
+        return 0;
+    }
+    const nudgeRuns = () => runs.filter((cmd) => cmd[cmd.length - 1] === nudgeMnt);
+    const nudgeMounts = () => mounts.filter(atNudge);
+    return {
+        root,
+        appDir,
+        mountpoint,
+        target,
+        backing,
+        logPath,
+        mounts,
+        runs,
+        procs,
+        spawns,
+        merged,
+        logs,
+        supervisor,
+        eject,
+        crash,
+        nudgeDir,
+        nudgeMnt,
+        nudgeStore,
+        nudgeProcs,
+        nudgeSpawns,
+        nudgeRuns,
+        nudgeMounts,
+    };
 }
 
 const fusermount = (mountpoint: string) => ['fusermount3', '-u', '-z', mountpoint];
@@ -804,6 +916,238 @@ describe('VfsSupervisor: helper output', () => {
     });
 });
 
+// #49: GLib's mount monitor misses the attach of a FUSE mount made through fusermount3 (it sees the detach), so Files
+// showed the drive in its sidebar only minutes later, at the next mount change anywhere. Once the drive shows mounted,
+// the supervisor makes such a change: it mounts a tiny private helper at a hidden path beside the control socket and
+// unmounts it at once. Best effort: bounded, always cleaned up, never touching the drive, never holding up its status.
+describe('VfsSupervisor: the nudge that shows the drive in Files (#49)', () => {
+    type H = ReturnType<typeof harness>;
+    const nudgeCmd = (h: H) => [
+        '/fake/bin/protondrive-vfs',
+        '--mountpoint',
+        h.nudgeMnt,
+        '--backing',
+        h.nudgeStore,
+        '--socket',
+        path.join(h.nudgeDir, 'no-daemon.sock'),
+    ];
+    const unmountNudge = (h: H) => ['fusermount3', '-u', h.nudgeMnt];
+    const lazyUnmountNudge = (h: H) => ['fusermount3', '-u', '-z', h.nudgeMnt];
+    // n nudges have run, and the last has cleaned up: its helper gone, its folder removed
+    const nudged = (h: H, n = 1) =>
+        until(() => h.nudgeSpawns.length === n && h.nudgeProcs.every((p) => !p.alive) && !existsSync(h.nudgeDir));
+    const nudgeWarnings = (h: H) => h.logs.filter((l) => l.startsWith('warn') && l.includes('nudge'));
+    const problems = (h: H) => h.logs.filter((l) => l.startsWith('warn') || l.startsWith('error'));
+    const driveMounted = (h: H) => mountsAt(h.mounts.join('\n'), h.target).length;
+
+    test('once the drive shows mounted, a hidden private mount beside the control socket is mounted and unmounted', async () => {
+        const h = harness({ nudge: {} });
+        await h.supervisor.start();
+        await until(() => h.supervisor.status().mounted);
+        await nudged(h);
+
+        expect(h.nudgeSpawns).toHaveLength(1);
+        const nudge = h.nudgeSpawns[0]!;
+        // The same helper, on a hidden folder in the control socket's own private dir, with an empty store and no daemon
+        expect(nudge.cmd).toEqual(nudgeCmd(h));
+        expect(h.nudgeDir).toBe(path.join(path.dirname(path.join(h.root, 'control.sock')), '.nudge'));
+        expect(nudge.dirMode).toBe(0o700);
+        expect(nudge.mountpointMode).toBe(0o700);
+        expect(nudge.mountpointEntries).toEqual([]);
+        expect(nudge.storeEntries).toEqual([]);
+        expect(nudge.socketExists).toBe(false);
+        expect(typeof nudge.stdout === 'string' && nudge.stdout === 'pipe').toBe(false); // never a pipe nobody drains
+        // After the drive's mount showed, and only then
+        expect(nudge.driveMounts).toBe(1);
+        // Mounted, then unmounted, and its helper's session ended by that
+        expect(h.runs).toEqual([unmountNudge(h)]);
+        expect(h.nudgeProcs[0]!.kills).toEqual([]);
+        expect(h.nudgeMounts()).toEqual([]);
+        // The drive is untouched
+        expect(h.runs.flat()).not.toContain(h.mountpoint);
+        expect(driveMounted(h)).toBe(1);
+        expect(h.procs[0]!.alive).toBe(true);
+        expect(h.spawns).toHaveLength(1);
+        expect(h.supervisor.status()).toEqual({ mode: 'virtual', mounted: true, reason: null });
+        expect(problems(h)).toEqual([]);
+    });
+
+    test('without the option there is no nudge', async () => {
+        const h = harness();
+        await h.supervisor.start();
+        await until(() => h.supervisor.status().mounted);
+        await Bun.sleep(100);
+        expect(h.nudgeSpawns).toEqual([]);
+        expect(h.runs).toEqual([]);
+        expect(existsSync(h.nudgeDir)).toBe(false);
+    });
+
+    test('every mount is nudged: at start, after Mount again and after a crash', async () => {
+        const h = harness({ nudge: {} });
+        await h.supervisor.start();
+        await until(() => h.supervisor.status().mounted);
+        await nudged(h, 1);
+
+        h.eject();
+        await until(() => h.supervisor.status().reason === 'ejected');
+        await Bun.sleep(50);
+        expect(h.nudgeSpawns).toHaveLength(1); // an eject mounts nothing
+        await h.supervisor.mountAgain();
+        await until(() => h.supervisor.status().mounted);
+        await nudged(h, 2);
+
+        h.crash(null, 'SIGKILL');
+        await until(() => h.spawns.length === 3 && h.supervisor.status().mounted);
+        await nudged(h, 3);
+
+        expect(h.nudgeSpawns.map((s) => s.driveMounts)).toEqual([1, 1, 1]);
+        expect(h.nudgeRuns()).toEqual([unmountNudge(h), unmountNudge(h), unmountNudge(h)]);
+        // The drive's own unmount after the crash was its own, never the nudge's
+        expect(h.runs.filter((cmd) => cmd[cmd.length - 1] === h.target)).toEqual([fusermount(h.target)]);
+        expect(problems(h).filter((l) => l.includes('nudge'))).toEqual([]);
+    });
+
+    test("the drive's status never waits for the nudge: mounted at once, and an eject meanwhile is seen at once", async () => {
+        let release!: () => void;
+        const h = harness({ nudge: { unmountGate: new Promise<void>((resolve) => (release = resolve)) } });
+        await h.supervisor.start();
+        await until(() => h.nudgeRuns().length === 1); // the nudge is mounted, and its unmount hangs
+        expect(h.supervisor.status()).toEqual({ mode: 'virtual', mounted: true, reason: null });
+
+        h.eject();
+        await until(() => h.supervisor.status().reason === 'ejected');
+        expect(h.nudgeProcs[0]!.alive).toBe(true);
+        release();
+        await nudged(h);
+        expect(h.supervisor.status().reason).toBe('ejected');
+    });
+
+    test('never two nudges at once: a mount during a nudge is nudged once that one has finished', async () => {
+        let release!: () => void;
+        const h = harness({ nudge: { unmountGate: new Promise<void>((resolve) => (release = resolve)) } });
+        await h.supervisor.start();
+        await until(() => h.nudgeRuns().length === 1);
+
+        // The drive crashes and mounts again while the first nudge still runs
+        h.crash(1);
+        await until(() => h.spawns.length === 2 && h.supervisor.status().mounted);
+        await Bun.sleep(50);
+        expect(h.nudgeSpawns).toHaveLength(1);
+
+        release();
+        await nudged(h, 2);
+        expect(h.nudgeSpawns.map((s) => s.nudgesAlive)).toEqual([0, 0]);
+        await Bun.sleep(50);
+        expect(h.nudgeSpawns).toHaveLength(2); // one more, not one per mount seen meanwhile
+    });
+
+    test('a nudge that fails is logged once and ignored, and always cleans up', async () => {
+        const cases: Array<{ what: string; nudge: FakeNudge; runs: (h: H) => string[][]; killed: string[] }> = [
+            { what: 'its helper cannot start', nudge: { spawnThrows: true }, runs: () => [], killed: [] },
+            // Stuck before its mount: killed at the bound
+            { what: 'its mount never shows', nudge: { mounts: false }, runs: () => [], killed: ['SIGKILL'] },
+            // Busy (something looks into it): unmounted lazily instead
+            {
+                what: 'fusermount3 -u fails',
+                nudge: { plainUnmountFails: true },
+                runs: (h) => [unmountNudge(h), lazyUnmountNudge(h)],
+                killed: [],
+            },
+            // Its session lingers after the unmount: killed
+            {
+                what: 'its helper does not exit',
+                nudge: { exitsOnUnmount: false, diesOn: 'sigkill' },
+                runs: (h) => [unmountNudge(h)],
+                killed: ['SIGKILL'],
+            },
+        ];
+        for (const c of cases) {
+            const h = harness({ nudge: c.nudge, timing: { nudgeWaitMs: 100 } });
+            await h.supervisor.start();
+            await until(() => nudgeWarnings(h).length > 0, 3000);
+            await nudged(h);
+            expect({ what: c.what, runs: h.runs }).toEqual({ what: c.what, runs: c.runs(h) });
+            expect({ what: c.what, killed: h.nudgeProcs.flatMap((p) => p.kills) }).toEqual({ what: c.what, killed: c.killed });
+            expect(h.nudgeMounts()).toEqual([]);
+            expect(existsSync(h.nudgeDir)).toBe(false);
+            await Bun.sleep(50);
+            expect({ what: c.what, warnings: nudgeWarnings(h).length }).toEqual({ what: c.what, warnings: 1 });
+            expect(problems(h)).toEqual(nudgeWarnings(h));
+            // The drive is untouched, and shows mounted
+            expect(h.runs.flat()).not.toContain(h.mountpoint);
+            expect(driveMounted(h)).toBe(1);
+            expect(h.procs[0]!.kills).toEqual([]);
+            expect(h.supervisor.status()).toEqual({ mode: 'virtual', mounted: true, reason: null });
+        }
+    });
+
+    test('a nudge mount left by an earlier session is unmounted lazily first; one that is not ours stops the nudge', async () => {
+        const left = harness({ nudge: {} });
+        mkdirSync(left.nudgeMnt, { recursive: true });
+        writeFileSync(path.join(left.nudgeDir, 'leftover'), 'x');
+        left.mounts.push(mountLine(7, left.nudgeMnt, 'fuse.protondrive', 'protondrive'));
+        await left.supervisor.start();
+        await nudged(left);
+        expect(left.runs).toEqual([lazyUnmountNudge(left), unmountNudge(left)]);
+        expect(left.nudgeSpawns[0]!.mountpointEntries).toEqual([]);
+        expect(left.nudgeMounts()).toEqual([]);
+
+        const foreign = harness({ nudge: {} });
+        mkdirSync(foreign.nudgeMnt, { recursive: true });
+        foreign.mounts.push(mountLine(7, foreign.nudgeMnt, 'fuse.sshfs', 'me@host:'));
+        await foreign.supervisor.start();
+        await until(() => nudgeWarnings(foreign).length === 1);
+        await Bun.sleep(50);
+        expect(foreign.nudgeSpawns).toEqual([]);
+        expect(foreign.runs).toEqual([]);
+        expect(foreign.nudgeMounts()).toHaveLength(1);
+        expect(existsSync(foreign.nudgeMnt)).toBe(true); // never removed from under a mount
+        expect(foreign.supervisor.status().mounted).toBe(true);
+    });
+
+    test("a link where the nudge's folder goes is removed, never followed", async () => {
+        const h = harness({ nudge: {} });
+        const elsewhere = path.join(h.root, 'elsewhere');
+        mkdirSync(path.join(elsewhere, 'mnt'), { recursive: true });
+        writeFileSync(path.join(elsewhere, 'keep.txt'), 'keep');
+        symlinkSync(elsewhere, h.nudgeDir);
+        await h.supervisor.start();
+        await nudged(h);
+        expect(h.nudgeSpawns[0]!.dirIsLink).toBe(false);
+        expect(h.nudgeSpawns[0]!.dirMode).toBe(0o700);
+        expect(readdirSync(elsewhere).sort()).toEqual(['keep.txt', 'mnt']);
+        expect(problems(h)).toEqual([]);
+    });
+
+    test('a drive folder overlapping where the nudge would mount is never nudged', async () => {
+        const h = harness({ nudge: {}, paths: (root) => ({ mountpoint: path.join(root, '.nudge', 'mnt') }) });
+        await h.supervisor.start();
+        await until(() => h.supervisor.status().mounted);
+        await until(() => nudgeWarnings(h).length === 1);
+        await Bun.sleep(50);
+        expect(h.nudgeSpawns).toEqual([]);
+        expect(h.runs).toEqual([]);
+        expect(driveMounted(h)).toBe(1);
+    });
+
+    test('stop waits for a nudge on its way, so nothing is left mounted', async () => {
+        let release!: () => void;
+        const h = harness({ nudge: { unmountGate: new Promise<void>((resolve) => (release = resolve)) } });
+        await h.supervisor.start();
+        await until(() => h.nudgeRuns().length === 1);
+        setTimeout(release, 50);
+        await h.supervisor.stop();
+        expect(h.nudgeMounts()).toEqual([]);
+        expect(h.nudgeProcs.every((p) => !p.alive)).toBe(true);
+        expect(existsSync(h.nudgeDir)).toBe(false);
+        expect(driveMounted(h)).toBe(0);
+    });
+
+    test('the nudge waits 5 s for its mount by default', () => {
+        expect(DEFAULT_VFS_TIMING.nudgeWaitMs).toBe(5000);
+    });
+});
+
 describe('mergeStrayInto', () => {
     const when = new Date(2026, 9, 26, 14, 5, 9);
 
@@ -933,6 +1277,25 @@ describe('mountsAt', () => {
         expect(mountsAt(raw, mp)).toEqual(['fuse.protondrive']);
         expect(mountsAt(raw, '/home/me/Proton Drive')).toEqual([]);
     });
+
+    test('mountsUnder lists what is mounted at a folder or anywhere under it, never beside it', () => {
+        const info = [
+            mountLine(1, '/', 'ext4', '/dev/sda1'),
+            mountLine(2, '/run/u/pd/.nudge/mnt', 'fuse.protondrive', 'protondrive'),
+            mountLine(3, '/run/u/pd/.nudge', 'tmpfs'),
+            mountLine(4, '/run/u/pd/.nudge2', 'tmpfs'),
+            mountLine(5, '/run/u/pd/.nudge/a b/é', 'fuse.sshfs'),
+            '',
+        ].join('\n');
+        const raw = Buffer.from(info, 'utf8').toString('latin1');
+        expect(mountsUnder(raw, '/run/u/pd/.nudge')).toEqual([
+            ['/run/u/pd/.nudge/mnt', 'fuse.protondrive'],
+            ['/run/u/pd/.nudge', 'tmpfs'],
+            ['/run/u/pd/.nudge/a b/é', 'fuse.sshfs'],
+        ]);
+        expect(mountsUnder(raw, '/run/u/pd/.nudge/mnt')).toEqual([['/run/u/pd/.nudge/mnt', 'fuse.protondrive']]);
+        expect(mountsUnder(raw, '/run/u/other')).toEqual([]);
+    });
 });
 
 describe('fuseAvailable and findHelper', () => {
@@ -1025,7 +1388,7 @@ async function within<T>(promise: Promise<T>, ms: number, what: string): Promise
     }
 }
 
-function realMount(linked: boolean) {
+function realMount(linked: boolean, opts: { nudge?: boolean } = {}) {
     if (!existsSync(REAL_HELPER)) throw new Error(`Build the helper first (cargo build --release): ${REAL_HELPER}`);
     const root = tempRoot();
     const appDir = path.join(root, 'app');
@@ -1047,6 +1410,7 @@ function realMount(linked: boolean) {
     });
     const isMounted = () => mountsAt(readFileSync('/proc/self/mountinfo', 'latin1'), target).length > 0;
     const spawned: Subprocess[] = [];
+    const commands: string[][] = [];
     const orphans: Subprocess[] = [];
     const logs: string[] = [];
     const log = (level: string) => (m: string) => logs.push(`${level} ${m}`);
@@ -1062,11 +1426,13 @@ function realMount(linked: boolean) {
             mergeStrayInto(fullPath, mountpoint, backing);
         },
         spawn: ((cmd: string[], o: object) => {
+            commands.push(cmd);
             const proc = Bun.spawn(cmd, o);
             spawned.push(proc);
             return proc;
         }) as unknown as typeof Bun.spawn,
         timing: { restartDelaysMs: [200, 200, 200], stopWaitMs: 2000, mountPollMs: 20 },
+        nudge: opts.nudge,
     });
     // Never throws: stops, kills what is left, unmounts the temp mount point; answers what it couldn't clean up
     const cleanup = async (): Promise<string[]> => {
@@ -1076,16 +1442,24 @@ function realMount(linked: boolean) {
             if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL');
         }
         for (let i = 0; i < 5 && isMounted(); i++) Bun.spawnSync(['fusermount3', '-u', '-z', target]);
+        // A nudge's mount too, beside the temp socket: only ever our own, and only under the temp root
+        for (const [at, fstype] of mountsUnder(readFileSync('/proc/self/mountinfo', 'latin1'), root)) {
+            if (fstype === 'fuse.protondrive') Bun.spawnSync(['fusermount3', '-u', '-z', at]);
+        }
         void daemon.stop(true);
         if (readFileSync('/proc/self/mounts', 'utf8').includes(root)) problems.push(`still mounted under ${root}`);
         return problems;
     };
-    return { root, mountpoint, target, backing, socketPath, supervisor, spawned, orphans, isMounted, logs, cleanup };
+    return { root, mountpoint, target, backing, socketPath, supervisor, spawned, commands, orphans, isMounted, logs, cleanup };
 }
 
 // Runs the body, then always the cleanup; a failure is reported as it was, after the cleanup has run
-async function withRealMount(linked: boolean, body: (m: ReturnType<typeof realMount>) => Promise<void>): Promise<void> {
-    const m = realMount(linked);
+async function withRealMount(
+    linked: boolean,
+    body: (m: ReturnType<typeof realMount>) => Promise<void>,
+    opts: { nudge?: boolean } = {},
+): Promise<void> {
+    const m = realMount(linked, opts);
     let failure: unknown = null;
     try {
         await body(m);
@@ -1165,6 +1539,101 @@ describe.skipIf(!MOUNT_TESTS)('VfsSupervisor with the real helper', () => {
                 expect(statSync(mountpoint).isDirectory()).toBe(true);
                 expect(modeOf(target)).toBe(0o555);
             }),
+        60_000,
+    );
+
+    // #49: the nudge, for real: the same helper mounts beside the control socket (here in the temp root) and is
+    // unmounted at once, its session ending with that; mountinfo, read straight from the kernel, then shows the drive
+    // alone, and nothing at all once it stops
+    test(
+        'a real nudge leaves nothing mounted but the drive, and stop leaves nothing at all',
+        () =>
+            withRealMount(
+                false,
+                async ({ root, mountpoint, socketPath, supervisor, spawned, commands, isMounted }) => {
+                    const nudgeDir = path.join(path.dirname(socketPath), '.nudge');
+                    const mounted = () => mountsUnder(readFileSync('/proc/self/mountinfo', 'latin1'), root);
+                    await within(supervisor.start(), 15_000, 'start');
+                    await until(() => supervisor.status().mounted, 10_000);
+                    await until(() => spawned.length === 2 && spawned[1]!.exitCode !== null && !existsSync(nudgeDir), 15_000);
+                    expect(spawned[1]!.exitCode).toBe(0); // unmounted, not killed
+                    expect(commands[1]).toEqual([
+                        REAL_HELPER,
+                        '--mountpoint',
+                        path.join(nudgeDir, 'mnt'),
+                        '--backing',
+                        path.join(nudgeDir, 'store'),
+                        '--socket',
+                        path.join(nudgeDir, 'no-daemon.sock'),
+                    ]);
+                    expect(mounted()).toEqual([[mountpoint, 'fuse.protondrive']]);
+                    expect(isMounted()).toBe(true);
+                    expect(await within(readdir(mountpoint), 5000, 'readdir')).toContain('local.txt');
+
+                    await within(supervisor.stop(), 15_000, 'stop');
+                    expect(mounted()).toEqual([]);
+                },
+                { nudge: true },
+            ),
+        60_000,
+    );
+
+    // #49, as Files sees it: GLib's mount monitor in another process (python3 with gi, when present) is told of a mount
+    // change once the drive mounts, and the drive is in GLib's list of mounts then
+    const GLIB_WATCH = `
+import sys, warnings
+warnings.simplefilter('ignore')
+import gi
+gi.require_version('Gio', '2.0')
+from gi.repository import Gio, GLib
+want, seconds = sys.argv[1], int(sys.argv[2])
+loop = GLib.MainLoop()
+def listed():
+    mounts = Gio.unix_mounts_get()[0]
+    return any(m.get_mount_path() == want for m in mounts)
+def changed(*_):
+    if listed():
+        print('listed', flush=True)
+        loop.quit()
+monitor = Gio.UnixMountMonitor.get()
+monitor.connect('mounts-changed', changed)
+def give_up():
+    print('not listed', flush=True)
+    loop.quit()
+GLib.timeout_add_seconds(seconds, give_up)
+GLib.idle_add(lambda: print('ready', flush=True) and False)
+loop.run()
+`;
+    const hasGi = Bun.spawnSync(['python3', '-I', '-c', 'import gi; gi.require_version("Gio", "2.0")']).exitCode === 0;
+    test.skipIf(!hasGi)(
+        "GLib's mount monitor hears of the drive's mount, with the drive in its list then",
+        () =>
+            withRealMount(
+                false,
+                async ({ mountpoint, supervisor }) => {
+                    const watch = Bun.spawn(['python3', '-I', '-c', GLIB_WATCH, mountpoint, '15'], { stdout: 'pipe', stderr: 'ignore' });
+                    try {
+                        const reader = watch.stdout.getReader();
+                        let said = '';
+                        const nextLine = async () => {
+                            while (!said.includes('\n')) {
+                                const { value, done } = await within(reader.read(), 20_000, 'GLib watcher');
+                                if (done) break;
+                                said += new TextDecoder().decode(value);
+                            }
+                            const [line, ...rest] = said.split('\n');
+                            said = rest.join('\n');
+                            return line;
+                        };
+                        expect(await nextLine()).toBe('ready');
+                        await within(supervisor.start(), 15_000, 'start');
+                        expect(await nextLine()).toBe('listed');
+                    } finally {
+                        watch.kill('SIGKILL');
+                    }
+                },
+                { nudge: true },
+            ),
         60_000,
     );
 });

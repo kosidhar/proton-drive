@@ -109,6 +109,7 @@ export async function startSyncDaemon(options: {
                 helperPath: helperPath ?? 'protondrive-vfs', // spawned only when FUSE and the helper were found
                 logPath: path.join(appDir, 'vfs.log'),
                 logger: runtime.logger,
+                nudge: true, // so Files shows the drive in its sidebar as soon as it mounts (#49)
                 // A file saved into the bare folder while the drive was down: the engine uploads it as a new local file
                 mergeStray: async (fullPath) => {
                     for (const renamed of mergeStrayInto(fullPath, mountpoint, backingDir)) {

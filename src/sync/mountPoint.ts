@@ -38,13 +38,28 @@ export function pathsOverlap(a: string, b: string): boolean {
 // in octal (\040); the text is read as latin1 so each char is one byte and the comparison is byte for byte.
 export function mountsAt(mountinfo: string, mountpoint: string): string[] {
     const wanted = Buffer.from(mountpoint, 'utf8').toString('latin1');
-    const found: string[] = [];
+    return mountLines(mountinfo)
+        .filter(([at]) => at === wanted)
+        .map(([, fstype]) => fstype);
+}
+
+// The mounts at a folder or anywhere under it, as [mount point, file system type], in mount order (see mountsAt)
+export function mountsUnder(mountinfo: string, dir: string): Array<[string, string]> {
+    const wanted = Buffer.from(dir, 'utf8').toString('latin1');
+    return mountLines(mountinfo)
+        .filter(([at]) => at === wanted || at.startsWith(`${wanted}/`))
+        .map(([at, fstype]) => [Buffer.from(at, 'latin1').toString('utf8'), fstype]);
+}
+
+// Each mount's point (decoded, still latin1) and file system type
+function mountLines(mountinfo: string): Array<[string, string]> {
+    const found: Array<[string, string]> = [];
     for (const line of mountinfo.split('\n')) {
         const fields = line.split(' ');
         const separator = fields.indexOf('-', 6);
         if (separator < 0 || fields[4] === undefined) continue;
         const at = fields[4].replace(/\\([0-7]{3})/g, (_, octal: string) => String.fromCharCode(parseInt(octal, 8)));
-        if (at === wanted) found.push(fields[separator + 1] ?? '');
+        found.push([at, fields[separator + 1] ?? '']);
     }
     return found;
 }
