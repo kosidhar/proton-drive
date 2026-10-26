@@ -2798,6 +2798,98 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             }
         }
 
+        // I1, the rest: a folder above the file moved or renamed on the web during the hold leaves the file elsewhere too
+        const aboveChanged: Record<string, (d: ReturnType<typeof setup>) => void> = {
+            'Photos/2024 moved out of Photos': (d) => {
+                const folder = d.nodes.get('vol~Photos/2024')!;
+                d.nodes.set(folder.uid, { ...folder, parentUid: d.add('Elsewhere').uid });
+            },
+            'Photos renamed': (d) => {
+                const folder = d.nodes.get('vol~Photos')!;
+                d.nodes.set(folder.uid, { ...folder, name: { ok: true as const, value: 'Pictures' } });
+            },
+            'Photos/2024 renamed': (d) => {
+                const folder = d.nodes.get('vol~Photos/2024')!;
+                d.nodes.set(folder.uid, { ...folder, name: { ok: true as const, value: '2024-old' } });
+            },
+        };
+        for (const layout of ['plain', 'virtual'] as const) {
+            for (const [what, change] of Object.entries(aboveChanged)) {
+                test(`${layout}: with ${what} on the web during the hold, a file opened on demand under it is never trashed`, async () => {
+                    const d = setup(layout);
+                    await openedOnly(d);
+                    change(d);
+
+                    await confirmShown(d);
+                    await settled(d);
+
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.nodes.has('vol~Photos/2024/p.jpg')).toBe(true);
+                    expect(d.warnings).toContain('Not trashing Photos/2024/p.jpg: it moved in Proton Drive meanwhile, so it stays there');
+                    expect(stateDb.getAllItems()).toEqual([]);
+                    expect(d.engine.getStatus()).toMatchObject({ state: 'idle', lastError: null, filesMissing: null });
+                    await d.engine.reconcileNow();
+                    expect(d.engine.getStatus()).toMatchObject({ state: 'idle', lastError: null, filesMissing: null });
+                    expect(stateDb.getMeta(FILES_HOLD)).toBeNull();
+                    expect(d.calls.trashed).toEqual([]);
+                });
+            }
+        }
+
+        test('virtual: files opened on demand under the same folders are each trashed, the folders looked up once', async () => {
+            const d = setup('virtual');
+            d.add('Photos/2024/p.jpg', 'p');
+            d.add('Photos/2024/q.jpg', 'q');
+            d.add('Photos/2024/r.jpg', 'r');
+            await d.engine.reconcileNow();
+            await d.engine.hydrate('Photos/2024/p.jpg');
+            await d.engine.hydrate('Photos/2024/q.jpg');
+            await rm(d.localRoot, { recursive: true, force: true });
+            await mkdir(d.localRoot);
+            await d.engine.reconcileNow();
+            const looked = spyOn(d.sdk, 'getNode');
+            try {
+                await confirmShown(d);
+                await settled(d);
+                const lookups = looked.mock.calls.map(([uid]) => uid as string);
+                expect(lookups.filter((uid) => uid === 'vol~Photos/2024')).toHaveLength(1);
+                expect(lookups.filter((uid) => uid === 'vol~Photos')).toHaveLength(1);
+            } finally {
+                looked.mockRestore();
+            }
+            expect(d.calls.trashed.flat().sort()).toEqual(['vol~Photos/2024/p.jpg', 'vol~Photos/2024/q.jpg']);
+            expect(d.nodes.has('vol~Photos/2024/r.jpg')).toBe(true);
+            expect(d.engine.getStatus()).toMatchObject({ state: 'idle', filesMissing: null });
+        });
+
+        // P6: brought back while its node was being looked up: it keeps its record, so the next pass follows the move
+        // rather than uploading it again
+        test('virtual: a file restored while its node is looked up keeps its record, and nothing is trashed', async () => {
+            const d = setup('virtual');
+            await openedOnly(d);
+            const file = d.nodes.get('vol~Photos/2024/p.jpg')!;
+            d.nodes.set(file.uid, { ...file, parentUid: d.add('Archive').uid }); // moved on the web
+            const getNode = d.sdk.getNode.bind(d.sdk);
+            (d.sdk as any).getNode = async (uid: string) => {
+                if (uid === file.uid) {
+                    // The user copies it back from a backup just then
+                    await mkdir(path.join(d.localRoot, 'Photos/2024'), { recursive: true });
+                    await writeFile(path.join(d.localRoot, 'Photos/2024/p.jpg'), 'p');
+                }
+                return getNode(uid);
+            };
+
+            await confirmShown(d);
+            await settled(d);
+
+            expect(d.calls.trashed).toEqual([]);
+            expect(stateDb.getItemByPath('Photos/2024/p.jpg')?.nodeUid).toBe(file.uid);
+            expect(d.warnings.filter((w) => w.startsWith('Not trashing'))).toEqual([]);
+            await d.engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.calls.uploads).toEqual([]);
+        });
+
         for (const moved of [false, true]) {
             test(`virtual: a folder recorded without the folder above it goes by its node too${moved ? ', but not once moved on the web' : ''}`, async () => {
                 const d = setup('virtual');

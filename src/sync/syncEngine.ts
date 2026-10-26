@@ -1674,14 +1674,17 @@ export class ProtonDriveSyncEngine {
     // pass doesn't go into (online-only here), so it was never looked at, and the hold came back for ever. Each such
     // item, still recorded and still missing, goes as the pass would have taken it (see trashForDeletedLocal), by its
     // recorded node; one gone from Proton Drive already just loses its records. Nothing outside what was confirmed. An
-    // item goes only from where its record says it is (its parent and name): one moved or renamed in the cloud meanwhile
-    // isn't where the user deleted it, so it stays in Proton Drive where it went, and only its records go, as when the
-    // pass finds an item moved away (so nothing holds on it again).
+    // item goes only from where its record says it is, its whole path in Proton Drive now (see livePathOf): one moved
+    // or renamed in the cloud meanwhile, or under a folder that was, isn't where the user deleted it, so it stays in
+    // Proton Drive where it went, and only its records go, as when the pass finds an item moved away (so nothing holds on
+    // it again). An item back here meanwhile keeps its records: the next pass syncs it as it finds it.
     private async trashConfirmedOutOfReach(confirmation: { root: string; names: Set<string> }): Promise<void> {
         if (confirmation.root !== this.localRoot()) {
             return;
         }
         const ignorePatterns = this.stateDb.getSettings().ignorePatterns;
+        const rootUid = (await this.getRootFolder()).uid;
+        const folders = new Map<string, NodeEntity | null>(); // the folders above them, each looked up once
         const left: SyncedItemRecord[] = [];
         for (const name of confirmation.names) {
             for (const record of this.stateDb.getItemsUnder(name)) {
@@ -1703,9 +1706,13 @@ export class ProtonDriveSyncEngine {
                 continue; // Changed meanwhile
             }
             const node = await this.liveNode(record.nodeUid);
+            const livePath = node === null ? null : await this.livePathOf(node, rootUid, folders);
+            if (await this.existsLocally(rel)) {
+                continue; // Back meanwhile: it keeps its records, and the next pass syncs it
+            }
             if (node === null) {
                 this.stateDb.removeItemByPath(rel); // Gone from Proton Drive already, or in its trash
-            } else if (node.parentUid !== record.parentNodeUid || getName(node) !== path.posix.basename(rel)) {
+            } else if (livePath !== rel) {
                 this.stateDb.removeItemByPath(rel);
                 this.logger.warn(`Not trashing ${rel}: it moved in Proton Drive meanwhile, so it stays there`);
                 this.stateDb.logActivity({
@@ -1717,6 +1724,30 @@ export class ProtonDriveSyncEngine {
                 await this.trashForDeletedLocal(rel, node);
             }
         }
+    }
+
+    // A node's path in My files now, from the root down, looking up each folder above it in Proton Drive (`folders`
+    // keeps what was looked up, for the next item). Null when a folder above it is gone or in the trash, or the chain
+    // doesn't reach the root. A name that can't be read stands as the node's uid, so it matches no path here.
+    private async livePathOf(node: NodeEntity, rootUid: string, folders: Map<string, NodeEntity | null>): Promise<string | null> {
+        const names = [getName(node)];
+        let parentUid = node.parentUid;
+        for (let depth = 0; depth < 512 && parentUid; depth++) {
+            if (parentUid === rootUid) {
+                return names.reverse().join('/');
+            }
+            let parent = folders.get(parentUid);
+            if (parent === undefined) {
+                parent = await this.liveNode(parentUid);
+                folders.set(parentUid, parent);
+            }
+            if (parent === null) {
+                return null;
+            }
+            names.push(getName(parent));
+            parentUid = parent.parentUid;
+        }
+        return null;
     }
 
     private async trashRemoteNodeForDeletedLocal(relPath: string, remoteNode: NodeEntity): Promise<void> {
