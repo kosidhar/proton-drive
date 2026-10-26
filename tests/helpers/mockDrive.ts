@@ -16,7 +16,10 @@ export type MockNode = NodeEntity & { content?: string };
 // An in-memory My files tree behind the SDK calls the sync engine makes. Uploads, downloads and trashes are recorded
 // (by path, and trashes per call by uid), as are renames and moves (by uid), so tests can assert on exactly what reached
 // the cloud. A call that fails (see failNext and down) reaches nothing and is not recorded.
-export function makeMockDrive() {
+// Uids are `vol~<path>`; with slashFreeUids, `vol~<path with '|' for '/'>`, as Proton uids hold no '/' (uid gives a
+// path's uid either way).
+export function makeMockDrive(options: { slashFreeUids?: boolean } = {}) {
+    const uid = (relPath: string) => `vol~${options.slashFreeUids ? relPath.replaceAll('/', '|') : relPath}`;
     const nodes = new Map<string, MockNode>();
     const root = makeMockNode({ uid: 'vol~root', nameStr: 'root', type: NodeType.Folder });
     nodes.set(root.uid, root);
@@ -65,7 +68,7 @@ export function makeMockDrive() {
         return parent ? `${parent}/${nameOf(node)}` : nameOf(node);
     };
 
-    // Adds a file (with content) or a folder (without), creating missing parent folders; uids are `vol~<path>`.
+    // Adds a file (with content) or a folder (without), creating missing parent folders; see uid for their uids.
     const add = (relPath: string, content?: string): MockNode => {
         const segments = relPath.split('/');
         let parentUid = root.uid;
@@ -80,7 +83,7 @@ export function makeMockDrive() {
             }
             const isFile = isLast && content !== undefined;
             const node = makeMockNode({
-                uid: `vol~${current}`,
+                uid: uid(current),
                 parentUid,
                 nameStr: name,
                 type: isFile ? NodeType.File : NodeType.Folder,
@@ -89,7 +92,7 @@ export function makeMockDrive() {
             nodes.set(node.uid, node);
             parentUid = node.uid;
         }
-        return nodes.get(`vol~${relPath}`)!;
+        return nodes.get(uid(relPath))!;
     };
 
     const sdk = {
@@ -254,6 +257,7 @@ export function makeMockDrive() {
         root,
         nodes,
         add,
+        uid,
         sdk,
         eventsManager,
         logger,

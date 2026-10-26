@@ -137,10 +137,11 @@ export class RemoteIndex {
     }
 
     // Takes a node, with everything still under it, out of the tree for a moment: no lookup by path finds it there, and
-    // upsert puts it back. The caller puts back or removes every node it detached before it is done.
+    // upsert puts it back. The caller puts back or removes every node it detached before it is done. The uid is escaped,
+    // so that one node detached is never under another (a uid with a '/' would read as a path).
     detach(uid: string): void {
         const node = this.getByUid(uid);
-        const parked = `${DETACHED}/${uid}`;
+        const parked = `${DETACHED}/${encodeURIComponent(uid)}`;
         if (node && node.relPath !== parked) {
             this.relocate(node.relPath, parked);
         }

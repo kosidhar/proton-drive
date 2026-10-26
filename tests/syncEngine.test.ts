@@ -3348,9 +3348,9 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
     });
     describe('the virtual drive', () => {
-        const setup = () => {
+        const setup = (mock: { slashFreeUids?: boolean } = {}) => {
             stateDb.setMeta('driveLayout', 'virtual');
-            const drive = makeMockDrive();
+            const drive = makeMockDrive(mock);
             const backingDir = path.join(tempDir, 'files');
             const forgotten: string[] = [];
             // A new engine on the same database and drive is what a restart of the daemon gives
@@ -4863,7 +4863,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             // the cloud renames it, or as the replay reads it back after), or offline.
             type When = 'as the cloud renames it' | 'as it is read back' | 'offline';
             const renamedTwice = async (when: When) => {
-                const d = setup();
+                const d = setup({ slashFreeUids: true });
                 for (const name of ['a', 'b', 'c', 'd', 'e']) {
                     d.add(`Docs/${name}.txt`, name);
                 }
@@ -4885,7 +4885,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     let calls = 0;
                     sdk[method] = async (uid: string, ...rest: unknown[]) => {
                         // The replay reads the item before renaming it, and again after
-                        if (uid === 'vol~Docs/a.txt' && ++calls === (method === 'getNode' ? 2 : 1)) {
+                        if (uid === d.uid('Docs/a.txt') && ++calls === (method === 'getNode' ? 2 : 1)) {
                             entered();
                             await answer;
                         }
@@ -4905,20 +4905,20 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 };
             };
             const cloudNamesInDocs = (d: ReturnType<typeof setup>) =>
-                [...d.nodes.values()].filter((n) => n.parentUid === 'vol~Docs').map((n) => d.nameOf(n)).sort();
+                [...d.nodes.values()].filter((n) => n.parentUid === d.uid('Docs')).map((n) => d.nameOf(n)).sort();
 
             for (const when of ['as the cloud renames it', 'as it is read back', 'offline'] as const) {
                 test(`all of the folder is at the new path at once (first rename held ${when}), and a delete there trashes the item in Proton Drive`, async () => {
                     const d = await renamedTwice(when);
 
                     const index = d.engine.remoteIndex;
-                    expect(index.getByPath('Work')?.uid).toBe('vol~Docs');
+                    expect(index.getByPath('Work')?.uid).toBe(d.uid('Docs'));
                     expect(index.listChildren('Work').map((e) => [e.name, e.uid])).toEqual([
-                        ['a2.txt', 'vol~Docs/a.txt'],
-                        ['b.txt', 'vol~Docs/b.txt'],
-                        ['c.txt', 'vol~Docs/c.txt'],
-                        ['d.txt', 'vol~Docs/d.txt'],
-                        ['e.txt', 'vol~Docs/e.txt'],
+                        ['a2.txt', d.uid('Docs/a.txt')],
+                        ['b.txt', d.uid('Docs/b.txt')],
+                        ['c.txt', d.uid('Docs/c.txt')],
+                        ['d.txt', d.uid('Docs/d.txt')],
+                        ['e.txt', d.uid('Docs/e.txt')],
                     ]);
                     expect(index.getByPath('Docs')).toBeNull();
                     expect(index.uidsWithPrefix('provisional:')).toEqual([]);
@@ -4930,20 +4930,20 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     await d.engine.deleteItem('Work/c.txt');
 
                     expect(await d.files.exists('Work/c.txt')).toBe(false);
-                    expect(d.journal().filter((op) => op.kind === 'trash')).toMatchObject([{ nodeUid: 'vol~Docs/c.txt' }]);
+                    expect(d.journal().filter((op) => op.kind === 'trash')).toMatchObject([{ nodeUid: d.uid('Docs/c.txt') }]);
                     await d.backOnline();
                     expect(d.journal()).toEqual([]);
-                    expect(d.calls.trashed).toEqual([['vol~Docs/c.txt']]);
-                    expect(d.nameOf(d.nodes.get('vol~Docs')!)).toBe('Work');
+                    expect(d.calls.trashed).toEqual([[d.uid('Docs/c.txt')]]);
+                    expect(d.nameOf(d.nodes.get(d.uid('Docs'))!)).toBe('Work');
                     expect(cloudNamesInDocs(d)).toEqual(['a2.txt', 'b.txt', 'd.txt', 'e.txt']);
                     // Then this computer and Proton Drive agree: nothing uploads, and c.txt doesn't come back
                     await d.engine.reconcileNow();
                     expect(d.calls.uploads).toEqual([]);
-                    expect(d.calls.trashed).toEqual([['vol~Docs/c.txt']]);
+                    expect(d.calls.trashed).toEqual([[d.uid('Docs/c.txt')]]);
                     expect(index.getByPath('Work/c.txt')).toBeNull();
                     expect(await d.files.exists('Work/c.txt')).toBe(false);
                     expect(await readFile(d.local('Work/a2.txt'), 'utf8')).toBe('a');
-                    expect(stateDb.getItemByPath('Work/b.txt')?.nodeUid).toBe('vol~Docs/b.txt');
+                    expect(stateDb.getItemByPath('Work/b.txt')?.nodeUid).toBe(d.uid('Docs/b.txt'));
                 });
             }
 
@@ -4961,7 +4961,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.backOnline();
                 expect(d.journal()).toEqual([]);
                 expect(cloudNamesInDocs(d)).toEqual(['a2.txt', 'b.txt', 'c.txt', 'd2.txt', 'e.txt']);
-                expect(d.nameOf(d.nodes.get('vol~Docs/d.txt')!)).toBe('d2.txt');
+                expect(d.nameOf(d.nodes.get(d.uid('Docs/d.txt'))!)).toBe('d2.txt');
                 expect(await readFile(d.local('Work/a2.txt'), 'utf8')).toBe('a');
                 expect(d.calls.downloads).toEqual([]);
                 expect(d.calls.trashed).toEqual([]);
@@ -4973,11 +4973,11 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.engine.truncateItem('Work/d.txt');
 
                 expect(await readFile(d.local('Work/d.txt'), 'utf8')).toBe('');
-                expect(stateDb.getEditBaseline('Work/d.txt')?.nodeUid).toBe('vol~Docs/d.txt');
+                expect(stateDb.getEditBaseline('Work/d.txt')?.nodeUid).toBe(d.uid('Docs/d.txt'));
                 await writeFile(d.local('Work/d.txt'), 'mine');
                 await d.backOnline();
                 await d.engine.reconcileNow();
-                expect(d.nodes.get('vol~Docs/d.txt')?.content).toBe('mine');
+                expect(d.nodes.get(d.uid('Docs/d.txt'))?.content).toBe('mine');
                 expect(d.calls.uploads).toEqual(['Work/d.txt']);
                 expect(d.calls.trashed).toEqual([]);
             });
@@ -4988,7 +4988,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.engine.hydrate('Work/e.txt');
 
                 expect(await readFile(d.local('Work/e.txt'), 'utf8')).toBe('e');
-                expect(stateDb.getItemByPath('Work/e.txt')?.nodeUid).toBe('vol~Docs/e.txt');
+                expect(stateDb.getItemByPath('Work/e.txt')?.nodeUid).toBe(d.uid('Docs/e.txt'));
                 expect(d.calls.downloads).toEqual(['Docs/e.txt']);
                 await d.backOnline();
                 await d.engine.reconcileNow();
@@ -5000,7 +5000,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
             // Deletes are shown first: here the name Work, freed by one, is what the renamed folder takes
             test('a folder deleted before another is renamed to its name is not where that one goes, even once a listing puts it back', async () => {
-                const d = setup();
+                const d = setup({ slashFreeUids: true });
                 d.add('Docs/a.txt', 'a');
                 d.add('Docs/b.txt', 'b');
                 d.add('Work/x.txt', 'x');
@@ -5015,21 +5015,22 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.engine.reconcileNow(); // lists the old Work, which Proton Drive still has, at its name
 
                 const index = d.engine.remoteIndex;
-                expect(index.getByPath('Work')?.uid).toBe('vol~Docs');
-                expect(index.listChildren('Work').map((e) => e.uid)).toEqual(['vol~Docs/a.txt', 'vol~Docs/b.txt']);
-                expect(index.getByUid('vol~Work')).toBeNull();
+                expect(index.getByPath('Work')?.uid).toBe(d.uid('Docs'));
+                expect(index.listChildren('Work').map((e) => e.uid)).toEqual([d.uid('Docs/a.txt'), d.uid('Docs/b.txt')]);
+                expect(index.getByUid(d.uid('Work'))).toBeNull();
                 expect(d.engine.vfsChildren('Work').map((e) => e.name)).toEqual(['a2.txt', 'b.txt']);
                 d.down.clear();
                 await d.engine.replayRemoteOps();
                 expect(d.journal()).toEqual([]);
-                expect(d.calls.trashed).toEqual([['vol~Work']]);
-                expect(d.nameOf(d.nodes.get('vol~Docs')!)).toBe('Work');
+                expect(d.calls.trashed).toEqual([[d.uid('Work')]]);
+                expect(d.nameOf(d.nodes.get(d.uid('Docs'))!)).toBe('Work');
                 expect(cloudNamesInDocs(d)).toEqual(['a2.txt', 'b.txt']);
             });
         });
 
         // S25: every pending move is shown at once, none in another's way, so a name one frees is free for another
-        // whatever the order or depth (#26: a swap through a temporary name used to leave both files out of listings)
+        // whatever the order or depth (#26: a swap through a temporary name used to leave both files out of listings).
+        // Here and for #22, uids hold no '/', as Proton's don't: the index takes nodes aside by uid while it places them.
         describe('pending moves that free names and take them', () => {
             // Offline, with a sync pass after: its listing puts every item back where Proton Drive still has it
             const offlineThenListed = async (d: ReturnType<typeof setup>, moves: Array<[string, string]>) => {
@@ -5045,7 +5046,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
             for (const variant of ['from another folder', 'in the same folder'] as const) {
                 test(`a name freed by a move into a folder, then taken by a move up (${variant}), is the new item's after a listing`, async () => {
-                    const d = setup();
+                    const d = setup({ slashFreeUids: true });
                     d.add('b.txt', 'B');
                     d.add('X/keep.txt', 'k');
                     const from = variant === 'from another folder' ? 'Y/a.txt' : 'a.txt';
@@ -5058,7 +5059,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
                     const index = d.engine.remoteIndex;
                     expect(index.getByPath('b.txt')?.uid).toBe(aUid);
-                    expect(index.getByPath('X/b.txt')?.uid).toBe('vol~b.txt');
+                    expect(index.getByPath('X/b.txt')?.uid).toBe(d.uid('b.txt'));
                     expect(names(d, '')).toEqual(variant === 'from another folder' ? ['X', 'Y', 'b.txt'] : ['X', 'b.txt']);
                     expect(names(d, 'X')).toEqual(['b.txt', 'keep.txt']);
                     await d.engine.deleteItem('b.txt');
@@ -5067,12 +5068,12 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     await d.engine.replayRemoteOps();
                     expect(d.journal()).toEqual([]);
                     expect(d.calls.trashed).toEqual([[aUid]]);
-                    expect(d.nodes.get('vol~b.txt')?.parentUid).toBe('vol~X');
+                    expect(d.nodes.get(d.uid('b.txt'))?.parentUid).toBe(d.uid('X'));
                 });
             }
 
             test('two files swapped through a temporary name keep their swapped names after a listing, and each deletes as itself', async () => {
-                const d = setup();
+                const d = setup({ slashFreeUids: true });
                 d.add('a.txt', 'A');
                 d.add('b.txt', 'B');
                 d.add('X/k.txt', 'k');
@@ -5084,22 +5085,22 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 ]);
 
                 const index = d.engine.remoteIndex;
-                expect(index.getByPath('a.txt')?.uid).toBe('vol~b.txt');
-                expect(index.getByPath('b.txt')?.uid).toBe('vol~a.txt');
+                expect(index.getByPath('a.txt')?.uid).toBe(d.uid('b.txt'));
+                expect(index.getByPath('b.txt')?.uid).toBe(d.uid('a.txt'));
                 expect(index.getByPath('tmp.txt')).toBeNull();
                 expect(names(d, '')).toEqual(['X', 'a.txt', 'b.txt']);
                 await d.engine.deleteItem('a.txt');
                 await d.engine.deleteItem('b.txt');
-                expect(d.journal().filter((op) => op.kind === 'trash').map((op) => op.nodeUid)).toEqual(['vol~b.txt', 'vol~a.txt']);
+                expect(d.journal().filter((op) => op.kind === 'trash').map((op) => op.nodeUid)).toEqual([d.uid('b.txt'), d.uid('a.txt')]);
                 d.down.clear();
                 await d.engine.replayRemoteOps();
                 expect(d.journal()).toEqual([]);
-                expect(d.calls.trashed).toEqual([['vol~b.txt'], ['vol~a.txt']]);
+                expect(d.calls.trashed).toEqual([[d.uid('b.txt')], [d.uid('a.txt')]]);
                 expect(d.calls.renamed).toEqual([]);
             });
 
             test('three files rotated through a temporary name each show, and open, as the file now at that name', async () => {
-                const d = setup();
+                const d = setup({ slashFreeUids: true });
                 d.add('a.txt', 'A');
                 d.add('b.txt', 'B');
                 d.add('c.txt', 'C');
@@ -5112,15 +5113,15 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 ]);
 
                 const index = d.engine.remoteIndex;
-                expect(['a.txt', 'b.txt', 'c.txt'].map((p) => index.getByPath(p)?.uid)).toEqual(['vol~b.txt', 'vol~c.txt', 'vol~a.txt']);
+                expect(['a.txt', 'b.txt', 'c.txt'].map((p) => index.getByPath(p)?.uid)).toEqual([d.uid('b.txt'), d.uid('c.txt'), d.uid('a.txt')]);
                 expect(names(d, '')).toEqual(['a.txt', 'b.txt', 'c.txt']);
                 await d.engine.hydrate('c.txt');
                 expect(await readFile(d.local('c.txt'), 'utf8')).toBe('A');
-                expect(stateDb.getItemByPath('c.txt')?.nodeUid).toBe('vol~a.txt');
+                expect(stateDb.getItemByPath('c.txt')?.nodeUid).toBe(d.uid('a.txt'));
             });
 
             test('an item whose new name another device took meanwhile does not keep a file renamed to its old name out of listings', async () => {
-                const d = setup();
+                const d = setup({ slashFreeUids: true });
                 d.add('a.txt', 'A');
                 d.add('b.txt', 'B');
                 await d.engine.reconcileNow();
@@ -5131,23 +5132,48 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.engine.reconcileNow();
 
                 const index = d.engine.remoteIndex;
-                expect(index.getByPath('a.txt')?.uid).toBe('vol~b.txt');
-                expect(index.getByPath('x.txt')?.uid).toBe('vol~x.txt');
+                expect(index.getByPath('a.txt')?.uid).toBe(d.uid('b.txt'));
+                expect(index.getByPath('x.txt')?.uid).toBe(d.uid('x.txt'));
                 expect(names(d, '')).toEqual(['a.txt', 'x.txt']);
                 d.down.clear();
                 await d.engine.replayRemoteOps();
                 expect(d.journal()).toEqual([]);
-                expect(d.nameOf(d.nodes.get('vol~b.txt')!)).toBe('a.txt');
-                expect(d.nameOf(d.nodes.get('vol~a.txt')!)).toStartWith('x (conflict ');
-                expect(d.nodes.get('vol~x.txt')?.content).toBe('X');
+                expect(d.nameOf(d.nodes.get(d.uid('b.txt'))!)).toBe('a.txt');
+                expect(d.nameOf(d.nodes.get(d.uid('a.txt'))!)).toStartWith('x (conflict ');
+                expect(d.nodes.get(d.uid('x.txt'))?.content).toBe('X');
                 expect(names(d, '').length).toBe(3);
                 expect(d.calls.trashed).toEqual([]);
+            });
+
+            // Its folder's new name taken in the cloud too, a renamed file goes back into the folder where it was, both
+            // where Proton Drive still has them (deep enough that the path of what was in a folder is no deeper)
+            test('a renamed folder and a renamed file in it, both with their names taken in the cloud, stay where they were', async () => {
+                const d = setup({ slashFreeUids: true });
+                d.add('a/b/c/keep.txt', 'k');
+                d.add('a/b/c/P/c.txt', 'C');
+                d.add('a/b/c/P/d.txt', 'D');
+                await d.engine.reconcileNow();
+                await d.files.writeLocal('a/b/c/P/c.txt', 'C');
+                d.down.add('renameNode');
+                await d.engine.renameItem('a/b/c/P', 'a/b/c/Q');
+                await d.engine.renameItem('a/b/c/Q/c.txt', 'a/b/c/Q/c2.txt');
+                d.add('a/b/c/Q', 'a file from another device');
+
+                await d.engine.reconcileNow();
+
+                const index = d.engine.remoteIndex;
+                expect(index.getByUid(d.uid('a/b/c/P'))?.relPath).toBe('a/b/c/P');
+                expect(index.getByUid(d.uid('a/b/c/P/c.txt'))?.parentUid).toBe(d.uid('a/b/c/P'));
+                expect(index.getByUid(d.uid('a/b/c/P/c.txt'))?.relPath).toStartWith('a/b/c/P/');
+                expect(index.getByUid(d.uid('a/b/c/P/d.txt'))?.relPath).toBe('a/b/c/P/d.txt');
+                expect(index.getByPath('a/b/c/Q')?.uid).toBe(d.uid('a/b/c/Q'));
+                expect(names(d, 'a/b/c')).toEqual(['Q', 'keep.txt']);
             });
 
             // An older version showed the first rename of #22 in a provisional folder made up for Work, which then kept
             // the renamed folder at Docs: the next change through the drive puts the folder in that stand-in's place
             test('a provisional folder left where a renamed folder goes gives way to it', async () => {
-                const d = setup();
+                const d = setup({ slashFreeUids: true });
                 d.add('Docs/a.txt', 'a');
                 d.add('Docs/b.txt', 'b');
                 d.add('other.txt', 'o');
@@ -5160,18 +5186,18 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 const stale = 'provisional:left-by-an-older-version';
                 index.upsert({ ...index.getByPath('Work')!, relPath: 'Docs', name: 'Docs' });
                 index.upsert({ uid: stale, parentUid: d.root.uid, relPath: 'Work', name: 'Work', type: 'folder', size: 0, mtimeMs: 0, sha1: null });
-                index.upsert({ ...index.getByUid('vol~Docs/a.txt')!, parentUid: stale, relPath: 'Work/a2.txt' });
+                index.upsert({ ...index.getByUid(d.uid('Docs/a.txt'))!, parentUid: stale, relPath: 'Work/a2.txt' });
 
                 await d.engine.deleteItem('other.txt');
 
-                expect(index.getByPath('Work')?.uid).toBe('vol~Docs');
-                expect(index.listChildren('Work').map((e) => e.uid)).toEqual(['vol~Docs/a.txt', 'vol~Docs/b.txt']);
+                expect(index.getByPath('Work')?.uid).toBe(d.uid('Docs'));
+                expect(index.listChildren('Work').map((e) => e.uid)).toEqual([d.uid('Docs/a.txt'), d.uid('Docs/b.txt')]);
                 expect(index.getByUid(stale)).toBeNull();
                 expect(index.getByPath('Docs')).toBeNull();
             });
 
             test('a folder deleted after a file was moved out of it trashes only the folder, and the file stays where it went', async () => {
-                const d = setup();
+                const d = setup({ slashFreeUids: true });
                 d.add('F/c.txt', 'C');
                 d.add('F/d.txt', 'D');
                 d.add('G/g.txt', 'g');
@@ -5184,15 +5210,15 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.engine.reconcileNow();
 
                 const index = d.engine.remoteIndex;
-                expect(index.getByPath('G/c.txt')?.uid).toBe('vol~F/c.txt');
+                expect(index.getByPath('G/c.txt')?.uid).toBe(d.uid('F/c.txt'));
                 expect(index.getByPath('F')).toBeNull();
                 expect(names(d, '')).toEqual(['G']);
                 expect(names(d, 'G')).toEqual(['c.txt', 'g.txt']);
                 d.down.clear();
                 await d.engine.replayRemoteOps();
                 expect(d.journal()).toEqual([]);
-                expect(d.calls.trashed).toEqual([['vol~F']]);
-                expect(d.nodes.get('vol~F/c.txt')?.parentUid).toBe('vol~G');
+                expect(d.calls.trashed).toEqual([[d.uid('F')]]);
+                expect(d.nodes.get(d.uid('F/c.txt'))?.parentUid).toBe(d.uid('G'));
             });
         });
     });

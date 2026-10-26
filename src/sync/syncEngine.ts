@@ -2788,6 +2788,7 @@ export class ProtonDriveSyncEngine {
                 // In place: at its target, in the folder the cloud has there (one in a folder made here is placed afresh,
                 // as a node renamed to that folder's name may take its place)
                 const was = new Map<string, string>();
+                const outOfPlace: string[] = [];
                 for (const op of moves) {
                     const entry = this.index.getByUid(op.nodeUid);
                     if (!entry) {
@@ -2801,8 +2802,12 @@ export class ProtonDriveSyncEngine {
                         !isProvisional(parent.uid) &&
                         parent.relPath === parentOf(op.toPath);
                     if (!inPlace) {
-                        this.index.detach(op.nodeUid);
+                        outOfPlace.push(op.nodeUid);
                     }
+                }
+                // Only once every place is noted: a detach takes along what is under the node
+                for (const uid of outOfPlace) {
+                    this.index.detach(uid);
                 }
                 const needed = new Set<string>();
                 const stuck: RemoteIndexEntry[] = [];
