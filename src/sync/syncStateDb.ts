@@ -5,7 +5,8 @@ import path from 'node:path';
 import { selfOrDescendant, selfOrDescendantWhere } from './pathRange';
 
 export type ItemSyncStatus = 'synced' | 'uploading' | 'downloading' | 'conflict' | 'error' | 'ignored';
-export type ConflictStrategy = 'keep-both' | 'keep-local' | 'keep-remote' | 'prompt';
+export const CONFLICT_STRATEGIES = ['keep-both', 'keep-local', 'keep-remote', 'prompt'] as const;
+export type ConflictStrategy = (typeof CONFLICT_STRATEGIES)[number];
 
 export interface SyncedItemRecord {
     localRelPath: string;

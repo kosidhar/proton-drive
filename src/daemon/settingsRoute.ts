@@ -4,6 +4,7 @@ import { virtualDriveWanted } from '../sync/driveMode';
 import { type ProtonDriveSyncEngine, resolveSyncDirInput } from '../sync/syncEngine';
 import type { SyncStateDatabase } from '../sync/syncStateDb';
 import type { DriveController } from './driveController';
+import { parseSettings } from './settingsValidation';
 
 export interface SettingsRouteDeps {
     stateDb: SyncStateDatabase;
@@ -75,21 +76,31 @@ function answer(deps: SettingsRouteDeps, change: DriveChange, refused: boolean):
     });
 }
 
-// POST /api/settings (the unauthenticated TCP API): saves the settings given, except that it can't move files: a
+// POST /api/settings (the unauthenticated TCP API): saves ignorePatterns, conflictStrategy and notificationsEnabled (see
+// parseSettings; other keys are ignored), except that it can't move files: a
 // syncDir naming another folder than the stored one, or a virtualDriveWanted other than the current one, is refused in
 // folderError / switchError (code EACCES), while an unchanged one (the app always sends syncDir) is ignored and the
 // rest is saved. Those changes are made by POST /drive/settings on the user-only control socket. Answers 200 { ok:
 // true, settings, virtualDriveWanted, vfs, folderError, switchError }: ok means the other settings were saved. 400 for
-// a malformed body, 500 when the settings themselves can't be saved.
+// a body that is not JSON or holds an invalid value (code EINVAL, nothing stored), 500 when the settings themselves can't be saved.
 export async function settingsRoute(req: Request, deps: SettingsRouteDeps): Promise<Response> {
     const { stateDb, engine } = deps;
+    const invalid = (error: string) => Response.json({ error, code: 'EINVAL' }, { status: 400 });
+    let body: unknown;
+    try {
+        body = await req.json();
+    } catch {
+        return invalid('Invalid JSON body');
+    }
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) return invalid('The settings must be a JSON object');
     try {
         const prev = stateDb.getSettings();
-        const { virtualDriveWanted: wanted, syncDir, ...body } = (await req.json()) as Record<string, unknown>;
-        if (wanted !== undefined && typeof wanted !== 'boolean') {
-            return Response.json({ error: 'virtualDriveWanted must be true or false' }, { status: 400 });
-        }
-        stateDb.updateSettings(body);
+        const { virtualDriveWanted: wanted, syncDir } = body as Record<string, unknown>;
+        if (wanted !== undefined && typeof wanted !== 'boolean') return invalid('virtualDriveWanted must be true or false');
+        // Everything is checked before anything is stored
+        const parsed = parseSettings(body as Record<string, unknown>);
+        if (!parsed.ok) return invalid(parsed.error);
+        stateDb.updateSettings(parsed.value);
         if (JSON.stringify(prev.ignorePatterns) !== JSON.stringify(stateDb.getSettings().ignorePatterns)) {
             void engine.reconcileNow();
         }
