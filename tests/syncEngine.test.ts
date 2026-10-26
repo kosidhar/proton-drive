@@ -2174,6 +2174,130 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             }
         });
 
+        // S39-a, the reviewer's probe: a new file saved into the emptied folder (an app saving into the bare folder of a
+        // disk not mounted, or through the drive) used to be uploaded and recorded, which ended the hold, and the next
+        // pass trashed everything missing
+        for (const layout of ['plain', 'virtual'] as const) {
+            test(`${layout}: a new file saved while the files are missing neither ends the hold nor uploads, until they are back`, async () => {
+                const d = setup(layout);
+                await synced(d);
+                const away = path.join(tempDir, 'away');
+                await rename(d.localRoot, away);
+                await mkdir(d.localRoot);
+                await d.engine.reconcileNow();
+                expect(d.engine.getStatus().state).toBe('error');
+
+                await writeFile(path.join(d.localRoot, 'New.txt'), 'new');
+                await (d.engine as any).handleLocalFileChange('New.txt');
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.calls.uploads).toEqual([]);
+                expect(stateDb.getItemByPath('New.txt')).toBeNull();
+                expect(d.engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.localRoot) });
+
+                // The originals back (the new file stays beside them): everything goes on, the new file uploads
+                for (const name of await readdir(away)) await rename(path.join(away, name), path.join(d.localRoot, name));
+                await d.engine.reconcileNow();
+                expect(d.engine.getStatus()).toMatchObject({ state: 'idle', lastError: null, filesMissing: null });
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.calls.uploads).toEqual(['New.txt']);
+            });
+        }
+
+        test('the hold lasts until every original top-level item is back: one back of two still trashes nothing', async () => {
+            const d = setup();
+            await synced(d);
+            const away = path.join(tempDir, 'away');
+            await rename(d.localRoot, away);
+            await d.engine.reconcileNow();
+            await mkdir(d.localRoot);
+            await rename(path.join(away, 'Docs'), path.join(d.localRoot, 'Docs'));
+
+            await d.engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.engine.getStatus()).toMatchObject({
+                state: 'error',
+                filesMissing: { root: d.localRoot, names: ['Photos'], items: 2 },
+            });
+
+            await rename(path.join(away, 'Photos'), path.join(d.localRoot, 'Photos'));
+            await d.engine.reconcileNow();
+            expect(d.engine.getStatus()).toMatchObject({ state: 'idle', filesMissing: null });
+            expect(d.calls.trashed).toEqual([]);
+        });
+
+        test('the status says what is missing', async () => {
+            const d = setup();
+            await synced(d);
+            await rm(d.localRoot, { recursive: true });
+            await d.engine.reconcileNow();
+            // Docs, Docs/a.txt, Docs/b.txt, Photos, Photos/p.jpg
+            expect(d.engine.getStatus().filesMissing).toEqual({ root: d.localRoot, names: ['Docs', 'Photos'], items: 5 });
+        });
+
+        test('confirming they were deleted on purpose trashes exactly the missing recorded items, once', async () => {
+            const d = setup();
+            await synced(d);
+            const away = path.join(tempDir, 'away');
+            await rename(d.localRoot, away);
+            await mkdir(d.localRoot);
+            await d.engine.reconcileNow(); // held
+            await rename(path.join(away, 'Docs'), path.join(d.localRoot, 'Docs')); // Docs came back, Photos didn't
+            await writeFile(path.join(d.localRoot, 'New.txt'), 'new');
+            await d.engine.reconcileNow();
+            expect(d.engine.getStatus().state).toBe('error');
+            expect(d.calls.trashed).toEqual([]);
+
+            expect(await d.engine.confirmFilesMissingDeleted()).toEqual({ root: d.localRoot, names: ['Photos'], items: 2 });
+            await d.engine.holdForMove(); // waits for the pass the confirmation started
+            d.engine.releaseHold();
+
+            expect(d.calls.trashed).toEqual([['vol~Photos']]);
+            expect(d.nodes.has('vol~Docs/a.txt')).toBe(true);
+            expect(d.nodes.has('vol~Notes/n.txt')).toBe(true);
+            expect(d.calls.uploads).toEqual(['New.txt']);
+            expect(d.engine.getStatus()).toMatchObject({ state: 'idle', lastError: null, filesMissing: null });
+            expect(stateDb.listActivity(50).some((a) => a.details.includes('deleted on purpose'))).toBe(true);
+        });
+
+        test('a confirmation is used up by one pass: files that go missing later are held again', async () => {
+            const d = setup();
+            await synced(d);
+            await rm(path.join(d.localRoot, 'Docs'), { recursive: true });
+            await rm(path.join(d.localRoot, 'Photos'), { recursive: true });
+            await d.engine.reconcileNow();
+            await d.engine.confirmFilesMissingDeleted();
+            await d.engine.holdForMove();
+            d.engine.releaseHold();
+            expect(d.calls.trashed.flat().sort()).toEqual(['vol~Docs', 'vol~Photos']);
+
+            // Synced again, then gone again
+            d.engine.availability.setPin(d.add('Notes').uid, 'pinned', false);
+            await d.engine.reconcileNow();
+            expect(await d.files.exists('Notes/n.txt')).toBe(true);
+            await rm(path.join(d.localRoot, 'Notes'), { recursive: true });
+            await d.engine.reconcileNow();
+            expect(d.calls.trashed).toHaveLength(2);
+            expect(d.engine.getStatus().filesMissing).toMatchObject({ names: ['Notes'] });
+        });
+
+        test('confirming with nothing missing is refused, and the last top-level item deleted here is held until confirmed', async () => {
+            const d = setup();
+            await expect(d.engine.confirmFilesMissingDeleted()).rejects.toMatchObject({ status: 409 });
+            d.add('Only/x.txt', 'x');
+            d.engine.availability.setPin(d.add('Only').uid, 'pinned', false);
+            await d.engine.reconcileNow();
+            await rm(path.join(d.localRoot, 'Only'), { recursive: true });
+            await d.engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([]);
+
+            await d.engine.confirmFilesMissingDeleted();
+            await d.engine.holdForMove();
+            d.engine.releaseHold();
+            expect(d.calls.trashed).toEqual([['vol~Only']]);
+        });
+
         test('a partial loss (one top-level folder still there) is the user deleting the rest, as before', async () => {
             const d = setup();
             await synced(d);

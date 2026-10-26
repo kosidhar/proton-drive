@@ -8,7 +8,8 @@ import { driveSettings } from './settingsRoute';
 // TCP API. Kept apart from startSyncDaemon so that a test can check what each route reaches.
 export function controlServerOptions(deps: {
     socketPath: string;
-    engine: ControlServerOptions['engine'] & Pick<ProtonDriveSyncEngine, 'resolveConflictManually' | 'reconcileNow'>;
+    engine: ControlServerOptions['engine'] &
+        Pick<ProtonDriveSyncEngine, 'resolveConflictManually' | 'reconcileNow' | 'confirmFilesMissingDeleted'>;
     drive: Pick<DriveController, 'mountAgain' | 'resolveMove' | 'relocate' | 'setVirtualDriveWanted' | 'status'>;
     stateDb: SyncStateDatabase;
     signIn: NonNullable<ControlServerOptions['login']>;
@@ -25,6 +26,7 @@ export function controlServerOptions(deps: {
         login: deps.signIn,
         logout: deps.signOut,
         resolveConflict: (id, choice) => engine.resolveConflictManually(id, choice),
+        confirmFilesMissingDeleted: () => engine.confirmFilesMissingDeleted(),
         remoteMkdir: deps.makeRemoteFolder,
     };
 }

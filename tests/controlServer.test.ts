@@ -5,7 +5,7 @@ import path from 'node:path';
 
 import { defaultControlSocketPath, startControlServer } from '../src/daemon/controlServer';
 import { DriveOpError, type VfsEntry } from '../src/sync/driveOps';
-import type { AvailabilityAction, AvailabilityResult } from '../src/sync/syncEngine';
+import { type AvailabilityAction, type AvailabilityResult, FilesMissingRefused } from '../src/sync/syncEngine';
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -356,6 +356,54 @@ describe('POST /vfs/mount', () => {
         });
         expect((await call(socketPath, '/vfs/mount')).status).toBe(405);
         expect(calls).toBe(0);
+    });
+});
+
+// S39: the user says the files missing from the folder were deleted on purpose, so they go to the Proton Drive trash
+describe('POST /sync/files-missing', () => {
+    async function startWith(confirm?: () => Promise<{ root: string; names: string[]; items: number }>) {
+        const root = mkdtempSync(path.join(os.tmpdir(), 'pd-control-'));
+        cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+        const socketPath = path.join(root, 'control.sock');
+        const server = await startControlServer({ socketPath, engine: makeFake() as never, confirmFilesMissingDeleted: confirm });
+        cleanups.push(() => server.stop());
+        return socketPath;
+    }
+    const post = (socketPath: string, body: string) => call(socketPath, '/sync/files-missing', { method: 'POST', body });
+
+    test('delete-in-cloud confirms, and answers what was confirmed', async () => {
+        let calls = 0;
+        const socketPath = await startWith(async () => {
+            calls++;
+            return { root: '/home/u/ProtonDrive', names: ['Docs'], items: 3 };
+        });
+        const res = await post(socketPath, JSON.stringify({ action: 'delete-in-cloud' }));
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ ok: true, root: '/home/u/ProtonDrive', names: ['Docs'], items: 3 });
+        expect(calls).toBe(1);
+    });
+
+    test('with nothing missing it is 409 with the reason', async () => {
+        const socketPath = await startWith(async () => {
+            throw new FilesMissingRefused('Nothing is missing from /home/u/ProtonDrive');
+        });
+        const res = await post(socketPath, JSON.stringify({ action: 'delete-in-cloud' }));
+        expect(res.status).toBe(409);
+        expect(await res.json()).toEqual({ error: 'Nothing is missing from /home/u/ProtonDrive', code: 'EEXIST' });
+    });
+
+    test('anything but {action: "delete-in-cloud"} is 400 and confirms nothing; only POST', async () => {
+        let calls = 0;
+        const socketPath = await startWith(async () => {
+            calls++;
+            return { root: '/r', names: [], items: 0 };
+        });
+        for (const body of ['{}', '{"action":"keep"}', 'not json', '[]']) {
+            expect((await post(socketPath, body)).status).toBe(400);
+        }
+        expect((await call(socketPath, '/sync/files-missing')).status).toBe(405);
+        expect(calls).toBe(0);
+        expect((await post(await startWith(), JSON.stringify({ action: 'delete-in-cloud' }))).status).toBe(404);
     });
 });
 

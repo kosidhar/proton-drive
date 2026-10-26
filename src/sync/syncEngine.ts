@@ -88,6 +88,20 @@ export function filesMissingMessage(localRoot: string): string {
     return `Proton Drive's files are missing from ${localRoot}. Nothing was deleted in Proton Drive.`;
 }
 
+// A confirmation that missing files were deleted on purpose, with nothing missing: 409
+export class FilesMissingRefused extends Error {
+    readonly status = 409;
+    constructor(message: string) {
+        super(message);
+        this.name = 'FilesMissingRefused';
+    }
+}
+
+// Whether a top-level item is in a folder (a link counts as there), the folder itself being a folder
+function presentIn(root: string, name: string): boolean {
+    return Boolean(statSync(root, { throwIfNoEntry: false })?.isDirectory() && lstatSync(path.join(root, name), { throwIfNoEntry: false }));
+}
+
 // A conflict that can't be resolved now: 404 when there is no such conflict, 409 when it is already resolved (or being
 // resolved), so that resolving never acts twice
 export class ConflictRefusedError extends Error {
@@ -175,8 +189,11 @@ export class ProtonDriveSyncEngine {
     private inFlight = 0;
     // The move marker last found set (see holding), so that it is logged once
     private markerSeen: string | null = null;
-    // Where the files were found missing (see filesGone), until they are back
-    private filesGoneFrom: string | null = null;
+    // The files-missing hold (see filesGone): the local root, and the recorded top-level items missing when it began
+    private filesHold: { root: string; names: string[] } | null = null;
+    private filesGoneSaid: string | null = null; // where the hold was last told about, so it is said once
+    // Missing items the user said were deleted on purpose, for the next sync pass to take for deletes
+    private missingConfirmed: { root: string; names: Set<string> } | null = null;
     // Conflicts being resolved by hand right now, so that a second request for the same one is refused
     private readonly resolvingConflicts = new Set<number>();
 
@@ -250,6 +267,7 @@ export class ProtonDriveSyncEngine {
     }
 
     getStatus() {
+        const filesMissing = this.filesMissing(); // first: it can end the hold
         const settings = this.stateDb.getSettings();
         const stats = this.stateDb.getSummaryStats();
         const loggedIn = this.auth.isLoggedIn();
@@ -270,6 +288,7 @@ export class ProtonDriveSyncEngine {
             syncingFolders: Array.from(this.syncingFolders),
             stats,
             settings,
+            filesMissing,
         };
     }
 
@@ -372,24 +391,48 @@ export class ProtonDriveSyncEngine {
         return marker !== null;
     }
 
-    // #45: records exist, but not one of their files is in the local root: the folder is missing (deleted, moved away,
-    // a disk not mounted), or not one recorded top-level item is in it (an emptied store). That is never taken for the
-    // user deleting everything: nothing that reads the folder runs (no sync pass, no local or cloud change handling),
-    // nothing is made in it, and the status says so; everything goes on once the files are back. A partial loss is the
-    // user deleting those items, as ever. Looked at each time, so it clears by itself; said once.
+    // #45 / S39: records exist, but not one of their files is in the local root: the folder is missing (deleted, moved
+    // away, a disk not mounted), or not one recorded top-level item is in it (an emptied store). That is never taken for
+    // the user deleting everything. The engine holds: nothing that reads the folder runs (no sync pass, no local change
+    // handling at all, so a file saved meanwhile waits rather than being uploaded and recorded; no cloud change
+    // handling), nothing is made in it, and the status says what is missing. The hold is on the recorded top-level items
+    // missing when it began (filesHold.names), so nothing new in the folder can end it. It ends when every one of them is
+    // back (one whose records went meanwhile, deleted through the drive, no longer counts), when the local root changes,
+    // or when the user confirms they were deleted on purpose (confirmFilesMissingDeleted). A partial loss (some recorded
+    // top-level item still there) is the user deleting those items, as ever. Looked at each time; said once.
     private filesGone(): boolean {
         const root = this.localRoot();
-        const names = this.stateDb.recordedTopLevelNames();
-        const gone =
-            names.length > 0 &&
-            (!statSync(root, { throwIfNoEntry: false })?.isDirectory() ||
-                !names.some((name) => lstatSync(path.join(root, name), { throwIfNoEntry: false })));
-        if (gone) {
-            this.noteFilesGone(root);
-        } else if (this.filesGoneFrom !== null) {
-            this.noteFilesBack();
+        if (this.filesHold !== null && this.filesHold.root !== root) {
+            this.endFilesHold();
         }
-        return gone;
+        if (this.filesHold !== null) {
+            if (this.stillMissing().length > 0) {
+                this.noteFilesGone(root);
+                return true;
+            }
+            this.endFilesHold();
+            return false;
+        }
+        const names = this.stateDb.recordedTopLevelNames();
+        if (names.length === 0 || names.some((name) => presentIn(root, name))) {
+            return false;
+        }
+        const confirmed = this.missingConfirmed;
+        if (confirmed?.root === root && names.every((name) => confirmed.names.has(name))) {
+            return false; // the user said these were deleted on purpose: the pass takes them for deletes
+        }
+        this.filesHold = { root, names };
+        this.noteFilesGone(root);
+        return true;
+    }
+
+    // The hold's top-level items still missing and still recorded
+    private stillMissing(): string[] {
+        const hold = this.filesHold;
+        if (hold === null) {
+            return [];
+        }
+        return hold.names.filter((name) => this.stateDb.hasItemsUnder(name) && !presentIn(hold.root, name));
     }
 
     private noteFilesGone(root: string): void {
@@ -397,10 +440,10 @@ export class ProtonDriveSyncEngine {
         this.state = 'error';
         this.lastError = message;
         this.currentAction = null;
-        if (this.filesGoneFrom === root) {
+        if (this.filesGoneSaid === root) {
             return;
         }
-        this.filesGoneFrom = root;
+        this.filesGoneSaid = root;
         this.logger.warn(message);
         this.stateDb.logActivity({ action: 'error', localRelPath: '/', details: message });
         sendDesktopNotification({
@@ -411,21 +454,57 @@ export class ProtonDriveSyncEngine {
         });
     }
 
-    private noteFilesBack(): void {
-        const wasMessage = filesMissingMessage(this.filesGoneFrom ?? '');
-        this.filesGoneFrom = null;
-        if (this.lastError === wasMessage) {
+    private endFilesHold(): void {
+        const hold = this.filesHold;
+        this.filesHold = null;
+        this.filesGoneSaid = null;
+        if (hold === null) {
+            return;
+        }
+        if (this.lastError === filesMissingMessage(hold.root)) {
             this.lastError = null;
             if (this.state === 'error') {
                 this.state = 'idle';
             }
         }
-        this.logger.info(`Proton Drive's files are back in ${this.localRoot()}`);
+        this.logger.info(`Proton Drive's files are back in ${hold.root}, or no longer waited for`);
         // A folder that went away leaves its watchers quiet: the one back is watched afresh
         if (this.unsubscribeDriveEvents) {
             this.watcher.stop();
             void this.watcher.start().catch(() => {});
         }
+    }
+
+    // What is missing while the files are held as missing (see filesGone), for the status: the local root, the recorded
+    // top-level items still missing, and how many records are under them
+    filesMissing(): { root: string; names: string[]; items: number } | null {
+        if (this.filesHold !== null) {
+            this.filesGone(); // ends it once they are back
+        }
+        const hold = this.filesHold;
+        if (hold === null) {
+            return null;
+        }
+        const names = this.stillMissing();
+        return { root: hold.root, names, items: names.reduce((n, name) => n + this.stateDb.countItemsUnder(name), 0) };
+    }
+
+    // The user says the missing files were deleted on purpose (the GUI's "Delete them from Proton Drive too", POST
+    // /sync/files-missing): the hold ends, and the next sync pass takes the missing recorded items for deletes, moving
+    // them to the Proton Drive trash. That pass uses the confirmation up: anything missing after it is held again.
+    // Answers what was confirmed. Throws FilesMissingRefused (409) when nothing is held.
+    async confirmFilesMissingDeleted(): Promise<{ root: string; names: string[]; items: number }> {
+        const missing = this.filesGone() ? this.filesMissing() : null;
+        if (missing === null || missing.names.length === 0) {
+            throw new FilesMissingRefused(`Nothing is missing from ${this.localRoot()}`);
+        }
+        this.missingConfirmed = { root: missing.root, names: new Set(missing.names) };
+        this.endFilesHold();
+        const details = `The ${missing.items} item(s) missing from ${missing.root} (${missing.names.join(', ')}) were deleted on purpose: they go to the Proton Drive trash`;
+        this.logger.warn(details);
+        this.stateDb.logActivity({ action: 'sync', localRelPath: '/', details });
+        void this.reconcileNow();
+        return missing;
     }
 
     // What would make something in the local root is refused while the files are missing from it
@@ -578,6 +657,8 @@ export class ProtonDriveSyncEngine {
         if (this.filesGone()) {
             return; // Looked at again at the next pass
         }
+        // This pass takes the items the user confirmed as deleted for deletes, and uses the confirmation up
+        const confirmation = this.missingConfirmed;
 
         this.reconcileRunning = true;
         this.state = 'syncing';
@@ -640,6 +721,9 @@ export class ProtonDriveSyncEngine {
             });
         } finally {
             this.reconcileRunning = false;
+            if (confirmation !== null && this.missingConfirmed === confirmation) {
+                this.missingConfirmed = null;
+            }
             if (this.replayAfterPass) {
                 this.replayAfterPass = false;
                 void this.runReplay();
@@ -1650,6 +1734,9 @@ export class ProtonDriveSyncEngine {
     private async handleLocalFileChange(relPath: string): Promise<void> {
         if (this.holding() || !this.auth.isLoggedIn()) {
             return;
+        }
+        if (this.filesGone()) {
+            return; // Not a change to sync: the files are missing from the folder (see filesGone); the pass after catches up
         }
         await this.tracked(() => this.handleLocalFileChangeNow(relPath));
     }

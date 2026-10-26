@@ -168,6 +168,8 @@ export class SyncStateDatabase {
     // while it is read; what is stored is never rewritten by that (updateSettings writes only what it is given).
     // Checked once per stored value.
     private checkedIgnorePatterns: { raw: string | undefined; value: string[] } | null = null;
+    // recordedTopLevelNames, until the records change
+    private topLevelNames: string[] | null = null;
     private readonly warnedBadSettings = new Set<string>();
 
     private warnBadSetting(key: string, raw: string, what = 'not a valid value; using the default'): void {
@@ -268,6 +270,7 @@ export class SyncStateDatabase {
 
     // A record written for a path consumes the edit baseline there: the record is what it syncs by from then on
     upsertItem(item: Omit<SyncedItemRecord, 'updatedAt'> & { updatedAt?: number }): void {
+        this.topLevelNames = null;
         const updatedAt = item.updatedAt ?? Date.now();
         this.db.query('DELETE FROM drive_edit_baselines WHERE relPath = $relPath').run({ $relPath: item.localRelPath });
         this.db
@@ -318,15 +321,27 @@ export class SyncStateDatabase {
             .all() as SyncedItemRecord[];
     }
 
-    // The top-level names the records are under (the first segment of each path), each once
+    // The top-level names the records are under (the first segment of each path), each once, sorted. Kept until a record
+    // is added, removed or moved (every such write goes through this class).
     recordedTopLevelNames(): string[] {
-        const rows = this.db
-            .query(
-                `SELECT DISTINCT CASE WHEN instr(localRelPath, '/') > 0 THEN substr(localRelPath, 1, instr(localRelPath, '/') - 1)
-                     ELSE localRelPath END AS name FROM synced_items`,
-            )
-            .all() as Array<{ name: string }>;
-        return rows.map((row) => row.name);
+        if (this.topLevelNames === null) {
+            const rows = this.db
+                .query(
+                    `SELECT DISTINCT CASE WHEN instr(localRelPath, '/') > 0 THEN substr(localRelPath, 1, instr(localRelPath, '/') - 1)
+                         ELSE localRelPath END AS name FROM synced_items ORDER BY name`,
+                )
+                .all() as Array<{ name: string }>;
+            this.topLevelNames = rows.map((row) => row.name);
+        }
+        return [...this.topLevelNames];
+    }
+
+    // How many records are at a path and under it
+    countItemsUnder(localRelPath: string): number {
+        const row = this.db
+            .query(`SELECT COUNT(*) AS n FROM synced_items WHERE ${selfOrDescendantWhere('localRelPath')}`)
+            .get(selfOrDescendant(localRelPath)) as { n: number };
+        return row.n;
     }
 
     // The record at a path and every record under it.
@@ -337,6 +352,7 @@ export class SyncStateDatabase {
     }
 
     removeItemByPath(localRelPath: string): void {
+        this.topLevelNames = null;
         this.db.query(`DELETE FROM synced_items WHERE ${selfOrDescendantWhere('localRelPath')}`).run(selfOrDescendant(localRelPath));
     }
 
@@ -353,6 +369,7 @@ export class SyncStateDatabase {
         if (toRel.startsWith(`${fromRel}/`)) {
             throw new Error(`Can't move ${fromRel} into itself`);
         }
+        this.topLevelNames = null;
         this.db.transaction(() => {
             if (this.hasItemsUnder(toRel)) {
                 throw new Error(`Already recorded: ${toRel}`);
@@ -427,6 +444,7 @@ export class SyncStateDatabase {
         if (existing) {
             this.removeItemByPath(existing.localRelPath);
         } else {
+            this.topLevelNames = null;
             this.db.query('DELETE FROM synced_items WHERE nodeUid = $nodeUid').run({ $nodeUid: nodeUid });
         }
     }
