@@ -444,6 +444,40 @@ describe('moveToLayout: plain to virtual', () => {
         expect(s.logs.some((l) => l.startsWith('warn') && l.includes(s.syncDir))).toBe(true);
     });
 
+    test('a missing sync folder is an empty source even when the store already holds something', async () => {
+        const s = setup();
+        rmSync(s.syncDir, { recursive: true });
+        s.put(path.join(s.backingDir, 'leftover.txt'), 'left in the store');
+        expect(await s.move('virtual')).toBe('moved');
+        expect(modeOf(s.syncDir)).toBe(0o555);
+        expect(readFileSync(path.join(s.backingDir, 'leftover.txt'), 'utf8')).toBe('left in the store');
+    });
+
+    test('a destination that folds case refuses names that differ only in case, before anything moves, naming them', async () => {
+        const s = setup();
+        s.put(path.join(s.syncDir, 'Docs', 'Report.txt'), 'one');
+        s.put(path.join(s.syncDir, 'Docs', 'report.txt'), 'two');
+        s.put(path.join(s.syncDir, 'fine.txt'), 'fine');
+        const before = snapshot(s.syncDir);
+        const folds: MoveSeams = { destinationFoldsCase: () => true };
+        await expect(s.move('virtual', folds)).rejects.toThrow(/differ only in case.*Docs\/(Report|report)\.txt/);
+        expect(snapshot(s.syncDir)).toEqual(before);
+        expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBeNull();
+        // The same tree to a destination that keeps case moves
+        expect(await s.move('virtual')).toBe('moved');
+        expect(readdirSync(path.join(s.backingDir, 'Docs')).sort()).toEqual(['Report.txt', 'report.txt']);
+    });
+
+    test('the probes it makes at the destination are gone after the move, either way', async () => {
+        const s = setup();
+        s.fillTree(s.syncDir);
+        const probes = (dir: string) => readdirSync(dir).filter((n) => n.startsWith('.proton-drive-tmp-move-'));
+        expect(await s.move('virtual')).toBe('moved');
+        expect(probes(s.backingDir)).toEqual([]);
+        expect(await s.move('plain', { moveSameDisk: () => { throw exdev(); } })).toBe('moved');
+        expect(probes(s.syncDir)).toEqual([]);
+    });
+
     test('a missing sync folder is an empty one: it is created as the 0555 mount point', async () => {
         const s = setup();
         rmSync(s.syncDir, { recursive: true });

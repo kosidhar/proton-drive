@@ -62,6 +62,8 @@ export interface MoveSeams {
     setTimes?: (p: Buffer, atimeSec: number, mtimeSec: number) => void;
     // fsync of a folder whose entries changed, before the move is recorded as done
     fsyncDir?: (dir: Buffer) => void;
+    // Whether the destination takes two names that differ only in case for one (FAT, exFAT); probed otherwise
+    destinationFoldsCase?: () => boolean;
     deviceOf?: (p: string) => number;
     readMountInfo?: () => string;
     onStep?: (step: MoveStep, path: string) => void;
@@ -127,6 +129,7 @@ export async function moveToLayout(opts: {
     if (target === 'plain') {
         chmodSync(syncDir, 0o755); // the drive's mount point is 0555 while unmounted
     }
+    refuseCaseClashes(from, to, seams, logger);
     stateDb.setMeta(LAYOUT_MOVING, target);
     const mover = new Mover({ stateDb, logger, now: opts.now ?? new Date(), allowCopy: target === 'plain', seams, from, to });
     const left = existsSync(from) ? mover.moveAll() : [];
@@ -171,6 +174,7 @@ export async function relocateFiles(opts: {
         throw new Error(emptyFolderNeeded(to));
     }
     mkdirSync(to, { recursive: true });
+    refuseCaseClashes(from, to, opts.seams ?? {}, logger);
     stateDb.setMeta(SYNC_DIR_MOVING, JSON.stringify({ from, to }));
     const mover = new Mover({ stateDb, logger, now: opts.now ?? new Date(), allowCopy: true, seams: opts.seams ?? {}, from, to });
     const left = existsSync(from) ? mover.moveAll() : [];
@@ -232,9 +236,59 @@ function refuseIfMounted(syncDir: string, readInfo: () => string): void {
     }
 }
 
+// A destination that takes two names differing only in case for one (FAT, exFAT) can't hold both: the second would
+// take the first's place. Such names are refused, before anything moves, naming them.
+function refuseCaseClashes(from: string, to: string, seams: MoveSeams, logger: Logger): void {
+    if (!existsSync(from) || !(seams.destinationFoldsCase ?? (() => foldsCase(to)))()) return;
+    const clashes = caseClashes(from);
+    if (clashes.length > 0) {
+        const message = `${to} doesn't tell apart names that differ only in case, and ${from} holds such names: ${clashes.join('; ')}. Rename them first`;
+        logger.warn(message);
+        throw new Error(message);
+    }
+}
+
+// Made under one case, looked for under another
+function foldsCase(dir: string): boolean {
+    const probe = joinBytes(Buffer.from(dir), Buffer.from(`${COPY_PREFIX}case-probe`));
+    try {
+        removeOwnCopy(probe);
+        closeSync(openSync(probe, 'wx', 0o600));
+        return lstatSync(joinBytes(Buffer.from(dir), Buffer.from(`${COPY_PREFIX}case-probe`.toUpperCase())), { throwIfNoEntry: false }) !== undefined;
+    } catch {
+        return false;
+    } finally {
+        try {
+            removeOwnCopy(probe);
+        } catch {
+            // left for the next probe
+        }
+    }
+}
+
+// Names in one folder that differ only in case, anywhere in the tree (the first few)
+function caseClashes(root: string): string[] {
+    const found: string[] = [];
+    const walk = (dir: Buffer, rel: string) => {
+        const seen = new Map<string, string>();
+        for (const name of readdirSync(dir, { encoding: 'buffer' })) {
+            const text = name.toString();
+            const relPath = rel ? `${rel}/${text}` : text;
+            const folded = text.toLowerCase();
+            const other = seen.get(folded);
+            if (other !== undefined && found.length < 10) found.push(`${other} and ${relPath}`);
+            seen.set(folded, relPath);
+            const full = joinBytes(dir, name);
+            if (lstatSync(full).isDirectory()) walk(full, relPath);
+        }
+    };
+    walk(Buffer.from(root), '');
+    return found;
+}
+
 // The sync folder's top-level names that the store holds too
 function takenNames(syncDir: string, backingDir: string): string[] {
-    if (!existsSync(backingDir)) return [];
+    if (!existsSync(backingDir) || !existsSync(syncDir)) return []; // a missing sync folder is an empty one
     const store = Buffer.from(backingDir);
     return readdirSync(syncDir, { encoding: 'buffer' })
         .filter((name) => lstatSync(joinBytes(store, name), { throwIfNoEntry: false }))
