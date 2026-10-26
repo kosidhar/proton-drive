@@ -47,6 +47,7 @@ Proton Drive shows up in your file manager's sidebar as **Proton Drive**. It lis
 - **Eject and mount again:** Eject in Files unmounts the drive. **Mount again** in the app's Settings, or **Mount Proton Drive** in the tray, brings it back.
 - **Plain folder fallback:** Proton Drive stays an ordinary folder when FUSE isn't available (no `/dev/fuse`, no `fusermount3`, no helper, or the Flatpak build), when the switch **Show online-only files in Files (virtual drive)** in Settings is off, or when the sync folder is on a different disk from `~/.local/share` (Settings shows the reason).
 - **Changing the sync folder** needs an empty or new folder. If a move stops partway (for example, a full disk), Settings lets you finish it, move it back or retry.
+- **Switch the virtual drive off in Settings before uninstalling or installing an older version.** While it is on, your files live in the hidden store: an uninstall leaves them there, and an older version, which knows nothing of the store, takes the empty folder for files you deleted and moves them to the Proton Drive trash. Switching it off moves them back into your sync folder first.
 - **Runtime dependency:** `fuse3` (the `.deb`, `.rpm` and Arch packages pull it in). Moving files to the desktop Trash uses `gio` (`libglib2.0-bin` / `glib2`).
 
 ---
