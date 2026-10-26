@@ -4,13 +4,15 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { DriveOpError } from '../sync/driveOps';
-import type { AvailabilityAction, ProtonDriveSyncEngine } from '../sync/syncEngine';
+import { type AvailabilityAction, ConflictRefusedError, type ProtonDriveSyncEngine } from '../sync/syncEngine';
+import type { ConflictRecord } from '../sync/syncStateDb';
 import type { DriveMoveAction } from './vfsSupervisor';
 
 // Pin, free, hide and unhide change what is on disk, and so do the virtual drive's hydrate, rename and delete, so they
 // are reachable only through this user-only Unix socket and never through the unauthenticated TCP API.
 
 const ACTIONS: readonly string[] = ['pin', 'free', 'hide', 'unhide'] satisfies AvailabilityAction[];
+const CONFLICT_CHOICES: readonly string[] = ['keep-both', 'keep-local', 'keep-remote'];
 const MOVE_ACTIONS: readonly string[] = ['finish', 'move-back', 'retry'] satisfies DriveMoveAction[];
 
 export function defaultControlSocketPath(): string {
@@ -38,6 +40,9 @@ export interface ControlServerOptions {
     // Sign in (starts the browser sign-in and answers its URL, with what the app must show) and sign out
     login?: () => Promise<{ signInUrl: string } & Record<string, unknown>>;
     logout?: () => Promise<void>;
+    // Resolve a conflict by hand (see ProtonDriveSyncEngine.resolveConflictManually); throws ConflictRefusedError for an
+    // unknown or already resolved one
+    resolveConflict?: (id: number, choice: 'keep-both' | 'keep-local' | 'keep-remote') => Promise<ConflictRecord>;
 }
 
 // 'live' when something accepts connections on the socket, 'stale' when it refuses or is gone
@@ -239,6 +244,29 @@ async function authRoute(req: Request, route: string, opts: ControlServerOptions
     }
 }
 
+// POST /conflicts/resolve {id, choice: 'keep-both' | 'keep-local' | 'keep-remote'}: overwrites the local or the cloud
+// copy as chosen. 200 { ok: true, conflict }; 400 { error, code: 'EINVAL' } for a malformed request; 404 { error, code:
+// 'ENOENT' } for an unknown conflict; 409 { error, code: 'EEXIST' } for one already resolved, which is never acted on
+// again; 500 { error, code: 'EIO' } when resolving failed. Never reachable from the TCP API.
+async function resolveConflictRoute(req: Request, resolveConflict: ControlServerOptions['resolveConflict']): Promise<Response> {
+    const invalid = (message: string) => Response.json({ error: message, code: 'EINVAL' }, { status: 400 });
+    if (req.method !== 'POST') return jsonError('Method not allowed', 405);
+    if (!resolveConflict) return jsonError('Not found', 404);
+    const body = await jsonBody(req);
+    if (!body) return invalid('Invalid JSON body');
+    const { id, choice } = body;
+    if (typeof id !== 'number' || !Number.isSafeInteger(id)) return invalid('id must be the number of a conflict');
+    if (typeof choice !== 'string' || !CONFLICT_CHOICES.includes(choice)) return invalid(`choice must be one of ${CONFLICT_CHOICES.join(', ')}`);
+    try {
+        return Response.json({ ok: true, conflict: await resolveConflict(id, choice as 'keep-both' | 'keep-local' | 'keep-remote') });
+    } catch (err) {
+        if (err instanceof ConflictRefusedError) {
+            return Response.json({ error: err.message, code: err.status === 404 ? 'ENOENT' : 'EEXIST' }, { status: err.status });
+        }
+        return Response.json({ error: messageOf(err), code: 'EIO' }, { status: 500 });
+    }
+}
+
 export async function startControlServer(opts: ControlServerOptions): Promise<{ stop(): void }> {
     const { socketPath, engine } = opts;
     const dir = path.dirname(socketPath);
@@ -266,6 +294,9 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
             }
             if (url.pathname === '/auth/login' || url.pathname === '/auth/logout') {
                 return authRoute(req, url.pathname, opts);
+            }
+            if (url.pathname === '/conflicts/resolve') {
+                return resolveConflictRoute(req, opts.resolveConflict);
             }
             if (url.pathname === '/drive/settings') {
                 return driveSettingsRoute(req, opts.driveSettings);

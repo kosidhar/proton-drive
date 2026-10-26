@@ -5,6 +5,7 @@
 const REFUSED: ReadonlyMap<string, string> = new Map([
     ['/api/auth/login', 'Sign in and out from the Proton Drive app'],
     ['/api/auth/logout', 'Sign in and out from the Proton Drive app'],
+    ['/api/conflicts/resolve', 'Resolve conflicts from the Proton Drive app'],
 ]);
 
 // 403 { error, code: 'EACCES' } for a POST to a route that moved to the control socket, null for anything else

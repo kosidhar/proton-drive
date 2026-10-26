@@ -413,15 +413,6 @@ export async function startSyncDaemon(options: {
                     return Response.json(conflicts);
                 }
 
-                if (req.method === 'POST' && pathname === '/api/conflicts/resolve') {
-                    const body = (await req.json()) as {
-                        id: number;
-                        choice: 'keep-both' | 'keep-local' | 'keep-remote';
-                    };
-                    const resolved = await engine.resolveConflictManually(Number(body.id), body.choice);
-                    return Response.json({ ok: true, conflict: resolved });
-                }
-
                 if (req.method === 'POST' && pathname === '/api/settings') {
                     return settingsRoute(req, { stateDb, drive, engine });
                 }
@@ -529,6 +520,7 @@ export async function startSyncDaemon(options: {
             driveSettings: (change) => driveSettings(change, { stateDb, drive, engine }),
             login: signIn,
             logout: signOut,
+            resolveConflict: (id, choice) => engine.resolveConflictManually(id, choice),
         });
     } catch (err) {
         runtime.logger.error(`Control socket unavailable, availability actions are disabled: ${String(err)}`);

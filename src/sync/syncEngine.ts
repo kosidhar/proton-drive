@@ -82,6 +82,18 @@ const SLOW_DOWNLOAD_NOTICE_MS = 2000;
 const HYDRATE_STAGING_PREFIX = '.proton-drive-tmp-hydrate-';
 // What everything that would touch the files answers while they move between the sync folder and the backing store
 const BUSY_MOVING = 'Proton Drive is busy moving files';
+
+// A conflict that can't be resolved now: 404 when there is no such conflict, 409 when it is already resolved (or being
+// resolved), so that resolving never acts twice
+export class ConflictRefusedError extends Error {
+    constructor(
+        readonly status: 404 | 409,
+        message: string,
+    ) {
+        super(message);
+        this.name = 'ConflictRefusedError';
+    }
+}
 // How long moving the sync folder waits for what the engine is doing (an upload, a download) before giving up
 const RELOCATE_HOLD_TIMEOUT_MS = 60_000;
 
@@ -156,6 +168,8 @@ export class ProtonDriveSyncEngine {
     // inFlight counts what started before, which the move waits for
     private held = false;
     private inFlight = 0;
+    // Conflicts being resolved by hand right now, so that a second request for the same one is refused
+    private readonly resolvingConflicts = new Set<number>();
 
     constructor(
         private readonly sdk: ProtonDriveClient,
@@ -940,9 +954,25 @@ export class ProtonDriveSyncEngine {
     ): Promise<ConflictRecord> {
         const conflict = this.stateDb.getConflictById(conflictId);
         if (!conflict) {
-            throw new Error(`Conflict #${conflictId} not found`);
+            throw new ConflictRefusedError(404, `Conflict #${conflictId} not found`);
         }
-        const settings = this.stateDb.getSettings();
+        if (conflict.resolved || this.resolvingConflicts.has(conflictId)) {
+            throw new ConflictRefusedError(409, `Conflict #${conflictId} is already resolved`);
+        }
+        this.resolvingConflicts.add(conflictId);
+        try {
+            await this.resolveUnresolvedConflict(conflict, choice);
+        } finally {
+            this.resolvingConflicts.delete(conflictId);
+        }
+        return this.stateDb.getConflictById(conflictId)!;
+    }
+
+    private async resolveUnresolvedConflict(
+        conflict: ConflictRecord,
+        choice: 'keep-both' | 'keep-local' | 'keep-remote',
+    ): Promise<void> {
+        const conflictId = conflict.id;
         const localFullPath = path.join(this.localRoot(), conflict.localRelPath);
         const remoteMap = new Map<string, NodeEntity>();
 
@@ -963,8 +993,6 @@ export class ProtonDriveSyncEngine {
                 this.stateDb.markConflictResolved(conflictId, 'keep-both', conflictCopyRelPath);
             }
         });
-
-        return this.stateDb.getConflictById(conflictId)!;
     }
 
     private async downloadRemoteToLocal(
