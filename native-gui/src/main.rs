@@ -493,10 +493,49 @@ fn control_socket_path_from(xdg_runtime_dir: Option<std::ffi::OsString>, tmp: st
     }
 }
 
-fn control_socket_path() -> std::path::PathBuf {
+/// The temp dir as the daemon's Node os.tmpdir() finds it: $TMPDIR, else $TMP, else $TEMP, else /tmp, without a
+/// trailing slash.
+fn node_tmpdir(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = ["TMPDIR", "TMP", "TEMP"]
+        .iter()
+        .find_map(|name| var(name).filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| "/tmp".into());
+    let bytes = tmp.as_bytes();
+    if bytes.len() > 1 && bytes.ends_with(b"/") {
+        return std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..bytes.len() - 1]));
+    }
+    std::path::PathBuf::from(tmp)
+}
+
+fn own_uid() -> u32 {
     use std::os::unix::fs::MetadataExt;
-    let uid = std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(0);
-    control_socket_path_from(std::env::var_os("XDG_RUNTIME_DIR"), std::env::temp_dir(), uid)
+    std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(0)
+}
+
+fn control_socket_path() -> std::path::PathBuf {
+    control_socket_path_from(std::env::var_os("XDG_RUNTIME_DIR"), node_tmpdir(|name| std::env::var_os(name)), own_uid())
+}
+
+/// Why the folder holding the control socket can't be trusted, or None. The daemon makes it a 0700 folder of the
+/// user's; one that is missing just means no daemon runs (connecting then fails).
+fn socket_dir_problem(socket: &std::path::Path, uid: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = socket.parent().unwrap_or(std::path::Path::new("/"));
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(format!("Can't check the Proton Drive control socket's folder {} ({e})", dir.display())),
+    };
+    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+        return Some(format!(
+            "The Proton Drive control socket's folder {} isn't private to you (owner {}, mode {:o}); not connecting to it",
+            dir.display(),
+            meta.uid(),
+            meta.mode() & 0o7777
+        ));
+    }
+    None
 }
 
 /// One HTTP/1.1 request to the daemon's user-only control socket. Pin, free, hide and unhide go
@@ -528,6 +567,9 @@ fn control_request_at(
     // Every request on the socket goes through here: a screenshot never calls it, so it can't change anything
     if SCREENSHOT_MODE.load(AtomicOrdering::SeqCst) {
         return Err("Screenshots never call the Proton Drive background service".to_string());
+    }
+    if let Some(problem) = socket_dir_problem(socket, own_uid()) {
+        return Err(problem);
     }
     let mut stream =
         std::os::unix::net::UnixStream::connect(socket).map_err(|e| format!("{UNREACHABLE} ({e})"))?;
@@ -5660,11 +5702,82 @@ mod tests {
         assert_eq!(control_socket_path(), std::path::PathBuf::from("/run/user/4242/protondrive/control.sock"));
     }
 
+    // Final review M-5: the same temp dir rule as the daemon and the tray (Node's os.tmpdir())
+    #[test]
+    fn the_tmp_fallback_reads_tmpdir_then_tmp_then_temp_as_the_daemon_does() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| std::ffi::OsString::from(v))
+        };
+        assert_eq!(node_tmpdir(env(&[])), std::path::PathBuf::from("/tmp"));
+        assert_eq!(node_tmpdir(env(&[("TMPDIR", "/var/tmp/me/")])), std::path::PathBuf::from("/var/tmp/me"));
+        assert_eq!(node_tmpdir(env(&[("TMP", "/scratch")])), std::path::PathBuf::from("/scratch"));
+        assert_eq!(node_tmpdir(env(&[("TEMP", "/t")])), std::path::PathBuf::from("/t"));
+        assert_eq!(node_tmpdir(env(&[("TMP", "/a"), ("TEMP", "/b")])), std::path::PathBuf::from("/a"));
+        assert_eq!(node_tmpdir(env(&[("TMPDIR", ""), ("TMP", "/a")])), std::path::PathBuf::from("/a"));
+        assert_eq!(node_tmpdir(env(&[("TMPDIR", "/")])), std::path::PathBuf::from("/"));
+        assert_eq!(
+            control_socket_path_from(None, node_tmpdir(env(&[("TEMP", "/t/")])), 7),
+            std::path::PathBuf::from("/t/protondrive-7/control.sock")
+        );
+    }
+
+    /// A fresh folder of the user's, mode 0700 as the daemon makes it, for test sockets
+    fn private_dir(name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("{name}-{}-{:?}", std::process::id(), thread::current().id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    // Final review M-5: in the /tmp fallback anyone can make that folder first; the daemon's is the user's and 0700
+    #[test]
+    fn a_socket_folder_that_is_not_private_to_the_user_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = own_uid();
+        let dir = private_dir("pd-gui-sockdir");
+        let sock = dir.join("control.sock");
+        assert_eq!(socket_dir_problem(&sock, uid), None);
+        // Missing: no daemon runs, which connecting says
+        assert_eq!(socket_dir_problem(&dir.join("missing").join("control.sock"), uid), None);
+        for mode in [0o755, 0o770, 0o701, 0o1777] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            let problem = socket_dir_problem(&sock, uid).unwrap_or_default();
+            assert!(problem.contains(dir.to_str().unwrap()), "mode {mode:o}: {problem}");
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Another user's folder (root's), and the right uid that isn't the owner
+        assert!(socket_dir_problem(std::path::Path::new("/control.sock"), uid).is_some());
+        assert!(socket_dir_problem(&sock, uid.wrapping_add(1)).is_some());
+        // A link to a folder, or a file, isn't the daemon's folder either
+        let link = dir.with_extension("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(socket_dir_problem(&link.join("control.sock"), uid).is_some());
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn control_request_never_connects_through_a_folder_others_can_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = private_dir("pd-gui-open");
+        let sock = dir.join("c.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = control_request_at(&sock, "POST", "/vfs/mount", Some(&serde_json::json!({})), SHORT).unwrap_err();
+        assert!(err.contains("isn't private"), "{err}");
+        assert!(listener.accept().is_err(), "nothing connected");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Serves one canned HTTP reply on a fresh socket; returns the socket path and the request it saw.
     fn serve_once(reply: &'static [u8]) -> (std::path::PathBuf, thread::JoinHandle<String>) {
         use std::io::{Read, Write};
-        let dir = std::env::temp_dir().join(format!("pd-gui-test-{}-{:?}", std::process::id(), thread::current().id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = private_dir("pd-gui-test");
         let sock = dir.join(format!("c{}.sock", reply.len()));
         let _ = std::fs::remove_file(&sock);
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
@@ -5734,8 +5847,7 @@ mod tests {
 
     #[test]
     fn control_request_timeout_means_still_working_not_unreachable() {
-        let dir = std::env::temp_dir().join(format!("pd-gui-timeout-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = private_dir("pd-gui-timeout");
         let sock = dir.join("slow.sock");
         let _ = std::fs::remove_file(&sock);
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();

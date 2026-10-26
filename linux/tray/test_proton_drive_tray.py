@@ -6,8 +6,10 @@ Run: python3 linux/tray/test_proton_drive_tray.py
 import importlib.util
 import json
 import os
+import shutil
 import socket
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -71,6 +73,49 @@ class ControlSocketPathTest(unittest.TestCase):
             tray.control_socket_path({"TMPDIR": "/var/tmp/me/"}, uid=7), "/var/tmp/me/protondrive-7/control.sock"
         )
         self.assertEqual(tray.control_socket_path({"TMP": "/scratch"}, uid=7), "/scratch/protondrive-7/control.sock")
+
+
+class SocketFolderTest(unittest.TestCase):
+    """Final review M-5: in the /tmp fallback anyone can make the socket's folder first; the daemon's is the user's
+    and 0700, and the tray never connects through any other."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="pd-tray-")
+        os.chmod(self.dir, 0o700)
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.addCleanup(os.chmod, self.dir, 0o700)
+        self.sock = os.path.join(self.dir, "control.sock")
+
+    def test_only_a_private_folder_of_the_users_is_trusted(self):
+        uid = os.getuid()
+        self.assertIsNone(tray.socket_dir_problem(self.sock, uid))
+        # Missing: no daemon runs, which connecting says
+        self.assertIsNone(tray.socket_dir_problem(os.path.join(self.dir, "missing", "control.sock"), uid))
+        for mode in (0o755, 0o770, 0o701, 0o1777):
+            os.chmod(self.dir, mode)
+            self.assertIn(self.dir, tray.socket_dir_problem(self.sock, uid) or "", oct(mode))
+        os.chmod(self.dir, 0o700)
+        self.assertIsNotNone(tray.socket_dir_problem("/control.sock", uid))  # root's
+        self.assertIsNotNone(tray.socket_dir_problem(self.sock, uid + 1))
+        link = self.dir + ".link"
+        os.symlink(self.dir, link)
+        self.addCleanup(os.remove, link)
+        self.assertIsNotNone(tray.socket_dir_problem(os.path.join(link, "control.sock"), uid))
+
+    def test_never_connects_through_a_folder_others_can_write(self):
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        server.bind(self.sock)
+        server.listen(1)
+        server.setblocking(False)
+        os.chmod(self.dir, 0o777)
+        with self.assertRaises(tray.ControlError) as refused:
+            tray.connect_control_socket(self.sock)
+        self.assertIn("isn't private", str(refused.exception))
+        with self.assertRaises(BlockingIOError):
+            server.accept()  # nothing connected
+        os.chmod(self.dir, 0o700)
+        tray.connect_control_socket(self.sock).close()
 
 
 class RequestTest(unittest.TestCase):

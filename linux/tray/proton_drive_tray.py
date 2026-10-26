@@ -8,6 +8,7 @@ import json
 import os
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -95,11 +96,34 @@ def parse_response(raw: bytes) -> dict:
     raise ControlError(f"The Proton Drive background service answered {status}")
 
 
-def connect_control_socket() -> socket.socket:
+def socket_dir_problem(socket_path: str, uid=None):
+    """Why the folder holding the control socket can't be trusted, or None. The daemon makes it a 0700 folder of the
+    user's; in the /tmp fallback anyone could make it first. One that is missing just means no daemon runs."""
+    directory = os.path.dirname(socket_path) or "/"
+    try:
+        st = os.lstat(directory)
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        return f"Can't check the Proton Drive control socket's folder {directory} ({err})"
+    uid = os.getuid() if uid is None else uid
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or st.st_mode & 0o077:
+        return (
+            f"The Proton Drive control socket's folder {directory} isn't private to you "
+            f"(owner {st.st_uid}, mode {st.st_mode & 0o7777:o}); not connecting to it"
+        )
+    return None
+
+
+def connect_control_socket(path=None) -> socket.socket:
+    path = control_socket_path() if path is None else path
+    problem = socket_dir_problem(path)
+    if problem:
+        raise ControlError(problem)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(CONTROL_CONNECT_TIMEOUT)
     try:
-        sock.connect(control_socket_path())
+        sock.connect(path)
     except OSError:
         sock.close()
         raise
