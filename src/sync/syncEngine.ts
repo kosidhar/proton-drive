@@ -2694,15 +2694,17 @@ export class ProtonDriveSyncEngine {
     // The remote index as it will be once the pending operations reach Proton Drive, so listings show the result at once
     // (spec §5.2), whatever a listing of the cloud put back meanwhile:
     // - a node deleted here is left out;
-    // - a renamed or moved node is at its new path, unless the cloud has another node there (then it stays where the
-    //   cloud has it, and is no longer anything at that path here: see liveIndexEntry);
+    // - a renamed or moved node is at its new path, unless the cloud has another node there or its folder isn't there
+    //   (then it stays where it was, if that is still free, or is left out until a listing puts it back; either way it
+    //   is no longer anything at that path here: see liveIndexEntry);
     // - a folder made here that Proton Drive doesn't have yet is a provisional entry holding what was moved into it.
     // Nothing the cloud has is removed for it but what was deleted here, and provisional entries go once no pending move
     // needs them. `kept` has the entries of nodes a write just dropped, to put back at their new paths.
-    // Deletes go first, as the name one frees can be what a rename takes; then each node's latest rename or move,
-    // folders before what goes in them. A move's target is where the item is here now, which a later rename of a folder
-    // above takes along (see RemoteOpsJournal.retarget): in journal order the item would go first, into a provisional
-    // folder made up for that path, which would then keep the renamed folder (and all else in it) from its new path.
+    // Deletes go first, as the name one frees can be what a rename takes. Then every node with a pending rename or move
+    // that isn't in place yet is taken out of the tree, with what is under it, so that none is in the way of another (a
+    // name one frees can be what another takes, at any depth, or two can swap names), and each goes to the target of
+    // its latest operation, folders before what goes in them: targets are where the items are here now, which a later
+    // rename of a folder above takes along (see RemoteOpsJournal.retarget).
     private applyPendingOpsToIndex(kept = new Map<string, RemoteIndexEntry[]>()): void {
         try {
             this.stateDb.connection.transaction(() => {
@@ -2716,15 +2718,39 @@ export class ProtonDriveSyncEngine {
                 const moves = [...latest.values()]
                     .filter((op): op is Exclude<RemoteOp, { kind: 'trash' }> => op.kind !== 'trash')
                     .sort((a, b) => depthOf(a.toPath) - depthOf(b.toPath) || a.id - b.id);
+                // In place: at its target, in the folder the cloud has there (one in a folder made here is placed afresh,
+                // as a node renamed to that folder's name may take its place)
+                const was = new Map<string, string>();
+                for (const op of moves) {
+                    const entry = this.index.getByUid(op.nodeUid);
+                    if (!entry) {
+                        continue;
+                    }
+                    was.set(op.nodeUid, entry.relPath);
+                    const parent = entry.parentUid ? this.index.getByUid(entry.parentUid) : null;
+                    const inPlace =
+                        entry.relPath === op.toPath &&
+                        parent !== null &&
+                        !isProvisional(parent.uid) &&
+                        parent.relPath === parentOf(op.toPath);
+                    if (!inPlace) {
+                        this.index.detach(op.nodeUid);
+                    }
+                }
                 const needed = new Set<string>();
+                const stuck: RemoteIndexEntry[] = [];
                 for (const op of moves) {
                     const parent = this.indexedFolderFor(parentOf(op.toPath), needed);
                     const occupant = this.index.getByPath(op.toPath);
-                    if (!parent || (occupant && occupant.uid !== op.nodeUid)) {
+                    const entry = this.index.getByUid(op.nodeUid);
+                    // A provisional folder at the target is only a stand-in for what goes there
+                    if (!parent || (occupant && occupant.uid !== op.nodeUid && !isProvisional(occupant.uid))) {
+                        if (entry) {
+                            stuck.push(entry);
+                        }
                         continue;
                     }
                     const name = path.posix.basename(op.toPath);
-                    const entry = this.index.getByUid(op.nodeUid);
                     if (entry) {
                         if (entry.relPath !== op.toPath || entry.parentUid !== parent.uid) {
                             this.index.upsert({ ...entry, parentUid: parent.uid, relPath: op.toPath, name });
@@ -2737,6 +2763,19 @@ export class ProtonDriveSyncEngine {
                         for (const e of below) {
                             this.index.upsert({ ...e, relPath: op.toPath + e.relPath.slice(top.relPath.length) });
                         }
+                    }
+                }
+                // One that can't go to its target goes back where it was, folders before what was in them, unless another
+                // has taken that place
+                stuck.sort((a, b) => depthOf(was.get(a.uid) ?? '') - depthOf(was.get(b.uid) ?? ''));
+                for (const entry of stuck) {
+                    const parent = entry.parentUid ? this.index.getByUid(entry.parentUid) : null;
+                    const back = parent && !this.index.isDetached(parent) ? joinRel(parent.relPath, entry.name) : null;
+                    const there = back === null ? null : this.index.getByPath(back);
+                    if (back !== null && (!there || there.uid === entry.uid)) {
+                        this.index.upsert({ ...entry, relPath: back });
+                    } else {
+                        this.index.removeSubtree(entry.uid);
                     }
                 }
                 for (const uid of this.index.uidsWithPrefix(PROVISIONAL)) {

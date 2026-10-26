@@ -4911,5 +4911,173 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(cloudNamesInDocs(d)).toEqual(['a2.txt', 'b.txt']);
             });
         });
+
+        // S25: every pending move is shown at once, none in another's way, so a name one frees is free for another
+        // whatever the order or depth (#26: a swap through a temporary name used to leave both files out of listings)
+        describe('pending moves that free names and take them', () => {
+            // Offline, with a sync pass after: its listing puts every item back where Proton Drive still has it
+            const offlineThenListed = async (d: ReturnType<typeof setup>, moves: Array<[string, string]>) => {
+                await d.engine.reconcileNow();
+                d.down.add('moveNodes');
+                d.down.add('renameNode');
+                for (const [from, to] of moves) {
+                    await d.engine.renameItem(from, to);
+                }
+                await d.engine.reconcileNow();
+            };
+            const names = (d: ReturnType<typeof setup>, rel: string) => d.engine.vfsChildren(rel).map((e) => e.name);
+
+            for (const variant of ['from another folder', 'in the same folder'] as const) {
+                test(`a name freed by a move into a folder, then taken by a move up (${variant}), is the new item's after a listing`, async () => {
+                    const d = setup();
+                    d.add('b.txt', 'B');
+                    d.add('X/keep.txt', 'k');
+                    const from = variant === 'from another folder' ? 'Y/a.txt' : 'a.txt';
+                    const aUid = d.add(from, 'A').uid;
+
+                    await offlineThenListed(d, [
+                        ['b.txt', 'X/b.txt'],
+                        [from, 'b.txt'],
+                    ]);
+
+                    const index = d.engine.remoteIndex;
+                    expect(index.getByPath('b.txt')?.uid).toBe(aUid);
+                    expect(index.getByPath('X/b.txt')?.uid).toBe('vol~b.txt');
+                    expect(names(d, '')).toEqual(variant === 'from another folder' ? ['X', 'Y', 'b.txt'] : ['X', 'b.txt']);
+                    expect(names(d, 'X')).toEqual(['b.txt', 'keep.txt']);
+                    await d.engine.deleteItem('b.txt');
+                    expect(d.journal().filter((op) => op.kind === 'trash')).toMatchObject([{ nodeUid: aUid }]);
+                    d.down.clear();
+                    await d.engine.replayRemoteOps();
+                    expect(d.journal()).toEqual([]);
+                    expect(d.calls.trashed).toEqual([[aUid]]);
+                    expect(d.nodes.get('vol~b.txt')?.parentUid).toBe('vol~X');
+                });
+            }
+
+            test('two files swapped through a temporary name keep their swapped names after a listing, and each deletes as itself', async () => {
+                const d = setup();
+                d.add('a.txt', 'A');
+                d.add('b.txt', 'B');
+                d.add('X/k.txt', 'k');
+
+                await offlineThenListed(d, [
+                    ['a.txt', 'tmp.txt'],
+                    ['b.txt', 'a.txt'],
+                    ['tmp.txt', 'b.txt'],
+                ]);
+
+                const index = d.engine.remoteIndex;
+                expect(index.getByPath('a.txt')?.uid).toBe('vol~b.txt');
+                expect(index.getByPath('b.txt')?.uid).toBe('vol~a.txt');
+                expect(index.getByPath('tmp.txt')).toBeNull();
+                expect(names(d, '')).toEqual(['X', 'a.txt', 'b.txt']);
+                await d.engine.deleteItem('a.txt');
+                await d.engine.deleteItem('b.txt');
+                expect(d.journal().filter((op) => op.kind === 'trash').map((op) => op.nodeUid)).toEqual(['vol~b.txt', 'vol~a.txt']);
+                d.down.clear();
+                await d.engine.replayRemoteOps();
+                expect(d.journal()).toEqual([]);
+                expect(d.calls.trashed).toEqual([['vol~b.txt'], ['vol~a.txt']]);
+                expect(d.calls.renamed).toEqual([]);
+            });
+
+            test('three files rotated through a temporary name each show, and open, as the file now at that name', async () => {
+                const d = setup();
+                d.add('a.txt', 'A');
+                d.add('b.txt', 'B');
+                d.add('c.txt', 'C');
+
+                await offlineThenListed(d, [
+                    ['a.txt', 'tmp.txt'],
+                    ['b.txt', 'a.txt'],
+                    ['c.txt', 'b.txt'],
+                    ['tmp.txt', 'c.txt'],
+                ]);
+
+                const index = d.engine.remoteIndex;
+                expect(['a.txt', 'b.txt', 'c.txt'].map((p) => index.getByPath(p)?.uid)).toEqual(['vol~b.txt', 'vol~c.txt', 'vol~a.txt']);
+                expect(names(d, '')).toEqual(['a.txt', 'b.txt', 'c.txt']);
+                await d.engine.hydrate('c.txt');
+                expect(await readFile(d.local('c.txt'), 'utf8')).toBe('A');
+                expect(stateDb.getItemByPath('c.txt')?.nodeUid).toBe('vol~a.txt');
+            });
+
+            test('an item whose new name another device took meanwhile does not keep a file renamed to its old name out of listings', async () => {
+                const d = setup();
+                d.add('a.txt', 'A');
+                d.add('b.txt', 'B');
+                await d.engine.reconcileNow();
+                d.down.add('renameNode');
+                await d.engine.renameItem('a.txt', 'x.txt');
+                await d.engine.renameItem('b.txt', 'a.txt');
+                d.add('x.txt', 'X'); // another device, before the renames reach Proton Drive
+                await d.engine.reconcileNow();
+
+                const index = d.engine.remoteIndex;
+                expect(index.getByPath('a.txt')?.uid).toBe('vol~b.txt');
+                expect(index.getByPath('x.txt')?.uid).toBe('vol~x.txt');
+                expect(names(d, '')).toEqual(['a.txt', 'x.txt']);
+                d.down.clear();
+                await d.engine.replayRemoteOps();
+                expect(d.journal()).toEqual([]);
+                expect(d.nameOf(d.nodes.get('vol~b.txt')!)).toBe('a.txt');
+                expect(d.nameOf(d.nodes.get('vol~a.txt')!)).toStartWith('x (conflict ');
+                expect(d.nodes.get('vol~x.txt')?.content).toBe('X');
+                expect(names(d, '').length).toBe(3);
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            // An older version showed the first rename of #22 in a provisional folder made up for Work, which then kept
+            // the renamed folder at Docs: the next change through the drive puts the folder in that stand-in's place
+            test('a provisional folder left where a renamed folder goes gives way to it', async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                d.add('Docs/b.txt', 'b');
+                d.add('other.txt', 'o');
+                await d.engine.reconcileNow();
+                await d.files.writeLocal('Docs/a.txt', 'a');
+                d.down.add('renameNode');
+                await d.engine.renameItem('Docs/a.txt', 'Docs/a2.txt');
+                await d.engine.renameItem('Docs', 'Work');
+                const index = d.engine.remoteIndex;
+                const stale = 'provisional:left-by-an-older-version';
+                index.upsert({ ...index.getByPath('Work')!, relPath: 'Docs', name: 'Docs' });
+                index.upsert({ uid: stale, parentUid: d.root.uid, relPath: 'Work', name: 'Work', type: 'folder', size: 0, mtimeMs: 0, sha1: null });
+                index.upsert({ ...index.getByUid('vol~Docs/a.txt')!, parentUid: stale, relPath: 'Work/a2.txt' });
+
+                await d.engine.deleteItem('other.txt');
+
+                expect(index.getByPath('Work')?.uid).toBe('vol~Docs');
+                expect(index.listChildren('Work').map((e) => e.uid)).toEqual(['vol~Docs/a.txt', 'vol~Docs/b.txt']);
+                expect(index.getByUid(stale)).toBeNull();
+                expect(index.getByPath('Docs')).toBeNull();
+            });
+
+            test('a folder deleted after a file was moved out of it trashes only the folder, and the file stays where it went', async () => {
+                const d = setup();
+                d.add('F/c.txt', 'C');
+                d.add('F/d.txt', 'D');
+                d.add('G/g.txt', 'g');
+                await d.engine.reconcileNow();
+                d.down.add('moveNodes');
+                d.down.add('trashNodes');
+
+                await d.engine.renameItem('F/c.txt', 'G/c.txt');
+                await d.engine.deleteItem('F');
+                await d.engine.reconcileNow();
+
+                const index = d.engine.remoteIndex;
+                expect(index.getByPath('G/c.txt')?.uid).toBe('vol~F/c.txt');
+                expect(index.getByPath('F')).toBeNull();
+                expect(names(d, '')).toEqual(['G']);
+                expect(names(d, 'G')).toEqual(['c.txt', 'g.txt']);
+                d.down.clear();
+                await d.engine.replayRemoteOps();
+                expect(d.journal()).toEqual([]);
+                expect(d.calls.trashed).toEqual([['vol~F']]);
+                expect(d.nodes.get('vol~F/c.txt')?.parentUid).toBe('vol~G');
+            });
+        });
     });
 });

@@ -39,6 +39,8 @@ export function entryFromNode(node: NodeEntity, parentRelPath: string): RemoteIn
 // Temporary home for moved children while replaceChildren sorts out the final paths; no real path starts with U+0001 (SQLite text
 // would also cut a NUL short).
 const PARKING = '\u0001moving';
+// Where detach takes a node out of the tree, the same way
+const DETACHED = '\u0001detached';
 
 // A persistent copy of the remote My files tree, keyed by node uid with a unique relative path ('' for the root).
 export class RemoteIndex {
@@ -132,6 +134,20 @@ export class RemoteIndex {
                  WHERE ${selfOrDescendantWhere('relPath')}`,
             )
             .run({ $newPath: newPath, $oldPath: oldPath, ...selfOrDescendant(oldPath) });
+    }
+
+    // Takes a node, with everything still under it, out of the tree for a moment: no lookup by path finds it there, and
+    // upsert puts it back. The caller puts back or removes every node it detached before it is done.
+    detach(uid: string): void {
+        const node = this.getByUid(uid);
+        const parked = `${DETACHED}/${uid}`;
+        if (node && node.relPath !== parked) {
+            this.relocate(node.relPath, parked);
+        }
+    }
+
+    isDetached(entry: RemoteIndexEntry): boolean {
+        return entry.relPath.startsWith(`${DETACHED}/`);
     }
 
     removeSubtree(uid: string): void {
