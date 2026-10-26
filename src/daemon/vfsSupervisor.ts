@@ -4,15 +4,10 @@ import {
     closeSync,
     constants,
     fchmodSync,
-    lstatSync,
     mkdirSync,
     openSync,
     readdirSync,
-    readFileSync,
-    readlinkSync,
-    realpathSync,
     renameSync,
-    rmdirSync,
     statSync,
     writeSync,
     type Stats,
@@ -21,9 +16,11 @@ import path from 'node:path';
 
 import type { Logger } from '@protontech/drive-sdk';
 
-import { formatConflictFileName } from '../sync/conflictResolver';
 import type { DriveLayout } from '../sync/driveMode';
-import { moveWithoutReplacing } from '../sync/localMove';
+import { mergeInto } from '../sync/localMerge';
+import { canonicalPath, mountsAt, pathsOverlap, readMountInfo } from '../sync/mountPoint';
+
+export { mountsAt } from '../sync/mountPoint';
 
 // Runs protondrive-vfs, which mounts the drive at the sync folder: readies the mount point (a mount left by an earlier
 // session is unmounted, files saved into the bare folder are merged into the backing store), restarts a crashed
@@ -135,54 +132,10 @@ export function notMountableReason(status: VfsStatus): string {
     }
 }
 
-// The canonical path, worked out from the parent and readlink, never by looking inside: a dead or stuck mount at the
-// path must still be named as mountinfo and fusermount3 name it
-function canonicalPath(p: string): string {
-    let current = path.resolve(p);
-    for (let hops = 0; hops < 40; hops++) {
-        let joined: string;
-        try {
-            joined = path.join(realpathSync(path.dirname(current)), path.basename(current));
-        } catch {
-            return current;
-        }
-        try {
-            current = path.resolve(path.dirname(joined), readlinkSync(joined));
-        } catch {
-            return joined; // not a symlink
-        }
-    }
-    return current;
-}
-
-// Whether one path is the other or holds it
-function overlaps(a: string, b: string): boolean {
-    const inside = (child: string, parent: string) => {
-        const rel = path.relative(parent, child);
-        return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
-    };
-    return inside(a, b) || inside(b, a);
-}
-
 // What /api/status says when no supervisor runs, worked out once at start
 export function unsupervisedStatus(layout: DriveLayout, wanted: boolean, fuseOk: boolean): VfsStatus {
     if (layout === 'virtual') return { mode: 'virtual', mounted: false, reason: 'fuse-unavailable' };
     return { mode: 'plain', mounted: false, reason: !wanted ? 'switched-off' : !fuseOk ? 'fuse-unavailable' : null };
-}
-
-// The file system types mounted exactly at a path, bottom first. mountinfo escapes space, tab, newline and backslash
-// in octal (\040); the text is read as latin1 so each char is one byte and the comparison is byte for byte.
-export function mountsAt(mountinfo: string, mountpoint: string): string[] {
-    const wanted = Buffer.from(mountpoint, 'utf8').toString('latin1');
-    const found: string[] = [];
-    for (const line of mountinfo.split('\n')) {
-        const fields = line.split(' ');
-        const separator = fields.indexOf('-', 6);
-        if (separator < 0 || fields[4] === undefined) continue;
-        const at = fields[4].replace(/\\([0-7]{3})/g, (_, octal: string) => String.fromCharCode(parseInt(octal, 8)));
-        if (at === wanted) found.push(fields[separator + 1] ?? '');
-    }
-    return found;
 }
 
 // Moves an entry found in the bare mount point to the same place in the backing store, where the engine picks it up
@@ -200,50 +153,7 @@ export function mergeStrayInto(
     if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
         throw new Error(`${strayPath} isn't inside ${mountpoint}`);
     }
-    const renamed: string[] = [];
-    mergeEntry(strayPath, path.join(backingDir, rel), now, renamed, beforeRmdir);
-    return renamed;
-}
-
-function mergeEntry(
-    from: string,
-    to: string,
-    now: Date,
-    renamed: string[],
-    beforeRmdir: ((folder: string) => void) | undefined,
-): void {
-    // moveWithoutReplacing undoes a move it can't finish without saying why; this says why first
-    accessSync(path.dirname(from), constants.W_OK | constants.X_OK);
-    for (let attempt = 0; attempt < 3; attempt++) {
-        const there = lstatSync(to, { throwIfNoEntry: false });
-        if (!there) {
-            if (moveWithoutReplacing(from, to)) return;
-            if (!lstatSync(to, { throwIfNoEntry: false })) throw new Error(`Could not move ${from} to ${to}`);
-            continue; // the name was taken meanwhile
-        }
-        if (there.isDirectory() && lstatSync(from).isDirectory()) {
-            for (const name of readdirSync(from)) {
-                mergeEntry(path.join(from, name), path.join(to, name), now, renamed, beforeRmdir);
-            }
-            beforeRmdir?.(from);
-            rmdirSync(from); // ENOTEMPTY if something new arrived: then this stray isn't merged yet
-            return;
-        }
-        renamed.push(moveToConflictName(from, to, now));
-        return;
-    }
-    throw new Error(`Could not move ${from} to ${to}: its name keeps changing`);
-}
-
-function moveToConflictName(from: string, to: string, now: Date): string {
-    const name = formatConflictFileName(path.basename(to), now);
-    const dot = name.lastIndexOf('.');
-    const [stem, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ''];
-    for (let n = 0; n < 1000; n++) {
-        const candidate = path.join(path.dirname(to), n === 0 ? name : `${stem}-${n}${ext}`);
-        if (moveWithoutReplacing(from, candidate)) return candidate;
-    }
-    throw new Error(`No free conflict name for ${to}`);
+    return mergeInto(strayPath, path.join(backingDir, rel), { now, beforeRmdir });
 }
 
 async function runCommand(cmd: string[], logger: Logger): Promise<number> {
@@ -295,15 +205,7 @@ export class VfsSupervisor {
         this.logger = opts.logger;
         this.spawn = opts.spawn ?? Bun.spawn;
         this.run = opts.run ?? ((cmd) => runCommand(cmd, this.logger));
-        this.readMountInfo =
-            opts.readMountInfo ??
-            (() => {
-                try {
-                    return readFileSync('/proc/self/mountinfo', 'latin1');
-                } catch {
-                    return '';
-                }
-            });
+        this.readMountInfo = opts.readMountInfo ?? readMountInfo;
         this.stat = opts.stat ?? ((p) => statSync(p));
     }
 
@@ -361,9 +263,8 @@ export class VfsSupervisor {
     // The drive mounted over its own store, or over a folder holding it, would hide and then merge the store into
     // itself
     private overlapsAppFiles(): string | null {
-        const mountpoint = this.realMountpoint();
         for (const dir of [this.opts.appDir, this.opts.backingDir]) {
-            if (overlaps(mountpoint, canonicalPath(dir))) {
+            if (pathsOverlap(this.opts.mountpoint, dir)) {
                 return `The drive folder ${this.opts.mountpoint} overlaps ${dir}; not mounting the drive`;
             }
         }
