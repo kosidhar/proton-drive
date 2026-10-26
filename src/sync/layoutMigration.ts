@@ -173,7 +173,9 @@ export async function relocateFiles(opts: {
     if (stateDb.getMeta(SYNC_DIR_MOVING) === null && holdsFiles(to)) {
         throw new Error(emptyFolderNeeded(to));
     }
-    mkdirSync(to, { recursive: true, mode: 0o700 }); // for the user alone, as unsafeFolderReason wants it
+    // The folder itself for the user alone (the parents get the default mode)
+    mkdirSync(path.dirname(to), { recursive: true });
+    if (!existsSync(to)) mkdirSync(to, { mode: 0o700 });
     refuseCaseClashes(from, to, opts.seams ?? {}, logger);
     stateDb.setMeta(SYNC_DIR_MOVING, JSON.stringify({ from, to }));
     const mover = new Mover({ stateDb, logger, now: opts.now ?? new Date(), allowCopy: true, seams: opts.seams ?? {}, from, to });
@@ -306,14 +308,19 @@ export function holdsFiles(dir: string): boolean {
 }
 
 // An existing folder a sync folder moves to must be the user's own and closed to others, as the daemon may be asked
-// by a program other than the user's app: files moved into a folder another user can write are theirs to read or delete
-export function unsafeFolderReason(dir: string, uid: number | undefined = process.getuid?.()): string | null {
+// by a program other than the user's app: files moved into a folder another user can write are theirs to read or delete.
+// Group-writable is accepted only in the user's own primary group (Ubuntu's user-private groups, where Files makes
+// folders 0775); world-writable never.
+export function unsafeFolderReason(
+    dir: string,
+    me: { uid: number; gid: number } | undefined = process.getuid && process.getgid ? { uid: process.getuid(), gid: process.getgid() } : undefined,
+): string | null {
     const stat = statSync(dir, { throwIfNoEntry: false });
-    if (!stat || uid === undefined) return null; // a missing folder is made by the daemon, for the user alone
-    if (stat.uid !== uid) {
+    if (!stat || !me) return null; // a missing folder is made by the daemon, for the user alone
+    if (stat.uid !== me.uid) {
         return `${dir} belongs to another user; choose a folder that you own`;
     }
-    if ((stat.mode & 0o022) !== 0) {
+    if ((stat.mode & 0o002) !== 0 || ((stat.mode & 0o020) !== 0 && stat.gid !== me.gid)) {
         return `${dir} can be changed by other users; choose a folder only you can write to, or run chmod go-w on it`;
     }
     return null;

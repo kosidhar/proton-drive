@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import {
     chmodSync,
+    chownSync,
     existsSync,
     lstatSync,
     mkdirSync,
@@ -1097,7 +1098,7 @@ describe('The drive folder and the virtual drive change only over the control so
         await api.start();
         const open = path.join(s.root, 'Open');
         mkdirSync(open);
-        for (const mode of [0o777, 0o770, 0o707]) {
+        for (const mode of [0o777, 0o757, 0o707]) {
             chmodSync(open, mode);
             const res = await api.socket({ syncDir: open });
             expect([mode, res.json.folderError]).toEqual([mode, `${open} can be changed by other users; choose a folder only you can write to, or run chmod go-w on it`]);
@@ -1115,7 +1116,47 @@ describe('The drive folder and the virtual drive change only over the control so
 
     test('a folder owned by another user is refused', () => {
         const s = setup();
-        expect(unsafeFolderReason(s.root, (process.getuid?.() ?? 0) + 1)).toBe(`${s.root} belongs to another user; choose a folder that you own`);
-        expect(unsafeFolderReason(path.join(s.root, 'missing'), (process.getuid?.() ?? 0) + 1)).toBeNull();
+        const me = { uid: (process.getuid?.() ?? 0) + 1, gid: process.getgid?.() ?? 0 };
+        expect(unsafeFolderReason(s.root, me)).toBe(`${s.root} belongs to another user; choose a folder that you own`);
+        expect(unsafeFolderReason(path.join(s.root, 'missing'), me)).toBeNull();
+    });
+
+    test('group-writable is fine in the user\'s own group (Files makes 0775), refused in any other; world-writable never (S33)', () => {
+        const s = setup();
+        const dir = path.join(s.root, 'Shared');
+        mkdirSync(dir);
+        const me = { uid: process.getuid?.() ?? 0, gid: process.getgid?.() ?? 0 };
+        chmodSync(dir, 0o775);
+        expect(statSync(dir).gid).toBe(me.gid);
+        expect(unsafeFolderReason(dir, me)).toBeNull();
+        expect(unsafeFolderReason(dir, { ...me, gid: me.gid + 1 })).toMatch(/can be changed by other users/);
+        for (const mode of [0o777, 0o757, 0o707]) {
+            chmodSync(dir, mode);
+            expect([mode, unsafeFolderReason(dir, me)]).toEqual([mode, `${dir} can be changed by other users; choose a folder only you can write to, or run chmod go-w on it`]);
+        }
+        chmodSync(dir, 0o755);
+        expect(unsafeFolderReason(dir, me)).toBeNull();
+        // A group of the user's that is not the primary one, where the system has one
+        const other = process.getgroups?.().find((g) => g !== me.gid);
+        if (other !== undefined) {
+            chmodSync(dir, 0o775);
+            chownSync(dir, me.uid, other);
+            expect(unsafeFolderReason(dir, me)).toMatch(/can be changed by other users/);
+        }
+    });
+
+    test('a missing folder is made 0700, and the parents the daemon makes get the default mode', async () => {
+        const s = setup({ wanted: false });
+        s.fillTree(s.syncDir);
+        await s.boot();
+        const api = over(s);
+        await api.start();
+        const parent = path.join(s.root, 'New parent');
+        const to = path.join(parent, 'Drive');
+        expect((await api.socket({ syncDir: to })).json.folderError).toBeNull();
+        expect(modeOf(to)).toBe(0o700);
+        const plain = path.join(s.root, 'plain');
+        mkdirSync(plain);
+        expect(modeOf(parent)).toBe(modeOf(plain));
     });
 });
