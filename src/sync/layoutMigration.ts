@@ -45,6 +45,8 @@ const FOLDER_MODES = 'moveFolderModes';
 const COPY_PREFIX = '.proton-drive-tmp-move-';
 // Rounds of moving what is in the source folder: an app may save into the sync folder while its files move out
 const MOVE_ROUNDS = 3;
+// What a disk that can't keep a mode or times answers chmod or utimes with
+const ATTRIBUTE_REFUSALS = new Set(['EPERM', 'EACCES', 'ENOTSUP', 'EOPNOTSUPP', 'EINVAL']);
 
 // After each step, for a test to stop the move there as a crash would: a top-level entry done; a read-only folder made
 // writable; a folder made at the destination; a file copied beside where it goes, put there, its source removed
@@ -106,9 +108,18 @@ export async function moveToLayout(opts: {
     }
     // Either way: files moved into a mount go into the drive, and a listing of one isn't what is on disk
     refuseIfMounted(syncDir, seams.readMountInfo ?? readMountInfo);
-    if (target === 'virtual' && !resuming && hasEntries(syncDir) && !onSameDisk(syncDir, backingDir, seams.deviceOf ?? deviceOf)) {
-        logger.warn(`${syncDir} and ${backingDir} are on different disks: the files stay in ${syncDir}`);
-        return 'different-disk';
+    if (target === 'virtual' && !resuming) {
+        if (hasEntries(syncDir) && !onSameDisk(syncDir, backingDir, seams.deviceOf)) {
+            logger.warn(`${syncDir} and ${backingDir} are on different disks: the files stay in ${syncDir}`);
+            return 'different-disk';
+        }
+        // Moving back after a failure moves everything in the store out: it must hold nothing but what came in
+        const taken = takenNames(syncDir, backingDir);
+        if (taken.length > 0) {
+            const message = `${backingDir} already holds ${taken.join(', ')}, as ${syncDir} does: not moving the files into it (move those out of ${backingDir} first)`;
+            logger.warn(message);
+            throw new Error(message);
+        }
     }
 
     const [from, to] = target === 'virtual' ? [syncDir, backingDir] : [backingDir, syncDir];
@@ -153,6 +164,11 @@ export async function relocateFiles(opts: {
     const { stateDb, from, to, logger } = opts;
     if (pathsOverlap(from, to)) {
         throw new Error(`${to} and ${from} are inside one another; choose a folder outside the current Proton Drive folder`);
+    }
+    // Everything in the new folder then came from the old one: a move that stops can be undone exactly, and nothing
+    // unrelated is pulled into the sync folder. A move cut short (still marked) holds what it moved already.
+    if (stateDb.getMeta(SYNC_DIR_MOVING) === null && holdsFiles(to)) {
+        throw new Error(emptyFolderNeeded(to));
     }
     mkdirSync(to, { recursive: true });
     stateDb.setMeta(SYNC_DIR_MOVING, JSON.stringify({ from, to }));
@@ -216,6 +232,29 @@ function refuseIfMounted(syncDir: string, readInfo: () => string): void {
     }
 }
 
+// The sync folder's top-level names that the store holds too
+function takenNames(syncDir: string, backingDir: string): string[] {
+    if (!existsSync(backingDir)) return [];
+    const store = Buffer.from(backingDir);
+    return readdirSync(syncDir, { encoding: 'buffer' })
+        .filter((name) => lstatSync(joinBytes(store, name), { throwIfNoEntry: false }))
+        .map((name) => name.toString());
+}
+
+// A folder a sync folder can move to: missing, or holding nothing but what a move cut short leaves (its own copies)
+export function holdsFiles(dir: string): boolean {
+    try {
+        return readdirSync(dir, { encoding: 'buffer' }).some((name) => !name.subarray(0, COPY_PREFIX.length).equals(Buffer.from(COPY_PREFIX)));
+    } catch (error: unknown) {
+        if (errnoOf(error) === 'ENOENT') return false;
+        throw error;
+    }
+}
+
+export function emptyFolderNeeded(dir: string): string {
+    return `Choose an empty folder, or a new one: ${dir} already holds files`;
+}
+
 function hasEntries(dir: string): boolean {
     try {
         return readdirSync(dir).length > 0;
@@ -229,7 +268,7 @@ function deviceOf(p: string): number {
 }
 
 // The folder itself, or for one not made yet, its nearest parent that is there
-function onSameDisk(a: string, b: string, devOf: (p: string) => number): boolean {
+export function onSameDisk(a: string, b: string, devOf: (p: string) => number = deviceOf): boolean {
     let existing = path.resolve(b);
     while (!existsSync(existing) && path.dirname(existing) !== existing) {
         existing = path.dirname(existing);
@@ -238,9 +277,12 @@ function onSameDisk(a: string, b: string, devOf: (p: string) => number): boolean
 }
 
 // The modes of read-only folders a move made writable (rename(2) needs write access to a folder moved to another
-// parent, and removing entries needs it on their folder), kept in meta until the move is done, first value kept: put
-// back on the folder where it ended up and on one left behind. Keyed by the path relative to either root, or for a root
-// by its own path.
+// parent, removing entries needs it on their folder, adding entries on theirs), kept in meta until the move is done,
+// first value kept, then put back. Keys: `src:<rel>` a source folder (one left behind gets it back), `made:<rel>` a
+// folder the move put at the destination (it gets its source's mode), `dst:<rel>` a folder already at the destination
+// (it keeps its own), `root:<path>` either root. <rel> is the path relative to the roots, in hex.
+type FolderSide = 'src' | 'made' | 'dst';
+
 class FolderModes {
     private readonly modes: Record<string, number>;
 
@@ -258,18 +300,13 @@ class FolderModes {
         this.stateDb.setMeta(FOLDER_MODES, JSON.stringify(this.modes));
     }
 
-    original(key: string): number | undefined {
-        return this.modes[key];
-    }
-
     putBack(from: Buffer, to: Buffer, setMode: (p: Buffer, mode: number) => void): void {
         for (const [key, mode] of Object.entries(this.modes)) {
             const [kind, hex] = key.split(':') as [string, string];
             const bytes = Buffer.from(hex, 'hex');
-            const places = kind === 'root' ? [bytes] : [joinBytes(to, bytes), joinBytes(from, bytes)];
-            for (const place of places) {
-                if (lstatSync(place, { throwIfNoEntry: false })?.isDirectory()) setMode(place, mode);
-            }
+            if (kind === 'dst' && `made:${hex}` in this.modes) continue; // the move made it: its source's mode wins
+            const place = kind === 'root' ? bytes : joinBytes(kind === 'src' ? from : to, bytes);
+            if (lstatSync(place, { throwIfNoEntry: false })?.isDirectory()) setMode(place, mode);
         }
         this.stateDb.deleteMeta(FOLDER_MODES);
     }
@@ -308,24 +345,41 @@ export class Mover {
             now: opts.now,
             keepsName: 'incoming',
             leaveNonEmptyFolders: true,
+            modesMatter: this.destinationKeepsModes(),
             move: (from, to) => this.move(from, to),
-            // The folder there takes the incoming one's mode (a read-only one's at the end, writable until then)
+            // Both writable while entries move; the folder already there keeps its own mode
             openFolders: (from, fromStat, to, toStat) => {
-                this.openFolder(from, fromStat);
-                const mode = this.modes.original(this.keyOf(from)) ?? fromStat.mode & 0o7777;
-                if ((mode & 0o300) !== 0o300) {
-                    this.openFolder(to, toStat, mode);
-                } else if ((toStat.mode & 0o7777) !== mode) {
-                    this.setMode(to, mode);
-                }
+                this.openFolder(from, fromStat, 'src');
+                this.openFolder(to, toStat, 'dst');
             },
             changed: (dir) => this.touch(dir),
         };
     }
 
+    // Whether a mode set at the destination sticks (not on exFAT or FAT): only then is a mode part of a duplicate match
+    private destinationKeepsModes(): boolean {
+        const probe = joinBytes(this.to, Buffer.from(`${COPY_PREFIX}probe`));
+        try {
+            removeOwnCopy(probe);
+            closeSync(openSync(probe, 'wx', 0o600));
+            const setMode = this.opts.seams.setMode ?? chmodSync;
+            setMode(probe, 0o600);
+            setMode(probe, 0o640);
+            return (lstatSync(probe).mode & 0o777) === 0o640;
+        } catch {
+            return false;
+        } finally {
+            try {
+                removeOwnCopy(probe);
+            } catch {
+                // left for the next move's probe
+            }
+        }
+    }
+
     // Answers what is still in the source folder after the last round
     moveAll(): string[] {
-        this.openFolder(this.from, lstatSync(this.from));
+        this.openFolder(this.from, lstatSync(this.from), 'src');
         for (let round = 0; round < MOVE_ROUNDS; round++) {
             const names = readdirSync(this.from, { encoding: 'buffer' });
             if (names.length === 0) break;
@@ -349,21 +403,21 @@ export class Mover {
         }
     }
 
-    // A root by its own path, anything else by its path relative to the root it is in (the same on both sides)
-    private keyOf(p: Buffer): string {
+    // A root by its own path, anything else by its side and its path relative to the root it is in
+    private keyOf(p: Buffer, side: FolderSide): string {
         for (const root of [this.from, this.to]) {
             if (p.equals(root)) return `root:${p.toString('hex')}`;
             if (p.length > root.length && p[root.length] === 0x2f && p.subarray(0, root.length).equals(root)) {
-                return `rel:${p.subarray(root.length + 1).toString('hex')}`;
+                return `${side}:${p.subarray(root.length + 1).toString('hex')}`;
             }
         }
         return `root:${p.toString('hex')}`;
     }
 
-    // Writable for the move, its mode remembered first (or the given one, the source's, for a folder at the destination)
-    private openFolder(folder: Buffer, st: Stats, mode = st.mode & 0o7777): void {
+    // Writable for the move, its own mode remembered first
+    private openFolder(folder: Buffer, st: Stats, side: FolderSide): void {
         if ((st.mode & 0o300) === 0o300) return;
-        this.modes.remember(this.keyOf(folder), mode);
+        this.modes.remember(this.keyOf(folder, side), st.mode & 0o7777);
         chmodSync(folder, (st.mode & 0o7777) | 0o700);
         this.opts.seams.onStep?.('opened', folder.toString());
     }
@@ -392,11 +446,13 @@ export class Mover {
         this.bestEffort(() => (this.opts.seams.setTimes ?? utimesSync)(p, st.atimeMs / 1000, st.mtimeMs / 1000), `the times of ${p}`);
     }
 
-    // Some disks (exFAT, FAT) can't keep a mode, or keep times only to 10 ms or 2 s: never a reason to stop
+    // Some disks (exFAT, FAT) can't keep a mode, or keep times only to 10 ms or 2 s: a refusal is never a reason to stop.
+    // Anything else (an I/O error) stops the move, which the next run finishes.
     private bestEffort(set: () => void, what: string): void {
         try {
             set();
         } catch (error: unknown) {
+            if (!ATTRIBUTE_REFUSALS.has(errnoOf(error) ?? '')) throw error;
             if (++this.attributeFailures === 1) this.opts.logger.warn(`Couldn't keep ${what}: ${messageOf(error)}`);
         }
     }
@@ -433,7 +489,8 @@ export class Mover {
             if (errnoOf(error) !== 'EACCES' || !st?.isDirectory() || st.mode & 0o200) {
                 throw error;
             }
-            this.openFolder(from, st);
+            this.modes.remember(this.keyOf(from, 'made'), st.mode & 0o7777); // where it lands, it keeps its mode
+            this.openFolder(from, st, 'src');
             return moveSameDisk(from, to);
         }
     }
@@ -465,23 +522,25 @@ export class Mover {
         return this.copyFile(from, to);
     }
 
-    // Made (writable), filled entry by entry, then given the source's mode and times; the source goes once it is empty.
-    // Cut short anywhere, the next run merges into it, and the modes are put back at the end of the move.
+    // Made beside where it goes with the source's mode (a read-only one writable until the end of the move), put in place
+    // at once, filled entry by entry and given the source's times; the source goes once it is empty. Cut short
+    // anywhere, the next run merges into it, and the modes are put back at the end of the move.
     private copyFolder(from: Buffer, to: Buffer, st: Stats): boolean {
-        const readOnly = (st.mode & 0o300) !== 0o300;
-        if (readOnly) {
-            this.modes.remember(this.keyOf(from), st.mode & 0o7777);
+        if ((st.mode & 0o300) !== 0o300) {
+            this.modes.remember(this.keyOf(from, 'src'), st.mode & 0o7777);
+            this.modes.remember(this.keyOf(from, 'made'), st.mode & 0o7777);
         }
-        try {
-            mkdirSync(to, 0o700);
-        } catch (error: unknown) {
-            if (errnoOf(error) === 'EEXIST') return false;
-            throw error;
+        const made = joinBytes(parentOf(to), Buffer.from(`${COPY_PREFIX}dir-${createHash('sha1').update(nameOf(to)).digest('hex').slice(0, 16)}`));
+        removeOwnFolder(made); // one a crash left before it was put in place: always empty
+        mkdirSync(made, 0o700);
+        this.setMode(made, (st.mode & 0o7777) | 0o700);
+        if (!moveWithoutReplacing(made, to)) {
+            removeOwnFolder(made);
+            return false; // the name was taken meanwhile: the merge looks again
         }
         this.touch(parentOf(to));
         this.opts.seams.onStep?.('made', to.toString());
-        this.setMode(to, (st.mode & 0o7777) | 0o700); // a read-only one gets its own mode at the end
-        this.openFolder(from, st);
+        this.openFolder(from, st, 'src');
         for (const name of readdirSync(from, { encoding: 'buffer' })) {
             this.mergeOne(joinBytes(from, name), joinBytes(to, name));
         }
@@ -548,6 +607,14 @@ export class Mover {
 
 function copyExclusive(from: Buffer, to: Buffer): void {
     copyFileSync(from, to, constants.COPYFILE_EXCL);
+}
+
+function removeOwnFolder(folder: Buffer): void {
+    try {
+        rmdirSync(folder);
+    } catch (error: unknown) {
+        if (errnoOf(error) !== 'ENOENT') throw error;
+    }
 }
 
 function removeOwnCopy(copy: Buffer): void {

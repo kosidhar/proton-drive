@@ -6,10 +6,13 @@ import type { Logger } from '@protontech/drive-sdk';
 import { type DriveLayout, readDriveLayout, virtualDriveWanted } from '../sync/driveMode';
 import {
     DifferentDiskError,
+    emptyFolderNeeded,
     finishRelocation,
+    holdsFiles,
     LAYOUT_MOVING,
     type MoveSeams,
     moveToLayout,
+    onSameDisk,
     pendingRelocation,
     relocateFiles,
     SYNC_DIR_MOVING,
@@ -57,6 +60,8 @@ export class DriveController {
     private moveError: string | null = null;
     private differentDisk = false;
     private driveStarted = false;
+    // Moving back failed because the files are moving out to another disk, where only that move can go on
+    private onlyOnwardOut = false;
     private socketUp = false; // whether the helper can reach this daemon
 
     constructor(private readonly opts: DriveControllerOptions) {}
@@ -135,6 +140,7 @@ export class DriveController {
         const { stateDb } = this.opts;
         const save = () => stateDb.setMeta('virtualDriveWanted', wanted ? '1' : '0');
         const target: DriveLayout = wanted && this.opts.fuseOk ? 'virtual' : 'plain';
+        this.refuseMovingBackFromAnotherDisk(target);
         if (!this.layoutMovePending() && target === readDriveLayout(stateDb)) {
             // FUSE can't run the drive, or the files are where the choice wants them already: an earlier move that
             // failed (and was undone) is no longer what the status is about
@@ -143,7 +149,13 @@ export class DriveController {
             this.differentDisk = false;
             return;
         }
+        const previous = stateDb.getMeta('virtualDriveWanted');
         await this.switchTo(target, save);
+        if (this.onlyOnwardOut) {
+            // The files can only go on moving out, to another disk (see moveTo): the choice stays as it was
+            if (previous === null) stateDb.deleteMeta('virtualDriveWanted');
+            else stateDb.setMeta('virtualDriveWanted', previous);
+        }
         if (this.moveError !== null) throw new Error(this.moveError);
     }
 
@@ -152,22 +164,23 @@ export class DriveController {
     // overlapping the app's own files, or inside the old one or holding it, is refused. While a relocation that failed
     // is still marked, only moving back to the old folder (undoing it) or to the new one again is allowed.
     async relocate(raw: string): Promise<string> {
-        if (this.moving) throw new Error(BUSY);
         const { stateDb, engine, appDir, backingDir } = this.opts;
         const newDir = resolveSyncDirInput(raw);
         const stopped = this.stuck ? pendingRelocation(stateDb) : null;
         if (stopped) {
+            if (this.moving) throw new Error(BUSY);
             if (newDir === path.resolve(stopped.from) || newDir === path.resolve(stopped.to)) {
                 return this.resumeRelocation(stopped, newDir);
             }
             throw new Error(this.relocationStopped(stopped));
         }
-        if (this.stuck) {
-            throw new Error(`Moving the files stopped (${this.moveError}); switch the virtual drive again, or restart Proton Drive, to finish first`);
-        }
         const oldDir = stateDb.getSettings().syncDir;
         if (newDir === path.resolve(oldDir)) {
-            return oldDir;
+            return oldDir; // the folder it already is, however it is written: nothing to do, even while files move
+        }
+        if (this.moving) throw new Error(BUSY);
+        if (this.stuck) {
+            throw new Error(`Moving the files stopped (${this.moveError}); switch the virtual drive again, or restart Proton Drive, to finish first`);
         }
         for (const dir of [appDir, backingDir]) {
             if (pathsOverlap(newDir, dir)) {
@@ -176,6 +189,12 @@ export class DriveController {
         }
         if (pathsOverlap(newDir, oldDir)) {
             throw new Error(`${newDir} and ${oldDir} are inside one another; choose a folder outside the current Proton Drive folder`);
+        }
+        // Then everything in it comes from the old folder: a move that stops can be undone exactly, nothing unrelated
+        // is pulled into the drive (the stray merge would take it into the store), and nothing of the user's is mounted
+        // over
+        if (holdsFiles(newDir)) {
+            throw new Error(emptyFolderNeeded(newDir));
         }
         this.moving = true;
         try {
@@ -205,14 +224,17 @@ export class DriveController {
         }
     }
 
-    // Mount again: after a move that failed (still marked, or undone), tries it again first
+    // Mount again: after a move that failed (still marked, or undone), tries it again first; when that leaves the files
+    // in the plain folder (the drive switched off, or FUSE missing), that was all there was to do
     async mountAgain(): Promise<void> {
         if (this.moving) throw new Error(BUSY);
         this.refuseWhileRelocationStopped();
         const target = this.target();
+        this.refuseMovingBackFromAnotherDisk(target);
         if (this.layoutMovePending() || (this.moveError !== null && target !== readDriveLayout(this.opts.stateDb))) {
             await this.switchTo(target);
             if (this.moveError !== null) throw new Error(this.moveError);
+            if (readDriveLayout(this.opts.stateDb) !== 'virtual') return;
         }
         if (!this.supervisor) throw new Error(notMountableReason(this.status()));
         await this.supervisor.mountAgain();
@@ -233,6 +255,21 @@ export class DriveController {
 
     private relocationStopped(stopped: { from: string; to: string }): string {
         return `Moving the Proton Drive folder to ${stopped.to} stopped (${this.moveError}); move it back to ${stopped.from}, or to ${stopped.to} again`;
+    }
+
+    // A move out that stopped on another disk (a full one, say) can only go on there: moving back would copy the files
+    // into the store, and undoing that would push them out again
+    private refuseMovingBackFromAnotherDisk(target: DriveLayout): void {
+        const { stateDb, backingDir, moveSeams } = this.opts;
+        if (target !== 'virtual' || stateDb.getMeta(LAYOUT_MOVING) !== 'plain') return;
+        const syncDir = stateDb.getSettings().syncDir;
+        if (!onSameDisk(syncDir, backingDir, moveSeams?.deviceOf)) {
+            throw new Error(this.freeSpaceFirst(syncDir, this.moveError));
+        }
+    }
+
+    private freeSpaceFirst(syncDir: string, why: string | null): string {
+        return `Free space on the disk holding ${syncDir}, then try again: the files are moving there${why ? ` (${why})` : ''}, and they can't move back into the drive's store from another disk`;
     }
 
     private refuseWhileRelocationStopped(): void {
@@ -291,8 +328,11 @@ export class DriveController {
     // unmounted before files move out of the store.
     private async moveTo(target: DriveLayout): Promise<void> {
         const { stateDb, logger } = this.opts;
+        const movingOut = stateDb.getMeta(LAYOUT_MOVING) === 'plain';
+        const earlier = this.moveError;
         this.moveError = null;
         this.differentDisk = false;
+        this.onlyOnwardOut = false;
         if (target === 'plain') {
             const stillMounted = await this.releaseMountPoint();
             if (stillMounted) {
@@ -307,6 +347,13 @@ export class DriveController {
             return;
         } catch (error: unknown) {
             logger.error(`Could not move the files to the ${target} layout: ${messageOf(error)}`);
+            if (target === 'virtual' && movingOut && error instanceof DifferentDiskError) {
+                // Moving back from a move out that stopped on another disk: that move is the one to finish
+                stateDb.setMeta(LAYOUT_MOVING, 'plain');
+                this.fail(this.freeSpaceFirst(stateDb.getSettings().syncDir, earlier));
+                this.onlyOnwardOut = true;
+                return;
+            }
             this.fail(messageOf(error));
             if (target === 'virtual' && stateDb.getMeta(LAYOUT_MOVING) !== null) {
                 await this.undoMoveIntoStore(error);

@@ -20,6 +20,7 @@ import { SyncStateDatabase } from '../sync/syncStateDb';
 import { defaultControlSocketPath, startControlServer } from './controlServer';
 import { DriveController } from './driveController';
 import { isTrustedLocalRequest } from './requestGuard';
+import { settingsRoute } from './settingsRoute';
 import { findHelper, fuseAvailable, mergeStrayInto, VfsSupervisor } from './vfsSupervisor';
 
 export const DEFAULT_DAEMON_PORT = Number(process.env.PROTON_DRIVE_DAEMON_PORT || 49152);
@@ -420,32 +421,7 @@ export async function startSyncDaemon(options: {
                 }
 
                 if (req.method === 'POST' && pathname === '/api/settings') {
-                    const prev = stateDb.getSettings();
-                    const { virtualDriveWanted: wanted, syncDir, ...body } = (await req.json()) as Record<string, unknown>;
-                    if (wanted !== undefined && typeof wanted !== 'boolean') {
-                        return Response.json({ error: 'virtualDriveWanted must be true or false' }, { status: 400 });
-                    }
-                    // The sync folder changes only by moving there (or, for the drive, mounting there)
-                    if (typeof syncDir === 'string' && syncDir.trim() && syncDir.trim() !== prev.syncDir) {
-                        body.syncDir = await drive.relocate(syncDir.trim());
-                    }
-                    const updated = stateDb.updateSettings(body);
-                    if (
-                        prev.syncDir !== updated.syncDir ||
-                        JSON.stringify(prev.ignorePatterns) !== JSON.stringify(updated.ignorePatterns)
-                    ) {
-                        void engine.reconcileNow();
-                    }
-                    // Moves the files, and throws (answered 500 with the error) when that fails
-                    if (typeof wanted === 'boolean' && wanted !== virtualDriveWanted(stateDb)) {
-                        await drive.setVirtualDriveWanted(wanted);
-                    }
-                    return Response.json({
-                        ok: true,
-                        settings: stateDb.getSettings(),
-                        virtualDriveWanted: virtualDriveWanted(stateDb),
-                        vfs: drive.status(),
-                    });
+                    return settingsRoute(req, { stateDb, drive, engine });
                 }
 
                 // Remote browser endpoints

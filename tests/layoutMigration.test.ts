@@ -231,6 +231,7 @@ describe('moveToLayout: plain to virtual', () => {
         const first = readdirSync(s.syncDir)[0]!;
         s.put(path.join(s.backingDir, first), `content ${first[0]}`);
         s.record(first);
+        s.stateDb.setMeta(LAYOUT_MOVING, 'virtual'); // a resume: a fresh move refuses a name the store already holds
         const before = snapshot(s.syncDir);
 
         await expect(s.move('virtual', { moveSameDisk: () => { throw exdev(); } })).rejects.toBeInstanceOf(DifferentDiskError);
@@ -296,6 +297,7 @@ describe('moveToLayout: plain to virtual', () => {
         writeFileSync(odd(s.syncDir, '/Docs/inner-', [0xff], '.txt'), 'inner');
         symlinkSync(odd('tgt-', [0xff]), odd(s.syncDir, '/ln'));
         s.put(path.join(s.backingDir, 'Docs', 'other.txt'), 'x'); // Docs is merged, not renamed
+        s.stateDb.setMeta(LAYOUT_MOVING, 'virtual'); // a resume, as only then can the store hold a name already
         const names = (dir: Buffer) => readdirSync(dir, { encoding: 'buffer' }).map((b) => b.toString('hex')).sort();
         const before = { top: names(sync), docs: names(odd(s.syncDir, '/Docs')) };
 
@@ -321,6 +323,7 @@ describe('moveToLayout: plain to virtual', () => {
             s.put(path.join(s.syncDir, name), 'synced');
             s.put(path.join(s.backingDir, name), 'was in the store', 1_600_000_000);
         }
+        s.stateDb.setMeta(LAYOUT_MOVING, 'virtual'); // a resume, as only then can the store hold a name already
         expect(await s.move('virtual')).toBe('moved');
         const stored = readdirSync(s.backingDir, { encoding: 'buffer' });
         expect(stored).toHaveLength(4);
@@ -367,7 +370,25 @@ describe('moveToLayout: plain to virtual', () => {
         expect(readDriveLayout(s.stateDb)).toBe('plain');
     });
 
-    test('nothing in the backing store is replaced: a folder is merged into, a taken name steps aside', async () => {
+    test('a fresh move into a store already holding one of the sync folder\'s names is refused, moving nothing', async () => {
+        const s = setup();
+        s.fillTree(s.syncDir);
+        s.put(path.join(s.backingDir, 'Docs', 'stale.txt'), 'left in the store');
+        s.put(path.join(s.backingDir, 'unrelated.txt'), 'left in the store too');
+        const before = snapshot(s.syncDir);
+        await expect(s.move('virtual')).rejects.toThrow(/already holds Docs/);
+        expect(snapshot(s.syncDir)).toEqual(before);
+        expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBeNull();
+        expect(readDriveLayout(s.stateDb)).toBe('plain');
+        expect(s.logs.some((l) => l.includes('already holds Docs'))).toBe(true);
+
+        // Something that takes no name of the sync folder's doesn't stand in the way
+        rmSync(path.join(s.backingDir, 'Docs'), { recursive: true });
+        expect(await s.move('virtual')).toBe('moved');
+        expect(readFileSync(path.join(s.backingDir, 'unrelated.txt'), 'utf8')).toBe('left in the store too');
+    });
+
+    test('resuming, nothing in the backing store is replaced: a folder is merged into, a taken name steps aside', async () => {
         const s = setup();
         s.put(path.join(s.syncDir, 'Docs', 'same.txt'), 'synced copy');
         s.put(path.join(s.syncDir, 'Docs', 'new.txt'), 'new');
@@ -375,6 +396,7 @@ describe('moveToLayout: plain to virtual', () => {
         s.put(path.join(s.backingDir, 'Docs', 'same.txt'), 'was in the store');
         s.put(path.join(s.backingDir, 'Docs', 'kept.txt'), 'kept');
         s.put(path.join(s.backingDir, 'top.txt'), 'was in the store too');
+        s.stateDb.setMeta(LAYOUT_MOVING, 'virtual');
 
         expect(await s.move('virtual')).toBe('moved');
 
@@ -503,6 +525,26 @@ describe('moveToLayout: virtual to plain', () => {
         expect(p('Docs/other.txt')).toBe('other');
         expect(p('top.txt')).toBe('synced top');
         expect(p(formatConflictFileName('top.txt', when))).toBe('saved too');
+    });
+
+    test('a folder already in the sync folder keeps its own mode, a read-only one too, as entries are merged into it', async () => {
+        const s = setup();
+        s.put(path.join(s.backingDir, 'Docs', 'a.txt'), 'a');
+        s.put(path.join(s.backingDir, 'Locked', 'b.txt'), 'b');
+        chmodSync(path.join(s.backingDir, 'Docs'), 0o775);
+        s.stateDb.setMeta('driveLayout', 'virtual');
+        s.put(path.join(s.syncDir, 'Docs', 'stray.txt'), 'saved into the bare folder');
+        s.put(path.join(s.syncDir, 'Locked', 'stray.txt'), 'saved too');
+        chmodSync(path.join(s.syncDir, 'Docs'), 0o750);
+        chmodSync(path.join(s.syncDir, 'Locked'), 0o555);
+
+        expect(await s.move('plain')).toBe('moved');
+
+        expect(modeOf(path.join(s.syncDir, 'Docs'))).toBe(0o750);
+        expect(modeOf(path.join(s.syncDir, 'Locked'))).toBe(0o555);
+        expect(readFileSync(path.join(s.syncDir, 'Docs', 'a.txt'), 'utf8')).toBe('a');
+        expect(readFileSync(path.join(s.syncDir, 'Locked', 'b.txt'), 'utf8')).toBe('b');
+        expect(readFileSync(path.join(s.syncDir, 'Locked', 'stray.txt'), 'utf8')).toBe('saved too');
     });
 
     describe('across disks', () => {
@@ -659,6 +701,27 @@ describe('moveToLayout: virtual to plain', () => {
             expect(s.logs.some((l) => l.startsWith('warn') && l.includes('EPERM'))).toBe(true);
         });
 
+        test('an I/O error setting a mode is not taken for a disk that can\'t keep modes: the move stops and a re-run finishes it', async () => {
+            const s = setup();
+            const before = await virtualWith(s);
+            let failed = false;
+            const flaky = acrossDisks({
+                setMode: (p, mode) => {
+                    if (!failed && !p.toString().includes('.proton-drive-tmp-move-probe')) {
+                        failed = true;
+                        throw Object.assign(new Error('EIO: i/o error, chmod'), { code: 'EIO' });
+                    }
+                    chmodSync(p, mode);
+                },
+            });
+            await expect(s.move('plain', flaky)).rejects.toThrow('EIO');
+            expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBe('plain');
+            expect(await s.move('plain', acrossDisks())).toBe('moved');
+            expect(snapshot(s.syncDir, { folderTimes: false })).toEqual(
+                Object.fromEntries(Object.entries(before).map(([k, v]) => [k, v.startsWith('dir') ? v.split(' ').slice(0, 2).join(' ') : v])),
+            );
+        });
+
         test('a read-only folder whose copy was cut short between making it and opening its source resumes', async () => {
             const s = setup();
             mkdirSync(s.backingDir, { recursive: true });
@@ -742,12 +805,24 @@ describe('mergeInto', () => {
         s.put(path.join(to, 'touched.txt'), 'same', 1_700_000_002);
         s.put(path.join(from, 'differs.txt'), 'abcd', 1_700_000_000);
         s.put(path.join(to, 'differs.txt'), 'abce', 1_700_000_000);
-        for (const name of ['linked.txt', 'copy.txt', 'touched.txt', 'differs.txt']) {
+        // The same bytes with another mode (an executable bit) are a different file
+        s.put(path.join(from, 'run.sh'), 'echo', 1_700_000_000, 0o755);
+        s.put(path.join(to, 'run.sh'), 'echo', 1_700_000_000, 0o644);
+        for (const name of ['linked.txt', 'copy.txt', 'touched.txt', 'differs.txt', 'run.sh']) {
             mergeInto(path.join(from, name), path.join(to, name), { now: when });
         }
         expect(readdirSync(from)).toEqual([]);
         expect(readdirSync(to).sort()).toEqual(
-            ['copy.txt', 'differs.txt', formatConflictFileName('differs.txt', when), 'linked.txt', 'other.txt', 'touched.txt'].sort(),
+            [
+                'copy.txt',
+                'differs.txt',
+                formatConflictFileName('differs.txt', when),
+                'linked.txt',
+                'other.txt',
+                'run.sh',
+                formatConflictFileName('run.sh', when),
+                'touched.txt',
+            ].sort(),
         );
     });
 });
@@ -835,6 +910,26 @@ describe('relocateFiles', () => {
             if (!entry.startsWith('dir')) expect([rel, left[rel] ?? moved[rel]]).toEqual([rel, entry]);
         }
         expect(Object.keys(moved).filter((rel) => rel.includes('.proton-drive-tmp-move-'))).toEqual([]);
+    });
+
+    test('a new folder that already holds files is refused before anything happens; one holding only our own leftovers is not', async () => {
+        const s = setup();
+        s.fillTree(s.syncDir);
+        const before = snapshot(s.syncDir);
+        const { to, relocate } = relocation(s);
+        s.put(path.join(to, 'mine.txt'), "the user's own");
+        await expect(relocate()).rejects.toThrow(/Choose an empty folder, or a new one: .* already holds files/);
+        expect(snapshot(s.syncDir)).toEqual(before);
+        expect(readdirSync(to)).toEqual(['mine.txt']);
+        expect(s.stateDb.getMeta(SYNC_DIR_MOVING)).toBeNull();
+        expect(s.stateDb.getSettings().syncDir).toBe(s.syncDir);
+
+        rmSync(path.join(to, 'mine.txt'));
+        s.put(path.join(to, '.proton-drive-tmp-move-0123456789abcdef'), 'a copy a crash left');
+        await relocate();
+        expect(readFileSync(path.join(to, 'Docs', 'report.odt'), 'utf8')).toBe('report');
+        expect(readdirSync(s.syncDir)).toEqual([]);
+        expect(s.stateDb.getSettings().syncDir).toBe(to);
     });
 
     test('a record whose file was already gone is dropped, so the file comes back rather than being trashed', async () => {

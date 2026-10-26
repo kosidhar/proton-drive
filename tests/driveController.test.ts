@@ -19,6 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { startControlServer } from '../src/daemon/controlServer';
+import { settingsRoute } from '../src/daemon/settingsRoute';
 import { DriveController, type DriveSupervisor } from '../src/daemon/driveController';
 import type { VfsStatus } from '../src/daemon/vfsSupervisor';
 import { readDriveLayout } from '../src/sync/driveMode';
@@ -396,8 +397,8 @@ describe('DriveController at start', () => {
     });
 });
 
-describe('DriveController: a cross-device refusal after a file was dropped as a duplicate (C1)', () => {
-    test('is undone: every file is back in the plain folder with its record, and nothing reads as deleted', async () => {
+describe('DriveController: a store already holding one of the sync folder\'s names (C1, m3)', () => {
+    test('stops the move before anything moves: every file stays in the plain folder with its record', async () => {
         const s = setup({ loggedIn: false });
         for (const n of ['a', 'b', 'c', 'd', 'e', 'f']) s.put(path.join(s.syncDir, `${n}.txt`), `content ${n}`);
         const first = readdirSync(s.syncDir)[0]!;
@@ -416,12 +417,15 @@ describe('DriveController: a cross-device refusal after a file was dropped as a 
             lastError: null,
         });
         const before = snapshot(s.syncDir);
+        const store = snapshot(s.backingDir);
         const { controller } = await s.boot({ moveSeams: { moveSameDisk: () => { throw exdev(); } } });
 
         expect(snapshot(s.syncDir)).toEqual(before);
+        expect(snapshot(s.backingDir)).toEqual(store);
         expect(readDriveLayout(s.stateDb)).toBe('plain');
         expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBeNull();
-        expect(controller.status()).toEqual({ mode: 'plain', mounted: false, reason: 'different-disk' });
+        expect(controller.status()).toMatchObject({ mode: 'plain', mounted: false, reason: 'move-failed' });
+        expect(controller.status().error).toMatch(new RegExp(`already holds ${first.replace('.', '\\.')}`));
         for (const item of s.stateDb.getAllItems()) expect(existsSync(path.join(s.syncDir, item.localRelPath))).toBe(true);
     });
 });
@@ -466,6 +470,53 @@ describe('DriveController: every failed move has a way out', () => {
         expect(snapshot(s.syncDir)).toEqual(before);
         expect(controller.status()).toEqual({ mode: 'plain', mounted: false, reason: 'switched-off' });
     });
+
+    test('Mount again after a move out that failed retries it, and then says the drive is switched off', async () => {
+        const { s, before, controller, recover } = await stuckMovingOut();
+        recover();
+        await controller.mountAgain();
+        expect(readDriveLayout(s.stateDb)).toBe('plain');
+        expect(snapshot(s.syncDir)).toEqual(before);
+        expect(controller.status()).toEqual({ mode: 'plain', mounted: false, reason: 'switched-off' });
+    });
+
+    for (const seenAs of ['another device', 'a cross-device refusal'] as const) {
+    test(`switching back while a move out to another disk is stuck (${seenAs}) asks to free space there, and moves nothing more`, async () => {
+        const s = setup();
+        s.leftVirtual();
+        const before = snapshot(s.backingDir, { folderTimes: false });
+        let full = false;
+        let copies = 0;
+        const { copyFileSync } = await import('node:fs');
+        const otherDisk: MoveSeams = {
+            // A bind mount: one device number, yet rename(2) refuses
+            deviceOf: (p) => (seenAs === 'another device' && p.startsWith(s.syncDir) ? 2 : 1),
+            moveSameDisk: () => {
+                throw exdev();
+            },
+            copyFile: (from, to) => {
+                if (full && ++copies > 2) throw enospc();
+                copyFileSync(from, to);
+            },
+        };
+        const { controller } = await s.boot({ moveSeams: otherDisk });
+        full = true;
+        await expect(controller.setVirtualDriveWanted(false)).rejects.toThrow(/ENOSPC/);
+        expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBe('plain');
+        const copiesWhenStuck = copies;
+
+        await expect(controller.setVirtualDriveWanted(true)).rejects.toThrow(/Free space on the disk holding .*ProtonDrive/);
+        expect(copies).toBe(copiesWhenStuck);
+        expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBe('plain');
+        expect(s.stateDb.getMeta('virtualDriveWanted')).toBe('0');
+        expect(controller.status()).toMatchObject({ reason: 'move-failed' });
+
+        full = false; // space freed: the move out finishes
+        await controller.setVirtualDriveWanted(false);
+        expect(readDriveLayout(s.stateDb)).toBe('plain');
+        expect(snapshot(s.syncDir, { folderTimes: false })).toEqual(before);
+    });
+    }
 
     test('Mount again retries a move into the drive that failed and was undone, then mounts', async () => {
         const s = setup({ wanted: false });
@@ -574,6 +625,8 @@ describe('DriveController: switching the virtual drive on and off', () => {
         expect(existsSync(path.join(s.backingDir, 'Docs', 'x.odt'))).toBe(false);
         await expect(controller.setVirtualDriveWanted(true)).rejects.toThrow('Proton Drive is busy moving files');
         await expect(controller.mountAgain()).rejects.toThrow('Proton Drive is busy moving files');
+        await expect(controller.relocate(path.join(s.root, 'Elsewhere'))).rejects.toThrow('Proton Drive is busy moving files');
+        expect(await controller.relocate(`${s.syncDir}/`)).toBe(s.syncDir); // a settings save naming the same folder
 
         release();
         await switching;
@@ -690,6 +743,99 @@ describe('DriveController: relocating the drive folder', () => {
         }
         expect(s.stateDb.getSettings().syncDir).toBe(s.syncDir);
         expect(s.supervisors.map((x) => x.events)).toEqual([['start']]);
+    });
+});
+
+describe('DriveController: a new folder must be missing or empty (S30)', () => {
+    for (const layout of ['plain', 'virtual'] as const) {
+        test(`in the ${layout} layout, a folder that already holds files is refused and nothing changes`, async () => {
+            const s = setup(layout === 'plain' ? { wanted: false } : {});
+            if (layout === 'virtual') s.leftVirtual();
+            else s.fillTree(s.syncDir);
+            const { engine, controller } = await s.boot();
+            const where = layout === 'virtual' ? s.backingDir : s.syncDir;
+            const before = snapshot(where);
+            const to = path.join(s.root, 'Documents');
+            s.put(path.join(to, 'mine.txt'), "the user's own");
+
+            await expect(controller.relocate(to)).rejects.toThrow(`Choose an empty folder, or a new one: ${to} already holds files`);
+
+            expect(snapshot(where)).toEqual(before);
+            expect(readdirSync(to)).toEqual(['mine.txt']);
+            expect(s.stateDb.getSettings().syncDir).toBe(s.syncDir);
+            expect(s.supervisors.map((x) => x.events)).toEqual(layout === 'virtual' ? [['start']] : []);
+            expect(() => engine.vfsChildren('')).not.toThrow();
+
+            // An empty one is fine
+            rmSync(path.join(to, 'mine.txt'));
+            expect(await controller.relocate(to)).toBe(to);
+        });
+    }
+});
+
+describe('POST /api/settings with a relocation that stopped (I2)', () => {
+    const serve = (s: ReturnType<typeof setup>) => {
+        const server = Bun.serve({
+            port: 0,
+            hostname: '127.0.0.1',
+            fetch: (req) => settingsRoute(req, { stateDb: s.stateDb, drive: s.controller, engine: s.engine }),
+        });
+        cleanups.push(() => void server.stop(true));
+        return (body: unknown) =>
+            fetch(`http://127.0.0.1:${server.port}/api/settings`, { method: 'POST', body: JSON.stringify(body) }).then(async (r) => ({
+                status: r.status,
+                json: (await r.json()) as { error?: string; settings?: { syncDir: string } },
+            }));
+    };
+    const stopped = async () => {
+        const s = setup({ wanted: false });
+        s.fillTree(s.syncDir);
+        const before = snapshot(s.syncDir);
+        let failing = true;
+        await s.boot({
+            moveSeams: {
+                onStep: (step) => {
+                    if (step === 'entry' && failing) throw new Error('EIO: i/o error');
+                },
+            },
+        });
+        const post = serve(s);
+        const to = path.join(s.root, 'Elsewhere');
+        expect((await post({ syncDir: to })).status).toBe(500);
+        expect(s.stateDb.getMeta(SYNC_DIR_MOVING)).not.toBeNull();
+        return { s, before, post, to, recover: () => (failing = false) };
+    };
+
+    test('asking for the folder it started from (the setting as it still is) moves everything back', async () => {
+        const { s, before, post, to, recover } = await stopped();
+        recover();
+        const res = await post({ syncDir: s.syncDir, notificationsEnabled: false });
+        expect(res.status).toBe(200);
+        expect(res.json.settings?.syncDir).toBe(s.syncDir);
+        expect(snapshot(s.syncDir)).toEqual(before);
+        expect(readdirSync(to)).toEqual([]);
+        expect(s.stateDb.getMeta(SYNC_DIR_MOVING)).toBeNull();
+        expect(() => s.engine.vfsChildren('')).not.toThrow();
+    });
+
+    test('asking for the folder it was moving to finishes the move', async () => {
+        const { s, before, post, to, recover } = await stopped();
+        recover();
+        const res = await post({ syncDir: to });
+        expect(res.status).toBe(200);
+        expect(res.json.settings?.syncDir).toBe(to);
+        expect(snapshot(to)).toEqual(before);
+        expect(readdirSync(s.syncDir)).toEqual([]);
+    });
+
+    test('the folder it already is, written differently, with nothing stopped, changes nothing', async () => {
+        const s = setup({ wanted: false });
+        await s.boot();
+        const post = serve(s);
+        const res = await post({ syncDir: `${s.syncDir}/`, notificationsEnabled: true });
+        expect(res.status).toBe(200);
+        expect(res.json.settings?.syncDir).toBe(s.syncDir);
+        expect(s.stateDb.getSettings().notificationsEnabled).toBe(true);
     });
 });
 

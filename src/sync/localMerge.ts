@@ -35,6 +35,8 @@ export interface MergeOptions {
     keepsName?: 'existing' | 'incoming';
     // A source folder still holding something once merged is left for a later round instead of failing (ENOTEMPTY)
     leaveNonEmptyFolders?: boolean;
+    // Whether a file's mode is part of what makes two copies the same (unless the destination can't keep modes)
+    modesMatter?: boolean;
     // Runs before entries move out of a source folder into the folder already there (stats from before), so that both
     // can be made writable
     openFolders?: (from: Buffer, fromStat: Stats, to: Buffer, toStat: Stats) => void;
@@ -81,7 +83,7 @@ function mergeEntry(from: Buffer, to: Buffer, now: Date, renamed: Buffer[], opts
             opts.changed?.(parentOf(from));
             return;
         }
-        if (sameContent(from, coming, to, there)) {
+        if (sameContent(from, coming, to, there, opts.modesMatter ?? true)) {
             unlinkSync(from); // what is there already holds every byte of it (a move cut short by a crash leaves this)
             opts.changed?.(parentOf(from));
             return;
@@ -150,14 +152,16 @@ export function conflictName(name: Buffer, now: Date, n = 0): Buffer {
     return Buffer.concat([stem, mark, ext]);
 }
 
-// Two names of one file, two links to the same place, or two files with the same bytes (never folders)
-function sameContent(a: Buffer, aStat: Stats, b: Buffer, bStat: Stats): boolean {
+// Two names of one file, two links to the same place, or two files with the same bytes and mode (never folders)
+function sameContent(a: Buffer, aStat: Stats, b: Buffer, bStat: Stats, modesMatter: boolean): boolean {
     if (aStat.isDirectory() || bStat.isDirectory()) return false;
     if (aStat.dev === bStat.dev && aStat.ino === bStat.ino) return true;
     if (aStat.isSymbolicLink() && bStat.isSymbolicLink()) {
         return (readlinkSync(a, { encoding: 'buffer' }) as Buffer).equals(readlinkSync(b, { encoding: 'buffer' }) as Buffer);
     }
-    return aStat.isFile() && bStat.isFile() && aStat.size === bStat.size && sameBytes(a, b);
+    if (!aStat.isFile() || !bStat.isFile() || aStat.size !== bStat.size) return false;
+    if (modesMatter && (aStat.mode & 0o7777) !== (bStat.mode & 0o7777)) return false;
+    return sameBytes(a, b);
 }
 
 export function sameBytes(a: string | Buffer, b: string | Buffer): boolean {

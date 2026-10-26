@@ -1734,39 +1734,44 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             return { ...drive, engine, oldDir: stateDb.getSettings().syncDir, newDir: path.join(tempDir, 'Elsewhere') };
         };
 
-        test('a folder already in the new place is merged into, and a file already there steps aside; nothing is replaced', async () => {
+        // S30: a folder that already holds files is refused, so nothing unrelated is pulled into the drive, and a move
+        // that stops part way can be undone exactly
+        test('a new folder that already holds files is refused before anything moves', async () => {
+            const d = setup(false);
+            await mkdir(d.oldDir, { recursive: true });
+            await writeFile(path.join(d.oldDir, 'a.txt'), 'synced a');
+            await mkdir(d.newDir, { recursive: true });
+            await writeFile(path.join(d.newDir, 'a.txt'), 'the user\'s own a.txt');
+            await expect(d.engine.relocateSyncFolder(d.oldDir, d.newDir)).rejects.toThrow(/Choose an empty folder, or a new one/);
+            expect(await readFile(path.join(d.oldDir, 'a.txt'), 'utf8')).toBe('synced a');
+            expect(await readFile(path.join(d.newDir, 'a.txt'), 'utf8')).toBe('the user\'s own a.txt');
+            expect(stateDb.getSettings().syncDir).toBe(d.oldDir);
+        });
+
+        test('synced files moved to an empty folder keep their records: nothing is trashed, uploaded or downloaded again', async () => {
             const d = setup();
             d.add('Docs/a.txt', 'synced a');
             d.add('top.txt', 'synced top');
             d.engine.availability.setPin(d.root.uid, 'pinned', false);
             await d.engine.start({ backgroundInitialReconcile: false });
             await d.engine.reconcileNow();
-            await mkdir(path.join(d.newDir, 'Docs'), { recursive: true });
-            await writeFile(path.join(d.newDir, 'Docs', 'a.txt'), 'was already there');
-            await writeFile(path.join(d.newDir, 'Docs', 'mine.txt'), 'mine');
-            await writeFile(path.join(d.newDir, 'top.txt'), 'top already there');
+            await mkdir(d.newDir, { recursive: true }); // there, and empty
             const records = stateDb.getAllItems();
+            const downloads = [...d.calls.downloads];
 
             expect(await d.engine.relocateSyncFolder(d.oldDir, d.newDir)).toBe(d.newDir);
 
-            const at = (rel: string) => readFile(path.join(d.newDir, rel), 'utf8');
-            expect(await at('Docs/a.txt')).toBe('synced a');
-            expect(await at('Docs/mine.txt')).toBe('mine');
-            expect(await at('top.txt')).toBe('synced top');
-            const conflicts = (await readdir(path.join(d.newDir, 'Docs'))).filter((n) => n.includes('conflict'));
-            expect(await Promise.all(conflicts.map((n) => at(`Docs/${n}`)))).toEqual(['was already there']);
-            const topConflicts = (await readdir(d.newDir)).filter((n) => n.includes('conflict'));
-            expect(await Promise.all(topConflicts.map((n) => at(n)))).toEqual(['top already there']);
+            expect(await readFile(path.join(d.newDir, 'Docs/a.txt'), 'utf8')).toBe('synced a');
+            expect(await readFile(path.join(d.newDir, 'top.txt'), 'utf8')).toBe('synced top');
             expect(await readdir(d.oldDir)).toEqual([]);
             expect(stateDb.getSettings().syncDir).toBe(d.newDir);
-
-            // The next pass (started by the relocation) finds every synced file where its record says: nothing is
-            // trashed or uploaded over, and the records of the synced files are as they were
+            // The next pass (started by the relocation) finds every synced file where its record says
             await d.engine.holdForMove(); // waits for that pass
             d.engine.releaseHold();
             expect(records.map((r) => stateDb.getItemByPath(r.localRelPath)?.nodeUid)).toEqual(records.map((r) => r.nodeUid));
             expect(d.calls.trashed).toEqual([]);
-            expect(d.calls.uploads.sort()).toEqual([...conflicts.map((n) => `Docs/${n}`), 'Docs/mine.txt', ...topConflicts].sort());
+            expect(d.calls.uploads).toEqual([]);
+            expect(d.calls.downloads).toEqual(downloads);
             await d.engine.stop();
         });
 
