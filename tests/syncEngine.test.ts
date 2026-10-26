@@ -4203,6 +4203,62 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(d.calls.downloads).toEqual([]);
             });
 
+            // Review N1: an editor's atomic save over a file whose edit is still unsettled keeps judging by the baseline
+            test('an atomic save over an edit still in conflict (prompt) never overwrites the cloud change', async () => {
+                stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                await d.engine.reconcileNow();
+                await truncatedAndWritten(d, 'Docs/doc.txt', 'mine');
+                changeInCloud(d, 'vol~Docs/doc.txt', 'theirs');
+                await d.engine.reconcileNow(); // the conflict is queued, with no record; the index now has 'theirs'
+                // The editor saves again: a temp file renamed over the file, through the drive
+                await writeFile(d.local('Docs/doc.txt.new'), 'mine again');
+                await d.engine.renameItem('Docs/doc.txt.new', 'Docs/doc.txt');
+                await d.engine.replayRemoteOps();
+                expect(stateDb.getEditBaseline('Docs/doc.txt')?.sha1).toBe(new Bun.CryptoHasher('sha1').update('old').digest('hex'));
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                expect(d.calls.uploads).toEqual([]);
+                expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('mine again');
+            });
+
+            test('an atomic save after a keep-both cut short never overwrites the cloud change', async () => {
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                await d.engine.reconcileNow();
+                await truncatedAndWritten(d, 'Docs/doc.txt', 'mine');
+                changeInCloud(d, 'vol~Docs/doc.txt', 'theirs');
+                d.failNext('getFileRevisionDownloader'); // the conflict copy is made, then the download fails
+                await d.engine.reconcileNow();
+                await writeFile(d.local('Docs/doc.txt.new'), 'mine again');
+                await d.engine.renameItem('Docs/doc.txt.new', 'Docs/doc.txt');
+                await d.engine.replayRemoteOps();
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                expect(d.calls.uploads).not.toContain('Docs/doc.txt');
+                const copies = cloudNamesIn(d, 'vol~Docs').filter((n) => n.startsWith('doc (conflict '));
+                expect(copies.map((c) => d.named('vol~Docs', c)[0]?.content)).toContain('mine again');
+            });
+
+            // Review N5: deleted outside the drive and reported by the watcher
+            test('the watcher reporting the file gone drops its baseline', async () => {
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                await d.engine.reconcileNow();
+                await d.engine.truncateItem('Docs/doc.txt');
+                await rm(d.local('Docs/doc.txt'));
+
+                await (d.engine as any).handleLocalFileChange('Docs/doc.txt');
+
+                expect(stateDb.getEditBaseline('Docs/doc.txt')).toBeNull();
+                expect(d.calls.trashed).toEqual([]);
+            });
+
             test('a baseline whose file is gone is dropped at the next pass', async () => {
                 const d = setup();
                 d.add('Docs/doc.txt', 'old');

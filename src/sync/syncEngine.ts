@@ -1411,7 +1411,8 @@ export class ProtonDriveSyncEngine {
             const dbRecord = this.stateDb.getItemByPath(relPath);
 
             if (!st) {
-                // Local item was deleted
+                // Local item was deleted: an edit baseline there stands for nothing any more
+                this.stateDb.dropEditBaselines(relPath);
                 if (dbRecord) {
                     try {
                         const remoteNode = await this.sdk.getNode(dbRecord.nodeUid);
@@ -2395,18 +2396,23 @@ export class ProtonDriveSyncEngine {
                 this.stateDb.connection.transaction(() => {
                     if (keepsTarget) {
                         // The replaced file keeps its identity, marked as changed here, so the next look uploads its new
-                        // content as a new revision of it
-                        const base =
-                            targetRecord?.nodeUid === targetUid ? targetRecord : recordFromIndexEntry(targetEntry!, toRel);
+                        // content as a new revision of it. A target being edited through the drive with no record yet
+                        // keeps its edit baseline instead: what the drive showed decides, not the index, which may
+                        // have moved on to another device's change since
+                        const edit = targetRecord ? null : this.stateDb.getEditBaseline(toRel);
                         this.stateDb.removeItemByPath(fromRel);
-                        this.stateDb.upsertItem({
-                            ...base,
-                            localSha1: null,
-                            localMtimeMs: 0,
-                            syncStatus: 'synced',
-                            lastError: null,
-                            updatedAt: undefined,
-                        });
+                        if (edit?.nodeUid !== targetUid) {
+                            const base =
+                                targetRecord?.nodeUid === targetUid ? targetRecord : recordFromIndexEntry(targetEntry!, toRel);
+                            this.stateDb.upsertItem({
+                                ...base,
+                                localSha1: null,
+                                localMtimeMs: 0,
+                                syncStatus: 'synced',
+                                lastError: null,
+                                updatedAt: undefined,
+                            });
+                        }
                         if (sourceUid !== null && sourceUid !== targetUid) {
                             this.journal.enqueue({ kind: 'trash', nodeUid: sourceUid, path: fromRel });
                         }
