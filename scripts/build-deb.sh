@@ -18,6 +18,11 @@ export PATH="$HOME/.cargo/bin:$PATH"
 cp "$ROOT_DIR/native-gui/target/release/protondrive-gui" "$ROOT_DIR/release/protondrive-gui"
 chmod 0755 "$ROOT_DIR/release/protondrive-gui"
 
+echo "==> Compiling virtual drive helper (protondrive-vfs)..."
+(cd "$ROOT_DIR/native-vfs" && cargo build --release)
+cp "$ROOT_DIR/native-vfs/target/release/protondrive-vfs" "$ROOT_DIR/release/protondrive-vfs"
+chmod 0755 "$ROOT_DIR/release/protondrive-vfs"
+
 echo "==> Staging Debian package layout in $STAGE_DIR..."
 rm -rf "$STAGE_DIR"
 mkdir -p \
@@ -31,7 +36,8 @@ mkdir -p \
 
 cp "$ROOT_DIR/release/proton-drive-ubuntu" "$STAGE_DIR/usr/bin/proton-drive-ubuntu"
 cp "$ROOT_DIR/release/protondrive-gui" "$STAGE_DIR/usr/bin/protondrive-gui"
-chmod 0755 "$STAGE_DIR/usr/bin/proton-drive-ubuntu" "$STAGE_DIR/usr/bin/protondrive-gui"
+cp "$ROOT_DIR/release/protondrive-vfs" "$STAGE_DIR/usr/bin/protondrive-vfs"
+chmod 0755 "$STAGE_DIR/usr/bin/proton-drive-ubuntu" "$STAGE_DIR/usr/bin/protondrive-gui" "$STAGE_DIR/usr/bin/protondrive-vfs"
 ln -sf proton-drive-ubuntu "$STAGE_DIR/usr/bin/protondrive"
 
 cp "$ROOT_DIR/linux/systemd/proton-drive-ubuntu.service" "$STAGE_DIR/usr/lib/systemd/user/proton-drive-ubuntu.service"
@@ -47,8 +53,8 @@ Version: ${VERSION}
 Section: utils
 Priority: optional
 Architecture: ${ARCH}
-Depends: libsecret-1-0, libnotify-bin, xdg-utils
-Recommends: python3-nautilus
+Depends: libsecret-1-0, libnotify-bin, xdg-utils, fuse3
+Recommends: python3-nautilus, libglib2.0-bin
 Maintainer: Gautam Chauhan <gautam@ubuntu.local>
 Description: Unofficial Proton Drive two-way sync & desktop client for Ubuntu
  Third-party application not officially supported by Proton.

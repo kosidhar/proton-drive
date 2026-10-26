@@ -559,7 +559,7 @@
 **Files:** none. Verification only, plus a closing commit if a fix is needed.
 
 - [ ] **Step 1: Back up and record.**
-  - Copy the state DB with sqlite3 backup into the scratchpad.
+  - Back up the state DB into the scratchpad with `VACUUM INTO`, which needs no sqlite3 (it isn't installed): `~/.bun/bin/bun -e 'new (require("bun:sqlite").Database)(process.argv[1], { readwrite: true, create: false }).run("VACUUM INTO ?", [process.argv[2]])' ~/.local/share/proton-drive-ubuntu/ubuntu-sync-state.sqlite <scratchpad>/state-before-stage-2.sqlite` (the target must not exist yet).
   - Record the status, `du -sb ~/ProtonDrive`, the file count, and the last activity id.
 - [ ] **Step 2: Build and install** the daemon, GUI and helper. Restart the daemon only while idle (quit via the API, then `setsid -f`).
 - [ ] **Step 3: Check the layout move:**
@@ -580,7 +580,65 @@
   - **Clean up** with `rm -r ~/ProtonDrive/fod2-test`, which goes to the Proton trash.
 - [ ] **Step 5: Live background-reader check.** Open a folder with online-only images in Files (ask the user to browse it, or use `gio list` plus `gio info -a standard::content-type` on it). The activity log shows no downloads.
 - [ ] **Step 6:** Screenshots of the GUI Settings and My files from the installed build. Commit any fix with `Fixes #N` (or close the issue at merge), and push.
-- **Rollback:**
-  1. Switch the virtual drive off in Settings (Task 9 moves the files back); or, if the daemon won't start, `fusermount3 -u -z ~/ProtonDrive`.
-  2. Move `~/.local/share/proton-drive-ubuntu/files/*` back into `~/ProtonDrive` and set meta `driveLayout='plain'`.
-  3. Then reinstall the `main` binaries.
+- **Rollback** (back to the `main` binaries). `main` knows nothing of the backing store. A `main` daemon started while the files are in it syncs the empty `~/ProtonDrive` and trashes every cloud copy, so **never start a `main` daemon while meta `driveLayout` is `'virtual'`**. Meta is the `settings` table (`key TEXT PRIMARY KEY, value TEXT NOT NULL`) of `~/.local/share/proton-drive-ubuntu/ubuntu-sync-state.sqlite` (`$XDG_DATA_HOME/proton-drive-ubuntu/` when that is set).
+
+  The `sqlite3` command isn't installed by default, so the database steps go through `pdb`, a stand-in on Bun's built-in SQLite. It runs one SQL text against `$DB`, printing rows as `sqlite3` does (`a|b`). It needs no install: `~/.bun/bin/bun` runs it, or, with no Bun installed, the Stage 2 `protondrive` binary does (with `BUN_BE_BUN=1` it acts as Bun). With `sqlite3` installed, `sqlite3 "$DB" "<the same SQL>"` does the same.
+
+  Set these first:
+  ```sh
+  APP=~/.local/share/proton-drive-ubuntu; DB=$APP/ubuntu-sync-state.sqlite; STORE=$APP/files
+  BUN=~/.bun/bin/bun    # or, with no Bun installed: BUN=~/.local/bin/protondrive; export BUN_BE_BUN=1
+  pdb() { "$BUN" -e 'const { Database } = require("bun:sqlite"); const [, file, sql] = process.argv; const db = new Database(file, { readwrite: true, create: false }); db.run("PRAGMA busy_timeout = 5000"); if (/^\s*select/i.test(sql)) { for (const row of db.query(sql).values()) console.log(row.join("|")); } else { db.run(sql); }' "$DB" "$1"; }
+  ```
+  1. **Preferred: let the Stage 2 daemon move the files back.**
+     - In Settings, switch off **Show online-only files in Files (virtual drive)**, and wait until the move is done.
+     - Confirm that `curl -s http://127.0.0.1:49152/api/status | python3 -c 'import json,sys; print(json.load(sys.stdin)["vfs"])'` shows `'mode': 'plain'`, with no `'move'`.
+     - Confirm that `pdb "SELECT key, value FROM settings WHERE key IN ('driveLayout', 'layoutMoving', 'syncDirMoving', 'localMoveInProgress');"` prints only `driveLayout|plain`.
+     - Then go to step 3.
+  2. **Only if the Stage 2 daemon won't start: move the files back by hand.**
+     - Check that no Proton Drive process runs: `pgrep -a protondrive` must print nothing (no daemon, app or helper). If it prints anything, choose **Quit Proton Drive** in the tray menu, or close the app (`pkill -x protondrive-gui`, so that it can't start the daemon again) and then run `curl -s -X POST http://127.0.0.1:49152/api/quit`; check again. A daemon still running would read the moves below as deletes.
+     - Back up the database, and look at its markers:
+       ```sh
+       pdb "VACUUM INTO '$APP/ubuntu-sync-state.pre-rollback.sqlite'"
+       pdb "SELECT key, value FROM settings WHERE key IN ('syncDir', 'driveLayout', 'layoutMoving', 'syncDirMoving', 'localMoveInProgress');"
+       ```
+     - `VACUUM INTO` refuses a file that already exists: pick another name for a second backup. With `sqlite3`: `sqlite3 "$DB" ".backup '$APP/ubuntu-sync-state.pre-rollback.sqlite'"`.
+     - `syncDir` names the Proton Drive folder. The commands below assume it is `~/ProtonDrive`; use yours if it isn't.
+     - If `syncDirMoving` is listed, stop here. A move of the plain folder was cut short, and only the Stage 2 daemon can finish it.
+     - Unmount the drive, and make the folder writable again (it is `0555` while unmounted). `findmnt` must print nothing:
+       ```sh
+       fusermount3 -u -z ~/ProtonDrive 2>/dev/null; findmnt ~/ProtonDrive
+       chmod 755 ~/ProtonDrive
+       ```
+     - Move everything out of the store, dot-entries included, never replacing anything:
+       ```sh
+       find "$STORE" -mindepth 1 -maxdepth 1 -exec mv -n -t ~/ProtonDrive {} +
+       find "$STORE" -mindepth 1
+       ```
+     - The last `find` must print nothing. If it prints a folder, a move was cut short inside it, so it exists in both places. Merge it file by file, again never replacing anything:
+       ```sh
+       (cd "$STORE" && find . -mindepth 1 -type d -printf '%P\0' | xargs -0r -I{} mkdir -p -- ~/ProtonDrive/{})
+       (cd "$STORE" && find . -mindepth 1 ! -type d -printf '%P\0' | xargs -0r -I{} mv -n -- {} ~/ProtonDrive/{})
+       find "$STORE" -mindepth 1 -type d -empty -delete
+       find "$STORE" -mindepth 1
+       ```
+     - Whatever the last `find` still prints has a name already taken in `~/ProtonDrive`. Compare the two copies and keep the right one by hand. The store must end up empty.
+     - Record the plain layout. `virtualDriveWanted='0'` stops the Stage 2 daemon in step 3 from moving the files back into the store:
+       ```sh
+       pdb "BEGIN; INSERT OR REPLACE INTO settings (key, value) VALUES ('driveLayout', 'plain'), ('virtualDriveWanted', '0'); DELETE FROM settings WHERE key = 'layoutMoving'; COMMIT;"
+       pdb "SELECT key, value FROM settings WHERE key IN ('driveLayout', 'layoutMoving', 'syncDirMoving', 'localMoveInProgress', 'virtualDriveWanted');"
+       ```
+     - The check must print only `driveLayout|plain` and `virtualDriveWanted|0`.
+  3. **Before installing the `main` binaries:** run the Stage 2 daemon, online, signed in, and in the plain layout, until it has finished all its work:
+     - every change made through the drive has reached Proton Drive (`remote_ops`);
+     - every file edited through the drive is recorded (`drive_edit_baselines`);
+     - a local move cut short is finished (`localMoveInProgress`).
+
+     `main` reads none of these. Pending renames and moves would be lost: the moved items would upload again as new ones, and the cloud copies at their old paths would be trashed (#16). Files edited through the drive would meet `main`'s conflict handling. With the daemon idle, both checks must pass:
+     ```sh
+     pdb "SELECT (SELECT COUNT(*) FROM remote_ops), (SELECT COUNT(*) FROM drive_edit_baselines);"
+     pdb "SELECT key, value FROM settings WHERE key IN ('driveLayout', 'layoutMoving', 'syncDirMoving', 'localMoveInProgress');"
+     ```
+     - The first must print `0|0`. The second must print only `driveLayout|plain`.
+     - If the Stage 2 daemon can't run at all, don't install `main`: keep the Stage 2 binaries installed and investigate.
+     - Otherwise, with the daemon idle, quit Proton Drive (the tray's **Quit Proton Drive**, or close the app and then run `curl -s -X POST http://127.0.0.1:49152/api/quit`). Check that `pgrep -a protondrive` prints nothing, back up the database again (`pdb "VACUUM INTO '$APP/ubuntu-sync-state.pre-main.sqlite'"`), and install the `main` binaries.

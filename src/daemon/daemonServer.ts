@@ -14,10 +14,15 @@ import {
     THIRD_PARTY_DISCLOSURE,
 } from '../sdk';
 import { migrateExcludedFolders } from '../sync/availabilityMigration';
+import { backingDirFor, virtualDriveWanted } from '../sync/driveMode';
 import { ProtonDriveSyncEngine } from '../sync/syncEngine';
 import { SyncStateDatabase } from '../sync/syncStateDb';
 import { defaultControlSocketPath, startControlServer } from './controlServer';
+import { controlServerOptions } from './controlWiring';
+import { DriveController } from './driveController';
 import { isTrustedLocalRequest } from './requestGuard';
+import { refuseOnTcp } from './tcpRefusals';
+import { findHelper, fuseAvailable, mergeStrayInto, VfsSupervisor } from './vfsSupervisor';
 
 export const DEFAULT_DAEMON_PORT = Number(process.env.PROTON_DRIVE_DAEMON_PORT || 49152);
 export const DEFAULT_DAEMON_HOST = '127.0.0.1';
@@ -80,15 +85,39 @@ export async function startSyncDaemon(options: {
         runtime.auth,
         stateDb,
         runtime.logger,
+        { backingDir: backingDirFor(runtime.config.appDir) },
     );
 
-    // Before the first sync with the availability policy, so what is synced today stays downloaded. A failure stops
-    // the start: syncing unmigrated would leave old Cloud only records that read as local deletions.
-    if ((await migrateExcludedFolders(stateDb, engine.availability, stateDbPath)) === 'migrated') {
-        runtime.logger.info('Migrated Cloud only folders to the availability policy');
-    }
-    await engine.start({ backgroundInitialReconcile: true });
-    ensureSystemTrayIndicator();
+    // The drive: the files move between the sync folder and the backing store to match the mode, and the helper runs
+    // while they are in the store. FUSE and the helper are looked for once, here, so /api/status stays cheap.
+    const appDir = runtime.config.appDir;
+    const backingDir = backingDirFor(appDir);
+    const helperPath = findHelper();
+    const drive = new DriveController({
+        stateDb,
+        engine,
+        appDir,
+        backingDir,
+        logger: runtime.logger,
+        fuseOk: fuseAvailable(helperPath),
+        makeSupervisor: (mountpoint) =>
+            new VfsSupervisor({
+                mountpoint,
+                backingDir,
+                appDir,
+                socketPath: defaultControlSocketPath(),
+                helperPath: helperPath ?? 'protondrive-vfs', // spawned only when FUSE and the helper were found
+                logPath: path.join(appDir, 'vfs.log'),
+                logger: runtime.logger,
+                nudge: true, // so Files shows the drive in its sidebar as soon as it mounts (#49)
+                // A file saved into the bare folder while the drive was down: the engine uploads it as a new local file
+                mergeStray: async (fullPath) => {
+                    for (const renamed of mergeStrayInto(fullPath, mountpoint, backingDir)) {
+                        runtime.logger.warn(`A stray in ${mountpoint} took a name already in the drive; kept it as ${renamed}`);
+                    }
+                },
+            }),
+    });
 
     let cachedAccount: ProtonAccountInfo | null = null;
     let lastAccountFetchMs = 0;
@@ -223,7 +252,70 @@ export async function startSyncDaemon(options: {
         void fetchRemotePathItems('/my-files').catch(() => {});
     }
 
+    // Sign in and out: called only through the control socket (POST /auth/login, /auth/logout), never from the TCP API
+    const signIn = async () => {
+        let signInUrlResolver: ((url: string) => void) | null = null;
+        const signInUrlPromise = new Promise<string>((resolve) => {
+            signInUrlResolver = resolve;
+        });
+
+        // Run authViaWeb in background and resolve signInUrl as soon as ready
+        void runtime.auth
+            .authViaWeb((signInUrl) => {
+                openBrowserUrl(signInUrl);
+                signInUrlResolver?.(signInUrl);
+            })
+            .then(async () => {
+                await runtime.eventsManager.startSubscriptions();
+                stateDb.logActivity({
+                    action: 'auth',
+                    localRelPath: '/',
+                    details: 'Signed in to Proton Drive via web authentication',
+                });
+                sendDesktopNotification({
+                    title: 'Proton Drive Connected',
+                    body: 'Successfully signed in and started two-way folder sync.',
+                    enabled: stateDb.getSettings().notificationsEnabled,
+                });
+                await engine.start({ backgroundInitialReconcile: true });
+                void refreshAccountInfo(true);
+                void fetchRemotePathItems('/my-files').catch(() => {});
+                ensureSystemTrayIndicator();
+            })
+            .catch((err: unknown) => {
+                runtime.logger.error('Web authentication failed', err);
+            });
+
+        const signInUrl = await Promise.race([
+            signInUrlPromise,
+            new Promise<string>((resolve) => setTimeout(() => resolve(''), 3000)),
+        ]);
+        return { signInUrl, disclosure: THIRD_PARTY_DISCLOSURE };
+    };
+
+    const signOut = async () => {
+        await engine.stop();
+        await runtime.auth.logout();
+        await runtime.clearCaches();
+        cachedAccount = null;
+        stateDb.logActivity({
+            action: 'auth',
+            localRelPath: '/',
+            details: 'Signed out and cleared local crypto/entity caches',
+        });
+    };
+
+    // Called only through the control socket (POST /remote/mkdir), never from the TCP API
+    const makeRemoteFolder = async (parentPath: string, name: string) => {
+        const parentNode = await runtime.paths.getNode(parentPath, [PathType.MyFiles, PathType.SharedWithMe, PathType.Devices]);
+        const created = await runtime.sdk.createFolder(parentNode, name);
+        remoteListCache.delete(parentPath);
+        void fetchRemotePathItems(parentPath).catch(() => {});
+        return { uid: created.uid, name: getName(created) };
+    };
+
     const settings = stateDb.getSettings();
+    let controlServer: { stop(): void } | null = null;
     const reconcileTimer = setInterval(() => {
         const s = stateDb.getSettings();
         if (runtime.auth.isLoggedIn()) {
@@ -234,6 +326,19 @@ export async function startSyncDaemon(options: {
         }
     }, Math.max(30, settings.reconcileIntervalSec) * 1000);
 
+    // Unmounts first, while the daemon still answers the helper; bounded, so it never holds up the shutdown
+    const stop = async () => {
+        clearInterval(reconcileTimer);
+        await drive.stop();
+        server.stop();
+        controlServer?.stop();
+        await engine.stop();
+        stateDb.close();
+        await runtime.dispose();
+    };
+
+    // Listening before any file moves: a second daemon fails here (the port is taken) instead of moving files too, and
+    // the app sees this one answer, busy, rather than starting another
     let lastRejectionLogAt = 0;
     const server = Bun.serve({
         hostname: host,
@@ -253,6 +358,8 @@ export async function startSyncDaemon(options: {
                     { status: 403 },
                 );
             }
+            const refused = refuseOnTcp(req);
+            if (refused) return refused;
             const url = new URL(req.url);
             const pathname = url.pathname;
 
@@ -276,6 +383,8 @@ export async function startSyncDaemon(options: {
                     const systemd = await getSystemdServiceStatus();
                     return Response.json({
                         ...engine.getStatus(),
+                        vfs: drive.status(),
+                        virtualDriveWanted: virtualDriveWanted(stateDb),
                         account: cachedAccount,
                         appVersion: runtime.config.appVersion,
                         sdkVersion: runtime.config.sdkVersion,
@@ -309,89 +418,9 @@ export async function startSyncDaemon(options: {
                     return Response.json({ ok: true, status: engine.getStatus() });
                 }
 
-                if (req.method === 'POST' && pathname === '/api/auth/login') {
-                    let signInUrlResolver: ((url: string) => void) | null = null;
-                    const signInUrlPromise = new Promise<string>((resolve) => {
-                        signInUrlResolver = resolve;
-                    });
-
-                    // Run authViaWeb in background and resolve signInUrl as soon as ready
-                    void runtime.auth
-                        .authViaWeb((signInUrl) => {
-                            openBrowserUrl(signInUrl);
-                            signInUrlResolver?.(signInUrl);
-                        })
-                        .then(async () => {
-                            await runtime.eventsManager.startSubscriptions();
-                            stateDb.logActivity({
-                                action: 'auth',
-                                localRelPath: '/',
-                                details: 'Signed in to Proton Drive via web authentication',
-                            });
-                            sendDesktopNotification({
-                                title: 'Proton Drive Connected',
-                                body: 'Successfully signed in and started two-way folder sync.',
-                                enabled: stateDb.getSettings().notificationsEnabled,
-                            });
-                            await engine.start({ backgroundInitialReconcile: true });
-                            void refreshAccountInfo(true);
-                            void fetchRemotePathItems('/my-files').catch(() => {});
-                            ensureSystemTrayIndicator();
-                        })
-                        .catch((err: unknown) => {
-                            runtime.logger.error('Web authentication failed', err);
-                        });
-
-                    const signInUrl = await Promise.race([
-                        signInUrlPromise,
-                        new Promise<string>((resolve) => setTimeout(() => resolve(''), 3000)),
-                    ]);
-
-                    return Response.json({ ok: true, signInUrl, disclosure: THIRD_PARTY_DISCLOSURE });
-                }
-
-                if (req.method === 'POST' && pathname === '/api/auth/logout') {
-                    await engine.stop();
-                    await runtime.auth.logout();
-                    await runtime.clearCaches();
-                    cachedAccount = null;
-                    stateDb.logActivity({
-                        action: 'auth',
-                        localRelPath: '/',
-                        details: 'Signed out and cleared local crypto/entity caches',
-                    });
-                    return Response.json({ ok: true });
-                }
-
                 if (req.method === 'GET' && pathname === '/api/conflicts') {
                     const conflicts = stateDb.listConflicts(true);
                     return Response.json(conflicts);
-                }
-
-                if (req.method === 'POST' && pathname === '/api/conflicts/resolve') {
-                    const body = (await req.json()) as {
-                        id: number;
-                        choice: 'keep-both' | 'keep-local' | 'keep-remote';
-                    };
-                    const resolved = await engine.resolveConflictManually(Number(body.id), body.choice);
-                    return Response.json({ ok: true, conflict: resolved });
-                }
-
-                if (req.method === 'POST' && pathname === '/api/settings') {
-                    const prev = stateDb.getSettings();
-                    const body = (await req.json()) as Record<string, unknown>;
-                    if (typeof body.syncDir === 'string' && body.syncDir.trim() && body.syncDir.trim() !== prev.syncDir) {
-                        const relocated = await engine.relocateSyncFolder(prev.syncDir, body.syncDir.trim());
-                        body.syncDir = relocated;
-                    }
-                    const updated = stateDb.updateSettings(body);
-                    if (
-                        prev.syncDir !== updated.syncDir ||
-                        JSON.stringify(prev.ignorePatterns) !== JSON.stringify(updated.ignorePatterns)
-                    ) {
-                        void engine.reconcileNow();
-                    }
-                    return Response.json({ ok: true, settings: stateDb.getSettings() });
                 }
 
                 // Remote browser endpoints
@@ -421,23 +450,6 @@ export async function startSyncDaemon(options: {
                     }
                     const items = await livePromise;
                     return Response.json({ path: remotePath, items: withAvailability(remotePath, items) });
-                }
-
-                if (req.method === 'POST' && pathname === '/api/remote/mkdir') {
-                    const body = (await req.json()) as { parentPath: string; name: string };
-                    const targetParent = body.parentPath || '/my-files';
-                    const parentNode = await runtime.paths.getNode(targetParent, [
-                        PathType.MyFiles,
-                        PathType.SharedWithMe,
-                        PathType.Devices,
-                    ]);
-                    const created = await runtime.sdk.createFolder(parentNode, body.name);
-                    remoteListCache.delete(targetParent);
-                    void fetchRemotePathItems(targetParent).catch(() => {});
-                    return Response.json({
-                        ok: true,
-                        folder: { uid: created.uid, name: getName(created) },
-                    });
                 }
 
                 // Nautilus file status lookup endpoint
@@ -475,22 +487,36 @@ export async function startSyncDaemon(options: {
         },
     });
 
-    // The only way to pin, free, hide or unhide: a user-only Unix socket, never the TCP API above
-    let controlServer: { stop(): void } | null = null;
-    try {
-        controlServer = await startControlServer({ socketPath: defaultControlSocketPath(), engine });
-    } catch (err) {
-        runtime.logger.error(`Control socket unavailable, availability actions are disabled: ${String(err)}`);
-    }
+    // A move cut short is finished, then the files move to match the mode, all before the engine starts. The
+    // availability migration runs in between, on a whole tree, before the first sync with the availability policy (so
+    // what is synced today stays downloaded); its failure stops the start, as syncing unmigrated would leave old Cloud
+    // only records that read as local deletions.
+    await drive.settleAtStart(async () => {
+        if ((await migrateExcludedFolders(stateDb, engine.availability, stateDbPath, engine.localRoot())) === 'migrated') {
+            runtime.logger.info('Migrated Cloud only folders to the availability policy');
+        }
+    });
+    await engine.start({ backgroundInitialReconcile: true }); // does nothing while a move that stopped holds it
+    ensureSystemTrayIndicator();
 
-    const stop = async () => {
-        clearInterval(reconcileTimer);
-        server.stop();
-        controlServer?.stop();
-        await engine.stop();
-        stateDb.close();
-        await runtime.dispose();
-    };
+    // The only way to pin, free, hide or unhide, to change settings or the drive folder or the virtual drive, to sign in
+    // or out, to resolve a conflict or to make a cloud folder: a user-only Unix socket, never the TCP API above
+    try {
+        controlServer = await startControlServer(
+            controlServerOptions({
+                socketPath: defaultControlSocketPath(),
+                engine,
+                drive,
+                stateDb,
+                signIn,
+                signOut,
+                makeRemoteFolder,
+            }),
+        );
+    } catch (err) {
+        runtime.logger.error(`Control socket unavailable, so the app can't pin or free files, change settings, sign in or out, resolve conflicts or make folders: ${String(err)}`);
+    }
+    await drive.startDrive(controlServer !== null);
 
     return {
         url: `http://${host}:${server.port}`,

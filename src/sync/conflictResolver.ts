@@ -3,16 +3,20 @@ import { hostname } from 'node:os';
 import path from 'node:path';
 
 export function formatConflictFileName(originalName: string, date = new Date(), host = hostname()): string {
-    const pad = (n: number) => String(n).padStart(2, '0');
-    const stamp = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`;
-    const safeHost = host.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'ubuntu';
-
     const dotIndex = originalName.lastIndexOf('.');
     const hasExt = dotIndex > 0 && dotIndex < originalName.length - 1;
     const stem = hasExt ? originalName.slice(0, dotIndex) : originalName;
     const ext = hasExt ? originalName.slice(dotIndex) : '';
 
-    return `${stem} (conflict ${stamp} ${safeHost})${ext}`;
+    return `${stem}${conflictMark(date, host)}${ext}`;
+}
+
+// What a conflict name adds between the stem and the extension: " (conflict <date time> <host>)"
+export function conflictMark(date = new Date(), host = hostname()): string {
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const stamp = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`;
+    const safeHost = host.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'ubuntu';
+    return ` (conflict ${stamp} ${safeHost})`;
 }
 
 export async function createLocalConflictCopy(localFullPath: string): Promise<string> {

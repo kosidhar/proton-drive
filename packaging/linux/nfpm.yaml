@@ -28,7 +28,9 @@ overrides:
       - libgcc-s1
       - libxkbcommon0
       - libvulkan1 | libegl1
+      - fuse3
     recommends:
+      - libglib2.0-bin
       - libsecret-1-0
       - libnotify-bin
       - xdg-utils
@@ -43,7 +45,9 @@ overrides:
     depends:
       - libxkbcommon
       - (vulkan-loader or libglvnd-egl)
+      - fuse3
     recommends:
+      - glib2
       - libsecret
       - libnotify
       - xdg-utils
@@ -61,6 +65,9 @@ contents:
     file_info: { mode: 0755 }
   - src: ${STAGE}/usr/bin/protondrive-gui
     dst: /usr/bin/protondrive-gui
+    file_info: { mode: 0755 }
+  - src: ${STAGE}/usr/bin/protondrive-vfs
+    dst: /usr/bin/protondrive-vfs
     file_info: { mode: 0755 }
   - src: /usr/bin/protondrive
     dst: /usr/bin/proton-drive-ubuntu

@@ -39,6 +39,8 @@ export function entryFromNode(node: NodeEntity, parentRelPath: string): RemoteIn
 // Temporary home for moved children while replaceChildren sorts out the final paths; no real path starts with U+0001 (SQLite text
 // would also cut a NUL short).
 const PARKING = '\u0001moving';
+// Where detach takes a node out of the tree, the same way
+const DETACHED = '\u0001detached';
 
 // A persistent copy of the remote My files tree, keyed by node uid with a unique relative path ('' for the root).
 export class RemoteIndex {
@@ -134,6 +136,21 @@ export class RemoteIndex {
             .run({ $newPath: newPath, $oldPath: oldPath, ...selfOrDescendant(oldPath) });
     }
 
+    // Takes a node, with everything still under it, out of the tree for a moment: no lookup by path finds it there, and
+    // upsert puts it back. The caller puts back or removes every node it detached before it is done. The uid is escaped,
+    // so that one node detached is never under another (a uid with a '/' would read as a path).
+    detach(uid: string): void {
+        const node = this.getByUid(uid);
+        const parked = `${DETACHED}/${encodeURIComponent(uid)}`;
+        if (node && node.relPath !== parked) {
+            this.relocate(node.relPath, parked);
+        }
+    }
+
+    isDetached(entry: RemoteIndexEntry): boolean {
+        return entry.relPath.startsWith(`${DETACHED}/`);
+    }
+
     removeSubtree(uid: string): void {
         const node = this.getByUid(uid);
         if (!node) {
@@ -160,6 +177,14 @@ export class RemoteIndex {
         return this.db
             .query(`SELECT * FROM remote_nodes WHERE ${selfOrDescendantWhere('relPath')} ORDER BY relPath ASC`)
             .all(selfOrDescendant(relPath)) as RemoteIndexEntry[];
+    }
+
+    // The uids that start with a prefix (as a byte range, like pathRange)
+    uidsWithPrefix(prefix: string): string[] {
+        const rows = this.db
+            .query('SELECT uid FROM remote_nodes WHERE uid >= $lo AND uid < $hi')
+            .all({ $lo: prefix, $hi: `${prefix}\uffff` }) as { uid: string }[];
+        return rows.map((row) => row.uid);
     }
 
     listChildren(relPath: string): RemoteIndexEntry[] {

@@ -3,9 +3,10 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 
 import { selfOrDescendant, selfOrDescendantWhere } from './pathRange';
+import { type ConflictStrategy, isConflictStrategy, usableIgnorePatterns } from './settingsRules';
 
 export type ItemSyncStatus = 'synced' | 'uploading' | 'downloading' | 'conflict' | 'error' | 'ignored';
-export type ConflictStrategy = 'keep-both' | 'keep-local' | 'keep-remote' | 'prompt';
+export { CONFLICT_STRATEGIES, type ConflictStrategy } from './settingsRules';
 
 export interface SyncedItemRecord {
     localRelPath: string;
@@ -20,6 +21,19 @@ export interface SyncedItemRecord {
     syncStatus: ItemSyncStatus;
     lastError: string | null;
     updatedAt: number;
+}
+
+// What the virtual drive showed of an online-only file when it turned it into a local one (POST /vfs/truncate): the
+// local file's content is an edit of that version of that node. Kept apart from the records, so a file that goes away
+// never reads as the user deleting something synced.
+export interface EditBaseline {
+    relPath: string;
+    nodeUid: string;
+    parentUid: string | null;
+    sha1: string | null;
+    mtimeMs: number;
+    size: number;
+    createdAt: number;
 }
 
 export interface ConflictRecord {
@@ -135,6 +149,55 @@ export class SyncStateDatabase {
                 value TEXT NOT NULL
             )
         `);
+
+        this.db.run(`
+            CREATE TABLE IF NOT EXISTS drive_edit_baselines (
+                relPath TEXT PRIMARY KEY,
+                nodeUid TEXT NOT NULL,
+                parentUid TEXT,
+                sha1 TEXT,
+                mtimeMs INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                createdAt INTEGER NOT NULL
+            )
+        `);
+    }
+
+    // A stored value that fails the settings rules (saved before they existed) is never used as it is: it would stop
+    // syncing (not a list of strings) or hide the drive (matches everything). Its usable part, or the default, stands in
+    // while it is read; what is stored is never rewritten by that (updateSettings writes only what it is given).
+    // Checked once per stored value.
+    private checkedIgnorePatterns: { raw: string | undefined; value: string[] } | null = null;
+    // recordedTopLevelNames, until the records change
+    private topLevelNames: string[] | null = null;
+    private readonly warnedBadSettings = new Set<string>();
+
+    private warnBadSetting(key: string, raw: string, what = 'not a valid value; using the default'): void {
+        if (this.warnedBadSettings.has(`${key}=${raw}`)) return;
+        this.warnedBadSettings.add(`${key}=${raw}`);
+        console.warn(`The stored ${key} (${raw.slice(0, 80)}) is ${what === 'not a valid value; using the default' ? what : `used ${what}`}; the stored value is kept as it is`);
+    }
+
+    private storedIgnorePatterns(raw: string | undefined): string[] {
+        const cached = this.checkedIgnorePatterns;
+        if (cached && cached.raw === raw) return [...cached.value];
+        let value = [...DEFAULT_IGNORE_PATTERNS];
+        if (raw !== undefined) {
+            let usable: ReturnType<typeof usableIgnorePatterns> = null;
+            try {
+                usable = usableIgnorePatterns(JSON.parse(raw));
+            } catch {
+                // not JSON
+            }
+            if (usable === null) {
+                this.warnBadSetting('ignorePatterns', raw);
+            } else {
+                value = usable.patterns;
+                if (usable.dropped > 0) this.warnBadSetting('ignorePatterns', raw, `leaving out ${usable.dropped} unusable pattern(s)`);
+            }
+        }
+        this.checkedIgnorePatterns = { raw, value };
+        return [...value];
     }
 
     getSettings(): SyncSettings {
@@ -142,16 +205,18 @@ export class SyncStateDatabase {
         const rows = this.db.query('SELECT key, value FROM settings').all() as Array<{ key: string; value: string }>;
         const map = new Map(rows.map((r) => [r.key, r.value]));
 
-        let ignorePatterns = [...DEFAULT_IGNORE_PATTERNS];
-        try {
-            if (map.has('ignorePatterns')) {
-                ignorePatterns = JSON.parse(map.get('ignorePatterns')!) as string[];
-            }
-        } catch {}
+        const ignorePatterns = this.storedIgnorePatterns(map.get('ignorePatterns'));
+        const storedStrategy = map.get('conflictStrategy');
+        let conflictStrategy: ConflictStrategy = 'keep-both';
+        if (isConflictStrategy(storedStrategy)) {
+            conflictStrategy = storedStrategy;
+        } else if (storedStrategy) {
+            this.warnBadSetting('conflictStrategy', storedStrategy);
+        }
 
         return {
             syncDir: map.get('syncDir') || defaultSyncDir,
-            conflictStrategy: (map.get('conflictStrategy') as ConflictStrategy) || 'keep-both',
+            conflictStrategy,
             notificationsEnabled: map.has('notificationsEnabled') ? map.get('notificationsEnabled') === 'true' : true,
             reconcileIntervalSec: Number(map.get('reconcileIntervalSec') || 120),
             paused: map.get('paused') === 'true',
@@ -159,17 +224,22 @@ export class SyncStateDatabase {
         };
     }
 
+    // Writes only the settings given, so a value stored as it is (see getSettings) is never rewritten by a save of another;
+    // answers all of them
     updateSettings(partial: Partial<SyncSettings>): SyncSettings {
         const current = this.getSettings();
         const next: SyncSettings = { ...current, ...partial };
         const upsert = this.db.query('INSERT OR REPLACE INTO settings (key, value) VALUES ($key, $value)');
+        const store = (key: keyof SyncSettings, value: string) => {
+            if (partial[key] !== undefined) upsert.run({ $key: key, $value: value });
+        };
 
-        upsert.run({ $key: 'syncDir', $value: next.syncDir });
-        upsert.run({ $key: 'conflictStrategy', $value: next.conflictStrategy });
-        upsert.run({ $key: 'notificationsEnabled', $value: String(next.notificationsEnabled) });
-        upsert.run({ $key: 'reconcileIntervalSec', $value: String(next.reconcileIntervalSec) });
-        upsert.run({ $key: 'paused', $value: String(next.paused) });
-        upsert.run({ $key: 'ignorePatterns', $value: JSON.stringify(next.ignorePatterns) });
+        store('syncDir', next.syncDir);
+        store('conflictStrategy', next.conflictStrategy);
+        store('notificationsEnabled', String(next.notificationsEnabled));
+        store('reconcileIntervalSec', String(next.reconcileIntervalSec));
+        store('paused', String(next.paused));
+        store('ignorePatterns', JSON.stringify(next.ignorePatterns));
 
         return next;
     }
@@ -198,8 +268,11 @@ export class SyncStateDatabase {
         }
     }
 
+    // A record written for a path consumes the edit baseline there: the record is what it syncs by from then on
     upsertItem(item: Omit<SyncedItemRecord, 'updatedAt'> & { updatedAt?: number }): void {
+        this.topLevelNames = null;
         const updatedAt = item.updatedAt ?? Date.now();
+        this.db.query('DELETE FROM drive_edit_baselines WHERE relPath = $relPath').run({ $relPath: item.localRelPath });
         this.db
             .query(`
                 INSERT OR REPLACE INTO synced_items (
@@ -248,6 +321,29 @@ export class SyncStateDatabase {
             .all() as SyncedItemRecord[];
     }
 
+    // The top-level names the records are under (the first segment of each path), each once, sorted. Kept until a record
+    // is added, removed or moved (every such write goes through this class).
+    recordedTopLevelNames(): string[] {
+        if (this.topLevelNames === null) {
+            const rows = this.db
+                .query(
+                    `SELECT DISTINCT CASE WHEN instr(localRelPath, '/') > 0 THEN substr(localRelPath, 1, instr(localRelPath, '/') - 1)
+                         ELSE localRelPath END AS name FROM synced_items ORDER BY name`,
+                )
+                .all() as Array<{ name: string }>;
+            this.topLevelNames = rows.map((row) => row.name);
+        }
+        return [...this.topLevelNames];
+    }
+
+    // How many records are at a path and under it
+    countItemsUnder(localRelPath: string): number {
+        const row = this.db
+            .query(`SELECT COUNT(*) AS n FROM synced_items WHERE ${selfOrDescendantWhere('localRelPath')}`)
+            .get(selfOrDescendant(localRelPath)) as { n: number };
+        return row.n;
+    }
+
     // The record at a path and every record under it.
     getItemsUnder(localRelPath: string): SyncedItemRecord[] {
         return this.db
@@ -256,7 +352,83 @@ export class SyncStateDatabase {
     }
 
     removeItemByPath(localRelPath: string): void {
+        this.topLevelNames = null;
         this.db.query(`DELETE FROM synced_items WHERE ${selfOrDescendantWhere('localRelPath')}`).run(selfOrDescendant(localRelPath));
+    }
+
+    // Moves the record at a path, and every record under it, to another path, in one transaction (a local copy moved to
+    // follow a rename in the cloud). The root never moves, nor does a path into itself, and records already at the
+    // target are never merged into or overwritten: each of these throws, changing nothing.
+    renameItemPath(fromRel: string, toRel: string): void {
+        if (fromRel === '' || toRel === '') {
+            throw new Error("The root of the sync folder can't be moved");
+        }
+        if (toRel === fromRel) {
+            return;
+        }
+        if (toRel.startsWith(`${fromRel}/`)) {
+            throw new Error(`Can't move ${fromRel} into itself`);
+        }
+        this.topLevelNames = null;
+        this.db.transaction(() => {
+            if (this.hasItemsUnder(toRel)) {
+                throw new Error(`Already recorded: ${toRel}`);
+            }
+            this.db
+                .query(
+                    `UPDATE synced_items SET localRelPath = $toRel || substr(localRelPath, length($fromRel) + 1),
+                         updatedAt = $updatedAt
+                     WHERE ${selfOrDescendantWhere('localRelPath')}`,
+                )
+                .run({ $toRel: toRel, $fromRel: fromRel, $updatedAt: Date.now(), ...selfOrDescendant(fromRel) });
+        })();
+    }
+
+    recordEditBaseline(baseline: Omit<EditBaseline, 'createdAt'>): void {
+        this.db
+            .query(
+                `INSERT OR REPLACE INTO drive_edit_baselines (relPath, nodeUid, parentUid, sha1, mtimeMs, size, createdAt)
+                 VALUES ($relPath, $nodeUid, $parentUid, $sha1, $mtimeMs, $size, $createdAt)`,
+            )
+            .run({
+                $relPath: baseline.relPath,
+                $nodeUid: baseline.nodeUid,
+                $parentUid: baseline.parentUid,
+                $sha1: baseline.sha1,
+                $mtimeMs: Math.round(baseline.mtimeMs),
+                $size: baseline.size,
+                $createdAt: Date.now(),
+            });
+    }
+
+    getEditBaseline(relPath: string): EditBaseline | null {
+        const row = this.db.query('SELECT * FROM drive_edit_baselines WHERE relPath = $relPath').get({ $relPath: relPath });
+        return (row as EditBaseline | null) ?? null;
+    }
+
+    listEditBaselines(): EditBaseline[] {
+        return this.db.query('SELECT * FROM drive_edit_baselines ORDER BY relPath ASC').all() as EditBaseline[];
+    }
+
+    // The baselines at a path and under it
+    dropEditBaselines(relPath: string): void {
+        this.db.query(`DELETE FROM drive_edit_baselines WHERE ${selfOrDescendantWhere('relPath')}`).run(selfOrDescendant(relPath));
+    }
+
+    // The baselines at a path and under it now go with what is at toRel; any that were there go
+    moveEditBaselines(fromRel: string, toRel: string): void {
+        if (fromRel === toRel) {
+            return;
+        }
+        this.db.transaction(() => {
+            this.dropEditBaselines(toRel);
+            this.db
+                .query(
+                    `UPDATE drive_edit_baselines SET relPath = $toRel || substr(relPath, length($fromRel) + 1)
+                     WHERE ${selfOrDescendantWhere('relPath')}`,
+                )
+                .run({ $toRel: toRel, $fromRel: fromRel, ...selfOrDescendant(fromRel) });
+        })();
     }
 
     hasItemsUnder(localRelPath: string): boolean {
@@ -272,6 +444,7 @@ export class SyncStateDatabase {
         if (existing) {
             this.removeItemByPath(existing.localRelPath);
         } else {
+            this.topLevelNames = null;
             this.db.query('DELETE FROM synced_items WHERE nodeUid = $nodeUid').run({ $nodeUid: nodeUid });
         }
     }
