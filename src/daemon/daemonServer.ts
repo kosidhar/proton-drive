@@ -14,11 +14,12 @@ import {
     THIRD_PARTY_DISCLOSURE,
 } from '../sdk';
 import { migrateExcludedFolders } from '../sync/availabilityMigration';
-import { backingDirFor } from '../sync/driveMode';
+import { backingDirFor, readDriveLayout, virtualDriveWanted } from '../sync/driveMode';
 import { ProtonDriveSyncEngine } from '../sync/syncEngine';
 import { SyncStateDatabase } from '../sync/syncStateDb';
 import { defaultControlSocketPath, startControlServer } from './controlServer';
 import { isTrustedLocalRequest } from './requestGuard';
+import { findHelper, fuseAvailable, mergeStrayInto, unsupervisedStatus, VfsSupervisor, type VfsStatus } from './vfsSupervisor';
 
 export const DEFAULT_DAEMON_PORT = Number(process.env.PROTON_DRIVE_DAEMON_PORT || 49152);
 export const DEFAULT_DAEMON_HOST = '127.0.0.1';
@@ -236,6 +237,18 @@ export async function startSyncDaemon(options: {
         }
     }, Math.max(30, settings.reconcileIntervalSec) * 1000);
 
+    // The drive: only once the files are in the backing store (driveLayout virtual); moving them there is a later step.
+    // FUSE and the helper are looked for once, here, so /api/status stays cheap.
+    const backingDir = backingDirFor(runtime.config.appDir);
+    const helperPath = findHelper();
+    const layout = readDriveLayout(stateDb);
+    const fuseOk = fuseAvailable(helperPath);
+    let vfsSupervisor: VfsSupervisor | null = null;
+    let vfsFixedStatus: VfsStatus = unsupervisedStatus(layout, virtualDriveWanted(stateDb), fuseOk);
+    if (layout === 'virtual' && !fuseOk) {
+        runtime.logger.error(`The drive can't be mounted: FUSE or protondrive-vfs isn't available (helper: ${helperPath ?? 'not found'})`);
+    }
+
     let lastRejectionLogAt = 0;
     const server = Bun.serve({
         hostname: host,
@@ -278,6 +291,7 @@ export async function startSyncDaemon(options: {
                     const systemd = await getSystemdServiceStatus();
                     return Response.json({
                         ...engine.getStatus(),
+                        vfs: vfsSupervisor?.status() ?? vfsFixedStatus,
                         account: cachedAccount,
                         appVersion: runtime.config.appVersion,
                         sdkVersion: runtime.config.sdkVersion,
@@ -480,13 +494,46 @@ export async function startSyncDaemon(options: {
     // The only way to pin, free, hide or unhide: a user-only Unix socket, never the TCP API above
     let controlServer: { stop(): void } | null = null;
     try {
-        controlServer = await startControlServer({ socketPath: defaultControlSocketPath(), engine });
+        controlServer = await startControlServer({
+            socketPath: defaultControlSocketPath(),
+            engine,
+            mountAgain: async () => {
+                if (!vfsSupervisor) throw new Error('The virtual drive is off: Proton Drive is a plain folder');
+                await vfsSupervisor.mountAgain();
+            },
+        });
     } catch (err) {
         runtime.logger.error(`Control socket unavailable, availability actions are disabled: ${String(err)}`);
     }
 
+    if (layout === 'virtual' && fuseOk && !controlServer) {
+        // The helper can't reach this daemon, and a socket held by another daemon means that one runs the drive:
+        // starting here would unmount it
+        runtime.logger.error('Not mounting the drive: the control socket is unavailable');
+        vfsFixedStatus = { mode: 'virtual', mounted: false, reason: 'mount-point-busy' };
+    } else if (layout === 'virtual' && helperPath && fuseOk) {
+        const mountpoint = settings.syncDir;
+        vfsSupervisor = new VfsSupervisor({
+            mountpoint,
+            backingDir,
+            socketPath: defaultControlSocketPath(),
+            helperPath,
+            logPath: path.join(runtime.config.appDir, 'vfs.log'),
+            logger: runtime.logger,
+            // A file saved into the bare folder while the drive was down: the engine uploads it as a new local file
+            mergeStray: async (fullPath) => {
+                for (const renamed of mergeStrayInto(fullPath, mountpoint, backingDir)) {
+                    runtime.logger.warn(`A stray in ${mountpoint} took a name already in the drive; kept it as ${renamed}`);
+                }
+            },
+        });
+        await vfsSupervisor.start();
+    }
+
     const stop = async () => {
         clearInterval(reconcileTimer);
+        // Unmount first, while the daemon still answers the helper; bounded, so it never holds up the shutdown
+        await vfsSupervisor?.stop();
         server.stop();
         controlServer?.stop();
         await engine.stop();

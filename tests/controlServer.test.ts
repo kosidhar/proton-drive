@@ -310,6 +310,55 @@ describe('drive routes', () => {
     });
 });
 
+describe('POST /vfs/mount', () => {
+    async function startWith(mountAgain?: () => Promise<void>) {
+        const root = mkdtempSync(path.join(os.tmpdir(), 'pd-control-'));
+        cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+        const socketPath = path.join(root, 'control.sock');
+        const server = await startControlServer({ socketPath, engine: makeFake() as never, mountAgain });
+        cleanups.push(() => server.stop());
+        return socketPath;
+    }
+
+    test('mounts the drive again and answers ok', async () => {
+        let calls = 0;
+        const socketPath = await startWith(async () => {
+            calls++;
+        });
+        const res = await call(socketPath, '/vfs/mount', { method: 'POST' });
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ ok: true });
+        expect(calls).toBe(1);
+    });
+
+    test('a refusal is 400 with its message and a code', async () => {
+        const socketPath = await startWith(async () => {
+            throw new Error('Not mounting over /home/me/ProtonDrive/a.txt');
+        });
+        const res = await call(socketPath, '/vfs/mount', { method: 'POST' });
+        expect(res.status).toBe(400);
+        expect(await res.json()).toEqual({ error: 'Not mounting over /home/me/ProtonDrive/a.txt', code: 'EIO' });
+    });
+
+    test('with no supervisor (a plain folder) it is 400 with a clear error', async () => {
+        const socketPath = await startWith();
+        const res = await call(socketPath, '/vfs/mount', { method: 'POST' });
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as { error: string; code: string };
+        expect(body.error).toMatch(/virtual drive/i);
+        expect(body.code).toBe('EIO');
+    });
+
+    test('only POST', async () => {
+        let calls = 0;
+        const socketPath = await startWith(async () => {
+            calls++;
+        });
+        expect((await call(socketPath, '/vfs/mount')).status).toBe(405);
+        expect(calls).toBe(0);
+    });
+});
+
 describe('defaultControlSocketPath', () => {
     test('uses XDG_RUNTIME_DIR when set, else a per-uid tmp dir', () => {
         const saved = process.env.XDG_RUNTIME_DIR;

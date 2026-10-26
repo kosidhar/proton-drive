@@ -26,6 +26,8 @@ export interface ControlServerOptions {
         ProtonDriveSyncEngine,
         'setAvailability' | 'availabilityOf' | 'vfsChildren' | 'hydrate' | 'renameItem' | 'deleteItem' | 'truncateItem'
     >;
+    // Mount again (the tray and the app): absent while Proton Drive is a plain folder
+    mountAgain?: () => Promise<void>;
 }
 
 // 'live' when something accepts connections on the socket, 'stale' when it refuses or is gone
@@ -155,6 +157,19 @@ async function driveRoute(req: Request, route: string, engine: DriveEngine): Pro
 
 const DRIVE_ROUTES: readonly string[] = ['/vfs/children', '/vfs/hydrate', '/vfs/rename', '/vfs/delete', '/vfs/truncate'];
 
+// POST /vfs/mount: mounts the drive again after an eject, a crash streak or a busy mount point; { ok: true }, or 400
+// { error, code } when the mount point can't be readied
+async function mountRoute(req: Request, mountAgain: ControlServerOptions['mountAgain']): Promise<Response> {
+    if (req.method !== 'POST') return driveError(new Error('Method not allowed'), 405);
+    if (!mountAgain) return driveError(new Error('The virtual drive is off: Proton Drive is a plain folder'));
+    try {
+        await mountAgain();
+        return Response.json({ ok: true });
+    } catch (err) {
+        return driveError(err);
+    }
+}
+
 export async function startControlServer(opts: ControlServerOptions): Promise<{ stop(): void }> {
     const { socketPath, engine } = opts;
     const dir = path.dirname(socketPath);
@@ -173,6 +188,9 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
             const url = new URL(req.url);
             if (DRIVE_ROUTES.includes(url.pathname)) {
                 return driveRoute(req, url.pathname, engine);
+            }
+            if (url.pathname === '/vfs/mount') {
+                return mountRoute(req, opts.mountAgain);
             }
             if (url.pathname !== '/availability') {
                 return jsonError('Not found', 404);
