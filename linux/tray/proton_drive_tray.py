@@ -7,8 +7,10 @@ import fcntl
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
+import threading
 import urllib.request
 
 import gi
@@ -27,6 +29,123 @@ except (ValueError, ImportError):
         sys.exit(0)
 
 DAEMON_URL = os.environ.get("PROTON_DRIVE_DAEMON_URL", "http://127.0.0.1:49152")
+
+MOUNT_LABEL = "Mount Proton Drive"
+OPEN_FOLDER_LABEL = "Open Proton Drive Folder"
+# Why a virtual drive can be mounted again (the daemon's vfs.reason); POST /vfs/mount refuses the rest
+MOUNT_REASONS = ("ejected", "crashed", "mount-point-busy")
+CONTROL_CONNECT_TIMEOUT = 2.0
+# Mounting readies the mount point first; past this the daemon is still at it, and the menu says so on the next poll
+MOUNT_READ_TIMEOUT = 15.0
+
+
+class ControlError(Exception):
+    """A control socket request that failed; the message is for the user."""
+
+
+def control_socket_path(env=None, uid=None) -> str:
+    """The daemon's control socket, by the rule of its defaultControlSocketPath(): $XDG_RUNTIME_DIR/protondrive/
+    control.sock, else <tmpdir>/protondrive-<uid>/control.sock with tmpdir as Node's os.tmpdir() finds it."""
+    env = os.environ if env is None else env
+    runtime_dir = env.get("XDG_RUNTIME_DIR")
+    if runtime_dir:
+        return os.path.join(runtime_dir, "protondrive", "control.sock")
+    tmp = env.get("TMPDIR") or env.get("TMP") or env.get("TEMP") or "/tmp"
+    if len(tmp) > 1 and tmp.endswith("/"):
+        tmp = tmp[:-1]
+    uid = os.getuid() if uid is None else uid
+    return os.path.join(tmp, f"protondrive-{uid}", "control.sock")
+
+
+def build_request(method: str, path: str, body=None) -> bytes:
+    """One HTTP/1.1 request that closes the connection after the reply, with a JSON body if given."""
+    payload = b"" if body is None else json.dumps(body).encode("utf-8")
+    head = f"{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: application/json\r\n"
+    if body is not None:
+        head += f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+    return (head + "\r\n").encode("ascii") + payload
+
+
+def parse_response(raw: bytes) -> dict:
+    """The JSON object of a 2xx reply; anything else raises ControlError with the daemon's error message."""
+    malformed = "Malformed reply from the Proton Drive background service"
+    head, separator, body = raw.partition(b"\r\n\r\n")
+    if not separator:
+        raise ControlError(malformed)
+    lines = head.decode("latin-1").split("\r\n")
+    try:
+        status = int(lines[0].split()[1])
+    except (IndexError, ValueError):
+        raise ControlError(malformed) from None
+    for line in lines[1:]:
+        name, _, value = line.partition(":")
+        if name.strip().lower() == "content-length" and value.strip().isdigit() and int(value) <= len(body):
+            body = body[: int(value)]
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except ValueError:
+        data = None
+    if 200 <= status < 300:
+        if not isinstance(data, dict):
+            raise ControlError("Unreadable reply from the Proton Drive background service")
+        return data
+    message = data.get("error") if isinstance(data, dict) else None
+    if isinstance(message, str) and message:
+        raise ControlError(message)
+    raise ControlError(f"The Proton Drive background service answered {status}")
+
+
+def connect_control_socket() -> socket.socket:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(CONTROL_CONNECT_TIMEOUT)
+    try:
+        sock.connect(control_socket_path())
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
+def control_request(method: str, path: str, body=None, timeout=MOUNT_READ_TIMEOUT, connect=connect_control_socket) -> dict:
+    """One request to the daemon's user-only control socket, where the writes live (the TCP API refuses them)."""
+    unreachable = "Can't reach the Proton Drive background service"
+    try:
+        sock = connect()
+    except OSError as err:
+        raise ControlError(f"{unreachable} ({err})") from err
+    try:
+        sock.settimeout(timeout)
+        sock.sendall(build_request(method, path, body))
+        chunks = []
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except socket.timeout as err:
+        raise ControlError("Proton Drive is still working on it in the background") from err
+    except OSError as err:
+        raise ControlError(f"{unreachable} ({err})") from err
+    finally:
+        sock.close()
+    return parse_response(b"".join(chunks))
+
+
+def offers_mount(status: dict) -> bool:
+    """Mount is offered for a virtual drive left unmounted by an eject, a crash streak or a busy mount point; a daemon
+    before the virtual drive sends no vfs, and gets no Mount item."""
+    vfs = status.get("vfs")
+    if not isinstance(vfs, dict):
+        return False
+    return vfs.get("mode") == "virtual" and not vfs.get("mounted") and vfs.get("reason") in MOUNT_REASONS
+
+
+def notify(title: str, body: str) -> None:
+    """A desktop notification; nothing happens if notify-send is missing."""
+    try:
+        spawn_detached(["notify-send", "--app-name=Proton Drive", "--icon=ch.proton.drive", title, body])
+    except OSError:
+        pass
 
 
 def spawn_detached(argv) -> None:
@@ -118,9 +237,16 @@ class ProtonDriveTrayIndicator:
         open_app_item.connect("activate", self.on_open_app)
         self.menu.append(open_app_item)
 
-        open_folder_item = Gtk.MenuItem(label="Open ~/ProtonDrive Folder")
+        open_folder_item = Gtk.MenuItem(label=OPEN_FOLDER_LABEL)
         open_folder_item.connect("activate", self.on_open_folder)
         self.menu.append(open_folder_item)
+
+        # Shown only while the virtual drive can be mounted again (see offers_mount)
+        self.mounting = False
+        self.mount_item = Gtk.MenuItem(label=MOUNT_LABEL)
+        self.mount_item.connect("activate", self.on_mount)
+        self.mount_item.set_no_show_all(True)
+        self.menu.append(self.mount_item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
@@ -204,9 +330,11 @@ class ProtonDriveTrayIndicator:
                 self.status_item.set_label("Status: Up to date")
 
             self.pause_item.set_label("Resume Sync" if self.paused else "Pause Sync")
+            self.mount_item.set_visible(offers_mount(data))
         except Exception:
             self.indicator.set_icon_full("protondrive-tray-error", "Daemon Offline")
             self.status_item.set_label("Status: Daemon Offline")
+            self.mount_item.set_visible(False)
         return True
 
     def on_open_app(self, _widget):
@@ -225,6 +353,30 @@ class ProtonDriveTrayIndicator:
 
     def on_open_folder(self, _widget):
         spawn_detached(["xdg-open", self.sync_dir])
+
+    def on_mount(self, _widget):
+        """POST /vfs/mount on the control socket, off the GTK thread; a failure is a notification, never a crash."""
+        if self.mounting:
+            return
+        self.mounting = True
+        self.mount_item.set_sensitive(False)
+        threading.Thread(target=self._mount_in_background, daemon=True).start()
+
+    def _mount_in_background(self):
+        try:
+            control_request("POST", "/vfs/mount", {})
+            error = None
+        except Exception as err:  # a ControlError, or anything unforeseen: reported, not raised
+            error = str(err) or type(err).__name__
+        GLib.idle_add(self._mount_finished, error)
+
+    def _mount_finished(self, error):
+        self.mounting = False
+        self.mount_item.set_sensitive(True)
+        if error:
+            notify("Couldn't mount Proton Drive", error)
+        self.poll_status()
+        return False
 
     def on_sync_now(self, _widget):
         try:
