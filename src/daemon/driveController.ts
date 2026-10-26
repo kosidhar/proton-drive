@@ -1,4 +1,4 @@
-import { chmodSync, statSync } from 'node:fs';
+import { chmodSync, lstatSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 import type { Logger } from '@protontech/drive-sdk';
@@ -179,13 +179,22 @@ export class DriveController {
     // move that stopped waits for an action.
     async relocate(raw: string): Promise<string> {
         const { stateDb, engine, appDir, backingDir } = this.opts;
-        const newDir = resolveSyncDirInput(raw);
+        let newDir = resolveSyncDirInput(raw);
         const oldDir = stateDb.getSettings().syncDir;
         if (newDir === path.resolve(oldDir)) {
             return oldDir; // the folder it already is, however it is written: nothing to do, even while files move
         }
         if (this.moving) throw new Error(BUSY);
         this.refuseWhileStopped();
+        // A link is stored as the folder it points to, so that it can't be repointed later
+        const unsafe = unsafeFolderReason(newDir);
+        if (unsafe !== null) {
+            throw new Error(unsafe);
+        }
+        if (lstatSync(newDir, { throwIfNoEntry: false })?.isSymbolicLink()) {
+            newDir = realpathSync(newDir);
+            if (newDir === path.resolve(oldDir)) return oldDir;
+        }
         for (const dir of [appDir, backingDir]) {
             if (pathsOverlap(newDir, dir)) {
                 throw new Error(`${newDir} overlaps ${dir}, where Proton Drive keeps its own files; choose another folder`);
@@ -193,10 +202,6 @@ export class DriveController {
         }
         if (pathsOverlap(newDir, oldDir)) {
             throw new Error(`${newDir} and ${oldDir} are inside one another; choose a folder outside the current Proton Drive folder`);
-        }
-        const unsafe = unsafeFolderReason(newDir);
-        if (unsafe !== null) {
-            throw new Error(unsafe);
         }
         // Then everything in it comes from the old folder: a move that stops can be moved back exactly, nothing
         // unrelated is pulled into the drive (the stray merge would take it into the store), and nothing of the user's

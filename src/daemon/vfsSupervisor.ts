@@ -17,6 +17,7 @@ import path from 'node:path';
 import type { Logger } from '@protontech/drive-sdk';
 
 import type { DriveLayout } from '../sync/driveMode';
+import { makeUserFolder } from '../sync/layoutMigration';
 import { mergeInto } from '../sync/localMerge';
 import { canonicalPath, mountsAt, pathsOverlap, readMountInfo } from '../sync/mountPoint';
 
@@ -383,7 +384,7 @@ export class VfsSupervisor {
             st = this.stat(mountpoint);
         } catch (err) {
             if (errnoOf(err) !== 'ENOENT') return `Can't use ${mountpoint}: ${messageOf(err)}`;
-            mkdirSync(mountpoint, { recursive: true, mode: 0o700 });
+            makeUserFolder(mountpoint);
             chmodSync(mountpoint, 0o700);
             return null;
         }

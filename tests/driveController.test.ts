@@ -24,7 +24,7 @@ import { driveSettings, settingsRoute } from '../src/daemon/settingsRoute';
 import { DriveController, type DriveSupervisor } from '../src/daemon/driveController';
 import type { VfsStatus } from '../src/daemon/vfsSupervisor';
 import { readDriveLayout } from '../src/sync/driveMode';
-import { LAYOUT_MOVING, type MoveSeams, SYNC_DIR_MOVING, unsafeFolderReason } from '../src/sync/layoutMigration';
+import { LAYOUT_MOVING, makeUserFolder, type MoveSeams, SYNC_DIR_MOVING, unsafeFolderReason } from '../src/sync/layoutMigration';
 import { moveWithoutReplacing } from '../src/sync/localMove';
 import { LOCAL_MOVE_IN_PROGRESS, ProtonDriveSyncEngine } from '../src/sync/syncEngine';
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
@@ -1158,5 +1158,82 @@ describe('The drive folder and the virtual drive change only over the control so
         const plain = path.join(s.root, 'plain');
         mkdirSync(plain);
         expect(modeOf(parent)).toBe(modeOf(plain));
+    });
+
+    test('a folder that appears during the hold, open to others or holding files, is refused and nothing moves (M1)', async () => {
+        for (const how of ['open', 'files'] as const) {
+            const s = setup({ wanted: false });
+            s.fillTree(s.syncDir);
+            const { engine } = await s.boot();
+            const before = snapshot(s.syncDir);
+            const to = path.join(s.root, `Appears ${how}`);
+            const hold = engine.holdForMove.bind(engine);
+            engine.holdForMove = async (...args: Parameters<typeof hold>) => {
+                await hold(...args);
+                if (existsSync(to)) return; // once
+                mkdirSync(to);
+                chmodSync(to, how === 'open' ? 0o777 : 0o755);
+                if (how === 'files') writeFileSync(path.join(to, 'mine.txt'), 'x');
+            };
+            const api = over(s);
+            await api.start();
+            const res = await api.socket({ syncDir: to });
+            expect(String(res.json.folderError)).toMatch(how === 'open' ? /can be changed by other users/ : /already holds files/);
+            expect(snapshot(s.syncDir)).toEqual(before);
+            expect(readdirSync(to)).toEqual(how === 'open' ? [] : ['mine.txt']);
+            expect(s.stateDb.getSettings().syncDir).toBe(s.syncDir);
+            expect(s.stateDb.getMeta(SYNC_DIR_MOVING)).toBeNull();
+        }
+    });
+
+    test('makeUserFolder gives the parents it makes the default mode and only the folder itself 0700 (M2)', () => {
+        const s = setup();
+        const to = path.join(s.root, 'a', 'b', 'Drive');
+        expect(makeUserFolder(to)).toBe('made');
+        expect(modeOf(to)).toBe(0o700);
+        const plain = path.join(s.root, 'plain');
+        mkdirSync(plain);
+        expect(modeOf(path.join(s.root, 'a'))).toBe(modeOf(plain));
+        expect(modeOf(path.join(s.root, 'a', 'b'))).toBe(modeOf(plain));
+        expect(makeUserFolder(to)).toBe('existed');
+    });
+
+    test('a link to a safe folder is stored as the folder it points to (M3)', async () => {
+        const s = setup({ wanted: false });
+        s.fillTree(s.syncDir);
+        await s.boot();
+        const real = path.join(s.root, 'Real');
+        mkdirSync(real);
+        chmodSync(real, 0o755);
+        const link = path.join(s.root, 'Link');
+        symlinkSync(real, link);
+        const api = over(s);
+        await api.start();
+        expect((await api.socket({ syncDir: link })).json.folderError).toBeNull();
+        expect(s.stateDb.getSettings().syncDir).toBe(real);
+    });
+
+    test('a link owned by another user is refused, and a dangling one is named (M3, M4)', () => {
+        const s = setup();
+        const real = path.join(s.root, 'Real');
+        mkdirSync(real);
+        chmodSync(real, 0o755);
+        const link = path.join(s.root, 'Link');
+        symlinkSync(real, link);
+        const me = { uid: process.getuid?.() ?? 0, gid: process.getgid?.() ?? 0 };
+        expect(unsafeFolderReason(link, me)).toBeNull();
+        expect(unsafeFolderReason(link, { ...me, uid: me.uid + 1 })).toBe(`${link} is a link owned by another user; choose a folder that you own`);
+        const dangling = path.join(s.root, 'Dangling');
+        symlinkSync(path.join(s.root, 'nowhere'), dangling);
+        expect(unsafeFolderReason(dangling, me)).toBe(`${dangling} is a link to a folder that doesn't exist`);
+    });
+
+    test('an empty syncDir on the socket is a 400 (EINVAL)', async () => {
+        const s = setup({ wanted: false });
+        await s.boot();
+        const api = over(s);
+        await api.start();
+        const res = await api.socket({ syncDir: '' });
+        expect([res.status, res.json.code]).toEqual([400, 'EINVAL']);
     });
 });

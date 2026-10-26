@@ -173,9 +173,14 @@ export async function relocateFiles(opts: {
     if (stateDb.getMeta(SYNC_DIR_MOVING) === null && holdsFiles(to)) {
         throw new Error(emptyFolderNeeded(to));
     }
-    // The folder itself for the user alone (the parents get the default mode)
-    mkdirSync(path.dirname(to), { recursive: true });
-    if (!existsSync(to)) mkdirSync(to, { mode: 0o700 });
+    // The folder may have appeared while the move waited (the engine's hold): it is looked at again where it is used. A
+    // move cut short (still marked) holds what it moved already, and a move back goes to the user's own old folder.
+    const fresh = stateDb.getMeta(SYNC_DIR_MOVING) === null;
+    if (makeUserFolder(to) === 'existed' && fresh) {
+        const unsafe = unsafeFolderReason(to);
+        if (unsafe !== null) throw new Error(unsafe);
+        if (holdsFiles(to)) throw new Error(emptyFolderNeeded(to));
+    }
     refuseCaseClashes(from, to, opts.seams ?? {}, logger);
     stateDb.setMeta(SYNC_DIR_MOVING, JSON.stringify({ from, to }));
     const mover = new Mover({ stateDb, logger, now: opts.now ?? new Date(), allowCopy: true, seams: opts.seams ?? {}, from, to });
@@ -315,7 +320,12 @@ export function unsafeFolderReason(
     dir: string,
     me: { uid: number; gid: number } | undefined = process.getuid && process.getgid ? { uid: process.getuid(), gid: process.getgid() } : undefined,
 ): string | null {
+    const link = lstatSync(dir, { throwIfNoEntry: false });
+    if (link?.isSymbolicLink() && me && link.uid !== me.uid) {
+        return `${dir} is a link owned by another user; choose a folder that you own`;
+    }
     const stat = statSync(dir, { throwIfNoEntry: false });
+    if (link?.isSymbolicLink() && !stat) return `${dir} is a link to a folder that doesn't exist`;
     if (!stat || !me) return null; // a missing folder is made by the daemon, for the user alone
     if (stat.uid !== me.uid) {
         return `${dir} belongs to another user; choose a folder that you own`;
@@ -324,6 +334,18 @@ export function unsafeFolderReason(
         return `${dir} can be changed by other users; choose a folder only you can write to, or run chmod go-w on it`;
     }
     return null;
+}
+
+// Makes a folder for the user alone (0700) and the parents it lacks with the default mode; 'existed' when it was there
+export function makeUserFolder(dir: string): 'made' | 'existed' {
+    mkdirSync(path.dirname(dir), { recursive: true });
+    try {
+        mkdirSync(dir, { mode: 0o700 });
+        return 'made';
+    } catch (error: unknown) {
+        if (errnoOf(error) === 'EEXIST') return 'existed';
+        throw error;
+    }
 }
 
 export function emptyFolderNeeded(dir: string): string {

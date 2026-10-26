@@ -214,7 +214,7 @@ async function driveSettingsRoute(req: Request, driveSettings: ControlServerOpti
     if (!body) return invalid('Invalid JSON body');
     const unknown = Object.keys(body).filter((key) => key !== 'syncDir' && key !== 'virtualDriveWanted');
     if (unknown.length > 0) return invalid(`Unknown setting: ${unknown.join(', ')}`);
-    if (body.syncDir !== undefined && typeof body.syncDir !== 'string') return invalid('syncDir must be a folder path');
+    if (body.syncDir !== undefined && (typeof body.syncDir !== 'string' || !body.syncDir.trim())) return invalid('syncDir must be the path of a folder');
     if (body.virtualDriveWanted !== undefined && typeof body.virtualDriveWanted !== 'boolean') {
         return invalid('virtualDriveWanted must be true or false');
     }
