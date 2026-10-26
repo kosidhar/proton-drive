@@ -9,7 +9,16 @@ use eframe::egui::{
 };
 use serde::{Deserialize, Serialize};
 
-const DAEMON_URL: &str = "http://127.0.0.1:49152";
+/// The daemon's TCP API: 127.0.0.1 at $PROTON_DRIVE_DAEMON_PORT, as the daemon reads it, else at 49152
+fn daemon_url_for(port: Option<&str>) -> String {
+    let port = port.and_then(|p| p.trim().parse::<u16>().ok()).filter(|p| *p != 0).unwrap_or(49152);
+    format!("http://127.0.0.1:{port}")
+}
+
+fn daemon_url() -> &'static str {
+    static URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    URL.get_or_init(|| daemon_url_for(std::env::var("PROTON_DRIVE_DAEMON_PORT").ok().as_deref()))
+}
 
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
@@ -178,7 +187,7 @@ fn btn_secondary_hover_bg() -> Color32 {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NavTab {
     Overview,
     CloudBrowser,
@@ -240,6 +249,9 @@ struct DaemonStatus {
     /// Why the state is "error" (the last pass failed, or the files are missing from the folder)
     #[serde(default)]
     last_error: Option<String>,
+    /// While the daemon holds because the files are missing from the folder: what is missing
+    #[serde(default)]
+    files_missing: Option<FilesMissing>,
     logged_in: bool,
     sync_dir: String,
     active_transfers: Vec<ActiveTransfer>,
@@ -255,6 +267,28 @@ struct DaemonStatus {
     /// The Settings switch as stored (the drive may still be a plain folder, e.g. without FUSE)
     #[serde(default)]
     virtual_drive_wanted: Option<bool>,
+}
+
+/// What is missing while the daemon holds because the files are missing from the folder (`filesMissing` in
+/// /api/status): the folder, the recorded top-level items still missing, and how many items that is.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+struct FilesMissing {
+    root: String,
+    names: Vec<String>,
+    items: u64,
+}
+
+/// "Docs and Photos are", "A, B, C and 2 more are": the missing top-level items as the hold banner names them.
+fn missing_names(fm: &FilesMissing) -> String {
+    const SHOWN: usize = 3;
+    let n = fm.names.len();
+    match n {
+        0 => "Your files are".to_string(),
+        1 => format!("{} is", fm.names[0]),
+        _ if n <= SHOWN => format!("{} and {} are", fm.names[..n - 1].join(", "), fm.names[n - 1]),
+        _ => format!("{} and {} more are", fm.names[..SHOWN].join(", "), n - SHOWN),
+    }
 }
 
 /// The virtual drive as `/api/status` describes it (`VfsStatus` in src/daemon/vfsSupervisor.ts).
@@ -739,6 +773,13 @@ fn resolve_conflict_at(socket: &std::path::Path, id: u64, choice: &str) -> Resul
     control_request_at(socket, "POST", "/conflicts/resolve", Some(&body), RESOLVE_READ_TIMEOUT).map(|_| ())
 }
 
+/// POST /sync/files-missing {action: "delete-in-cloud"}: the files missing from the folder were deleted on purpose, so
+/// the daemon's next sync moves them to the Proton Drive trash.
+fn files_missing_delete_at(socket: &std::path::Path) -> Result<(), String> {
+    let body = serde_json::json!({ "action": "delete-in-cloud" });
+    control_request_at(socket, "POST", "/sync/files-missing", Some(&body), DRIVE_READ_TIMEOUT).map(|_| ())
+}
+
 /// POST /remote/mkdir {parentPath, name}: makes a folder in the cloud.
 fn make_folder_at(socket: &std::path::Path, parent_path: &str, name: &str) -> Result<(), String> {
     let body = serde_json::json!({ "parentPath": parent_path, "name": name });
@@ -774,6 +815,8 @@ enum PendingConfirm {
     KeepAll,
     /// Switching the virtual drive off moves the downloaded files back into a normal folder.
     VirtualDriveOff,
+    /// The files missing from the folder were deleted on purpose: they go to the Proton Drive trash too.
+    DeleteMissing { root: String, items: u64 },
 }
 
 /// What a confirmation dialog says, and what its button asks the daemon to do to which path.
@@ -782,6 +825,8 @@ struct ConfirmCopy {
     body: String,
     detail: &'static str,
     button: &'static str,
+    /// The button that does nothing (the default: Escape and a click outside do the same)
+    cancel: &'static str,
     rel_path: String,
     action: &'static str,
 }
@@ -793,6 +838,7 @@ fn confirm_copy(confirm: &PendingConfirm) -> ConfirmCopy {
             body: format!("\"{name}\" disappears from your Proton Drive folder on this computer. It stays in Proton Drive, and you can unhide it any time."),
             detail: "Changes that haven't synced yet are uploaded first. Hiding is refused if anything inside exists only on this computer.",
             button: "Hide",
+            cancel: "Cancel",
             rel_path: rel_path.clone(),
             action: "hide",
         },
@@ -803,6 +849,7 @@ fn confirm_copy(confirm: &PendingConfirm) -> ConfirmCopy {
                 body: format!("This removes the local copies of everything in {place} that is safely in Proton Drive. Nothing is deleted online. Use Always keep to download them again."),
                 detail: "Anything marked Always keep here stops being kept. Files that aren't fully synced, or that you've told Proton Drive to ignore, stay on this computer.",
                 button: "Free up space",
+                cancel: "Cancel",
                 rel_path: rel_path.clone(),
                 action: "free",
             }
@@ -812,6 +859,7 @@ fn confirm_copy(confirm: &PendingConfirm) -> ConfirmCopy {
             body: "This downloads everything in My files to this computer and keeps it updated.".to_string(),
             detail: "Items you made online only are downloaded too; hidden items stay hidden. This can take a long time and use a lot of disk space.",
             button: "Keep everything",
+            cancel: "Cancel",
             rel_path: String::new(),
             action: "pin",
         },
@@ -820,9 +868,22 @@ fn confirm_copy(confirm: &PendingConfirm) -> ConfirmCopy {
             body: "Your downloaded files move back into a normal folder; online-only files stop showing in Files.".to_string(),
             detail: "Nothing is deleted: online-only files stay in Proton Drive, and you can switch the virtual drive on again at any time.",
             button: "Switch off",
+            cancel: "Cancel",
             rel_path: String::new(),
             // Not an availability action: render_confirm_modal sends the switch instead
             action: "virtual-drive-off",
+        },
+        PendingConfirm::DeleteMissing { root, items } => ConfirmCopy {
+            title: "Delete them from Proton Drive too?".to_string(),
+            body: format!(
+                "The {items} items that were in {root} will move to the Proton Drive trash. You can restore them from the trash on the Proton Drive website."
+            ),
+            detail: "Keep waiting if they are on a disk that isn't connected, or you are bringing them back: nothing is deleted while Proton Drive waits.",
+            button: "Delete from Proton Drive",
+            cancel: "Keep waiting",
+            rel_path: String::new(),
+            // Not an availability action: render_confirm_modal sends the confirmation instead
+            action: "files-missing-delete",
         },
     }
 }
@@ -870,6 +931,8 @@ enum WorkerCommand {
     LoadConflicts,
     ResolveConflict { id: u64, choice: String },
     SetAvailability { path: String, action: String },
+    /// The files missing from the folder were deleted on purpose (POST /sync/files-missing)
+    ConfirmFilesMissing,
 }
 
 /// Set once in `main` when the app only renders a screenshot: nothing that changes anything is ever sent then, and
@@ -938,6 +1001,8 @@ enum WorkerEvent {
     VirtualDriveSwitched(Result<SettingsReply, String>),
     /// Mount again or an action on a stopped move finished, or why not
     DriveDone(Result<(), String>),
+    /// The confirmation that the missing files were deleted on purpose went through, or why not
+    FilesMissingDone(Result<(), String>),
 }
 
 /// A line telling how something went: done, or why not.
@@ -1132,6 +1197,9 @@ struct ProtonDriveNativeApp {
     drive_working: bool,
     /// Why the last of those was refused or failed
     drive_error: Option<String>,
+    /// The confirmation that the missing files were deleted on purpose is still running, and why the last one failed
+    files_missing_working: bool,
+    files_missing_error: Option<String>,
 
     // Conflicts state
     conflicts: Vec<ConflictRecord>,
@@ -1145,6 +1213,8 @@ struct ProtonDriveNativeApp {
 
     /// Screenshot-only: `--drive-status` and `--drive-move`, laid over every status from the daemon
     fake_drive: Option<(String, Option<String>)>,
+    /// Screenshot-only: `--files-missing`, the daemon holding with the files missing, laid over every status
+    fake_files_missing: bool,
 
     // Window geometry state
     window_geometry: WindowGeometry,
@@ -1249,12 +1319,15 @@ impl ProtonDriveNativeApp {
             settings_notice: None,
             drive_working: false,
             drive_error: None,
+            files_missing_working: false,
+            files_missing_error: None,
             conflicts: Vec::new(),
             conflict_error: None,
             edit_sync_dir,
             edit_conflict_strategy,
             edit_notifications,
             fake_drive: None,
+            fake_files_missing: false,
             window_geometry,
             maximize_applied_on_open: false,
             applied_light_mode: initial_light,
@@ -1263,6 +1336,17 @@ impl ProtonDriveNativeApp {
             screenshot_requested: false,
             last_poll: Instant::now(),
         }
+    }
+
+    /// Screenshot-only: lays `--files-missing` over a status from the daemon.
+    fn apply_fake_files_missing(&self, status: &mut DaemonStatus) {
+        if !self.fake_files_missing {
+            return;
+        }
+        let root = if status.sync_dir.is_empty() { "/home/u/ProtonDrive".to_string() } else { status.sync_dir.clone() };
+        status.state = "error".into();
+        status.last_error = Some(format!("Proton Drive's files are missing from {root}. Nothing was deleted in Proton Drive."));
+        status.files_missing = Some(FilesMissing { root, names: vec!["Documents".into(), "Photos".into()], items: 1284 });
     }
 
     /// Screenshot-only: lays `--drive-status` / `--drive-move` over a status from the daemon.
@@ -1323,6 +1407,7 @@ impl ProtonDriveNativeApp {
                         self.daemon_online = true;
                         self.initial_connecting = false;
                         self.apply_fake_drive(&mut s);
+                        self.apply_fake_files_missing(&mut s);
                         // Edits being made or saved stay as they are; Save compares them with what they were loaded from
                         if !self.settings_dirty && !self.settings_saving {
                             self.load_settings_form(&s.settings);
@@ -1401,6 +1486,11 @@ impl ProtonDriveNativeApp {
                 WorkerEvent::DriveDone(result) => {
                     self.drive_working = false;
                     self.drive_error = result.err();
+                    let _ = self.tx.send(WorkerCommand::RefreshAll);
+                }
+                WorkerEvent::FilesMissingDone(result) => {
+                    self.files_missing_working = false;
+                    self.files_missing_error = result.err();
                     let _ = self.tx.send(WorkerCommand::RefreshAll);
                 }
                 WorkerEvent::RemoteLoaded(res) => {
@@ -2839,7 +2929,7 @@ impl ProtonDriveNativeApp {
             screen_rect.center().y - modal_h * 0.5,
         );
 
-        let ConfirmCopy { title, body, detail, button, rel_path: action_path, action } = confirm_copy(&confirm);
+        let ConfirmCopy { title, body, detail, button, cancel, rel_path: action_path, action } = confirm_copy(&confirm);
 
         let area_resp = egui::Area::new(egui::Id::new("confirm_dialog"))
             .order(egui::Order::Tooltip)
@@ -2870,7 +2960,7 @@ impl ProtonDriveNativeApp {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if proton_button(
                                 ui,
-                                Vec2::new(138.0, 36.0),
+                                Vec2::new(if button.len() > 16 { 186.0 } else { 138.0 }, 36.0),
                                 button,
                                 PROTON_PURPLE,
                                 PROTON_PURPLE_HOVER,
@@ -2882,6 +2972,10 @@ impl ProtonDriveNativeApp {
                             {
                                 if confirm == PendingConfirm::VirtualDriveOff {
                                     self.send_drive_command(WorkerCommand::SetVirtualDrive(false));
+                                } else if matches!(confirm, PendingConfirm::DeleteMissing { .. }) {
+                                    self.files_missing_working = true;
+                                    self.files_missing_error = None;
+                                    let _ = self.tx.send(WorkerCommand::ConfirmFilesMissing);
                                 } else {
                                     self.send_availability(action_path.clone(), action);
                                 }
@@ -2892,8 +2986,8 @@ impl ProtonDriveNativeApp {
 
                             if proton_button(
                                 ui,
-                                Vec2::new(88.0, 36.0),
-                                "Cancel",
+                                Vec2::new(if cancel == "Cancel" { 88.0 } else { 118.0 }, 36.0),
+                                cancel,
                                 BG_CARD_ALT(),
                                 btn_secondary_hover_bg(),
                                 Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
@@ -2916,6 +3010,53 @@ impl ProtonDriveNativeApp {
                 }
             }
         }
+    }
+
+    /// Above every tab while the daemon holds because the files are missing from the folder: what is missing, that
+    /// nothing was deleted, and, behind a confirmation, deleting them from Proton Drive too. Keeping waiting is the
+    /// default: it needs nothing.
+    fn render_files_missing(&mut self, ui: &mut egui::Ui) {
+        let Some(fm) = self.status.files_missing.clone() else {
+            return;
+        };
+        Frame::NONE
+            .fill(Color32::from_rgba_unmultiplied(239, 68, 68, 26))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(239, 68, 68, 110)))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::symmetric(16, 12))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                let title = format!("Proton Drive's files are missing from {}. Nothing was deleted in Proton Drive.", fm.root);
+                ui.add(egui::Label::new(RichText::new(title).size(13.5).strong().color(TEXT_PRIMARY())).wrap());
+                ui.add_space(2.0);
+                let detail = format!(
+                    "{} missing. Proton Drive waits for them to come back and syncs nothing meanwhile.",
+                    missing_names(&fm)
+                );
+                ui.add(egui::Label::new(RichText::new(detail).size(12.5).color(TEXT_MUTED())).wrap());
+                if let Some(error) = &self.files_missing_error {
+                    ui.add_space(2.0);
+                    ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
+                }
+                ui.add_space(8.0);
+                let working = self.files_missing_working;
+                let clicked = proton_button(
+                    ui,
+                    Vec2::new(250.0, 32.0),
+                    "Delete them from Proton Drive too",
+                    BG_CARD_ALT(),
+                    btn_secondary_hover_bg(),
+                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                    if working { TEXT_MUTED() } else { STATUS_DANGER },
+                    12.5,
+                )
+                .on_hover_text("Asks first. While they are missing, nothing is deleted in Proton Drive.")
+                .clicked();
+                if clicked && !working {
+                    self.pending_confirm = Some(PendingConfirm::DeleteMissing { root: fm.root.clone(), items: fm.items });
+                }
+            });
+        ui.add_space(14.0);
     }
 
     /// One frame of the window's contents: sidebar, header, the current tab and anything floating over them.
@@ -2944,6 +3085,7 @@ impl ProtonDriveNativeApp {
                 if self.pending_confirm.is_some() {
                     ui.disable(); // Nothing under the confirmation dialog takes clicks or keys while it is open
                 }
+                self.render_files_missing(ui);
                 match self.tab {
                     NavTab::Overview => self.render_overview_tab(ui),
                     NavTab::CloudBrowser => self.render_browser_tab(ui),
@@ -4939,7 +5081,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                 ctx.request_repaint();
             }
             WorkerCommand::TriggerSync => {
-                let _ = ureq::post(&format!("{DAEMON_URL}/api/sync")).call();
+                let _ = ureq::post(&format!("{}/api/sync", daemon_url())).call();
                 let _ = tx.send(WorkerEvent::StatusAndActivity {
                     status: Box::new(fetch_status()),
                     activity: fetch_activity(),
@@ -4947,7 +5089,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                 ctx.request_repaint();
             }
             WorkerCommand::SetPaused(paused) => {
-                let _ = ureq::post(&format!("{DAEMON_URL}/api/pause"))
+                let _ = ureq::post(&format!("{}/api/pause", daemon_url()))
                     .send_json(serde_json::json!({ "paused": paused }));
                 let _ = tx.send(WorkerEvent::StatusAndActivity {
                     status: Box::new(fetch_status()),
@@ -4968,7 +5110,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                 let tx_clone = tx.clone();
                 let ctx_clone = ctx.clone();
                 thread::spawn(move || {
-                    let url = format!("{DAEMON_URL}/api/remote/list?path={path}");
+                    let url = format!("{}/api/remote/list?path={path}", daemon_url());
                     let mut res = ureq::get(&url)
                         .call()
                         .map_err(|e| e.to_string())
@@ -5012,7 +5154,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                 });
             }
             WorkerCommand::LoadConflicts => {
-                if let Ok(resp) = ureq::get(&format!("{DAEMON_URL}/api/conflicts")).call() {
+                if let Ok(resp) = ureq::get(&format!("{}/api/conflicts", daemon_url())).call() {
                     if let Ok(list) = resp.into_json::<Vec<ConflictRecord>>() {
                         let _ = tx.send(WorkerEvent::ConflictsLoaded(list));
                         ctx.request_repaint();
@@ -5021,6 +5163,9 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
             }
             WorkerCommand::ResolveConflict { id, choice } => off_thread(&tx, &ctx, move || {
                 WorkerEvent::ConflictResolved(resolve_conflict_at(&control_socket_path(), id, &choice))
+            }),
+            WorkerCommand::ConfirmFilesMissing => off_thread(&tx, &ctx, || {
+                WorkerEvent::FilesMissingDone(files_missing_delete_at(&control_socket_path()))
             }),
         }
     }
@@ -5036,7 +5181,7 @@ fn off_thread(tx: &Sender<WorkerEvent>, ctx: &egui::Context, work: impl FnOnce()
 }
 
 fn fetch_status() -> Result<DaemonStatus, String> {
-    ureq::get(&format!("{DAEMON_URL}/api/status"))
+    ureq::get(&format!("{}/api/status", daemon_url()))
         .timeout(Duration::from_millis(1200))
         .call()
         .map_err(|e| e.to_string())
@@ -5044,7 +5189,7 @@ fn fetch_status() -> Result<DaemonStatus, String> {
 }
 
 fn fetch_activity() -> Vec<ActivityRecord> {
-    ureq::get(&format!("{DAEMON_URL}/api/activity?limit=40"))
+    ureq::get(&format!("{}/api/activity?limit=40", daemon_url()))
         .timeout(Duration::from_millis(1200))
         .call()
         .ok()
@@ -5109,6 +5254,8 @@ OPTIONS:
   --drive-move <KIND>   with --screenshot: add a move that stopped (relocation | layout)
   --drive-error <TEXT>  with --screenshot: show TEXT as the refusal of a drive request
   --confirm-drive-off   with --screenshot: show the confirmation for switching the virtual drive off
+  --files-missing       with --screenshot: show the daemon holding with the files missing from the folder
+  --confirm-files-missing  with --screenshot: also show the confirmation for deleting them from Proton Drive too
   --login-error <TEXT>  with --screenshot: show TEXT as a failed sign-in
   --path <FOLDER>       open My files at a remote folder, e.g. /my-files/photos
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
@@ -5142,6 +5289,8 @@ fn main() -> eframe::Result {
     let mut cli_drive_move: Option<String> = None;
     let mut cli_drive_error: Option<String> = None;
     let mut cli_confirm_drive_off = false;
+    let mut cli_files_missing = false;
+    let mut cli_confirm_files_missing = false;
     let mut cli_login_error: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -5182,6 +5331,13 @@ fn main() -> eframe::Result {
             }
             "--confirm-drive-off" => {
                 cli_confirm_drive_off = true;
+            }
+            "--files-missing" => {
+                cli_files_missing = true;
+            }
+            "--confirm-files-missing" => {
+                cli_files_missing = true;
+                cli_confirm_files_missing = true;
             }
             "--login-error" => {
                 cli_login_error = args.next();
@@ -5342,9 +5498,16 @@ fn main() -> eframe::Result {
                     app.pending_confirm = Some(PendingConfirm::VirtualDriveOff);
                 }
                 app.fake_drive = fake_drive;
+                app.fake_files_missing = cli_files_missing;
                 let mut status = std::mem::take(&mut app.status);
                 app.apply_fake_drive(&mut status);
+                app.apply_fake_files_missing(&mut status);
                 app.status = status;
+                if cli_confirm_files_missing {
+                    if let Some(fm) = &app.status.files_missing {
+                        app.pending_confirm = Some(PendingConfirm::DeleteMissing { root: fm.root.clone(), items: fm.items });
+                    }
+                }
                 app.drive_error = cli_drive_error;
                 if let Some(error) = cli_login_error {
                     app.show_account_error(format!("Couldn't start signing in: {error}"));
@@ -6003,12 +6166,15 @@ mod tests {
                 settings_notice: None,
                 drive_working: false,
                 drive_error: None,
+                files_missing_working: false,
+                files_missing_error: None,
                 conflicts: Vec::new(),
                 conflict_error: None,
                 edit_sync_dir: String::new(),
                 edit_conflict_strategy: "keep-both".into(),
                 edit_notifications: false,
                 fake_drive: None,
+                fake_files_missing: false,
                 window_geometry: WindowGeometry::default(),
                 maximize_applied_on_open: true,
                 applied_light_mode: false,
@@ -6099,6 +6265,7 @@ mod tests {
                     WorkerCommand::SetVirtualDrive(on) => Some(format!("virtual drive {on}")),
                     WorkerCommand::MountAgain => Some("mount again".to_string()),
                     WorkerCommand::DriveMove { action, from, to } => Some(format!("{action} {from} -> {to}")),
+                    WorkerCommand::ConfirmFilesMissing => Some("files missing: delete in cloud".to_string()),
                     _ => None,
                 })
                 .collect()
@@ -6628,6 +6795,7 @@ mod tests {
             WorkerCommand::DriveMove { action: "finish".into(), from: "a".into(), to: "b".into() },
             WorkerCommand::ResolveConflict { id: 1, choice: "keep-both".into() },
             WorkerCommand::SetAvailability { path: "x".into(), action: "pin".into() },
+            WorkerCommand::ConfirmFilesMissing,
         ];
         for cmd in &writes {
             assert!(!allowed_in_screenshot_mode(cmd));
@@ -6635,6 +6803,112 @@ mod tests {
     }
 
     const SWITCH: &str = "Show online-only files in Files (virtual drive)";
+
+    // S39: while the files are missing from the folder, the daemon holds; the app says so on every tab, and deleting
+    // them from Proton Drive too takes a confirmation, with keeping waiting as the default
+    const MISSING: &str = "Proton Drive's files are missing from /home/u/ProtonDrive. Nothing was deleted in Proton Drive.";
+    const DELETE_TOO: &str = "Delete them from Proton Drive too";
+
+    fn held(h: &mut Harness) {
+        h.app.status.state = "error".into();
+        h.app.status.last_error = Some(MISSING.into());
+        h.app.status.files_missing =
+            Some(FilesMissing { root: "/home/u/ProtonDrive".into(), names: vec!["Docs".into(), "Photos".into()], items: 12 });
+        h.frames(3);
+    }
+
+    #[test]
+    fn the_files_missing_hold_shows_on_every_tab() {
+        let mut h = Harness::new("/my-files");
+        assert!(h.text_at(DELETE_TOO).is_none());
+        held(&mut h);
+        for tab in [NavTab::CloudBrowser, NavTab::Overview, NavTab::Conflicts, NavTab::Settings] {
+            h.app.tab = tab;
+            h.frames(3);
+            assert!(h.text_at(DELETE_TOO).is_some(), "{tab:?}");
+            assert!(h.text_at("Docs and Photos are missing. Proton Drive waits for them to come back and syncs nothing meanwhile.").is_some(), "{tab:?}");
+        }
+    }
+
+    #[test]
+    fn deleting_the_missing_files_from_proton_drive_asks_first_and_keep_waiting_sends_nothing() {
+        let mut h = Harness::new("/my-files");
+        held(&mut h);
+        h.click(h.text_at(DELETE_TOO).unwrap());
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::DeleteMissing { root: "/home/u/ProtonDrive".into(), items: 12 }));
+        assert!(h
+            .text_at("The 12 items that were in /home/u/ProtonDrive will move to the Proton Drive trash. You can restore them from the trash on the Proton Drive website.")
+            .is_some());
+        assert_eq!(h.sent(), Vec::<String>::new());
+        h.click(h.text_at("Keep waiting").expect("keep waiting is offered"));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+
+        h.click(h.text_at(DELETE_TOO).unwrap());
+        h.click(h.text_at("Delete from Proton Drive").expect("the dialog is painted"));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), vec!["files missing: delete in cloud".to_string()]);
+        assert!(h.app.files_missing_working);
+        // Nothing more is sent while it runs
+        h.click(h.text_at(DELETE_TOO).unwrap());
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+
+        h.event(WorkerEvent::FilesMissingDone(Err("Nothing is missing from /home/u/ProtonDrive".into())));
+        assert!(!h.app.files_missing_working);
+        assert!(h.text_at("Nothing is missing from /home/u/ProtonDrive").is_some());
+    }
+
+    #[test]
+    fn the_confirmation_posts_delete_in_cloud_on_the_control_socket() {
+        let reply: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 61\r\n\r\n{\"ok\":true,\"root\":\"/home/u/ProtonDrive\",\"names\":[],\"items\":0}";
+        let (sock, server) = serve_once(reply);
+        files_missing_delete_at(&sock).unwrap();
+        let seen = server.join().unwrap();
+        assert!(seen.starts_with("POST /sync/files-missing HTTP/1.1\r\n"), "{seen}");
+        assert!(seen.ends_with(r#"{"action":"delete-in-cloud"}"#), "{seen}");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn daemon_status_reads_files_missing() {
+        let status: DaemonStatus = serde_json::from_str(
+            r#"{"state":"error","currentAction":null,"loggedIn":true,"syncDir":"/home/u/ProtonDrive","activeTransfers":[],
+                "filesMissing":{"root":"/home/u/ProtonDrive","names":["Docs"],"items":3},
+                "stats":{"totalFiles":1,"totalFolders":0,"totalBytes":3,"unresolvedConflicts":0,"errorItems":0},
+                "settings":{"syncDir":"/home/u/ProtonDrive","conflictStrategy":"keep-both","notificationsEnabled":true,
+                            "reconcileIntervalSec":120,"paused":false,"ignorePatterns":[".git"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(status.files_missing, Some(FilesMissing { root: "/home/u/ProtonDrive".into(), names: vec!["Docs".into()], items: 3 }));
+        let none: DaemonStatus = serde_json::from_str(r#"{"state":"idle","loggedIn":true,"syncDir":"/x","activeTransfers":[],
+            "stats":{"totalFiles":1,"totalFolders":0,"totalBytes":3,"unresolvedConflicts":0,"errorItems":0},
+            "settings":{"syncDir":"/x","conflictStrategy":"keep-both","notificationsEnabled":true,"reconcileIntervalSec":120,"paused":false,"ignorePatterns":[]},
+            "filesMissing":null}"#).unwrap();
+        assert_eq!(none.files_missing, None);
+    }
+
+    // The app reaches the daemon where the daemon listens: $PROTON_DRIVE_DAEMON_PORT when set (a sandboxed screenshot
+    // points it at a port nothing listens on), else 49152
+    #[test]
+    fn the_daemon_url_honours_the_daemons_port_variable() {
+        assert_eq!(daemon_url_for(None), "http://127.0.0.1:49152");
+        assert_eq!(daemon_url_for(Some("50001")), "http://127.0.0.1:50001");
+        assert_eq!(daemon_url_for(Some(" 50001 ")), "http://127.0.0.1:50001");
+        for bad in ["", "0", "x", "70000", "-1"] {
+            assert_eq!(daemon_url_for(Some(bad)), "http://127.0.0.1:49152", "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn missing_names_read_as_a_list() {
+        let fm = |names: &[&str], items| FilesMissing { root: "/r".into(), names: names.iter().map(|n| n.to_string()).collect(), items };
+        assert_eq!(missing_names(&fm(&["Docs"], 1)), "Docs is");
+        assert_eq!(missing_names(&fm(&["Docs", "Photos"], 2)), "Docs and Photos are");
+        assert_eq!(missing_names(&fm(&["A", "B", "C"], 3)), "A, B and C are");
+        assert_eq!(missing_names(&fm(&["A", "B", "C", "D", "E"], 5)), "A, B, C and 2 more are");
+        assert_eq!(missing_names(&fm(&[], 0)), "Your files are");
+    }
 
     #[test]
     fn the_settings_tab_shows_the_drive_and_its_switch() {
