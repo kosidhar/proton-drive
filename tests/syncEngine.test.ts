@@ -4617,6 +4617,47 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(names.some((n) => n.startsWith('doc (conflict '))).toBe(true);
                 expect(await readFile(path.join(files.syncDir(), 'Docs/doc.txt'), 'utf8')).toBe('old');
             });
+
+            // Final review M-3 (deferred L157): a file being edited through the drive with no record yet is an edit of
+            // its baseline's node. Another device may have put a node of its own at that path since, which the index then
+            // holds: deleting or renaming the file here acts on the baseline's node, never on that one.
+            const replacedByAnotherDevice = async () => {
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                await d.engine.reconcileNow();
+                await truncatedAndWritten(d, 'Docs/doc.txt', 'mine');
+                d.nodes.delete('vol~Docs/doc.txt');
+                const theirs = makeMockNode({ uid: 'vol~theirs', parentUid: 'vol~Docs', nameStr: 'doc.txt', type: NodeType.File, content: 'theirs' });
+                d.nodes.set(theirs.uid, theirs);
+                d.engine.remoteIndex.upsert(entryFromNode(theirs, 'Docs')!); // as a listing of Docs would
+                expect(stateDb.getItemByPath('Docs/doc.txt')).toBeNull();
+                expect(stateDb.getEditBaseline('Docs/doc.txt')?.nodeUid).toBe('vol~Docs/doc.txt');
+                expect(d.engine.remoteIndex.getByPath('Docs/doc.txt')?.uid).toBe('vol~theirs');
+                return d;
+            };
+
+            test('deleting it through the drive trashes the node it is an edit of, never the one another device put there', async () => {
+                const d = await replacedByAnotherDevice();
+
+                await d.engine.deleteItem('Docs/doc.txt');
+                expect(d.journal().map((op) => [op.kind, op.nodeUid])).toEqual([['trash', 'vol~Docs/doc.txt']]);
+                await d.engine.replayRemoteOps();
+
+                expect(d.calls.trashed.flat()).not.toContain('vol~theirs');
+                expect(d.nodes.get('vol~theirs')?.content).toBe('theirs');
+            });
+
+            test('renaming it through the drive renames the node it is an edit of, never the one another device put there', async () => {
+                const d = await replacedByAnotherDevice();
+
+                await d.engine.renameItem('Docs/doc.txt', 'Docs/renamed.txt');
+                expect(d.journal().map((op) => [op.kind, op.nodeUid])).toEqual([['rename', 'vol~Docs/doc.txt']]);
+                await d.engine.replayRemoteOps();
+
+                expect(d.calls.renamed.map((r) => r.uid)).not.toContain('vol~theirs');
+                expect(d.nameOf(d.nodes.get('vol~theirs')!)).toBe('doc.txt');
+                expect(await readFile(d.local('Docs/renamed.txt'), 'utf8')).toBe('mine');
+            });
         });
 
         // #21: the watcher used to upload such a file as a new revision of the cloud's, overwriting it unseen

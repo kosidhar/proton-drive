@@ -2580,7 +2580,11 @@ export class ProtonDriveSyncEngine {
         if (!source && !sourceEntry) {
             throw new DriveOpError('ENOENT', `Not found: ${fromRel}`);
         }
-        const sourceUid = ignoredFrom ? null : (this.stateDb.getItemByPath(fromRel)?.nodeUid ?? nodeUidOf(sourceEntry));
+        // A file being edited through the drive with no record yet is an edit of its baseline's node: the index may hold
+        // another node at its path since (another device's), which isn't the one this file stands for
+        const sourceUid = ignoredFrom
+            ? null
+            : (this.stateDb.getItemByPath(fromRel)?.nodeUid ?? this.stateDb.getEditBaseline(fromRel)?.nodeUid ?? nodeUidOf(sourceEntry));
         const target = lstatSync(path.join(root, toRel), { throwIfNoEntry: false });
         const targetRecord = this.stateDb.getItemByPath(toRel);
         const targetEntry = ignoredTo ? null : this.liveIndexEntry(toRel);
@@ -2836,7 +2840,9 @@ export class ProtonDriveSyncEngine {
     // cloud has another node at that name, which is what the user deleted.
     private trashTargets(relPath: string, entry: RemoteIndexEntry | null): Map<string, string> {
         const targets = new Map<string, string>();
-        const own = this.stateDb.getItemByPath(relPath)?.nodeUid ?? nodeUidOf(entry);
+        // A file being edited through the drive with no record yet stands for its baseline's node, not for another node
+        // the index may hold at its path since
+        const own = this.stateDb.getItemByPath(relPath)?.nodeUid ?? this.stateDb.getEditBaseline(relPath)?.nodeUid ?? nodeUidOf(entry);
         if (own !== null) {
             targets.set(own, relPath);
         } else {
