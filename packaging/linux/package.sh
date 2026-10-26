@@ -49,6 +49,9 @@ if [ "$SKIP_BUILD" = 0 ]; then
   echo "==> Building native Rust desktop GUI (protondrive-gui)..."
   (cd "$ROOT/native-gui" && cargo build --release)
   install -Dm755 "$CARGO_TARGET_DIR/release/protondrive-gui" "$ROOT/release/protondrive-gui"
+  echo "==> Building virtual drive helper (protondrive-vfs)..."
+  (cd "$ROOT/native-vfs" && cargo build --release)
+  install -Dm755 "$ROOT/native-vfs/target/release/protondrive-vfs" "$ROOT/release/protondrive-vfs"
 fi
 
 WORK="$CARGO_TARGET_DIR/linux-package"
@@ -59,8 +62,9 @@ mkdir -p "$STAGE"
 # ---- Stage shared FHS tree (used by tar, deb, rpm, AppImage, Flatpak, Arch) ----
 install -Dm755 "$ROOT/release/proton-drive-ubuntu" "$STAGE/usr/bin/protondrive"
 install -Dm755 "$ROOT/release/protondrive-gui" "$STAGE/usr/bin/protondrive-gui"
+install -Dm755 "$ROOT/release/protondrive-vfs" "$STAGE/usr/bin/protondrive-vfs"
 ln -sf protondrive "$STAGE/usr/bin/proton-drive-ubuntu"
-strip "$STAGE/usr/bin/protondrive-gui" 2>/dev/null || true
+strip "$STAGE/usr/bin/protondrive-gui" "$STAGE/usr/bin/protondrive-vfs" 2>/dev/null || true
 
 install -Dm644 "$HERE/$APP_ID.desktop" "$STAGE/usr/share/applications/$APP_ID.desktop"
 mkdir -p "$STAGE/usr/share/metainfo"

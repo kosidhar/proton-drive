@@ -6,8 +6,9 @@ pkgdesc="Native Linux desktop client and two-way folder sync daemon for Proton D
 arch=('x86_64' 'aarch64')
 url="https://github.com/gautamchauhan/proton-drive"
 license=('MIT')
-depends=('glibc' 'gcc-libs' 'libxkbcommon' 'vulkan-icd-loader' 'hicolor-icon-theme')
+depends=('glibc' 'gcc-libs' 'libxkbcommon' 'vulkan-icd-loader' 'hicolor-icon-theme' 'fuse3')
 optdepends=(
+  'glib2: gio, used to move files to the desktop Trash'
   'libsecret: OS Keyring credential storage via Freedesktop Secret Service'
   'libnotify: Desktop sync and conflict notifications'
   'nautilus-python: GNOME Files (Nautilus) context menu and sync emblem integration'

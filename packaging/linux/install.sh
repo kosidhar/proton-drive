@@ -53,7 +53,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
   echo "==> Uninstalling Proton Drive from $PREFIX..."
   systemctl --user disable --now protondrive.service 2>/dev/null || true
   systemctl --user disable --now proton-drive-ubuntu.service 2>/dev/null || true
-  rm -f "$PREFIX/bin/protondrive" "$PREFIX/bin/protondrive-gui" "$PREFIX/bin/proton-drive-ubuntu"
+  rm -f "$PREFIX/bin/protondrive" "$PREFIX/bin/protondrive-gui" "$PREFIX/bin/protondrive-vfs" "$PREFIX/bin/proton-drive-ubuntu"
   rm -f "$PREFIX/share/applications/ch.proton.drive.desktop" "$PREFIX/share/applications/proton-drive.desktop"
   rm -f "$PREFIX/share/metainfo/ch.proton.drive.metainfo.xml"
   rm -f "$SYSTEMD_USER_DIR/protondrive.service"
@@ -79,6 +79,8 @@ mkdir -p \
 if [ -d "$SRC_Root/bin" ]; then
   install -Dm755 "$SRC_Root/bin/protondrive" "$PREFIX/bin/protondrive"
   install -Dm755 "$SRC_Root/bin/protondrive-gui" "$PREFIX/bin/protondrive-gui"
+  # The virtual drive helper must sit next to protondrive (the daemon looks beside itself first)
+  install -Dm755 "$SRC_Root/bin/protondrive-vfs" "$PREFIX/bin/protondrive-vfs"
   ln -sf protondrive "$PREFIX/bin/proton-drive-ubuntu"
   cp -R "$SRC_Root/share/icons/hicolor" "$PREFIX/share/icons/"
   [ -d "$SRC_Root/share/protondrive" ] && cp -R "$SRC_Root/share/protondrive/"* "$PREFIX/share/protondrive/"
@@ -95,6 +97,7 @@ if [ -d "$SRC_Root/bin" ]; then
 else
   install -Dm755 "$SRC_Root/release/proton-drive-ubuntu" "$PREFIX/bin/protondrive"
   install -Dm755 "$SRC_Root/release/protondrive-gui" "$PREFIX/bin/protondrive-gui"
+  install -Dm755 "$SRC_Root/release/protondrive-vfs" "$PREFIX/bin/protondrive-vfs"
   ln -sf protondrive "$PREFIX/bin/proton-drive-ubuntu"
   cp -R "$SRC_Root/assets/app-icon/hicolor" "$PREFIX/share/icons/"
   cp -R "$SRC_Root/assets/app-icon/tray/"*.png "$PREFIX/share/protondrive/tray/"

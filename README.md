@@ -38,6 +38,19 @@ Built to work out-of-the-box across all major Linux distributions and desktop en
 
 ---
 
+## Virtual Drive (Files On-Demand)
+
+Proton Drive shows up in your file manager's sidebar as **Proton Drive**. It lists every file in your account, including online-only ones, and a file downloads the moment an app opens it.
+
+- **How it works:** the daemon keeps downloaded files in a hidden store, `~/.local/share/proton-drive-ubuntu/files`, and mounts a FUSE view of it at your sync folder (default `~/ProtonDrive`). The `protondrive-vfs` helper, installed next to `protondrive`, serves that mount.
+- **Nothing downloads in the background:** thumbnailers and desktop search never trigger a download, so browsing a folder of online-only photos shows generic icons and costs no bandwidth.
+- **Eject and mount again:** Eject in Files unmounts the drive. **Mount again** in the app's Settings, or **Mount Proton Drive** in the tray, brings it back.
+- **Plain folder fallback:** Proton Drive stays an ordinary folder when FUSE isn't available (no `/dev/fuse`, no `fusermount3`, no helper, or the Flatpak build), when the switch **Show online-only files in Files (virtual drive)** in Settings is off, or when the sync folder is on a different disk from `~/.local/share` (Settings shows the reason).
+- **Changing the sync folder** needs an empty or new folder. If a move stops partway (for example, a full disk), Settings lets you finish it, move it back or retry.
+- **Runtime dependency:** `fuse3` (the `.deb`, `.rpm` and Arch packages pull it in). Moving files to the desktop Trash uses `gio` (`libglib2.0-bin` / `glib2`).
+
+---
+
 ## Building & Installing on Any Linux Distro
 
 ### Build All Linux Packages (`.AppImage`, `.deb`, `.rpm`, `.tar.gz`)
@@ -58,6 +71,8 @@ This outputs all 4 universal release artifacts to `./dist/release/`:
 ./packaging/linux/install.sh --user
 systemctl --user enable --now protondrive.service
 ```
+
+Install `fuse3` from your distro first if you want the virtual drive.
 
 ### Option B: Debian / Ubuntu / Mint / Pop!\_OS (`.deb`)
 
