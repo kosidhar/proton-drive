@@ -91,8 +91,8 @@ type DriveEngine = ControlServerOptions['engine'];
 
 // GET /vfs/children?path=, POST /vfs/hydrate {path}, POST /vfs/rename {from, to, noReplace?}, POST /vfs/delete {path,
 // onlyIfEmpty?, trash?} (onlyIfEmpty is rmdir, trash a Move to Trash), POST /vfs/truncate {path} (an online-only file
-// made an empty local one). Paths are paths of My files, UTF-8 as they are ('' is the top); each answers { entries } or
-// { ok: true }, or 400 { error, code }.
+// made an empty local one); the last three also take deadlineMs. Paths are paths of My files, UTF-8 as they are ('' is
+// the top); each answers { entries } or { ok: true }, or 400 { error, code }.
 async function driveRoute(req: Request, route: string, engine: DriveEngine): Promise<Response> {
     if (route === '/vfs/children') {
         if (req.method !== 'GET') return driveError(new Error('Method not allowed'), 405);
@@ -107,6 +107,11 @@ async function driveRoute(req: Request, route: string, engine: DriveEngine): Pro
     if (req.method !== 'POST') return driveError(new Error('Method not allowed'), 405);
     const body = await jsonBody(req);
     if (!body) return driveError(new Error('Invalid JSON body'));
+    // When the helper stops waiting (epoch ms): a change whose turn comes later is refused, not done behind its back
+    if (route !== '/vfs/hydrate' && body.deadlineMs !== undefined && !Number.isFinite(body.deadlineMs)) {
+        return driveError(new Error('deadlineMs must be a number'));
+    }
+    const deadlineMs = typeof body.deadlineMs === 'number' ? body.deadlineMs : undefined;
     try {
         switch (route) {
             case '/vfs/hydrate':
@@ -121,7 +126,7 @@ async function driveRoute(req: Request, route: string, engine: DriveEngine): Pro
                 if (body.noReplace !== undefined && typeof body.noReplace !== 'boolean') {
                     return driveError(new Error('noReplace must be true or false'));
                 }
-                await engine.renameItem(body.from, body.to, { noReplace: body.noReplace === true });
+                await engine.renameItem(body.from, body.to, { noReplace: body.noReplace === true, deadlineMs });
                 break;
             case '/vfs/delete':
                 if (typeof body.path !== 'string') return driveError(new Error('Missing path'));
@@ -131,11 +136,15 @@ async function driveRoute(req: Request, route: string, engine: DriveEngine): Pro
                 if (body.trash !== undefined && typeof body.trash !== 'boolean') {
                     return driveError(new Error('trash must be true or false'));
                 }
-                await engine.deleteItem(body.path, { onlyIfEmpty: body.onlyIfEmpty === true, trash: body.trash === true });
+                await engine.deleteItem(body.path, {
+                    onlyIfEmpty: body.onlyIfEmpty === true,
+                    trash: body.trash === true,
+                    deadlineMs,
+                });
                 break;
             case '/vfs/truncate':
                 if (typeof body.path !== 'string') return driveError(new Error('Missing path'));
-                await engine.truncateItem(body.path);
+                await engine.truncateItem(body.path, { deadlineMs });
                 break;
         }
         return Response.json({ ok: true });

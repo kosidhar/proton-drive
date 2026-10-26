@@ -1849,10 +1849,16 @@ export class ProtonDriveSyncEngine {
     // goes to the Proton Drive trash if it was ever uploaded. Only a file on this computer can replace, and only a file.
     // Moving into an ignored name takes the item out of what is synced: Proton Drive keeps it where it was. With
     // noReplace, nothing that is at toRel (here or only in Proton Drive) is ever replaced.
+    // With deadlineMs, a rename whose turn comes after it is refused with `Timed out waiting: <path>` (EIO), changing
+    // nothing (deleteItem and truncateItem take it too).
     // Rejects with a DriveOpError: `Not found: <path>` (ENOENT), `Already exists: <path>` (EEXIST), `Hidden: <path>`
     // (EACCES), or EXDEV for an online-only file replacing another (it has no local copy to put there: mv then copies it,
     // which downloads it, and deletes it); with `Invalid path: <path>` for a path that climbs out of My files.
-    async renameItem(fromRel: string, toRel: string, opts: { noReplace?: boolean } = {}): Promise<void> {
+    async renameItem(
+        fromRel: string,
+        toRel: string,
+        opts: { noReplace?: boolean; deadlineMs?: number } = {},
+    ): Promise<void> {
         const from = normalizeDrivePath(fromRel);
         const to = normalizeDrivePath(toRel);
         if (from === '' || to === '') {
@@ -1864,7 +1870,10 @@ export class ProtonDriveSyncEngine {
         if (to.startsWith(`${from}/`)) {
             throw new Error(`Can't move ${from} into itself`);
         }
-        await this.inAvailabilityRun(() => this.renameLocally(from, to, opts.noReplace === true));
+        await this.inAvailabilityRun(() => {
+            this.inTime(opts.deadlineMs, from);
+            return this.renameLocally(from, to, opts.noReplace === true);
+        });
         void this.replayRemoteOps();
     }
 
@@ -1876,12 +1885,18 @@ export class ProtonDriveSyncEngine {
     // desktop Trash rather than away, as after a cloud delete, and the user is told.
     // Rejects with a DriveOpError: `Not found: <path>` (ENOENT), `Hidden: <path>` (EACCES), with onlyIfEmpty `Not empty:
     // <path>` (ENOTEMPTY) or `Not a folder: <path>` (EIO); or with `Invalid path: <path>`.
-    async deleteItem(relPath: string, opts: { onlyIfEmpty?: boolean; trash?: boolean } = {}): Promise<void> {
+    async deleteItem(
+        relPath: string,
+        opts: { onlyIfEmpty?: boolean; trash?: boolean; deadlineMs?: number } = {},
+    ): Promise<void> {
         const rel = normalizeDrivePath(relPath);
         if (rel === '') {
             throw new Error("The whole of Proton Drive can't be deleted");
         }
-        await this.inAvailabilityRun(() => this.deleteLocally(rel, opts.onlyIfEmpty === true, opts.trash === true));
+        await this.inAvailabilityRun(() => {
+            this.inTime(opts.deadlineMs, rel);
+            return this.deleteLocally(rel, opts.onlyIfEmpty === true, opts.trash === true);
+        });
         void this.replayRemoteOps();
     }
 
@@ -1891,9 +1906,20 @@ export class ProtonDriveSyncEngine {
     // version, the conflict handling once it doesn't. The empty file is never put over anything that appeared meanwhile.
     // Rejects with a DriveOpError: `Not found: <path>` (ENOENT) for anything but an online-only file, `Hidden: <path>`
     // (EACCES), `Already exists: <path>` (EEXIST) when it is on this computer; or with `Invalid path: <path>`.
-    async truncateItem(relPath: string): Promise<void> {
+    async truncateItem(relPath: string, opts: { deadlineMs?: number } = {}): Promise<void> {
         const rel = normalizeDrivePath(relPath);
-        await this.inAvailabilityRun(() => this.truncateLocally(rel));
+        await this.inAvailabilityRun(() => {
+            this.inTime(opts.deadlineMs, rel);
+            return this.truncateLocally(rel);
+        });
+    }
+
+    // A drive change carries the time the helper stops waiting for it (it has told the app EIO by then): one whose turn
+    // comes later is refused, before it touches anything, rather than done behind the app's back.
+    private inTime(deadlineMs: number | undefined, relPath: string): void {
+        if (deadlineMs !== undefined && Date.now() > deadlineMs) {
+            throw new DriveOpError('EIO', `Timed out waiting: ${relPath}`);
+        }
     }
 
     private async truncateLocally(rel: string): Promise<void> {

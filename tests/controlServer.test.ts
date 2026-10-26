@@ -54,8 +54,8 @@ function makeFake(rejectWith?: string) {
             if (relPath === 'missing.txt') throw new DriveOpError('ENOENT', `Not found: ${relPath}`);
             if (relPath === 'Full' && opts?.onlyIfEmpty) throw new DriveOpError('ENOTEMPTY', `Not empty: ${relPath}`);
         },
-        async truncateItem(relPath: string): Promise<void> {
-            driveCalls.push(['truncate', relPath]);
+        async truncateItem(relPath: string, opts?: { deadlineMs?: number }): Promise<void> {
+            driveCalls.push(opts?.deadlineMs === undefined ? ['truncate', relPath] : ['truncate', relPath, opts]);
             if (relPath === 'local.txt') throw new DriveOpError('EEXIST', `Already exists: ${relPath}`);
         },
     };
@@ -230,6 +230,19 @@ describe('drive routes', () => {
         ]);
     });
 
+    test('the drive changes pass a deadline through', async () => {
+        const { socketPath, engine } = await start();
+        const deadlineMs = 1_800_000_000_000;
+        expect((await post(socketPath, '/vfs/truncate', { path: 'a', deadlineMs })).status).toBe(200);
+        expect((await post(socketPath, '/vfs/rename', { from: 'a', to: 'b', deadlineMs })).status).toBe(200);
+        expect((await post(socketPath, '/vfs/delete', { path: 'b', deadlineMs })).status).toBe(200);
+        expect(engine.driveCalls).toEqual([
+            ['truncate', 'a', { deadlineMs }],
+            ['rename', 'a', 'b', { noReplace: false, deadlineMs }],
+            ['delete', 'b', { onlyIfEmpty: false, trash: false, deadlineMs }],
+        ]);
+    });
+
     test("an engine error is 400 with its message and code, and any other error is code EIO", async () => {
         const { socketPath } = await start();
         const expectError = async (res: Response, error: string, code: string) => {
@@ -266,6 +279,9 @@ describe('drive routes', () => {
             await post(socketPath, '/vfs/delete', { path: 'Full', onlyIfEmpty: 1 }),
             await post(socketPath, '/vfs/truncate', { path: 3 }),
             await post(socketPath, '/vfs/delete', { path: 'Docs', trash: 'yes' }),
+            await post(socketPath, '/vfs/truncate', { path: 'a', deadlineMs: 'soon' }),
+            await post(socketPath, '/vfs/rename', { from: 'a', to: 'b', deadlineMs: null }),
+            await post(socketPath, '/vfs/delete', { path: 'a', deadlineMs: '1800000000000' }),
         ];
         for (const res of bad) {
             expect(res.status).toBe(400);

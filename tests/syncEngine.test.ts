@@ -4259,6 +4259,40 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(d.calls.trashed).toEqual([]);
             });
 
+            // S24: the helper gives up after its own limit; what it gave up on mustn't happen later
+            test('a truncate, rename or delete whose turn comes after its deadline changes nothing', async () => {
+                const d = setup();
+                d.add('Docs/online.txt', 'o');
+                d.add('Docs/keep.txt', 'k');
+                await d.engine.reconcileNow();
+                await d.engine.setAvailability('Docs/keep.txt', 'pin');
+                let release!: () => void;
+                const held = (d.engine as any).inAvailabilityRun(() => new Promise<void>((resolve) => (release = resolve)));
+                const deadlineMs = Date.now() + 20;
+                const late = [
+                    failure(d.engine.truncateItem('Docs/online.txt', { deadlineMs })),
+                    failure(d.engine.renameItem('Docs/keep.txt', 'Docs/moved.txt', { deadlineMs })),
+                    failure(d.engine.deleteItem('Docs/keep.txt', { deadlineMs })),
+                ];
+                await Bun.sleep(200);
+                release();
+                await held;
+
+                expect(await Promise.all(late)).toEqual([
+                    { code: 'EIO', message: 'Timed out waiting: Docs/online.txt', driveOpError: true },
+                    { code: 'EIO', message: 'Timed out waiting: Docs/keep.txt', driveOpError: true },
+                    { code: 'EIO', message: 'Timed out waiting: Docs/keep.txt', driveOpError: true },
+                ]);
+                expect(await d.files.exists('Docs/online.txt')).toBe(false);
+                expect(stateDb.getEditBaseline('Docs/online.txt')).toBeNull();
+                expect(await readFile(d.local('Docs/keep.txt'), 'utf8')).toBe('k');
+                expect(await d.files.exists('Docs/moved.txt')).toBe(false);
+                expect(d.journal()).toEqual([]);
+                // In time, as before
+                await d.engine.truncateItem('Docs/online.txt', { deadlineMs: Date.now() + 60_000 });
+                expect(await readFile(d.local('Docs/online.txt'), 'utf8')).toBe('');
+            });
+
             test('a baseline whose file is gone is dropped at the next pass', async () => {
                 const d = setup();
                 d.add('Docs/doc.txt', 'old');
