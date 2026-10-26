@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 
 import { selfOrDescendant, selfOrDescendantWhere } from './pathRange';
-import { type ConflictStrategy, isConflictStrategy, problemWithIgnorePatterns } from './settingsRules';
+import { type ConflictStrategy, isConflictStrategy, usableIgnorePatterns } from './settingsRules';
 
 export type ItemSyncStatus = 'synced' | 'uploading' | 'downloading' | 'conflict' | 'error' | 'ignored';
 export { CONFLICT_STRATEGIES, type ConflictStrategy } from './settingsRules';
@@ -163,15 +163,17 @@ export class SyncStateDatabase {
         `);
     }
 
-    // A stored value that fails the settings rules (saved before they existed) is never used: it would stop syncing
-    // (not a list of strings) or hide the drive (matches everything). The default stands in; checked once per value.
+    // A stored value that fails the settings rules (saved before they existed) is never used as it is: it would stop
+    // syncing (not a list of strings) or hide the drive (matches everything). Its usable part, or the default, stands in
+    // while it is read; what is stored is never rewritten by that (updateSettings writes only what it is given).
+    // Checked once per stored value.
     private checkedIgnorePatterns: { raw: string | undefined; value: string[] } | null = null;
     private readonly warnedBadSettings = new Set<string>();
 
-    private warnBadSetting(key: string, raw: string): void {
+    private warnBadSetting(key: string, raw: string, what = 'not a valid value; using the default'): void {
         if (this.warnedBadSettings.has(`${key}=${raw}`)) return;
         this.warnedBadSettings.add(`${key}=${raw}`);
-        console.warn(`Ignoring the stored ${key} (${raw.slice(0, 80)}): not a valid value; using the default`);
+        console.warn(`The stored ${key} (${raw.slice(0, 80)}) is ${what === 'not a valid value; using the default' ? what : `used ${what}`}; the stored value is kept as it is`);
     }
 
     private storedIgnorePatterns(raw: string | undefined): string[] {
@@ -179,18 +181,17 @@ export class SyncStateDatabase {
         if (cached && cached.raw === raw) return [...cached.value];
         let value = [...DEFAULT_IGNORE_PATTERNS];
         if (raw !== undefined) {
-            let problem: string | null;
-            let parsed: unknown;
+            let usable: ReturnType<typeof usableIgnorePatterns> = null;
             try {
-                parsed = JSON.parse(raw);
-                problem = problemWithIgnorePatterns(parsed);
+                usable = usableIgnorePatterns(JSON.parse(raw));
             } catch {
-                problem = 'not JSON';
+                // not JSON
             }
-            if (problem === null) {
-                value = parsed as string[];
-            } else {
+            if (usable === null) {
                 this.warnBadSetting('ignorePatterns', raw);
+            } else {
+                value = usable.patterns;
+                if (usable.dropped > 0) this.warnBadSetting('ignorePatterns', raw, `leaving out ${usable.dropped} unusable pattern(s)`);
             }
         }
         this.checkedIgnorePatterns = { raw, value };
@@ -221,17 +222,22 @@ export class SyncStateDatabase {
         };
     }
 
+    // Writes only the settings given, so a value stored as it is (see getSettings) is never rewritten by a save of another;
+    // answers all of them
     updateSettings(partial: Partial<SyncSettings>): SyncSettings {
         const current = this.getSettings();
         const next: SyncSettings = { ...current, ...partial };
         const upsert = this.db.query('INSERT OR REPLACE INTO settings (key, value) VALUES ($key, $value)');
+        const store = (key: keyof SyncSettings, value: string) => {
+            if (partial[key] !== undefined) upsert.run({ $key: key, $value: value });
+        };
 
-        upsert.run({ $key: 'syncDir', $value: next.syncDir });
-        upsert.run({ $key: 'conflictStrategy', $value: next.conflictStrategy });
-        upsert.run({ $key: 'notificationsEnabled', $value: String(next.notificationsEnabled) });
-        upsert.run({ $key: 'reconcileIntervalSec', $value: String(next.reconcileIntervalSec) });
-        upsert.run({ $key: 'paused', $value: String(next.paused) });
-        upsert.run({ $key: 'ignorePatterns', $value: JSON.stringify(next.ignorePatterns) });
+        store('syncDir', next.syncDir);
+        store('conflictStrategy', next.conflictStrategy);
+        store('notificationsEnabled', String(next.notificationsEnabled));
+        store('reconcileIntervalSec', String(next.reconcileIntervalSec));
+        store('paused', String(next.paused));
+        store('ignorePatterns', JSON.stringify(next.ignorePatterns));
 
         return next;
     }

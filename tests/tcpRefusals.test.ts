@@ -45,7 +45,7 @@ describe('What the TCP API refuses, and how the daemon is wired (#32, #33, #36)'
         const source = readFileSync(path.join(import.meta.dir, '../src/daemon/daemonServer.ts'), 'utf8');
         const fetchAt = source.indexOf('async fetch(req, srv)');
         const guardAt = source.indexOf('isTrustedLocalRequest(', fetchAt);
-        const refuseAt = source.indexOf('refuseOnTcp(req)', fetchAt);
+        const refuseAt = source.search(/const refused = refuseOnTcp\(req\);\s*if \(refused\) return refused;/);
         const firstRouteAt = source.indexOf("pathname === '/", fetchAt);
         expect(fetchAt).toBeGreaterThan(0);
         expect(guardAt).toBeGreaterThan(fetchAt);
@@ -118,7 +118,7 @@ describe('What the TCP API refuses, and how the daemon is wired (#32, #33, #36)'
             fetch('http://localhost/remote/mkdir', { unix: socketPath, method, body: method === 'POST' ? raw : undefined } as RequestInit).then(
                 async (r) => ({ status: r.status, json: (await r.json()) as Record<string, unknown> }),
             );
-        for (const body of ['{}', '{"name":""}', '{"name":3}', '{"name":"a/b"}', '{"name":"a","parentPath":4}', '[1]', 'not json']) {
+        for (const body of ['{}', '{"name":""}', '{"name":"  "}', '{"name":"."}', '{"name":".."}', '{"name":"a\\u0000b"}', '{"name":3}', '{"name":"a/b"}', '{"name":"a","parentPath":4}', '[1]', 'not json']) {
             const res = await post(body);
             expect([body, res.status, res.json.code]).toEqual([body, 400, 'EINVAL']);
         }

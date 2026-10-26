@@ -9,8 +9,15 @@ export type ConflictStrategy = (typeof CONFLICT_STRATEGIES)[number];
 export const MAX_IGNORE_PATTERNS = 500;
 export const MAX_IGNORE_PATTERN_LENGTH = 1024;
 
-// Paths of every shape the patterns together must not all ignore: that would hide the whole drive
-const SAMPLE_PATHS = ['a', 'b', 'a.txt', '.hidden', 'x.y.z', 'a/b', 'Documents/report.pdf', 'photos/2024/img 1.jpg', 'a/b/c/d/e'];
+// Names no real file has, so only a wildcard can match them: a pattern or a list that ignores all of these hides every
+// file (or, for the nested ones, everything inside folders), whatever the files are called
+const SAMPLE_PATHS = ['zq7-a', 'zq7-b.zq7', 'zq7-c/yk3-d.zq7', '.zq7-e', 'vu9-f/yk3-g/xw5-h'];
+const NESTED_SAMPLE_PATHS = SAMPLE_PATHS.filter((sample) => sample.includes('/'));
+
+function hidesAll(patterns: string[]): boolean {
+    const ignored = (sample: string) => matchesIgnorePatterns(sample, patterns);
+    return SAMPLE_PATHS.every(ignored) || NESTED_SAMPLE_PATHS.every(ignored);
+}
 
 function problemWithPattern(pattern: unknown, index: number): string | null {
     const which = `ignorePatterns[${index}]`;
@@ -31,10 +38,6 @@ export function problemWithIgnorePatterns(patterns: unknown): string | null {
     }
     const list = patterns as string[];
     try {
-        const ignored = (sample: string, within: string[]) => matchesIgnorePatterns(sample, within);
-        const hidesAll = (within: string[]) =>
-            SAMPLE_PATHS.every((sample) => ignored(sample, within)) ||
-            SAMPLE_PATHS.filter((sample) => sample.includes('/')).every((sample) => ignored(sample, within));
         for (const [index, pattern] of list.entries()) {
             if (hidesAll([pattern])) return `ignorePatterns[${index}] (${JSON.stringify(pattern)}) matches every file and would hide the whole drive`;
         }
@@ -43,6 +46,30 @@ export function problemWithIgnorePatterns(patterns: unknown): string | null {
         return 'ignorePatterns holds a pattern that is not valid';
     }
     return null;
+}
+
+// What of a stored list can be used (it may have been saved before the checks existed): the entries that are valid,
+// none of which hides everything alone, or null when nothing usable is left (or the rest together hide everything), and
+// the default list stands in. A stored list that is empty is a usable list that ignores nothing. `dropped` counts the
+// entries left out.
+export function usableIgnorePatterns(stored: unknown): { patterns: string[]; dropped: number } | null {
+    if (!Array.isArray(stored)) return null;
+    const usable: string[] = [];
+    for (const [index, pattern] of stored.entries()) {
+        try {
+            if (problemWithPattern(pattern, index) === null && !hidesAll([pattern as string])) usable.push(pattern as string);
+        } catch {
+            // a pattern that is not valid is left out
+        }
+    }
+    const patterns = usable.slice(0, MAX_IGNORE_PATTERNS);
+    if (stored.length > 0 && patterns.length === 0) return null;
+    try {
+        if (patterns.length > 1 && hidesAll(patterns)) return null;
+    } catch {
+        return null;
+    }
+    return { patterns, dropped: stored.length - patterns.length };
 }
 
 export function isConflictStrategy(value: unknown): value is ConflictStrategy {
