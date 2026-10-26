@@ -153,7 +153,8 @@ fn PROTON_PURPLE_TEXT() -> Color32 {
 const STATUS_SUCCESS: Color32 = Color32::from_rgb(25, 150, 118); // #199676
 const STATUS_WARNING: Color32 = Color32::from_rgb(230, 138, 0); // #E68A00
 const STATUS_DANGER: Color32 = Color32::from_rgb(220, 50, 81); // #DC3251
-const STATUS_DANGER_HOVER: Color32 = Color32::from_rgb(232, 74, 103); // #E84A67
+// Darker on hover, so the white label keeps a contrast of at least 4.5:1 (5.5:1; STATUS_DANGER has 4.5:1)
+const STATUS_DANGER_HOVER: Color32 = Color32::from_rgb(196, 43, 71); // #C42B47
 
 #[inline]
 fn table_header_bg() -> Color32 {
@@ -271,14 +272,16 @@ struct DaemonStatus {
 }
 
 /// What is missing while the daemon holds because the files are missing from the folder (`filesMissing` in
-/// /api/status): the folder (the sync folder, as the user knows it), the recorded items still missing (top-level items,
-/// or after the files came back, whatever is still missing at any depth), and how many items that is.
+/// /api/status): the sync folder (which a confirmation names), the recorded items still missing (top-level items, or
+/// after the files came back, whatever is still missing at any depth), how many items that is, and what the daemon says
+/// about it, in the user's terms (empty from a daemon before #46's fixes).
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 struct FilesMissing {
     root: String,
     names: Vec<String>,
     items: u64,
+    message: String,
 }
 
 /// "Docs and Photos are", "A, B, C and 2 more are": the missing items as the hold banner names them.
@@ -900,13 +903,13 @@ fn confirm_copy(confirm: &PendingConfirm) -> ConfirmCopy {
             // Not an availability action: render_confirm_modal sends the switch instead
             action: "virtual-drive-off",
         },
-        PendingConfirm::DeleteMissing { root, names, items } => ConfirmCopy {
+        PendingConfirm::DeleteMissing { names, items, .. } => ConfirmCopy {
             title: "Delete them from Proton Drive too?".to_string(),
+            // The banner above says where they were missing from; this says what goes
             body: {
-                let (what, them) = if *items == 1 { ("item that was", "it") } else { ("items that were", "them") };
+                let (what, them) = if *items == 1 { ("missing item".to_string(), "it") } else { (format!("{items} missing items"), "them") };
                 format!(
-                    "The {items} {what} in {} ({}) will move to the Proton Drive trash. You can restore {them} from the trash on the Proton Drive website.",
-                    shown_folder(root),
+                    "The {what} ({}) will move to the Proton Drive trash. You can restore {them} from the trash on the Proton Drive website.",
                     listed_names(names)
                 )
             },
@@ -1383,11 +1386,12 @@ impl ProtonDriveNativeApp {
                 _ => "/home/u/ProtonDrive".to_string(),
             }
         };
-        status.state = "error".into();
-        status.last_error = Some(format!("Proton Drive's files are missing from {root}. Nothing was deleted in Proton Drive."));
         // As after a restore by copy that has yet to finish: a folder still missing, and one file deeper down
+        let message = format!("1284 items are missing from {}. Nothing was deleted in Proton Drive.", shown_folder(&root));
+        status.state = "error".into();
+        status.last_error = Some(message.clone());
         let names = vec!["Documents".into(), "Photos/2024/IMG_2041.jpg".into()];
-        status.files_missing = Some(FilesMissing { root, names, items: 1284 });
+        status.files_missing = Some(FilesMissing { root, names, items: 1284, message });
     }
 
     /// Screenshot-only: lays `--drive-status` / `--drive-move` over a status from the daemon.
@@ -3073,10 +3077,13 @@ impl ProtonDriveNativeApp {
             .inner_margin(Margin::symmetric(16, 12))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                let title = format!(
-                    "Proton Drive's files are missing from {}. Nothing was deleted in Proton Drive.",
-                    shown_folder(&fm.root)
-                );
+                // What the daemon says (what is missing, and where, in the user's terms); a daemon from before it said
+                // so names the folder
+                let title = if fm.message.trim().is_empty() {
+                    format!("Proton Drive's files are missing from {}. Nothing was deleted in Proton Drive.", shown_folder(&fm.root))
+                } else {
+                    fm.message.clone()
+                };
                 ui.add(egui::Label::new(RichText::new(title).size(13.5).strong().color(TEXT_PRIMARY())).wrap());
                 ui.add_space(2.0);
                 let detail = format!(
@@ -6883,7 +6890,7 @@ mod tests {
         h.app.status.state = "error".into();
         h.app.status.last_error = Some(MISSING.into());
         h.app.status.files_missing =
-            Some(FilesMissing { root: "/home/u/ProtonDrive".into(), names: vec!["Docs".into(), "Photos".into()], items: 12 });
+            Some(FilesMissing { root: "/home/u/ProtonDrive".into(), names: vec!["Docs".into(), "Photos".into()], items: 12, ..Default::default() });
         h.frames(3);
     }
 
@@ -6914,7 +6921,7 @@ mod tests {
             })
         );
         assert!(h
-            .text_at("The 12 items that were in /home/u/ProtonDrive (Docs and Photos) will move to the Proton Drive trash. You can restore them from the trash on the Proton Drive website.")
+            .text_at("The 12 missing items (Docs and Photos) will move to the Proton Drive trash. You can restore them from the trash on the Proton Drive website.")
             .is_some());
         assert_eq!(h.sent(), Vec::<String>::new());
         h.click(h.text_at("Keep waiting").expect("keep waiting is offered"));
@@ -6958,13 +6965,21 @@ mod tests {
     fn daemon_status_reads_files_missing() {
         let status: DaemonStatus = serde_json::from_str(
             r#"{"state":"error","currentAction":null,"loggedIn":true,"syncDir":"/home/u/ProtonDrive","activeTransfers":[],
-                "filesMissing":{"root":"/home/u/ProtonDrive","names":["Docs"],"items":3},
+                "filesMissing":{"root":"/home/u/ProtonDrive","names":["Docs"],"items":3,"message":"Docs is missing from ~/ProtonDrive. Nothing was deleted in Proton Drive."},
                 "stats":{"totalFiles":1,"totalFolders":0,"totalBytes":3,"unresolvedConflicts":0,"errorItems":0},
                 "settings":{"syncDir":"/home/u/ProtonDrive","conflictStrategy":"keep-both","notificationsEnabled":true,
                             "reconcileIntervalSec":120,"paused":false,"ignorePatterns":[".git"]}}"#,
         )
         .unwrap();
-        assert_eq!(status.files_missing, Some(FilesMissing { root: "/home/u/ProtonDrive".into(), names: vec!["Docs".into()], items: 3 }));
+        assert_eq!(
+            status.files_missing,
+            Some(FilesMissing {
+                root: "/home/u/ProtonDrive".into(),
+                names: vec!["Docs".into()],
+                items: 3,
+                message: "Docs is missing from ~/ProtonDrive. Nothing was deleted in Proton Drive.".into()
+            })
+        );
         let none: DaemonStatus = serde_json::from_str(r#"{"state":"idle","loggedIn":true,"syncDir":"/x","activeTransfers":[],
             "stats":{"totalFiles":1,"totalFolders":0,"totalBytes":3,"unresolvedConflicts":0,"errorItems":0},
             "settings":{"syncDir":"/x","conflictStrategy":"keep-both","notificationsEnabled":true,"reconcileIntervalSec":120,"paused":false,"ignorePatterns":[]},
@@ -6986,7 +7001,12 @@ mod tests {
 
     #[test]
     fn missing_names_read_as_a_list() {
-        let fm = |names: &[&str], items| FilesMissing { root: "/r".into(), names: names.iter().map(|n| n.to_string()).collect(), items };
+        let fm = |names: &[&str], items| FilesMissing {
+            root: "/r".into(),
+            names: names.iter().map(|n| n.to_string()).collect(),
+            items,
+            ..Default::default()
+        };
         assert_eq!(missing_names(&fm(&["Docs"], 1)), "Docs is");
         assert_eq!(missing_names(&fm(&["Docs", "Photos"], 2)), "Docs and Photos are");
         assert_eq!(missing_names(&fm(&["A", "B", "C"], 3)), "A, B and C are");
@@ -7012,9 +7032,19 @@ mod tests {
         });
         assert_eq!(
             one.body,
-            "The 1 item that was in /mnt/disk/ProtonDrive (Photos/p2.jpg) will move to the Proton Drive trash. You can restore it from the trash on the Proton Drive website."
+            "The missing item (Photos/p2.jpg) will move to the Proton Drive trash. You can restore it from the trash on the Proton Drive website."
         );
 
+        // The banner says what the daemon says: what is missing, and where, in the user's terms
+        let mut h = Harness::new("/my-files");
+        held(&mut h);
+        let says = "Photos/p2.jpg is missing from the drive's storage. Nothing was deleted in Proton Drive.";
+        h.app.status.files_missing.as_mut().unwrap().message = says.into();
+        h.frames(3);
+        assert!(h.text_at(says).is_some());
+        assert!(h.text_at(MISSING).is_none());
+
+        // A daemon from before it said so: the app says it, with ~ for the home folder
         let home = std::env::var("HOME").unwrap_or_default();
         if home.len() > 1 {
             let mut h = Harness::new("/my-files");
@@ -7022,14 +7052,31 @@ mod tests {
             h.app.status.files_missing.as_mut().unwrap().root = format!("{home}/ProtonDrive");
             h.frames(3);
             assert!(h.text_at("Proton Drive's files are missing from ~/ProtonDrive. Nothing was deleted in Proton Drive.").is_some());
-            h.click(h.text_at(DELETE_TOO).unwrap());
-            assert!(h
-                .text_at("The 12 items that were in ~/ProtonDrive (Docs and Photos) will move to the Proton Drive trash. You can restore them from the trash on the Proton Drive website.")
-                .is_some());
             // The daemon gets the folder as it is, not as shown
+            h.click(h.text_at(DELETE_TOO).unwrap());
             h.click(h.text_at("Delete from Proton Drive").unwrap());
             assert_eq!(h.sent(), vec![format!("files missing: delete in cloud {home}/ProtonDrive Docs, Photos")]);
         }
+    }
+
+    /// WCAG contrast ratio of two opaque colours.
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        fn luminance(c: Color32) -> f32 {
+            let lin = |v: u8| {
+                let v = v as f32 / 255.0;
+                if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+        }
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    #[test]
+    fn the_destructive_buttons_white_label_reads_at_rest_and_on_hover() {
+        assert!(contrast(Color32::WHITE, STATUS_DANGER) >= 4.5, "{}", contrast(Color32::WHITE, STATUS_DANGER));
+        assert!(contrast(Color32::WHITE, STATUS_DANGER_HOVER) >= 4.5, "{}", contrast(Color32::WHITE, STATUS_DANGER_HOVER));
+        assert_ne!(STATUS_DANGER_HOVER, STATUS_DANGER);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test } from 'bun:test';
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { cp, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -23,7 +23,15 @@ import { startControlServer } from '../src/daemon/controlServer';
 import { createLocalConflictCopy, formatConflictFileName } from '../src/sync/conflictResolver';
 import { DriveOpError } from '../src/sync/driveOps';
 import { matchesIgnorePatterns } from '../src/sync/localWatcher';
-import { type AvailabilityResult, FILES_HOLD, LOCAL_MOVE_IN_PROGRESS, ProtonDriveSyncEngine } from '../src/sync/syncEngine';
+import {
+    type AvailabilityResult,
+    FILES_HOLD,
+    filesMissingMessage,
+    LOCAL_MOVE_IN_PROGRESS,
+    missingPlace,
+    ProtonDriveSyncEngine,
+} from '../src/sync/syncEngine';
+import { LAYOUT_MOVING } from '../src/sync/layoutMigration';
 import { RemoteOpsJournal } from '../src/sync/remoteOps';
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
 import { localFiles } from './helpers/localFiles';
@@ -2043,7 +2051,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
     describe('a missing or emptied local root (#45)', () => {
         const missing = (root: string) => `Proton Drive's files are missing from ${root}. Nothing was deleted in Proton Drive.`;
         const exists = (p: string) => stat(p).then(() => true, () => false);
-        const setup = (layout: 'plain' | 'virtual' = 'plain') => {
+        // Engines here look at what is missing afresh every time (filesMissingCacheMs 0), unless a test says otherwise
+        const setup = (layout: 'plain' | 'virtual' = 'plain', opts: { cacheMs?: number } = {}) => {
             if (layout === 'virtual') stateDb.setMeta('driveLayout', 'virtual');
             const drive = makeMockDrive();
             const backingDir = path.join(tempDir, 'files');
@@ -2052,11 +2061,14 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const restart = () =>
                 new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
                     backingDir,
+                    filesMissingCacheMs: opts.cacheMs ?? 0,
                 });
-            // The folder the user knows, which the status and the messages name: the sync folder, also in the virtual
-            // layout (where the files are kept in the backing store)
+            // The status's root, which a confirmation names: the sync folder, also in the virtual layout (where the files
+            // are kept in the backing store)
             const shown = stateDb.getSettings().syncDir;
-            return { ...drive, engine: restart(), restart, localRoot, shown, files: localFiles(stateDb, () => localRoot) };
+            // Where the messages say the files are missing from, in the user's terms
+            const place = layout === 'virtual' ? "the drive's storage" : shown;
+            return { ...drive, engine: restart(), restart, localRoot, shown, place, files: localFiles(stateDb, () => localRoot) };
         };
         // Confirms what the status says is missing, as the app does
         const confirmShown = (d: ReturnType<typeof setup>, engine = d.engine) =>
@@ -2089,10 +2101,10 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await engine.reconcileNow(); // the timer's next pass
                 expect(d.calls.trashed).toEqual([]);
                 expect(await exists(d.localRoot)).toBe(false);
-                expect(engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.shown) });
+                expect(engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.place) });
                 expect(stateDb.getAllItems()).toHaveLength(records);
                 expect(missingWarnings(d)).toHaveLength(1);
-                expect(stateDb.listActivity(50).filter((a) => a.details === missing(d.shown))).toHaveLength(1);
+                expect(stateDb.listActivity(50).filter((a) => a.details === missing(d.place))).toHaveLength(1);
             } finally {
                 await engine.stop();
             }
@@ -2114,12 +2126,12 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 treeEventScopeId: 's',
                 eventId: 'e1',
             });
-            await expect(d.engine.setAvailability('Docs', 'pin')).rejects.toThrow(missing(d.shown));
+            await expect(d.engine.setAvailability('Docs', 'pin')).rejects.toThrow(missing(d.place));
 
             expect(d.calls.trashed).toEqual([]);
             expect(stateDb.getAllItems()).toHaveLength(records);
             expect(await readdir(d.localRoot)).toEqual([]);
-            expect(d.engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.shown) });
+            expect(d.engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.place) });
         });
 
         test('the virtual layout with an emptied store trashes nothing, and an open of an online-only file is refused', async () => {
@@ -2129,13 +2141,13 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await mkdir(d.localRoot);
 
             await d.engine.reconcileNow();
-            await expect(d.engine.hydrate('Notes/n.txt')).rejects.toMatchObject({ code: 'EIO', message: missing(d.shown) });
+            await expect(d.engine.hydrate('Notes/n.txt')).rejects.toMatchObject({ code: 'EIO', message: missing(d.place) });
 
             expect(d.calls.trashed).toEqual([]);
             expect(d.calls.downloads.filter((p) => p.startsWith('Notes'))).toEqual([]);
             expect(stateDb.getAllItems()).toHaveLength(records);
             expect(await readdir(d.localRoot)).toEqual([]);
-            expect(d.engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.shown) });
+            expect(d.engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.place) });
         });
 
         test('once the files are back, the next pass syncs as usual, and a genuine delete then reaches Proton Drive', async () => {
@@ -2200,7 +2212,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(d.calls.trashed).toEqual([]);
                 expect(d.calls.uploads).toEqual([]);
                 expect(stateDb.getItemByPath('New.txt')).toBeNull();
-                expect(d.engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.shown) });
+                expect(d.engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.place) });
 
                 // The originals back (the new file stays beside them): everything goes on, the new file uploads
                 for (const name of await readdir(away)) await rename(path.join(away, name), path.join(d.localRoot, name));
@@ -2239,7 +2251,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await rm(d.localRoot, { recursive: true });
             await d.engine.reconcileNow();
             // Docs, Docs/a.txt, Docs/b.txt, Photos, Photos/p.jpg
-            expect(d.engine.getStatus().filesMissing).toEqual({ root: d.shown, names: ['Docs', 'Photos'], items: 5 });
+            expect(d.engine.getStatus().filesMissing).toEqual({ root: d.shown, names: ['Docs', 'Photos'], items: 5, message: missing(d.place) });
         });
 
         test('confirming they were deleted on purpose trashes exactly the missing recorded items, once', async () => {
@@ -2255,7 +2267,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.engine.getStatus().state).toBe('error');
             expect(d.calls.trashed).toEqual([]);
 
-            expect(await confirmShown(d)).toEqual({ root: d.shown, names: ['Photos'], items: 2 });
+            expect(await confirmShown(d)).toMatchObject({ root: d.shown, names: ['Photos'], items: 2 });
             await d.engine.holdForMove(); // waits for the pass the confirmation started
             d.engine.releaseHold();
 
@@ -2351,10 +2363,13 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 }
             };
         };
+        // Some of the files missing, as the status and the messages say it: the one item, or how many
+        const someMissing = (d: ReturnType<typeof setup>, names: string[], items: number) =>
+            `${names.length === 1 ? `${names[0]} is` : `${items} items are`} missing from ${d.place}. Nothing was deleted in Proton Drive.`;
         const held = (d: ReturnType<typeof setup>, names: string[], items: number) => ({
             state: 'error',
-            lastError: missing(d.shown),
-            filesMissing: { root: d.shown, names, items },
+            lastError: someMissing(d, names, items),
+            filesMissing: { root: d.shown, names, items, message: someMissing(d, names, items) },
         });
 
         for (const layout of ['plain', 'virtual'] as const) {
@@ -2431,7 +2446,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.calls.trashed).toEqual([]);
         });
 
-        test('a pass that fails after the hold ends leaves the next one taking nothing missing for a delete either', async () => {
+        test('the look at what is missing runs after a pass that fails too', async () => {
             const d = setup();
             const copyBack = await lost(d);
             await copyBack('Docs');
@@ -2440,11 +2455,125 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
             d.failNext('iterateFolderChildren'); // the network drops as the pass starts listing
             await d.engine.reconcileNow();
-            expect(d.engine.getStatus().state).toBe('error');
-            await d.engine.reconcileNow();
 
+            // Held again by that pass itself, with no pass after it
+            expect(d.engine.getStatus()).toMatchObject(held(d, ['Photos/p2.jpg'], 1));
+            expect(d.calls.trashed).toEqual([]);
+        });
+
+        test('until a look has run, every pass after a hold takes nothing missing for a delete', async () => {
+            const d = setup();
+            const copyBack = await lost(d);
+            await copyBack('Docs');
+            await copyBack('Photos', { onlyTheFolder: true });
+            await copyBack('Photos/p.jpg');
+            // The first pass fails, and so does its look (a disk error, say): no hold, but the look is still due
+            d.failNext('iterateFolderChildren');
+            const look = spyOn(d.engine as any, 'missingRecordedItems').mockImplementationOnce(() => {
+                throw new Error('Input/output error');
+            });
+            try {
+                await d.engine.reconcileNow();
+            } finally {
+                look.mockRestore();
+            }
+            expect(d.engine.getStatus().filesMissing).toBeNull();
+            expect(stateDb.getMeta(FILES_HOLD)).not.toBeNull();
+
+            // The next pass walks the folder, finds p2.jpg missing, and leaves it alone, then holds on it
+            await d.engine.reconcileNow();
             expect(d.calls.trashed).toEqual([]);
             expect(d.engine.getStatus()).toMatchObject(held(d, ['Photos/p2.jpg'], 1));
+        });
+
+        // I1: a local change seen after the hold ended, before a pass has looked: a copy cancelled part-way writes a file
+        // and removes it again, which the watcher reports as a delete of that recorded file
+        for (const layout of ['plain', 'virtual'] as const) {
+            test(`${layout}: a file written and removed again by a cancelled copy after the hold ends isn't taken for a delete`, async () => {
+                const d = setup(layout);
+                const copyBack = await lost(d);
+                await copyBack('Photos');
+                await copyBack('Docs', { onlyTheFolder: true });
+                await copyBack('Docs/a.txt');
+                expect(d.engine.getStatus().filesMissing).toBeNull(); // every top-level item waited for is back
+
+                await writeFile(path.join(d.localRoot, 'Docs/b.txt'), 'part of'); // the copy of b.txt, cancelled
+                await rm(path.join(d.localRoot, 'Docs/b.txt'));
+                await (d.engine as any).handleLocalFileChange('Docs/b.txt');
+
+                expect(d.calls.trashed).toEqual([]);
+                expect(stateDb.getItemByPath('Docs/b.txt')).not.toBeNull();
+                await d.engine.reconcileNow();
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.engine.getStatus()).toMatchObject(held(d, ['Docs/b.txt'], 1));
+            });
+        }
+
+        test('while held, the status and local changes look at what is missing at most once a second; a pass looks afresh', async () => {
+            const d = setup('plain', { cacheMs: 1000 });
+            const copyBack = await lost(d);
+            const looks = spyOn(stateDb, 'countItemsUnder'); // once for each item held, at each look
+            const start = Date.now();
+            try {
+                setSystemTime(start);
+                for (let i = 0; i < 5; i++) {
+                    d.engine.getStatus();
+                    await (d.engine as any).handleLocalFileChange(`New${i}.txt`);
+                }
+                expect(looks.mock.calls.length).toBeLessThanOrEqual(2); // Docs and Photos, once
+                looks.mockClear();
+                setSystemTime(start + 1500);
+                d.engine.getStatus();
+                d.engine.getStatus();
+                expect(looks.mock.calls.length).toBe(2);
+
+                // Back: the status may say so up to a second later, but the next pass looks afresh
+                await copyBack('Docs');
+                await copyBack('Photos');
+                expect(d.engine.getStatus().filesMissing).not.toBeNull();
+                await d.engine.reconcileNow();
+                expect(d.engine.getStatus()).toMatchObject({ state: 'idle', filesMissing: null });
+                expect(d.calls.trashed).toEqual([]);
+            } finally {
+                setSystemTime();
+                looks.mockRestore();
+            }
+        });
+
+        test('while the files move between the folder and the store, a saved hold is neither taken up nor said', async () => {
+            const d = setup();
+            await lost(d);
+            const said = d.warnings.filter((w) => w === missing(d.place)).length;
+            stateDb.setMeta(LAYOUT_MOVING, 'virtual'); // a move cut short, which the daemon finishes before syncing
+
+            const engine = d.restart();
+            expect(engine.getStatus().filesMissing).toBeNull();
+            await expect(engine.confirmFilesMissingDeleted({ root: d.shown, names: ['Docs', 'Photos'] })).rejects.toMatchObject({
+                status: 409,
+                message: 'Proton Drive is busy moving files',
+            });
+            expect(d.warnings.filter((w) => w === missing(d.place))).toHaveLength(said);
+
+            stateDb.deleteMeta(LAYOUT_MOVING);
+            expect(engine.getStatus()).toMatchObject({ state: 'error', filesMissing: { names: ['Docs', 'Photos'] } });
+            expect(d.calls.trashed).toEqual([]);
+        });
+
+        test("the messages say what is missing, and where, in the user's terms", () => {
+            expect(missingPlace('/home/u/ProtonDrive', false, '/home/u')).toBe('~/ProtonDrive');
+            expect(missingPlace('/home/u', false, '/home/u/')).toBe('~');
+            expect(missingPlace('/home/user/ProtonDrive', false, '/home/u')).toBe('/home/user/ProtonDrive');
+            expect(missingPlace('/mnt/disk/ProtonDrive', false, '/home/u')).toBe('/mnt/disk/ProtonDrive');
+            expect(missingPlace('/home/u/ProtonDrive', true, '/home/u')).toBe("the drive's storage");
+            const where = '~/ProtonDrive';
+            expect(filesMissingMessage(where)).toBe("Proton Drive's files are missing from ~/ProtonDrive. Nothing was deleted in Proton Drive.");
+            expect(filesMissingMessage(where, { names: ['Docs', 'Photos'], items: 9, whole: true })).toBe(filesMissingMessage(where));
+            expect(filesMissingMessage(where, { names: ['Photos'], items: 3, whole: false })).toBe(
+                'Photos is missing from ~/ProtonDrive. Nothing was deleted in Proton Drive.',
+            );
+            expect(filesMissingMessage(where, { names: ['Docs/b.txt', 'Photos'], items: 4, whole: false })).toBe(
+                '4 items are missing from ~/ProtonDrive. Nothing was deleted in Proton Drive.',
+            );
         });
 
         test('confirming after a partial return trashes exactly what the dialog counted, and holds on anything else missing', async () => {
@@ -2454,7 +2583,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await copyBack('Docs/a.txt'); // Docs/b.txt isn't back, and Photos isn't either
             await d.engine.reconcileNow();
             const shownBefore = d.engine.getStatus().filesMissing;
-            expect(shownBefore).toEqual({ root: d.shown, names: ['Photos'], items: 3 });
+            expect(shownBefore).toEqual({ root: d.shown, names: ['Photos'], items: 3, message: someMissing(d, ['Photos'], 3) });
 
             expect(await confirmShown(d)).toEqual(shownBefore!);
             await d.engine.holdForMove(); // waits for the pass the confirmation started
@@ -2488,7 +2617,11 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             }
             await d.engine.reconcileNow();
             expect(d.calls.trashed).toEqual([]);
-            expect(d.engine.getStatus()).toMatchObject(held(d, ['Docs', 'Photos'], 5));
+            expect(d.engine.getStatus()).toMatchObject({
+                state: 'error',
+                lastError: missing(d.place), // all of them
+                filesMissing: { names: ['Docs', 'Photos'], items: 5 },
+            });
 
             // The same names in another order are the same confirmation
             expect(await d.engine.confirmFilesMissingDeleted({ root: d.shown, names: ['Photos', 'Docs'] })).toMatchObject({
@@ -2500,21 +2633,34 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
 
         test('being held again after the files came back says what is still missing once, and a new loss is said anew', async () => {
+            const notices: string[] = [];
+            const notify = spyOn(notifications, 'sendDesktopNotification').mockImplementation((n) => {
+                notices.push(`${n.title}: ${n.body}`);
+            });
+            try {
+                await heldAgainSaid(notices);
+            } finally {
+                notify.mockRestore();
+            }
+        });
+        const heldAgainSaid = async (notices: string[]) => {
             const d = setup();
             // Told as everything missing: the warning, the activity entry and the notification go together
-            const saidMissing = () => d.warnings.filter((w) => w === missing(d.shown));
+            const saidMissing = () => d.warnings.filter((w) => w === missing(d.place));
             const copyBack = await lost(d);
             expect(saidMissing()).toHaveLength(1);
+            expect(notices).toEqual([`Proton Drive: files missing: ${missing(d.place)}`]);
             await copyBack('Docs');
             await copyBack('Photos', { onlyTheFolder: true });
             await d.engine.reconcileNow();
             await d.engine.reconcileNow();
             // Held again on Photos/p.jpg and p2.jpg: told once, as what is still missing, not as everything missing
             expect(saidMissing()).toHaveLength(1);
-            const stillMissing = stateDb.listActivity(50).filter((a) => a.details.startsWith('Still missing from'));
-            expect(stillMissing.map((a) => a.details)).toEqual([
-                `Still missing from ${d.shown} after the files came back: Photos/p.jpg and Photos/p2.jpg. Nothing was deleted in Proton Drive; Proton Drive waits for them.`,
-            ]);
+            const still = `Photos/p.jpg and Photos/p2.jpg are still missing from ${d.place} after the files came back. Nothing was deleted in Proton Drive; Proton Drive waits for them.`;
+            const stillMissing = stateDb.listActivity(50).filter((a) => a.details.includes('still missing from'));
+            expect(stillMissing.map((a) => a.details)).toEqual([still]);
+            // And one notification for it, like the first
+            expect(notices).toEqual([`Proton Drive: files missing: ${missing(d.place)}`, `Proton Drive: files still missing: ${still}`]);
 
             // Back, then the whole folder gone again before a pass looked: a new loss, said again
             await copyBack('Photos/p.jpg');
@@ -2523,10 +2669,11 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await rename(d.localRoot, path.join(tempDir, 'away again'));
             await d.engine.reconcileNow();
             expect(saidMissing()).toHaveLength(2);
+            expect(notices).toHaveLength(3);
             expect(d.calls.trashed).toEqual([]);
-        });
+        };
 
-        test('virtual: the status and the messages name the sync folder, never the backing store', async () => {
+        test("virtual: the messages say the drive's storage, and the status names the sync folder, never the store", async () => {
             const d = setup('virtual');
             await synced(d);
             await rm(d.localRoot, { recursive: true, force: true });
@@ -2535,7 +2682,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
             const status = d.engine.getStatus();
             expect(status.filesMissing?.root).toBe(stateDb.getSettings().syncDir);
-            expect(status.lastError).toBe(missing(stateDb.getSettings().syncDir));
+            expect(status.lastError).toBe("Proton Drive's files are missing from the drive's storage. Nothing was deleted in Proton Drive.");
+            expect(status.filesMissing?.message).toBe(status.lastError!);
             expect(JSON.stringify(status.filesMissing)).not.toContain(d.localRoot);
             expect(stateDb.listActivity(50).map((a) => a.details).join('\n')).not.toContain(`missing from ${d.localRoot}`);
         });
