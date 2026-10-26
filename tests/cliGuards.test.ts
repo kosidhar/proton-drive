@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
-import { controlSocketAccepts, daemonRunning, MOVING_FILES_MESSAGE, pendingMoveMarker } from '../src/cli/daemonProbe';
+import { runAvailabilityCommand } from '../src/cli/availabilityCommands';
+import { controlSocketAccepts, controlSocketDirProblem, daemonRunning, MOVING_FILES_MESSAGE, pendingMoveMarker } from '../src/cli/daemonProbe';
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
 
 // Final review I-1: the CLI runs an engine of its own only when no daemon runs, and never while files are moving
@@ -56,6 +57,52 @@ describe('detecting a running daemon', () => {
     test('neither the socket nor the TCP API: not running', async () => {
         const socketPath = path.join(tempDir(), 'control.sock');
         expect(await daemonRunning({ socketPath, statusUrl: await deadUrl() })).toBe(false);
+    });
+});
+
+// Final review M-5 / addendum concern 4: in the /tmp fallback anyone can make the socket's folder first; the daemon's is
+// the user's and 0700, and the CLI never sends a request through any other
+describe("the control socket's folder", () => {
+    const uid = process.getuid!();
+
+    test('only a private folder of the user\'s is trusted; a missing one just means no daemon runs', () => {
+        const dir = tempDir();
+        chmodSync(dir, 0o700);
+        const sock = path.join(dir, 'control.sock');
+        expect(controlSocketDirProblem(sock, uid)).toBeNull();
+        expect(controlSocketDirProblem(path.join(dir, 'missing', 'control.sock'), uid)).toBeNull();
+        for (const mode of [0o755, 0o770, 0o701, 0o1777]) {
+            chmodSync(dir, mode);
+            expect(controlSocketDirProblem(sock, uid) ?? '').toContain(dir);
+        }
+        chmodSync(dir, 0o700);
+        expect(controlSocketDirProblem('/control.sock', uid)).not.toBeNull(); // root's
+        expect(controlSocketDirProblem(sock, uid + 1)).not.toBeNull();
+        const link = `${dir}.link`;
+        symlinkSync(dir, link);
+        cleanups.push(() => rmSync(link, { force: true }));
+        expect(controlSocketDirProblem(path.join(link, 'control.sock'), uid)).not.toBeNull();
+    });
+
+    test('pin, free, hide and unhide never reach a socket in a folder others can write', async () => {
+        const dir = tempDir();
+        const socketPath = path.join(dir, 'control.sock');
+        const requests: string[] = [];
+        const server = Bun.serve({
+            unix: socketPath,
+            fetch(req) {
+                requests.push(new URL(req.url).pathname);
+                return Response.json({ state: 'pinned', kept: [], refused: null });
+            },
+        });
+        cleanups.push(() => server.stop(true));
+        chmodSync(dir, 0o777);
+        cleanups.push(() => chmodSync(dir, 0o700));
+        expect(await runAvailabilityCommand('pin', '/my-files/Docs', '/home/u/ProtonDrive', socketPath)).toBe(1);
+        expect(requests).toEqual([]);
+        chmodSync(dir, 0o700);
+        expect(await runAvailabilityCommand('pin', '/my-files/Docs', '/home/u/ProtonDrive', socketPath)).toBe(0);
+        expect(requests).toEqual(['/availability']);
     });
 });
 
@@ -144,5 +191,24 @@ describe('a move that the daemon has to finish', () => {
         expect(requests).toEqual([{ path: '/conflicts/resolve', body: { id: 7, choice: 'keep-local' } }]);
         expect(out.stdout).toContain('Conflict #7 (Docs/a.txt) resolved with keep-local.');
         expect(out.code).toBe(0);
+    }, 30_000);
+
+    test('`protondrive conflicts resolve` never sends it through a socket folder others can write', async () => {
+        const requests: string[] = [];
+        const out = await runCli(['conflicts', 'resolve', '7', 'keep-local'], (_appDir, runtimeDir) => {
+            mkdirSync(path.join(runtimeDir, 'protondrive'), { mode: 0o700 });
+            const server = Bun.serve({
+                unix: path.join(runtimeDir, 'protondrive', 'control.sock'),
+                fetch(req) {
+                    requests.push(new URL(req.url).pathname);
+                    return Response.json({ ok: true, conflict: { id: 7, localRelPath: 'Docs/a.txt' } });
+                },
+            });
+            cleanups.push(() => server.stop(true));
+            chmodSync(path.join(runtimeDir, 'protondrive'), 0o777);
+        });
+        expect(requests).toEqual([]);
+        expect(out.stderr).toContain("isn't private to you");
+        expect(out.code).toBe(1);
     }, 30_000);
 });

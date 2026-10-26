@@ -2,6 +2,7 @@ import path from 'node:path';
 
 import { defaultControlSocketPath } from '../daemon/controlServer';
 import type { AvailabilityAction } from '../sync/syncEngine';
+import { controlSocketDirProblem } from './daemonProbe';
 
 export const DAEMON_NOT_RUNNING_MESSAGE = `The Proton Drive daemon isn't running; start it with "protondrive daemon".`;
 
@@ -74,6 +75,11 @@ export async function runAvailabilityCommand(
         return 1;
     }
 
+    const unsafe = controlSocketDirProblem(socketPath);
+    if (unsafe !== null) {
+        console.error(unsafe);
+        return 1;
+    }
     const verbs = { pin: 'Pinning', free: 'Freeing', hide: 'Hiding', unhide: 'Unhiding', status: 'Checking' };
     console.log(`${verbs[action]} ${relPath || '/my-files'}…`);
 

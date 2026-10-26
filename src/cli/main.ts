@@ -21,7 +21,7 @@ import {
     uploadLocalFileToDrive,
 } from '../sdk';
 import { DAEMON_NOT_RUNNING_MESSAGE, runAvailabilityCommand } from './availabilityCommands';
-import { daemonRunning, MOVING_FILES_MESSAGE, pendingMoveMarker } from './daemonProbe';
+import { controlSocketDirProblem, daemonRunning, MOVING_FILES_MESSAGE, pendingMoveMarker } from './daemonProbe';
 import { defaultControlSocketPath } from '../daemon/controlServer';
 import { migrateExcludedFolders } from '../sync/availabilityMigration';
 import { backingDirFor } from '../sync/driveMode';
@@ -64,6 +64,10 @@ async function daemonSyncDir(): Promise<string | null> {
 
 // POST /conflicts/resolve on the daemon's control socket; throws with the daemon's own message when it refuses
 async function resolveConflictOnDaemon(id: number, choice: string): Promise<{ localRelPath: string }> {
+    const unsafe = controlSocketDirProblem(defaultControlSocketPath());
+    if (unsafe !== null) {
+        throw new Error(unsafe);
+    }
     let res: Response;
     try {
         res = await fetch('http://localhost/conflicts/resolve', {

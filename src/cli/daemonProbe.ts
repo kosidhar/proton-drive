@@ -1,5 +1,6 @@
-import { existsSync } from 'node:fs';
+import { existsSync, lstatSync, type Stats } from 'node:fs';
 import net from 'node:net';
+import path from 'node:path';
 
 import { LAYOUT_MOVING, SYNC_DIR_MOVING } from '../sync/layoutMigration';
 import { SyncStateDatabase } from '../sync/syncStateDb';
@@ -22,6 +23,25 @@ export function controlSocketAccepts(socketPath: string, timeoutMs = 1000): Prom
         socket.once('connect', () => done(true));
         socket.once('error', () => done(false));
     });
+}
+
+// Why the folder holding the control socket can't be trusted, or null. The daemon makes it a 0700 folder of the user's;
+// in the /tmp fallback (no XDG_RUNTIME_DIR) anyone could make it first. One that is missing just means no daemon runs.
+export function controlSocketDirProblem(socketPath: string, uid: number = process.getuid?.() ?? -1): string | null {
+    const dir = path.dirname(socketPath);
+    let st: Stats | undefined;
+    try {
+        st = lstatSync(dir, { throwIfNoEntry: false });
+    } catch (error: unknown) {
+        return `Can't check the Proton Drive control socket's folder ${dir} (${error instanceof Error ? error.message : String(error)})`;
+    }
+    if (!st) {
+        return null;
+    }
+    if (!st.isDirectory() || st.uid !== uid || (st.mode & 0o077) !== 0) {
+        return `The Proton Drive control socket's folder ${dir} isn't private to you (owner ${st.uid}, mode ${(st.mode & 0o7777).toString(8)}); not connecting to it`;
+    }
+    return null;
 }
 
 // The daemon runs when its control socket accepts a connection; failing that, when its TCP API answers (a daemon with
