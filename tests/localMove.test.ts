@@ -62,4 +62,30 @@ describe('moveWithoutReplacing', () => {
         expect(await readdir(at('B'))).toEqual(['y']);
         expect(await readFile(at('C'), 'utf8')).toBe('c');
     });
+
+    // Final review L64: a file system with no hard links can answer link(2) with ENOSYS as well
+    const linkFailing = (code: string) => () => {
+        throw Object.assign(new Error(`${code}: link`), { code });
+    };
+
+    for (const code of ['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS']) {
+        test(`without hard links (link answers ${code}), a file still moves to a free path, and never over anything`, async () => {
+            await writeFile(at('a.txt'), 'a');
+            expect(moveWithoutReplacing(at('a.txt'), at('b.txt'), linkFailing(code))).toBe(true);
+            expect(await exists('a.txt')).toBe(false);
+            expect(await readFile(at('b.txt'), 'utf8')).toBe('a');
+
+            await writeFile(at('c.txt'), 'c');
+            expect(moveWithoutReplacing(at('c.txt'), at('b.txt'), linkFailing(code))).toBe(false);
+            expect(await readFile(at('c.txt'), 'utf8')).toBe('c');
+            expect(await readFile(at('b.txt'), 'utf8')).toBe('a');
+        });
+    }
+
+    test('any other link failure is thrown, and the file stays', async () => {
+        await writeFile(at('a.txt'), 'a');
+        expect(() => moveWithoutReplacing(at('a.txt'), at('b.txt'), linkFailing('EIO'))).toThrow(/EIO/);
+        expect(await readFile(at('a.txt'), 'utf8')).toBe('a');
+        expect(await exists('b.txt')).toBe(false);
+    });
 });
