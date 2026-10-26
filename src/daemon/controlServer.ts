@@ -35,6 +35,9 @@ export interface ControlServerOptions {
     driveMove?: (action: DriveMoveAction, from?: string, to?: string) => Promise<void>;
     // Change the drive folder and the virtual drive switch (see driveSettings in settingsRoute.ts); answers the response
     driveSettings?: (change: { syncDir?: string; virtualDriveWanted?: boolean }) => Promise<Response>;
+    // Sign in (starts the browser sign-in and answers its URL, with what the app must show) and sign out
+    login?: () => Promise<{ signInUrl: string } & Record<string, unknown>>;
+    logout?: () => Promise<void>;
 }
 
 // 'live' when something accepts connections on the socket, 'stale' when it refuses or is gone
@@ -221,6 +224,21 @@ async function driveSettingsRoute(req: Request, driveSettings: ControlServerOpti
     return driveSettings({ syncDir: body.syncDir as string | undefined, virtualDriveWanted: body.virtualDriveWanted as boolean | undefined });
 }
 
+// POST /auth/login: starts the sign-in in the browser; 200 { ok: true, signInUrl, disclosure } (signInUrl is '' when the
+// sign-in page was not ready in time). POST /auth/logout: signs out and clears the caches; 200 { ok: true }. Signing in
+// or out is never reachable from the TCP API; 500 { error } when it fails.
+async function authRoute(req: Request, route: string, opts: ControlServerOptions): Promise<Response> {
+    if (req.method !== 'POST') return jsonError('Method not allowed', 405);
+    const action = route === '/auth/login' ? opts.login : opts.logout;
+    if (!action) return jsonError('Not found', 404);
+    try {
+        const result = await action();
+        return Response.json({ ok: true, ...(result ?? {}) });
+    } catch (err) {
+        return Response.json({ error: messageOf(err), code: 'EIO' }, { status: 500 });
+    }
+}
+
 export async function startControlServer(opts: ControlServerOptions): Promise<{ stop(): void }> {
     const { socketPath, engine } = opts;
     const dir = path.dirname(socketPath);
@@ -245,6 +263,9 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
             }
             if (url.pathname === '/drive/move') {
                 return driveMoveRoute(req, opts.driveMove);
+            }
+            if (url.pathname === '/auth/login' || url.pathname === '/auth/logout') {
+                return authRoute(req, url.pathname, opts);
             }
             if (url.pathname === '/drive/settings') {
                 return driveSettingsRoute(req, opts.driveSettings);

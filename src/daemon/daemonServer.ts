@@ -20,6 +20,7 @@ import { SyncStateDatabase } from '../sync/syncStateDb';
 import { defaultControlSocketPath, startControlServer } from './controlServer';
 import { DriveController } from './driveController';
 import { isTrustedLocalRequest } from './requestGuard';
+import { refuseOnTcp } from './tcpRefusals';
 import { driveSettings, settingsRoute } from './settingsRoute';
 import { findHelper, fuseAvailable, mergeStrayInto, VfsSupervisor } from './vfsSupervisor';
 
@@ -250,6 +251,59 @@ export async function startSyncDaemon(options: {
         void fetchRemotePathItems('/my-files').catch(() => {});
     }
 
+    // Sign in and out: called only through the control socket (POST /auth/login, /auth/logout), never from the TCP API
+    const signIn = async () => {
+        let signInUrlResolver: ((url: string) => void) | null = null;
+        const signInUrlPromise = new Promise<string>((resolve) => {
+            signInUrlResolver = resolve;
+        });
+
+        // Run authViaWeb in background and resolve signInUrl as soon as ready
+        void runtime.auth
+            .authViaWeb((signInUrl) => {
+                openBrowserUrl(signInUrl);
+                signInUrlResolver?.(signInUrl);
+            })
+            .then(async () => {
+                await runtime.eventsManager.startSubscriptions();
+                stateDb.logActivity({
+                    action: 'auth',
+                    localRelPath: '/',
+                    details: 'Signed in to Proton Drive via web authentication',
+                });
+                sendDesktopNotification({
+                    title: 'Proton Drive Connected',
+                    body: 'Successfully signed in and started two-way folder sync.',
+                    enabled: stateDb.getSettings().notificationsEnabled,
+                });
+                await engine.start({ backgroundInitialReconcile: true });
+                void refreshAccountInfo(true);
+                void fetchRemotePathItems('/my-files').catch(() => {});
+                ensureSystemTrayIndicator();
+            })
+            .catch((err: unknown) => {
+                runtime.logger.error('Web authentication failed', err);
+            });
+
+        const signInUrl = await Promise.race([
+            signInUrlPromise,
+            new Promise<string>((resolve) => setTimeout(() => resolve(''), 3000)),
+        ]);
+        return { signInUrl, disclosure: THIRD_PARTY_DISCLOSURE };
+    };
+
+    const signOut = async () => {
+        await engine.stop();
+        await runtime.auth.logout();
+        await runtime.clearCaches();
+        cachedAccount = null;
+        stateDb.logActivity({
+            action: 'auth',
+            localRelPath: '/',
+            details: 'Signed out and cleared local crypto/entity caches',
+        });
+    };
+
     const settings = stateDb.getSettings();
     let controlServer: { stop(): void } | null = null;
     const reconcileTimer = setInterval(() => {
@@ -294,6 +348,8 @@ export async function startSyncDaemon(options: {
                     { status: 403 },
                 );
             }
+            const refused = refuseOnTcp(req);
+            if (refused) return refused;
             const url = new URL(req.url);
             const pathname = url.pathname;
 
@@ -350,60 +406,6 @@ export async function startSyncDaemon(options: {
                     const body = (await req.json().catch(() => ({}))) as { paused?: boolean };
                     await engine.setPaused(Boolean(body.paused));
                     return Response.json({ ok: true, status: engine.getStatus() });
-                }
-
-                if (req.method === 'POST' && pathname === '/api/auth/login') {
-                    let signInUrlResolver: ((url: string) => void) | null = null;
-                    const signInUrlPromise = new Promise<string>((resolve) => {
-                        signInUrlResolver = resolve;
-                    });
-
-                    // Run authViaWeb in background and resolve signInUrl as soon as ready
-                    void runtime.auth
-                        .authViaWeb((signInUrl) => {
-                            openBrowserUrl(signInUrl);
-                            signInUrlResolver?.(signInUrl);
-                        })
-                        .then(async () => {
-                            await runtime.eventsManager.startSubscriptions();
-                            stateDb.logActivity({
-                                action: 'auth',
-                                localRelPath: '/',
-                                details: 'Signed in to Proton Drive via web authentication',
-                            });
-                            sendDesktopNotification({
-                                title: 'Proton Drive Connected',
-                                body: 'Successfully signed in and started two-way folder sync.',
-                                enabled: stateDb.getSettings().notificationsEnabled,
-                            });
-                            await engine.start({ backgroundInitialReconcile: true });
-                            void refreshAccountInfo(true);
-                            void fetchRemotePathItems('/my-files').catch(() => {});
-                            ensureSystemTrayIndicator();
-                        })
-                        .catch((err: unknown) => {
-                            runtime.logger.error('Web authentication failed', err);
-                        });
-
-                    const signInUrl = await Promise.race([
-                        signInUrlPromise,
-                        new Promise<string>((resolve) => setTimeout(() => resolve(''), 3000)),
-                    ]);
-
-                    return Response.json({ ok: true, signInUrl, disclosure: THIRD_PARTY_DISCLOSURE });
-                }
-
-                if (req.method === 'POST' && pathname === '/api/auth/logout') {
-                    await engine.stop();
-                    await runtime.auth.logout();
-                    await runtime.clearCaches();
-                    cachedAccount = null;
-                    stateDb.logActivity({
-                        action: 'auth',
-                        localRelPath: '/',
-                        details: 'Signed out and cleared local crypto/entity caches',
-                    });
-                    return Response.json({ ok: true });
                 }
 
                 if (req.method === 'GET' && pathname === '/api/conflicts') {
@@ -525,6 +527,8 @@ export async function startSyncDaemon(options: {
             mountAgain: () => drive.mountAgain(),
             driveMove: (action, from, to) => drive.resolveMove(action, from, to),
             driveSettings: (change) => driveSettings(change, { stateDb, drive, engine }),
+            login: signIn,
+            logout: signOut,
         });
     } catch (err) {
         runtime.logger.error(`Control socket unavailable, availability actions are disabled: ${String(err)}`);
