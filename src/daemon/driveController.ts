@@ -138,6 +138,13 @@ export class DriveController {
                 engine.recoverLocalMove();
                 await this.moveTo(target);
             }
+            if (readDriveLayout(stateDb) === 'virtual') {
+                // An older version knows nothing of the store: started now, it would sync the empty folder and trash
+                // the cloud copies; and an uninstall leaves the files there
+                logger.info(
+                    `The files are in the virtual drive's store, ${this.opts.backingDir}: switch the virtual drive off in Settings before uninstalling or installing an older version of Proton Drive`,
+                );
+            }
         } finally {
             this.moving = false;
             if (!this.stuck) engine.releaseHold();

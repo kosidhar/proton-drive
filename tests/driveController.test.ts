@@ -244,6 +244,25 @@ describe('DriveController at start', () => {
         expect(s.controller.status()).toEqual({ mode: 'virtual', mounted: true, reason: null });
     });
 
+    // Final review C-1: an older version, or an uninstall, while the files are in the store loses track of them (an
+    // older daemon syncs the empty folder and trashes the cloud copies); the log says where they are and what to do
+    test('in the virtual layout, the start logs where the files are and to switch the drive off before uninstalling or downgrading', async () => {
+        const s = setup();
+        s.fillTree(s.syncDir);
+        await s.boot();
+        const note = s.logs.filter((l) => l.includes(s.backingDir) && /switch the virtual drive off/i.test(l));
+        expect(note).toHaveLength(1);
+        expect(note[0]).toMatch(/uninstall/i);
+        expect(note[0]).toMatch(/older version/i);
+    });
+
+    test('in the plain layout the start says nothing of the kind', async () => {
+        const s = setup({ wanted: false });
+        s.fillTree(s.syncDir);
+        await s.boot();
+        expect(s.logs.filter((l) => /switch the virtual drive off/i.test(l))).toEqual([]);
+    });
+
     test('switched off, a plain folder stays as it is', async () => {
         const s = setup({ wanted: false });
         s.fillTree(s.syncDir);
