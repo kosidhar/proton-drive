@@ -2693,15 +2693,25 @@ export class ProtonDriveSyncEngine {
     // - a folder made here that Proton Drive doesn't have yet is a provisional entry holding what was moved into it.
     // Nothing the cloud has is removed for it but what was deleted here, and provisional entries go once no pending move
     // needs them. `kept` has the entries of nodes a write just dropped, to put back at their new paths.
+    // Deletes go first, as the name one frees can be what a rename takes; then each node's latest rename or move,
+    // folders before what goes in them. A move's target is where the item is here now, which a later rename of a folder
+    // above takes along (see RemoteOpsJournal.retarget): in journal order the item would go first, into a provisional
+    // folder made up for that path, which would then keep the renamed folder (and all else in it) from its new path.
     private applyPendingOpsToIndex(kept = new Map<string, RemoteIndexEntry[]>()): void {
         try {
             this.stateDb.connection.transaction(() => {
-                const needed = new Set<string>();
-                for (const op of this.journal.pending()) {
+                const pending = this.journal.pending();
+                for (const op of pending) {
                     if (op.kind === 'trash') {
                         this.index.removeSubtree(op.nodeUid);
-                        continue;
                     }
+                }
+                const latest = new Map<string, RemoteOp>(pending.map((op) => [op.nodeUid, op]));
+                const moves = [...latest.values()]
+                    .filter((op): op is Exclude<RemoteOp, { kind: 'trash' }> => op.kind !== 'trash')
+                    .sort((a, b) => depthOf(a.toPath) - depthOf(b.toPath) || a.id - b.id);
+                const needed = new Set<string>();
+                for (const op of moves) {
                     const parent = this.indexedFolderFor(parentOf(op.toPath), needed);
                     const occupant = this.index.getByPath(op.toPath);
                     if (!parent || (occupant && occupant.uid !== op.nodeUid)) {
@@ -4045,6 +4055,11 @@ function nodeUidOf(entry: RemoteIndexEntry | null): string | null {
 function parentOf(relPath: string): string {
     const slash = relPath.lastIndexOf('/');
     return slash === -1 ? '' : relPath.slice(0, slash);
+}
+
+// How many folders down a path is: a folder's path is less deep than anything in it
+function depthOf(relPath: string): number {
+    return relPath.split('/').length;
 }
 
 function joinRel(parentRel: string, name: string): string {

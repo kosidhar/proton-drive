@@ -4618,5 +4618,178 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(d.journal()).toEqual([]);
             });
         });
+
+        // #22: the pending rename of a.txt, taken along to Work/a2.txt by the rename of its folder, used to be shown first,
+        // in a folder made up for the name Work, which then kept the folder itself (and all else in it) at Docs
+        describe('a folder renamed right after a rename in it', () => {
+            // Docs holds a.txt, b.txt and c.txt on this computer with no records (as the issue found them) and online-only
+            // d.txt and e.txt. a.txt is renamed, then Docs, while the first rename is on its way to Proton Drive (held as
+            // the cloud renames it, or as the replay reads it back after), or offline.
+            type When = 'as the cloud renames it' | 'as it is read back' | 'offline';
+            const renamedTwice = async (when: When) => {
+                const d = setup();
+                for (const name of ['a', 'b', 'c', 'd', 'e']) {
+                    d.add(`Docs/${name}.txt`, name);
+                }
+                await d.engine.reconcileNow();
+                for (const name of ['a', 'b', 'c']) {
+                    await d.files.writeLocal(`Docs/${name}.txt`, name);
+                }
+                let release = () => {};
+                let inFlight = Promise.resolve();
+                if (when === 'offline') {
+                    d.down.add('renameNode');
+                } else {
+                    const sdk = d.sdk as any;
+                    const method = when === 'as the cloud renames it' ? 'renameNode' : 'getNode';
+                    const real = sdk[method].bind(sdk);
+                    const answer = new Promise<void>((resolve) => (release = resolve));
+                    let entered!: () => void;
+                    inFlight = new Promise<void>((resolve) => (entered = resolve));
+                    let calls = 0;
+                    sdk[method] = async (uid: string, ...rest: unknown[]) => {
+                        // The replay reads the item before renaming it, and again after
+                        if (uid === 'vol~Docs/a.txt' && ++calls === (method === 'getNode' ? 2 : 1)) {
+                            entered();
+                            await answer;
+                        }
+                        return real(uid, ...rest);
+                    };
+                }
+                await d.engine.renameItem('Docs/a.txt', 'Docs/a2.txt');
+                await inFlight;
+                await d.engine.renameItem('Docs', 'Work');
+                return {
+                    ...d,
+                    backOnline: async () => {
+                        release();
+                        d.down.clear();
+                        await d.engine.replayRemoteOps();
+                    },
+                };
+            };
+            const cloudNamesInDocs = (d: ReturnType<typeof setup>) =>
+                [...d.nodes.values()].filter((n) => n.parentUid === 'vol~Docs').map((n) => d.nameOf(n)).sort();
+
+            for (const when of ['as the cloud renames it', 'as it is read back', 'offline'] as const) {
+                test(`all of the folder is at the new path at once (first rename held ${when}), and a delete there trashes the item in Proton Drive`, async () => {
+                    const d = await renamedTwice(when);
+
+                    const index = d.engine.remoteIndex;
+                    expect(index.getByPath('Work')?.uid).toBe('vol~Docs');
+                    expect(index.listChildren('Work').map((e) => [e.name, e.uid])).toEqual([
+                        ['a2.txt', 'vol~Docs/a.txt'],
+                        ['b.txt', 'vol~Docs/b.txt'],
+                        ['c.txt', 'vol~Docs/c.txt'],
+                        ['d.txt', 'vol~Docs/d.txt'],
+                        ['e.txt', 'vol~Docs/e.txt'],
+                    ]);
+                    expect(index.getByPath('Docs')).toBeNull();
+                    expect(index.uidsWithPrefix('provisional:')).toEqual([]);
+                    // Listings show the new paths only
+                    expect(d.engine.vfsChildren('').map((e) => e.name)).toEqual(['Work']);
+                    expect(d.engine.vfsChildren('Work').map((e) => e.name)).toEqual(['a2.txt', 'b.txt', 'c.txt', 'd.txt', 'e.txt']);
+                    expect(d.engine.vfsChildren('Docs')).toEqual([]);
+
+                    await d.engine.deleteItem('Work/c.txt');
+
+                    expect(await d.files.exists('Work/c.txt')).toBe(false);
+                    expect(d.journal().filter((op) => op.kind === 'trash')).toMatchObject([{ nodeUid: 'vol~Docs/c.txt' }]);
+                    await d.backOnline();
+                    expect(d.journal()).toEqual([]);
+                    expect(d.calls.trashed).toEqual([['vol~Docs/c.txt']]);
+                    expect(d.nameOf(d.nodes.get('vol~Docs')!)).toBe('Work');
+                    expect(cloudNamesInDocs(d)).toEqual(['a2.txt', 'b.txt', 'd.txt', 'e.txt']);
+                    // Then this computer and Proton Drive agree: nothing uploads, and c.txt doesn't come back
+                    await d.engine.reconcileNow();
+                    expect(d.calls.uploads).toEqual([]);
+                    expect(d.calls.trashed).toEqual([['vol~Docs/c.txt']]);
+                    expect(index.getByPath('Work/c.txt')).toBeNull();
+                    expect(await d.files.exists('Work/c.txt')).toBe(false);
+                    expect(await readFile(d.local('Work/a2.txt'), 'utf8')).toBe('a');
+                    expect(stateDb.getItemByPath('Work/b.txt')?.nodeUid).toBe('vol~Docs/b.txt');
+                });
+            }
+
+            test('a rename meanwhile finds an online-only source, and an online-only target in the way, at the new path', async () => {
+                const d = await renamedTwice('as the cloud renames it');
+
+                expect(await failure(d.engine.renameItem('Work/a2.txt', 'Work/e.txt', { noReplace: true }))).toEqual({
+                    code: 'EEXIST',
+                    message: 'Already exists: Work/e.txt',
+                    driveOpError: true,
+                });
+                await d.engine.renameItem('Work/d.txt', 'Work/d2.txt');
+
+                expect(d.engine.vfsChildren('Work').map((e) => e.name)).toEqual(['a2.txt', 'b.txt', 'c.txt', 'd2.txt', 'e.txt']);
+                await d.backOnline();
+                expect(d.journal()).toEqual([]);
+                expect(cloudNamesInDocs(d)).toEqual(['a2.txt', 'b.txt', 'c.txt', 'd2.txt', 'e.txt']);
+                expect(d.nameOf(d.nodes.get('vol~Docs/d.txt')!)).toBe('d2.txt');
+                expect(await readFile(d.local('Work/a2.txt'), 'utf8')).toBe('a');
+                expect(d.calls.downloads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test('a truncate meanwhile finds the online-only file at the new path, and its new content is an edit of that file', async () => {
+                const d = await renamedTwice('as the cloud renames it');
+
+                await d.engine.truncateItem('Work/d.txt');
+
+                expect(await readFile(d.local('Work/d.txt'), 'utf8')).toBe('');
+                expect(stateDb.getEditBaseline('Work/d.txt')?.nodeUid).toBe('vol~Docs/d.txt');
+                await writeFile(d.local('Work/d.txt'), 'mine');
+                await d.backOnline();
+                await d.engine.reconcileNow();
+                expect(d.nodes.get('vol~Docs/d.txt')?.content).toBe('mine');
+                expect(d.calls.uploads).toEqual(['Work/d.txt']);
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test('opening an online-only file meanwhile downloads it to the new path', async () => {
+                const d = await renamedTwice('as the cloud renames it');
+
+                await d.engine.hydrate('Work/e.txt');
+
+                expect(await readFile(d.local('Work/e.txt'), 'utf8')).toBe('e');
+                expect(stateDb.getItemByPath('Work/e.txt')?.nodeUid).toBe('vol~Docs/e.txt');
+                expect(d.calls.downloads).toEqual(['Docs/e.txt']);
+                await d.backOnline();
+                await d.engine.reconcileNow();
+                expect(await readFile(d.local('Work/e.txt'), 'utf8')).toBe('e');
+                expect(d.calls.downloads).toEqual(['Docs/e.txt']);
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            // Deletes are shown first: here the name Work, freed by one, is what the renamed folder takes
+            test('a folder deleted before another is renamed to its name is not where that one goes, even once a listing puts it back', async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                d.add('Docs/b.txt', 'b');
+                d.add('Work/x.txt', 'x');
+                await d.engine.reconcileNow();
+                await d.files.writeLocal('Docs/a.txt', 'a');
+                d.down.add('renameNode');
+                d.down.add('trashNodes');
+
+                await d.engine.renameItem('Docs/a.txt', 'Docs/a2.txt');
+                await d.engine.deleteItem('Work');
+                await d.engine.renameItem('Docs', 'Work');
+                await d.engine.reconcileNow(); // lists the old Work, which Proton Drive still has, at its name
+
+                const index = d.engine.remoteIndex;
+                expect(index.getByPath('Work')?.uid).toBe('vol~Docs');
+                expect(index.listChildren('Work').map((e) => e.uid)).toEqual(['vol~Docs/a.txt', 'vol~Docs/b.txt']);
+                expect(index.getByUid('vol~Work')).toBeNull();
+                expect(d.engine.vfsChildren('Work').map((e) => e.name)).toEqual(['a2.txt', 'b.txt']);
+                d.down.clear();
+                await d.engine.replayRemoteOps();
+                expect(d.journal()).toEqual([]);
+                expect(d.calls.trashed).toEqual([['vol~Work']]);
+                expect(d.nameOf(d.nodes.get('vol~Docs')!)).toBe('Work');
+                expect(cloudNamesInDocs(d)).toEqual(['a2.txt', 'b.txt']);
+            });
+        });
     });
 });
