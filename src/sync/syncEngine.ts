@@ -82,6 +82,11 @@ const SLOW_DOWNLOAD_NOTICE_MS = 2000;
 const HYDRATE_STAGING_PREFIX = '.proton-drive-tmp-hydrate-';
 // What everything that would touch the files answers while they move between the sync folder and the backing store
 const BUSY_MOVING = 'Proton Drive is busy moving files';
+// The status, and what everything that would make something in the folder answers, while the files are missing from it
+// (see filesGone)
+export function filesMissingMessage(localRoot: string): string {
+    return `Proton Drive's files are missing from ${localRoot}. Nothing was deleted in Proton Drive.`;
+}
 
 // A conflict that can't be resolved now: 404 when there is no such conflict, 409 when it is already resolved (or being
 // resolved), so that resolving never acts twice
@@ -170,6 +175,8 @@ export class ProtonDriveSyncEngine {
     private inFlight = 0;
     // The move marker last found set (see holding), so that it is logged once
     private markerSeen: string | null = null;
+    // Where the files were found missing (see filesGone), until they are back
+    private filesGoneFrom: string | null = null;
     // Conflicts being resolved by hand right now, so that a second request for the same one is refused
     private readonly resolvingConflicts = new Set<number>();
 
@@ -275,7 +282,10 @@ export class ProtonDriveSyncEngine {
 
     private async startNow(options: { backgroundInitialReconcile?: boolean }): Promise<void> {
         const settings = this.stateDb.getSettings();
-        await mkdir(this.localRoot(), { recursive: true });
+        // Made only on a fresh install (no records): a missing folder with records is the files missing (see filesGone)
+        if (!this.filesGone()) {
+            await mkdir(this.localRoot(), { recursive: true });
+        }
         this.recoverLocalMove();
         await this.sweepHydrateStaging();
         this.reconcilePasses = 0;
@@ -360,6 +370,69 @@ export class ProtonDriveSyncEngine {
         }
         this.markerSeen = marker;
         return marker !== null;
+    }
+
+    // #45: records exist, but not one of their files is in the local root: the folder is missing (deleted, moved away,
+    // a disk not mounted), or not one recorded top-level item is in it (an emptied store). That is never taken for the
+    // user deleting everything: nothing that reads the folder runs (no sync pass, no local or cloud change handling),
+    // nothing is made in it, and the status says so; everything goes on once the files are back. A partial loss is the
+    // user deleting those items, as ever. Looked at each time, so it clears by itself; said once.
+    private filesGone(): boolean {
+        const root = this.localRoot();
+        const names = this.stateDb.recordedTopLevelNames();
+        const gone =
+            names.length > 0 &&
+            (!statSync(root, { throwIfNoEntry: false })?.isDirectory() ||
+                !names.some((name) => lstatSync(path.join(root, name), { throwIfNoEntry: false })));
+        if (gone) {
+            this.noteFilesGone(root);
+        } else if (this.filesGoneFrom !== null) {
+            this.noteFilesBack();
+        }
+        return gone;
+    }
+
+    private noteFilesGone(root: string): void {
+        const message = filesMissingMessage(root);
+        this.state = 'error';
+        this.lastError = message;
+        this.currentAction = null;
+        if (this.filesGoneFrom === root) {
+            return;
+        }
+        this.filesGoneFrom = root;
+        this.logger.warn(message);
+        this.stateDb.logActivity({ action: 'error', localRelPath: '/', details: message });
+        sendDesktopNotification({
+            title: 'Proton Drive: files missing',
+            body: message,
+            urgency: 'critical',
+            enabled: this.stateDb.getSettings().notificationsEnabled,
+        });
+    }
+
+    private noteFilesBack(): void {
+        const wasMessage = filesMissingMessage(this.filesGoneFrom ?? '');
+        this.filesGoneFrom = null;
+        if (this.lastError === wasMessage) {
+            this.lastError = null;
+            if (this.state === 'error') {
+                this.state = 'idle';
+            }
+        }
+        this.logger.info(`Proton Drive's files are back in ${this.localRoot()}`);
+        // A folder that went away leaves its watchers quiet: the one back is watched afresh
+        if (this.unsubscribeDriveEvents) {
+            this.watcher.stop();
+            void this.watcher.start().catch(() => {});
+        }
+    }
+
+    // What would make something in the local root is refused while the files are missing from it
+    private refuseWhileFilesGone(): void {
+        if (this.filesGone()) {
+            throw new DriveOpError('EIO', filesMissingMessage(this.localRoot()));
+        }
     }
 
     private idleForMove(): boolean {
@@ -501,6 +574,9 @@ export class ProtonDriveSyncEngine {
         if (this.reconcileRunning) {
             this.reconcileQueued = true;
             return;
+        }
+        if (this.filesGone()) {
+            return; // Looked at again at the next pass
         }
 
         this.reconcileRunning = true;
@@ -963,6 +1039,7 @@ export class ProtonDriveSyncEngine {
         if (this.holding()) {
             throw new Error(BUSY_MOVING);
         }
+        this.refuseWhileFilesGone();
         return this.tracked(() => this.resolveConflictNow(conflictId, choice));
     }
 
@@ -1608,6 +1685,9 @@ export class ProtonDriveSyncEngine {
             const dbRecord = this.stateDb.getItemByPath(relPath);
 
             if (!st) {
+                if (this.filesGone()) {
+                    return; // Not a delete of this item: every file is missing from the folder
+                }
                 // Local item was deleted: an edit baseline there stands for nothing any more
                 this.stateDb.dropEditBaselines(relPath);
                 if (dbRecord) {
@@ -1674,6 +1754,9 @@ export class ProtonDriveSyncEngine {
     private async handleRemoteDriveEvent(event: DriveEvent): Promise<void> {
         if (this.holding()) {
             return; // The pass after the move, at start(), catches up
+        }
+        if (this.filesGone()) {
+            return; // The pass once the files are back catches up
         }
         await this.tracked(() => this.handleRemoteDriveEventNow(event));
     }
@@ -2058,6 +2141,7 @@ export class ProtonDriveSyncEngine {
         opts: { noReplace?: boolean; deadlineMs?: number } = {},
     ): Promise<void> {
         this.refuseWhileHeld();
+        this.refuseWhileFilesGone();
         const from = normalizeDrivePath(fromRel);
         const to = normalizeDrivePath(toRel);
         if (from === '' || to === '') {
@@ -2108,6 +2192,7 @@ export class ProtonDriveSyncEngine {
     // (EACCES), `Already exists: <path>` (EEXIST) when it is on this computer; or with `Invalid path: <path>`.
     async truncateItem(relPath: string, opts: { deadlineMs?: number } = {}): Promise<void> {
         this.refuseWhileHeld();
+        this.refuseWhileFilesGone();
         const rel = normalizeDrivePath(relPath);
         await this.inAvailabilityRun(() => {
             this.inTime(opts.deadlineMs, rel);
@@ -2219,6 +2304,7 @@ export class ProtonDriveSyncEngine {
         let rel: string;
         try {
             this.refuseWhileHeld();
+            this.refuseWhileFilesGone();
             rel = normalizeDrivePath(relPath);
         } catch (error: unknown) {
             return Promise.reject(error);
@@ -3632,6 +3718,7 @@ export class ProtonDriveSyncEngine {
         if (this.holding()) {
             throw new Error(BUSY_MOVING);
         }
+        this.refuseWhileFilesGone();
         return this.tracked(() => this.setAvailabilityNow(relPath, action));
     }
 

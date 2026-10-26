@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { appendFileSync, writeFileSync } from 'node:fs';
-import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -232,6 +232,30 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         await engine.stop();
     });
 
+    // #45: once every recorded top-level item is gone from the folder, that reads as the files missing, never as
+    // deletes. A test of a genuine delete keeps another synced top-level file, so that what it deletes is a partial loss.
+    const keepAnotherSyncedFile = async (add: (rel: string, content?: string) => NodeEntity) => {
+        const node = add('Kept.txt', 'kept');
+        const full = path.join(stateDb.getSettings().syncDir, 'Kept.txt');
+        await mkdir(path.dirname(full), { recursive: true });
+        await writeFile(full, 'kept');
+        const st = await stat(full);
+        const sha1 = await computeLocalFileSha1(full);
+        stateDb.upsertItem({
+            localRelPath: 'Kept.txt',
+            nodeUid: node.uid,
+            parentNodeUid: node.parentUid ?? null,
+            type: 'file',
+            localSha1: sha1,
+            remoteSha1: sha1,
+            localMtimeMs: st.mtimeMs,
+            remoteMtimeMs: node.modificationTime.getTime(),
+            size: st.size,
+            syncStatus: 'synced',
+            lastError: null,
+        });
+    };
+
     describe('remote index', () => {
         const setup = () => {
             const remoteNodes = new Map<string, NodeEntity & { content?: string }>();
@@ -354,8 +378,12 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
         test('a locally deleted synced folder leaves no index entries once it is trashed', async () => {
             const { engine, remoteNodes, rootNode, archive } = setup();
+            // Another top-level item stays, so the delete is a partial loss, never the files missing (#45)
+            const kept = makeMockNode({ uid: 'vol~kept', parentUid: rootNode.uid, nameStr: 'Kept.txt', type: NodeType.File, content: 'kept' });
+            remoteNodes.set(kept.uid, kept);
             engine.availability.setPin(rootNode.uid, 'pinned', false);
             await engine.start();
+            expect(await readFile(path.join(stateDb.getSettings().syncDir, 'Kept.txt'), 'utf8')).toBe('kept');
 
             await rm(path.join(stateDb.getSettings().syncDir, 'Archive'), { recursive: true, force: true });
             await engine.reconcileNow();
@@ -454,7 +482,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         };
 
         test('deleting a partly downloaded folder trashes only what was local', async () => {
-            const { engine, nodes, calls, files } = await partlyDownloaded();
+            const { engine, add, nodes, calls, files } = await partlyDownloaded();
+            await keepAnotherSyncedFile(add);
 
             await rm(local('Photos'), { recursive: true });
             await engine.reconcileNow();
@@ -471,7 +500,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
 
         test('a partly downloaded folder deleted under the watcher also trashes only what was local', async () => {
-            const { engine, nodes, calls, files } = await partlyDownloaded();
+            const { engine, add, nodes, calls, files } = await partlyDownloaded();
+            await keepAnotherSyncedFile(add);
 
             await rm(local('Photos'), { recursive: true });
             await (engine as any).handleLocalFileChange('Photos');
@@ -483,6 +513,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
         test('a deleted pinned folder holding something never downloaded is left online-only, not brought back', async () => {
             const { engine, add, nodes, calls, files } = setup();
+            await keepAnotherSyncedFile(add);
             const aJpg = add('Photos/a.jpg', 'a');
             add('Photos/.DS_Store', 'matches an ignore pattern, so never downloaded');
             engine.availability.setPin('vol~Photos', 'pinned', false);
@@ -501,6 +532,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
         test('deleting a folder never trashes a hidden or hiding folder inside it', async () => {
             const { engine, add, root, nodes, calls, files } = setup();
+            await keepAnotherSyncedFile(add);
             add('Work/plan.txt', 'plan');
             add('Work/Secret/s.txt', 'secret');
             engine.availability.setPin(root.uid, 'pinned', false);
@@ -518,6 +550,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
         test('deleting a folder that was replaced in the cloud by another of the same name trashes nothing', async () => {
             const { engine, add, root, nodes, calls, files } = setup();
+            await keepAnotherSyncedFile(add);
             add('Photos/a.jpg', 'old');
             engine.availability.setPin(root.uid, 'pinned', false);
             await engine.reconcileNow();
@@ -539,6 +572,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
         test('deleting a file that was replaced in the cloud by another of the same name trashes nothing when the recorded one is gone', async () => {
             const { engine, add, root, nodes, calls, files } = setup();
+            await keepAnotherSyncedFile(add);
             add('Report', 'v1');
             engine.availability.setPin(root.uid, 'pinned', false);
             await engine.reconcileNow();
@@ -558,6 +592,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
         test('deleting a file replaced by a new upload trashes the recorded file when it is still there', async () => {
             const { engine, add, root, nodes, calls, files } = setup();
+            await keepAnotherSyncedFile(add);
             add('Report', 'v1');
             engine.availability.setPin(root.uid, 'pinned', false);
             await engine.reconcileNow();
@@ -578,7 +613,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
 
         test('a deleted folder is not trashed while its cloud contents cannot all be listed', async () => {
-            const { engine, calls, failListing, warnings, files } = await partlyDownloaded();
+            const { engine, add, calls, failListing, warnings, files } = await partlyDownloaded();
+            await keepAnotherSyncedFile(add);
             failListing.add('vol~Photos');
 
             await rm(local('Photos'), { recursive: true });
@@ -642,6 +678,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
         test('what was local in a partly downloaded folder goes to the trash in one call', async () => {
             const { engine, add, calls } = await partlyDownloaded();
+            await keepAnotherSyncedFile(add);
             add('Photos/2024/x.jpg', 'x');
             add('Photos/2024/y.jpg', 'y');
             engine.availability.setPin('vol~Photos/c.jpg', 'pinned', false);
@@ -694,6 +731,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         // Proton Docs and Sheets are never downloaded and not in the remote index, but trashing a folder takes them along
         test('a deleted folder holding a Proton Doc keeps the doc in the cloud', async () => {
             const { engine, add, root, nodes, calls } = setup();
+            await keepAnotherSyncedFile(add);
             add('Done/a.txt', 'a');
             Object.assign(add('Done/plan', 'doc'), { mediaType: 'application/vnd.proton.doc' });
             engine.availability.setPin(root.uid, 'pinned', false);
@@ -709,6 +747,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
         test('a wholly downloaded subfolder holding a Proton Sheet is not trashed as one item', async () => {
             const { engine, add, nodes, calls } = setup();
+            await keepAnotherSyncedFile(add);
             add('Photos/a.jpg', 'a');
             add('Photos/b.jpg', 'b');
             add('Photos/Work/w.txt', 'w');
@@ -727,6 +766,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
         test('a deleted folder whose every item was local is trashed whole, as before', async () => {
             const { engine, add, root, nodes, calls } = setup();
+            await keepAnotherSyncedFile(add);
             add('Done/a.txt', 'a');
             add('Done/sub/b.txt', 'b');
             engine.availability.setPin(root.uid, 'pinned', false);
@@ -1151,7 +1191,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
 
         test('hiding a folder already deleted here leaves no records behind and trashes nothing', async () => {
-            const { engine, nodes, calls, files } = await downloaded({ 'Old/a.txt': 'a', 'Old/sub/b.txt': 'b' }, 'vol~Old');
+            const { engine, add, nodes, calls, files } = await downloaded({ 'Old/a.txt': 'a', 'Old/sub/b.txt': 'b' }, 'vol~Old');
+            await keepAnotherSyncedFile(add);
             await rm(local('Old'), { recursive: true }); // before any sync has seen the deletion
 
             const result = await engine.setAvailability('Old', 'hide');
@@ -1993,6 +2034,167 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const calls = d.listing.calls;
             await d.engine.reconcileNow();
             expect(d.listing.calls).toBeGreaterThan(calls);
+        });
+    });
+
+    // #45 (S38): a sync folder deleted or moved away, or an emptied backing store, leaves records whose files are all
+    // gone. That is never taken for the user deleting everything: the engine holds, says so, and goes on once the files
+    // are back. A partial loss is still the user deleting those items.
+    describe('a missing or emptied local root (#45)', () => {
+        const missing = (root: string) => `Proton Drive's files are missing from ${root}. Nothing was deleted in Proton Drive.`;
+        const exists = (p: string) => stat(p).then(() => true, () => false);
+        const setup = (layout: 'plain' | 'virtual' = 'plain') => {
+            if (layout === 'virtual') stateDb.setMeta('driveLayout', 'virtual');
+            const drive = makeMockDrive();
+            const backingDir = path.join(tempDir, 'files');
+            const localRoot = layout === 'virtual' ? backingDir : stateDb.getSettings().syncDir;
+            // A new engine on the same database and drive is what a restart of the daemon gives
+            const restart = () =>
+                new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                    backingDir,
+                });
+            return { ...drive, engine: restart(), restart, localRoot, files: localFiles(stateDb, () => localRoot) };
+        };
+        // Two top-level folders, synced and downloaded, and one online-only
+        const synced = async (d: ReturnType<typeof setup>) => {
+            d.add('Docs/a.txt', 'a');
+            d.add('Docs/b.txt', 'b');
+            d.add('Photos/p.jpg', 'p');
+            d.add('Notes/n.txt', 'n');
+            d.engine.availability.setPin(d.add('Docs').uid, 'pinned', false);
+            d.engine.availability.setPin(d.add('Photos').uid, 'pinned', false);
+            await d.engine.reconcileNow();
+            expect(d.engine.availability.stateOf('Notes/n.txt')).toBe('online-only');
+            expect(await d.files.exists('Docs/a.txt')).toBe(true);
+            expect(await d.files.exists('Photos/p.jpg')).toBe(true);
+            expect(d.engine.getStatus().state).toBe('idle');
+            return stateDb.getAllItems().length;
+        };
+        const missingWarnings = (d: ReturnType<typeof setup>) => d.warnings.filter((w) => w.includes('missing from'));
+
+        test('a deleted sync folder: a start trashes nothing, never makes the folder again, and the status says so', async () => {
+            const d = setup();
+            const records = await synced(d);
+            await rm(d.localRoot, { recursive: true, force: true });
+
+            const engine = d.restart();
+            try {
+                await engine.start({ backgroundInitialReconcile: false });
+                await engine.reconcileNow(); // the timer's next pass
+                expect(d.calls.trashed).toEqual([]);
+                expect(await exists(d.localRoot)).toBe(false);
+                expect(engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.localRoot) });
+                expect(stateDb.getAllItems()).toHaveLength(records);
+                expect(missingWarnings(d)).toHaveLength(1);
+                expect(stateDb.listActivity(50).filter((a) => a.details === missing(d.localRoot))).toHaveLength(1);
+            } finally {
+                await engine.stop();
+            }
+        });
+
+        test('an emptied sync folder: passes, local deletes and cloud events trash nothing and drop no record', async () => {
+            const d = setup();
+            const records = await synced(d);
+            await rm(path.join(d.localRoot, 'Docs'), { recursive: true });
+            await rm(path.join(d.localRoot, 'Photos'), { recursive: true });
+
+            await d.engine.reconcileNow();
+            await (d.engine as any).handleLocalFileChange('Docs/a.txt');
+            await (d.engine as any).handleLocalFileChange('Docs');
+            await (d.engine as any).handleRemoteDriveEvent({
+                type: DriveEventType.NodeUpdated,
+                nodeUid: 'vol~Photos/p.jpg',
+                parentNodeUid: 'vol~Photos',
+                treeEventScopeId: 's',
+                eventId: 'e1',
+            });
+            await expect(d.engine.setAvailability('Docs', 'pin')).rejects.toThrow(missing(d.localRoot));
+
+            expect(d.calls.trashed).toEqual([]);
+            expect(stateDb.getAllItems()).toHaveLength(records);
+            expect(await readdir(d.localRoot)).toEqual([]);
+            expect(d.engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.localRoot) });
+        });
+
+        test('the virtual layout with an emptied store trashes nothing, and an open of an online-only file is refused', async () => {
+            const d = setup('virtual');
+            const records = await synced(d);
+            await rm(d.localRoot, { recursive: true, force: true });
+            await mkdir(d.localRoot);
+
+            await d.engine.reconcileNow();
+            await expect(d.engine.hydrate('Notes/n.txt')).rejects.toMatchObject({ code: 'EIO', message: missing(d.localRoot) });
+
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.calls.downloads.filter((p) => p.startsWith('Notes'))).toEqual([]);
+            expect(stateDb.getAllItems()).toHaveLength(records);
+            expect(await readdir(d.localRoot)).toEqual([]);
+            expect(d.engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.localRoot) });
+        });
+
+        test('once the files are back, the next pass syncs as usual, and a genuine delete then reaches Proton Drive', async () => {
+            const d = setup();
+            await synced(d);
+            const away = path.join(tempDir, 'Moved away');
+            await rename(d.localRoot, away);
+            await d.engine.reconcileNow();
+            expect(d.engine.getStatus().state).toBe('error');
+
+            await rename(away, d.localRoot);
+            await d.engine.reconcileNow();
+            expect(d.engine.getStatus()).toMatchObject({ state: 'idle', lastError: null });
+            expect(d.calls.trashed).toEqual([]);
+
+            await rm(path.join(d.localRoot, 'Docs/a.txt'));
+            await d.engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+        });
+
+        test('a sync folder deleted and made again is watched afresh once the files are back', async () => {
+            const d = setup();
+            await synced(d);
+            const backup = path.join(tempDir, 'backup');
+            await cp(d.localRoot, backup, { recursive: true, preserveTimestamps: true });
+            const engine = d.restart();
+            try {
+                await engine.start({ backgroundInitialReconcile: false });
+                await rm(d.localRoot, { recursive: true, force: true });
+                await engine.reconcileNow();
+                expect(engine.getStatus().state).toBe('error');
+
+                await cp(backup, d.localRoot, { recursive: true, preserveTimestamps: true });
+                await engine.reconcileNow();
+                expect(engine.getStatus()).toMatchObject({ state: 'idle', lastError: null });
+                await writeFile(path.join(d.localRoot, 'Docs/new.txt'), 'new');
+                for (let i = 0; i < 300 && !d.calls.uploads.includes('Docs/new.txt'); i++) await Bun.sleep(10);
+                expect(d.calls.uploads).toEqual(['Docs/new.txt']);
+                expect(d.calls.trashed).toEqual([]);
+            } finally {
+                await engine.stop();
+            }
+        });
+
+        test('a partial loss (one top-level folder still there) is the user deleting the rest, as before', async () => {
+            const d = setup();
+            await synced(d);
+            await rm(path.join(d.localRoot, 'Docs'), { recursive: true });
+
+            await d.engine.reconcileNow();
+
+            expect(d.calls.trashed.flat()).toContain('vol~Docs');
+            expect(d.engine.getStatus().lastError).toBeNull();
+        });
+
+        test('a fresh install (no records) makes the sync folder at start, as before', async () => {
+            const d = setup();
+            expect(await exists(d.localRoot)).toBe(false);
+            await d.engine.start({ backgroundInitialReconcile: false });
+            try {
+                expect(await exists(d.localRoot)).toBe(true);
+                expect(d.engine.getStatus().lastError).toBeNull();
+            } finally {
+                await d.engine.stop();
+            }
         });
     });
 

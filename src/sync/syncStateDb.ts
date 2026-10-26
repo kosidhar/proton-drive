@@ -318,6 +318,17 @@ export class SyncStateDatabase {
             .all() as SyncedItemRecord[];
     }
 
+    // The top-level names the records are under (the first segment of each path), each once
+    recordedTopLevelNames(): string[] {
+        const rows = this.db
+            .query(
+                `SELECT DISTINCT CASE WHEN instr(localRelPath, '/') > 0 THEN substr(localRelPath, 1, instr(localRelPath, '/') - 1)
+                     ELSE localRelPath END AS name FROM synced_items`,
+            )
+            .all() as Array<{ name: string }>;
+        return rows.map((row) => row.name);
+    }
+
     // The record at a path and every record under it.
     getItemsUnder(localRelPath: string): SyncedItemRecord[] {
         return this.db
