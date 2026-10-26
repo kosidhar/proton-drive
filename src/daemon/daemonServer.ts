@@ -19,7 +19,15 @@ import { ProtonDriveSyncEngine } from '../sync/syncEngine';
 import { SyncStateDatabase } from '../sync/syncStateDb';
 import { defaultControlSocketPath, startControlServer } from './controlServer';
 import { isTrustedLocalRequest } from './requestGuard';
-import { findHelper, fuseAvailable, mergeStrayInto, unsupervisedStatus, VfsSupervisor, type VfsStatus } from './vfsSupervisor';
+import {
+    findHelper,
+    fuseAvailable,
+    mergeStrayInto,
+    notMountableReason,
+    unsupervisedStatus,
+    VfsSupervisor,
+    type VfsStatus,
+} from './vfsSupervisor';
 
 export const DEFAULT_DAEMON_PORT = Number(process.env.PROTON_DRIVE_DAEMON_PORT || 49152);
 export const DEFAULT_DAEMON_HOST = '127.0.0.1';
@@ -498,7 +506,7 @@ export async function startSyncDaemon(options: {
             socketPath: defaultControlSocketPath(),
             engine,
             mountAgain: async () => {
-                if (!vfsSupervisor) throw new Error('The virtual drive is off: Proton Drive is a plain folder');
+                if (!vfsSupervisor) throw new Error(notMountableReason(vfsFixedStatus));
                 await vfsSupervisor.mountAgain();
             },
         });
@@ -516,6 +524,7 @@ export async function startSyncDaemon(options: {
         vfsSupervisor = new VfsSupervisor({
             mountpoint,
             backingDir,
+            appDir: runtime.config.appDir,
             socketPath: defaultControlSocketPath(),
             helperPath,
             logPath: path.join(runtime.config.appDir, 'vfs.log'),

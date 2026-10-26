@@ -3,6 +3,7 @@ import {
     chmodSync,
     closeSync,
     constants,
+    fchmodSync,
     lstatSync,
     mkdirSync,
     openSync,
@@ -61,6 +62,7 @@ type HelperProcess = Pick<ReturnType<typeof Bun.spawn>, 'exited' | 'exitCode' | 
 export interface VfsSupervisorOptions {
     mountpoint: string;
     backingDir: string;
+    appDir: string; // the drive must never mount over it, or over a folder holding it
     socketPath: string;
     helperPath: string;
     logPath: string; // the helper's stdout and stderr: <appDir>/vfs.log
@@ -119,6 +121,49 @@ export function fuseAvailable(helperPath: string | null): boolean {
     return onPath('fusermount3') !== null;
 }
 
+// Why POST /vfs/mount has nothing to mount, from the status worked out at start
+export function notMountableReason(status: VfsStatus): string {
+    switch (status.reason) {
+        case 'switched-off':
+            return 'The virtual drive is switched off: Proton Drive is a plain folder';
+        case 'fuse-unavailable':
+            return "The virtual drive can't run: FUSE or protondrive-vfs isn't available on this system";
+        case 'mount-point-busy':
+            return "The virtual drive can't run: the daemon's control socket is unavailable";
+        default:
+            return "Proton Drive is a plain folder: its files haven't moved into the virtual drive";
+    }
+}
+
+// The canonical path, worked out from the parent and readlink, never by looking inside: a dead or stuck mount at the
+// path must still be named as mountinfo and fusermount3 name it
+function canonicalPath(p: string): string {
+    let current = path.resolve(p);
+    for (let hops = 0; hops < 40; hops++) {
+        let joined: string;
+        try {
+            joined = path.join(realpathSync(path.dirname(current)), path.basename(current));
+        } catch {
+            return current;
+        }
+        try {
+            current = path.resolve(path.dirname(joined), readlinkSync(joined));
+        } catch {
+            return joined; // not a symlink
+        }
+    }
+    return current;
+}
+
+// Whether one path is the other or holds it
+function overlaps(a: string, b: string): boolean {
+    const inside = (child: string, parent: string) => {
+        const rel = path.relative(parent, child);
+        return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+    };
+    return inside(a, b) || inside(b, a);
+}
+
 // What /api/status says when no supervisor runs, worked out once at start
 export function unsupervisedStatus(layout: DriveLayout, wanted: boolean, fuseOk: boolean): VfsStatus {
     if (layout === 'virtual') return { mode: 'virtual', mounted: false, reason: 'fuse-unavailable' };
@@ -143,18 +188,30 @@ export function mountsAt(mountinfo: string, mountpoint: string): string[] {
 // Moves an entry found in the bare mount point to the same place in the backing store, where the engine picks it up
 // as a new local file. Nothing is ever replaced: a folder already in the store is merged into, and an entry whose
 // name is taken there gets a conflict name. Answers where conflict-named entries went. Throws when something can't be
-// moved; what wasn't moved stays put.
-export function mergeStrayInto(strayPath: string, mountpoint: string, backingDir: string, now = new Date()): string[] {
+// moved; what wasn't moved stays put. beforeRmdir is for tests: it runs as an emptied stray folder is about to go.
+export function mergeStrayInto(
+    strayPath: string,
+    mountpoint: string,
+    backingDir: string,
+    now = new Date(),
+    beforeRmdir?: (folder: string) => void,
+): string[] {
     const rel = path.relative(mountpoint, strayPath);
-    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+    if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
         throw new Error(`${strayPath} isn't inside ${mountpoint}`);
     }
     const renamed: string[] = [];
-    mergeEntry(strayPath, path.join(backingDir, rel), now, renamed);
+    mergeEntry(strayPath, path.join(backingDir, rel), now, renamed, beforeRmdir);
     return renamed;
 }
 
-function mergeEntry(from: string, to: string, now: Date, renamed: string[]): void {
+function mergeEntry(
+    from: string,
+    to: string,
+    now: Date,
+    renamed: string[],
+    beforeRmdir: ((folder: string) => void) | undefined,
+): void {
     // moveWithoutReplacing undoes a move it can't finish without saying why; this says why first
     accessSync(path.dirname(from), constants.W_OK | constants.X_OK);
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -166,8 +223,9 @@ function mergeEntry(from: string, to: string, now: Date, renamed: string[]): voi
         }
         if (there.isDirectory() && lstatSync(from).isDirectory()) {
             for (const name of readdirSync(from)) {
-                mergeEntry(path.join(from, name), path.join(to, name), now, renamed);
+                mergeEntry(path.join(from, name), path.join(to, name), now, renamed, beforeRmdir);
             }
+            beforeRmdir?.(from);
             rmdirSync(from); // ENOTEMPTY if something new arrived: then this stray isn't merged yet
             return;
         }
@@ -294,24 +352,22 @@ export class VfsSupervisor {
         return next;
     }
 
-    // The canonical path, where the helper mounts and what mountinfo shows. Worked out from the parent and readlink,
-    // never by looking inside the mount point: a dead or stuck mount there must still be recognised.
+    // Where the helper mounts (it canonicalizes too), what mountinfo shows and what fusermount3 needs: fusermount3
+    // resolves only the parent, so a symlinked sync folder's own path is never found in mtab
     private realMountpoint(): string {
-        let p = path.resolve(this.opts.mountpoint);
-        for (let hops = 0; hops < 40; hops++) {
-            let joined: string;
-            try {
-                joined = path.join(realpathSync(path.dirname(p)), path.basename(p));
-            } catch {
-                return p;
-            }
-            try {
-                p = path.resolve(path.dirname(joined), readlinkSync(joined));
-            } catch {
-                return joined; // not a symlink
+        return canonicalPath(this.opts.mountpoint);
+    }
+
+    // The drive mounted over its own store, or over a folder holding it, would hide and then merge the store into
+    // itself
+    private overlapsAppFiles(): string | null {
+        const mountpoint = this.realMountpoint();
+        for (const dir of [this.opts.appDir, this.opts.backingDir]) {
+            if (overlaps(mountpoint, canonicalPath(dir))) {
+                return `The drive folder ${this.opts.mountpoint} overlaps ${dir}; not mounting the drive`;
             }
         }
-        return p;
+        return null;
     }
 
     private mounts(): string[] {
@@ -328,7 +384,7 @@ export class VfsSupervisor {
     }
 
     private async unmount(): Promise<void> {
-        const cmd = ['fusermount3', '-u', '-z', this.opts.mountpoint];
+        const cmd = ['fusermount3', '-u', '-z', this.realMountpoint()];
         try {
             await settlesWithin(this.run(cmd), this.timing.unmountWaitMs);
         } catch (err) {
@@ -374,6 +430,8 @@ export class VfsSupervisor {
 
     // Answers why the drive can't be mounted, or null when the mount point is ready: free of mounts, a folder, empty
     private async prepare(): Promise<string | null> {
+        const overlap = this.overlapsAppFiles();
+        if (overlap) return overlap;
         const blocked = await this.clearOurMounts();
         if (blocked) return blocked;
         const mountpoint = this.opts.mountpoint;
@@ -454,6 +512,7 @@ export class VfsSupervisor {
         }
         const fd = openSync(logPath, 'a', 0o600);
         try {
+            fchmodSync(fd, 0o600); // it names the user's files, and may predate this mode
             writeSync(fd, `--- ${new Date().toISOString()} starting protondrive-vfs on ${mountpoint}\n`);
             return this.spawn([helperPath, '--mountpoint', mountpoint, '--backing', backingDir, '--socket', socketPath], {
                 stdin: 'ignore',
@@ -487,6 +546,7 @@ export class VfsSupervisor {
         this.clearPoll();
         if (this.stopping) return;
         const ejected = proc.exitCode === 0;
+        this.state = { mounted: false, reason: ejected ? 'ejected' : 'starting' };
         if (ejected) {
             this.logger.info(`The drive at ${this.opts.mountpoint} was ejected`);
         } else {
@@ -558,7 +618,7 @@ export class VfsSupervisor {
     // 0555 while unmounted, so apps can't save into the bare folder. Never through a mount: on ours it would change
     // the backing store, on another it isn't ours to change.
     private restoreReadOnly(): void {
-        if (this.mounts().length > 0) return;
+        if (this.mounts().length > 0 || this.overlapsAppFiles()) return;
         try {
             if (!this.stat(this.opts.mountpoint).isDirectory()) return;
             chmodSync(this.opts.mountpoint, 0o555);

@@ -26,6 +26,7 @@ import {
     fuseAvailable,
     mergeStrayInto,
     mountsAt,
+    notMountableReason,
     unsupervisedStatus,
     VfsSupervisor,
     type VfsTiming,
@@ -129,19 +130,24 @@ function harness(opts: {
     onSpawn?: (stderr: unknown) => void;
     spawnThrows?: number;
     linkedMountpoint?: boolean; // the sync folder is a symlink to the folder mounted on
+    paths?: (root: string) => { mountpoint?: string; backing?: string; appDir?: string };
+    runGate?: Promise<void>; // fusermount3 doesn't return until this settles
 } = {}) {
     const root = tempRoot();
-    const mountpoint = path.join(root, 'Proton Drive');
-    // mountinfo and the helper use the canonical path
+    const custom = opts.paths?.(root) ?? {};
+    const appDir = custom.appDir ?? path.join(root, 'app');
+    const backing = custom.backing ?? path.join(appDir, 'files');
+    const mountpoint = custom.mountpoint ?? path.join(root, 'Proton Drive');
+    // mountinfo, the helper and fusermount3 use the canonical path
     const target = opts.linkedMountpoint ? path.join(root, 'real drive') : mountpoint;
-    const backing = path.join(root, 'files');
-    const logPath = path.join(root, 'vfs.log');
+    const logPath = path.join(appDir, 'vfs.log');
+    mkdirSync(appDir, { recursive: true });
+    mkdirSync(backing, { recursive: true });
     if (!opts.noMountpoint) {
-        mkdirSync(target);
+        mkdirSync(target, { recursive: true });
         chmodSync(target, opts.mountpointMode ?? 0o555);
         if (target !== mountpoint) symlinkSync(target, mountpoint);
     }
-    mkdirSync(backing);
     const mounts: string[] = opts.mounts ? opts.mounts(target) : [];
     let nextId = 100;
     let spawnThrows = opts.spawnThrows ?? 0;
@@ -163,6 +169,7 @@ function harness(opts: {
     const supervisor = new VfsSupervisor({
         mountpoint,
         backingDir: backing,
+        appDir,
         socketPath: path.join(root, 'control.sock'),
         helperPath: '/fake/bin/protondrive-vfs',
         logPath,
@@ -201,12 +208,13 @@ function harness(opts: {
         }) as unknown as typeof Bun.spawn,
         async run(cmd: string[]) {
             runs.push(cmd);
-            if (cmd[0] === 'fusermount3' && cmd[cmd.length - 1] === mountpoint) {
-                removeOneOurs();
-                // The session of a live helper ends when its mount goes
-                if (opts.exitsOnUnmount !== false) {
-                    for (const proc of procs) proc.finish(0);
-                }
+            await opts.runGate;
+            // fusermount3 resolves the parent but not the last component: a symlink's path isn't in mtab
+            if (cmd[0] !== 'fusermount3' || cmd[cmd.length - 1] !== target) return 1;
+            removeOneOurs();
+            // The session of a live helper ends when its mount goes
+            if (opts.exitsOnUnmount !== false) {
+                for (const proc of procs) proc.finish(0);
             }
             return 0;
         },
@@ -222,7 +230,7 @@ function harness(opts: {
     };
     // The helper dies (exit code, or a signal), leaving its mount behind dead
     const crash = (code: number | null = 1, signal: string | null = null) => procs[procs.length - 1]!.finish(code, signal);
-    return { root, mountpoint, backing, logPath, mounts, runs, procs, spawns, merged, logs, supervisor, eject, crash };
+    return { root, appDir, mountpoint, target, backing, logPath, mounts, runs, procs, spawns, merged, logs, supervisor, eject, crash };
 }
 
 const fusermount = (mountpoint: string) => ['fusermount3', '-u', '-z', mountpoint];
@@ -298,9 +306,25 @@ describe('VfsSupervisor: preparing the mount point', () => {
 
         const orphan = harness({ linkedMountpoint: true, mounts: (mp) => [mountLine(7, mp, 'fuse.protondrive', 'protondrive')] });
         await orphan.supervisor.start();
-        expect(orphan.runs).toEqual([fusermount(orphan.mountpoint)]);
+        expect(orphan.runs).toEqual([fusermount(orphan.target)]);
         expect(orphan.spawns).toHaveLength(1);
         await until(() => orphan.supervisor.status().mounted);
+    });
+
+    test('a symlinked sync folder: a crash and a stop unmount the canonical path, so no dead mount is left', async () => {
+        const h = harness({ linkedMountpoint: true });
+        await h.supervisor.start();
+        await until(() => h.supervisor.status().mounted);
+        h.crash(null, 'SIGKILL');
+        await until(() => h.spawns.length === 2);
+        expect(h.runs).toEqual([fusermount(h.target)]);
+        expect(h.spawns[1]!.mountsAtSpawn).toBe(0);
+        await until(() => h.supervisor.status().mounted);
+        await h.supervisor.stop();
+        expect(h.runs).toEqual([fusermount(h.target), fusermount(h.target)]);
+        expect(h.procs[1]!.kills).toEqual([]);
+        expect(h.mounts).toEqual([]);
+        expect(modeOf(h.target)).toBe(0o555);
     });
 
     test("a dead foreign mount at the symlink's target is recognised, so the ENOTCONN fallback never touches it", async () => {
@@ -400,6 +424,58 @@ describe('VfsSupervisor: preparing the mount point', () => {
         expect(readdirSync(h.backing).sort()).toEqual(['early.txt', 'late.txt']);
     });
 
+    test('strays whose names start with two dots are merged like any other', async () => {
+        const h = harness({ mountpointMode: 0o700 });
+        writeFileSync(path.join(h.mountpoint, '..notes'), 'n');
+        mkdirSync(path.join(h.mountpoint, '...'));
+        await h.supervisor.start();
+        expect(h.spawns).toHaveLength(1);
+        expect(readdirSync(h.backing).sort()).toEqual(['...', '..notes']);
+    });
+
+    test('a file saved into a stray folder mid-merge keeps the drive unmounted, and nothing is lost', async () => {
+        const h = harness({
+            mountpointMode: 0o700,
+            mergeStray: async (fullPath, { mountpoint, backing }) => {
+                mergeStrayInto(fullPath, mountpoint, backing, new Date(), (folder) => {
+                    writeFileSync(path.join(folder, 'late.txt'), 'late'); // an app saves just before it goes
+                });
+            },
+        });
+        mkdirSync(path.join(h.backing, 'Docs'));
+        mkdirSync(path.join(h.mountpoint, 'Docs'));
+        writeFileSync(path.join(h.mountpoint, 'Docs', 'a.txt'), 'a');
+        await h.supervisor.start();
+        expect(h.spawns).toEqual([]);
+        expect(h.supervisor.status().reason).toBe('mount-point-busy');
+        expect(readFileSync(path.join(h.backing, 'Docs', 'a.txt'), 'utf8')).toBe('a');
+        expect(readFileSync(path.join(h.mountpoint, 'Docs', 'late.txt'), 'utf8')).toBe('late');
+    });
+
+    test('a mount point overlapping the backing store or the app dir is refused and never touched', async () => {
+        const cases = {
+            'inside the backing store': (root: string) => ({ mountpoint: path.join(root, 'app', 'files', 'Drive') }),
+            'the backing store itself': (root: string) => ({ mountpoint: path.join(root, 'app', 'files') }),
+            'inside the app dir': (root: string) => ({ mountpoint: path.join(root, 'app', 'Drive') }),
+            'holding the app dir': (root: string) => ({
+                mountpoint: path.join(root, 'home'),
+                appDir: path.join(root, 'home', '.local', 'app'),
+            }),
+        };
+        for (const [name, paths] of Object.entries(cases)) {
+            const h = harness({ paths, mountpointMode: 0o750 });
+            writeFileSync(path.join(h.backing, 'in the store.txt'), 'x');
+            await h.supervisor.start();
+            expect([name, h.spawns.length, h.runs.length]).toEqual([name, 0, 0]);
+            expect(h.supervisor.status().reason).toBe('mount-point-busy');
+            expect(h.logs.some((l) => l.startsWith('error') && l.includes('overlaps'))).toBe(true);
+            await expect(h.supervisor.mountAgain()).rejects.toThrow(/overlaps/);
+            await h.supervisor.stop();
+            expect([name, modeOf(h.mountpoint)]).toEqual([name, 0o750]);
+            expect(readFileSync(path.join(h.backing, 'in the store.txt'), 'utf8')).toBe('x');
+        }
+    });
+
     test('a stray left in the mount point after merging keeps the drive unmounted', async () => {
         const h = harness({ mountpointMode: 0o700, mergeStray: async () => {} });
         writeFileSync(path.join(h.mountpoint, 'stuck.txt'), 'x');
@@ -488,6 +564,31 @@ describe('VfsSupervisor: the helper session', () => {
         await until(() => h.spawns.length === 2);
         expect(h.spawns[1]!.mode).toBe(0o700);
         expect(h.spawns[1]!.mountsAtSpawn).toBe(0);
+        await until(() => h.supervisor.status().mounted);
+    });
+
+    test('a crash shows unmounted at once, while its dead mount is still being cleared', async () => {
+        let release!: () => void;
+        const h = harness({ runGate: new Promise<void>((resolve) => (release = resolve)) });
+        await h.supervisor.start();
+        await until(() => h.supervisor.status().mounted);
+        h.crash(1);
+        await until(() => h.runs.length === 1);
+        expect(h.supervisor.status()).toEqual({ mode: 'virtual', mounted: false, reason: 'starting' });
+        release();
+        await until(() => h.spawns.length === 2);
+    });
+
+    test('mountAgain while a restart is pending starts exactly one helper', async () => {
+        const h = harness({ timing: { restartDelaysMs: [150, 150, 150] } });
+        await h.supervisor.start();
+        await until(() => h.supervisor.status().mounted);
+        h.crash(1);
+        await until(() => h.runs.length === 1 && modeOf(h.mountpoint) === 0o555);
+        await h.supervisor.mountAgain();
+        expect(h.spawns).toHaveLength(2);
+        await Bun.sleep(300); // past the restart that was pending
+        expect(h.spawns).toHaveLength(2);
         await until(() => h.supervisor.status().mounted);
     });
 
@@ -637,6 +738,31 @@ describe('VfsSupervisor: helper output', () => {
         expect(existsSync(`${h.logPath}.1`)).toBe(false);
     });
 
+    test('vfs.log is made user-only each time it is opened, not only when created', async () => {
+        const h = harness();
+        writeFileSync(h.logPath, 'earlier\n');
+        chmodSync(h.logPath, 0o644);
+        await h.supervisor.start();
+        expect(modeOf(h.logPath)).toBe(0o600);
+    });
+
+    test('a log that grew past 1 MB during a session is rotated when the crashed helper restarts', async () => {
+        let first = true;
+        const h = harness({
+            onSpawn: (fd) => {
+                if (first && typeof fd === 'number') writeSync(fd, 'y'.repeat(1024 * 1024 + 10));
+                first = false;
+            },
+        });
+        await h.supervisor.start();
+        await until(() => h.supervisor.status().mounted);
+        expect(existsSync(`${h.logPath}.1`)).toBe(false);
+        h.crash(1);
+        await until(() => h.spawns.length === 2);
+        expect(statSync(`${h.logPath}.1`).size).toBeGreaterThan(1024 * 1024);
+        expect(statSync(h.logPath).size).toBeLessThan(4096);
+    });
+
     test('vfs.log over 1 MB is rotated to vfs.log.1 when the helper starts', async () => {
         const h = harness();
         const big = 'x'.repeat(1024 * 1024 + 10);
@@ -738,10 +864,14 @@ describe('mergeStrayInto', () => {
         expect(readdirSync(path.join(b, 'Docs'))).toEqual(['cloud.txt']);
     });
 
-    test('refuses a path outside the mount point', () => {
-        const { mountpoint: mp, backing: b } = dirs();
+    test('refuses a path outside the mount point, but not a name starting with two dots', () => {
+        const { mountpoint: mp, backing: b, put, read } = dirs();
         expect(() => mergeStrayInto(path.join(path.dirname(mp), 'elsewhere'), mp, b, when)).toThrow();
         expect(() => mergeStrayInto(mp, mp, b, when)).toThrow();
+        expect(() => mergeStrayInto(path.dirname(mp), mp, b, when)).toThrow();
+        put(path.join(mp, '..notes'), 'n');
+        mergeStrayInto(path.join(mp, '..notes'), mp, b, when);
+        expect(read(path.join(b, '..notes'))).toBe('n');
     });
 });
 
@@ -825,6 +955,16 @@ describe('fuseAvailable and findHelper', () => {
     });
 });
 
+describe('notMountableReason', () => {
+    test('says why Mount again has nothing to mount', () => {
+        expect(notMountableReason({ mode: 'plain', mounted: false, reason: 'switched-off' })).toMatch(/switched off/);
+        expect(notMountableReason({ mode: 'plain', mounted: false, reason: 'fuse-unavailable' })).toMatch(/FUSE/);
+        expect(notMountableReason({ mode: 'virtual', mounted: false, reason: 'fuse-unavailable' })).toMatch(/FUSE/);
+        expect(notMountableReason({ mode: 'virtual', mounted: false, reason: 'mount-point-busy' })).toMatch(/control socket/);
+        expect(notMountableReason({ mode: 'plain', mounted: false, reason: null })).toMatch(/plain folder/);
+    });
+});
+
 describe('unsupervisedStatus', () => {
     test('plain layout: switched off, FUSE unavailable, or neither', () => {
         expect(unsupervisedStatus('plain', false, true)).toEqual({ mode: 'plain', mounted: false, reason: 'switched-off' });
@@ -838,97 +978,164 @@ describe('unsupervisedStatus', () => {
     });
 });
 
-// A real mount of the built helper over temp dirs, with a fake daemon on a temp socket; only with
-// PROTONDRIVE_VFS_MOUNT_TESTS=1. Everything on the mount goes through async fs: this process also answers the helper.
+// Real mounts of the built helper over temp dirs, with a fake daemon on a temp socket; only with
+// PROTONDRIVE_VFS_MOUNT_TESTS=1. Everything on the mount goes through async fs (this process also answers the helper),
+// every await is bounded so a failure always reaches the cleanup, and the cleanup always unmounts.
 const MOUNT_TESTS = process.env.PROTONDRIVE_VFS_MOUNT_TESTS === '1';
 const REAL_HELPER = path.resolve(import.meta.dir, '../native-vfs/target/release/protondrive-vfs');
+
+async function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise<never>((_, reject) => (timer = setTimeout(() => reject(new Error(`Timed out: ${what}`)), ms))),
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+function realMount(linked: boolean) {
+    if (!existsSync(REAL_HELPER)) throw new Error(`Build the helper first (cargo build --release): ${REAL_HELPER}`);
+    const root = tempRoot();
+    const appDir = path.join(root, 'app');
+    const backing = path.join(appDir, 'files');
+    const mountpoint = path.join(root, 'Proton Drive');
+    const target = linked ? path.join(root, 'real drive') : mountpoint; // where the mount really is
+    const socketPath = path.join(root, 'control.sock');
+    mkdirSync(backing, { recursive: true });
+    mkdirSync(target);
+    chmodSync(target, 0o555);
+    if (linked) symlinkSync(target, mountpoint);
+    writeFileSync(path.join(backing, 'local.txt'), 'here');
+    const daemon = Bun.serve({
+        unix: socketPath,
+        fetch(req) {
+            if (new URL(req.url).pathname === '/vfs/children') return Response.json({ entries: [] });
+            return Response.json({ error: 'Not found', code: 'ENOENT' }, { status: 404 });
+        },
+    });
+    const isMounted = () => mountsAt(readFileSync('/proc/self/mountinfo', 'latin1'), target).length > 0;
+    const spawned: Subprocess[] = [];
+    const orphans: Subprocess[] = [];
+    const logs: string[] = [];
+    const log = (level: string) => (m: string) => logs.push(`${level} ${m}`);
+    const supervisor = new VfsSupervisor({
+        mountpoint,
+        backingDir: backing,
+        appDir,
+        socketPath,
+        helperPath: REAL_HELPER,
+        logPath: path.join(appDir, 'vfs.log'),
+        logger: { debug: log('debug'), info: log('info'), warn: log('warn'), error: log('error') },
+        mergeStray: async (fullPath) => {
+            mergeStrayInto(fullPath, mountpoint, backing);
+        },
+        spawn: ((cmd: string[], o: object) => {
+            const proc = Bun.spawn(cmd, o);
+            spawned.push(proc);
+            return proc;
+        }) as unknown as typeof Bun.spawn,
+        timing: { restartDelaysMs: [200, 200, 200], stopWaitMs: 2000, mountPollMs: 20 },
+    });
+    // Never throws: stops, kills what is left, unmounts the temp mount point; answers what it couldn't clean up
+    const cleanup = async (): Promise<string[]> => {
+        const problems: string[] = [];
+        await within(supervisor.stop(), 15_000, 'stop').catch((err: unknown) => problems.push(String(err)));
+        for (const proc of [...spawned, ...orphans]) {
+            if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL');
+        }
+        for (let i = 0; i < 5 && isMounted(); i++) Bun.spawnSync(['fusermount3', '-u', '-z', target]);
+        void daemon.stop(true);
+        if (readFileSync('/proc/self/mounts', 'utf8').includes(root)) problems.push(`still mounted under ${root}`);
+        return problems;
+    };
+    return { root, mountpoint, target, backing, socketPath, supervisor, spawned, orphans, isMounted, logs, cleanup };
+}
+
+// Runs the body, then always the cleanup; a failure is reported as it was, after the cleanup has run
+async function withRealMount(linked: boolean, body: (m: ReturnType<typeof realMount>) => Promise<void>): Promise<void> {
+    const m = realMount(linked);
+    let failure: unknown = null;
+    try {
+        await body(m);
+    } catch (err) {
+        failure = err;
+    }
+    const problems = await m.cleanup();
+    if (failure) {
+        if (failure instanceof Error) failure.message += `\ncleanup: ${problems.join('; ') || 'clean'}\n${m.logs.join('\n')}`;
+        throw failure;
+    }
+    expect(problems).toEqual([]);
+}
 
 describe.skipIf(!MOUNT_TESTS)('VfsSupervisor with the real helper', () => {
     test(
         'kill -9 leaves no lasting ENOTCONN, an eject ends at 0555, an orphan helper is taken over, and stop unmounts',
-        async () => {
-            if (!existsSync(REAL_HELPER)) throw new Error(`Build the helper first (cargo build --release): ${REAL_HELPER}`);
-            const root = tempRoot();
-            const mountpoint = path.join(root, 'Proton Drive');
-            const backing = path.join(root, 'files');
-            const socketPath = path.join(root, 'control.sock');
-            mkdirSync(mountpoint);
-            chmodSync(mountpoint, 0o555);
-            mkdirSync(backing);
-            writeFileSync(path.join(backing, 'local.txt'), 'here');
-            const daemon = Bun.serve({
-                unix: socketPath,
-                fetch(req) {
-                    if (new URL(req.url).pathname === '/vfs/children') return Response.json({ entries: [] });
-                    return Response.json({ error: 'Not found', code: 'ENOENT' }, { status: 404 });
-                },
-            });
-            const isMounted = () => mountsAt(readFileSync('/proc/self/mountinfo', 'latin1'), mountpoint).length > 0;
-            const spawned: Subprocess[] = [];
-            let orphan: Subprocess | null = null;
-            const supervisor = new VfsSupervisor({
-                mountpoint,
-                backingDir: backing,
-                socketPath,
-                helperPath: REAL_HELPER,
-                logPath: path.join(root, 'vfs.log'),
-                logger: { debug() {}, info() {}, warn() {}, error() {} },
-                mergeStray: async (fullPath) => {
-                    mergeStrayInto(fullPath, mountpoint, backing);
-                },
-                spawn: ((cmd: string[], o: object) => {
-                    const proc = Bun.spawn(cmd, o);
-                    spawned.push(proc);
-                    return proc;
-                }) as unknown as typeof Bun.spawn,
-                timing: { restartDelaysMs: [200, 200, 200], stopWaitMs: 2000, mountPollMs: 20 },
-            });
-            try {
-                await supervisor.start();
+        () =>
+            withRealMount(false, async ({ mountpoint, backing, socketPath, supervisor, spawned, orphans, isMounted }) => {
+                await within(supervisor.start(), 15_000, 'start');
                 await until(() => supervisor.status().mounted, 10_000);
-                expect(await readdir(mountpoint)).toContain('local.txt');
+                expect(await within(readdir(mountpoint), 5000, 'readdir')).toContain('local.txt');
 
                 // kill -9 of the helper: its dead mount is cleared and a new helper mounts
                 process.kill(spawned[0]!.pid, 'SIGKILL');
                 await until(() => spawned.length === 2 && supervisor.status().mounted, 10_000);
                 expect(statSync(mountpoint).isDirectory()).toBe(true);
-                expect(await readdir(mountpoint)).toContain('local.txt');
+                expect(await within(readdir(mountpoint), 5000, 'readdir')).toContain('local.txt');
 
                 // Eject, as Files does
                 expect(Bun.spawnSync(['fusermount3', '-u', mountpoint]).exitCode).toBe(0);
-                expect(await spawned[1]!.exited).toBe(0);
+                expect(await within(spawned[1]!.exited, 5000, 'helper exit after eject')).toBe(0);
                 await until(() => supervisor.status().reason === 'ejected', 5000);
                 expect(modeOf(mountpoint)).toBe(0o555);
                 expect(isMounted()).toBe(false);
-                await supervisor.stop();
+                await within(supervisor.stop(), 15_000, 'stop');
 
                 // A helper that outlived a killed daemon still holds a live mount: the next start takes it over
                 chmodSync(mountpoint, 0o700);
-                orphan = Bun.spawn([REAL_HELPER, '--mountpoint', mountpoint, '--backing', backing, '--socket', socketPath], {
+                const orphan = Bun.spawn([REAL_HELPER, '--mountpoint', mountpoint, '--backing', backing, '--socket', socketPath], {
                     stdin: 'ignore',
                     stdout: 'ignore',
                     stderr: 'ignore',
                 });
+                orphans.push(orphan);
                 await until(isMounted, 10_000);
-                await supervisor.start();
-                expect(await orphan.exited).toBe(0);
+                await within(supervisor.start(), 15_000, 'start over the orphan');
+                expect(await within(orphan.exited, 5000, 'orphan exit')).toBe(0);
                 await until(() => supervisor.status().mounted, 10_000);
-                expect(await readdir(mountpoint)).toContain('local.txt');
+                expect(await within(readdir(mountpoint), 5000, 'readdir')).toContain('local.txt');
 
-                await supervisor.stop();
+                await within(supervisor.stop(), 15_000, 'stop');
                 expect(isMounted()).toBe(false);
                 expect(modeOf(mountpoint)).toBe(0o555);
-                expect(spawned.every((proc) => proc.exitCode !== null || proc.signalCode !== null)).toBe(true);
-            } finally {
-                await supervisor.stop();
-                for (const proc of [...spawned, orphan]) {
-                    if (proc && proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL');
-                }
-                for (let i = 0; i < 5 && isMounted(); i++) Bun.spawnSync(['fusermount3', '-u', '-z', mountpoint]);
-                void daemon.stop(true);
-                expect(readFileSync('/proc/self/mounts', 'utf8')).not.toContain(root);
-            }
-        },
+                expect(spawned[2]!.exitCode).toBe(0); // its session ended with the unmount, not a kill
+            }),
+        60_000,
+    );
+
+    test(
+        'a symlinked sync folder: kill -9 recovers with no lasting ENOTCONN, and stop unmounts',
+        () =>
+            withRealMount(true, async ({ mountpoint, target, supervisor, spawned, isMounted }) => {
+                await within(supervisor.start(), 15_000, 'start');
+                await until(() => supervisor.status().mounted, 10_000);
+                expect(isMounted()).toBe(true); // at the canonical path
+                expect(await within(readdir(mountpoint), 5000, 'readdir')).toContain('local.txt');
+
+                process.kill(spawned[0]!.pid, 'SIGKILL');
+                await until(() => spawned.length === 2 && supervisor.status().mounted, 10_000);
+                expect(statSync(mountpoint).isDirectory()).toBe(true);
+                expect(await within(readdir(mountpoint), 5000, 'readdir')).toContain('local.txt');
+
+                await within(supervisor.stop(), 15_000, 'stop');
+                expect(isMounted()).toBe(false);
+                expect(spawned[1]!.exitCode).toBe(0); // unmounted, not killed
+                expect(statSync(mountpoint).isDirectory()).toBe(true);
+                expect(modeOf(target)).toBe(0o555);
+            }),
         60_000,
     );
 });
