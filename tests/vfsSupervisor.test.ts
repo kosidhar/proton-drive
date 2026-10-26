@@ -104,7 +104,7 @@ class FakeProc {
     }
 }
 
-const FAST: VfsTiming = { restartDelaysMs: [20, 40, 60], crashWindowMs: 60_000, unmountWaitMs: 300, stopWaitMs: 100, mountPollMs: 5 };
+const FAST: VfsTiming = { restartDelaysMs: [20, 40, 60], crashWindowMs: 60_000, unmountWaitMs: 300, stopWaitMs: 100, mountPollMs: 5, mountTimeoutMs: 10_000 };
 
 interface SpawnCall {
     cmd: string[];
@@ -636,6 +636,35 @@ describe('VfsSupervisor: the helper session', () => {
             await until(() => h.spawns.length === n + 1);
         }
         expect(h.supervisor.status().reason).not.toBe('crashed');
+    });
+
+    // Final review M-6: a helper that stays alive but never mounts left the status at starting for ever, with no Mount
+    // again
+    test('a helper that never mounts within the bound is killed and counted as a crash, ending in crashed', async () => {
+        const h = harness({ helperMounts: false, timing: { mountTimeoutMs: 80 } });
+        await h.supervisor.start();
+        expect(h.supervisor.status().reason).toBe('starting');
+        await until(() => h.spawns.length === 2);
+        expect(h.procs[0]!.kills).toEqual(['SIGKILL']);
+        expect(h.logs.some((l) => l.includes("didn't mount the drive"))).toBe(true);
+        await until(() => h.supervisor.status().reason === 'crashed', 3000);
+        expect(h.spawns).toHaveLength(4);
+        expect(h.procs.every((p) => !p.alive)).toBe(true);
+        expect(modeOf(h.mountpoint)).toBe(0o555);
+    });
+
+    test('a helper that mounts within the bound is never killed for it', async () => {
+        const h = harness({ timing: { mountTimeoutMs: 200 } });
+        await h.supervisor.start();
+        await until(() => h.supervisor.status().mounted);
+        await Bun.sleep(300);
+        expect(h.procs[0]!.kills).toEqual([]);
+        expect(h.spawns).toHaveLength(1);
+        expect(h.supervisor.status()).toEqual({ mode: 'virtual', mounted: true, reason: null });
+    });
+
+    test('the mount is waited for 30 s by default', () => {
+        expect(DEFAULT_VFS_TIMING.mountTimeoutMs).toBe(30_000);
     });
 
     test('a helper that cannot be started counts as a crash', async () => {

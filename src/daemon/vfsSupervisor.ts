@@ -69,6 +69,7 @@ export interface VfsTiming {
     unmountWaitMs: number; // for a lazy unmount to leave mountinfo
     stopWaitMs: number; // for the helper to exit at shutdown, and again after each signal
     mountPollMs: number; // first look for the new mount; it doubles up to 2 s
+    mountTimeoutMs: number; // a helper whose mount hasn't shown by then is killed, and counted as a crash
 }
 
 export const DEFAULT_VFS_TIMING: VfsTiming = {
@@ -77,6 +78,7 @@ export const DEFAULT_VFS_TIMING: VfsTiming = {
     unmountWaitMs: 2000,
     stopWaitMs: 2000,
     mountPollMs: 100,
+    mountTimeoutMs: 30_000,
 };
 
 // FSName and Subtype "protondrive": how our own mounts show in mountinfo
@@ -468,8 +470,12 @@ export class VfsSupervisor {
         }
     }
 
+    // Until the mount shows, or the bound passes: a helper still alive then, with nothing mounted (stuck, say, before
+    // or in its mount), is killed, and its exit is a crash like any other (restarted, or crashed after a streak), so
+    // the drive never stays starting for ever
     private watchForMount(proc: HelperProcess): void {
         let delay = this.timing.mountPollMs;
+        const giveUpAt = Date.now() + this.timing.mountTimeoutMs;
         const look = () => {
             this.pollTimer = null;
             if (proc !== this.proc) return;
@@ -478,7 +484,15 @@ export class VfsSupervisor {
                 this.logger.info(`Mounted the drive at ${this.opts.mountpoint}`);
                 return;
             }
-            delay = Math.min(delay * 2, 2000);
+            const left = giveUpAt - Date.now();
+            if (left <= 0) {
+                this.logger.error(
+                    `protondrive-vfs didn't mount the drive at ${this.opts.mountpoint} within ${Math.round(this.timing.mountTimeoutMs / 1000)} s; stopping it`,
+                );
+                proc.kill('SIGKILL'); // its exit (onExit) is the crash
+                return;
+            }
+            delay = Math.min(delay * 2, 2000, left);
             this.pollTimer = setTimeout(look, delay);
         };
         this.pollTimer = setTimeout(look, delay);
