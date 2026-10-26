@@ -4620,6 +4620,41 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 }
             }
 
+            // A conflict copy is a new file too: never uploaded over a cloud file that already has its name
+            for (const when of ['by a pass (keep-both)', 'by hand (keep both)'] as const) {
+                test(`a conflict copy whose name Proton Drive already has takes the next free name, made ${when}`, async () => {
+                    stateDb.updateSettings({ conflictStrategy: when === 'by hand (keep both)' ? 'prompt' : 'keep-both' });
+                    const d = setup();
+                    d.add('Docs/doc.txt', 'old');
+                    await d.engine.reconcileNow();
+                    await d.files.writeLocal('Docs/doc.txt', 'mine');
+                    let taken = '';
+                    const getFileUploader = (d.sdk as any).getFileUploader.bind(d.sdk);
+                    (d.sdk as any).getFileUploader = async (parent: unknown, name: string, ...rest: unknown[]) => {
+                        if (!taken && name.startsWith('doc (conflict ')) {
+                            taken = name;
+                            d.add(`Docs/${name}`, 'another device'); // made by another device with the same name
+                        }
+                        return getFileUploader(parent, name, ...rest);
+                    };
+
+                    await d.engine.reconcileNow();
+                    if (when === 'by hand (keep both)') {
+                        await d.engine.resolveConflictManually(stateDb.listConflicts()[0]!.id, 'keep-both');
+                    }
+
+                    expect(taken).not.toBe('');
+                    const next = taken.replace(/\.txt$/, '-1.txt');
+                    expect(d.named('vol~Docs', taken).map((n) => n.content)).toEqual(['another device']);
+                    expect(d.named('vol~Docs', next).map((n) => n.content)).toEqual(['mine']);
+                    expect(await readFile(d.local(`Docs/${next}`), 'utf8')).toBe('mine');
+                    expect(await d.files.exists(`Docs/${taken}`)).toBe(false);
+                    expect(stateDb.getItemByPath(`Docs/${next}`)?.nodeUid).toBe(d.named('vol~Docs', next)[0]!.uid);
+                    expect(stateDb.listConflicts(true).map((c) => c.conflictCopyPath)).toEqual([`Docs/${next}`]);
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('old');
+                });
+            }
+
             test('a pass still uploads an edit of a recorded file as a new revision of it', async () => {
                 const d = setup();
                 await pinnedDocs(d);

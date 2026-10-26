@@ -813,11 +813,9 @@ export class ProtonDriveSyncEngine {
 
         // Default: keep-both
         const conflictCopyFullPath = await createLocalConflictCopy(localFullPath);
-        const conflictCopyRelPath = path.relative(this.localRoot(), conflictCopyFullPath).split(path.sep).join('/');
+        const madeAs = path.relative(this.localRoot(), conflictCopyFullPath).split(path.sep).join('/');
         await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
-
-        const parentNode = await this.ensureParentFolderNode(conflictCopyRelPath, remoteMap, since);
-        await this.uploadLocalToRemote(conflictCopyRelPath, conflictCopyFullPath, parentNode, since);
+        const conflictCopyRelPath = await this.uploadConflictCopy(madeAs, remoteMap, since);
 
         this.stateDb.recordConflict({
             localRelPath: relPath,
@@ -835,6 +833,40 @@ export class ProtonDriveSyncEngine {
             localRelPath: relPath,
             details: `Resolved conflict with keep-both: saved ${conflictCopyRelPath}`,
         });
+    }
+
+    // Uploads a conflict copy just made here as a new file, never over a cloud file that already has its name: refused,
+    // the copy takes the next conflict name free here and tries again (a few times). Returns the path it ends up at.
+    private async uploadConflictCopy(
+        copyRelPath: string,
+        remoteMap: Map<string, NodeEntity>,
+        since: number,
+    ): Promise<string> {
+        const root = this.localRoot();
+        const name = path.posix.basename(copyRelPath);
+        const dot = name.lastIndexOf('.');
+        const [stem, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ''];
+        let relPath = copyRelPath;
+        let n = 0;
+        for (let attempt = 0; attempt < 10; attempt++) {
+            const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
+            const fullPath = path.join(root, relPath);
+            const result = await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, undefined, 'skip');
+            if (result.status !== 'skipped') {
+                return relPath;
+            }
+            let next: string;
+            do {
+                n += 1;
+                next = joinRel(parentOf(copyRelPath), `${stem}-${n}${ext}`);
+            } while (await this.existsLocally(next));
+            this.watcher.suppressPath(relPath);
+            this.watcher.suppressPath(next);
+            if (moveWithoutReplacing(path.join(root, relPath), path.join(root, next))) {
+                relPath = next;
+            }
+        }
+        throw new Error(`No free name in Proton Drive for ${copyRelPath}`);
     }
 
     async resolveConflictManually(
@@ -860,13 +892,9 @@ export class ProtonDriveSyncEngine {
                 this.stateDb.markConflictResolved(conflictId, 'keep-remote');
             } else {
                 const conflictCopyFullPath = await createLocalConflictCopy(localFullPath);
-                const conflictCopyRelPath = path
-                    .relative(this.localRoot(), conflictCopyFullPath)
-                    .split(path.sep)
-                    .join('/');
+                const madeAs = path.relative(this.localRoot(), conflictCopyFullPath).split(path.sep).join('/');
                 await this.downloadRemoteToLocal(conflict.localRelPath, remoteNode, localFullPath, since);
-                const parentNode = await this.ensureParentFolderNode(conflictCopyRelPath, remoteMap, since);
-                await this.uploadLocalToRemote(conflictCopyRelPath, conflictCopyFullPath, parentNode, since);
+                const conflictCopyRelPath = await this.uploadConflictCopy(madeAs, remoteMap, since);
                 this.stateDb.markConflictResolved(conflictId, 'keep-both', conflictCopyRelPath);
             }
         });
