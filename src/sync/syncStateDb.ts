@@ -3,10 +3,10 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 
 import { selfOrDescendant, selfOrDescendantWhere } from './pathRange';
+import { type ConflictStrategy, isConflictStrategy, problemWithIgnorePatterns } from './settingsRules';
 
 export type ItemSyncStatus = 'synced' | 'uploading' | 'downloading' | 'conflict' | 'error' | 'ignored';
-export const CONFLICT_STRATEGIES = ['keep-both', 'keep-local', 'keep-remote', 'prompt'] as const;
-export type ConflictStrategy = (typeof CONFLICT_STRATEGIES)[number];
+export { CONFLICT_STRATEGIES, type ConflictStrategy } from './settingsRules';
 
 export interface SyncedItemRecord {
     localRelPath: string;
@@ -163,21 +163,57 @@ export class SyncStateDatabase {
         `);
     }
 
+    // A stored value that fails the settings rules (saved before they existed) is never used: it would stop syncing
+    // (not a list of strings) or hide the drive (matches everything). The default stands in; checked once per value.
+    private checkedIgnorePatterns: { raw: string | undefined; value: string[] } | null = null;
+    private readonly warnedBadSettings = new Set<string>();
+
+    private warnBadSetting(key: string, raw: string): void {
+        if (this.warnedBadSettings.has(`${key}=${raw}`)) return;
+        this.warnedBadSettings.add(`${key}=${raw}`);
+        console.warn(`Ignoring the stored ${key} (${raw.slice(0, 80)}): not a valid value; using the default`);
+    }
+
+    private storedIgnorePatterns(raw: string | undefined): string[] {
+        const cached = this.checkedIgnorePatterns;
+        if (cached && cached.raw === raw) return [...cached.value];
+        let value = [...DEFAULT_IGNORE_PATTERNS];
+        if (raw !== undefined) {
+            let problem: string | null;
+            let parsed: unknown;
+            try {
+                parsed = JSON.parse(raw);
+                problem = problemWithIgnorePatterns(parsed);
+            } catch {
+                problem = 'not JSON';
+            }
+            if (problem === null) {
+                value = parsed as string[];
+            } else {
+                this.warnBadSetting('ignorePatterns', raw);
+            }
+        }
+        this.checkedIgnorePatterns = { raw, value };
+        return [...value];
+    }
+
     getSettings(): SyncSettings {
         const defaultSyncDir = process.env.PROTON_DRIVE_SYNC_DIR || path.join(homedir(), 'ProtonDrive');
         const rows = this.db.query('SELECT key, value FROM settings').all() as Array<{ key: string; value: string }>;
         const map = new Map(rows.map((r) => [r.key, r.value]));
 
-        let ignorePatterns = [...DEFAULT_IGNORE_PATTERNS];
-        try {
-            if (map.has('ignorePatterns')) {
-                ignorePatterns = JSON.parse(map.get('ignorePatterns')!) as string[];
-            }
-        } catch {}
+        const ignorePatterns = this.storedIgnorePatterns(map.get('ignorePatterns'));
+        const storedStrategy = map.get('conflictStrategy');
+        let conflictStrategy: ConflictStrategy = 'keep-both';
+        if (isConflictStrategy(storedStrategy)) {
+            conflictStrategy = storedStrategy;
+        } else if (storedStrategy) {
+            this.warnBadSetting('conflictStrategy', storedStrategy);
+        }
 
         return {
             syncDir: map.get('syncDir') || defaultSyncDir,
-            conflictStrategy: (map.get('conflictStrategy') as ConflictStrategy) || 'keep-both',
+            conflictStrategy,
             notificationsEnabled: map.has('notificationsEnabled') ? map.get('notificationsEnabled') === 'true' : true,
             reconcileIntervalSec: Number(map.get('reconcileIntervalSec') || 120),
             paused: map.get('paused') === 'true',

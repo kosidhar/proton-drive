@@ -128,6 +128,20 @@ describe('Resolving conflicts only over the control socket (#33)', () => {
         expect(s.drive.calls.uploads).toEqual(['a.txt']);
     });
 
+    test('the socket keeps both: the cloud copy takes the name, the local one is kept beside it and uploaded', async () => {
+        const s = setup();
+        const c = s.conflict('a.txt');
+        await s.start();
+        const res = await s.socket({ id: c.id, choice: 'keep-both' });
+        expect(res.status).toBe(200);
+        const conflict = res.json.conflict as { resolved: number; resolution: string; conflictCopyPath: string };
+        expect(conflict).toMatchObject({ resolved: 1, resolution: 'keep-both' });
+        expect(conflict.conflictCopyPath).toMatch(/^a.*conflict/);
+        expect(s.read('a.txt')).toBe('cloud copy');
+        expect(s.read(conflict.conflictCopyPath)).toBe('local copy');
+        expect(s.drive.calls.uploads).toEqual([conflict.conflictCopyPath]);
+    });
+
     test('a conflict that is already resolved is refused with 409 and nothing is touched', async () => {
         const s = setup();
         const done = s.conflict('a.txt', true);
@@ -158,6 +172,7 @@ describe('Resolving conflicts only over the control socket (#33)', () => {
         await s.start();
         const both = await Promise.all([s.socket({ id: c.id, choice: 'keep-local' }), s.socket({ id: c.id, choice: 'keep-local' })]);
         expect(both.map((r) => r.status).sort()).toEqual([200, 409]);
+        expect(String(both.find((r) => r.status === 409)!.json.error)).toMatch(/being resolved/);
         expect(s.drive.calls.uploads).toEqual(['a.txt']);
     });
 

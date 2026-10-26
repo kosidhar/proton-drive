@@ -20,7 +20,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { startControlServer } from '../src/daemon/controlServer';
-import { driveSettings, settingsRoute } from '../src/daemon/settingsRoute';
+import { driveSettings } from '../src/daemon/settingsRoute';
 import { DriveController, type DriveSupervisor } from '../src/daemon/driveController';
 import type { VfsStatus } from '../src/daemon/vfsSupervisor';
 import { readDriveLayout } from '../src/sync/driveMode';
@@ -743,12 +743,6 @@ describe('DriveController: a plain relocation cut short', () => {
 describe('Explicit actions for a move that stopped (S31)', () => {
     const over = (s: ReturnType<typeof setup>) => {
         const socketPath = path.join(s.root, 'control.sock');
-        const settings = Bun.serve({
-            port: 0,
-            hostname: '127.0.0.1',
-            fetch: (req) => settingsRoute(req, { stateDb: s.stateDb, drive: s.controller, engine: s.engine }),
-        });
-        cleanups.push(() => void settings.stop(true));
         const json = async (r: Response) => ({ status: r.status, json: (await r.json()) as Record<string, unknown> });
         return {
             start: async () => {
@@ -761,8 +755,6 @@ describe('Explicit actions for a move that stopped (S31)', () => {
                 });
                 cleanups.push(() => server.stop());
             },
-            saveSettings: (body: unknown) =>
-                fetch(`http://127.0.0.1:${settings.port}/api/settings`, { method: 'POST', body: JSON.stringify(body) }).then(json),
             driveSettings: (body: unknown) =>
                 fetch('http://localhost/drive/settings', { unix: socketPath, method: 'POST', body: JSON.stringify(body) } as RequestInit).then(json),
             move: (body: unknown) =>
@@ -944,7 +936,7 @@ describe('Explicit actions for a move that stopped (S31)', () => {
         const { s, api, to } = await stoppedRelocation();
         const old = snapshot(s.syncDir);
         const moved = snapshot(to);
-        const res = await api.saveSettings({ syncDir: s.syncDir, notificationsEnabled: true, conflictStrategy: 'keep-local' });
+        const res = await api.driveSettings({ syncDir: s.syncDir, notificationsEnabled: true, conflictStrategy: 'keep-local' });
         expect(res.status).toBe(200);
         expect(res.json).toMatchObject({ ok: true, folderError: null });
         expect(snapshot(s.syncDir)).toEqual(old);
@@ -1009,53 +1001,41 @@ describe('The drive folder and the virtual drive change only over the control so
     const over = (s: ReturnType<typeof setup>) => {
         const socketPath = path.join(s.root, 'control.sock');
         const deps = { stateDb: s.stateDb, drive: s.controller, engine: s.engine };
-        const tcp = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: (req) => settingsRoute(req, deps) });
-        cleanups.push(() => void tcp.stop(true));
         const json = async (r: Response) => ({ status: r.status, json: (await r.json()) as Record<string, unknown> });
         return {
             start: async () => {
                 const server = await startControlServer({ socketPath, engine: s.engine, driveSettings: (change) => driveSettings(change, deps) });
                 cleanups.push(() => server.stop());
             },
-            tcp: (body: unknown) => fetch(`http://127.0.0.1:${tcp.port}/api/settings`, { method: 'POST', body: JSON.stringify(body) }).then(json),
             socket: (body: unknown, raw?: string) =>
                 fetch('http://localhost/drive/settings', { unix: socketPath, method: 'POST', body: raw ?? JSON.stringify(body) } as RequestInit).then(json),
         };
     };
 
-    test('TCP refuses a changed folder and a changed switch, saves the rest, and moves nothing', async () => {
+    test('the socket ignores an unchanged folder, however written, and an unchanged switch, and saves the rest', async () => {
+        const s = setup({ wanted: false });
+        await s.boot();
+        const api = over(s);
+        await api.start();
+        const res = await api.socket({ syncDir: `${s.syncDir}/`, virtualDriveWanted: false, conflictStrategy: 'keep-local' });
+        expect(res.json).toMatchObject({ ok: true, folderError: null, switchError: null });
+        expect(s.stateDb.getSettings()).toMatchObject({ syncDir: s.syncDir, conflictStrategy: 'keep-local' });
+    });
+
+    test('the socket saves the plain settings beside a folder it refuses, and moves nothing', async () => {
         const s = setup({ wanted: false });
         s.fillTree(s.syncDir);
         await s.boot();
         const before = snapshot(s.syncDir);
         const api = over(s);
-        const to = path.join(s.root, 'Elsewhere');
-        const res = await api.tcp({ syncDir: to, virtualDriveWanted: true, notificationsEnabled: true, ignorePatterns: ['*.bak'] });
-        expect(res.status).toBe(200);
-        expect(res.json).toMatchObject({ ok: true, code: 'EACCES', virtualDriveWanted: false });
-        expect(String(res.json.folderError)).toMatch(/Proton Drive app/);
-        expect(String(res.json.switchError)).toMatch(/Proton Drive app/);
+        await api.start();
+        const busy = path.join(s.root, 'Documents');
+        s.put(path.join(busy, 'mine.txt'), "the user's own");
+        chmodSync(busy, 0o755);
+        const res = await api.socket({ syncDir: busy, notificationsEnabled: true, ignorePatterns: ['*.bak'] });
+        expect(res.json).toMatchObject({ ok: true, folderError: `Choose an empty folder, or a new one: ${busy} already holds files` });
         expect(s.stateDb.getSettings()).toMatchObject({ syncDir: s.syncDir, notificationsEnabled: true, ignorePatterns: ['*.bak'] });
-        expect(s.stateDb.getMeta('virtualDriveWanted')).toBe('0');
         expect(snapshot(s.syncDir)).toEqual(before);
-        expect(existsSync(to)).toBe(false);
-        expect(s.supervisors).toEqual([]);
-    });
-
-    test('TCP ignores an unchanged folder, however written, and an unchanged switch', async () => {
-        const s = setup({ wanted: false });
-        await s.boot();
-        const api = over(s);
-        const res = await api.tcp({ syncDir: `${s.syncDir}/`, virtualDriveWanted: false, conflictStrategy: 'keep-local' });
-        expect(res.json).toMatchObject({ ok: true, folderError: null, switchError: null });
-        expect(res.json.code).toBeUndefined();
-        expect(s.stateDb.getSettings()).toMatchObject({ syncDir: s.syncDir, conflictStrategy: 'keep-local' });
-    });
-
-    test('TCP still rejects a malformed switch', async () => {
-        const s = setup({ wanted: false });
-        await s.boot();
-        expect((await over(s).tcp({ virtualDriveWanted: 'yes' })).status).toBe(400);
     });
 
     test('the socket relocates the folder and switches the drive', async () => {
@@ -1082,7 +1062,7 @@ describe('The drive folder and the virtual drive change only over the control so
         await s.boot();
         const api = over(s);
         await api.start();
-        for (const body of [{ syncDir: 3 }, { virtualDriveWanted: 'yes' }, { notificationsEnabled: true }, [1]]) {
+        for (const body of [{ syncDir: 3 }, { virtualDriveWanted: 'yes' }, { theme: 'dark' }, { ignorePatterns: 3 }, [1]]) {
             const res = await api.socket(body);
             expect([body, res.status, res.json.code]).toEqual([body, 400, 'EINVAL']);
         }

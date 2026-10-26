@@ -1,55 +1,52 @@
-import { matchesIgnorePatterns } from '../sync/localWatcher';
-import { CONFLICT_STRATEGIES, type SyncSettings } from '../sync/syncStateDb';
+import { isConflictStrategy, CONFLICT_STRATEGIES, problemWithIgnorePatterns } from '../sync/settingsRules';
+import type { SyncSettings } from '../sync/syncStateDb';
 
-export const MAX_IGNORE_PATTERNS = 500;
-export const MAX_IGNORE_PATTERN_LENGTH = 1024;
-
-// Paths of every shape a pattern must not all ignore: one that does would hide the whole drive
-const SAMPLE_PATHS = ['a', 'a.txt', '.hidden', 'x.y.z', 'a/b', 'Documents/report.pdf', 'photos/2024/img 1.jpg', 'a/b/c/d/e'];
-
-function problemWithPattern(pattern: unknown, index: number): string | null {
-    const which = `ignorePatterns[${index}]`;
-    if (typeof pattern !== 'string' || !pattern.trim()) return `${which} must be a non-empty pattern`;
-    if (pattern.length > MAX_IGNORE_PATTERN_LENGTH) return `${which} is longer than ${MAX_IGNORE_PATTERN_LENGTH} characters`;
-    if (pattern.includes('\0')) return `${which} must not contain a null character`;
-    try {
-        const ignored = (sample: string) => matchesIgnorePatterns(sample, [pattern]);
-        // Everything, or everything inside a folder (what '*/**' hides): either way the drive would show nothing
-        if (SAMPLE_PATHS.every(ignored) || SAMPLE_PATHS.filter((sample) => sample.includes('/')).every(ignored)) {
-            return `${which} (${JSON.stringify(pattern)}) matches every file and would hide the whole drive`;
-        }
-    } catch {
-        return `${which} is not a valid pattern`;
-    }
-    return null;
-}
+export { MAX_IGNORE_PATTERN_LENGTH, MAX_IGNORE_PATTERNS } from '../sync/settingsRules';
 
 export type ParsedSettings = { ok: true; value: Partial<SyncSettings> } | { ok: false; error: string };
 
-// The settings the app may change over the TCP API: ignorePatterns (at most 500 non-empty patterns of at most 1024
-// characters, none of which matches everything), conflictStrategy (one the engine knows) and notificationsEnabled
-// (true or false). Checks all of them before anything is stored; keys it doesn't know are left out of the value.
+// The plain settings the app may change: ignorePatterns, conflictStrategy and notificationsEnabled (see
+// sync/settingsRules.ts for what they may hold). Checks all of them before anything is stored; keys it doesn't know
+// are left out of the value (parseSettingsRequest refuses them).
 export function parseSettings(body: Record<string, unknown>): ParsedSettings {
     const value: Partial<SyncSettings> = {};
     const { ignorePatterns, conflictStrategy, notificationsEnabled } = body;
     if (ignorePatterns !== undefined) {
-        if (!Array.isArray(ignorePatterns)) return { ok: false, error: 'ignorePatterns must be a list of patterns' };
-        if (ignorePatterns.length > MAX_IGNORE_PATTERNS) return { ok: false, error: `ignorePatterns holds more than ${MAX_IGNORE_PATTERNS} patterns` };
-        for (const [index, pattern] of ignorePatterns.entries()) {
-            const problem = problemWithPattern(pattern, index);
-            if (problem) return { ok: false, error: problem };
-        }
+        const problem = problemWithIgnorePatterns(ignorePatterns);
+        if (problem) return { ok: false, error: problem };
         value.ignorePatterns = ignorePatterns as string[];
     }
     if (conflictStrategy !== undefined) {
-        if (typeof conflictStrategy !== 'string' || !(CONFLICT_STRATEGIES as readonly string[]).includes(conflictStrategy)) {
+        if (!isConflictStrategy(conflictStrategy)) {
             return { ok: false, error: `conflictStrategy must be one of ${CONFLICT_STRATEGIES.join(', ')}` };
         }
-        value.conflictStrategy = conflictStrategy as SyncSettings['conflictStrategy'];
+        value.conflictStrategy = conflictStrategy;
     }
     if (notificationsEnabled !== undefined) {
         if (typeof notificationsEnabled !== 'boolean') return { ok: false, error: 'notificationsEnabled must be true or false' };
         value.notificationsEnabled = notificationsEnabled;
     }
     return { ok: true, value };
+}
+
+// What POST /drive/settings on the control socket accepts: the plain settings (settings), and the drive folder and
+// the virtual drive switch, which move files
+export interface SettingsChange {
+    settings: Partial<SyncSettings>;
+    syncDir?: string;
+    virtualDriveWanted?: boolean;
+}
+
+const SETTING_KEYS: readonly string[] = ['ignorePatterns', 'conflictStrategy', 'notificationsEnabled', 'syncDir', 'virtualDriveWanted'];
+
+// Checks every field of a request (unknown keys are refused) before anything is stored
+export function parseSettingsRequest(body: Record<string, unknown>): { ok: true; value: SettingsChange } | { ok: false; error: string } {
+    const unknown = Object.keys(body).filter((key) => !SETTING_KEYS.includes(key));
+    if (unknown.length > 0) return { ok: false, error: `Unknown setting: ${unknown.join(', ')}` };
+    const { syncDir, virtualDriveWanted } = body;
+    if (syncDir !== undefined && (typeof syncDir !== 'string' || !syncDir.trim())) return { ok: false, error: 'syncDir must be the path of a folder' };
+    if (virtualDriveWanted !== undefined && typeof virtualDriveWanted !== 'boolean') return { ok: false, error: 'virtualDriveWanted must be true or false' };
+    const plain = parseSettings(body);
+    if (!plain.ok) return plain;
+    return { ok: true, value: { settings: plain.value, syncDir, virtualDriveWanted } };
 }

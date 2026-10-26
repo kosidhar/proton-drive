@@ -18,10 +18,10 @@ import { backingDirFor, virtualDriveWanted } from '../sync/driveMode';
 import { ProtonDriveSyncEngine } from '../sync/syncEngine';
 import { SyncStateDatabase } from '../sync/syncStateDb';
 import { defaultControlSocketPath, startControlServer } from './controlServer';
+import { controlServerOptions } from './controlWiring';
 import { DriveController } from './driveController';
 import { isTrustedLocalRequest } from './requestGuard';
 import { refuseOnTcp } from './tcpRefusals';
-import { driveSettings, settingsRoute } from './settingsRoute';
 import { findHelper, fuseAvailable, mergeStrayInto, VfsSupervisor } from './vfsSupervisor';
 
 export const DEFAULT_DAEMON_PORT = Number(process.env.PROTON_DRIVE_DAEMON_PORT || 49152);
@@ -304,6 +304,15 @@ export async function startSyncDaemon(options: {
         });
     };
 
+    // Called only through the control socket (POST /remote/mkdir), never from the TCP API
+    const makeRemoteFolder = async (parentPath: string, name: string) => {
+        const parentNode = await runtime.paths.getNode(parentPath, [PathType.MyFiles, PathType.SharedWithMe, PathType.Devices]);
+        const created = await runtime.sdk.createFolder(parentNode, name);
+        remoteListCache.delete(parentPath);
+        void fetchRemotePathItems(parentPath).catch(() => {});
+        return { uid: created.uid, name: getName(created) };
+    };
+
     const settings = stateDb.getSettings();
     let controlServer: { stop(): void } | null = null;
     const reconcileTimer = setInterval(() => {
@@ -413,10 +422,6 @@ export async function startSyncDaemon(options: {
                     return Response.json(conflicts);
                 }
 
-                if (req.method === 'POST' && pathname === '/api/settings') {
-                    return settingsRoute(req, { stateDb, drive, engine });
-                }
-
                 // Remote browser endpoints
                 if (req.method === 'GET' && pathname === '/api/remote/list') {
                     if (!runtime.auth.isLoggedIn()) {
@@ -444,23 +449,6 @@ export async function startSyncDaemon(options: {
                     }
                     const items = await livePromise;
                     return Response.json({ path: remotePath, items: withAvailability(remotePath, items) });
-                }
-
-                if (req.method === 'POST' && pathname === '/api/remote/mkdir') {
-                    const body = (await req.json()) as { parentPath: string; name: string };
-                    const targetParent = body.parentPath || '/my-files';
-                    const parentNode = await runtime.paths.getNode(targetParent, [
-                        PathType.MyFiles,
-                        PathType.SharedWithMe,
-                        PathType.Devices,
-                    ]);
-                    const created = await runtime.sdk.createFolder(parentNode, body.name);
-                    remoteListCache.delete(targetParent);
-                    void fetchRemotePathItems(targetParent).catch(() => {});
-                    return Response.json({
-                        ok: true,
-                        folder: { uid: created.uid, name: getName(created) },
-                    });
                 }
 
                 // Nautilus file status lookup endpoint
@@ -510,20 +498,22 @@ export async function startSyncDaemon(options: {
     await engine.start({ backgroundInitialReconcile: true }); // does nothing while a move that stopped holds it
     ensureSystemTrayIndicator();
 
-    // The only way to pin, free, hide or unhide, and to change the drive folder or the virtual drive: a user-only Unix socket, never the TCP API above
+    // The only way to pin, free, hide or unhide, to change settings or the drive folder or the virtual drive, to sign in
+    // or out, to resolve a conflict or to make a cloud folder: a user-only Unix socket, never the TCP API above
     try {
-        controlServer = await startControlServer({
-            socketPath: defaultControlSocketPath(),
-            engine,
-            mountAgain: () => drive.mountAgain(),
-            driveMove: (action, from, to) => drive.resolveMove(action, from, to),
-            driveSettings: (change) => driveSettings(change, { stateDb, drive, engine }),
-            login: signIn,
-            logout: signOut,
-            resolveConflict: (id, choice) => engine.resolveConflictManually(id, choice),
-        });
+        controlServer = await startControlServer(
+            controlServerOptions({
+                socketPath: defaultControlSocketPath(),
+                engine,
+                drive,
+                stateDb,
+                signIn,
+                signOut,
+                makeRemoteFolder,
+            }),
+        );
     } catch (err) {
-        runtime.logger.error(`Control socket unavailable, availability actions are disabled: ${String(err)}`);
+        runtime.logger.error(`Control socket unavailable, so the app can't pin or free files, change settings, sign in or out, resolve conflicts or make folders: ${String(err)}`);
     }
     await drive.startDrive(controlServer !== null);
 

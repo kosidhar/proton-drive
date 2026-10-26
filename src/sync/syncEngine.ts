@@ -956,8 +956,11 @@ export class ProtonDriveSyncEngine {
         if (!conflict) {
             throw new ConflictRefusedError(404, `Conflict #${conflictId} not found`);
         }
-        if (conflict.resolved || this.resolvingConflicts.has(conflictId)) {
+        if (conflict.resolved) {
             throw new ConflictRefusedError(409, `Conflict #${conflictId} is already resolved`);
+        }
+        if (this.resolvingConflicts.has(conflictId)) {
+            throw new ConflictRefusedError(409, `Conflict #${conflictId} is being resolved`);
         }
         this.resolvingConflicts.add(conflictId);
         try {

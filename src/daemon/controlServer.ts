@@ -6,13 +6,15 @@ import path from 'node:path';
 import { DriveOpError } from '../sync/driveOps';
 import { type AvailabilityAction, ConflictRefusedError, type ProtonDriveSyncEngine } from '../sync/syncEngine';
 import type { ConflictRecord } from '../sync/syncStateDb';
+import { parseSettingsRequest, type SettingsChange } from './settingsValidation';
 import type { DriveMoveAction } from './vfsSupervisor';
 
 // Pin, free, hide and unhide change what is on disk, and so do the virtual drive's hydrate, rename and delete, so they
 // are reachable only through this user-only Unix socket and never through the unauthenticated TCP API.
 
 const ACTIONS: readonly string[] = ['pin', 'free', 'hide', 'unhide'] satisfies AvailabilityAction[];
-const CONFLICT_CHOICES: readonly string[] = ['keep-both', 'keep-local', 'keep-remote'];
+type ConflictChoice = Parameters<NonNullable<ControlServerOptions['resolveConflict']>>[1];
+const CONFLICT_CHOICES: readonly string[] = ['keep-both', 'keep-local', 'keep-remote'] satisfies ConflictChoice[];
 const MOVE_ACTIONS: readonly string[] = ['finish', 'move-back', 'retry'] satisfies DriveMoveAction[];
 
 export function defaultControlSocketPath(): string {
@@ -35,8 +37,11 @@ export interface ControlServerOptions {
     // Finish, move back or retry a move that stopped (see DriveController.resolveMove); its errors may carry an HTTP
     // status and the move waiting now
     driveMove?: (action: DriveMoveAction, from?: string, to?: string) => Promise<void>;
-    // Change the drive folder and the virtual drive switch (see driveSettings in settingsRoute.ts); answers the response
-    driveSettings?: (change: { syncDir?: string; virtualDriveWanted?: boolean }) => Promise<Response>;
+    // Save settings, which may move the drive folder or switch the virtual drive (see driveSettings in settingsRoute.ts);
+    // the request is checked already, and the answer is the response
+    driveSettings?: (change: SettingsChange) => Promise<Response>;
+    // Make a folder in the cloud, in the folder My files or elsewhere by its path; answers the folder made
+    remoteMkdir?: (parentPath: string, name: string) => Promise<{ uid: string; name: string }>;
     // Sign in (starts the browser sign-in and answers its URL, with what the app must show) and sign out
     login?: () => Promise<{ signInUrl: string } & Record<string, unknown>>;
     logout?: () => Promise<void>;
@@ -210,23 +215,41 @@ async function driveMoveRoute(req: Request, driveMove: ControlServerOptions['dri
     }
 }
 
-// POST /drive/settings {syncDir?, virtualDriveWanted?}: moves the Proton Drive folder and switches the virtual drive on
-// or off, which move every file: reachable only here, never through the TCP API. Answers 200 { ok: true, settings,
-// virtualDriveWanted, vfs, folderError, switchError } (an error is null or why that change was refused or failed); 400
-// { error, code } for a malformed request.
+// POST /drive/settings {ignorePatterns?, conflictStrategy?, notificationsEnabled?, syncDir?, virtualDriveWanted?}: the
+// only way to save settings. syncDir and virtualDriveWanted move every file, so they are reachable only here, never
+// through the TCP API. Every field is checked before any is stored (see parseSettingsRequest; an unknown key is
+// refused). Answers 200 { ok: true, settings, virtualDriveWanted, vfs, folderError, switchError } (an error is null or
+// why that change was refused or failed); 400 { error, code: 'EINVAL' } for an invalid request, with nothing stored.
 async function driveSettingsRoute(req: Request, driveSettings: ControlServerOptions['driveSettings']): Promise<Response> {
     const invalid = (message: string) => Response.json({ error: message, code: 'EINVAL' }, { status: 400 });
     if (req.method !== 'POST') return jsonError('Method not allowed', 405);
     if (!driveSettings) return jsonError('Not found', 404);
     const body = await jsonBody(req);
     if (!body) return invalid('Invalid JSON body');
-    const unknown = Object.keys(body).filter((key) => key !== 'syncDir' && key !== 'virtualDriveWanted');
-    if (unknown.length > 0) return invalid(`Unknown setting: ${unknown.join(', ')}`);
-    if (body.syncDir !== undefined && (typeof body.syncDir !== 'string' || !body.syncDir.trim())) return invalid('syncDir must be the path of a folder');
-    if (body.virtualDriveWanted !== undefined && typeof body.virtualDriveWanted !== 'boolean') {
-        return invalid('virtualDriveWanted must be true or false');
+    const parsed = parseSettingsRequest(body);
+    if (!parsed.ok) return invalid(parsed.error);
+    return driveSettings(parsed.value);
+}
+
+// POST /remote/mkdir {parentPath?, name}: makes a folder in the cloud, in parentPath (default /my-files). 200 { ok: true,
+// folder: { uid, name } }; 400 { error, code: 'EINVAL' } for a missing or bad name (empty, '.', '..', holding a '/')
+// or parentPath; 500 { error, code: 'EIO' } when it failed. Never reachable from the TCP API.
+async function remoteMkdirRoute(req: Request, remoteMkdir: ControlServerOptions['remoteMkdir']): Promise<Response> {
+    const invalid = (message: string) => Response.json({ error: message, code: 'EINVAL' }, { status: 400 });
+    if (req.method !== 'POST') return jsonError('Method not allowed', 405);
+    if (!remoteMkdir) return jsonError('Not found', 404);
+    const body = await jsonBody(req);
+    if (!body) return invalid('Invalid JSON body');
+    const { parentPath, name } = body;
+    if (typeof name !== 'string' || !name.trim() || name === '.' || name === '..' || name.includes('/') || name.includes('\0')) {
+        return invalid('name must be the name of a folder');
     }
-    return driveSettings({ syncDir: body.syncDir as string | undefined, virtualDriveWanted: body.virtualDriveWanted as boolean | undefined });
+    if (parentPath !== undefined && typeof parentPath !== 'string') return invalid('parentPath must be a path');
+    try {
+        return Response.json({ ok: true, folder: await remoteMkdir(parentPath || '/my-files', name) });
+    } catch (err) {
+        return Response.json({ error: messageOf(err), code: 'EIO' }, { status: 500 });
+    }
 }
 
 // POST /auth/login: starts the sign-in in the browser; 200 { ok: true, signInUrl, disclosure } (signInUrl is '' when the
@@ -258,7 +281,7 @@ async function resolveConflictRoute(req: Request, resolveConflict: ControlServer
     if (typeof id !== 'number' || !Number.isSafeInteger(id)) return invalid('id must be the number of a conflict');
     if (typeof choice !== 'string' || !CONFLICT_CHOICES.includes(choice)) return invalid(`choice must be one of ${CONFLICT_CHOICES.join(', ')}`);
     try {
-        return Response.json({ ok: true, conflict: await resolveConflict(id, choice as 'keep-both' | 'keep-local' | 'keep-remote') });
+        return Response.json({ ok: true, conflict: await resolveConflict(id, choice as ConflictChoice) });
     } catch (err) {
         if (err instanceof ConflictRefusedError) {
             return Response.json({ error: err.message, code: err.status === 404 ? 'ENOENT' : 'EEXIST' }, { status: err.status });
@@ -297,6 +320,9 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
             }
             if (url.pathname === '/conflicts/resolve') {
                 return resolveConflictRoute(req, opts.resolveConflict);
+            }
+            if (url.pathname === '/remote/mkdir') {
+                return remoteMkdirRoute(req, opts.remoteMkdir);
             }
             if (url.pathname === '/drive/settings') {
                 return driveSettingsRoute(req, opts.driveSettings);
