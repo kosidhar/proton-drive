@@ -504,11 +504,7 @@ impl State {
         match self.resolve(rel) {
             Some(Node::Local(meta)) if meta.is_dir() => Ok(()),
             Some(Node::Online(entry)) if entry.kind == Kind::Folder => {
-                // The folders missing here, deepest first, down from the nearest one that is
-                let missing: Vec<&Path> = rel
-                    .ancestors()
-                    .take_while(|p| !is_root(p) && std::fs::symlink_metadata(self.backing.join(p)).is_err())
-                    .collect();
+                let missing = self.missing_backing_folders(rel);
                 std::fs::DirBuilder::new().recursive(true).mode(0o755).create(self.backing.join(rel))?;
                 // Each folder made changes the listing it is in
                 for made in missing {
@@ -528,6 +524,7 @@ impl State {
     fn make_empty(&self, rel: &Path) -> Result<(), Errno> {
         // An online-only entry came from a UTF-8 listing, so its path is UTF-8
         let Some(rel_str) = rel.to_str() else { return Err(Errno::EIO) };
+        let missing = self.missing_backing_folders(rel.parent().unwrap_or(Path::new("")));
         match self.daemon.truncate(rel_str) {
             Ok(()) => {}
             Err(err) if err.errno == libc::EEXIST => {}
@@ -536,10 +533,19 @@ impl State {
                 return Err(self.refused(&format!("empty {rel_str:?}"), err, &allowed));
             }
         }
-        if let Some(parent) = rel.parent() {
-            self.forget_listing(parent); // it is local now
+        // It is local now, and so is each folder the daemon made to hold it
+        self.forget_listing(rel.parent().unwrap_or(Path::new("")));
+        for made in missing {
+            self.forget_listing(made.parent().unwrap_or(Path::new("")));
         }
         Ok(())
+    }
+
+    /// The folders of `rel` (itself included) missing from the backing store, deepest first, down from the nearest one
+    /// that is there.
+    fn missing_backing_folders<'a>(&self, rel: &'a Path) -> Vec<&'a Path> {
+        let missing = |p: &&Path| !is_root(p) && std::fs::symlink_metadata(self.backing.join(p)).is_err();
+        rel.ancestors().take_while(missing).collect()
     }
 
     /// The backing file behind a deferred open, put there now: downloaded, or made empty when it is about to be cut
@@ -638,14 +644,45 @@ impl State {
     }
 
     /// The errno for a rename, delete or truncate the daemon refused: its own, when it is one this call can give. A
-    /// daemon that didn't answer in time gives EIO here, though what was asked still happens there later: nothing
-    /// cancels it once it is in the daemon's queue.
+    /// daemon that didn't answer in time gives EIO here; the deadline sent with the call makes it refuse the change
+    /// if its turn comes after that, so nothing happens behind the app's back.
     fn refused(&self, what: &str, err: DaemonError, allowed: &[i32]) -> Errno {
         let errno = if allowed.contains(&err.errno) { err.errno } else { libc::EIO };
         if errno == libc::EIO {
             eprintln!("protondrive-vfs: couldn't {what}: {}", err.message);
         }
         Errno::from_i32(errno)
+    }
+
+    /// A rename through the drive, which the daemon carries out whole. Never on a session thread.
+    fn rename_through_daemon(
+        &self,
+        from: &Path,
+        from_str: &str,
+        to: &Path,
+        to_str: &str,
+        no_replace: bool,
+        tid: u32,
+    ) -> Result<(), Errno> {
+        let mut renamed = self.daemon.rename(from_str, to_str, no_replace);
+        // An online-only file can't take another's place without its content here, and mv would answer EXDEV by
+        // deleting the target before copying, which loses it if the copy then fails: downloaded first, the rename
+        // keeps the target's identity (a new revision of it). Tried on any EXDEV, whatever this helper's listing says
+        // (it may be backing off): the daemon refuses a download that doesn't apply, and that is the answer then
+        if renamed.as_ref().is_err_and(|err| err.errno == libc::EXDEV) {
+            self.hydrate(tid, from)?;
+            renamed = self.daemon.rename(from_str, to_str, no_replace);
+        }
+        match renamed {
+            Ok(()) => {
+                self.moved(from, to);
+                Ok(())
+            }
+            Err(err) => {
+                let allowed = [libc::ENOENT, libc::EEXIST, libc::EACCES, libc::EXDEV, libc::EIO];
+                Err(self.refused(&format!("rename {from_str:?} to {to_str:?}"), err, &allowed))
+            }
+        }
     }
 
     /// After a rename through the drive: its numbers follow it, and the listings it was in or under are stale.
@@ -1044,28 +1081,9 @@ impl Filesystem for DriveFs {
             return reply.error(Errno::EILSEQ); // the daemon's paths are UTF-8
         };
         let tid = req.pid();
-        s.on_worker("rename", move |s| {
-            let mut renamed = s.daemon.rename(&from_str, &to_str, no_replace);
-            // An online-only file can't take another's place without its content here, and mv would answer EXDEV by
-            // deleting the target before copying, which loses it if the copy then fails: downloaded first, the rename
-            // keeps the target's identity (a new revision of it)
-            let exdev = renamed.as_ref().is_err_and(|err| err.errno == libc::EXDEV);
-            if exdev && matches!(s.resolve(&from), Some(Node::Online(entry)) if entry.kind == Kind::File) {
-                if let Err(errno) = s.hydrate(tid, &from) {
-                    return reply.error(errno);
-                }
-                renamed = s.daemon.rename(&from_str, &to_str, no_replace);
-            }
-            match renamed {
-                Ok(()) => {
-                    s.moved(&from, &to);
-                    reply.ok()
-                }
-                Err(err) => {
-                    let allowed = [libc::ENOENT, libc::EEXIST, libc::EACCES, libc::EXDEV, libc::EIO];
-                    reply.error(s.refused(&format!("rename {from_str:?} to {to_str:?}"), err, &allowed))
-                }
-            }
+        s.on_worker("rename", move |s| match s.rename_through_daemon(&from, &from_str, &to, &to_str, no_replace, tid) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
         });
     }
 
@@ -1556,6 +1574,83 @@ mod tests {
         let deferred = Deferred { ino, flags: libc::O_WRONLY, state, settled: Condvar::new() };
         drop(SettleGuard { deferred: &deferred }); // as a panic in settle_now would
         assert!(matches!(*lock(&deferred.state), Settling::Pending));
+    }
+
+    // A daemon on a temp socket answering each request with `answer` (the request line and the JSON body)
+    fn scripted(
+        name: &str,
+        answer: impl Fn(&str, &serde_json::Value) -> (u16, String) + Send + Sync + 'static,
+    ) -> Gated {
+        let root = std::env::temp_dir().join(format!("protondrive-vfs-fs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("backing")).unwrap();
+        let socket = root.join("d.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let answer = Arc::new(answer);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let answer = answer.clone();
+                std::thread::spawn(move || {
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    let mut body_at = None;
+                    while let Ok(n @ 1..) = stream.read(&mut buf) {
+                        raw.extend_from_slice(&buf[..n]);
+                        let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                        let head = String::from_utf8_lossy(&raw[..end]).to_lowercase();
+                        let len: usize = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse().ok()))
+                            .unwrap_or(0);
+                        if raw.len() >= end + 4 + len {
+                            body_at = Some(end + 4);
+                            break;
+                        }
+                    }
+                    let Some(at) = body_at else { return };
+                    let line = String::from_utf8_lossy(&raw).lines().next().unwrap_or("").to_string();
+                    let body = serde_json::from_slice(&raw[at..]).unwrap_or(serde_json::Value::Null);
+                    let (status, reply) = answer(&line, &body);
+                    let _ = write!(stream, "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{reply}", reply.len());
+                });
+            }
+        });
+        let gate = Arc::new((Mutex::new(true), Condvar::new()));
+        let none = || Arc::new(AtomicUsize::new(0));
+        let drive = DriveFs::new(root.join("backing"), DaemonClient::new(socket));
+        Gated { drive, root, listings: none(), downloads: none(), gate }
+    }
+
+    // Review N3: an EXDEV is tried with the download whatever the helper's own listing says (here: nothing at all, as
+    // when listings are backing off from a stuck daemon)
+    #[test]
+    fn any_exdev_rename_downloads_the_source_and_tries_once_more() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let root = std::env::temp_dir().join(format!("protondrive-vfs-fs-exdev-{}", std::process::id()));
+        let backing = root.join("backing");
+        let g = scripted("exdev", move |line, body| {
+            seen.lock().unwrap().push(line.split(' ').nth(1).unwrap_or("").to_string());
+            if line.starts_with("GET /vfs/children") {
+                return (200, r#"{"entries":[]}"#.into());
+            }
+            if line.starts_with("POST /vfs/hydrate") {
+                let _ = std::fs::write(backing.join(body["path"].as_str().unwrap_or("x")), b"downloaded");
+                return (200, r#"{"ok":true}"#.into());
+            }
+            // An online-only file can't replace another: EXDEV while it has no local copy
+            if backing.join("a.txt").exists() {
+                (200, r#"{"ok":true}"#.into())
+            } else {
+                (400, r#"{"error":"Not on this computer","code":"EXDEV"}"#.into())
+            }
+        });
+        let (from, to) = (Path::new("a.txt"), Path::new("b.txt"));
+        assert_eq!(g.drive.state.rename_through_daemon(from, "a.txt", to, "b.txt", false, 0), Ok(()));
+        let calls: Vec<String> =
+            calls.lock().unwrap().iter().filter(|c| !c.starts_with("/vfs/children")).cloned().collect();
+        assert_eq!(calls, ["/vfs/rename", "/vfs/hydrate", "/vfs/rename"]);
     }
 
     #[test]

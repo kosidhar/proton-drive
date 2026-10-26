@@ -18,8 +18,9 @@ use crate::listing::{Entry, Kind};
 pub const CHILDREN_TIMEOUT: Duration = Duration::from_secs(3);
 /// A download for an open completes or fails within 30 minutes.
 pub const HYDRATE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-/// A rename, delete or truncate waits its turn in the daemon's queue, but changes only this computer: no network. One
-/// that takes longer still happens in the daemon afterwards (nothing cancels it), though the app has been told EIO.
+/// A rename, delete or truncate waits its turn in the daemon's queue, but changes only this computer: no network. Each
+/// goes with the time this limit runs out (deadlineMs), and the daemon refuses one whose turn comes later, so a change
+/// the app was told failed (EIO) never happens afterwards.
 pub const CHANGE_TIMEOUT: Duration = Duration::from_secs(60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// A daemon whose connection backlog stays full this long isn't serving.
@@ -127,7 +128,15 @@ impl DaemonClient {
         if no_replace {
             body["noReplace"] = serde_json::Value::Bool(true);
         }
-        self.request("POST", "/vfs/rename", Some(&body), CHANGE_TIMEOUT, &|| false).map(|_| ())
+        self.change("/vfs/rename", body)
+    }
+
+    /// A change of the drive, with the deadline after which the daemon must not make it any more.
+    fn change(&self, route: &str, mut body: serde_json::Value) -> Result<(), DaemonError> {
+        let deadline = std::time::SystemTime::now() + CHANGE_TIMEOUT;
+        let deadline_ms = deadline.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        body["deadlineMs"] = serde_json::Value::from(deadline_ms);
+        self.request("POST", route, Some(&body), CHANGE_TIMEOUT, &|| false).map(|_| ())
     }
 
     /// Deletes an item of the drive, everything in it included, and moves it to the cloud's trash later on. An rmdir
@@ -139,14 +148,13 @@ impl DaemonClient {
             Removal::Rmdir => body["onlyIfEmpty"] = serde_json::Value::Bool(true),
             Removal::Trash => body["trash"] = serde_json::Value::Bool(true),
         }
-        self.request("POST", "/vfs/delete", Some(&body), CHANGE_TIMEOUT, &|| false).map(|_| ())
+        self.change("/vfs/delete", body)
     }
 
     /// Makes an online-only file an empty local one, with nothing downloaded; the daemon keeps what the drive showed
     /// of it as what its new content is an edit of. EEXIST when it is on this computer already.
     pub fn truncate(&self, rel: &str) -> Result<(), DaemonError> {
-        let body = serde_json::json!({ "path": rel });
-        self.request("POST", "/vfs/truncate", Some(&body), CHANGE_TIMEOUT, &|| false).map(|_| ())
+        self.change("/vfs/truncate", serde_json::json!({ "path": rel }))
     }
 
     fn request(
@@ -525,16 +533,24 @@ mod tests {
     }
 
     #[test]
-    fn renames_and_deletes_send_their_flags_only_when_set() {
+    fn renames_and_deletes_send_their_flags_only_when_set_and_always_a_deadline() {
         let (client, bodies) = serve_recording("changes", "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}");
+        let now_ms = || std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let earliest = now_ms() + CHANGE_TIMEOUT.as_millis() as u64;
         assert_eq!(client.rename("a.txt", "Docs/b.txt", false), Ok(()));
         assert_eq!(client.rename("a.txt", "b.txt", true), Ok(()));
         assert_eq!(client.delete("Docs", Removal::Unlink), Ok(()));
         assert_eq!(client.delete("Docs", Removal::Rmdir), Ok(()));
         assert_eq!(client.delete("Docs", Removal::Trash), Ok(()));
         assert_eq!(client.truncate("Docs/a.txt"), Ok(()));
+        let latest = now_ms() + CHANGE_TIMEOUT.as_millis() as u64;
         let _ = std::fs::remove_file(&client.socket);
-        let got: Vec<serde_json::Value> = bodies.try_iter().collect();
+        let mut got: Vec<serde_json::Value> = bodies.try_iter().collect();
+        // When the helper stops waiting, so the daemon never does it later
+        for body in &mut got {
+            let deadline = body.as_object_mut().and_then(|b| b.remove("deadlineMs")).and_then(|d| d.as_u64());
+            assert!(deadline.is_some_and(|d| (earliest..=latest).contains(&d)), "{body}: {deadline:?}");
+        }
         assert_eq!(
             got,
             [

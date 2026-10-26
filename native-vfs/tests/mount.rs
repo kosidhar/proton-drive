@@ -192,7 +192,7 @@ fn serve(mut stream: UnixStream, backing: &Path, fake: &Fake, calls: &Calls) {
             (200, json!({ "entries": fake.children.lock().unwrap().get(&path).cloned().unwrap_or_default() }))
         }
         ("POST", None) if target == "/vfs/rename" => {
-            let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let body = without_deadline(&body);
             calls.renames.lock().unwrap().push(body.clone());
             let (from, to) = (body["from"].as_str().unwrap_or(""), body["to"].as_str().unwrap_or(""));
             match fake_rename(backing, fake, from, to, body["noReplace"] == json!(true)) {
@@ -201,16 +201,18 @@ fn serve(mut stream: UnixStream, backing: &Path, fake: &Fake, calls: &Calls) {
             }
         }
         ("POST", None) if target == "/vfs/truncate" => {
-            let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let body = without_deadline(&body);
             let path = body["path"].as_str().unwrap_or("").to_string();
-            calls.truncates.lock().unwrap().push(path.clone());
+            let deadline_wrong = body.get("deadlineMs").is_some();
+            let noted = if deadline_wrong { format!("{path} (deadline missing or wrong)") } else { path.clone() };
+            calls.truncates.lock().unwrap().push(noted);
             match fake_truncate(backing, fake, &path) {
                 Ok(()) => (200, json!({ "ok": true })),
                 Err(code) => (400, json!({ "error": "Refused", "code": code })),
             }
         }
         ("POST", None) if target == "/vfs/delete" => {
-            let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let body = without_deadline(&body);
             calls.deletes.lock().unwrap().push(body.clone());
             match fake_delete(backing, fake, body["path"].as_str().unwrap_or(""), body["onlyIfEmpty"] == json!(true)) {
                 Ok(()) => (200, json!({ "ok": true })),
@@ -245,6 +247,18 @@ fn serve(mut stream: UnixStream, backing: &Path, fake: &Fake, calls: &Calls) {
         "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len()
     );
+}
+
+/// A change's body as the test checks it: the helper's deadline (which must be about a minute from now) taken out, or
+/// left in, marked, when it is missing or wrong, so the test's comparison fails.
+fn without_deadline(raw: &[u8]) -> Value {
+    let mut body: Value = serde_json::from_slice(raw).unwrap_or(Value::Null);
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let deadline = body.as_object_mut().and_then(|b| b.remove("deadlineMs")).and_then(|d| d.as_u64());
+    if !deadline.is_some_and(|d| d > now_ms + 50_000 && d <= now_ms + 61_000) {
+        body["deadlineMs"] = json!(format!("missing or wrong: {deadline:?}"));
+    }
+    body
 }
 
 fn split_path(path: &str) -> (&str, &str) {
