@@ -23,7 +23,7 @@ import { startControlServer } from '../src/daemon/controlServer';
 import { createLocalConflictCopy, formatConflictFileName } from '../src/sync/conflictResolver';
 import { DriveOpError } from '../src/sync/driveOps';
 import { matchesIgnorePatterns } from '../src/sync/localWatcher';
-import { type AvailabilityResult, LOCAL_MOVE_IN_PROGRESS, ProtonDriveSyncEngine } from '../src/sync/syncEngine';
+import { type AvailabilityResult, FILES_HOLD, LOCAL_MOVE_IN_PROGRESS, ProtonDriveSyncEngine } from '../src/sync/syncEngine';
 import { RemoteOpsJournal } from '../src/sync/remoteOps';
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
 import { localFiles } from './helpers/localFiles';
@@ -2053,8 +2053,14 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
                     backingDir,
                 });
-            return { ...drive, engine: restart(), restart, localRoot, files: localFiles(stateDb, () => localRoot) };
+            // The folder the user knows, which the status and the messages name: the sync folder, also in the virtual
+            // layout (where the files are kept in the backing store)
+            const shown = stateDb.getSettings().syncDir;
+            return { ...drive, engine: restart(), restart, localRoot, shown, files: localFiles(stateDb, () => localRoot) };
         };
+        // Confirms what the status says is missing, as the app does
+        const confirmShown = (d: ReturnType<typeof setup>, engine = d.engine) =>
+            engine.confirmFilesMissingDeleted(engine.getStatus().filesMissing!);
         // Two top-level folders, synced and downloaded, and one online-only
         const synced = async (d: ReturnType<typeof setup>) => {
             d.add('Docs/a.txt', 'a');
@@ -2083,10 +2089,10 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await engine.reconcileNow(); // the timer's next pass
                 expect(d.calls.trashed).toEqual([]);
                 expect(await exists(d.localRoot)).toBe(false);
-                expect(engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.localRoot) });
+                expect(engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.shown) });
                 expect(stateDb.getAllItems()).toHaveLength(records);
                 expect(missingWarnings(d)).toHaveLength(1);
-                expect(stateDb.listActivity(50).filter((a) => a.details === missing(d.localRoot))).toHaveLength(1);
+                expect(stateDb.listActivity(50).filter((a) => a.details === missing(d.shown))).toHaveLength(1);
             } finally {
                 await engine.stop();
             }
@@ -2108,12 +2114,12 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 treeEventScopeId: 's',
                 eventId: 'e1',
             });
-            await expect(d.engine.setAvailability('Docs', 'pin')).rejects.toThrow(missing(d.localRoot));
+            await expect(d.engine.setAvailability('Docs', 'pin')).rejects.toThrow(missing(d.shown));
 
             expect(d.calls.trashed).toEqual([]);
             expect(stateDb.getAllItems()).toHaveLength(records);
             expect(await readdir(d.localRoot)).toEqual([]);
-            expect(d.engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.localRoot) });
+            expect(d.engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.shown) });
         });
 
         test('the virtual layout with an emptied store trashes nothing, and an open of an online-only file is refused', async () => {
@@ -2123,13 +2129,13 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await mkdir(d.localRoot);
 
             await d.engine.reconcileNow();
-            await expect(d.engine.hydrate('Notes/n.txt')).rejects.toMatchObject({ code: 'EIO', message: missing(d.localRoot) });
+            await expect(d.engine.hydrate('Notes/n.txt')).rejects.toMatchObject({ code: 'EIO', message: missing(d.shown) });
 
             expect(d.calls.trashed).toEqual([]);
             expect(d.calls.downloads.filter((p) => p.startsWith('Notes'))).toEqual([]);
             expect(stateDb.getAllItems()).toHaveLength(records);
             expect(await readdir(d.localRoot)).toEqual([]);
-            expect(d.engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.localRoot) });
+            expect(d.engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.shown) });
         });
 
         test('once the files are back, the next pass syncs as usual, and a genuine delete then reaches Proton Drive', async () => {
@@ -2194,7 +2200,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(d.calls.trashed).toEqual([]);
                 expect(d.calls.uploads).toEqual([]);
                 expect(stateDb.getItemByPath('New.txt')).toBeNull();
-                expect(d.engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.localRoot) });
+                expect(d.engine.getStatus()).toMatchObject({ state: 'error', lastError: missing(d.shown) });
 
                 // The originals back (the new file stays beside them): everything goes on, the new file uploads
                 for (const name of await readdir(away)) await rename(path.join(away, name), path.join(d.localRoot, name));
@@ -2218,7 +2224,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.calls.trashed).toEqual([]);
             expect(d.engine.getStatus()).toMatchObject({
                 state: 'error',
-                filesMissing: { root: d.localRoot, names: ['Photos'], items: 2 },
+                filesMissing: { root: d.shown, names: ['Photos'], items: 2 },
             });
 
             await rename(path.join(away, 'Photos'), path.join(d.localRoot, 'Photos'));
@@ -2233,7 +2239,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await rm(d.localRoot, { recursive: true });
             await d.engine.reconcileNow();
             // Docs, Docs/a.txt, Docs/b.txt, Photos, Photos/p.jpg
-            expect(d.engine.getStatus().filesMissing).toEqual({ root: d.localRoot, names: ['Docs', 'Photos'], items: 5 });
+            expect(d.engine.getStatus().filesMissing).toEqual({ root: d.shown, names: ['Docs', 'Photos'], items: 5 });
         });
 
         test('confirming they were deleted on purpose trashes exactly the missing recorded items, once', async () => {
@@ -2249,7 +2255,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.engine.getStatus().state).toBe('error');
             expect(d.calls.trashed).toEqual([]);
 
-            expect(await d.engine.confirmFilesMissingDeleted()).toEqual({ root: d.localRoot, names: ['Photos'], items: 2 });
+            expect(await confirmShown(d)).toEqual({ root: d.shown, names: ['Photos'], items: 2 });
             await d.engine.holdForMove(); // waits for the pass the confirmation started
             d.engine.releaseHold();
 
@@ -2267,7 +2273,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await rm(path.join(d.localRoot, 'Docs'), { recursive: true });
             await rm(path.join(d.localRoot, 'Photos'), { recursive: true });
             await d.engine.reconcileNow();
-            await d.engine.confirmFilesMissingDeleted();
+            await confirmShown(d);
             await d.engine.holdForMove();
             d.engine.releaseHold();
             expect(d.calls.trashed.flat().sort()).toEqual(['vol~Docs', 'vol~Photos']);
@@ -2284,7 +2290,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
         test('confirming with nothing missing is refused, and the last top-level item deleted here is held until confirmed', async () => {
             const d = setup();
-            await expect(d.engine.confirmFilesMissingDeleted()).rejects.toMatchObject({ status: 409 });
+            await expect(d.engine.confirmFilesMissingDeleted({ root: d.shown, names: [] })).rejects.toMatchObject({ status: 409 });
             d.add('Only/x.txt', 'x');
             d.engine.availability.setPin(d.add('Only').uid, 'pinned', false);
             await d.engine.reconcileNow();
@@ -2292,7 +2298,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await d.engine.reconcileNow();
             expect(d.calls.trashed).toEqual([]);
 
-            await d.engine.confirmFilesMissingDeleted();
+            await confirmShown(d);
             await d.engine.holdForMove();
             d.engine.releaseHold();
             expect(d.calls.trashed).toEqual([['vol~Only']]);
@@ -2319,6 +2325,219 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             } finally {
                 await d.engine.stop();
             }
+        });
+
+        // #46: the hold ended once every top-level item it waited for was there again, so a restore by copy ended it as
+        // soon as the last top-level folder was made, and the next pass trashed what wasn't copied yet. The first pass
+        // after a hold now takes nothing missing for a delete: it holds again on whatever recorded item is still missing,
+        // at any depth, until it is back or the user confirms it was deleted.
+        // Docs (a.txt, b.txt) and Photos (p.jpg, p2.jpg) synced, Notes online-only; a backup of the folder, then it is gone
+        const lost = async (d: ReturnType<typeof setup>) => {
+            d.add('Photos/p2.jpg', 'p2');
+            await synced(d);
+            const backup = path.join(tempDir, 'backup');
+            await cp(d.localRoot, backup, { recursive: true, preserveTimestamps: true });
+            await rm(d.localRoot, { recursive: true, force: true });
+            await d.engine.reconcileNow();
+            expect(d.engine.getStatus()).toMatchObject({ state: 'error', filesMissing: { names: ['Docs', 'Photos'] } });
+            // Copies an item back from the backup, as a file manager or cp does (times kept)
+            return async (rel: string, opts: { onlyTheFolder?: boolean } = {}) => {
+                const to = path.join(d.localRoot, rel);
+                await mkdir(path.dirname(to), { recursive: true });
+                if (opts.onlyTheFolder) {
+                    await mkdir(to);
+                } else {
+                    await cp(path.join(backup, rel), to, { recursive: true, preserveTimestamps: true });
+                }
+            };
+        };
+        const held = (d: ReturnType<typeof setup>, names: string[], items: number) => ({
+            state: 'error',
+            lastError: missing(d.shown),
+            filesMissing: { root: d.shown, names, items },
+        });
+
+        for (const layout of ['plain', 'virtual'] as const) {
+            test(`${layout}: a restore by copy that has made Photos with one of its two files trashes nothing, and holds on the other`, async () => {
+                const d = setup(layout);
+                const copyBack = await lost(d);
+                await copyBack('Docs');
+                await copyBack('Photos', { onlyTheFolder: true });
+                await copyBack('Photos/p.jpg'); // p2.jpg isn't copied yet
+
+                await d.engine.reconcileNow(); // the timer's next pass
+                await d.engine.reconcileNow();
+
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.engine.getStatus()).toMatchObject(held(d, ['Photos/p2.jpg'], 1));
+
+                // p2.jpg lands: everything goes on, with nothing uploaded again or trashed
+                await copyBack('Photos/p2.jpg');
+                await d.engine.reconcileNow();
+                expect(d.engine.getStatus()).toMatchObject({ state: 'idle', lastError: null, filesMissing: null });
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.nodes.has('vol~Photos/p2.jpg')).toBe(true);
+
+                // A delete after that is the user's, as ever
+                await rm(path.join(d.localRoot, 'Docs/a.txt'));
+                await d.engine.reconcileNow();
+                expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+            });
+        }
+
+        test('a full restore ends the hold, and the pass after it syncs as usual', async () => {
+            const d = setup();
+            const copyBack = await lost(d);
+            await copyBack('Docs');
+            await copyBack('Photos');
+            await d.files.writeLocal('Docs/new.txt', 'new');
+
+            await d.engine.reconcileNow();
+
+            expect(d.engine.getStatus()).toMatchObject({ state: 'idle', lastError: null, filesMissing: null });
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.calls.uploads).toEqual(['Docs/new.txt']);
+            expect(stateDb.getMeta(FILES_HOLD)).toBeNull(); // looked at: the hold is over
+            await rm(path.join(d.localRoot, 'Photos/p.jpg'));
+            await d.engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([['vol~Photos/p.jpg']]);
+        });
+
+        test('the hold, and the look at what is missing after it, survive a restart of the daemon', async () => {
+            const d = setup();
+            const copyBack = await lost(d);
+            await copyBack('Docs'); // Photos still missing
+
+            let engine = d.restart();
+            expect(engine.getStatus()).toMatchObject(held(d, ['Photos'], 3)); // before any pass
+            await engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([]);
+            expect(engine.getStatus()).toMatchObject(held(d, ['Photos'], 3));
+
+            // Photos made, with one of its files, and the daemon restarted before the pass that would look at it
+            await copyBack('Photos', { onlyTheFolder: true });
+            await copyBack('Photos/p.jpg');
+            expect(engine.getStatus().filesMissing).toBeNull(); // every top-level item waited for is there
+            engine = d.restart();
+            await engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([]);
+            expect(engine.getStatus()).toMatchObject(held(d, ['Photos/p2.jpg'], 1));
+
+            await copyBack('Photos/p2.jpg');
+            engine = d.restart();
+            await engine.reconcileNow();
+            expect(engine.getStatus()).toMatchObject({ state: 'idle', lastError: null, filesMissing: null });
+            expect(d.calls.trashed).toEqual([]);
+        });
+
+        test('a pass that fails after the hold ends leaves the next one taking nothing missing for a delete either', async () => {
+            const d = setup();
+            const copyBack = await lost(d);
+            await copyBack('Docs');
+            await copyBack('Photos', { onlyTheFolder: true });
+            await copyBack('Photos/p.jpg');
+
+            d.failNext('iterateFolderChildren'); // the network drops as the pass starts listing
+            await d.engine.reconcileNow();
+            expect(d.engine.getStatus().state).toBe('error');
+            await d.engine.reconcileNow();
+
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.engine.getStatus()).toMatchObject(held(d, ['Photos/p2.jpg'], 1));
+        });
+
+        test('confirming after a partial return trashes exactly what the dialog counted, and holds on anything else missing', async () => {
+            const d = setup();
+            const copyBack = await lost(d);
+            await copyBack('Docs', { onlyTheFolder: true });
+            await copyBack('Docs/a.txt'); // Docs/b.txt isn't back, and Photos isn't either
+            await d.engine.reconcileNow();
+            const shownBefore = d.engine.getStatus().filesMissing;
+            expect(shownBefore).toEqual({ root: d.shown, names: ['Photos'], items: 3 });
+
+            expect(await confirmShown(d)).toEqual(shownBefore!);
+            await d.engine.holdForMove(); // waits for the pass the confirmation started
+            d.engine.releaseHold();
+
+            expect(d.calls.trashed).toEqual([['vol~Photos']]); // the 3 items counted: Photos, p.jpg and p2.jpg
+            expect(d.nodes.has('vol~Docs/b.txt')).toBe(true);
+            expect(d.engine.getStatus()).toMatchObject(held(d, ['Docs/b.txt'], 1));
+
+            // That one can be confirmed in turn
+            await confirmShown(d);
+            await d.engine.holdForMove();
+            d.engine.releaseHold();
+            expect(d.calls.trashed).toEqual([['vol~Photos'], ['vol~Docs/b.txt']]);
+            expect(d.engine.getStatus()).toMatchObject({ state: 'idle', lastError: null, filesMissing: null });
+        });
+
+        test('a confirmation must name exactly what is missing: anything else is refused (409) and deletes nothing', async () => {
+            const d = setup();
+            await synced(d);
+            await rm(path.join(d.localRoot, 'Docs'), { recursive: true });
+            await rm(path.join(d.localRoot, 'Photos'), { recursive: true });
+            await d.engine.reconcileNow();
+
+            for (const wrong of [
+                { root: d.shown, names: ['Docs'] },
+                { root: d.shown, names: ['Docs', 'Photos', 'Notes'] },
+                { root: path.join(tempDir, 'Elsewhere'), names: ['Docs', 'Photos'] },
+            ]) {
+                await expect(d.engine.confirmFilesMissingDeleted(wrong)).rejects.toMatchObject({ status: 409 });
+            }
+            await d.engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.engine.getStatus()).toMatchObject(held(d, ['Docs', 'Photos'], 5));
+
+            // The same names in another order are the same confirmation
+            expect(await d.engine.confirmFilesMissingDeleted({ root: d.shown, names: ['Photos', 'Docs'] })).toMatchObject({
+                names: ['Docs', 'Photos'],
+            });
+            await d.engine.holdForMove();
+            d.engine.releaseHold();
+            expect(d.calls.trashed.flat().sort()).toEqual(['vol~Docs', 'vol~Photos']);
+        });
+
+        test('being held again after the files came back says what is still missing once, and a new loss is said anew', async () => {
+            const d = setup();
+            // Told as everything missing: the warning, the activity entry and the notification go together
+            const saidMissing = () => d.warnings.filter((w) => w === missing(d.shown));
+            const copyBack = await lost(d);
+            expect(saidMissing()).toHaveLength(1);
+            await copyBack('Docs');
+            await copyBack('Photos', { onlyTheFolder: true });
+            await d.engine.reconcileNow();
+            await d.engine.reconcileNow();
+            // Held again on Photos/p.jpg and p2.jpg: told once, as what is still missing, not as everything missing
+            expect(saidMissing()).toHaveLength(1);
+            const stillMissing = stateDb.listActivity(50).filter((a) => a.details.startsWith('Still missing from'));
+            expect(stillMissing.map((a) => a.details)).toEqual([
+                `Still missing from ${d.shown} after the files came back: Photos/p.jpg and Photos/p2.jpg. Nothing was deleted in Proton Drive; Proton Drive waits for them.`,
+            ]);
+
+            // Back, then the whole folder gone again before a pass looked: a new loss, said again
+            await copyBack('Photos/p.jpg');
+            await copyBack('Photos/p2.jpg');
+            expect(d.engine.getStatus().filesMissing).toBeNull();
+            await rename(d.localRoot, path.join(tempDir, 'away again'));
+            await d.engine.reconcileNow();
+            expect(saidMissing()).toHaveLength(2);
+            expect(d.calls.trashed).toEqual([]);
+        });
+
+        test('virtual: the status and the messages name the sync folder, never the backing store', async () => {
+            const d = setup('virtual');
+            await synced(d);
+            await rm(d.localRoot, { recursive: true, force: true });
+            await mkdir(d.localRoot);
+            await d.engine.reconcileNow();
+
+            const status = d.engine.getStatus();
+            expect(status.filesMissing?.root).toBe(stateDb.getSettings().syncDir);
+            expect(status.lastError).toBe(missing(stateDb.getSettings().syncDir));
+            expect(JSON.stringify(status.filesMissing)).not.toContain(d.localRoot);
+            expect(stateDb.listActivity(50).map((a) => a.details).join('\n')).not.toContain(`missing from ${d.localRoot}`);
         });
     });
 

@@ -359,9 +359,11 @@ describe('POST /vfs/mount', () => {
     });
 });
 
-// S39: the user says the files missing from the folder were deleted on purpose, so they go to the Proton Drive trash
+// S39 / #46: the user says the files missing from the folder, as they were shown (root and names), were deleted on
+// purpose, so they go to the Proton Drive trash; anything else than what is missing now is refused
 describe('POST /sync/files-missing', () => {
-    async function startWith(confirm?: () => Promise<{ root: string; names: string[]; items: number }>) {
+    type Expected = { root: string; names: string[] };
+    async function startWith(confirm?: (expected: Expected) => Promise<{ root: string; names: string[]; items: number }>) {
         const root = mkdtempSync(path.join(os.tmpdir(), 'pd-control-'));
         cleanups.push(() => rmSync(root, { recursive: true, force: true }));
         const socketPath = path.join(root, 'control.sock');
@@ -370,40 +372,57 @@ describe('POST /sync/files-missing', () => {
         return socketPath;
     }
     const post = (socketPath: string, body: string) => call(socketPath, '/sync/files-missing', { method: 'POST', body });
+    const shown = { action: 'delete-in-cloud', root: '/home/u/ProtonDrive', names: ['Docs', 'Photos/p2.jpg'] };
 
-    test('delete-in-cloud confirms, and answers what was confirmed', async () => {
-        let calls = 0;
-        const socketPath = await startWith(async () => {
-            calls++;
-            return { root: '/home/u/ProtonDrive', names: ['Docs'], items: 3 };
+    test('delete-in-cloud passes on what the user was shown, and answers what was confirmed', async () => {
+        const seen: Expected[] = [];
+        const socketPath = await startWith(async (expected) => {
+            seen.push(expected);
+            return { root: '/home/u/ProtonDrive', names: ['Docs', 'Photos/p2.jpg'], items: 3 };
         });
-        const res = await post(socketPath, JSON.stringify({ action: 'delete-in-cloud' }));
+        const res = await post(socketPath, JSON.stringify(shown));
         expect(res.status).toBe(200);
-        expect(await res.json()).toEqual({ ok: true, root: '/home/u/ProtonDrive', names: ['Docs'], items: 3 });
-        expect(calls).toBe(1);
+        expect(await res.json()).toEqual({ ok: true, root: '/home/u/ProtonDrive', names: ['Docs', 'Photos/p2.jpg'], items: 3 });
+        expect(seen).toEqual([{ root: '/home/u/ProtonDrive', names: ['Docs', 'Photos/p2.jpg'] }]);
     });
 
-    test('with nothing missing it is 409 with the reason', async () => {
-        const socketPath = await startWith(async () => {
-            throw new FilesMissingRefused('Nothing is missing from /home/u/ProtonDrive');
-        });
-        const res = await post(socketPath, JSON.stringify({ action: 'delete-in-cloud' }));
-        expect(res.status).toBe(409);
-        expect(await res.json()).toEqual({ error: 'Nothing is missing from /home/u/ProtonDrive', code: 'EEXIST' });
+    test('with nothing missing, or something else missing than what was shown, it is 409 with the reason', async () => {
+        for (const reason of ['Nothing is missing from /home/u/ProtonDrive', 'What is missing from /home/u/ProtonDrive has changed']) {
+            const socketPath = await startWith(async () => {
+                throw new FilesMissingRefused(reason);
+            });
+            const res = await post(socketPath, JSON.stringify(shown));
+            expect(res.status).toBe(409);
+            expect(await res.json()).toEqual({ error: reason, code: 'EEXIST' });
+        }
     });
 
-    test('anything but {action: "delete-in-cloud"} is 400 and confirms nothing; only POST', async () => {
+    test('anything but {action: "delete-in-cloud", root, names} is 400 and confirms nothing; only POST', async () => {
         let calls = 0;
         const socketPath = await startWith(async () => {
             calls++;
             return { root: '/r', names: [], items: 0 };
         });
-        for (const body of ['{}', '{"action":"keep"}', 'not json', '[]']) {
-            expect((await post(socketPath, body)).status).toBe(400);
+        const { root, names } = shown;
+        for (const body of [
+            '{}',
+            '{"action":"keep"}',
+            'not json',
+            '[]',
+            JSON.stringify({ action: 'delete-in-cloud' }), // what the app sent before #46: it names nothing
+            JSON.stringify({ action: 'delete-in-cloud', names }),
+            JSON.stringify({ action: 'delete-in-cloud', root }),
+            JSON.stringify({ action: 'delete-in-cloud', root: '', names }),
+            JSON.stringify({ action: 'delete-in-cloud', root, names: [] }),
+            JSON.stringify({ action: 'delete-in-cloud', root, names: 'Docs' }),
+            JSON.stringify({ action: 'delete-in-cloud', root, names: ['Docs', 3] }),
+            JSON.stringify({ action: 'delete-in-cloud', root, names: [''] }),
+        ]) {
+            expect({ body, status: (await post(socketPath, body)).status }).toEqual({ body, status: 400 });
         }
         expect((await call(socketPath, '/sync/files-missing')).status).toBe(405);
         expect(calls).toBe(0);
-        expect((await post(await startWith(), JSON.stringify({ action: 'delete-in-cloud' }))).status).toBe(404);
+        expect((await post(await startWith(), JSON.stringify(shown))).status).toBe(404);
     });
 });
 

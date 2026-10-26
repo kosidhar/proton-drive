@@ -48,9 +48,10 @@ export interface ControlServerOptions {
     // Resolve a conflict by hand (see ProtonDriveSyncEngine.resolveConflictManually); throws ConflictRefusedError for an
     // unknown or already resolved one
     resolveConflict?: (id: number, choice: 'keep-both' | 'keep-local' | 'keep-remote') => Promise<ConflictRecord>;
-    // The user says the files missing from the folder were deleted on purpose (see
-    // ProtonDriveSyncEngine.confirmFilesMissingDeleted); throws FilesMissingRefused when nothing is missing
-    confirmFilesMissingDeleted?: () => Promise<{ root: string; names: string[]; items: number }>;
+    // The user says the files missing from the folder, as they were shown (the status's filesMissing root and names),
+    // were deleted on purpose (see ProtonDriveSyncEngine.confirmFilesMissingDeleted); throws FilesMissingRefused when
+    // nothing is missing, or something else than what was shown
+    confirmFilesMissingDeleted?: (expected: { root: string; names: string[] }) => Promise<{ root: string; names: string[]; items: number }>;
 }
 
 // 'live' when something accepts connections on the socket, 'stale' when it refuses or is gone
@@ -293,19 +294,25 @@ async function resolveConflictRoute(req: Request, resolveConflict: ControlServer
     }
 }
 
-// POST /sync/files-missing {action: 'delete-in-cloud'}: the files missing from the folder (the engine holds while they
-// are) were deleted on purpose, so the next sync pass moves them to the Proton Drive trash. 200 { ok: true, root, names,
-// items } with what was confirmed; 400 { error, code: 'EINVAL' } for anything else; 409 { error, code: 'EEXIST' } when
-// nothing is missing; 500 { error, code: 'EIO' } otherwise. Never reachable from the TCP API.
+// POST /sync/files-missing {action: 'delete-in-cloud', root, names}: the files missing from the folder (the engine holds
+// while they are) were deleted on purpose, so the next sync pass moves them to the Proton Drive trash. root and names are
+// what the user was shown (filesMissing in /api/status), which must still be exactly what is missing, as /drive/move
+// names its move by from and to. 200 { ok: true, root, names, items } with what was confirmed; 400 { error, code:
+// 'EINVAL' } for a malformed request; 409 { error, code: 'EEXIST' } when nothing is missing, or something else than
+// what was shown; 500 { error, code: 'EIO' } otherwise. Never reachable from the TCP API.
 async function filesMissingRoute(req: Request, confirm: ControlServerOptions['confirmFilesMissingDeleted']): Promise<Response> {
+    const invalid = (message: string) => Response.json({ error: message, code: 'EINVAL' }, { status: 400 });
     if (req.method !== 'POST') return jsonError('Method not allowed', 405);
     if (!confirm) return jsonError('Not found', 404);
     const body = await jsonBody(req);
-    if (!body || body.action !== 'delete-in-cloud') {
-        return Response.json({ error: 'action must be delete-in-cloud', code: 'EINVAL' }, { status: 400 });
+    if (!body || body.action !== 'delete-in-cloud') return invalid('action must be delete-in-cloud');
+    const { root, names } = body;
+    if (typeof root !== 'string' || !root) return invalid('root must be the folder the files are missing from');
+    if (!Array.isArray(names) || names.length === 0 || !names.every((name) => typeof name === 'string' && name !== '')) {
+        return invalid('names must be the items missing');
     }
     try {
-        return Response.json({ ok: true, ...(await confirm()) });
+        return Response.json({ ok: true, ...(await confirm({ root, names: names as string[] })) });
     } catch (err) {
         if (err instanceof FilesMissingRefused) {
             return Response.json({ error: err.message, code: 'EEXIST' }, { status: 409 });

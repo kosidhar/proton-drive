@@ -26,7 +26,7 @@ export function controlServerOptions(deps: {
         login: deps.signIn,
         logout: deps.signOut,
         resolveConflict: (id, choice) => engine.resolveConflictManually(id, choice),
-        confirmFilesMissingDeleted: () => engine.confirmFilesMissingDeleted(),
+        confirmFilesMissingDeleted: (expected) => engine.confirmFilesMissingDeleted(expected),
         remoteMkdir: deps.makeRemoteFolder,
     };
 }

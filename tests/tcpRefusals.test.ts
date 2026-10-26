@@ -72,8 +72,8 @@ describe('What the TCP API refuses, and how the daemon is wired (#32, #33, #36)'
                     return { id } as never;
                 },
                 reconcileNow: async () => {},
-                confirmFilesMissingDeleted: async () => {
-                    calls.push(['files-missing']);
+                confirmFilesMissingDeleted: async (expected: unknown) => {
+                    calls.push(['files-missing', expected]);
                     return { root: '/r', names: ['Docs'], items: 1 };
                 },
             } as never,
@@ -102,8 +102,19 @@ describe('What the TCP API refuses, and how the daemon is wired (#32, #33, #36)'
         expect((await post('/remote/mkdir', { parentPath: '/my-files', name: 'New' })).json).toEqual({ ok: true, folder: { uid: 'u1', name: 'New' } });
         expect((await post('/drive/settings', { notificationsEnabled: false })).status).toBe(200);
         expect(stateDb.getSettings().notificationsEnabled).toBe(false);
-        expect((await post('/sync/files-missing', { action: 'delete-in-cloud' })).json).toEqual({ ok: true, root: '/r', names: ['Docs'], items: 1 });
-        expect(calls).toEqual([['signIn'], ['signOut'], ['resolve', 3, 'keep-local'], ['mkdir', '/my-files', 'New'], ['files-missing']]);
+        expect((await post('/sync/files-missing', { action: 'delete-in-cloud', root: '/r', names: ['Docs'] })).json).toEqual({
+            ok: true,
+            root: '/r',
+            names: ['Docs'],
+            items: 1,
+        });
+        expect(calls).toEqual([
+            ['signIn'],
+            ['signOut'],
+            ['resolve', 3, 'keep-local'],
+            ['mkdir', '/my-files', 'New'],
+            ['files-missing', { root: '/r', names: ['Docs'] }],
+        ]);
     });
 
     test('the mkdir route checks its body and reports a failure', async () => {
