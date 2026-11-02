@@ -2890,9 +2890,13 @@ export class ProtonDriveSyncEngine {
     // A rename, delete or cloud move of it meanwhile makes it reject with ENOENT. Rejects with a DriveOpError:
     // `Hidden: <path>` (EACCES) for an item hidden or being hidden, `Not in Proton Drive: <path>` (ENOENT), `Not a file:
     // <path>` (EIO), or the download's error (EIO); with `Invalid path: <path>` for a path that climbs out of My files.
-    hydrate(relPath: string): Promise<void> {
+    hydrate(relPath: string, opts: { opener?: string } = {}): Promise<void> {
         let rel: string;
         try {
+            // An app the user blocked is refused first, quietly: it may be walking a whole folder
+            if (opts.opener !== undefined && this.stateDb.getSettings().blockedApps.includes(opts.opener)) {
+                throw new DriveOpError('EACCES', `Blocked: ${opts.opener}`);
+            }
             this.refuseWhileHeld();
             this.refuseWhileFilesGone();
             rel = normalizeDrivePath(relPath);
