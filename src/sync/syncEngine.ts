@@ -18,7 +18,7 @@ import {
     ValidationError,
 } from '@protontech/drive-sdk';
 
-import { sendDesktopNotification } from '../linux/notifications';
+import { sendActionNotification, sendDesktopNotification } from '../linux/notifications';
 import type { Manager as EventsManager } from '../sdk/events/manager';
 import {
     computeLocalFileSha1,
@@ -32,6 +32,8 @@ import {
 } from '../sdk/fileOps';
 import { getClaimedSize, getName } from '../sdk/node';
 import { AvailabilityPolicy, type ItemAvailability } from './availability';
+import { DownloadWatch } from './downloadWatch';
+import { problemWithBlockedApps } from './settingsRules';
 import { StateEvents } from './stateEvents';
 import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
 import { createLocalConflictCopy, formatConflictFileName } from './conflictResolver';
@@ -255,6 +257,8 @@ export class ProtonDriveSyncEngine {
     private replayAfterPass = false;
     // Downloads for the virtual drive under way, by path: a second open of the same file waits for the same one
     private hydrations = new Map<string, Promise<void>>();
+    // Downloads by app, to tell the user when one app downloads many files (see DownloadWatch)
+    private readonly downloadWatch = new DownloadWatch();
     private hydrateStaging = new Set<string>(); // their staging files
     private slowDownloadNoticeMs = SLOW_DOWNLOAD_NOTICE_MS;
     // Held while the files move between the sync folder and the backing store (see holdForMove): nothing new starts, and
@@ -288,6 +292,8 @@ export class ProtonDriveSyncEngine {
             // Deletes GNOME's failed-thumbnail record of a file by its path under the mount (see thumbnailCache)
             forgetFailedThumbnail?: (mountFullPath: string) => Promise<void>;
             moveSeams?: MoveSeams; // for tests: moving the sync folder
+            // How the user is asked about an app downloading many files (sendActionNotification; for tests)
+            askWithActions?: typeof sendActionNotification;
             // For tests: when the coalesced state changes go out (see StateEvents)
             stateEventSchedule?: (run: () => void, delayMs: number) => () => void;
             // For tests: how long what is missing while held is taken as known (FILES_MISSING_CACHE_MS; see stillMissing)
@@ -2907,7 +2913,7 @@ export class ProtonDriveSyncEngine {
         if (running) {
             return running;
         }
-        const run = this.hydrateNow(rel).finally(() => {
+        const run = this.hydrateNow(rel, opts.opener).finally(() => {
             this.hydrations.delete(rel);
             this.stateEvents.touch(rel);
         });
@@ -2916,11 +2922,58 @@ export class ProtonDriveSyncEngine {
         return run;
     }
 
-    private async hydrateNow(rel: string): Promise<void> {
+    // One app downloaded many files in the last minute: the user is told, and can block it from the notification. Without
+    // buttons (an old notify-send), the notification says where to block it instead.
+    private noticeMassDownload(app: string, count: number): void {
+        const enabled = this.stateDb.getSettings().notificationsEnabled;
+        if (!enabled) {
+            return;
+        }
+        const title = `${app} is downloading many files from Proton Drive`;
+        const body = `It has downloaded ${count} files in the last minute.`;
+        this.logger.info(`${title} (${count} in the last minute)`);
+        const ask = this.options.askWithActions ?? sendActionNotification;
+        void ask({ title, body, actions: [{ key: 'block', label: 'Block this app' }], enabled })
+            .then((choice) => {
+                if (choice === 'block') {
+                    this.blockApp(app);
+                } else if (choice === 'unsupported') {
+                    sendDesktopNotification({ title, body: `${body} You can block it in Proton Drive's Settings.`, enabled });
+                }
+            })
+            .catch(() => {});
+    }
+
+    // Adds an app to the blocklist (the user chose Block this app), unless it is there already or the list is full
+    private blockApp(app: string): void {
+        const current = this.stateDb.getSettings().blockedApps;
+        const next = current.includes(app) ? current : [...current, app];
+        if (problemWithBlockedApps(next) !== null) {
+            this.logger.warn(`Can't block ${app}: ${problemWithBlockedApps(next)}`);
+            return;
+        }
+        if (next !== current) {
+            this.stateDb.updateSettings({ blockedApps: next });
+            this.logger.info(`Blocked ${app} from downloading files from Proton Drive`);
+        }
+        sendDesktopNotification({
+            title: `${app} is blocked`,
+            body: "It can't download files from Proton Drive any more. Unblock it in Settings.",
+            enabled: this.stateDb.getSettings().notificationsEnabled,
+        });
+    }
+
+    private async hydrateNow(rel: string, opener: string | undefined): Promise<void> {
         const name = path.posix.basename(rel);
         // Counted from when the download itself starts: a refusal, or a slow look-up before it, says nothing
         let slowNotice: ReturnType<typeof setTimeout> | undefined;
         const downloadStarted = () => {
+            if (slowNotice === undefined) {
+                const count = this.downloadWatch.record(opener);
+                if (count !== null && opener !== undefined) {
+                    this.noticeMassDownload(opener, count);
+                }
+            }
             slowNotice ??= setTimeout(() => {
                 sendDesktopNotification({
                     title: `Downloading ${name}…`,
