@@ -34,6 +34,25 @@ describe('RemoteIndex', () => {
         await rm(tempDir, { recursive: true, force: true });
     });
 
+    test('reports what changes for the file manager, and nothing for what does not', () => {
+        index.replaceChildren('root', '', [folder('a', 'root', 'A')]);
+        index.replaceChildren('a', 'A', [file('x', 'a', 'A/x.txt')]);
+        const seen: Array<[string, boolean]> = [];
+        index.onChange = (relPath, subtree) => seen.push([relPath, subtree]);
+
+        index.replaceChildren('a', 'A', [file('x', 'a', 'A/x.txt')]); // nothing new
+        expect(seen).toEqual([]);
+
+        index.replaceChildren('root', '', [folder('a', 'root', 'Renamed')]); // a rename found by a crawl
+        expect(seen).toContainEqual(['A', true]);
+        expect(seen).toContainEqual(['Renamed', true]);
+        expect(seen.some(([p]) => p.startsWith('\u0001'))).toBe(true); // parked on the way: StateEvents drops those
+
+        seen.length = 0;
+        index.replaceChildren('root', '', []);
+        expect(seen).toEqual([['Renamed', true]]);
+    });
+
     test('replaceChildren removes vanished children and their subtrees', () => {
         index.replaceChildren('root', '', [folder('a', 'root', 'A')]);
         index.replaceChildren('a', 'A', [file('x', 'a', 'A/x.txt'), folder('b', 'a', 'A/B')]);

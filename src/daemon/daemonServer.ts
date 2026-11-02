@@ -298,6 +298,7 @@ export async function startSyncDaemon(options: {
         await runtime.auth.logout();
         await runtime.clearCaches();
         cachedAccount = null;
+        engine.stateEvents.reset(); // the file manager's emblems start over
         stateDb.logActivity({
             action: 'auth',
             localRelPath: '/',
