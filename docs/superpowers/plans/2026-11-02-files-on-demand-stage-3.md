@@ -85,7 +85,7 @@
 
 - [x] **Step 1:** `git switch -c files-on-demand-stage-3 main-epgufb`.
 - [x] **Step 2:** Remove the deprecated `baseUrl` from `tsconfig.json`. Every `paths` entry already starts with `./`, so they resolve from the tsconfig without it. `bunx tsc --noEmit` passes again.
-- [ ] **Step 3:** Commit `chore: drop the deprecated baseUrl so the type check passes`.
+- [x] **Step 3:** Commit `chore: drop the deprecated baseUrl so the type check passes`.
 
 ---
 
@@ -130,7 +130,7 @@ export class StateEvents {
   - `reset()` after a mode switch, a `syncDir` relocation, a sign-out, and a layout move.
 - The engine exposes `readonly stateEvents: StateEvents`.
 
-- [ ] **Step 1: Failing tests.**
+- [x] **Step 1: Failing tests.**
   - **`StateEvents`, with a fake clock:**
     - touching `a/b/c.txt` sends `['', 'a', 'a/b', 'a/b/c.txt']` once after 250 ms;
     - two touches within the delay give one change;
@@ -143,10 +143,10 @@ export class StateEvents {
     - after a download is recorded for `Docs/a.txt` it sees `Docs/a.txt` and `Docs`;
     - after `renameItem('a', 'b')` it sees both subtrees;
     - a relocation sends `'reset'`.
-- [ ] **Step 2: Run** the tests. Expected: FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** the full suite and tsc. Expected: pass.
-- [ ] **Step 5: Commit** `feat(sync): coalesced state change events for the file manager`.
+- [x] **Step 2: Run** the tests. Expected: FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** the full suite and tsc. Expected: pass.
+- [x] **Step 5: Commit** `feat(sync): coalesced state change events for the file manager`.
 
 ---
 
@@ -181,7 +181,7 @@ itemStates(folderRel: string): { self: ItemState | null; children: Record<string
   - `self` is the folder's own state, or `null` for the root.
   - **Hidden or `hiding`** items are left out of `children`. A `hiding` folder still lists as hidden, since it's on its way out.
 
-- [ ] **Step 1: Failing tests.**
+- [x] **Step 1: Failing tests.**
   - `childStates` equals `stateOf` on random trees with pins, unpins, hides and partial downloads.
   - The 5,000-child timing.
   - `itemStates`:
@@ -191,10 +191,10 @@ itemStates(folderRel: string): { self: ItemState | null; children: Record<string
     - a conflict wins over an error;
     - a hidden child is absent;
     - a path that is a file answers `null`.
-- [ ] **Step 2: Run** the tests. Expected: FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** the suite and tsc. Expected: pass.
-- [ ] **Step 5: Commit** `feat(sync): states of a folder's children in a fixed number of queries`.
+- [x] **Step 2: Run** the tests. Expected: FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** the suite and tsc. Expected: pass.
+- [x] **Step 5: Commit** `feat(sync): states of a folder's children in a fixed number of queries`.
 
 ---
 
@@ -225,15 +225,15 @@ itemStates(folderRel: string): { self: ItemState | null; children: Record<string
 - The listener is unsubscribed when the stream closes or is cancelled.
 - At most 16 event streams are open at once; the 17th gets 503.
 
-- [ ] **Step 1: Failing tests**, against a fake engine and a temporary socket:
+- [x] **Step 1: Failing tests**, against a fake engine and a temporary socket:
   - `/fm/states` for `syncDir/Docs` maps to `Docs`; for `syncDir` maps to `''`; for `syncDir/../x` and `/tmp` answers 404; a name with a space and `é` survives.
   - `/fm/events` sends `hello` first, then a coalesced `changed` with absolute paths, then `reset` after `stateEvents.reset()`.
   - A reader that never reads, followed by 100 changes, gets the stream closed, and the server's listener count goes back to 0.
   - A 17th stream gets 503.
-- [ ] **Step 2: Run** the tests. Expected: FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** the suite and tsc. Expected: pass.
-- [ ] **Step 5: Commit** `feat(daemon): folder states and a change stream for the file manager`.
+- [x] **Step 2: Run** the tests. Expected: FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** the suite and tsc. Expected: pass.
+- [x] **Step 5: Commit** `feat(daemon): folder states and a change stream for the file manager`.
 
 ---
 
@@ -279,11 +279,11 @@ itemStates(folderRel: string): { self: ItemState | null; children: Record<string
 - LRU eviction.
 - The client functions match the tray's source.
 
-- [ ] **Step 1:** Write the failing tests.
-- [ ] **Step 2: Run** `python3 linux/nautilus/test_proton_drive_nautilus.py`. Expected: FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** both Python test files. Expected: pass.
-- [ ] **Step 5: Commit** `feat(nautilus): availability emblems from one request per folder, off the UI thread`.
+- [x] **Step 1:** Write the failing tests.
+- [x] **Step 2: Run** `python3 linux/nautilus/test_proton_drive_nautilus.py`. Expected: FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** both Python test files. Expected: pass.
+- [x] **Step 5: Commit** `feat(nautilus): availability emblems from one request per folder, off the UI thread`.
 
 ---
 
@@ -317,11 +317,11 @@ itemStates(folderRel: string): { self: ItemState | null; children: Record<string
 - `kept` items are added up across items.
 - An unreachable daemon gives one notification.
 
-- [ ] **Step 1:** Write the failing tests.
-- [ ] **Step 2: Run** the tests. Expected: FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** both Python test files. Expected: pass.
-- [ ] **Step 5: Commit** `feat(nautilus): Always keep, Free up space and Hide from the right-click menu`.
+- [x] **Step 1:** Write the failing tests.
+- [x] **Step 2: Run** the tests. Expected: FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** both Python test files. Expected: pass.
+- [x] **Step 5: Commit** `feat(nautilus): Always keep, Free up space and Hide from the right-click menu`.
 
 ---
 
@@ -351,11 +351,11 @@ itemStates(folderRel: string): { self: ItemState | null; children: Record<string
 - The server closes the stream and the reader reconnects. Use a fake clock for the backoff.
 - Dead weakrefs are pruned.
 
-- [ ] **Step 1:** Write the failing tests.
-- [ ] **Step 2: Run** the tests. Expected: FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** both Python test files. Expected: pass.
-- [ ] **Step 5: Commit** `feat(nautilus): emblems follow changes within seconds, without a refresh`.
+- [x] **Step 1:** Write the failing tests.
+- [x] **Step 2: Run** the tests. Expected: FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** both Python test files. Expected: pass.
+- [x] **Step 5: Commit** `feat(nautilus): emblems follow changes within seconds, without a refresh`.
 
 ---
 
@@ -366,24 +366,24 @@ itemStates(folderRel: string): { self: ItemState | null; children: Record<string
 - Modify: `packaging/linux/install.sh`, `packaging/linux/package.sh`, `packaging/linux/arch/PKGBUILD` (if it stages its own files), `packaging/linux/postinst.sh`
 
 **Steps:**
-- [ ] **Step 1: Draw** the three SVGs to the table in Global Constraints.
+- [x] **Step 1: Draw** the three SVGs to the table in Global Constraints.
   - 16×16 viewBox, no text, no external references, no scripts.
   - Each must stay readable at 16 px on both a light (`#ffffff`) and a dark (`#242424`) background. The white disc of `-local` and a 1 px white halo around the cloud of `-cloud` give the contrast.
-- [ ] **Step 2: Check** by rendering each at 16, 32 and 64 px on both backgrounds into the scratchpad (`rsvg-convert`, or Chromium through Playwright if that is missing), then look at the PNGs.
-- [ ] **Step 3: Install** the emblems into `share/icons/hicolor/scalable/emblems/` in every install path (`install.sh --user`, the release staging in `package.sh`, and so the .deb, .rpm, tar and Arch builds), then refresh the icon cache as each path already does.
+- [x] **Step 2: Check** by rendering each at 16, 32 and 64 px on both backgrounds into the scratchpad (`rsvg-convert`, or Chromium through Playwright if that is missing), then look at the PNGs.
+- [x] **Step 3: Install** the emblems into `share/icons/hicolor/scalable/emblems/` in every install path (`install.sh --user`, the release staging in `package.sh`, and so the .deb, .rpm, tar and Arch builds), then refresh the icon cache as each path already does.
   - `install.sh` uninstall removes `emblem-protondrive-*`.
   - The release tree (`install.sh` from a release) copies `share/icons/hicolor` whole, so it gets them through the staging. The Flatpak build gets them too, from the same staging; they are unused there.
-- [ ] **Step 4: Check** with `bash packaging/linux/install.sh --user` into a temporary `PREFIX` (or `--dry-run` if it has one) that the three files land where expected. Also check the staged tree from `package.sh` with the build step skipped, if it allows that; otherwise inspect it by reading.
-- [ ] **Step 5: Commit** `feat(packaging): install the Proton Drive emblems`.
+- [x] **Step 4: Check** with `bash packaging/linux/install.sh --user` into a temporary `PREFIX` (or `--dry-run` if it has one) that the three files land where expected. Also check the staged tree from `package.sh` with the build step skipped, if it allows that; otherwise inspect it by reading.
+- [x] **Step 5: Commit** `feat(packaging): install the Proton Drive emblems`.
 
 ---
 
 ### Task 8: Docs, review and merge
 
-- [ ] **Step 1: README.** Update the Files section: the three icons and their meanings, the right-click actions, "unhide in the app", and that Files must be restarted (`nautilus -q`) after an upgrade.
-- [ ] **Step 2: Review** the whole branch diff against the Review Focus list and the Global Constraints. Fix what is found, each fix as its own commit.
-- [ ] **Step 3: Run** every check in Global Constraints, plus `cargo test` in `native-vfs` (it should be untouched, so it is a guard only).
-- [ ] **Step 4: Merge** with `git switch main-epgufb && git merge --no-ff files-on-demand-stage-3 -m "Merge branch 'files-on-demand-stage-3': Proton Drive emblems and actions in Files"`, then `git push -u origin main-epgufb`.
+- [x] **Step 1: README.** Update the Files section: the three icons and their meanings, the right-click actions, "unhide in the app", and that Files must be restarted (`nautilus -q`) after an upgrade.
+- [x] **Step 2: Review** the whole branch diff against the Review Focus list and the Global Constraints. Fix what is found, each fix as its own commit.
+- [x] **Step 3: Run** every check in Global Constraints, plus `cargo test` in `native-vfs` (it should be untouched, so it is a guard only).
+- [x] **Step 4: Merge** with `git switch main-epgufb && git merge --no-ff files-on-demand-stage-3 -m "Merge branch 'files-on-demand-stage-3': Proton Drive emblems and actions in Files"`, then `git push -u origin main-epgufb`.
 
 ---
 
