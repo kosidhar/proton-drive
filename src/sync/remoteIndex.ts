@@ -98,6 +98,7 @@ export class RemoteIndex {
                 const previous = this.getByUid(child.uid);
                 if (previous && previous.relPath !== this.childPath(parentRelPath, child.name)) {
                     this.relocate(previous.relPath, `${PARKING}/${child.uid}`);
+                    this.onChange?.(previous.relPath, true); // upsert sees only the parked path, never this one
                 }
             }
             for (const child of children) {
