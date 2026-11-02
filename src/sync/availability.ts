@@ -121,6 +121,64 @@ export class AvailabilityPolicy {
     return this.hasLocalCopy(relPath) ? "downloaded" : "online-only";
   }
 
+  // The state of every indexed child of a folder, by name, as stateOf gives it, in a fixed number of queries (a folder
+  // of thousands of files is listed at once in the file manager). Empty for a path that isn't an indexed folder.
+  childStates(folderRel: string): Map<string, ItemAvailability> {
+    const out = new Map<string, ItemAvailability>();
+    const folder = this.index.getByPath(folderRel);
+    if (!folder || folder.type !== "folder") {
+      return out;
+    }
+    const children = this.db
+      .query(
+        `SELECT n.name, n.type, a.pin, a.hide FROM remote_nodes n LEFT JOIN availability a ON a.nodeUid = n.uid
+                 WHERE n.parentUid = $uid`,
+      )
+      .all({ $uid: folder.uid }) as {
+      name: string;
+      type: string;
+      pin: string | null;
+      hide: string | null;
+    }[];
+    const hiddenAbove = this.hiddenBy(folderRel);
+    const pinnedAbove = this.isPinned(folderRel);
+    const missing = this.childrenMissingFiles(folderRel);
+    for (const child of children) {
+      if (hiddenAbove) {
+        out.set(child.name, hiddenAbove.hide === "pending" ? "hiding" : "hidden");
+      } else if (child.hide) {
+        out.set(child.name, child.hide === "pending" ? "hiding" : "hidden");
+      } else if (child.pin ? child.pin === "pinned" : pinnedAbove) {
+        out.set(child.name, "pinned");
+      } else {
+        out.set(child.name, missing.has(child.name) ? "online-only" : "downloaded");
+      }
+    }
+    return out;
+  }
+
+  // The names of a folder's children that are, or hold, a file with no local copy
+  private childrenMissingFiles(folderRel: string): Set<string> {
+    const prefix = folderRel === "" ? "" : `${folderRel}/`;
+    const below =
+      folderRel === ""
+        ? "n.relPath != ''"
+        : "(n.relPath >= $lo AND n.relPath < $hi)";
+    const rows = this.db
+      .query(
+        `SELECT DISTINCT CASE WHEN instr(rest, '/') > 0 THEN substr(rest, 1, instr(rest, '/') - 1) ELSE rest END AS name
+                 FROM (SELECT substr(n.relPath, length($prefix) + 1) AS rest FROM remote_nodes n
+                       WHERE n.type = 'file' AND ${below}
+                         AND NOT EXISTS (SELECT 1 FROM synced_items s WHERE s.localRelPath = n.relPath))`,
+      )
+      .all({
+        // SQLite measures the prefix in characters, as substr counts them (a JS length counts UTF-16 units)
+        $prefix: prefix,
+        ...(folderRel === "" ? {} : { $lo: prefix, $hi: `${folderRel}0` }),
+      }) as { name: string }[];
+    return new Set(rows.map((row) => row.name));
+  }
+
   // Nodes at or below relPath that are hidden or being hidden, as their paths.
   hiddenWithin(relPath: string): string[] {
     const rows = this.db
