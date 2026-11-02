@@ -9,6 +9,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-23-files-on-demand-design.md`, delivery step 3 of §6 (§2.3, §2.5, §2.6, §5.5, and the emblem part of §5.8).
 - Builds on Stage 2, merged as `f521607`.
+- **Tracking issue:** #52. Follow-ups found while building it: #53 (folder emblems and files waiting to upload), #54 (`install.sh --uninstall` leaves the app icons).
 - **Already done in Stage 2:** clearing GNOME's failed-thumbnail entries after a download (see the Stage 2 plan, "Deviation from §6").
 - **Out of scope (Stage 4):** the mass-download notice and "Block this app", the user blocklist in Settings, and the Trash and Settings polish.
 - **Nemo** keeps today's menu (spec §3 makes parity optional). Dolphin is unchanged. `/api/file-status` stays on the TCP API for them, unchanged.
