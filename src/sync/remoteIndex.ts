@@ -36,6 +36,18 @@ export function entryFromNode(node: NodeEntity, parentRelPath: string): RemoteIn
     };
 }
 
+function sameEntry(a: RemoteIndexEntry, b: RemoteIndexEntry): boolean {
+    return (
+        a.parentUid === b.parentUid &&
+        a.relPath === b.relPath &&
+        a.name === b.name &&
+        a.type === b.type &&
+        a.size === b.size &&
+        a.mtimeMs === b.mtimeMs &&
+        a.sha1 === b.sha1
+    );
+}
+
 // Temporary home for moved children while replaceChildren sorts out the final paths; no real path starts with U+0001 (SQLite text
 // would also cut a NUL short).
 const PARKING = '\u0001moving';
@@ -44,6 +56,10 @@ const DETACHED = '\u0001detached';
 
 // A persistent copy of the remote My files tree, keyed by node uid with a unique relative path ('' for the root).
 export class RemoteIndex {
+    // Told of every path whose state may have changed (subtree: everything below it too), for the file manager's
+    // emblems (see StateEvents)
+    onChange: ((relPath: string, subtree: boolean) => void) | null = null;
+
     constructor(private db: Database) {
         this.db.run(`
             CREATE TABLE IF NOT EXISTS remote_nodes (
@@ -94,6 +110,9 @@ export class RemoteIndex {
     upsert(entry: RemoteIndexEntry): void {
         this.db.transaction(() => {
             const previous = this.getByUid(entry.uid);
+            if (previous && sameEntry(previous, entry)) {
+                return; // nothing changes (a full crawl upserts every node it sees)
+            }
             // Whatever else sits at the target path is stale: the tree has just told us this node is there.
             const occupant = this.getByPath(entry.relPath);
             if (occupant && occupant.uid !== entry.uid) {
@@ -101,6 +120,10 @@ export class RemoteIndex {
             }
             if (previous && previous.relPath !== entry.relPath) {
                 this.relocate(previous.relPath, entry.relPath);
+                this.onChange?.(previous.relPath, true);
+                this.onChange?.(entry.relPath, true);
+            } else {
+                this.onChange?.(entry.relPath, false);
             }
             this.db
                 .query(
@@ -144,6 +167,7 @@ export class RemoteIndex {
         const parked = `${DETACHED}/${encodeURIComponent(uid)}`;
         if (node && node.relPath !== parked) {
             this.relocate(node.relPath, parked);
+            this.onChange?.(node.relPath, true);
         }
     }
 
@@ -159,6 +183,7 @@ export class RemoteIndex {
         this.db
             .query(`DELETE FROM remote_nodes WHERE ${selfOrDescendantWhere('relPath')}`)
             .run(selfOrDescendant(node.relPath));
+        this.onChange?.(node.relPath, true);
     }
 
     getByUid(uid: string): RemoteIndexEntry | null {

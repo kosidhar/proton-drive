@@ -12,6 +12,9 @@ export type ItemAvailability =
 // node until a nearer flag overrides it; hide wins over pin. Paths that are not indexed yet (local items waiting for
 // their upload) resolve through their nearest indexed ancestor.
 export class AvailabilityPolicy {
+  // Told of every subtree whose state may have changed, for the file manager's emblems (see StateEvents)
+  onChange: ((relPath: string, subtree: boolean) => void) | null = null;
+
   constructor(
     private db: Database,
     private index: RemoteIndex,
@@ -39,6 +42,7 @@ export class AvailabilityPolicy {
       }
       this.dropEmptyRows();
     })();
+    this.changedBelow(uid);
   }
 
   // A hide supersedes everything beneath it, so the descendants' own flags are dropped.
@@ -55,6 +59,14 @@ export class AvailabilityPolicy {
       }
       this.dropEmptyRows();
     })();
+    this.changedBelow(uid);
+  }
+
+  private changedBelow(uid: string): void {
+    const node = this.index.getByUid(uid);
+    if (node) {
+      this.onChange?.(node.relPath, true);
+    }
   }
 
   isPinned(relPath: string): boolean {

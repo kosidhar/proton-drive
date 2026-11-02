@@ -6728,4 +6728,94 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
         });
     });
+    describe('state events', () => {
+        // Changes go out when the test says (flush), not on a timer
+        const setup = (opts: { virtual?: boolean } = {}) => {
+            if (opts.virtual) stateDb.setMeta('driveLayout', 'virtual');
+            const drive = makeMockDrive();
+            let due: (() => void) | null = null;
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                ...(opts.virtual ? { backingDir: path.join(tempDir, 'files'), moveToDesktopTrash: async () => false } : {}),
+                stateEventSchedule: (run) => {
+                    due = run;
+                    return () => {
+                        due = null;
+                    };
+                },
+            });
+            const seen: unknown[] = [];
+            engine.stateEvents.subscribe((change) => seen.push(change));
+            const flush = () => {
+                const run = due;
+                due = null;
+                run?.();
+                const out = [...seen];
+                seen.length = 0;
+                return out;
+            };
+            return { ...drive, engine, flush };
+        };
+
+        test('Free up space on a folder sends its subtree, and a download sends the file and its folders', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            await d.engine.reconcileNow();
+            d.flush();
+            await d.engine.setAvailability('Docs', 'pin');
+            await d.engine.reconcileNow();
+            const afterPin = d.flush() as Array<{ paths: string[]; subtrees: string[] }>;
+            expect(afterPin.length).toBe(1);
+            expect(afterPin[0].subtrees).toContain('Docs');
+
+            await d.engine.setAvailability('Docs', 'free');
+            const afterFree = d.flush() as Array<{ paths: string[]; subtrees: string[] }>;
+            expect(afterFree[0].subtrees).toEqual(['Docs']);
+            expect(afterFree[0].paths).toContain('');
+        });
+
+        test('a download recorded for a file sends the file, its folder and the root', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            await d.engine.reconcileNow();
+            d.flush();
+            stateDb.upsertItem({
+                localRelPath: 'Docs/a.txt', nodeUid: d.uid('Docs/a.txt'), parentNodeUid: d.uid('Docs'), type: 'file',
+                localSha1: null, remoteSha1: null, localMtimeMs: 0, remoteMtimeMs: 0, size: 1, syncStatus: 'synced', lastError: null,
+            });
+            expect(d.flush()).toEqual([{ paths: ['', 'Docs', 'Docs/a.txt'], subtrees: [] }]);
+        });
+
+        test('a crawl that finds nothing new sends nothing', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            await d.engine.reconcileNow();
+            d.flush();
+            await d.engine.reconcileNow();
+            expect(d.flush()).toEqual([]);
+        });
+
+        test('a rename through the drive sends both subtrees', async () => {
+            const d = setup({ virtual: true });
+            d.add('Projects/a.txt', 'a');
+            await d.engine.reconcileNow();
+            d.flush();
+            await d.engine.renameItem('Projects', 'Work');
+            const [change] = d.flush() as Array<{ paths: string[]; subtrees: string[] }>;
+            expect(change.subtrees).toEqual(expect.arrayContaining(['Projects', 'Work']));
+        });
+
+        test('moving the sync folder, changing the ignore patterns or the layout sends a reset', () => {
+            const d = setup();
+            stateDb.updateSettings({ syncDir: path.join(tempDir, 'Elsewhere') });
+            expect(d.flush()).toEqual(['reset']);
+            stateDb.updateSettings({ ignorePatterns: ['*.bak'] });
+            expect(d.flush()).toEqual(['reset']);
+            stateDb.updateSettings({ ignorePatterns: ['*.bak'], notificationsEnabled: false });
+            expect(d.flush()).toEqual([]);
+            stateDb.setMeta('driveLayout', 'virtual');
+            expect(d.flush()).toEqual(['reset']);
+            stateDb.setMeta('driveLayout', 'virtual');
+            expect(d.flush()).toEqual([]);
+        });
+    });
 });
