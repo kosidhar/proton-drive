@@ -6818,4 +6818,87 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.flush()).toEqual([]);
         });
     });
+    describe('itemStates', () => {
+        const setup = () => {
+            const drive = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger);
+            return { ...drive, engine, files: localFiles(stateDb) };
+        };
+        const record = (relPath: string, syncStatus: 'synced' | 'uploading' | 'error' = 'synced') =>
+            stateDb.upsertItem({
+                localRelPath: relPath, nodeUid: `vol~${relPath}`, parentNodeUid: null, type: 'file', localSha1: null,
+                remoteSha1: null, localMtimeMs: 0, remoteMtimeMs: 0, size: 1, syncStatus, lastError: null,
+            });
+
+        test('a folder and its children: availability, local-only items, and nothing hidden', async () => {
+            const d = setup();
+            const docs = d.add('Docs');
+            d.add('Docs/a.txt', 'a');
+            d.add('Docs/b.txt', 'b');
+            d.add('Docs/Secret/s.txt', 's');
+            d.add('Other/c.txt', 'c');
+            d.engine.availability.setPin(docs.uid, 'pinned', false);
+            await d.engine.reconcileNow();
+            await d.engine.setAvailability('Docs/b.txt', 'free');
+            await d.engine.setAvailability('Docs/Secret', 'hide');
+            await d.files.writeLocal('Docs/new.txt', 'not uploaded yet');
+            await d.files.writeLocal('Docs/.git/HEAD', 'ref');
+
+            const docsStates = d.engine.itemStates('Docs')!;
+            // A file waiting to upload shows on itself; its folders sum up only what is recorded, the same from any view
+            expect(docsStates.self).toEqual({ availability: 'pinned', transfer: null });
+            expect(docsStates.children).toEqual({
+                'a.txt': { availability: 'pinned', transfer: null },
+                'b.txt': { availability: 'online-only', transfer: null },
+                'new.txt': { availability: 'downloaded', transfer: 'syncing' },
+                '.git': null,
+            });
+
+            const root = d.engine.itemStates('')!;
+            expect(root.self).toBeNull();
+            expect(root.children.Other).toEqual({ availability: 'online-only', transfer: null });
+            expect(root.children.Docs).toEqual(docsStates.self);
+        });
+
+        test('an error makes its folders show it, and a conflict wins over an error', async () => {
+            const d = setup();
+            d.add('A/B/x.txt', 'x');
+            d.add('A/B/y.txt', 'y');
+            await d.engine.reconcileNow();
+            record('A/B/x.txt', 'error');
+            expect(d.engine.itemStates('')!.children.A?.transfer).toBe('error');
+            expect(d.engine.itemStates('A')!.children.B?.transfer).toBe('error');
+            expect(d.engine.itemStates('A/B')!.children['x.txt']?.transfer).toBe('error');
+            expect(d.engine.itemStates('A/B')!.children['y.txt']?.transfer).toBeNull();
+
+            stateDb.recordConflict({
+                localRelPath: 'A/B/y.txt', nodeUid: 'vol~A/B/y.txt', localSha1: null, remoteSha1: null, localMtimeMs: 0, remoteMtimeMs: 0,
+            });
+            expect(d.engine.itemStates('A')!.children.B?.transfer).toBe('conflict');
+            expect(d.engine.itemStates('A')!.self?.transfer).toBe('conflict');
+        });
+
+        test('a file, a hidden folder or a path out of the drive answers null', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            d.add('Hidden/h.txt', 'h');
+            await d.engine.reconcileNow();
+            await d.engine.setAvailability('Hidden', 'hide');
+            expect(d.engine.itemStates('Docs/a.txt')).toBeNull();
+            expect(d.engine.itemStates('Hidden')).toBeNull();
+            expect(d.engine.itemStates('../x')).toBeNull();
+            expect(d.engine.itemStates('Nope')).toBeNull();
+        });
+
+        test('a folder made here and not uploaded yet waits to upload, all of it', async () => {
+            const d = setup();
+            await d.engine.reconcileNow();
+            await d.files.writeLocal('Fresh/one.txt', '1');
+            await d.files.writeLocal('Fresh/node_modules/x.js', 'x');
+            expect(d.engine.itemStates('Fresh')).toEqual({
+                self: { availability: 'downloaded', transfer: 'syncing' },
+                children: { 'one.txt': { availability: 'downloaded', transfer: 'syncing' }, node_modules: null },
+            });
+        });
+    });
 });

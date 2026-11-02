@@ -175,6 +175,7 @@ itemStates(folderRel: string): { self: ItemState | null; children: Record<string
     - local items not in the index yet get `{ availability: 'downloaded', transfer: 'syncing' }`;
     - `transfer` comes from the `synced_items` status (`uploading` and `downloading` give `syncing`; `error` gives `error`), from an unresolved conflict on the path (`conflict`), and from an in-flight hydrate (`syncing`).
   - **Folders:** a folder gets `syncing` when any item below it is transferring, `error` when any has an error, and `conflict` when any has a conflict.
+    - This counts only what is recorded (`synced_items`, conflicts, in-flight hydrates). A local file waiting to upload shows `syncing` on itself but not on its folders: finding those below a folder would need a disk scan, and a folder's emblem must be the same whether Files shows it from its parent or from inside it.
     - All three come from one grouped query each, the same way as `childStates`.
     - Precedence: conflict, then error, then syncing.
   - `self` is the folder's own state, or `null` for the root.

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { lstatSync, renameSync, statSync, utimesSync } from 'node:fs';
+import { lstatSync, readdirSync, renameSync, statSync, utimesSync } from 'node:fs';
 import { lstat, mkdir, readdir, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -2769,6 +2769,120 @@ export class ProtonDriveSyncEngine {
         return entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     }
 
+    // What the file manager shows on a folder and each of its children, in a fixed number of queries (see
+    // AvailabilityPolicy.childStates): the availability, and a transfer under way, an error or a conflict at the item or
+    // anywhere below it, as recorded. A child that is a local item matching an ignore pattern gets null (no emblem); one not in Proton
+    // Drive yet is waiting to upload (syncing). Hidden items are left out, as the drive leaves them out. Null when the
+    // path isn't a folder of the drive, or while the files are moving.
+    itemStates(relPath: string): FolderStates | null {
+        let rel: string;
+        try {
+            rel = normalizeDrivePath(relPath);
+        } catch {
+            return null;
+        }
+        if (this.holding()) {
+            return null;
+        }
+        const ignorePatterns = this.stateDb.getSettings().ignorePatterns;
+        if (rel !== '' && (matchesIgnorePatterns(rel, ignorePatterns) || this.policy.hiddenBy(rel) !== null)) {
+            return null;
+        }
+        const localNames = this.localChildNames(rel);
+        const folder = this.liveIndexEntry(rel);
+        if (!folder || folder.type !== 'folder') {
+            // A folder made here and not uploaded yet: everything in it waits to upload
+            if (localNames === null || folder) {
+                return null;
+            }
+            const children: Record<string, ItemState | null> = {};
+            for (const name of localNames) {
+                children[name] = this.localOnlyState(childRel(rel, name), ignorePatterns);
+            }
+            return { self: { availability: 'downloaded', transfer: 'syncing' }, children };
+        }
+
+        const availability = this.policy.childStates(rel);
+        const transfers = this.transfersBelow(rel);
+        const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
+        const children: Record<string, ItemState | null> = {};
+        for (const child of this.index.listChildren(rel)) {
+            const state = availability.get(child.name);
+            if (
+                takesAway(latest.get(child.uid), child) ||
+                matchesIgnorePatterns(child.relPath, ignorePatterns) ||
+                state === undefined ||
+                state === 'hidden' ||
+                state === 'hiding'
+            ) {
+                continue;
+            }
+            children[child.name] = { availability: state, transfer: transfers.get(child.name) ?? null };
+        }
+        for (const name of localNames ?? []) {
+            if (!(name in children) && !availability.has(name)) {
+                // Shown as syncing on itself only: what waits to upload is known by looking at the disk, which a folder's
+                // emblem can't do for everything below it, so folders sum up what the records say, the same from any view
+                children[name] = this.localOnlyState(childRel(rel, name), ignorePatterns);
+            }
+        }
+        let below: Transfer = null;
+        for (const transfer of transfers.values()) {
+            below = worseTransfer(below, transfer);
+        }
+        const selfState = this.policy.stateOf(rel);
+        const self =
+            rel === '' || selfState === 'hidden' || selfState === 'hiding' ? null : { availability: selfState, transfer: below };
+        return { self, children };
+    }
+
+    // The names in a folder of the local root (engine temp files left out), or null when it isn't a folder here
+    private localChildNames(rel: string): string[] | null {
+        try {
+            return readdirSync(path.join(this.localRoot(), rel)).filter((name) => !isEngineTempName(name));
+        } catch {
+            return null;
+        }
+    }
+
+    private localOnlyState(rel: string, ignorePatterns: string[]): ItemState | null {
+        return matchesIgnorePatterns(rel, ignorePatterns) ? null : { availability: 'downloaded', transfer: 'syncing' };
+    }
+
+    // The worst transfer at or below each child of a folder, by the child's name: uploads and downloads under way and
+    // opens of online-only files (syncing), errors, and unresolved conflicts
+    private transfersBelow(folderRel: string): Map<string, Transfer> {
+        const prefix = folderRel === '' ? '' : `${folderRel}/`;
+        const below = (column: string) => (folderRel === '' ? `${column} != ''` : `(${column} >= $lo AND ${column} < $hi)`);
+        const params = { $prefix: prefix, ...(folderRel === '' ? {} : { $lo: prefix, $hi: `${folderRel}0` }) };
+        const firstSegment = (column: string) =>
+            `CASE WHEN instr(substr(${column}, length($prefix) + 1), '/') > 0
+                  THEN substr(substr(${column}, length($prefix) + 1), 1, instr(substr(${column}, length($prefix) + 1), '/') - 1)
+                  ELSE substr(${column}, length($prefix) + 1) END`;
+        const rows = this.stateDb.connection
+            .query(
+                `SELECT ${firstSegment('localRelPath')} AS name,
+                        CASE WHEN syncStatus = 'error' THEN 'error' ELSE 'syncing' END AS transfer
+                   FROM synced_items
+                  WHERE syncStatus IN ('uploading', 'downloading', 'error') AND ${below('localRelPath')}
+                 UNION ALL
+                 SELECT ${firstSegment('localRelPath')} AS name, 'conflict' AS transfer
+                   FROM conflicts WHERE resolved = 0 AND ${below('localRelPath')}`,
+            )
+            .all(params) as { name: string; transfer: Exclude<Transfer, null> }[];
+        const out = new Map<string, Transfer>();
+        for (const row of rows) {
+            out.set(row.name, worseTransfer(out.get(row.name) ?? null, row.transfer));
+        }
+        for (const opening of this.hydrations.keys()) {
+            if (opening.startsWith(prefix) && opening !== folderRel) {
+                const name = opening.slice(prefix.length).split('/')[0];
+                out.set(name, worseTransfer(out.get(name) ?? null, 'syncing'));
+            }
+        }
+        return out;
+    }
+
     // Downloads an online-only file into the backing store, for the virtual drive to open it (an app opened it). Calls for
     // the same path while one runs get that one; a file already here resolves at once. Nothing waits for the download,
     // and whatever happens to the item meanwhile wins (see hydrateFile). The user is told when the download takes over
@@ -4912,6 +5026,27 @@ async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boo
 
 // A path from the virtual drive as a path of My files: no slash at either end, and no empty, '.' or '..' segment, so
 // it can't climb out of it.
+export type Transfer = 'syncing' | 'error' | 'conflict' | null;
+export interface ItemState {
+    availability: 'pinned' | 'downloaded' | 'online-only';
+    transfer: Transfer;
+}
+export interface FolderStates {
+    self: ItemState | null; // null for the root
+    children: Record<string, ItemState | null>; // null: no emblem (a local item matching an ignore pattern)
+}
+
+const TRANSFER_RANK: Record<string, number> = { syncing: 1, error: 2, conflict: 3 };
+
+// A conflict shows over an error, and an error over a transfer under way
+function worseTransfer(a: Transfer, b: Transfer): Transfer {
+    return (b ? TRANSFER_RANK[b] : 0) > (a ? TRANSFER_RANK[a] : 0) ? b : a;
+}
+
+function childRel(parentRel: string, name: string): string {
+    return parentRel === '' ? name : `${parentRel}/${name}`;
+}
+
 function normalizeDrivePath(relPath: string): string {
     const trimmed = relPath.replace(/^\/+|\/+$/g, '');
     if (trimmed.includes('\0') || trimmed.split('/').some((s) => s === '.' || s === '..' || (s === '' && trimmed !== ''))) {
