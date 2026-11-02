@@ -13,6 +13,7 @@ import {
     type ProtonDriveSyncEngine,
 } from '../sync/syncEngine';
 import type { ConflictRecord } from '../sync/syncStateDb';
+import { type FileManagerSource, FM_ROUTES, fileManagerRoute } from './fileManagerRoutes';
 import { parseSettingsRequest, type SettingsChange } from './settingsValidation';
 import type { DriveMoveAction } from './vfsSupervisor';
 
@@ -39,6 +40,9 @@ export interface ControlServerOptions {
         ProtonDriveSyncEngine,
         'setAvailability' | 'availabilityOf' | 'vfsChildren' | 'hydrate' | 'renameItem' | 'deleteItem' | 'truncateItem'
     >;
+    // What the file manager extension reads: where the drive is, the states of a folder's items, and what changes (see
+    // fileManagerRoutes.ts)
+    fileManager?: FileManagerSource;
     // Mount again (the tray and the app): absent while Proton Drive is a plain folder
     mountAgain?: () => Promise<void>;
     // Finish, move back or retry a move that stopped (see DriveController.resolveMove); its errors may carry an HTTP
@@ -353,6 +357,9 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
             const url = new URL(req.url);
             if (DRIVE_ROUTES.includes(url.pathname)) {
                 return driveRoute(req, url.pathname, engine);
+            }
+            if (FM_ROUTES.includes(url.pathname)) {
+                return fileManagerRoute(req, url, opts.fileManager);
             }
             if (url.pathname === '/vfs/mount') {
                 return mountRoute(req, opts.mountAgain);
