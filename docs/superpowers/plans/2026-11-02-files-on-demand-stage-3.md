@@ -239,6 +239,8 @@ itemStates(folderRel: string): { self: ItemState | null; children: Record<string
 
 ### Task 4: Emblems in the Nautilus extension
 
+> Tasks 4, 5 and 6 change one file and landed as one commit, `feat(nautilus): emblems, right-click actions and live refresh for the drive`. The extension's state lives in a `ProtonDriveFiles` class that only the main loop touches, with the socket, the worker threads, notifications and Nautilus's completion injected, so all three tasks are tested without Nautilus. The stream reader was also checked against the real Bun control server (chunked transfer encoding, non-ASCII paths).
+
 **Files:**
 - Modify: `linux/nautilus/proton_drive_nautilus.py`
 - Create: `linux/nautilus/test_proton_drive_nautilus.py`
