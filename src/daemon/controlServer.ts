@@ -130,7 +130,7 @@ async function jsonBody(req: Request): Promise<Record<string, unknown> | null> {
 
 type DriveEngine = ControlServerOptions['engine'];
 
-// GET /vfs/children?path=, POST /vfs/hydrate {path}, POST /vfs/rename {from, to, noReplace?}, POST /vfs/delete {path,
+// GET /vfs/children?path=, POST /vfs/hydrate {path, opener?} (opener: the name of the app that opened it), POST /vfs/rename {from, to, noReplace?}, POST /vfs/delete {path,
 // onlyIfEmpty?, trash?} (onlyIfEmpty is rmdir, trash a Move to Trash), POST /vfs/truncate {path} (an online-only file
 // made an empty local one); the last three also take deadlineMs. Paths are paths of My files, UTF-8 as they are ('' is
 // the top); each answers { entries } or { ok: true }, or 400 { error, code }.
@@ -157,8 +157,11 @@ async function driveRoute(req: Request, route: string, engine: DriveEngine): Pro
         switch (route) {
             case '/vfs/hydrate':
                 if (typeof body.path !== 'string') return driveError(new Error('Missing path'));
-                // Waits for the whole download: the helper gives up after its own limit (30 minutes)
-                await engine.hydrate(body.path);
+                // Waits for the whole download: the helper gives up after its own limit (30 minutes). An opener that
+                // isn't a short name is no name: never blocked, never counted
+                await engine.hydrate(body.path, {
+                    opener: typeof body.opener === 'string' && body.opener.length > 0 && body.opener.length <= 64 ? body.opener : undefined,
+                });
                 break;
             case '/vfs/rename':
                 if (typeof body.from !== 'string' || typeof body.to !== 'string') {

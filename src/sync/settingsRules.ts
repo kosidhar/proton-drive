@@ -72,6 +72,30 @@ export function usableIgnorePatterns(stored: unknown): { patterns: string[]; dro
     return { patterns, dropped: stored.length - patterns.length };
 }
 
+export const MAX_BLOCKED_APPS = 100;
+// An app is named by its comm, the kernel's name of its process, which is at most 15 bytes
+export const MAX_BLOCKED_APP_LENGTH = 15;
+
+// Why a list of blocked apps can't be stored, or null when it can: a list of at most MAX_BLOCKED_APPS distinct names,
+// each the name of a process (1 to 15 bytes, no '/', no control characters, no leading or trailing spaces).
+export function problemWithBlockedApps(apps: unknown): string | null {
+    if (!Array.isArray(apps)) return 'blockedApps must be a list of app names';
+    if (apps.length > MAX_BLOCKED_APPS) return `At most ${MAX_BLOCKED_APPS} apps can be blocked`;
+    const seen = new Set<string>();
+    for (const app of apps) {
+        if (typeof app !== 'string' || app === '') return 'Each blocked app must be a name';
+        if (Buffer.byteLength(app, 'utf8') > MAX_BLOCKED_APP_LENGTH) {
+            return `"${app}" is too long: an app's name has at most ${MAX_BLOCKED_APP_LENGTH} bytes`;
+        }
+        if (app.includes('/') || /[\u0000-\u001f\u007f]/.test(app) || app.trim() !== app) {
+            return `"${app}" isn't the name of an app`;
+        }
+        if (seen.has(app)) return `"${app}" is listed twice`;
+        seen.add(app);
+    }
+    return null;
+}
+
 export function isConflictStrategy(value: unknown): value is ConflictStrategy {
     return typeof value === 'string' && (CONFLICT_STRATEGIES as readonly string[]).includes(value);
 }
