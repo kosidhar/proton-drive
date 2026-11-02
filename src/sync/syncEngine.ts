@@ -32,6 +32,7 @@ import {
 } from '../sdk/fileOps';
 import { getClaimedSize, getName } from '../sdk/node';
 import { AvailabilityPolicy, type ItemAvailability } from './availability';
+import { StateEvents } from './stateEvents';
 import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
 import { createLocalConflictCopy, formatConflictFileName } from './conflictResolver';
 import { gioTrash, type MoveToDesktopTrash } from './desktopTrash';
@@ -243,6 +244,8 @@ export class ProtonDriveSyncEngine {
     private workSince = new Map<number, number>();
     private readonly index: RemoteIndex;
     private readonly policy: AvailabilityPolicy;
+    // What changed, for the file manager's emblems (see StateEvents and the control socket's /fm/events)
+    readonly stateEvents: StateEvents;
     // Renames, moves and deletes made through the virtual drive that Proton Drive has yet to get, and the replay of them:
     // one at a time (replayRun), again when asked meanwhile (replayAgain), and after the sync pass when asked during one
     // (replayAfterPass)
@@ -285,12 +288,21 @@ export class ProtonDriveSyncEngine {
             // Deletes GNOME's failed-thumbnail record of a file by its path under the mount (see thumbnailCache)
             forgetFailedThumbnail?: (mountFullPath: string) => Promise<void>;
             moveSeams?: MoveSeams; // for tests: moving the sync folder
+            // For tests: when the coalesced state changes go out (see StateEvents)
+            stateEventSchedule?: (run: () => void, delayMs: number) => () => void;
             // For tests: how long what is missing while held is taken as known (FILES_MISSING_CACHE_MS; see stillMissing)
             filesMissingCacheMs?: number;
         } = {},
     ) {
         this.index = new RemoteIndex(this.stateDb.connection);
         this.policy = new AvailabilityPolicy(this.stateDb.connection, this.index);
+        this.stateEvents = new StateEvents(options.stateEventSchedule ? { schedule: options.stateEventSchedule } : {});
+        const changed = (relPath: string, subtree: boolean) =>
+            subtree ? this.stateEvents.touchSubtree(relPath) : this.stateEvents.touch(relPath);
+        this.index.onChange = changed;
+        this.policy.onChange = changed;
+        this.stateDb.onChange = changed;
+        this.stateDb.onReset = () => this.stateEvents.reset();
         this.journal = new RemoteOpsJournal(this.stateDb.connection);
         this.watcher = new LocalFolderWatcher(
             () => this.localRoot(),
@@ -2106,6 +2118,7 @@ export class ProtonDriveSyncEngine {
     }
 
     private async handleLocalFileChange(relPath: string): Promise<void> {
+        this.stateEvents.touch(relPath); // a new file shows as waiting to upload; a removed one goes
         if (this.holding() || !this.auth.isLoggedIn()) {
             return;
         }
@@ -2778,8 +2791,10 @@ export class ProtonDriveSyncEngine {
         }
         const run = this.hydrateNow(rel).finally(() => {
             this.hydrations.delete(rel);
+            this.stateEvents.touch(rel);
         });
         this.hydrations.set(rel, run);
+        this.stateEvents.touch(rel); // shown as syncing while it opens
         return run;
     }
 
