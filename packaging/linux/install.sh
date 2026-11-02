@@ -106,6 +106,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
   rm -f "$PREFIX/share/applications/ch.proton.drive.desktop" "$PREFIX/share/applications/proton-drive.desktop"
   rm -f "$PREFIX/share/metainfo/ch.proton.drive.metainfo.xml"
   rm -f "$SYSTEMD_USER_DIR/protondrive.service"
+  rm -f "$PREFIX/share/icons/hicolor/scalable/emblems/emblem-protondrive-"*.svg
   find "$PREFIX/share/icons/hicolor" -name "ch.proton.drive.*" -o -name "protondrive.*" -delete 2>/dev/null || true
   command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$PREFIX/share/applications" 2>/dev/null || true
   command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f "$PREFIX/share/icons/hicolor" 2>/dev/null || true
@@ -153,6 +154,9 @@ else
   cp -R "$SRC_Root/assets/app-icon/tray/"*.png "$PREFIX/share/protondrive/tray/"
   cp -R "$SRC_Root/assets/app-icon/tray/"*.png "$PREFIX/share/icons/hicolor/64x64/apps/"
   install -Dm755 "$SRC_Root/linux/tray/proton_drive_tray.py" "$PREFIX/share/protondrive/proton_drive_tray.py"
+  for emblem in "$SRC_Root"/linux/icons/emblems/emblem-protondrive-*.svg; do
+    install -Dm644 "$emblem" "$PREFIX/share/icons/hicolor/scalable/emblems/$(basename "$emblem")"
+  done
   install -Dm644 "$SRC_Root/packaging/linux/ch.proton.drive.desktop" "$PREFIX/share/applications/ch.proton.drive.desktop"
   rm -f "$PREFIX/share/nautilus-python/extensions/proton_drive_nautilus.py"
   install -Dm644 "$SRC_Root/linux/nautilus/proton_drive_nautilus.py" "$PREFIX/share/nautilus-python/extensions/ch_proton_drive_nautilus.py"
