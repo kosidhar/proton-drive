@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 
 import { selfOrDescendant, selfOrDescendantWhere } from './pathRange';
-import { type ConflictStrategy, isConflictStrategy, usableIgnorePatterns } from './settingsRules';
+import { type ConflictStrategy, isConflictStrategy, problemWithBlockedApps, usableIgnorePatterns } from './settingsRules';
 
 export type ItemSyncStatus = 'synced' | 'uploading' | 'downloading' | 'conflict' | 'error' | 'ignored';
 export { CONFLICT_STRATEGIES, type ConflictStrategy } from './settingsRules';
@@ -66,6 +66,8 @@ export interface SyncSettings {
     reconcileIntervalSec: number;
     paused: boolean;
     ignorePatterns: string[];
+    // Apps (by process name) that may not download online-only files from the virtual drive
+    blockedApps: string[];
 }
 
 export const DEFAULT_IGNORE_PATTERNS = [
@@ -209,6 +211,19 @@ export class SyncStateDatabase {
         return [...value];
     }
 
+    // A stored list that can't be used reads as none blocked, with a warning: a bad value must never stop the drive
+    private storedBlockedApps(raw: string | undefined): string[] {
+        if (raw === undefined) return [];
+        try {
+            const apps: unknown = JSON.parse(raw);
+            if (problemWithBlockedApps(apps) === null) return apps as string[];
+        } catch {
+            // not JSON
+        }
+        this.warnBadSetting('blockedApps', raw);
+        return [];
+    }
+
     getSettings(): SyncSettings {
         const defaultSyncDir = process.env.PROTON_DRIVE_SYNC_DIR || path.join(homedir(), 'ProtonDrive');
         const rows = this.db.query('SELECT key, value FROM settings').all() as Array<{ key: string; value: string }>;
@@ -230,6 +245,7 @@ export class SyncStateDatabase {
             reconcileIntervalSec: Number(map.get('reconcileIntervalSec') || 120),
             paused: map.get('paused') === 'true',
             ignorePatterns,
+            blockedApps: this.storedBlockedApps(map.get('blockedApps')),
         };
     }
 
@@ -249,6 +265,7 @@ export class SyncStateDatabase {
         store('reconcileIntervalSec', String(next.reconcileIntervalSec));
         store('paused', String(next.paused));
         store('ignorePatterns', JSON.stringify(next.ignorePatterns));
+        store('blockedApps', JSON.stringify(next.blockedApps));
 
         if (
             (partial.syncDir !== undefined && partial.syncDir !== current.syncDir) ||

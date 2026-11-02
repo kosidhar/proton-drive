@@ -4978,6 +4978,26 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
 
         describe('hydrate', () => {
+            test('an app the user blocked is refused, quietly, and downloads nothing; others and unknown openers download', async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                d.add('Docs/b.txt', 'b');
+                d.add('Docs/c.txt', 'c');
+                await d.engine.reconcileNow();
+                stateDb.updateSettings({ blockedApps: ['rg'] });
+                const notify = spyOn(notifications, 'sendDesktopNotification');
+                try {
+                    await expect(d.engine.hydrate('Docs/a.txt', { opener: 'rg' })).rejects.toMatchObject({ code: 'EACCES', message: 'Blocked: rg' });
+                    expect(d.calls.downloads).toEqual([]);
+                    expect(notify).not.toHaveBeenCalled();
+                    await d.engine.hydrate('Docs/b.txt', { opener: 'gedit' });
+                    await d.engine.hydrate('Docs/c.txt'); // an older helper sends no opener
+                    expect(d.calls.downloads.sort()).toEqual(['Docs/b.txt', 'Docs/c.txt']);
+                } finally {
+                    notify.mockRestore();
+                }
+            });
+
             test('downloads a file once for concurrent calls, records it, and forgets its failed thumbnail', async () => {
                 const d = setup();
                 d.add('Docs/été/a b.txt', 'hello');

@@ -38,8 +38,8 @@ function makeFake(rejectWith?: string) {
                 { name: 'résumé b.txt', type: 'file', size: 12, mtimeMs: 2000 },
             ];
         },
-        async hydrate(relPath: string): Promise<void> {
-            driveCalls.push(['hydrate', relPath]);
+        async hydrate(relPath: string, opts?: { opener?: string }): Promise<void> {
+            driveCalls.push(opts?.opener === undefined ? ['hydrate', relPath] : ['hydrate', relPath, opts.opener]);
             if (relPath === 'offline.txt') throw new DriveOpError('EIO', 'Network unreachable');
             if (relPath === 'gone.txt') throw new DriveOpError('ENOENT', `Not in Proton Drive: ${relPath}`);
             if (relPath === 'odd.txt') throw new Error('Something unexpected');
@@ -194,6 +194,14 @@ describe('drive routes', () => {
         expect(res.status).toBe(200);
         expect(await res.json()).toEqual({ ok: true });
         expect(engine.driveCalls).toEqual([['hydrate', 'Docs/été/a é.txt']]);
+    });
+
+    test('POST /vfs/hydrate passes the opener through, and drops one that is not a short name', async () => {
+        const { socketPath, engine } = await start();
+        for (const opener of ['rg', '', 42, 'x'.repeat(65)]) {
+            expect((await post(socketPath, '/vfs/hydrate', { path: 'a.txt', opener })).status).toBe(200);
+        }
+        expect(engine.driveCalls).toEqual([['hydrate', 'a.txt', 'rg'], ['hydrate', 'a.txt'], ['hydrate', 'a.txt'], ['hydrate', 'a.txt']]);
     });
 
     test('POST /vfs/rename passes noReplace through, and POST /vfs/delete passes onlyIfEmpty and trash through', async () => {
