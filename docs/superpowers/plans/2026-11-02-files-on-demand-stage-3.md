@@ -35,7 +35,7 @@
   |---|---|---|
   | `emblem-protondrive-pinned` | Always keep on this device | solid green circle (`#1ea672`), white check |
   | `emblem-protondrive-local` | Downloaded | white circle, green ring (`#1ea672`, 1.5 px), green check |
-  | `emblem-protondrive-cloud` | Online only | grey (`#77777c`) cloud outline, transparent inside |
+  | `emblem-protondrive-cloud` | Online only | grey (`#77777c`) cloud outline, filled 85% white (reads on dark backgrounds, like OneDrive's) |
 
   Transient states keep the stock emblems: `emblem-synchronizing` (uploading, downloading, waiting to upload, opening) and `emblem-important` (error, conflict). A transient state replaces the availability emblem; Files shows them small, so one emblem per item.
 - **Folder rule (§5.5):** solid when the folder is effectively pinned; green ring when everything inside is downloaded; grey cloud when anything inside is online-only. This is what `AvailabilityPolicy.stateOf` already computes.
@@ -372,7 +372,7 @@ itemStates(folderRel: string): { self: ItemState | null; children: Record<string
 - [ ] **Step 2: Check** by rendering each at 16, 32 and 64 px on both backgrounds into the scratchpad (`rsvg-convert`, or Chromium through Playwright if that is missing), then look at the PNGs.
 - [ ] **Step 3: Install** the emblems into `share/icons/hicolor/scalable/emblems/` in every install path (`install.sh --user`, the release staging in `package.sh`, and so the .deb, .rpm, tar and Arch builds), then refresh the icon cache as each path already does.
   - `install.sh` uninstall removes `emblem-protondrive-*`.
-  - The Flatpak build gets nothing new: it has no Nautilus extension.
+  - The release tree (`install.sh` from a release) copies `share/icons/hicolor` whole, so it gets them through the staging. The Flatpak build gets them too, from the same staging; they are unused there.
 - [ ] **Step 4: Check** with `bash packaging/linux/install.sh --user` into a temporary `PREFIX` (or `--dry-run` if it has one) that the three files land where expected. Also check the staged tree from `package.sh` with the build step skipped, if it allows that; otherwise inspect it by reading.
 - [ ] **Step 5: Commit** `feat(packaging): install the Proton Drive emblems`.
 
