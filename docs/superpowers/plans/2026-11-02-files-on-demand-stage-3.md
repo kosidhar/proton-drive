@@ -59,7 +59,7 @@
   - `bun test tests` and `bunx tsc --noEmit` pass. As of `f521607`, `tsc` already fails on the deprecated `baseUrl` in `tsconfig.json`; Task 0 fixes that first.
   - `python3 linux/nautilus/test_proton_drive_nautilus.py` and `python3 linux/tray/test_proton_drive_tray.py` pass.
   - Run as a normal user: three layout tests rely on read-only folders and fail as root.
-- **Commits:** conventional style, no Claude/Anthropic attribution. Work on a local branch `files-on-demand-stage-3` from `main-epgufb`. At the end, merge it into `main-epgufb` with `--no-ff` (as Stages 1 and 2 were) and push `main-epgufb` only.
+- **Commits:** conventional style. Work on a local branch `files-on-demand-stage-3` from `main-epgufb`. At the end, merge it into `main-epgufb` with `--no-ff` (as Stages 1 and 2 were) and push `main-epgufb` only.
 
 ## Review Focus
 
@@ -83,9 +83,9 @@
 
 ### Task 0: Branch, and a green type check
 
-- [ ] **Step 1:** `git switch -c files-on-demand-stage-3 main-epgufb`.
-- [ ] **Step 2:** Add `"ignoreDeprecations": "6.0"` to `tsconfig.json`'s `compilerOptions`, so that `bunx tsc --noEmit` passes again. Keep `baseUrl`; removing it is a separate change. Fix any other error tsc then shows.
-- [ ] **Step 3:** Commit `chore: silence the TypeScript 6 baseUrl deprecation so the type check passes`.
+- [x] **Step 1:** `git switch -c files-on-demand-stage-3 main-epgufb`.
+- [x] **Step 2:** Remove the deprecated `baseUrl` from `tsconfig.json`. Every `paths` entry already starts with `./`, so they resolve from the tsconfig without it. `bunx tsc --noEmit` passes again.
+- [ ] **Step 3:** Commit `chore: drop the deprecated baseUrl so the type check passes`.
 
 ---
 
