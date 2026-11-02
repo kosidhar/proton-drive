@@ -201,8 +201,9 @@ itemStates(folderRel: string): { self: ItemState | null; children: Record<string
 ### Task 3: Control routes for the file manager
 
 **Files:**
+- Create: `src/daemon/fileManagerRoutes.ts`
 - Modify: `src/daemon/controlServer.ts`, `src/daemon/controlWiring.ts`
-- Test: `tests/controlServer.test.ts` (`describe('file manager routes')`)
+- Test: `tests/fileManagerRoutes.test.ts`
 
 **Routes** (control socket only; read-only):
 - `GET /fm/root` returns `{ syncDir, mode: 'virtual' | 'plain', mounted: boolean }`.
