@@ -37,7 +37,7 @@ import { problemWithBlockedApps } from './settingsRules';
 import { StateEvents } from './stateEvents';
 import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
 import { createLocalConflictCopy, formatConflictFileName } from './conflictResolver';
-import { gioTrash, type MoveToDesktopTrash } from './desktopTrash';
+import { homeTrash, type MoveToDesktopTrash } from './desktopTrash';
 import { readDriveLayout } from './driveMode';
 import { LAYOUT_MOVING, type MoveSeams, relocateFiles, SYNC_DIR_MOVING } from './layoutMigration';
 import { DriveOpError, type VfsEntry } from './driveOps';
@@ -2414,8 +2414,10 @@ export class ProtonDriveSyncEngine {
                 continue; // Gone meanwhile, or an empty folder: nothing in it to keep
             }
             let wasMoved = false;
+            // In the virtual layout the item is in the hidden store, but the user knows it under the drive (#40)
+            const shownPath = this.inBackingStore() ? path.join(this.stateDb.getSettings().syncDir, rel) : undefined;
             try {
-                wasMoved = await this.moveToDesktopTrash(fullPath);
+                wasMoved = await this.moveToDesktopTrash(fullPath, shownPath);
             } catch {
                 // Counts as not moved
             }
@@ -2436,7 +2438,7 @@ export class ProtonDriveSyncEngine {
     }
 
     private get moveToDesktopTrash(): MoveToDesktopTrash {
-        return this.options.moveToDesktopTrash ?? gioTrash;
+        return this.options.moveToDesktopTrash ?? homeTrash();
     }
 
     // A synced item the cloud no longer lists at its path. Renamed or moved there, its local copy follows; deleted or

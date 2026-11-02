@@ -3212,8 +3212,10 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const drive = makeMockDrive();
             const trashDir = path.join(tempDir, 'Trash');
             const handedToTrash: string[] = [];
-            const moveToDesktopTrash = async (fullPath: string) => {
+            const shownToTrash: Array<string | undefined> = [];
+            const moveToDesktopTrash = async (fullPath: string, shownPath?: string) => {
                 handedToTrash.push(fullPath);
+                shownToTrash.push(shownPath);
                 if (!trashWorks) {
                     return false;
                 }
@@ -3233,7 +3235,9 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(drive.calls.downloads.sort()).toEqual(['Projects/app/index.ts', 'Projects/notes.txt', 'Projects/readme.txt']);
             const local = (rel: string) => path.join(engine.localRoot(), rel);
             const trashed = () => handedToTrash.map((p) => path.relative(engine.localRoot(), p)).sort();
-            return { ...drive, engine, files: localFiles(stateDb, () => engine.localRoot()), local, trashDir, trashed };
+            // Where the Trash is told each came from: under the drive in the virtual layout (#40), nothing extra in the plain
+            const shown = () => shownToTrash.map((p) => (p === undefined ? p : path.relative(stateDb.getSettings().syncDir, p))).sort();
+            return { ...drive, engine, files: localFiles(stateDb, () => engine.localRoot()), local, trashDir, trashed, shown };
         };
         type Drive = Awaited<ReturnType<typeof downloadedProjects>>;
         // An ignored .git, which is never uploaded, and an edit that hasn't uploaded yet
@@ -3289,6 +3293,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
                     // The topmost local-only things, not the folders holding them
                     expect(d.trashed()).toEqual(['Projects/app/.git', 'Projects/notes.txt']);
+                    expect(d.shown()).toEqual(layout === 'virtual' ? ['Projects/app/.git', 'Projects/notes.txt'] : [undefined, undefined]);
                     expect(await readFile(path.join(d.trashDir, '.git/HEAD'), 'utf8')).toBe('ref: refs/heads/main');
                     expect(await readFile(path.join(d.trashDir, 'notes.txt'), 'utf8')).toBe('edited, not uploaded yet');
                     expect(await d.files.exists('Projects')).toBe(false); // emptied, so removed
