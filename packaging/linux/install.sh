@@ -107,7 +107,15 @@ if [ "$UNINSTALL" -eq 1 ]; then
   rm -f "$PREFIX/share/metainfo/ch.proton.drive.metainfo.xml"
   rm -f "$SYSTEMD_USER_DIR/protondrive.service"
   rm -f "$PREFIX/share/icons/hicolor/scalable/emblems/emblem-protondrive-"*.svg
-  find "$PREFIX/share/icons/hicolor" -name "ch.proton.drive.*" -o -name "protondrive.*" -delete 2>/dev/null || true
+  # The file manager integrations and the tray, so Files, Nemo and Dolphin stop offering Proton Drive (#54)
+  rm -f "$PREFIX/share/nautilus-python/extensions/ch_proton_drive_nautilus.py" \
+    "$PREFIX/share/nautilus-python/extensions/proton_drive_nautilus.py" \
+    "$PREFIX/share/nemo-python/extensions/proton_drive_nemo.py" \
+    "$PREFIX/share/kio/servicemenus/protondrive.desktop"
+  rm -rf "$PREFIX/share/protondrive"
+  # The parentheses matter: without them -delete applies to the last name only (#54)
+  find "$PREFIX/share/icons/hicolor" \( -name "ch.proton.drive.*" -o -name "protondrive.*" -o -name "protondrive-tray-*" \) \
+    -delete 2>/dev/null || true
   command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$PREFIX/share/applications" 2>/dev/null || true
   command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f "$PREFIX/share/icons/hicolor" 2>/dev/null || true
   echo "==> Uninstalled Proton Drive."
