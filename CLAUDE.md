@@ -16,3 +16,4 @@
 - `bun test tests` and `bunx tsc --noEmit`. Run the tests as a normal user: three read-only-folder tests in `tests/vfsSupervisor.test.ts` and `tests/layoutMigration.test.ts` fail as root, because root ignores file permissions.
 - `python3 linux/nautilus/test_proton_drive_nautilus.py` and `python3 linux/tray/test_proton_drive_tray.py`.
 - In `native-vfs/` (and `native-gui/` when touched): `cargo test` and `cargo clippy --all-targets` with no warnings.
+- The helper's real mount tests run with `PROTONDRIVE_VFS_MOUNT_TESTS=1 cargo test --test mount` and need `/dev/fuse`. Three of them (`an_unwritable_log_never_takes_the_drive_down`, `mounts_as_protondrive_with_the_drives_options`, `unmounting_ends_the_helper_with_exit_code_0`) also need `fusermount3`, and fail where it isn't installed.
