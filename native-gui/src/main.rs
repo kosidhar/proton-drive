@@ -217,6 +217,8 @@ struct SyncSettings {
     reconcile_interval_sec: u64,
     paused: bool,
     ignore_patterns: Vec<String>,
+    /// Apps (by process name) the virtual drive won't download online-only files for; absent from an older daemon
+    blocked_apps: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -978,6 +980,8 @@ enum WorkerCommand {
     SaveSettings(serde_json::Value),
     /// The Settings switch `Show online-only files in Files (virtual drive)`
     SetVirtualDrive(bool),
+    /// POST /drive/settings with the whole new list of blocked apps (Block or Unblock in Settings)
+    SetBlockedApps(Vec<String>),
     MountAgain,
     /// An action on a move that stopped, naming the move by where it goes
     DriveMove { action: String, from: String, to: String },
@@ -1052,6 +1056,7 @@ enum WorkerEvent {
     AvailabilityDone { path: String, result: Result<AvailabilityResult, String> },
     SettingsSaved(Result<SettingsReply, String>),
     VirtualDriveSwitched(Result<SettingsReply, String>),
+    BlockedAppsSaved(Result<SettingsReply, String>),
     /// Mount again or an action on a stopped move finished, or why not
     DriveDone(Result<(), String>),
     /// What was asked about the missing files (deleted on purpose, or kept online-only) went through, or why not
@@ -1250,6 +1255,11 @@ struct ProtonDriveNativeApp {
     drive_working: bool,
     /// Why the last of those was refused or failed
     drive_error: Option<String>,
+    /// The name typed under Apps blocked from downloading, whether a Block or Unblock is still running, and why the
+    /// last one was refused
+    block_app_input: String,
+    blocklist_working: bool,
+    blocklist_error: Option<String>,
     /// The confirmation that the missing files were deleted on purpose is still running, and why the last one failed
     files_missing_working: bool,
     files_missing_error: Option<String>,
@@ -1372,6 +1382,9 @@ impl ProtonDriveNativeApp {
             settings_notice: None,
             drive_working: false,
             drive_error: None,
+            block_app_input: String::new(),
+            blocklist_working: false,
+            blocklist_error: None,
             files_missing_working: false,
             files_missing_error: None,
             conflicts: Vec::new(),
@@ -1551,6 +1564,18 @@ impl ProtonDriveNativeApp {
                         Err(e) => self.drive_error = Some(e),
                     }
                     let _ = self.tx.send(WorkerCommand::RefreshAll);
+                }
+                WorkerEvent::BlockedAppsSaved(result) => {
+                    self.blocklist_working = false;
+                    match result {
+                        Ok(reply) => {
+                            self.blocklist_error = None;
+                            self.block_app_input.clear();
+                            self.apply_settings_reply(reply);
+                        }
+                        // Nothing was stored: the name stays, to fix and try again
+                        Err(e) => self.blocklist_error = Some(e),
+                    }
                 }
                 WorkerEvent::DriveDone(result) => {
                     self.drive_working = false;
@@ -3784,6 +3809,8 @@ impl ProtonDriveNativeApp {
                     if let Some(vfs) = self.status.vfs.clone() {
                         self.render_drive_card(ui, &vfs);
                         ui.add_space(14.0);
+                        self.render_blocked_apps_card(ui);
+                        ui.add_space(14.0);
                     }
                     self.render_sync_settings_card(ui);
                 });
@@ -3967,6 +3994,77 @@ impl ProtonDriveNativeApp {
             });
         if let Some(action) = chosen {
             self.send_drive_command(WorkerCommand::DriveMove { action, from: mv.from.clone(), to: mv.to.clone() });
+        }
+    }
+
+    /// Apps blocked from downloading online-only files: each with Unblock, and a name to block.
+    fn render_blocked_apps_card(&mut self, ui: &mut egui::Ui) {
+        let apps = self.status.settings.blocked_apps.clone();
+        let mut asked: Option<Result<Vec<String>, String>> = None;
+        card_frame().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(RichText::new("Apps blocked from downloading").size(16.0).strong().color(TEXT_PRIMARY()));
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new("These apps can't download online-only files. Files they already have on this computer still open.")
+                        .size(12.5)
+                        .color(TEXT_MUTED()),
+                )
+                .wrap(),
+            );
+            ui.add_space(12.0);
+            ui.add_enabled_ui(!self.blocklist_working, |ui| {
+                if apps.is_empty() {
+                    ui.label(RichText::new("No apps are blocked.").size(13.0).color(TEXT_MUTED()));
+                }
+                for app in &apps {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(app).size(13.5).monospace().color(TEXT_PRIMARY()));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let size = Vec2::new(button_width(ui, "Unblock"), 28.0);
+                            let stroke = Some(Stroke::new(1.0_f32, BORDER_SUBTLE()));
+                            if proton_button(ui, size, "Unblock", BG_CARD_ALT(), btn_secondary_hover_bg(), stroke, TEXT_PRIMARY(), 12.5)
+                                .clicked()
+                            {
+                                asked = Some(Ok(without_blocked_app(&apps, app)));
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let button_w = button_width(ui, "Block");
+                    let input_w = (ui.available_width() - button_w - 6.0 - ui.spacing().item_spacing.x).clamp(120.0, 320.0);
+                    let field = ui.add_sized(
+                        [input_w, 32.0],
+                        egui::TextEdit::singleline(&mut self.block_app_input)
+                            .hint_text("App name, e.g. rg")
+                            .vertical_align(Align::Center),
+                    );
+                    let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.add_space(6.0);
+                    let clicked = proton_button(ui, Vec2::new(button_w, 32.0), "Block", PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE, 13.0)
+                        .clicked();
+                    if (clicked || entered) && !self.block_app_input.trim().is_empty() {
+                        asked = Some(with_blocked_app(&apps, &self.block_app_input));
+                    }
+                });
+            });
+            if let Some(error) = &self.blocklist_error {
+                ui.add_space(8.0);
+                ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
+            }
+        });
+        match asked {
+            Some(Ok(list)) if !self.blocklist_working => {
+                self.blocklist_error = None;
+                self.blocklist_working = true;
+                let _ = self.tx.send(WorkerCommand::SetBlockedApps(list));
+            }
+            Some(Err(problem)) => self.blocklist_error = Some(problem),
+            _ => {}
         }
     }
 
@@ -4452,6 +4550,30 @@ fn breadcrumbs_width(painter: &egui::Painter, parts: &[String], gap: f32) -> f32
             text_width(painter, breadcrumb_label(idx, part), &crumb_font) + BREADCRUMB_PAD_X * 2.0 + 2.0 + gap + separator
         })
         .sum::<f32>()
+}
+
+/// The blocklist with one more app, as the daemon will take it (see problemWithBlockedApps): a process name of 1 to 15
+/// bytes, trimmed, with no '/' or control characters. One already listed leaves the list as it is.
+fn with_blocked_app(apps: &[String], name: &str) -> Result<Vec<String>, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Type the name of an app to block.".into());
+    }
+    if name.len() > 15 {
+        return Err(format!("\"{name}\" is too long: an app's process name has at most 15 bytes."));
+    }
+    if name.contains('/') || name.chars().any(char::is_control) {
+        return Err(format!("\"{name}\" isn't the name of an app. Use its process name, as `ps` shows it."));
+    }
+    let mut next = apps.to_vec();
+    if !next.iter().any(|a| a == name) {
+        next.push(name.to_string());
+    }
+    Ok(next)
+}
+
+fn without_blocked_app(apps: &[String], name: &str) -> Vec<String> {
+    apps.iter().filter(|a| *a != name).cloned().collect()
 }
 
 fn card_frame() -> Frame {
@@ -5266,6 +5388,10 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
             WorkerCommand::SetVirtualDrive(on) => off_thread(&tx, &ctx, move || {
                 let change = serde_json::json!({ "virtualDriveWanted": on });
                 WorkerEvent::VirtualDriveSwitched(save_settings_at(&control_socket_path(), &change))
+            }),
+            WorkerCommand::SetBlockedApps(apps) => off_thread(&tx, &ctx, move || {
+                let change = serde_json::json!({ "blockedApps": apps });
+                WorkerEvent::BlockedAppsSaved(save_settings_at(&control_socket_path(), &change))
             }),
             WorkerCommand::MountAgain => off_thread(&tx, &ctx, || WorkerEvent::DriveDone(mount_again_at(&control_socket_path()))),
             WorkerCommand::DriveMove { action, from, to } => off_thread(&tx, &ctx, move || {
@@ -6294,6 +6420,9 @@ mod tests {
                 settings_notice: None,
                 drive_working: false,
                 drive_error: None,
+                block_app_input: String::new(),
+                blocklist_working: false,
+                blocklist_error: None,
                 files_missing_working: false,
                 files_missing_error: None,
                 conflicts: Vec::new(),
@@ -6407,6 +6536,7 @@ mod tests {
                     WorkerCommand::LoadRemotePath(path) => Some(format!("open {path}")),
                     WorkerCommand::SaveSettings(changes) => Some(format!("save {changes}")),
                     WorkerCommand::SetVirtualDrive(on) => Some(format!("virtual drive {on}")),
+                    WorkerCommand::SetBlockedApps(apps) => Some(format!("blocked apps {}", apps.join(","))),
                     WorkerCommand::MountAgain => Some("mount again".to_string()),
                     WorkerCommand::DriveMove { action, from, to } => Some(format!("{action} {from} -> {to}")),
                     WorkerCommand::ResolveFilesMissing { choice, root, names } => {
@@ -6737,6 +6867,7 @@ mod tests {
             reconcile_interval_sec: 120,
             paused: false,
             ignore_patterns: vec![".git".into(), "*.part".into()],
+            blocked_apps: Vec::new(),
         }
     }
 
@@ -7246,6 +7377,66 @@ mod tests {
         assert_eq!(h.app.pending_confirm, None);
         assert_eq!(h.sent(), vec!["virtual drive false".to_string()]);
         assert!(h.app.drive_working);
+    }
+
+    #[test]
+    fn the_blocklist_is_parsed_when_there_and_empty_from_an_older_daemon() {
+        let old: SyncSettings = serde_json::from_str(r#"{"syncDir":"/x","conflictStrategy":"keep-both"}"#).unwrap();
+        assert!(old.blocked_apps.is_empty());
+        let new: SyncSettings = serde_json::from_str(r#"{"syncDir":"/x","blockedApps":["rg","code"]}"#).unwrap();
+        assert_eq!(new.blocked_apps, ["rg", "code"]);
+    }
+
+    #[test]
+    fn a_name_to_block_is_checked_as_the_daemon_checks_it() {
+        let apps = vec!["rg".to_string()];
+        assert_eq!(with_blocked_app(&apps, "  code "), Ok(vec!["rg".to_string(), "code".to_string()]));
+        assert_eq!(with_blocked_app(&apps, "rg"), Ok(apps.clone()));
+        assert!(with_blocked_app(&apps, "   ").is_err());
+        assert!(with_blocked_app(&apps, "a-very-long-name").is_err());
+        assert!(with_blocked_app(&apps, "éééééééé").is_err()); // 16 bytes
+        assert!(with_blocked_app(&apps, "/usr/bin/rg").is_err());
+        assert!(with_blocked_app(&apps, "r\tg").is_err());
+        assert_eq!(without_blocked_app(&["rg".into(), "code".into()], "rg"), ["code"]);
+    }
+
+    #[test]
+    fn blocked_apps_are_listed_and_unblock_and_block_send_the_new_list() {
+        let mut h = Harness::settings(Some(vfs("virtual", true, None)), Some(true));
+        assert!(h.text_at("No apps are blocked.").is_some());
+        h.app.status.settings.blocked_apps = vec!["rg".into(), "code".into()];
+        h.frames(2);
+        assert!(h.text_at("rg").is_some());
+        assert!(h.text_at("No apps are blocked.").is_none());
+
+        h.click(h.text_at("Unblock").expect("each app has Unblock"));
+        assert_eq!(h.sent(), vec!["blocked apps code".to_string()]);
+        assert!(h.app.blocklist_working);
+        // Nothing else is sent while it runs
+        h.click(h.text_at("Unblock").unwrap());
+        assert_eq!(h.sent(), Vec::<String>::new());
+        let settings = SyncSettings { blocked_apps: vec!["code".into()], ..h.app.status.settings.clone() };
+        h.event(WorkerEvent::BlockedAppsSaved(Ok(SettingsReply { settings: Some(settings), ..Default::default() })));
+        assert!(!h.app.blocklist_working);
+        assert!(h.text_at("rg").is_none());
+
+        h.app.block_app_input = "backup.sh".into();
+        h.click(h.text_at("Block").expect("a name can be blocked"));
+        assert_eq!(h.sent(), vec!["blocked apps code,backup.sh".to_string()]);
+        h.event(WorkerEvent::BlockedAppsSaved(Err("\"backup.sh\" isn't the name of an app".into())));
+        assert!(h.text_at("\"backup.sh\" isn't the name of an app").is_some());
+        assert_eq!(h.app.block_app_input, "backup.sh");
+
+        h.app.block_app_input = "/bin/sh".into();
+        h.click(h.text_at("Block").unwrap());
+        assert_eq!(h.sent(), Vec::<String>::new());
+        assert!(h.app.blocklist_error.as_deref().is_some_and(|e| e.contains("isn't the name of an app")));
+    }
+
+    #[test]
+    fn without_the_virtual_drive_there_is_no_blocklist() {
+        let h = Harness::settings(None, None);
+        assert!(h.text_at("Apps blocked from downloading").is_none());
     }
 
     #[test]

@@ -3212,8 +3212,10 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const drive = makeMockDrive();
             const trashDir = path.join(tempDir, 'Trash');
             const handedToTrash: string[] = [];
-            const moveToDesktopTrash = async (fullPath: string) => {
+            const shownToTrash: Array<string | undefined> = [];
+            const moveToDesktopTrash = async (fullPath: string, shownPath?: string) => {
                 handedToTrash.push(fullPath);
+                shownToTrash.push(shownPath);
                 if (!trashWorks) {
                     return false;
                 }
@@ -3233,7 +3235,9 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(drive.calls.downloads.sort()).toEqual(['Projects/app/index.ts', 'Projects/notes.txt', 'Projects/readme.txt']);
             const local = (rel: string) => path.join(engine.localRoot(), rel);
             const trashed = () => handedToTrash.map((p) => path.relative(engine.localRoot(), p)).sort();
-            return { ...drive, engine, files: localFiles(stateDb, () => engine.localRoot()), local, trashDir, trashed };
+            // Where the Trash is told each came from: under the drive in the virtual layout (#40), nothing extra in the plain
+            const shown = () => shownToTrash.map((p) => (p === undefined ? p : path.relative(stateDb.getSettings().syncDir, p))).sort();
+            return { ...drive, engine, files: localFiles(stateDb, () => engine.localRoot()), local, trashDir, trashed, shown };
         };
         type Drive = Awaited<ReturnType<typeof downloadedProjects>>;
         // An ignored .git, which is never uploaded, and an edit that hasn't uploaded yet
@@ -3289,6 +3293,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
                     // The topmost local-only things, not the folders holding them
                     expect(d.trashed()).toEqual(['Projects/app/.git', 'Projects/notes.txt']);
+                    expect(d.shown()).toEqual(layout === 'virtual' ? ['Projects/app/.git', 'Projects/notes.txt'] : [undefined, undefined]);
                     expect(await readFile(path.join(d.trashDir, '.git/HEAD'), 'utf8')).toBe('ref: refs/heads/main');
                     expect(await readFile(path.join(d.trashDir, 'notes.txt'), 'utf8')).toBe('edited, not uploaded yet');
                     expect(await d.files.exists('Projects')).toBe(false); // emptied, so removed
@@ -4978,6 +4983,94 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
 
         describe('hydrate', () => {
+            test('one app downloading more than 20 files in a minute is told about once, and Block this app blocks it', async () => {
+                stateDb.updateSettings({ notificationsEnabled: true });
+                const asked: Array<{ title: string; body: string }> = [];
+                let answer!: (choice: string | null) => void;
+                const d = setup();
+                const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                    backingDir: path.join(tempDir, 'files'),
+                    moveToDesktopTrash: async () => false,
+                    askWithActions: (n) => {
+                        asked.push({ title: n.title, body: n.body });
+                        return new Promise((resolve) => (answer = resolve));
+                    },
+                });
+                for (let i = 0; i < 25; i++) d.add(`Big/f${i}.txt`, `${i}`);
+                d.add('Big/here.txt', 'here');
+                await engine.reconcileNow();
+                await engine.hydrate('Big/here.txt', { opener: 'rg' }); // already here afterwards: asking again counts nothing
+                for (let i = 0; i < 19; i++) await engine.hydrate('Big/here.txt', { opener: 'rg' });
+                const notify = spyOn(notifications, 'sendDesktopNotification').mockImplementation(() => {});
+                try {
+                    for (let i = 0; i < 19; i++) await engine.hydrate(`Big/f${i}.txt`, { opener: 'rg' });
+                    expect(asked).toEqual([]); // 20 downloads so far
+                    await engine.hydrate('Big/f19.txt', { opener: 'rg' });
+                    expect(asked).toEqual([{ title: 'rg is downloading many files from Proton Drive', body: 'It has downloaded 21 files in the last minute.' }]);
+                    await engine.hydrate('Big/f20.txt', { opener: 'rg' });
+                    expect(asked.length).toBe(1);
+
+                    answer('block');
+                    await Bun.sleep(10);
+                    expect(stateDb.getSettings().blockedApps).toEqual(['rg']);
+                    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ title: 'rg is blocked' }));
+                    await expect(engine.hydrate('Big/f21.txt', { opener: 'rg' })).rejects.toMatchObject({ code: 'EACCES' });
+                    await engine.hydrate('Big/f22.txt', { opener: 'gedit' });
+                } finally {
+                    notify.mockRestore();
+                }
+            });
+
+            test('without buttons the notice says where to block the app, and with notifications off nothing is said', async () => {
+                const d = setup();
+                let asked = 0;
+                const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                    backingDir: path.join(tempDir, 'files'),
+                    moveToDesktopTrash: async () => false,
+                    askWithActions: async () => {
+                        asked += 1;
+                        return 'unsupported';
+                    },
+                });
+                for (let i = 0; i < 50; i++) d.add(`Big/f${i}.txt`, `${i}`);
+                await engine.reconcileNow();
+                const notify = spyOn(notifications, 'sendDesktopNotification').mockImplementation(() => {});
+                try {
+                    for (let i = 0; i < 25; i++) await engine.hydrate(`Big/f${i}.txt`, { opener: 'code' });
+                    expect(asked).toBe(0); // notificationsEnabled is off in this suite
+                    stateDb.updateSettings({ notificationsEnabled: true });
+                    for (let i = 25; i < 50; i++) await engine.hydrate(`Big/f${i}.txt`, { opener: 'backup' });
+                    await Bun.sleep(10);
+                    expect(asked).toBe(1);
+                    expect(notify).toHaveBeenCalledWith(
+                        expect.objectContaining({ body: "It has downloaded 21 files in the last minute. You can block it in Proton Drive's Settings." }),
+                    );
+                    expect(stateDb.getSettings().blockedApps).toEqual([]);
+                } finally {
+                    notify.mockRestore();
+                }
+            });
+
+            test('an app the user blocked is refused, quietly, and downloads nothing; others and unknown openers download', async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                d.add('Docs/b.txt', 'b');
+                d.add('Docs/c.txt', 'c');
+                await d.engine.reconcileNow();
+                stateDb.updateSettings({ blockedApps: ['rg'] });
+                const notify = spyOn(notifications, 'sendDesktopNotification');
+                try {
+                    await expect(d.engine.hydrate('Docs/a.txt', { opener: 'rg' })).rejects.toMatchObject({ code: 'EACCES', message: 'Blocked: rg' });
+                    expect(d.calls.downloads).toEqual([]);
+                    expect(notify).not.toHaveBeenCalled();
+                    await d.engine.hydrate('Docs/b.txt', { opener: 'gedit' });
+                    await d.engine.hydrate('Docs/c.txt'); // an older helper sends no opener
+                    expect(d.calls.downloads.sort()).toEqual(['Docs/b.txt', 'Docs/c.txt']);
+                } finally {
+                    notify.mockRestore();
+                }
+            });
+
             test('downloads a file once for concurrent calls, records it, and forgets its failed thumbnail', async () => {
                 const d = setup();
                 d.add('Docs/été/a b.txt', 'hello');

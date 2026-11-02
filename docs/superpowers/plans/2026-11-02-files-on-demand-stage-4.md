@@ -11,7 +11,7 @@ Also make the desktop Trash show an item's drive path as its original location (
 
 **Spec:** `docs/superpowers/specs/2026-10-23-files-on-demand-design.md`, delivery step 4 of §6 (§5.3 "Who triggers a download" and "Mass downloads by one app"). Builds on Stage 3 (#52).
 
-**Tracking issue:** #55.
+**Tracking issue:** #55. Follow-up found while building it: #56 (apps are known only by their 15-byte process name).
 
 **Out of scope:** measuring the built-in background-reader list on real GNOME 50 Files. That needs the real desktop, so it is in Task 7's checklist, and anything it finds gets its own issue.
 
@@ -60,7 +60,7 @@ Also make the desktop Trash show an item's drive path as its original location (
 
 ### Task 0: Branch
 
-- [ ] **Step 1:** `git switch -c files-on-demand-stage-4 main-epgufb`.
+- [x] **Step 1:** `git switch -c files-on-demand-stage-4 main-epgufb`.
 
 ### Task 1: The helper says who opened a file
 
@@ -128,9 +128,9 @@ Also make the desktop Trash show an item's drive path as its original location (
 
 ### Task 6: Docs, review and merge
 
-- [ ] README: the notice, the blocklist, and where to unblock.
-- [ ] Review the branch against Review Focus; every problem found gets an issue (`CLAUDE.md`).
-- [ ] All checks; merge `--no-ff` into `main-epgufb`; push; update #55.
+- [x] README: the notice, the blocklist, and where to unblock.
+- [x] Review the branch against Review Focus; every problem found gets an issue (`CLAUDE.md`).
+- [x] All checks; merge `--no-ff` into `main-epgufb`; push; update #55.
 
 ### Task 7: Acceptance on the real desktop (the user)
 

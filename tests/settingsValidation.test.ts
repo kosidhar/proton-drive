@@ -287,3 +287,51 @@ describe('a bad stored setting is not used, and not overwritten (#34)', () => {
         }
     });
 });
+
+describe('blockedApps', () => {
+    test('a list of app names is stored and reads back; an empty list unblocks everything', async () => {
+        const t = setup();
+        expect(t.before.blockedApps).toEqual([]);
+        const saved = await t.save({ blockedApps: ['rg', 'code', 'baloo_file_extr'] });
+        expect(saved.status).toBe(200);
+        expect(t.stateDb.getSettings().blockedApps).toEqual(['rg', 'code', 'baloo_file_extr']);
+        expect((await t.save({ blockedApps: [] })).status).toBe(200);
+        expect(t.stateDb.getSettings().blockedApps).toEqual([]);
+    });
+
+    const bad: Array<[string, unknown]> = [
+        ['not a list', 'rg'],
+        ['an empty name', ['']],
+        ['a name that is not text', [42]],
+        ['a name longer than 15 bytes', ['a-very-long-name']],
+        ['15 characters but more bytes', ['éééééééé']],
+        ['a path', ['/usr/bin/rg']],
+        ['a control character', ['r\ng']],
+        ['spaces around it', [' rg']],
+        ['a duplicate', ['rg', 'rg']],
+        ['too many', Array.from({ length: 101 }, (_, i) => `app${i}`)],
+    ];
+    for (const [name, blockedApps] of bad) {
+        test(`${name}: 400 EINVAL, nothing stored`, async () => {
+            const t = setup();
+            const saved = await t.save({ blockedApps });
+            expect(saved.status).toBe(400);
+            expect(saved.json.code).toBe('EINVAL');
+            expect(t.stateDb.getSettings().blockedApps).toEqual([]);
+        });
+    }
+
+    test('100 names of 15 bytes are fine', () => {
+        const apps = Array.from({ length: 100 }, (_, i) => `app-${String(i).padStart(11, '0')}`);
+        expect(parseSettings({ blockedApps: apps })).toEqual({ ok: true, value: { blockedApps: apps } });
+    });
+
+    test('a stored list that is unusable reads as none blocked, and is kept as it is', () => {
+        const t = setup();
+        t.stateDb.connection.run("INSERT OR REPLACE INTO settings (key, value) VALUES ('blockedApps', '{not json')");
+        expect(t.stateDb.getSettings().blockedApps).toEqual([]);
+        t.stateDb.connection.run(`INSERT OR REPLACE INTO settings (key, value) VALUES ('blockedApps', '["/bin/sh"]')`);
+        expect(t.stateDb.getSettings().blockedApps).toEqual([]);
+        expect(t.stateDb.getMeta('blockedApps')).toBe('["/bin/sh"]');
+    });
+});
