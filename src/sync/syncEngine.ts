@@ -47,7 +47,7 @@ import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
 import { pathsOverlap } from './mountPoint';
 import { entryFromNode, RemoteIndex, type RemoteIndexEntry } from './remoteIndex';
 import { type RemoteOp, RemoteOpsJournal } from './remoteOps';
-import type { ConflictRecord, EditBaseline, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
+import type { ConflictRecord, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
 import { forgetFailedThumbnail } from './thumbnailCache';
 
 export { DriveOpError, type DriveOpErrorCode, type VfsEntry } from './driveOps';
@@ -1224,13 +1224,21 @@ export class ProtonDriveSyncEngine {
                     remoteNode.activeRevision?.claimedModificationTime ?? remoteNode.modificationTime
                 ).getTime();
 
-                // Fast path: if mtime & size match DB record and remoteSha1 matches DB record, no SHA1 recomputation needed
+                const remoteNow: CloudVersion = { sha1: remoteSha1, mtimeMs: remoteMtimeMs, size: getClaimedSize(remoteNode) ?? 0 };
+                // What the record says the cloud held when it was made (its size is the local one, the same then)
+                const remoteAtSync: CloudVersion | null = dbRecord
+                    ? { sha1: dbRecord.remoteSha1, mtimeMs: dbRecord.remoteMtimeMs, size: dbRecord.size }
+                    : null;
+
+                // Fast path: the local file's time and size match the record, and the cloud hasn't changed since it: no
+                // SHA1 recomputation needed
                 if (
                     dbRecord &&
+                    remoteAtSync &&
                     dbRecord.syncStatus === 'synced' &&
                     Math.abs(localInfo.mtimeMs - dbRecord.localMtimeMs) < 10 &&
                     localInfo.size === dbRecord.size &&
-                    remoteSha1 === dbRecord.remoteSha1
+                    !cloudChangedSince(remoteAtSync, remoteNow)
                 ) {
                     return;
                 }
@@ -1267,9 +1275,9 @@ export class ProtonDriveSyncEngine {
                 const edit = dbRecord ? null : this.stateDb.getEditBaseline(relPath);
                 const editOfThis = edit?.nodeUid === remoteNode.uid ? edit : null;
                 const localChangedSinceSync = !dbRecord || localSha1 !== dbRecord.localSha1;
-                const remoteChangedSinceSync = dbRecord
-                    ? remoteSha1 !== dbRecord.remoteSha1
-                    : !editOfThis || cloudChangedSince(editOfThis, remoteSha1, remoteMtimeMs, getClaimedSize(remoteNode) ?? 0);
+                const remoteChangedSinceSync = remoteAtSync
+                    ? cloudChangedSince(remoteAtSync, remoteNow)
+                    : !editOfThis || cloudChangedSince(editOfThis, remoteNow);
 
                 if (localChangedSinceSync && !remoteChangedSinceSync) {
                     const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
@@ -5168,13 +5176,22 @@ function isTransient(error: unknown): boolean {
     return error instanceof ConnectionError || error instanceof AbortError || error instanceof ServerError;
 }
 
-// Whether the cloud's file has changed since the drive showed it. Two missing checksums don't make it the same: then its
-// time and size must match too.
-function cloudChangedSince(edit: EditBaseline, sha1: string | null, mtimeMs: number, size: number): boolean {
-    if (edit.sha1 !== null) {
-        return sha1 !== edit.sha1;
+// A version of a cloud file, as its active revision claims it: its SHA1 (null when the uploader gave none), modified
+// time and size
+interface CloudVersion {
+    sha1: string | null;
+    mtimeMs: number;
+    size: number;
+}
+
+// Whether the cloud's file has changed since a version of it seen before: what the drive showed (an edit baseline), or
+// what a record says it held. Two checksums decide it alone. A missing checksum never makes it the same (#24): then the
+// checksums, the time and the size must all match.
+function cloudChangedSince(seen: CloudVersion, now: CloudVersion): boolean {
+    if (seen.sha1 !== null && now.sha1 !== null) {
+        return now.sha1 !== seen.sha1;
     }
-    return sha1 !== null || mtimeMs !== edit.mtimeMs || size !== edit.size;
+    return now.sha1 !== seen.sha1 || now.mtimeMs !== seen.mtimeMs || now.size !== seen.size;
 }
 
 // A record for a file only the remote index knows (online-only), as replaced through the drive: its node, and what the
