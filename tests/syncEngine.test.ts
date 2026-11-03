@@ -7509,6 +7509,118 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
             });
 
+            test('a local file with the very content of the cloud file, not recorded yet, is that file: a delete trashes it', async () => {
+                const d = setup();
+                d.add('Docs/doc.txt', 'theirs');
+                await d.engine.reconcileNow();
+                await d.files.writeLocal('Docs/doc.txt', 'theirs');
+
+                await d.engine.deleteItem('Docs/doc.txt');
+                await d.engine.replayRemoteOps();
+
+                expect(d.calls.trashed).toEqual([['vol~Docs/doc.txt']]);
+            });
+
+            test('one whose cloud file claims no SHA1 can not be told apart: a delete keeps the cloud file', async () => {
+                const d = setup();
+                const node = d.add('Docs/doc.txt', 'theirs');
+                d.nodes.set(node.uid, { ...node, activeRevision: { ...node.activeRevision!, claimedDigests: undefined } } as any);
+                await d.engine.reconcileNow();
+                await d.files.writeLocal('Docs/doc.txt', 'theirs');
+
+                await d.engine.deleteItem('Docs/doc.txt');
+
+                await expectCloudFileKept(d);
+            });
+
+            // Docs holds the collision, another file and a folder, all in Proton Drive
+            const collidedInFolder = async () => {
+                stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+                const d = setup();
+                d.add('Docs/doc.txt', 'theirs');
+                d.add('Docs/other.txt', 'o');
+                d.add('Docs/Sub/x.txt', 'x');
+                await d.engine.reconcileNow();
+                await d.files.writeLocal('Docs/doc.txt', 'mine');
+                return d;
+            };
+            const driveRoute = async (d: ReturnType<typeof setup>, route: string, body: object) => {
+                const socketPath = path.join(tempDir, 'sock', 'control.sock');
+                const server = await startControlServer({ socketPath, engine: d.engine });
+                try {
+                    const res = await fetch(`http://localhost${route}`, { unix: socketPath, method: 'POST', body: JSON.stringify(body) } as RequestInit);
+                    return { status: res.status, body: await res.json() };
+                } finally {
+                    await server.stop();
+                }
+            };
+
+            for (const trash of [false, true]) {
+                test(`a folder ${trash ? 'moved to the Trash' : 'deleted'} through the drive trashes what else is in it, never the colliding cloud file`, async () => {
+                    const d = await collidedInFolder();
+
+                    expect(await driveRoute(d, '/vfs/delete', { path: 'Docs', trash })).toEqual({ status: 200, body: { ok: true } });
+                    await d.engine.replayRemoteOps();
+
+                    expect(d.calls.trashed.flat().sort()).toEqual(['vol~Docs/Sub', 'vol~Docs/other.txt']);
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                    expect(d.nodes.get('vol~Docs')).toBeDefined();
+                    expect(d.engine.remoteIndex.getByPath('Docs/other.txt')).toBeNull();
+                    expect(d.engine.vfsChildren('').map((e) => e.name)).toEqual(['Docs']);
+                    expect(d.engine.vfsChildren('Docs').map((e) => e.name)).toEqual(['doc.txt']);
+                    await d.engine.reconcileNow();
+                    expect(d.calls.trashed.flat().sort()).toEqual(['vol~Docs/Sub', 'vol~Docs/other.txt']);
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                });
+            }
+
+            test("an editor's save over a colliding file is no new revision of the cloud file: the conflict handling decides", async () => {
+                const d = await collided('keep-both');
+                await d.files.writeLocal('Docs/doc.txt.new', 'mine, saved again');
+
+                await d.engine.renameItem('Docs/doc.txt.new', 'Docs/doc.txt');
+                await d.engine.replayRemoteOps();
+                await (d.engine as any).handleLocalFileChange('Docs/doc.txt');
+                await d.engine.reconcileNow();
+
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                const copies = [...d.nodes.values()].filter((n) => n.parentUid === 'vol~Docs' && d.nameOf(n).includes(' (conflict '));
+                expect(copies.map((n) => n.content)).toEqual(['mine, saved again']);
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test('renaming a colliding file moves only the local file: the cloud file keeps its name', async () => {
+                const d = await collided('keep-both');
+
+                await d.engine.renameItem('Docs/doc.txt', 'Docs/mine.txt');
+                await d.engine.replayRemoteOps();
+
+                expect(d.calls.renamed).toEqual([]);
+                expect(d.nameOf(d.nodes.get('vol~Docs/doc.txt')!)).toBe('doc.txt');
+                expect(await readFile(d.local('Docs/mine.txt'), 'utf8')).toBe('mine');
+                expect(docEntry(d)?.size).toBe(6);
+                await d.engine.reconcileNow();
+                expect(d.calls.uploads).toEqual(['Docs/mine.txt']);
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test('renaming a file in a conflict queued for the user moves only the local file, and ends that conflict', async () => {
+                stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                const d = await collided('prompt');
+                await (d.engine as any).handleLocalFileChange('Docs/doc.txt');
+                expect(stateDb.listConflicts().map((c) => c.localRelPath)).toEqual(['Docs/doc.txt']);
+
+                await d.engine.renameItem('Docs/doc.txt', 'Docs/mine.txt');
+                await d.engine.replayRemoteOps();
+
+                expect(d.calls.renamed).toEqual([]);
+                expect(stateDb.listConflicts()).toEqual([]);
+                await d.engine.reconcileNow();
+                expect(d.calls.uploads).toEqual(['Docs/mine.txt']);
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+            });
+
             test('a file synced as usual still goes to the Proton Drive trash when deleted through the drive', async () => {
                 const d = setup();
                 d.add('Docs/doc.txt', 'old');
