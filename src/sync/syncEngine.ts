@@ -2471,9 +2471,16 @@ export class ProtonDriveSyncEngine {
 
             if (!st?.isFile()) {
                 this.forgetSettling(relPath);
-            } else if (dbRecord?.type === 'file' && !changedSinceRecord(st, dbRecord)) {
-                // As it was recorded (a spurious report, an app opening it read-write, a move the engine made): nothing
-                // here to upload, so no hash and no look at Proton Drive; a sync pass compares it with the cloud (#89)
+            } else if (
+                dbRecord?.type === 'file' &&
+                dbRecord.syncStatus === 'synced' &&
+                !changedSinceRecord(st, dbRecord) &&
+                st.ctimeMs <= dbRecord.updatedAt + 1
+            ) {
+                // As it was recorded, and not written since (a spurious report, an app opening it read-write): nothing here
+                // to upload, so no hash and no look at Proton Drive; a sync pass compares it with the cloud (#89). The ctime
+                // is the system's, set by every write, so an edit that keeps the size and puts the old mtime back (a
+                // container, cp -p, touch -r) still goes on to be hashed and uploaded
                 return;
             } else if (changedSinceRecord(st, dbRecord) && this.stillBeingWritten(relPath, st)) {
                 return; // Looked at again once it has stayed as it is
