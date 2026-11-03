@@ -8753,6 +8753,35 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
             });
 
+            test(`${layout}: after a move the sync followed, an edit here still uploads at once`, async () => {
+                const d = await setup();
+                const folder = d.add('Folder');
+                const node = d.nodes.get(d.uid('a.txt'))!;
+                d.nodes.set(d.uid('a.txt'), { ...node, parentUid: folder.uid }); // moved by another device
+                await d.engine.reconcileNow(); // followed here
+                expect(await readFile(d.local('Folder/a.txt'), 'utf8')).toBe('original');
+                d.calls.uploads.length = 0;
+
+                await writeFile(d.local('Folder/a.txt'), 'local edit');
+                await d.watcherSees('Folder/a.txt');
+                expect(d.calls.uploads).toEqual(['Folder/a.txt']);
+                expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('local edit');
+            });
+
+            test(`${layout}: a file deleted in Proton Drive and made anew there is never uploaded over by the watcher`, async () => {
+                const d = await setup();
+                d.nodes.delete(d.uid('a.txt'));
+                d.nodes.set(
+                    'vol~other-a',
+                    makeMockNode({ uid: 'vol~other-a', parentUid: d.root.uid, nameStr: 'a.txt', type: NodeType.File, content: 'new from another device' }),
+                );
+                await writeFile(d.local('a.txt'), 'local edit');
+                await d.watcherSees('a.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.nodes.get('vol~other-a')?.content).toBe('new from another device');
+                expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
+            });
+
             test(`${layout}: an edit here with the cloud unchanged still uploads as a new revision, at once`, async () => {
                 const d = await setup();
                 await writeFile(d.local('a.txt'), 'local edit');
