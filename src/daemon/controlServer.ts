@@ -13,6 +13,7 @@ import {
     type ProtonDriveSyncEngine,
 } from '../sync/syncEngine';
 import type { ConflictRecord } from '../sync/syncStateDb';
+import { type FileManagerSource, FM_ROUTES, fileManagerRoute } from './fileManagerRoutes';
 import { parseSettingsRequest, type SettingsChange } from './settingsValidation';
 import type { DriveMoveAction } from './vfsSupervisor';
 
@@ -39,6 +40,9 @@ export interface ControlServerOptions {
         ProtonDriveSyncEngine,
         'setAvailability' | 'availabilityOf' | 'vfsChildren' | 'hydrate' | 'renameItem' | 'deleteItem' | 'truncateItem'
     >;
+    // What the file manager extension reads: where the drive is, the states of a folder's items, and what changes (see
+    // fileManagerRoutes.ts)
+    fileManager?: FileManagerSource;
     // Mount again (the tray and the app): absent while Proton Drive is a plain folder
     mountAgain?: () => Promise<void>;
     // Finish, move back or retry a move that stopped (see DriveController.resolveMove); its errors may carry an HTTP
@@ -126,7 +130,7 @@ async function jsonBody(req: Request): Promise<Record<string, unknown> | null> {
 
 type DriveEngine = ControlServerOptions['engine'];
 
-// GET /vfs/children?path=, POST /vfs/hydrate {path}, POST /vfs/rename {from, to, noReplace?}, POST /vfs/delete {path,
+// GET /vfs/children?path=, POST /vfs/hydrate {path, opener?} (opener: the name of the app that opened it), POST /vfs/rename {from, to, noReplace?}, POST /vfs/delete {path,
 // onlyIfEmpty?, trash?} (onlyIfEmpty is rmdir, trash a Move to Trash), POST /vfs/truncate {path} (an online-only file
 // made an empty local one); the last three also take deadlineMs. Paths are paths of My files, UTF-8 as they are ('' is
 // the top); each answers { entries } or { ok: true }, or 400 { error, code }.
@@ -153,8 +157,11 @@ async function driveRoute(req: Request, route: string, engine: DriveEngine): Pro
         switch (route) {
             case '/vfs/hydrate':
                 if (typeof body.path !== 'string') return driveError(new Error('Missing path'));
-                // Waits for the whole download: the helper gives up after its own limit (30 minutes)
-                await engine.hydrate(body.path);
+                // Waits for the whole download: the helper gives up after its own limit (30 minutes). An opener that
+                // isn't a short name is no name: never blocked, never counted
+                await engine.hydrate(body.path, {
+                    opener: typeof body.opener === 'string' && body.opener.length > 0 && body.opener.length <= 64 ? body.opener : undefined,
+                });
                 break;
             case '/vfs/rename':
                 if (typeof body.from !== 'string' || typeof body.to !== 'string') {
@@ -353,6 +360,9 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
             const url = new URL(req.url);
             if (DRIVE_ROUTES.includes(url.pathname)) {
                 return driveRoute(req, url.pathname, engine);
+            }
+            if (FM_ROUTES.includes(url.pathname)) {
+                return fileManagerRoute(req, url, opts.fileManager);
             }
             if (url.pathname === '/vfs/mount') {
                 return mountRoute(req, opts.mountAgain);

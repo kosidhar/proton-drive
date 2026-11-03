@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Proton Drive: Online only (downloads when opened) -->
+  <path id="cloud" d="M4.6 12.5 H11.6 A2.9 2.9 0 0 0 12 6.73 A4 4 0 0 0 4.3 6.6 A2.95 2.95 0 0 0 4.6 12.5 Z" fill="none" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round"/>
+  <path d="M4.6 12.5 H11.6 A2.9 2.9 0 0 0 12 6.73 A4 4 0 0 0 4.3 6.6 A2.95 2.95 0 0 0 4.6 12.5 Z" fill="#ffffff" fill-opacity="0.85" stroke="#77777c" stroke-width="1.4" stroke-linejoin="round"/>
+</svg>

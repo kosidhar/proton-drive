@@ -183,3 +183,137 @@ describe("AvailabilityPolicy", () => {
     expect(policy.isPinned("Docs/Deep/c.txt")).toBe(true);
   });
 });
+
+describe("AvailabilityPolicy.childStates", () => {
+  let tempDir: string;
+  let stateDb: SyncStateDatabase;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "proton-drive-childstates-"));
+    stateDb = new SyncStateDatabase(path.join(tempDir, "state.sqlite"));
+  });
+
+  afterEach(async () => {
+    stateDb.close();
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  // A small deterministic generator, so a failure can be replayed by its seed
+  function rng(seed: number) {
+    let state = seed >>> 0 || 1;
+    return () => {
+      state ^= state << 13;
+      state ^= state >>> 17;
+      state ^= state << 5;
+      return (state >>> 0) / 0x100000000;
+    };
+  }
+
+  function record(relPath: string): void {
+    stateDb.upsertItem({
+      localRelPath: relPath,
+      nodeUid: `uid-${relPath}`,
+      parentNodeUid: null,
+      type: "file",
+      localSha1: null,
+      remoteSha1: null,
+      localMtimeMs: 0,
+      remoteMtimeMs: 0,
+      size: 1,
+      syncStatus: "synced",
+      lastError: null,
+    });
+  }
+
+  // Names that sort and slice awkwardly: a prefix of a sibling, a character after '/', an emoji (two UTF-16 units)
+  const NAMES = ["a", "a b", "a0", "ab", "é", "😀", "Z", "a.txt", "-"];
+
+  function randomTree(seed: number) {
+    const next = rng(seed);
+    const index = new RemoteIndex(stateDb.connection);
+    const policy = new AvailabilityPolicy(stateDb.connection, index);
+    index.setRoot("root");
+    const folders: { uid: string; relPath: string }[] = [{ uid: "root", relPath: "" }];
+    let n = 0;
+    const grow = (parentUid: string, parentRel: string, depth: number) => {
+      const names = NAMES.filter(() => next() < 0.5);
+      const children: RemoteIndexEntry[] = [];
+      for (const name of names) {
+        const relPath = parentRel === "" ? name : `${parentRel}/${name}`;
+        const uid = `u${n++}`;
+        const isFolder = depth < 3 && next() < 0.4;
+        children.push(isFolder ? folder(uid, parentUid, relPath) : file(uid, parentUid, relPath));
+      }
+      index.replaceChildren(parentUid, parentRel, children);
+      for (const child of children) {
+        if (child.type === "folder") {
+          folders.push({ uid: child.uid, relPath: child.relPath });
+          grow(child.uid, child.relPath, depth + 1);
+        } else if (next() < 0.5) {
+          record(child.relPath);
+        }
+      }
+    };
+    grow("root", "", 0);
+    for (const node of index.listSubtree("")) {
+      const roll = next();
+      if (roll < 0.1) policy.setPin(node.uid, "pinned", false);
+      else if (roll < 0.2) policy.setPin(node.uid, "unpinned", false);
+      else if (roll < 0.25 && node.relPath !== "") policy.setHide(node.uid, "hidden");
+      else if (roll < 0.28 && node.relPath !== "") policy.setHide(node.uid, "pending");
+    }
+    return { index, policy, folders };
+  }
+
+  test("equals stateOf for every child of every folder, on random trees", () => {
+    for (let seed = 1; seed <= 60; seed++) {
+      new AvailabilityPolicy(stateDb.connection, new RemoteIndex(stateDb.connection)); // makes the tables
+      stateDb.connection.run("DELETE FROM remote_nodes");
+      stateDb.connection.run("DELETE FROM availability");
+      stateDb.connection.run("DELETE FROM synced_items");
+      const { index, policy, folders } = randomTree(seed);
+      for (const f of folders) {
+        const batched = policy.childStates(f.relPath);
+        const children = index.listChildren(f.relPath);
+        expect(batched.size).toBe(children.length);
+        for (const child of children) {
+          const one = policy.stateOf(child.relPath);
+          if (batched.get(child.name) !== one) {
+            throw new Error(`seed ${seed}: ${child.relPath} is ${one}, batched ${batched.get(child.name)}`);
+          }
+        }
+      }
+    }
+  });
+
+  test("is empty for a file or a path not in the index", () => {
+    const { policy } = randomTree(7);
+    expect(policy.childStates("no such folder").size).toBe(0);
+    const index = new RemoteIndex(stateDb.connection);
+    index.replaceChildren("root", "", [file("f", "root", "only.txt")]);
+    expect(policy.childStates("only.txt").size).toBe(0);
+  });
+
+  test("answers a folder of 5,000 children quickly", () => {
+    const index = new RemoteIndex(stateDb.connection);
+    const policy = new AvailabilityPolicy(stateDb.connection, index);
+    index.setRoot("root");
+    index.replaceChildren("root", "", [folder("big", "root", "Big")]);
+    const children: RemoteIndexEntry[] = [];
+    for (let i = 0; i < 5000; i++) {
+      children.push(i % 10 === 0 ? folder(`d${i}`, "big", `Big/d${i}`) : file(`f${i}`, "big", `Big/f${i}.jpg`));
+    }
+    index.replaceChildren("big", "Big", children);
+    for (let i = 0; i < 5000; i += 3) {
+      if (i % 10 !== 0) record(`Big/f${i}.jpg`);
+    }
+    policy.childStates("Big"); // warm the statements
+    const started = performance.now();
+    const states = policy.childStates("Big");
+    const took = performance.now() - started;
+    expect(states.size).toBe(5000);
+    expect(states.get("f3.jpg")).toBe("downloaded");
+    expect(states.get("f1.jpg")).toBe("online-only");
+    expect(took).toBeLessThan(50);
+  });
+});

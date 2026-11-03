@@ -118,9 +118,13 @@ impl DaemonClient {
     }
 
     /// Waits for the daemon to download the file into the backing store, giving up with EINTR as soon as
-    /// `interrupted` says so (it is asked every half second).
-    pub fn hydrate(&self, rel: &str, interrupted: &dyn Fn() -> bool) -> Result<(), DaemonError> {
-        let body = serde_json::json!({ "path": rel });
+    /// `interrupted` says so (it is asked every half second). `opener` is the name (comm) of the app that opened it:
+    /// the daemon refuses an app the user blocked, and tells the user when one app downloads many files.
+    pub fn hydrate(&self, rel: &str, opener: Option<&str>, interrupted: &dyn Fn() -> bool) -> Result<(), DaemonError> {
+        let mut body = serde_json::json!({ "path": rel });
+        if let Some(opener) = opener {
+            body["opener"] = serde_json::Value::from(opener);
+        }
         self.request("POST", "/vfs/hydrate", Some(&body), HYDRATE_TIMEOUT, interrupted).map(|_| ())
     }
 
@@ -504,7 +508,7 @@ mod tests {
         let client = serve_once("closed", |mut stream| {
             let _ = stream.read(&mut [0u8; 4096]);
         });
-        let reply = client.hydrate("a.txt", &|| false);
+        let reply = client.hydrate("a.txt", None, &|| false);
         let _ = std::fs::remove_file(&client.socket);
         assert_eq!(reply.unwrap_err(), DaemonError::eio("the daemon closed the connection without answering"));
     }
@@ -533,6 +537,19 @@ mod tests {
             }
         });
         (DaemonClient::new(socket), rx)
+    }
+
+    #[test]
+    fn a_hydrate_says_which_app_opened_the_file_when_it_is_known() {
+        let (client, bodies) = serve_recording("opener", "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}");
+        assert_eq!(client.hydrate("Docs/a b.txt", Some("rg"), &|| false), Ok(()));
+        assert_eq!(client.hydrate("Docs/a b.txt", None, &|| false), Ok(()));
+        let _ = std::fs::remove_file(&client.socket);
+        let got: Vec<serde_json::Value> = bodies.try_iter().collect();
+        assert_eq!(
+            got,
+            [serde_json::json!({ "path": "Docs/a b.txt", "opener": "rg" }), serde_json::json!({ "path": "Docs/a b.txt" })]
+        );
     }
 
     #[test]
@@ -582,7 +599,7 @@ mod tests {
     fn an_unreachable_daemon_is_eio() {
         let client = DaemonClient::new(std::env::temp_dir().join("protondrive-vfs-no-such.sock"));
         assert_eq!(client.children("").unwrap_err().errno, libc::EIO);
-        assert_eq!(client.hydrate("a.txt", &|| false).unwrap_err().errno, libc::EIO);
+        assert_eq!(client.hydrate("a.txt", None, &|| false).unwrap_err().errno, libc::EIO);
         assert_eq!(client.rename("a.txt", "b.txt", false).unwrap_err().errno, libc::EIO);
         assert_eq!(client.delete("a.txt", Removal::Unlink).unwrap_err().errno, libc::EIO);
         assert_eq!(client.truncate("a.txt").unwrap_err().errno, libc::EIO);
@@ -661,7 +678,7 @@ mod tests {
         let socket = client.socket.clone();
         let outcome = within(Duration::from_secs(5), move || {
             let started = Instant::now();
-            let reply = client.hydrate("a.txt", &|| started.elapsed() > Duration::from_millis(300));
+            let reply = client.hydrate("a.txt", None, &|| started.elapsed() > Duration::from_millis(300));
             (reply.map_err(|e| e.errno), started.elapsed())
         });
         let _ = std::fs::remove_file(&socket);
