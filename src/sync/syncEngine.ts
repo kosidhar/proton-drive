@@ -91,6 +91,10 @@ const MAX_ITEM_BACKOFF_MS = 60 * 60_000;
 // twice as long each time, up to SETTLE_MAX_QUIET_MS.
 const SETTLE_QUIET_MS = 2000;
 const SETTLE_MAX_QUIET_MS = 16_000;
+// A file that never stops changing (a log, say) uploads anyway after this long, and then at most this often
+const SETTLE_MAX_WAIT_MS = 2 * 60_000;
+// How long a file let through is remembered as it was then (see stillBeingWritten)
+const SETTLED_KEPT_MS = 60_000;
 // Uid prefix of the remote index entries that stand for folders made here that Proton Drive doesn't have yet, holding
 // what a pending move puts in them (see applyPendingOpsToIndex). Never a node: never resolved, moved or trashed.
 const PROVISIONAL = 'provisional:';
@@ -306,7 +310,13 @@ export class ProtonDriveSyncEngine {
     private readonly failingItems = new Map<string, { message: string; failures: number; retryAt: number }>();
     // Local files waiting to stay as they are before they upload (see stillBeingWritten): what they were at the last look
     // (size and times), since when (by the settle clock), how long they must stay so, and the next look
-    private readonly settlingFiles = new Map<string, { seen: string; since: number; quietMs: number; cancel: () => void }>();
+    // A file let through (settled) is kept a while with what it was then, so that looking at it again doesn't wait
+    private readonly settlingFiles = new Map<
+        string,
+        { seen: string; since: number; quietMs: number; changingSince: number; settled: boolean; cancel: () => void }
+    >();
+    // Looks again at settling files that are running now (stop() waits for them)
+    private readonly runningLooks = new Set<Promise<void>>();
 
     constructor(
         private readonly sdk: ProtonDriveClient,
@@ -331,6 +341,7 @@ export class ProtonDriveSyncEngine {
             settle?: {
                 quietMs?: number;
                 maxQuietMs?: number;
+                maxWaitMs?: number;
                 now?: () => number;
                 schedule?: (run: () => Promise<void>, delayMs: number) => () => void;
             };
@@ -475,6 +486,7 @@ export class ProtonDriveSyncEngine {
             settling.cancel(); // The pass at the next start looks at them again
         }
         this.settlingFiles.clear();
+        await Promise.all(this.runningLooks);
         if (this.unsubscribeDriveEvents) {
             this.unsubscribeDriveEvents();
             this.unsubscribeDriveEvents = null;
@@ -2382,8 +2394,12 @@ export class ProtonDriveSyncEngine {
     // Whether a local file that changed is still being written, by what it was at earlier looks (#51): its size and
     // times must stay the same for a while (SETTLE_QUIET_MS, longer each time it is seen changing again) before it
     // uploads. Until then it is left alone, and looked at again (as the watcher reports a change) once it should have
-    // settled. A file last changed longer ago than that, by its own times, has settled already: such files (edited while
-    // the daemon was down, say) upload at the first look, without a wait each.
+    // settled. A file whose ctime (set by the system as it changes, unlike an mtime, which cp -a or rsync can put
+    // anywhere) is older than that has settled already: such files (edited while the daemon was down, say) upload at the
+    // first look, without a wait each. A file that keeps changing is let through anyway once it has for
+    // SETTLE_MAX_WAIT_MS, and then at most that often: it uploads as it is (a change during the upload uploads again),
+    // and its path is never kept from syncing for long. A file let through stays so while it is as it was then, so the
+    // look after the one that settled it (as handling it goes on) never waits again.
     private stillBeingWritten(relPath: string, st: Stats): boolean {
         const settle = this.options.settle ?? {};
         const baseQuietMs = settle.quietMs ?? SETTLE_QUIET_MS;
@@ -2391,20 +2407,31 @@ export class ProtonDriveSyncEngine {
             return false;
         }
         const now = (settle.now ?? Date.now)();
+        for (const [rel, entry] of this.settlingFiles) {
+            if (entry.settled && now - entry.since > SETTLED_KEPT_MS) {
+                this.settlingFiles.delete(rel); // Long settled: its ctime says so by now
+            }
+        }
         const seen = `${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
         const earlier = this.settlingFiles.get(relPath);
+        if (earlier?.settled && earlier.seen === seen) {
+            return false;
+        }
         earlier?.cancel();
-        const same = earlier?.seen === seen;
-        const quietMs = !earlier
+        // A file let through that changes again starts over
+        const ongoing = earlier && !earlier.settled ? earlier : null;
+        const same = ongoing?.seen === seen;
+        const quietMs = !ongoing
             ? baseQuietMs
             : same
-              ? earlier.quietMs
-              : Math.min(earlier.quietMs * 2, settle.maxQuietMs ?? SETTLE_MAX_QUIET_MS);
-        const since = same ? earlier.since : now;
-        // File times are by the system clock: so is Date.now(), whatever clock the looks are timed by
-        const lastChangeMs = Math.max(st.mtimeMs, st.ctimeMs);
-        if (now - since >= quietMs || Date.now() - lastChangeMs >= quietMs) {
-            this.settlingFiles.delete(relPath);
+              ? ongoing.quietMs
+              : Math.min(ongoing.quietMs * 2, settle.maxQuietMs ?? SETTLE_MAX_QUIET_MS);
+        const since = ongoing && same ? ongoing.since : now;
+        const changingSince = ongoing?.changingSince ?? now;
+        const maxWaitMs = settle.maxWaitMs ?? SETTLE_MAX_WAIT_MS;
+        // ctime is by the system clock: so is Date.now(), whatever clock the looks are timed by
+        if (now - since >= quietMs || Date.now() - st.ctimeMs >= quietMs || now - changingSince >= maxWaitMs) {
+            this.settlingFiles.set(relPath, { seen, since: now, quietMs, changingSince: now, settled: true, cancel: () => {} });
             return false;
         }
         const schedule =
@@ -2414,13 +2441,32 @@ export class ProtonDriveSyncEngine {
                 timer.unref?.(); // Never what keeps a one-off run (the CLI's sync) going
                 return () => clearTimeout(timer);
             });
-        const lookAgain = () =>
-            this.handleLocalFileChange(relPath).catch((error: unknown) => {
+        const lookAgain = async () => {
+            const look = this.handleLocalFileChange(relPath).catch((error: unknown) => {
                 this.logger.warn(`Could not look at ${relPath} again once written: ${error}`);
             });
-        const cancel = schedule(lookAgain, since + quietMs - now);
-        this.settlingFiles.set(relPath, { seen, since, quietMs, cancel });
+            this.runningLooks.add(look);
+            try {
+                await look;
+            } finally {
+                this.runningLooks.delete(look);
+            }
+        };
+        const cancel = schedule(lookAgain, Math.min(since + quietMs, changingSince + maxWaitMs) - now);
+        this.settlingFiles.set(relPath, { seen, since, quietMs, changingSince, settled: false, cancel });
         return true;
+    }
+
+    // For a one-off sync (the CLI's): waits, up to timeoutMs, for the files still being written to settle and be looked
+    // at again. Answers how many are still waiting.
+    async waitForSettling(timeoutMs: number): Promise<number> {
+        const deadline = Date.now() + timeoutMs;
+        const waiting = () => [...this.settlingFiles.values()].filter((entry) => !entry.settled).length;
+        while ((waiting() > 0 || this.runningLooks.size > 0) && Date.now() < deadline) {
+            await Bun.sleep(Math.min(100, deadline - Date.now()));
+        }
+        await Promise.all(this.runningLooks);
+        return waiting();
     }
 
     private forgetSettling(relPath: string): void {

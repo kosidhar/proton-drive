@@ -3207,8 +3207,6 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
     });
 
-    // Projects is deleted or trashed in the cloud (on the web, or on another device) while this computer holds things
-    // in it that exist nowhere else: they must survive, in the desktop Trash or where they are (issue #16)
     // #51: a copy that stalls longer than the watcher's debounce used to upload the half-written file as a new revision.
     // A changed file now uploads only once it has stayed as it is for a while (longer each time it is seen growing).
     describe('a file still being written (#51)', () => {
@@ -3216,7 +3214,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             describe(`in the ${layout} layout`, () => {
                 // The engine's settle clock runs ahead of the real one by what advance() adds; the looks it schedules run
                 // when advance() reaches them
-                const setup = () => {
+                // quietMs: the wait (2 s by default here)
+                const setup = (opts: { quietMs?: number } = {}) => {
                     const backingDir = path.join(tempDir, 'files');
                     if (layout === 'virtual') {
                         stateDb.setMeta('driveLayout', 'virtual');
@@ -3228,8 +3227,9 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
                         ...(layout === 'virtual' ? { backingDir, moveToDesktopTrash: async () => false } : {}),
                         settle: {
-                            quietMs: 2000,
+                            quietMs: opts.quietMs ?? 2000,
                             maxQuietMs: 16_000,
+                            maxWaitMs: 120_000,
                             now,
                             schedule: (run, delayMs) => {
                                 const look = { at: now() + delayMs, run };
@@ -3252,8 +3252,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     return { ...drive, engine, advance, files, local, changed, pendingLooks: () => looks.length };
                 };
                 // Something on Proton Drive already, so that the folder never reads as missing its files (#45)
-                const started = async () => {
-                    const d = setup();
+                const started = async (opts: { quietMs?: number } = {}) => {
+                    const d = setup(opts);
                     d.add('Kept.txt', 'kept');
                     d.engine.availability.setPin(d.root.uid, 'pinned', false);
                     await d.engine.reconcileNow();
@@ -3302,6 +3302,170 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(d.calls.uploads).toEqual(['note.txt']);
                 });
 
+                const cloudNamed = (d: ReturnType<typeof setup>, name: string) =>
+                    [...d.nodes.values()].filter((n) => n.parentUid === d.root.uid && d.nameOf(n) === name);
+                const conflictCopies = (d: ReturnType<typeof setup>) =>
+                    [...d.nodes.values()].filter((n) => n.parentUid === d.root.uid && d.nameOf(n).includes(' (conflict '));
+
+                test('a new file where Proton Drive has another of that name meets the conflict handling once it settles', async () => {
+                    const d = await started();
+                    d.add('doc.txt', 'theirs'); // since the last listing: the root is pinned, and it would come down
+                    await d.files.writeLocal('doc.txt', 'mine');
+                    await d.changed('doc.txt');
+                    await d.engine.reconcileNow();
+                    expect(conflictCopies(d)).toEqual([]);
+
+                    await d.advance(2000);
+                    expect(conflictCopies(d).map((n) => n.content)).toEqual(['mine']);
+                    expect(cloudNamed(d, 'doc.txt')[0]?.content).toBe('theirs');
+                    expect(d.pendingLooks()).toBe(0);
+                });
+
+                // cp -a or rsync of files whose times are ahead (a camera's SD card, say): its own mtime never says it
+                // settled, and the look that settles it must not schedule another
+                test('a file with an mtime in the future settles, meets the conflict handling, and is not looked at again', async () => {
+                    stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                    const d = await started();
+                    d.add('extra.txt', 'theirs'); // since the last listing
+                    await d.files.writeLocal('extra.txt', 'mine');
+                    const tomorrow = new Date(Date.now() + 24 * 60 * 60_000);
+                    await utimes(d.local('extra.txt'), tomorrow, tomorrow);
+                    await d.changed('extra.txt');
+
+                    await d.advance(2000);
+                    expect(stateDb.listConflicts().map((c) => c.localRelPath)).toEqual(['extra.txt']);
+                    expect(d.pendingLooks()).toBe(0);
+                    await d.engine.reconcileNow(); // a pass after: settled already, by its ctime
+                    expect(d.pendingLooks()).toBe(0);
+                    expect(d.calls.uploads).toEqual([]);
+                });
+
+                test('a file deleted while it waits uploads nothing, and is not looked at again', async () => {
+                    const d = await started();
+                    await d.files.writeLocal('gone.txt', 'half');
+                    await d.changed('gone.txt');
+                    await rm(d.local('gone.txt'));
+                    await d.changed('gone.txt');
+                    expect(d.pendingLooks()).toBe(0);
+
+                    await d.advance(20_000);
+                    expect(d.calls.uploads).toEqual([]);
+                    expect(d.calls.trashed).toEqual([]);
+                });
+
+                test('a file renamed while it waits uploads once, under its new name', async () => {
+                    const d = await started();
+                    await d.files.writeLocal('draft.txt', 'text');
+                    await d.changed('draft.txt');
+                    await rename(d.local('draft.txt'), d.local('final.txt'));
+                    await d.changed('draft.txt');
+                    await d.changed('final.txt');
+
+                    await d.advance(2000);
+                    expect(d.calls.uploads).toEqual(['final.txt']);
+                    await d.engine.reconcileNow();
+                    expect(d.calls.uploads).toEqual(['final.txt']);
+                    expect(d.pendingLooks()).toBe(0);
+                });
+
+                test('after a restart, a file last changed longer ago than the wait uploads at the first look', async () => {
+                    const d = await started({ quietMs: 50 });
+                    await d.files.writeLocal('old.txt', 'written while the daemon was down');
+                    await Bun.sleep(80); // by the system clock, as file times are; the settle clock is not moved
+
+                    await d.engine.reconcileNow();
+                    expect(d.calls.uploads).toEqual(['old.txt']);
+                    expect(d.pendingLooks()).toBe(0);
+                });
+
+                test('stop() calls off the looks, and waits for one already running', async () => {
+                    const d = await started();
+                    await d.files.writeLocal('a.txt', 'a');
+                    await d.changed('a.txt');
+                    expect(d.pendingLooks()).toBe(1);
+                    await d.engine.stop();
+                    expect(d.pendingLooks()).toBe(0);
+
+                    // A look whose upload is held: stop() returns only once it is done
+                    await d.engine.start({ backgroundInitialReconcile: false });
+                    await d.files.writeLocal('b.txt', 'b');
+                    await d.changed('b.txt');
+                    const sdk = d.sdk as any;
+                    const real = sdk.getFileUploader.bind(sdk);
+                    let release!: () => void;
+                    const held = new Promise<void>((resolve) => (release = resolve));
+                    sdk.getFileUploader = async (...args: unknown[]) => {
+                        await held;
+                        return real(...args);
+                    };
+                    const looking = d.advance(2000);
+                    await Bun.sleep(20);
+                    let stopped = false;
+                    const stopping = d.engine.stop().then(() => (stopped = true));
+                    await Bun.sleep(20);
+                    expect(stopped).toBe(false);
+                    release();
+                    await Promise.all([looking, stopping]);
+                    expect(d.calls.uploads).toContain('b.txt');
+                });
+
+                test('waitForSettling (a one-off sync) waits for a file being written to upload, and says how many still wait', async () => {
+                    const drive = makeMockDrive();
+                    drive.add('Kept.txt', 'kept');
+                    const backingDir = path.join(tempDir, 'files');
+                    if (layout === 'virtual') {
+                        stateDb.setMeta('driveLayout', 'virtual');
+                    }
+                    const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                        ...(layout === 'virtual' ? { backingDir, moveToDesktopTrash: async () => false } : {}),
+                        settle: { quietMs: 100 }, // real timers
+                    });
+                    engine.availability.setPin(drive.root.uid, 'pinned', false);
+                    await engine.reconcileNow();
+                    await localFiles(stateDb, () => engine.localRoot()).writeLocal('new.txt', 'new');
+                    await engine.reconcileNow();
+                    expect(drive.calls.uploads).toEqual([]);
+
+                    expect(await engine.waitForSettling(5000)).toBe(0);
+                    expect(drive.calls.uploads).toEqual(['new.txt']);
+
+                    // One that keeps changing outlasts a short wait: it is counted, and stop() calls its look off
+                    appendFileSync(path.join(engine.localRoot(), 'new.txt'), ' more');
+                    await (engine as any).handleLocalFileChange('new.txt');
+                    expect(await engine.waitForSettling(10)).toBe(1);
+                    await engine.stop();
+                    expect(drive.calls.uploads).toEqual(['new.txt']);
+                });
+
+                test('a file that never stops changing still uploads after 2 minutes, and then at most every 2 minutes', async () => {
+                    const d = await started();
+                    await d.files.writeLocal('log.txt', 'line 0\n');
+                    await d.changed('log.txt');
+                    for (let second = 1; second <= 119; second++) {
+                        await d.advance(1000);
+                        appendFileSync(d.local('log.txt'), `line ${second}\n`);
+                        await d.changed('log.txt');
+                    }
+                    expect(d.calls.uploads).toEqual([]);
+                    await d.advance(1000);
+                    appendFileSync(d.local('log.txt'), 'line 120\n');
+                    await d.changed('log.txt');
+                    expect(d.calls.uploads).toEqual(['log.txt']);
+
+                    for (let second = 121; second <= 230; second++) {
+                        await d.advance(1000);
+                        appendFileSync(d.local('log.txt'), `line ${second}\n`);
+                        await d.changed('log.txt');
+                    }
+                    expect(d.calls.uploads).toEqual(['log.txt']); // not again within 2 minutes
+                    for (let second = 231; second <= 245; second++) {
+                        await d.advance(1000);
+                        appendFileSync(d.local('log.txt'), `line ${second}\n`);
+                        await d.changed('log.txt');
+                    }
+                    expect(d.calls.uploads).toEqual(['log.txt', 'log.txt']);
+                });
+
                 test('an edit of a synced file waits the same way, and a file not changed since its sync never waits', async () => {
                     const d = await started();
                     expect(d.pendingLooks()).toBe(0); // Kept.txt, just downloaded, is as its record says
@@ -3322,6 +3486,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         }
     });
 
+    // Projects is deleted or trashed in the cloud (on the web, or on another device) while this computer holds things
+    // in it that exist nowhere else: they must survive, in the desktop Trash or where they are (issue #16)
     describe('cloud-side deletes', () => {
         const activity = () => stateDb.listActivity(500).map((a) => a.details);
         // Projects downloaded through the engine, so the records are real. The desktop Trash is a fake that records
