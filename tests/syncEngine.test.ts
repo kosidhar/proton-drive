@@ -4433,8 +4433,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
             for (const [kind, error, tries] of [
                 ['an HTTP 4xx', () => new APIHTTPError('Unprocessable Entity', 422), 3],
-                // An API error code may come with a 5xx too: it gets the longer limit of unexpected failures
-                ['an unmapped API code', () => new APICodeError('Operation not allowed', 2061), 10],
+                // The 2xxx family of API codes are validation refusals, which don't change
+                ['an API code of the 2xxx validation family', () => new APICodeError('Operation not allowed', 2061), 3],
             ] as const) {
                 test(`refused with ${kind}, it is given up on after ${tries} tries, the user told once, and later operations go on`, async () => {
                     const d = await refusing(error);
@@ -4458,6 +4458,74 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(d.calls.trashed).toEqual([]);
                 });
             }
+
+            // An API code outside the 2xxx family may be what a 5xx outage or an expired session answers with (the SDK
+            // keeps no HTTP status with it): only a day of failing gives it up
+            describe('refused with an API code outside the 2xxx family, which a server outage can answer with', () => {
+                afterEach(() => setSystemTime());
+
+                test('it is still tried after many tries and over an hour, keeping the order', async () => {
+                    let now = Date.parse('2026-11-02T08:00:00Z');
+                    setSystemTime(now);
+                    const d = await refusing(() => new APICodeError('Service unavailable', 503));
+
+                    for (let i = 0; i < 30; i++) {
+                        now += 3 * 60_000;
+                        setSystemTime(now);
+                        await d.engine.replayRemoteOps();
+                    }
+
+                    expect(d.refusals()).toBeGreaterThanOrEqual(5); // with backoff, never given up on
+                    expect(d.journal().map((op) => (op.kind === 'trash' ? op.path : op.toPath))).toEqual(['Docs/a2.txt', 'Docs/b2.txt']);
+                    expect(d.calls.renamed).toEqual([]);
+                    expect(activity().filter((a) => a.includes('given up on'))).toEqual([]);
+                });
+
+                test('it is retried with backoff, not on every replay', async () => {
+                    const now = Date.parse('2026-11-02T08:00:00Z');
+                    setSystemTime(now);
+                    const d = await refusing(() => new APICodeError('Service unavailable', 503));
+                    for (let i = 0; i < 10; i++) {
+                        await d.engine.replayRemoteOps(); // all at the same moment
+                    }
+                    expect(d.refusals()).toBeLessThanOrEqual(3);
+                });
+
+                test('it is given up on after a day of failing, the user told once, and later operations go on', async () => {
+                    let now = Date.parse('2026-11-02T08:00:00Z');
+                    setSystemTime(now);
+                    const d = await refusing(() => new APICodeError('Unknown', 98765));
+
+                    for (let hour = 0; hour < 23; hour++) {
+                        now += 60 * 60_000;
+                        setSystemTime(now);
+                        await d.engine.replayRemoteOps();
+                    }
+                    expect(d.journal()).toHaveLength(2);
+                    for (let i = 0; i < 3; i++) {
+                        now += 60 * 60_000;
+                        setSystemTime(now);
+                        await d.engine.replayRemoteOps();
+                    }
+
+                    expect(d.journal()).toEqual([]);
+                    expect(d.calls.renamed).toEqual([{ uid: 'vol~Docs/b.txt', name: 'b2.txt' }]);
+                    expect(activity().filter((a) => a.includes('Docs/a2.txt') && a.includes('given up on'))).toHaveLength(1);
+                    expect(d.calls.trashed).toEqual([]);
+                });
+            });
+
+            test('refused with an HTTP 401 (a session that expired), it is never given up on quickly', async () => {
+                const d = await refusing(() => new APIHTTPError('Unauthorized', 401));
+
+                for (let i = 0; i < 12; i++) {
+                    await d.engine.replayRemoteOps();
+                }
+
+                expect(d.journal()).toHaveLength(2);
+                expect(d.calls.renamed).toEqual([]);
+                expect(activity().filter((a) => a.includes('given up on'))).toEqual([]);
+            });
 
             test('a rename of a file kept on this computer, given up on, puts its local copy back under the old name', async () => {
                 const d = setup();

@@ -14,8 +14,6 @@ import {
     NodeType,
     NodeWithSameNameExistsValidationError,
     type ProtonDriveClient,
-    RateLimitedError,
-    ServerError,
     ValidationError,
 } from '@protontech/drive-sdk';
 
@@ -38,6 +36,7 @@ import { problemWithBlockedApps } from './settingsRules';
 import { StateEvents } from './stateEvents';
 import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
 import { createLocalConflictCopy, formatConflictFileName } from './conflictResolver';
+import { isTransient, permanentRefusal, unmappedApiCode } from './remoteErrors';
 import { homeTrash, type MoveToDesktopTrash } from './desktopTrash';
 import { readDriveLayout } from './driveMode';
 import { LAYOUT_MOVING, type MoveSeams, relocateFiles, SYNC_DIR_MOVING } from './layoutMigration';
@@ -76,9 +75,13 @@ export const LOCAL_MOVE_IN_PROGRESS = 'localMoveInProgress';
 // How many times a journalled change may fail for a reason other than the network or the server before it is given up
 // on, so that it can't hold up everything after it for ever
 const MAX_UNEXPECTED_FAILURES = 10;
-// How many times an operation Proton Drive refuses with an HTTP 4xx (one the SDK doesn't map to a ValidationError) is
-// tried before it is given up on: such a refusal doesn't change, and the journal waits behind it meanwhile (#39)
-const MAX_HTTP_REFUSALS = 3;
+// How many times an operation Proton Drive refuses for good (see permanentRefusal) is tried before it is given up on:
+// such a refusal doesn't change, and the journal waits behind it meanwhile (#39)
+const MAX_PERMANENT_REFUSALS = 3;
+// An operation refused with an API code outside the 2xxx family, which a server outage or an expired session can answer
+// with too, is tried again with backoff (up to an hour between tries) and given up on only after failing for this long
+const GIVE_UP_UNMAPPED_AFTER_MS = 24 * 60 * 60_000;
+const MAX_REPLAY_BACKOFF_MS = 60 * 60_000;
 // Uid prefix of the remote index entries that stand for folders made here that Proton Drive doesn't have yet, holding
 // what a pending move puts in them (see applyPendingOpsToIndex). Never a node: never resolved, moved or trashed.
 const PROVISIONAL = 'provisional:';
@@ -3393,6 +3396,10 @@ export class ProtonDriveSyncEngine {
                 runsLeft = 3;
             }
             previousId = op.id;
+            const { retryAfter } = this.journal.failures(op.id);
+            if (retryAfter !== null && Date.now() < retryAfter) {
+                return; // Backing off (see replayFailed): everything after it waits, keeping the order
+            }
             const next = op.kind === 'trash' ? await this.replayTrash(op) : await this.replayMove(op);
             if (next === 'stop') {
                 return;
@@ -4242,16 +4249,29 @@ export class ProtonDriveSyncEngine {
     // A failed operation stays pending and replay stops, keeping the order; one that keeps failing for a reason that
     // isn't the network or the server is given up on in the end, and the user told (the next sync then follows what the
     // cloud has).
-    // A refusal the SDK doesn't map (see isRefusal) is no network or server trouble, though it is a ServerError: it is
-    // given up on in the end too, rather than retried forever with the journal waiting behind it (#39); an HTTP 4xx after
-    // MAX_HTTP_REFUSALS tries, an API error code (which may come with a 5xx) after MAX_UNEXPECTED_FAILURES.
+    // Refusals Proton Drive answers with are ServerErrors too, yet not all are trouble a later try gets past (#39): a
+    // permanent one (see permanentRefusal) is given up on after MAX_PERMANENT_REFUSALS tries; an API code outside the
+    // 2xxx family, which an outage or an expired session can answer with, only after GIVE_UP_UNMAPPED_AFTER_MS of
+    // failing, tried again with backoff meanwhile. Network failures, 5xx, 401 and rate limits are never given up on.
     private async replayFailed(op: RemoteOp, where: string, error: unknown): Promise<'next' | 'stop'> {
         const message = messageOf(error);
-        const limit = httpClientError(error) ? MAX_HTTP_REFUSALS : MAX_UNEXPECTED_FAILURES;
-        if ((isTransient(error) && !isRefusal(error)) || op.attempts + 1 < limit) {
-            this.journal.failed(op.id, message);
+        const now = Date.now();
+        const keep = (retryAfter: number | null = null): 'stop' => {
+            this.journal.failed(op.id, message, retryAfter);
             this.logger.warn(`Could not apply a change to ${where} in Proton Drive yet; trying again later: ${message}`);
             return 'stop';
+        };
+        if (permanentRefusal(error)) {
+            if (op.attempts + 1 < MAX_PERMANENT_REFUSALS) {
+                return keep();
+            }
+        } else if (unmappedApiCode(error)) {
+            const firstFailedAt = this.journal.failures(op.id).firstFailedAt ?? now;
+            if (now - firstFailedAt < GIVE_UP_UNMAPPED_AFTER_MS) {
+                return keep(now + Math.min(2 ** op.attempts * 60_000, MAX_REPLAY_BACKOFF_MS));
+            }
+        } else if (isTransient(error) || op.attempts + 1 < MAX_UNEXPECTED_FAILURES) {
+            return keep();
         }
         this.journal.complete(op.id);
         this.tellUser(
@@ -5162,9 +5182,9 @@ export class ProtonDriveSyncEngine {
     // An item a sync pass couldn't sync (#18): marked as failed, logged, and left for the next pass to try again, while
     // this one goes on with the rest. Nothing is decided about it, or about what is in it, this pass. A failure of the
     // network or the server (offline, a 5xx, a rate limit) would fail every item alike: it ends the pass, as before. A
-    // refusal of this one request (see isRefusal) is this item's failure.
+    // refusal of this one request for good (see permanentRefusal) is this item's failure.
     private itemFailed(relPath: string, error: unknown, failed: SyncFailure[]): void {
-        if (isTransient(error) && !isRefusal(error)) {
+        if (isTransient(error) && !permanentRefusal(error)) {
             throw error;
         }
         const message = messageOf(error);
@@ -5320,29 +5340,6 @@ function isWithin(relPath: string, dir: string): boolean {
 
 function messageOf(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
-}
-
-// The network or the server, which a later try may get past (a rate limit is a ServerError too)
-function isTransient(error: unknown): boolean {
-    return error instanceof ConnectionError || error instanceof AbortError || error instanceof ServerError;
-}
-
-// A request Proton Drive refused that the SDK doesn't map to a ValidationError: an APICodeError (an API error code it
-// has no class for), or an APIHTTPError with a 4xx other than a timeout or a rate limit. Both are ServerErrors, but no
-// later try is likely to get past them. (Neither class is exported by the SDK, so they are told by name.)
-function isRefusal(error: unknown): boolean {
-    return (
-        error instanceof ServerError && !(error instanceof RateLimitedError) && (error.name === 'APICodeError' || httpClientError(error))
-    );
-}
-
-// An APIHTTPError with a 4xx other than a timeout or a rate limit
-function httpClientError(error: unknown): boolean {
-    if (!(error instanceof ServerError) || error.name !== 'APIHTTPError') {
-        return false;
-    }
-    const status = (error as { statusCode?: unknown }).statusCode;
-    return typeof status === 'number' && status >= 400 && status < 500 && status !== 408 && status !== 429;
 }
 
 // A version of a cloud file, as its active revision claims it: its SHA1 (null when the uploader gave none), modified
