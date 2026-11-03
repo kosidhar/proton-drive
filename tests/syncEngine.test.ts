@@ -8393,4 +8393,85 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
         });
     });
+    describe('waiting prompt conflicts after the strategy changes or the sides agree (#68)', () => {
+        // Docs/a.txt downloaded and pinned, then edited here and in the cloud while the strategy is prompt: one waits
+        const queued = async (layout: 'plain' | 'virtual' = 'plain') => {
+            if (layout === 'virtual') stateDb.setMeta('driveLayout', 'virtual');
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 }, // edits count at once: these tests are about what happens after
+            });
+            d.add('Docs/a.txt', 'original');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            stateDb.updateSettings({ conflictStrategy: 'prompt' });
+            await writeFile(local('Docs/a.txt'), 'local edit');
+            const cloudEdit = (content: string) =>
+                d.nodes.set(
+                    'vol~Docs/a.txt',
+                    makeMockNode({ uid: 'vol~Docs/a.txt', parentUid: 'vol~Docs', nameStr: 'a.txt', type: NodeType.File, content }),
+                );
+            cloudEdit('remote edit');
+            await engine.reconcileNow();
+            expect(stateDb.listConflicts().map((c) => c.localRelPath)).toContain('Docs/a.txt');
+            const waiting = () => stateDb.listConflicts().filter((c) => c.localRelPath === 'Docs/a.txt');
+            const firstId = waiting()[0].id;
+            return { ...d, engine, local, cloudEdit, waiting, first: () => stateDb.getConflictById(firstId)! };
+        };
+
+        test('still prompt and still different: the conflict keeps waiting, and neither side is touched', async () => {
+            const d = await queued();
+            await d.engine.reconcileNow();
+            expect(d.waiting().length).toBeGreaterThan(0);
+            expect(d.first().resolved).toBe(0);
+            expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('local edit');
+            expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('remote edit');
+            expect(d.calls.trashed).toEqual([]);
+        });
+
+        test('switched to keep-both: the next pass keeps both, and the waiting conflict is closed as keep-both', async () => {
+            const d = await queued();
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+            await d.engine.reconcileNow();
+            expect(d.waiting()).toEqual([]);
+            expect(d.first()).toMatchObject({ resolved: 1, resolution: 'keep-both' });
+            expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('remote edit');
+            const copies = (await readdir(d.local('Docs'))).filter((n) => n !== 'a.txt');
+            expect(copies.length).toBe(1);
+            expect(await readFile(d.local(`Docs/${copies[0]}`), 'utf8')).toBe('local edit');
+            expect(d.calls.trashed).toEqual([]);
+        });
+
+        test('switched to keep-local: the local edit becomes a new revision, and the waiting conflict is closed as keep-local', async () => {
+            const d = await queued();
+            stateDb.updateSettings({ conflictStrategy: 'keep-local' });
+            await d.engine.reconcileNow();
+            expect(d.waiting()).toEqual([]);
+            expect(d.first()).toMatchObject({ resolved: 1, resolution: 'keep-local' });
+            expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('local edit');
+            expect(d.calls.trashed).toEqual([]);
+        });
+
+        test('both sides come to hold the same content: the conflict is closed as in-sync, and the file is synced', async () => {
+            const d = await queued();
+            await writeFile(d.local('Docs/a.txt'), 'remote edit');
+            await d.engine.reconcileNow();
+            expect(d.waiting()).toEqual([]);
+            expect(d.first()).toMatchObject({ resolved: 1, resolution: 'in-sync' });
+            expect(stateDb.getItemByPath('Docs/a.txt')?.syncStatus).toBe('synced');
+        });
+
+        test('virtual drive: once the sides agree, a delete through the drive trashes the cloud file, not kept as a collision', async () => {
+            const d = await queued('virtual');
+            await writeFile(d.local('Docs/a.txt'), 'remote edit');
+            await d.engine.reconcileNow();
+            expect(d.waiting()).toEqual([]);
+            await d.engine.deleteItem('Docs/a.txt');
+            await d.engine.replayRemoteOps();
+            expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+        });
+    });
 });

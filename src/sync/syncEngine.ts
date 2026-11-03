@@ -299,6 +299,9 @@ export class ProtonDriveSyncEngine {
     private missingConfirmed: { root: string; names: Set<string> } | null = null;
     // Conflicts being resolved by hand right now, so that a second request for the same one is refused
     private readonly resolvingConflicts = new Set<number>();
+    // Paths whose conflict a strategy is resolving right now (see handleFileConflict): recording them as synced then is
+    // that resolution, so recordSynced leaves their waiting conflicts to it
+    private readonly strategyResolving = new Set<string>();
     // The conflict copy a keep-both made of a file (by its path), and of what content, until that keep-both finishes or
     // the file's conflict is over some other way (resolved by hand, or the file synced): a retry after its download failed
     // goes on from it rather than make another (#25)
@@ -1427,58 +1430,61 @@ export class ProtonDriveSyncEngine {
             return;
         }
 
-        if (strategy === 'keep-local') {
-            const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
-            await this.uploadLocalToRemote(relPath, localFullPath, parentNode, since, remoteNode.uid);
-            this.stateDb.recordConflict({
+        const conflict = { localRelPath: relPath, nodeUid: remoteNode.uid, localSha1, remoteSha1, localMtimeMs, remoteMtimeMs };
+        // While the strategy resolves it, a record of the path as synced is this resolution, not the sides agreeing
+        this.strategyResolving.add(relPath);
+        try {
+            if (strategy === 'keep-local') {
+                const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
+                await this.uploadLocalToRemote(relPath, localFullPath, parentNode, since, remoteNode.uid);
+                this.settleConflict(conflict, 'keep-local');
+                this.keepBothCopies.delete(relPath);
+                return;
+            }
+
+            if (strategy === 'keep-remote') {
+                await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
+                this.settleConflict(conflict, 'keep-remote');
+                this.keepBothCopies.delete(relPath);
+                return;
+            }
+
+            // Default: keep-both
+            const conflictCopyRelPath = await this.keepBoth(relPath, localFullPath, localSha1, remoteNode, remoteMap, since);
+            this.settleConflict(conflict, 'keep-both', conflictCopyRelPath);
+            this.stateDb.logActivity({
+                action: 'conflict',
                 localRelPath: relPath,
-                nodeUid: remoteNode.uid,
-                localSha1,
-                remoteSha1,
-                localMtimeMs,
-                remoteMtimeMs,
-                resolved: true,
-                resolution: 'keep-local',
+                details: `Resolved conflict with keep-both: saved ${conflictCopyRelPath}`,
             });
-            this.keepBothCopies.delete(relPath);
+        } finally {
+            this.strategyResolving.delete(relPath);
+        }
+    }
+
+    // A conflict the strategy has just resolved. Conflicts already waiting at the path for the user (queued under the
+    // prompt strategy, before it changed: #68) are this one: they are closed with its resolution, rather than left
+    // waiting beside a new row. With none waiting, the resolution is recorded as a new row.
+    private settleConflict(
+        conflict: {
+            localRelPath: string;
+            nodeUid: string;
+            localSha1: string;
+            remoteSha1: string | null;
+            localMtimeMs: number;
+            remoteMtimeMs: number;
+        },
+        resolution: 'keep-local' | 'keep-remote' | 'keep-both',
+        conflictCopyPath?: string,
+    ): void {
+        const waiting = this.unresolvedConflictsAt(conflict.localRelPath);
+        if (waiting.length === 0) {
+            this.stateDb.recordConflict({ ...conflict, resolved: true, resolution, conflictCopyPath: conflictCopyPath ?? null });
             return;
         }
-
-        if (strategy === 'keep-remote') {
-            await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
-            this.stateDb.recordConflict({
-                localRelPath: relPath,
-                nodeUid: remoteNode.uid,
-                localSha1,
-                remoteSha1,
-                localMtimeMs,
-                remoteMtimeMs,
-                resolved: true,
-                resolution: 'keep-remote',
-            });
-            this.keepBothCopies.delete(relPath);
-            return;
+        for (const row of waiting) {
+            this.stateDb.markConflictResolved(row.id, resolution, conflictCopyPath ?? null);
         }
-
-        // Default: keep-both
-        const conflictCopyRelPath = await this.keepBoth(relPath, localFullPath, localSha1, remoteNode, remoteMap, since);
-
-        this.stateDb.recordConflict({
-            localRelPath: relPath,
-            nodeUid: remoteNode.uid,
-            localSha1,
-            remoteSha1,
-            localMtimeMs,
-            remoteMtimeMs,
-            resolved: true,
-            resolution: 'keep-both',
-            conflictCopyPath: conflictCopyRelPath,
-        });
-        this.stateDb.logActivity({
-            action: 'conflict',
-            localRelPath: relPath,
-            details: `Resolved conflict with keep-both: saved ${conflictCopyRelPath}`,
-        });
     }
 
     // Keeps both versions of a file in conflict: its local content as a conflict copy, uploaded as a new file, and the
@@ -2116,7 +2122,14 @@ export class ProtonDriveSyncEngine {
             return false;
         }
         this.stateDb.upsertItem(item);
-        // Synced: whatever conflict it was in is over, and a keep-both of it left unfinished with it (see keepBoth)
+        // Synced: whatever conflict it was in is over, and a keep-both of it left unfinished with it (see keepBoth). A
+        // conflict still waiting for the user there is over too: both sides agree, or one side was synced to the other
+        // (#68). A strategy resolving it now closes it itself, with its own resolution.
+        if (item.syncStatus === 'synced' && !this.strategyResolving.has(relPath)) {
+            for (const row of this.unresolvedConflictsAt(relPath)) {
+                this.stateDb.markConflictResolved(row.id, 'in-sync');
+            }
+        }
         this.keepBothCopies.delete(relPath);
         this.forgetFailure(relPath);
         return true;
