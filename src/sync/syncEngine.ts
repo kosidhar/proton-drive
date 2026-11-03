@@ -36,7 +36,7 @@ import { DownloadWatch } from './downloadWatch';
 import { problemWithBlockedApps } from './settingsRules';
 import { StateEvents } from './stateEvents';
 import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
-import { createLocalConflictCopy, formatConflictFileName } from './conflictResolver';
+import { createLocalConflictCopy, findLocalConflictCopy, formatConflictFileName } from './conflictResolver';
 import { homeTrash, type MoveToDesktopTrash } from './desktopTrash';
 import { readDriveLayout } from './driveMode';
 import { LAYOUT_MOVING, type MoveSeams, relocateFiles, SYNC_DIR_MOVING } from './layoutMigration';
@@ -1375,8 +1375,7 @@ export class ProtonDriveSyncEngine {
         }
 
         // Default: keep-both
-        const conflictCopyFullPath = await createLocalConflictCopy(localFullPath);
-        const madeAs = path.relative(this.localRoot(), conflictCopyFullPath).split(path.sep).join('/');
+        const madeAs = await this.keepBothCopy(localFullPath, localSha1);
         await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
         const conflictCopyRelPath = await this.uploadConflictCopy(madeAs, remoteMap, since);
 
@@ -1396,6 +1395,13 @@ export class ProtonDriveSyncEngine {
             localRelPath: relPath,
             details: `Resolved conflict with keep-both: saved ${conflictCopyRelPath}`,
         });
+    }
+
+    // The local conflict copy of a keep-both, as a path under the local root: the one an earlier try made of this same
+    // content, when the download of the cloud version failed after it (#25), or else a new one. One conflict, one copy.
+    private async keepBothCopy(localFullPath: string, localSha1: string): Promise<string> {
+        const copyFullPath = (await findLocalConflictCopy(localFullPath, localSha1)) ?? (await createLocalConflictCopy(localFullPath));
+        return path.relative(this.localRoot(), copyFullPath).split(path.sep).join('/');
     }
 
     // Uploads a conflict copy just made here as a new file, never over a cloud file that already has its name: refused,
@@ -1484,8 +1490,7 @@ export class ProtonDriveSyncEngine {
                 await this.downloadRemoteToLocal(conflict.localRelPath, remoteNode, localFullPath, since);
                 this.stateDb.markConflictResolved(conflictId, 'keep-remote');
             } else {
-                const conflictCopyFullPath = await createLocalConflictCopy(localFullPath);
-                const madeAs = path.relative(this.localRoot(), conflictCopyFullPath).split(path.sep).join('/');
+                const madeAs = await this.keepBothCopy(localFullPath, await computeLocalFileSha1(localFullPath));
                 await this.downloadRemoteToLocal(conflict.localRelPath, remoteNode, localFullPath, since);
                 const conflictCopyRelPath = await this.uploadConflictCopy(madeAs, remoteMap, since);
                 this.stateDb.markConflictResolved(conflictId, 'keep-both', conflictCopyRelPath);
