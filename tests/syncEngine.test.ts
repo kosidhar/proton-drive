@@ -7652,6 +7652,29 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
             });
 
+            // #66: queued again by every pass, it used to fill the Conflicts tab with copies of itself
+            test('queued for the user (prompt), it is queued once however many passes look at it, and refreshed', async () => {
+                const d = await collided('prompt');
+                const notified = spyOn(notifications, 'sendDesktopNotification');
+                try {
+                    await d.engine.reconcileNow();
+                    const [first] = stateDb.listConflicts();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    expect(stateDb.listConflicts().map((c) => c.id)).toEqual([first!.id]);
+                    expect(notified.mock.calls.filter(([n]) => n.title === 'Proton Drive Sync Conflict').length).toBe(1);
+
+                    // Another device changes it again: the same conflict, as it now stands
+                    const node = d.nodes.get('vol~Docs/doc.txt')!;
+                    const changed = makeMockNode({ uid: node.uid, parentUid: node.parentUid, nameStr: 'doc.txt', type: NodeType.File, content: 'theirs again' });
+                    d.nodes.set(node.uid, changed);
+                    await d.engine.reconcileNow();
+                    expect(stateDb.listConflicts().map((c) => [c.id, c.remoteSha1])).toEqual([[first!.id, changed.activeRevision!.claimedDigests!.sha1!]]);
+                } finally {
+                    notified.mockRestore();
+                }
+            });
+
             test('a file synced as usual still goes to the Proton Drive trash when deleted through the drive', async () => {
                 const d = setup();
                 d.add('Docs/doc.txt', 'old');

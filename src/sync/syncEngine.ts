@@ -1401,31 +1401,36 @@ export class ProtonDriveSyncEngine {
         since: number,
     ): Promise<void> {
         const strategy = settings.conflictStrategy;
-        sendDesktopNotification({
-            title: 'Proton Drive Sync Conflict',
-            body: `Conflict detected on ${relPath} (strategy: ${strategy})`,
-            urgency: 'normal',
-            enabled: settings.notificationsEnabled,
-        });
+        const notify = () =>
+            sendDesktopNotification({
+                title: 'Proton Drive Sync Conflict',
+                body: `Conflict detected on ${relPath} (strategy: ${strategy})`,
+                urgency: 'normal',
+                enabled: settings.notificationsEnabled,
+            });
 
         if (strategy === 'prompt') {
             this.stateDb.setItemStatus(relPath, 'conflict', 'Both local and remote files were modified');
-            this.stateDb.recordConflict({
+            // One already waiting there (each pass finds it again) is refreshed, and the user is told only once (#66)
+            const { queued } = this.stateDb.queueConflict({
                 localRelPath: relPath,
                 nodeUid: remoteNode.uid,
                 localSha1,
                 remoteSha1,
                 localMtimeMs,
                 remoteMtimeMs,
-                resolved: false,
             });
-            this.stateDb.logActivity({
-                action: 'conflict',
-                localRelPath: relPath,
-                details: 'Conflict queued for manual resolution',
-            });
+            if (queued) {
+                notify();
+                this.stateDb.logActivity({
+                    action: 'conflict',
+                    localRelPath: relPath,
+                    details: 'Conflict queued for manual resolution',
+                });
+            }
             return;
         }
+        notify();
 
         if (strategy === 'keep-local') {
             const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
