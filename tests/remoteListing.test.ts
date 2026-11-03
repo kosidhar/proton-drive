@@ -73,6 +73,21 @@ describe('withAvailability (#83)', () => {
         }
     });
 
+    test('pinned, hidden and hiding items, nested hides included, read as stateOf has them', () => {
+        policy.setPin('small-f1', 'pinned', false);
+        policy.setHide('small-f2', 'hidden');
+        policy.setHide('small-d0', 'pending');
+        index.replaceChildren('small-d0', 'Small/d0', [entry('inner', 'small-d0', 'Small/d0/Inner', 'folder')]);
+        policy.setHide('inner', 'hidden');
+        for (const [remotePath, rel] of [['/my-files/Small', 'Small'], ['/my-files/Small/d0', 'Small/d0']] as const) {
+            for (const item of withAvailability(policy, remotePath, listing(rel))) {
+                expect((item as { availability: string }).availability).toBe(policy.stateOf(`${rel}/${item.name}`));
+            }
+        }
+        const states = withAvailability(policy, '/my-files/Small', listing('Small')).map((i) => (i as { availability: string }).availability);
+        expect(states).toEqual(expect.arrayContaining(['pinned', 'hidden', 'hiding']));
+    });
+
     test('an item the index does not hold is asked about on its own', () => {
         const out = withAvailability(policy, '/my-files/Small', [{ name: 'f1.txt' }, { name: 'Untitled document' }]);
         expect(out.map((i) => (i as { availability: string }).availability)).toEqual([
