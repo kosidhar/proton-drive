@@ -2496,7 +2496,7 @@ export class ProtonDriveSyncEngine {
                 if (!(await stat(fullPath).catch(() => null))?.isFile()) {
                     return; // Gone while Proton Drive was asked (freed, deleted): the next look at it decides
                 }
-                if (!node || node.trashTime || node.type !== NodeType.File) {
+                if (!node || node.trashTime || node.type !== NodeType.File || (await this.inTrashedFolder(node))) {
                     return;
                 }
                 // Moved in Proton Drive: the sync pass follows the move (#16), then compares. Where the file is now in
@@ -2505,9 +2505,9 @@ export class ProtonDriveSyncEngine {
                     return;
                 }
                 // Read again: a sync pass may have recorded an upload of this file while Proton Drive was asked
-                const record = this.stateDb.getItemByPath(relPath) ?? dbRecord;
-                if (record.nodeUid !== node.uid) {
-                    return; // Recorded meanwhile as another node: the node looked at isn't this file's any more
+                const record = this.stateDb.getItemByPath(relPath);
+                if (!record || record.nodeUid !== node.uid) {
+                    return; // Its record went, or names another node, meanwhile: a pass decided about it; the next look sees
                 }
                 const cloudMovedOn =
                     record.syncStatus === 'conflict' ||
@@ -2640,6 +2640,28 @@ export class ProtonDriveSyncEngine {
             return true;
         }
         return settlesWithin(running, timeoutMs);
+    }
+
+    // Whether a node sits in a folder that is in the Proton Drive trash (trashing a folder marks only the folder), up to
+    // the root of My files. When that can't be told, it counts as in one: the caller leaves the item to the sync pass.
+    private async inTrashedFolder(node: NodeEntity): Promise<boolean> {
+        const root = await this.getRootFolder().catch(() => null);
+        if (!root) {
+            return true;
+        }
+        const seen = new Set<string>();
+        for (let uid = node.parentUid; uid && uid !== root.uid; ) {
+            if (seen.has(uid)) {
+                return true;
+            }
+            seen.add(uid);
+            const folder = await this.sdk.getNode(uid).catch(() => null);
+            if (!folder || folder.trashTime) {
+                return true;
+            }
+            uid = folder.parentUid;
+        }
+        return false;
     }
 
     // Whether a file was let through only because it kept changing for SETTLE_MAX_WAIT_MS, and hasn't gone quiet since:

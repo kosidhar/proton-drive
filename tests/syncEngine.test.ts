@@ -8768,6 +8768,19 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('local edit');
             });
 
+            test(`${layout}: an edit inside a folder another device trashed is never uploaded into the trash`, async () => {
+                const d = await setup();
+                d.add('Folder/b.txt', 'b');
+                await d.engine.reconcileNow();
+                d.calls.uploads.length = 0;
+                const folder = d.nodes.get(d.uid('Folder'))!;
+                d.nodes.set(d.uid('Folder'), { ...folder, trashTime: new Date() }); // only the folder is marked trashed
+                await writeFile(d.local('Folder/b.txt'), 'local edit');
+                await d.watcherSees('Folder/b.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(await readFile(d.local('Folder/b.txt'), 'utf8')).toBe('local edit');
+            });
+
             test(`${layout}: a file deleted in Proton Drive and made anew there is never uploaded over by the watcher`, async () => {
                 const d = await setup();
                 d.nodes.delete(d.uid('a.txt'));
