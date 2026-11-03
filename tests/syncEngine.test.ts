@@ -4418,6 +4418,46 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(d.tries()).toBe(2);
                 });
 
+                // Review of #18: an unmapped API code can be that one item's (an outage ends the pass through the SDK's
+                // plain ServerError once its requests keep failing)
+                test('an unmapped API code for one item fails only that item', async () => {
+                    const d = await withFailingDownload(layout, () => new APICodeError('Unknown', 98765));
+
+                    await d.engine.reconcileNow();
+
+                    expect(await readFile(d.local('A/fine.txt'), 'utf8')).toBe('fine');
+                    expect(await readFile(d.local('B/good.txt'), 'utf8')).toBe('good');
+                    expect(d.engine.getStatus().lastError).toContain('A/bad.txt');
+                    expect(d.calls.trashed).toEqual([]);
+                });
+
+                test('a folder whose listing keeps failing backs off and is logged once', async () => {
+                    const d = await withFailingDownload(layout, () => new Error('unused'));
+                    d.heal();
+                    let listingsOfA = 0;
+                    const iterate = (d.sdk as any).iterateFolderChildren;
+                    (d.sdk as any).iterateFolderChildren = (parent: NodeEntity | string) => {
+                        if ((typeof parent === 'string' ? parent : parent.uid) === 'vol~A') {
+                            listingsOfA += 1;
+                        }
+                        return iterate(parent);
+                    };
+                    d.failListing.add('vol~A');
+
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    expect(listingsOfA).toBe(1);
+                    expect(await readFile(d.local('B/good.txt'), 'utf8')).toBe('good');
+                    expect(d.engine.getStatus().lastError).toContain('A');
+
+                    for (let pass = 0; pass < 3; pass++) {
+                        later(2 * 60 * 60_000);
+                        await d.engine.reconcileNow();
+                    }
+                    expect(listingsOfA).toBe(4);
+                    expect(errorsFor('A')).toHaveLength(1);
+                });
+
                 test('offline, the pass still stops at the first failure rather than fail every item', async () => {
                     const d = await withFailingDownload(layout, () => new ConnectionError('Network unreachable'));
 

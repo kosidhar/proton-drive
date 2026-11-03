@@ -5163,15 +5163,17 @@ export class ProtonDriveSyncEngine {
                 this.itemFailed(relPath, error, failed);
                 continue; // Nor what is in it, this pass
             }
-            this.forgetFailure(relPath);
 
             const resolvedFolderNode = remoteMap.get(relPath) ?? remoteChild;
             const localStillExists = await stat(path.join(this.localRoot(), relPath))
                 .then((s) => s.isDirectory())
                 .catch(() => false);
             if (resolvedFolderNode && resolvedFolderNode.type === NodeType.Folder && localStillExists) {
-                subFoldersToRecurse.push({ node: resolvedFolderNode, relPath });
-            } else if (resolvedFolderNode && resolvedFolderNode.type === NodeType.Folder) {
+                subFoldersToRecurse.push({ node: resolvedFolderNode, relPath }); // Its failure is forgotten once listed
+                continue;
+            }
+            this.forgetFailure(relPath);
+            if (resolvedFolderNode && resolvedFolderNode.type === NodeType.Folder) {
                 onlineOnly.push({ node: resolvedFolderNode, relPath });
             }
         }
@@ -5191,16 +5193,19 @@ export class ProtonDriveSyncEngine {
                 await this.reconcileDirectoryIncremental(sub.node, sub.relPath, remoteMap, nextSettings, since, onlineOnly, failed);
             } catch (error: unknown) {
                 this.itemFailed(sub.relPath, error, failed); // Its listing, say: nothing in it is looked at this pass
+                continue;
             }
+            this.forgetFailure(sub.relPath);
         }
     }
 
     // An item a sync pass couldn't sync (#18): marked as failed, logged, and left for the next pass to try again, while
     // this one goes on with the rest. Nothing is decided about it, or about what is in it, this pass. A failure of the
     // network or the server (offline, a 5xx, a rate limit) would fail every item alike: it ends the pass, as before. A
-    // refusal of this one request for good (see permanentRefusal) is this item's failure.
+    // refusal of this one request (see permanentRefusal and unmappedApiCode) is this item's failure: an outage ends the
+    // pass all the same, as the SDK answers with a plain ServerError once its requests keep failing.
     private itemFailed(relPath: string, error: unknown, failed: SyncFailure[]): void {
-        if (isTransient(error) && !permanentRefusal(error)) {
+        if (isTransient(error) && !permanentRefusal(error) && !unmappedApiCode(error)) {
             throw error;
         }
         const message = messageOf(error);
