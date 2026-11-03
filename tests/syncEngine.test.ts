@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test } from 'bun:test';
 import { appendFileSync, writeFileSync } from 'node:fs';
-import { cp, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -16,6 +16,7 @@ import {
 
 import * as notifications from '../src/linux/notifications';
 import type { Manager as EventsManager } from '../src/sdk/events/manager';
+import * as fileOpsModule from '../src/sdk/fileOps';
 import { computeLocalFileSha1, detectMediaType, THIRD_PARTY_DISCLOSURE } from '../src/sdk/fileOps';
 import { PIN_ROOT_ON_FIRST_SYNC } from '../src/sync/availabilityMigration';
 import { entryFromNode } from '../src/sync/remoteIndex';
@@ -9143,6 +9144,158 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 }
             });
         }
+    });
+
+    describe('local changes are handled a few at a time (#90)', () => {
+        test('one file busy uploading never takes every turn from the others', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+                localChangeConcurrency: 2,
+            });
+            d.add('Kept.txt', 'kept');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            await writeFile(local('big.bin'), 'v1');
+            await writeFile(local('other.txt'), 'other');
+            // big.bin's upload waits on the network, inside its look (which then holds its turn and its place in the queue)
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            const uploadNewFile = (engine as any).uploadNewFile.bind(engine);
+            (engine as any).uploadNewFile = async (rel: string, ...rest: unknown[]) => {
+                if (rel === 'big.bin') await gate;
+                return uploadNewFile(rel, ...rest);
+            };
+            const first = (engine as any).handleLocalFileChange('big.bin');
+            await Bun.sleep(5);
+            const again = [1, 2, 3].map(() => (engine as any).handleLocalFileChange('big.bin')); // it keeps changing
+            await Bun.sleep(5);
+            const other = (engine as any).handleLocalFileChange('other.txt');
+            const done = await Promise.race([other.then(() => 'done'), Bun.sleep(500).then(() => 'kept waiting')]);
+            expect(done).toBe('done'); // not kept waiting behind big.bin
+            expect(d.calls.uploads).toEqual(['other.txt']);
+            release();
+            await Promise.all([first, ...again]);
+            expect(d.calls.uploads).toContain('big.bin');
+        });
+
+        test('thirty new files reported at once: never more than the limit at a time, and all of them upload', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+                localChangeConcurrency: 3,
+            });
+            d.add('Kept.txt', 'kept');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const names = Array.from({ length: 30 }, (_, i) => `new-${i}.txt`);
+            for (const name of names) await writeFile(path.join(engine.localRoot(), name), name);
+            let running = 0;
+            let most = 0;
+            const now = (engine as any).handleLocalFileChangeNow.bind(engine);
+            (engine as any).handleLocalFileChangeNow = async (rel: string) => {
+                running++;
+                most = Math.max(most, running);
+                try {
+                    await Bun.sleep(2);
+                    return await now(rel);
+                } finally {
+                    running--;
+                }
+            };
+            await Promise.all(names.map((name) => (engine as any).handleLocalFileChange(name)));
+            expect(most).toBe(3);
+            expect(d.calls.uploads.sort()).toEqual([...names].sort());
+        });
+    });
+
+    describe('an edit that keeps the size and puts the old mtime back is never taken for no change (#105)', () => {
+        const written = async () => {
+            const d = makeMockDrive();
+            const trashed: string[] = [];
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async (fullPath: string) => (trashed.push(fullPath), false),
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('vault.bin', 'AAAAAAAA');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            d.calls.uploads.length = 0;
+            const file = path.join(engine.localRoot(), 'vault.bin');
+            const before = await stat(file);
+            await Bun.sleep(20); // the write's ctime comes after the record
+            await writeFile(file, 'BBBBBBBB'); // as a VeraCrypt container, cp -p or touch -r would: same size, old time back
+            await utimes(file, before.atime, before.mtime);
+            return { ...d, engine, file, trashed };
+        };
+
+        test('a file whose ctime moved but not its content (chmod) is hashed once, not on every pass', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'a');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            await Bun.sleep(20);
+            await chmod(path.join(engine.localRoot(), 'a.txt'), 0o600);
+            const hashes = spyOn(fileOpsModule, 'computeLocalFileSha1');
+            try {
+                await engine.reconcileNow();
+                await engine.reconcileNow();
+                expect(hashes.mock.calls.filter(([p]) => String(p).endsWith('a.txt')).length).toBe(1); // the first pass only
+                expect(d.calls.uploads).toEqual([]);
+            } finally {
+                hashes.mockRestore();
+            }
+        });
+
+        test('a cloud file that claims no sha1 is hashed once too after a chmod', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            const added = d.add('legacy.txt', 'from an older client');
+            const node = d.nodes.get(added.uid)!;
+            d.nodes.set(added.uid, { ...node, activeRevision: { ...node.activeRevision!, claimedDigests: { sha1: undefined } } } as any);
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            await Bun.sleep(20);
+            await chmod(path.join(engine.localRoot(), 'legacy.txt'), 0o600);
+            const hashes = spyOn(fileOpsModule, 'computeLocalFileSha1');
+            try {
+                for (let i = 0; i < 3; i++) await engine.reconcileNow();
+                expect(hashes.mock.calls.filter(([p]) => String(p).endsWith('legacy.txt')).length).toBe(1);
+                expect(d.calls.uploads).toEqual([]);
+            } finally {
+                hashes.mockRestore();
+            }
+        });
+
+        test('a sync pass uploads it', async () => {
+            const d = await written();
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toEqual(['vault.bin']);
+            expect(d.nodes.get(d.uid('vault.bin'))?.content).toBe('BBBBBBBB');
+        });
+
+        test('a cloud delete before it uploaded keeps it here', async () => {
+            const d = await written();
+            d.nodes.delete(d.uid('vault.bin'));
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toEqual([]);
+            // Kept: as it was (the desktop Trash failed here) or as handed to it, never removed outright
+            const kept = (await readFile(d.file, 'utf8').catch(() => null)) ?? (d.trashed.length ? 'handed to the Trash' : null);
+            expect(kept === 'BBBBBBBB' || kept === 'handed to the Trash').toBe(true);
+        });
     });
 
     describe('nothing else acts on a file while the user resolves its conflict by hand (#104)', () => {
