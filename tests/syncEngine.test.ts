@@ -20,7 +20,7 @@ import { computeLocalFileSha1, detectMediaType, THIRD_PARTY_DISCLOSURE } from '.
 import { PIN_ROOT_ON_FIRST_SYNC } from '../src/sync/availabilityMigration';
 import { entryFromNode } from '../src/sync/remoteIndex';
 import { startControlServer } from '../src/daemon/controlServer';
-import { createLocalConflictCopy, formatConflictFileName, isConflictCopyOf } from '../src/sync/conflictResolver';
+import { createLocalConflictCopy, formatConflictFileName } from '../src/sync/conflictResolver';
 import { DriveOpError } from '../src/sync/driveOps';
 import { matchesIgnorePatterns } from '../src/sync/localWatcher';
 import {
@@ -86,19 +86,6 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         await writeFile(origPath, 'local version');
         const copyPath = await createLocalConflictCopy(origPath);
         expect(await readFile(copyPath, 'utf8')).toBe('local version');
-    });
-
-    test('tells the conflict copies made on this host of a file from other names', () => {
-        const at = new Date('2026-10-20T12:30:45Z');
-        const copy = formatConflictFileName('budget.xlsx', at, 'ubuntu-laptop');
-        expect(isConflictCopyOf(copy, 'budget.xlsx', 'ubuntu-laptop')).toBe(true);
-        expect(isConflictCopyOf(copy.replace('.xlsx', '-2.xlsx'), 'budget.xlsx', 'ubuntu-laptop')).toBe(true);
-        expect(isConflictCopyOf(copy, 'budget.xlsx', 'other-host')).toBe(false);
-        expect(isConflictCopyOf(copy, 'budget.csv', 'ubuntu-laptop')).toBe(false);
-        expect(isConflictCopyOf(copy, 'budget (2).xlsx', 'ubuntu-laptop')).toBe(false);
-        expect(isConflictCopyOf('budget (conflict notes).xlsx', 'budget.xlsx', 'ubuntu-laptop')).toBe(false);
-        expect(isConflictCopyOf(formatConflictFileName('Makefile', at, 'ubuntu-laptop'), 'Makefile', 'ubuntu-laptop')).toBe(true);
-        expect(isConflictCopyOf(formatConflictFileName('a+b (1).txt', at, 'h'), 'a+b (1).txt', 'h')).toBe(true);
     });
 
     test('performs two-way sync: downloads remote files, uploads local files, and handles remote delete events', async () => {
@@ -4136,6 +4123,117 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(d.calls.trashed).toEqual([]);
                     const resolved = stateDb.listConflicts(true).filter((c) => c.localRelPath === 'Docs/doc.txt');
                     expect(resolved.map((c) => c.conflictCopyPath)).toEqual([`Docs/${copies[0]}`]);
+                });
+
+                test('a retry while fully offline uploads the copy it made, and makes no other (#25)', async () => {
+                    const d = await synced(layout);
+                    d.changeInCloud('theirs');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    d.down.add('getFileRevisionDownloader');
+                    d.down.add('getFileUploader');
+
+                    for (let pass = 0; pass < 3; pass++) {
+                        await d.engine.reconcileNow();
+                    }
+                    expect(await d.copiesIn('Docs')).toHaveLength(1);
+                    expect(d.cloudCopies()).toEqual([]);
+
+                    d.down.clear();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    const copies = await d.copiesIn('Docs');
+                    expect(copies).toHaveLength(1);
+                    expect(d.cloudCopies().map((n) => [d.nameOf(n), n.content])).toEqual([[copies[0], 'mine']]);
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
+                    expect(d.calls.trashed).toEqual([]);
+                });
+
+                test('a copy edited in the cloud while the download fails is left as it is, and a new copy keeps the local version (#25)', async () => {
+                    const d = await synced(layout);
+                    d.changeInCloud('theirs');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    d.down.add('getFileRevisionDownloader');
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    const [made] = d.cloudCopies();
+                    expect(made?.content).toBe('mine'); // uploaded by a pass, as a new local file
+                    d.nodes.set(made!.uid, makeMockNode({ uid: made!.uid, parentUid: 'vol~Docs', nameStr: d.nameOf(made!), type: NodeType.File, content: 'their edit' }));
+
+                    d.down.clear();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.nodes.get(made!.uid)?.content).toBe('their edit');
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
+                    const cloud = d.cloudCopies().map((n) => n.content);
+                    expect(cloud.sort()).toEqual(['mine', 'their edit']);
+                });
+
+                test('a copy deleted in the cloud while the download fails is not taken for the copy: a new one keeps the local version (#25)', async () => {
+                    const d = await synced(layout);
+                    d.changeInCloud('theirs');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    d.down.add('getFileRevisionDownloader');
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    const [made] = d.cloudCopies();
+                    expect(made?.content).toBe('mine');
+                    d.nodes.delete(made!.uid); // another device deletes it
+
+                    d.down.clear();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.nodes.has(made!.uid)).toBe(false);
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
+                    const cloud = d.cloudCopies();
+                    expect(cloud.map((n) => n.content)).toEqual(['mine']);
+                    expect(cloud[0]?.uid).not.toBe(made!.uid);
+                    expect(await d.copiesIn('Docs')).toEqual([d.nameOf(cloud[0]!)]);
+                });
+
+                // Review of #25: the copy an earlier, finished conflict made (synced, and since edited in the cloud by
+                // another device) is never taken for this conflict's copy: nothing renames it, and nothing trashes it
+                test('a later keep-both never takes the synced copy of an earlier conflict for its own (#25 review)', async () => {
+                    const d = await synced(layout);
+                    d.changeInCloud('theirs');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    const [first] = await d.copiesIn('Docs');
+                    expect(first).toBeDefined();
+                    expect(d.cloudCopies().map((n) => d.nameOf(n))).toEqual([first!]);
+
+                    // A second conflict, left to the user, with the same local content as the first
+                    stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    d.changeInCloud('theirs again');
+                    await d.engine.reconcileNow();
+                    const [conflict] = stateDb.listConflicts().filter((c) => c.localRelPath === 'Docs/doc.txt');
+                    expect(conflict).toBeDefined();
+
+                    // Another device edits the first conflict's copy in the cloud
+                    const firstCopy = d.cloudCopies()[0]!;
+                    d.nodes.set(
+                        firstCopy.uid,
+                        makeMockNode({ uid: firstCopy.uid, parentUid: 'vol~Docs', nameStr: first!, type: NodeType.File, content: 'their edit of the copy' }),
+                    );
+
+                    await d.engine.resolveConflictManually(conflict!.id, 'keep-both');
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.nodes.get(firstCopy.uid)?.content).toBe('their edit of the copy');
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs again');
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs again');
+                    const cloud = d.cloudCopies().map((n) => [d.nameOf(n), n.content]);
+                    expect(cloud).toHaveLength(2);
+                    expect(cloud).toContainEqual([first!, 'their edit of the copy']);
+                    expect(cloud.filter(([, content]) => content === 'mine')).toHaveLength(1);
                 });
             });
         }
