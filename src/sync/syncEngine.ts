@@ -1401,31 +1401,36 @@ export class ProtonDriveSyncEngine {
         since: number,
     ): Promise<void> {
         const strategy = settings.conflictStrategy;
-        sendDesktopNotification({
-            title: 'Proton Drive Sync Conflict',
-            body: `Conflict detected on ${relPath} (strategy: ${strategy})`,
-            urgency: 'normal',
-            enabled: settings.notificationsEnabled,
-        });
+        const notify = () =>
+            sendDesktopNotification({
+                title: 'Proton Drive Sync Conflict',
+                body: `Conflict detected on ${relPath} (strategy: ${strategy})`,
+                urgency: 'normal',
+                enabled: settings.notificationsEnabled,
+            });
 
         if (strategy === 'prompt') {
             this.stateDb.setItemStatus(relPath, 'conflict', 'Both local and remote files were modified');
-            this.stateDb.recordConflict({
+            // One already waiting there (each pass finds it again) is refreshed, and the user is told only once (#66)
+            const { queued } = this.stateDb.queueConflict({
                 localRelPath: relPath,
                 nodeUid: remoteNode.uid,
                 localSha1,
                 remoteSha1,
                 localMtimeMs,
                 remoteMtimeMs,
-                resolved: false,
             });
-            this.stateDb.logActivity({
-                action: 'conflict',
-                localRelPath: relPath,
-                details: 'Conflict queued for manual resolution',
-            });
+            if (queued) {
+                notify();
+                this.stateDb.logActivity({
+                    action: 'conflict',
+                    localRelPath: relPath,
+                    details: 'Conflict queued for manual resolution',
+                });
+            }
             return;
         }
+        notify();
 
         if (strategy === 'keep-local') {
             const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
@@ -1462,6 +1467,9 @@ export class ProtonDriveSyncEngine {
 
         // Default: keep-both
         const conflictCopyRelPath = await this.keepBoth(relPath, localFullPath, localSha1, remoteNode, remoteMap, since);
+        if (conflictCopyRelPath === null) {
+            return; // Changed meanwhile: the next pass keeps both again
+        }
 
         this.stateDb.recordConflict({
             localRelPath: relPath,
@@ -1486,6 +1494,9 @@ export class ProtonDriveSyncEngine {
     // download failed goes on from the copy the earlier try made (see earlierKeepBothCopy), and nothing else is ever
     // taken for it. A copy nothing tracks yet is uploaded as made; refused (its name taken in Proton Drive), it stays as
     // it is and a new copy is made, so no file anything tracks is ever renamed.
+    // Returns null, with the local file left as it is, when it changed after its copy was taken (still being written,
+    // say: #67): what was written since would be lost under the cloud's version. The next pass keeps both again, from
+    // what it holds then; the copy made here stays, a new local file to that pass.
     private async keepBoth(
         relPath: string,
         localFullPath: string,
@@ -1493,7 +1504,32 @@ export class ProtonDriveSyncEngine {
         remoteNode: NodeEntity,
         remoteMap: Map<string, NodeEntity>,
         since: number,
-    ): Promise<string> {
+    ): Promise<string | null> {
+        // The local file as it was when copied: checked again just before the cloud's version replaces it
+        const snapshot = async (sha1: string) => {
+            const st = await stat(localFullPath).catch(() => null);
+            return st ? { size: st.size, mtimeMs: st.mtimeMs, sha1 } : null;
+        };
+        const unchangedSince = (copied: { size: number; mtimeMs: number; sha1: string } | null) => async () => {
+            const asCopied = async () => {
+                const st = await stat(localFullPath).catch(() => null);
+                return Boolean(copied && st?.isFile() && st.size === copied.size && st.mtimeMs === copied.mtimeMs);
+            };
+            if (!(await asCopied())) {
+                return false;
+            }
+            const sha1 = await computeLocalFileSha1(localFullPath).catch(() => null);
+            // Looked at again after reading it all: a write while it was being read is a change too
+            return sha1 === copied!.sha1 && (await asCopied());
+        };
+        const changedMeanwhile = async (madeAs?: string, copySha1?: string) => {
+            if (madeAs !== undefined && copySha1 !== undefined) {
+                await this.dropUntrackedCopy(madeAs, copySha1);
+                this.keepBothCopies.delete(relPath);
+            }
+            this.logger.info(`Keeping both versions of ${relPath} next time: it changed after its conflict copy was made`);
+            return null;
+        };
         const earlier = await this.earlierKeepBothCopy(relPath, localSha1);
         let copyRelPath: string | null = null;
         if (earlier?.inCloud) {
@@ -1505,17 +1541,42 @@ export class ProtonDriveSyncEngine {
             copyRelPath = result.status === 'skipped' ? null : earlier.relPath;
         }
         if (copyRelPath !== null) {
-            await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
+            // The earlier copy holds localSha1: the local file must still be that
+            const copied = await snapshot(localSha1);
+            if (!(await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since, unchangedSince(copied)))) {
+                return changedMeanwhile(); // Uploaded already: that copy stays
+            }
             this.keepBothCopies.delete(relPath);
             return copyRelPath;
         }
         const madeAs = path.relative(this.localRoot(), await createLocalConflictCopy(localFullPath)).split(path.sep).join('/');
-        this.keepBothCopies.set(relPath, { copyRelPath: madeAs, sha1: localSha1 });
-        await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
+        // What the copy holds, which may be newer than localSha1 (read before): the local file must still be that
+        const copySha1 = await computeLocalFileSha1(path.join(this.localRoot(), madeAs));
+        const copied = await snapshot(copySha1);
+        this.keepBothCopies.set(relPath, { copyRelPath: madeAs, sha1: copySha1 });
+        if (!(await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since, unchangedSince(copied)))) {
+            // The copy goes: the local file holds what it does, or newer. One copy per try would otherwise pile up (and
+            // upload) for as long as the file keeps changing.
+            return changedMeanwhile(madeAs, copySha1);
+        }
         // Past the download no retry comes (the file now holds the cloud's version): a copy whose upload fails here is
         // a new local file to the next pass
         this.keepBothCopies.delete(relPath);
         return await this.uploadConflictCopy(madeAs, remoteMap, since);
+    }
+
+    // Removes a conflict copy just made, while nothing tracks it (no record, no index entry) and it still holds what it
+    // was made with; otherwise it stays, as a file of its own
+    private async dropUntrackedCopy(copyRelPath: string, sha1: string): Promise<void> {
+        const fullPath = path.join(this.localRoot(), copyRelPath);
+        if (this.stateDb.getItemByPath(copyRelPath) || this.index.getByPath(copyRelPath)) {
+            return;
+        }
+        if ((await computeLocalFileSha1(fullPath).catch(() => null)) !== sha1) {
+            return;
+        }
+        this.watcher.suppressPath(copyRelPath);
+        await unlink(fullPath).catch(() => {});
     }
 
     // The copy an earlier, unfinished keep-both of this file made of this same content, if it can still be it: as made
@@ -1632,6 +1693,9 @@ export class ProtonDriveSyncEngine {
             } else {
                 const localSha1 = await computeLocalFileSha1(localFullPath);
                 const conflictCopyRelPath = await this.keepBoth(conflict.localRelPath, localFullPath, localSha1, remoteNode, remoteMap, since);
+                if (conflictCopyRelPath === null) {
+                    throw new ConflictRefusedError(409, `${conflict.localRelPath} changed while both were being kept; try again`);
+                }
                 this.stateDb.markConflictResolved(conflictId, 'keep-both', conflictCopyRelPath);
             }
             // Resolved, whichever way: a keep-both of it left unfinished before is over too (see keepBoth)
@@ -1639,12 +1703,15 @@ export class ProtonDriveSyncEngine {
         });
     }
 
+    // With beforePlacing, the download replaces the local file only if it answers true just before (see keepBoth).
+    // Answers whether the local file is now the cloud's version (or one the cloud's can't be).
     private async downloadRemoteToLocal(
         relPath: string,
         remoteNode: NodeEntity,
         localFullPath: string,
         since: number,
-    ): Promise<void> {
+        beforePlacing?: () => Promise<boolean>,
+    ): Promise<boolean> {
         const transferId = `dl:${relPath}`;
         this.watcher.suppressPath(relPath, 10000);
         this.activeTransfers.set(transferId, {
@@ -1669,7 +1736,11 @@ export class ProtonDriveSyncEngine {
                         current.totalBytes = totalBytes;
                     }
                 },
+                beforePlacing,
             });
+            if (result.status === 'skipped-changed') {
+                return false;
+            }
 
             if (result.status === 'downloaded' || result.status === 'skipped-identical') {
                 const remoteMtimeMs = (
@@ -1699,6 +1770,7 @@ export class ProtonDriveSyncEngine {
                     });
                 }
             }
+            return true;
         } catch (error: unknown) {
             const msg = error instanceof Error ? error.message : String(error);
             this.stateDb.setItemStatus(relPath, 'error', msg);
@@ -1964,6 +2036,18 @@ export class ProtonDriveSyncEngine {
             if (!record || (await this.existsLocally(relPath))) {
                 return;
             }
+            if (this.inQueuedConflict(relPath, record)) {
+                // This computer's side of a conflict waiting for the user is what went (#63): the cloud has another
+                // device's revision, never seen here, which stays, as a delete through the drive leaves it (#29)
+                this.stateDb.removeItemByPath(relPath);
+                this.endConflictsAsKeepRemote([relPath]);
+                this.stateDb.logActivity({
+                    action: 'delete-local',
+                    localRelPath: relPath,
+                    details: "Deleted on this computer while in conflict; the other device's version stays in Proton Drive",
+                });
+                return;
+            }
             if (record.nodeUid === remoteNode.uid) {
                 await this.trashRemoteNodeForDeletedLocal(relPath, remoteNode);
             } else if (recorded && !recorded.trashTime && recorded.uid === record.nodeUid) {
@@ -1981,7 +2065,16 @@ export class ProtonDriveSyncEngine {
             return;
         }
         const entries = this.index.listSubtree(relPath);
-        const syncedUid = new Map(this.stateDb.getItemsUnder(relPath).map((item) => [item.localRelPath, item.nodeUid]));
+        const recordsUnder = this.stateDb.getItemsUnder(relPath);
+        // Files in a conflict waiting for the user are kept, as never on this computer: the cloud has another device's
+        // revision of them (#63)
+        const conflictPaths = new Set(this.stateDb.listConflicts().map((conflict) => conflict.localRelPath));
+        const inConflict = recordsUnder
+            .filter((item) => this.inQueuedConflict(item.localRelPath, item, conflictPaths))
+            .map((item) => item.localRelPath);
+        const syncedUid = new Map(
+            recordsUnder.filter((item) => !inConflict.includes(item.localRelPath)).map((item) => [item.localRelPath, item.nodeUid]),
+        );
         const hidden = this.policy.hiddenWithin(relPath);
         // Everything that never was on this computer, with every folder above it up to the deleted one
         const holdsCloudOnly = new Set<string>();
@@ -2055,6 +2148,7 @@ export class ProtonDriveSyncEngine {
         // Online-only from now on: no records, so nothing below reads as deleted later, and not pinned, so it isn't
         // downloaded again
         this.stateDb.removeItemByPath(relPath);
+        this.endConflictsAsKeepRemote(inConflict);
         if (this.policy.isPinned(relPath) || this.policy.hasPinnedBelow(relPath)) {
             this.policy.setPin(remoteNode.uid, 'unpinned', true);
         }
@@ -3722,7 +3816,9 @@ export class ProtonDriveSyncEngine {
                 }
                 // An edit baseline follows its file, unless the file now stands for the target (its record) or leaves
                 // what is synced
-                if (keepsTarget || ignoredTo) {
+                // A colliding file goes on as a new one: what it was an edit of stays where it is (#65). A colliding target
+                // keeps its own baseline, if any: what replaces it is judged by it, as an edit of what the drive showed
+                if (keepsTarget || ignoredTo || sourceCollides || targetCollides) {
                     this.stateDb.dropEditBaselines(fromRel);
                 } else {
                     this.stateDb.moveEditBaselines(fromRel, toRel);
@@ -3796,12 +3892,7 @@ export class ProtonDriveSyncEngine {
                     this.stateDb.dropEditBaselines(relPath);
                     if (collision) {
                         // Nothing is left of this computer's side: what stays is the cloud's version
-                        const conflictPaths = new Set(collisions);
-                        for (const conflict of this.stateDb.listConflicts()) {
-                            if (conflictPaths.has(conflict.localRelPath)) {
-                                this.stateDb.markConflictResolved(conflict.id, 'keep-remote');
-                            }
-                        }
+                        this.endConflictsAsKeepRemote(collisions);
                         for (const uid of toTrash.keys()) {
                             this.index.removeSubtree(uid);
                         }
@@ -3868,9 +3959,10 @@ export class ProtonDriveSyncEngine {
 
     // The local file at a path in an unresolved collision (#29), or null: a file made or changed here and another file,
     // or another version, in Proton Drive at that path, with neither chosen yet. That is a conflict waiting for the user
-    // (prompt), or a local file with no record and no edit baseline where the remote index has a file, which the
-    // conflict handling has yet to see (see uploadNewFile). The drive shows the local file there (vfsChildren), and a
-    // delete through it removes only that (deleteLocally): the cloud file is the other device's, never seen here.
+    // (prompt), a local file with no record and no edit baseline where the remote index has a file, which the conflict
+    // handling has yet to see (see uploadNewFile), or a file edited through the drive whose node has changed since (#65).
+    // The drive shows the local file there (vfsChildren), and a delete through it removes only that (deleteLocally): the
+    // cloud file is the other device's, never seen here.
     // conflictPaths: the paths of the unresolved conflicts, when the caller has them already (a listing looks at many)
     private unresolvedCollision(relPath: string, entry: RemoteIndexEntry | null, conflictPaths?: Set<string>): Stats | null {
         if (!entry || entry.type !== 'file' || isProvisional(entry.uid)) {
@@ -3881,10 +3973,14 @@ export class ProtonDriveSyncEngine {
             return null;
         }
         const record = this.stateDb.getItemByPath(relPath);
-        const colliding = record
-            ? record.syncStatus === 'conflict' ||
-              (conflictPaths ? conflictPaths.has(relPath) : this.unresolvedConflictsAt(relPath).length > 0)
-            : this.stateDb.getEditBaseline(relPath) === null;
+        if (record) {
+            return this.inQueuedConflict(relPath, record, conflictPaths) ? local : null;
+        }
+        // A file edited through the drive is an edit of its baseline: a collision once the node it is an edit of has
+        // changed in the cloud since, as far as the index knows (#65). Another node at its path since is left to the
+        // baseline's own node (see trashTargets).
+        const edit = this.stateDb.getEditBaseline(relPath);
+        const colliding = !edit || (edit.nodeUid === entry.uid && cloudChangedSince(edit, entry));
         return colliding ? local : null;
     }
 
@@ -3962,6 +4058,27 @@ export class ProtonDriveSyncEngine {
             }
         }
         return targets;
+    }
+
+    // Whether a recorded item is in a conflict waiting for the user (prompt)
+    private inQueuedConflict(relPath: string, record: SyncedItemRecord, conflictPaths?: Set<string>): boolean {
+        return (
+            record.syncStatus === 'conflict' ||
+            (conflictPaths ? conflictPaths.has(relPath) : this.unresolvedConflictsAt(relPath).length > 0)
+        );
+    }
+
+    // This computer's side of the conflicts waiting at these paths is gone: what stays is the cloud's version
+    private endConflictsAsKeepRemote(paths: string[]): void {
+        if (paths.length === 0) {
+            return;
+        }
+        const ending = new Set(paths);
+        for (const conflict of this.stateDb.listConflicts()) {
+            if (ending.has(conflict.localRelPath)) {
+                this.stateDb.markConflictResolved(conflict.id, 'keep-remote');
+            }
+        }
     }
 
     private unresolvedConflictsAt(relPath: string): ConflictRecord[] {

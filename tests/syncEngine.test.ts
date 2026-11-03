@@ -4236,6 +4236,58 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             return { ...drive, engine, local, changeInCloud, copiesIn, cloudCopies };
         };
 
+        // #63: in the plain layout, a file deleted here while its conflict waits for the user (prompt) is this computer's
+        // side going away: the other device's revision stays in the cloud, as through the drive (#29)
+        describe('deleted here while its conflict waits for the user (#63)', () => {
+            const queued = async () => {
+                stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                const d = await synced('plain');
+                d.changeInCloud('theirs');
+                await writeFile(d.local('Docs/doc.txt'), 'mine');
+                await d.engine.reconcileNow();
+                expect(stateDb.listConflicts().map((c) => c.localRelPath)).toEqual(['Docs/doc.txt']);
+                expect(stateDb.getItemByPath('Docs/doc.txt')?.syncStatus).toBe('conflict');
+                return d;
+            };
+            const expectTheirsKept = async (d: Awaited<ReturnType<typeof queued>>) => {
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                expect(stateDb.listConflicts()).toEqual([]);
+                expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-remote']);
+                await d.engine.reconcileNow();
+                expect(d.calls.trashed).toEqual([]);
+                // The cloud's version comes down in its place (the root is pinned)
+                expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
+            };
+
+            test('reported by the watcher, it keeps the cloud file and the conflict ends as keep-remote', async () => {
+                const d = await queued();
+                await rm(d.local('Docs/doc.txt'));
+                await (d.engine as any).handleLocalFileChange('Docs/doc.txt');
+                await expectTheirsKept(d);
+            });
+
+            test('found by a pass, the same', async () => {
+                const d = await queued();
+                await rm(d.local('Docs/doc.txt'));
+                await d.engine.reconcileNow();
+                await expectTheirsKept(d);
+            });
+
+            test('with its folder deleted, the rest of the folder goes to the Proton Drive trash, never that file', async () => {
+                const d = await queued();
+                d.add('Docs/other.txt', 'o');
+                d.add('Kept.txt', 'k'); // so that Docs gone isn't every file missing from the folder (#45)
+                await d.engine.reconcileNow();
+                expect(await readFile(d.local('Docs/other.txt'), 'utf8')).toBe('o');
+                await rm(d.local('Docs'), { recursive: true });
+                await d.engine.reconcileNow();
+                expect(d.calls.trashed.flat()).toEqual(['vol~Docs/other.txt']);
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                expect(stateDb.listConflicts()).toEqual([]);
+            });
+        });
+
         for (const layout of ['plain', 'virtual'] as const) {
             describe(`in the ${layout} layout`, () => {
                 // #24: with no SHA1 on either side, the record and the cloud are compared by claimed time and size
@@ -4414,6 +4466,67 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                         expect(d.calls.downloads).toEqual(['Docs/doc.txt']);
                         expect(d.calls.uploads).toEqual([]);
                     });
+                });
+
+                // #67: what is written to the local file after keep-both took its copy (it was still being written) must
+                // not be lost under the cloud's version
+                test('keep-both never puts the cloud version over local content written after its copy (#67)', async () => {
+                    const d = await synced(layout);
+                    d.changeInCloud('theirs');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    // Written to again while the cloud version downloads
+                    const sdk = d.sdk as any;
+                    const real = sdk.getFileRevisionDownloader.bind(sdk);
+                    sdk.getFileRevisionDownloader = async (revisionUid: string) => {
+                        appendFileSync(d.local('Docs/doc.txt'), ' and more');
+                        sdk.getFileRevisionDownloader = real;
+                        return real(revisionUid);
+                    };
+
+                    await d.engine.reconcileNow();
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('mine and more');
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+
+                    // The next pass keeps both again, from what the file holds now
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
+                    const copies = await d.copiesIn('Docs');
+                    const contents = await Promise.all(copies.map((c) => readFile(d.local(`Docs/${c}`), 'utf8')));
+                    expect(contents).toContain('mine and more');
+                    expect(d.cloudCopies().map((n) => n.content)).toContain('mine and more');
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                });
+
+                test('keep-both of a file that keeps changing leaves no pile of conflict copies, one per try (#67)', async () => {
+                    const d = await synced(layout);
+                    d.changeInCloud('theirs');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    // Written to again during every download of the cloud version, until it stops
+                    const sdk = d.sdk as any;
+                    const real = sdk.getFileRevisionDownloader.bind(sdk);
+                    let writing = true;
+                    let line = 0;
+                    sdk.getFileRevisionDownloader = async (revisionUid: string) => {
+                        if (writing) {
+                            appendFileSync(d.local('Docs/doc.txt'), ` ${++line}`);
+                        }
+                        return real(revisionUid);
+                    };
+
+                    for (let pass = 0; pass < 5; pass++) {
+                        await d.engine.reconcileNow();
+                    }
+                    expect(await d.copiesIn('Docs')).toEqual([]);
+                    expect(d.cloudCopies()).toEqual([]);
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('mine 1 2 3 4 5');
+
+                    writing = false;
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
+                    expect(d.cloudCopies().map((n) => n.content)).toEqual(['mine 1 2 3 4 5']);
+                    expect((await d.copiesIn('Docs')).length).toBe(1);
                 });
 
                 // #25: a keep-both whose download of the cloud version fails makes its conflict copy once
@@ -7113,6 +7226,66 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(await readFile(path.join(files.syncDir(), 'Docs/doc.txt'), 'utf8')).toBe('old');
             });
 
+            // #65: another device changed the node since the drive showed it, and the remote index has heard (a listing,
+            // an event): the file here is no longer an edit of what the cloud has, so a delete or rename through the
+            // drive leaves the cloud node alone, as for a collision (#29), for the conflict handling to see
+            const changedSinceShown = async () => {
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                await d.engine.reconcileNow();
+                await truncatedAndWritten(d, 'Docs/doc.txt', 'mine');
+                changeInCloud(d, 'vol~Docs/doc.txt', 'theirs, longer');
+                d.engine.remoteIndex.upsert(entryFromNode(d.nodes.get('vol~Docs/doc.txt')!, 'Docs')!); // as a listing would
+                expect(stateDb.getEditBaseline('Docs/doc.txt')?.nodeUid).toBe('vol~Docs/doc.txt');
+                return d;
+            };
+            const docEntry = (d: ReturnType<typeof setup>) => d.engine.vfsChildren('Docs').find((e) => e.name === 'doc.txt');
+
+            test('changed in the cloud since the drive showed it, it lists as the local file, and a delete keeps the cloud node', async () => {
+                const d = await changedSinceShown();
+                expect(docEntry(d)?.size).toBe(4);
+
+                await d.engine.deleteItem('Docs/doc.txt');
+                await d.engine.replayRemoteOps();
+
+                expect(d.journal()).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs, longer');
+                expect(await d.files.exists('Docs/doc.txt')).toBe(false);
+                expect(stateDb.getEditBaseline('Docs/doc.txt')).toBeNull();
+                expect(docEntry(d)?.size).toBe('theirs, longer'.length);
+                await d.engine.reconcileNow();
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.calls.uploads).toEqual([]);
+            });
+
+            test('changed in the cloud since the drive showed it, a rename moves only the local file', async () => {
+                const d = await changedSinceShown();
+
+                await d.engine.renameItem('Docs/doc.txt', 'Docs/mine.txt');
+                await d.engine.replayRemoteOps();
+
+                expect(d.calls.renamed).toEqual([]);
+                expect(d.nameOf(d.nodes.get('vol~Docs/doc.txt')!)).toBe('doc.txt');
+                expect(stateDb.getEditBaseline('Docs/mine.txt')).toBeNull();
+                await d.engine.reconcileNow();
+                expect(d.calls.uploads).toEqual(['Docs/mine.txt']);
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs, longer');
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test('unchanged in the cloud since the drive showed it, a delete through the drive still trashes the node', async () => {
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                await d.engine.reconcileNow();
+                await truncatedAndWritten(d, 'Docs/doc.txt', 'mine');
+
+                await d.engine.deleteItem('Docs/doc.txt');
+                await d.engine.replayRemoteOps();
+
+                expect(d.calls.trashed).toEqual([['vol~Docs/doc.txt']]);
+            });
+
             // Final review M-3 (deferred L157): a file being edited through the drive with no record yet is an edit of
             // its baseline's node. Another device may have put a node of its own at that path since, which the index then
             // holds: deleting or renaming the file here acts on the baseline's node, never on that one.
@@ -7650,6 +7823,29 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.engine.reconcileNow();
                 expect(d.calls.uploads).toEqual(['Docs/mine.txt']);
                 expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+            });
+
+            // #66: queued again by every pass, it used to fill the Conflicts tab with copies of itself
+            test('queued for the user (prompt), it is queued once however many passes look at it, and refreshed', async () => {
+                const d = await collided('prompt');
+                const notified = spyOn(notifications, 'sendDesktopNotification');
+                try {
+                    await d.engine.reconcileNow();
+                    const [first] = stateDb.listConflicts();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    expect(stateDb.listConflicts().map((c) => c.id)).toEqual([first!.id]);
+                    expect(notified.mock.calls.filter(([n]) => n.title === 'Proton Drive Sync Conflict').length).toBe(1);
+
+                    // Another device changes it again: the same conflict, as it now stands
+                    const node = d.nodes.get('vol~Docs/doc.txt')!;
+                    const changed = makeMockNode({ uid: node.uid, parentUid: node.parentUid, nameStr: 'doc.txt', type: NodeType.File, content: 'theirs again' });
+                    d.nodes.set(node.uid, changed);
+                    await d.engine.reconcileNow();
+                    expect(stateDb.listConflicts().map((c) => [c.id, c.remoteSha1])).toEqual([[first!.id, changed.activeRevision!.claimedDigests!.sha1!]]);
+                } finally {
+                    notified.mockRestore();
+                }
             });
 
             test('a file synced as usual still goes to the Proton Drive trash when deleted through the drive', async () => {

@@ -85,3 +85,97 @@ describe('SyncStateDatabase paths', () => {
         expect(paths()).toEqual(['A', 'A/x', 'Z/A/old']);
     });
 });
+
+// #66: an unresolved conflict at a path is kept once, refreshed when queued again, never duplicated
+describe('SyncStateDatabase conflicts', () => {
+    let tempDir: string;
+    let dbPath: string;
+
+    beforeEach(async () => {
+        tempDir = await mkdtemp(path.join(tmpdir(), 'proton-drive-statedb-test-'));
+        dbPath = path.join(tempDir, 'state.sqlite');
+    });
+
+    afterEach(async () => {
+        await rm(tempDir, { recursive: true, force: true });
+    });
+
+    const conflict = (remoteSha1: string, resolved = false) => ({
+        localRelPath: 'Docs/doc.txt',
+        nodeUid: 'vol~Docs/doc.txt',
+        localSha1: 'mine',
+        remoteSha1,
+        localMtimeMs: 1,
+        remoteMtimeMs: 2,
+        resolved,
+    });
+
+    test('queueing a conflict again refreshes the one waiting, keeping its id', () => {
+        const stateDb = new SyncStateDatabase(dbPath);
+        const first = stateDb.queueConflict(conflict('theirs'));
+        expect(first.queued).toBe(true);
+        const again = stateDb.queueConflict(conflict('theirs, newer'));
+        expect(again.queued).toBe(false);
+
+        expect(stateDb.listConflicts().map((c) => ({ id: c.id, remoteSha1: c.remoteSha1 }))).toEqual([
+            { id: first.conflict.id, remoteSha1: 'theirs, newer' },
+        ]);
+        // Once resolved, a new conflict at the path is a new one
+        stateDb.markConflictResolved(first.conflict.id, 'keep-local');
+        expect(stateDb.queueConflict(conflict('later')).queued).toBe(true);
+        expect(stateDb.listConflicts().length).toBe(1);
+        expect(stateDb.listConflicts(true).length).toBe(2);
+        stateDb.close();
+    });
+
+    test('duplicates left by earlier versions are folded into one when the database opens', () => {
+        const stateDb = new SyncStateDatabase(dbPath);
+        stateDb.connection.run('DROP INDEX IF EXISTS idx_conflicts_one_unresolved_per_path');
+        const insert = (remoteSha1: string, resolved: number) =>
+            stateDb.connection.run(
+                `INSERT INTO conflicts (localRelPath, nodeUid, localSha1, remoteSha1, localMtimeMs, remoteMtimeMs, detectedAt, resolved)
+                 VALUES ('Docs/doc.txt', 'vol~Docs/doc.txt', 'mine', ?, 1, 2, 1, ?)`,
+                [remoteSha1, resolved],
+            );
+        insert('old', 1);
+        insert('a', 0);
+        insert('b', 0);
+        insert('c', 0);
+        stateDb.close();
+
+        const reopened = new SyncStateDatabase(dbPath);
+        expect(reopened.listConflicts().map((c) => c.remoteSha1)).toEqual(['c']);
+        expect(reopened.listConflicts(true).length).toBe(2);
+        expect(reopened.queueConflict(conflict('d')).queued).toBe(false);
+        expect(reopened.listConflicts().map((c) => c.remoteSha1)).toEqual(['d']);
+        reopened.close();
+    });
+});
+
+// #66 follow-up: opening the database never needs the write lock once it is set up, so a CLI command opens it while the
+// daemon is in the middle of a write
+describe('SyncStateDatabase opening', () => {
+    test('opens while another connection holds a write transaction', async () => {
+        const tempDir = await mkdtemp(path.join(tmpdir(), 'proton-drive-statedb-test-'));
+        const dbPath = path.join(tempDir, 'state.sqlite');
+        try {
+            const daemon = new SyncStateDatabase(dbPath);
+            daemon.connection.run('PRAGMA busy_timeout = 0');
+            daemon.connection.run('BEGIN IMMEDIATE');
+            const started = Date.now();
+            let opened: SyncStateDatabase | null = null;
+            try {
+                opened = new SyncStateDatabase(dbPath);
+                opened.connection.run('PRAGMA busy_timeout = 0');
+                expect(opened.listConflicts()).toEqual([]);
+            } finally {
+                opened?.close();
+                daemon.connection.run('ROLLBACK');
+                daemon.close();
+            }
+            expect(Date.now() - started).toBeLessThan(2000);
+        } finally {
+            await rm(tempDir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});
