@@ -162,13 +162,17 @@ function eventStream(req: Request, source: FileManagerSource): Response {
         return Response.json({ error: 'Too many event streams' }, { status: 503 });
     }
     let feed: EventFeed | null = null;
+    // Counted from before the feed is made to its end, released exactly once however it ends: closed, aborted,
+    // cancelled, or never started because making the feed threw (#125)
+    let counted = true;
+    openStreams++;
     const done = () => {
         if (feed && !feed.isClosed) {
             feed.stop();
         }
-        if (feed) {
+        if (counted) {
+            counted = false;
             openStreams--;
-            feed = null;
         }
     };
     const encoder = new TextEncoder();
@@ -188,7 +192,6 @@ function eventStream(req: Request, source: FileManagerSource): Response {
                         },
                     };
                     feed = new EventFeed(sink, source);
-                    openStreams++; // counted once it exists: one that can't start never holds a slot (#125)
                     req.signal.addEventListener('abort', done, { once: true });
                     if (req.signal.aborted) {
                         done(); // gone before the listener was there: it never fires, and the stream would stay counted
@@ -201,7 +204,8 @@ function eventStream(req: Request, source: FileManagerSource): Response {
             new CountQueuingStrategy({ highWaterMark: QUEUE_LINES }),
         );
     } catch (error: unknown) {
-        // The feed couldn't start (asking for the root threw, say): nothing was counted
+        // The feed couldn't start (asking for the root threw, say)
+        done();
         const message = error instanceof Error ? error.message : String(error);
         return Response.json({ error: `Can't stream changes: ${message}` }, { status: 503 });
     }
