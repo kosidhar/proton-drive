@@ -3869,6 +3869,154 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         }
     });
 
+    // A recorded file on both sides: whether the cloud changed since the record, and the keep-both conflict handling
+    describe('a recorded file changed on both sides', () => {
+        // Docs/doc.txt downloaded through the engine (pinned), so its record is real; withoutChecksum makes its cloud node
+        // one another client uploaded with no claimed SHA1
+        const synced = async (layout: 'plain' | 'virtual', withoutChecksum = false) => {
+            if (layout === 'virtual') {
+                stateDb.setMeta('driveLayout', 'virtual');
+            }
+            const drive = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+            });
+            drive.add('Docs/doc.txt', 'old');
+            const stripChecksum = (uid: string) => {
+                const node = drive.nodes.get(uid)!;
+                drive.nodes.set(uid, { ...node, activeRevision: { ...node.activeRevision!, claimedDigests: undefined } } as any);
+            };
+            if (withoutChecksum) {
+                stripChecksum('vol~Docs/doc.txt');
+            }
+            engine.availability.setPin(drive.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            expect(drive.calls.downloads).toEqual(['Docs/doc.txt']);
+            drive.calls.downloads.length = 0;
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            // Another device's new revision: a later time, and a new size and content (with no claimed SHA1 if asked)
+            const changeInCloud = (content: string, checksum = true) => {
+                const node = drive.nodes.get('vol~Docs/doc.txt')!;
+                const later = new Date(node.modificationTime.getTime() + 60_000);
+                drive.nodes.set(
+                    node.uid,
+                    makeMockNode({ uid: node.uid, parentUid: node.parentUid, nameStr: 'doc.txt', type: NodeType.File, content, modificationTime: later }),
+                );
+                const changed = drive.nodes.get(node.uid)!;
+                drive.nodes.set(node.uid, { ...changed, activeRevision: { ...changed.activeRevision!, claimedModificationTime: later } });
+                if (!checksum) {
+                    stripChecksum(node.uid);
+                }
+            };
+            const copiesIn = async (dir: string) => (await readdir(local(dir))).filter((n) => n.startsWith('doc (conflict ')).sort();
+            const cloudCopies = () =>
+                [...drive.nodes.values()].filter((n) => n.parentUid === 'vol~Docs' && drive.nameOf(n).startsWith('doc (conflict '));
+            return { ...drive, engine, local, changeInCloud, copiesIn, cloudCopies };
+        };
+
+        for (const layout of ['plain', 'virtual'] as const) {
+            describe(`in the ${layout} layout`, () => {
+                // #24: with no SHA1 on either side, the record and the cloud are compared by claimed time and size
+                describe('with no checksum on either side (#24)', () => {
+                    // As a record made from what the remote index knows of such a node (a file replaced through the
+                    // drive) has it: no SHA1 for the cloud side
+                    const withRecordWithoutChecksum = async () => {
+                        const d = await synced(layout, true);
+                        const record = stateDb.getItemByPath('Docs/doc.txt')!;
+                        stateDb.upsertItem({ ...record, remoteSha1: null });
+                        return d;
+                    };
+
+                    test("another device's edit comes down", async () => {
+                        const d = await withRecordWithoutChecksum();
+                        d.changeInCloud('theirs!', false);
+
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs!');
+                        expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs!');
+                        expect(d.calls.uploads).toEqual([]);
+                        expect(d.calls.trashed).toEqual([]);
+                    });
+
+                    test('a local edit after it is a conflict, never uploaded over it', async () => {
+                        const d = await withRecordWithoutChecksum();
+                        d.changeInCloud('theirs!', false);
+                        await writeFile(d.local('Docs/doc.txt'), 'mine');
+
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs!');
+                        expect(d.calls.uploads).not.toContain('Docs/doc.txt');
+                        expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs!');
+                        const copies = d.cloudCopies();
+                        expect(copies.length).toBe(1);
+                        expect(copies[0]?.content).toBe('mine');
+                        expect(d.calls.trashed).toEqual([]);
+                    });
+
+                    test('unchanged in the cloud, nothing comes down, and a local edit uploads as a new revision', async () => {
+                        const d = await withRecordWithoutChecksum();
+                        await d.engine.reconcileNow();
+                        expect(d.calls.downloads).toEqual([]);
+                        expect(d.calls.uploads).toEqual([]);
+
+                        await writeFile(d.local('Docs/doc.txt'), 'mine');
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('mine');
+                        expect(d.calls.uploads).toEqual(['Docs/doc.txt']);
+                        expect(d.calls.downloads).toEqual([]);
+                        expect(d.cloudCopies()).toEqual([]);
+                    });
+                });
+
+                // The common case stays as it was: with a SHA1 on both sides, the SHA1 alone decides
+                describe('with a checksum on both sides', () => {
+                    test('a new time in the cloud for the same content brings nothing down, and a local edit uploads', async () => {
+                        const d = await synced(layout);
+                        const node = d.nodes.get('vol~Docs/doc.txt')!;
+                        const later = new Date(node.modificationTime.getTime() + 60_000);
+                        d.nodes.set(node.uid, {
+                            ...node,
+                            modificationTime: later,
+                            activeRevision: { ...node.activeRevision!, claimedModificationTime: later },
+                        });
+
+                        await d.engine.reconcileNow();
+                        expect(d.calls.downloads).toEqual([]);
+                        expect(d.calls.uploads).toEqual([]);
+
+                        await writeFile(d.local('Docs/doc.txt'), 'mine');
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('mine');
+                        expect(d.calls.uploads).toEqual(['Docs/doc.txt']);
+                        expect(d.calls.downloads).toEqual([]);
+                        expect(d.cloudCopies()).toEqual([]);
+                    });
+
+                    test("another device's edit comes down once", async () => {
+                        const d = await synced(layout);
+                        d.changeInCloud('theirs!');
+
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs!');
+                        expect(d.calls.downloads).toEqual(['Docs/doc.txt']);
+                        expect(d.calls.uploads).toEqual([]);
+                    });
+                });
+            });
+        }
+    });
+
     // Renames, moves and deletes made through the virtual drive: done here at once, and in Proton Drive from a persistent,
     // ordered journal, so they also work offline (spec §5.2)
     describe('drive operations', () => {
