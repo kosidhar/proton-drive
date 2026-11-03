@@ -3268,6 +3268,7 @@ export class ProtonDriveSyncEngine {
         }
         await this.afterManualResolutions([from, to], opts.deadlineMs);
         await this.inAvailabilityRun(() => {
+            this.refuseWhileHeld(); // again: a move of the files may have begun while it waited
             this.inTime(opts.deadlineMs, from);
             return this.drivingAt([from, to], () => this.renameLocally(from, to, opts.noReplace === true));
         });
@@ -3293,6 +3294,7 @@ export class ProtonDriveSyncEngine {
         }
         await this.afterManualResolutions([rel], opts.deadlineMs);
         await this.inAvailabilityRun(() => {
+            this.refuseWhileHeld(); // again: a move of the files may have begun while it waited
             this.inTime(opts.deadlineMs, rel);
             return this.drivingAt([rel], () => this.deleteLocally(rel, opts.onlyIfEmpty === true, opts.trash === true));
         });

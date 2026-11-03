@@ -9606,6 +9606,50 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-local']);
         });
 
+        test('a delete of the folder holding the file waits for a keep-remote, then deletes what it left', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('F/a.txt', 'original');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            stateDb.updateSettings({ conflictStrategy: 'prompt' });
+            const file = path.join(engine.localRoot(), 'F/a.txt');
+            await writeFile(file, 'local edit');
+            const node = d.nodes.get(d.uid('F/a.txt'))!;
+            d.nodes.set(d.uid('F/a.txt'), makeMockNode({ uid: d.uid('F/a.txt'), parentUid: node.parentUid, nameStr: 'a.txt', type: NodeType.File, content: 'cloud edit' }));
+            await engine.reconcileNow();
+            const [conflict] = stateDb.listConflicts();
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            const getNode = d.sdk.getNode.bind(d.sdk);
+            (d.sdk as any).getNode = async (u: string) => {
+                if (u === d.uid('F/a.txt')) {
+                    (d.sdk as any).getNode = getNode;
+                    entered();
+                    await gate;
+                }
+                return getNode(u);
+            };
+            const manual = engine.resolveConflictManually(conflict.id, 'keep-remote');
+            await inside;
+            let deleted = false;
+            const del = engine.deleteItem('F').then(() => (deleted = true));
+            await Bun.sleep(20);
+            expect(deleted).toBe(false);
+            release();
+            await manual;
+            await del;
+            expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-remote']);
+            expect(await stat(path.join(engine.localRoot(), 'F')).catch(() => null)).toBeNull();
+            expect(stateDb.getItemByPath('F/a.txt')).toBeNull();
+        });
+
         test('a resolution asked for while a drive rename of the file runs is refused, and changes nothing', async () => {
             const d = await queued();
             let release!: () => void;
