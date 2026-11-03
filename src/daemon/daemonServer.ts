@@ -20,6 +20,7 @@ import { SyncStateDatabase } from '../sync/syncStateDb';
 import { defaultControlSocketPath, startControlServer } from './controlServer';
 import { controlServerOptions } from './controlWiring';
 import { DriveController } from './driveController';
+import { withAvailability } from './remoteListing';
 import { isTrustedLocalRequest } from './requestGuard';
 import { refuseOnTcp } from './tcpRefusals';
 import { findHelper, fuseAvailable, mergeStrayInto, VfsSupervisor } from './vfsSupervisor';
@@ -239,18 +240,6 @@ export async function startSyncDaemon(options: {
         }));
     };
 
-    // Availability is computed per response, never cached, so a cached listing still shows the current state
-    const withAvailability = (remotePath: string, items: CachedRemoteItem[]) => {
-        if (remotePath !== '/my-files' && !remotePath.startsWith('/my-files/')) {
-            return items;
-        }
-        const relDir = remotePath.replace(/^\/my-files\/?/, '').replace(/^\/+|\/+$/g, '');
-        return items.map((item) => ({
-            ...item,
-            availability: engine.availability.stateOf(relDir ? `${relDir}/${item.name}` : item.name),
-        }));
-    };
-
     if (runtime.auth.isLoggedIn()) {
         void fetchRemotePathItems('/my-files').catch(() => {});
     }
@@ -443,7 +432,7 @@ export async function startSyncDaemon(options: {
                         if (Date.now() - cached.updatedAt > 15_000) {
                             void fetchRemotePathItems(remotePath).catch(() => {});
                         }
-                        return Response.json({ path: remotePath, items: withAvailability(remotePath, cached.items) });
+                        return Response.json({ path: remotePath, items: withAvailability(engine.availability, remotePath, cached.items) });
                     }
                     const livePromise = fetchRemotePathItems(remotePath);
                     const fallbackItems = buildFallbackFromIndex(remotePath);
@@ -454,10 +443,10 @@ export async function startSyncDaemon(options: {
                                 setTimeout(() => resolve(fallbackItems), 900),
                             ),
                         ]);
-                        return Response.json({ path: remotePath, items: withAvailability(remotePath, items) });
+                        return Response.json({ path: remotePath, items: withAvailability(engine.availability, remotePath, items) });
                     }
                     const items = await livePromise;
-                    return Response.json({ path: remotePath, items: withAvailability(remotePath, items) });
+                    return Response.json({ path: remotePath, items: withAvailability(engine.availability, remotePath, items) });
                 }
 
                 // Nautilus file status lookup endpoint
