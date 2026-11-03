@@ -8988,6 +8988,44 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(stateDb.listConflicts(true).map((c) => [c.id, c.resolution])).toEqual([[d.conflict.id, 'keep-local']]);
         });
 
+        test('a pass that read the file before the user resolved it by hand, and reaches it after, leaves it alone', async () => {
+            const d = await queued();
+            stateDb.updateSettings({ conflictStrategy: 'keep-remote' });
+            d.add('0.txt', 'new from another device'); // sorts first: the pass is busy with it while the user resolves
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            const download = (d.sdk as any).getFileRevisionDownloader.bind(d.sdk);
+            (d.sdk as any).getFileRevisionDownloader = async (...args: unknown[]) => {
+                (d.sdk as any).getFileRevisionDownloader = download;
+                entered();
+                await gate;
+                return download(...args);
+            };
+            const pass = d.engine.reconcileNow();
+            await inside; // the pass has read its listing and records, and waits on 0.txt
+            await d.engine.resolveConflictManually(d.conflict.id, 'keep-local');
+            // A real download serves the revision the pass saw: the cloud's version from before the user's choice
+            const node = d.nodes.get(d.uid('a.txt'))!;
+            (d.sdk as any).getFileRevisionDownloader = async (revision: string) => {
+                if (!revision.startsWith(d.uid('a.txt'))) return download(revision);
+                const kept = node.content;
+                (node as any).content = 'cloud edit';
+                try {
+                    return await download(revision);
+                } finally {
+                    (node as any).content = kept;
+                }
+            };
+            release();
+            await pass;
+            (d.sdk as any).getFileRevisionDownloader = download;
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
+            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('local edit');
+            expect(stateDb.listConflicts(true).map((c) => [c.id, c.resolution])).toEqual([[d.conflict.id, 'keep-local']]);
+        });
+
         test('the user resolving by hand while a pass resolves the same conflict is told to try again, and nothing is relabelled', async () => {
             const d = await queued();
             stateDb.updateSettings({ conflictStrategy: 'keep-both' });

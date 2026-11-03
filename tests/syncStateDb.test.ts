@@ -128,6 +128,16 @@ describe('SyncStateDatabase conflicts', () => {
         stateDb.close();
     });
 
+    // #77: a resolved conflict keeps what it says happened; a late mark (a resolution that raced another) changes nothing
+    test('marking a conflict already resolved changes nothing', () => {
+        const stateDb = new SyncStateDatabase(dbPath);
+        const { conflict: row } = stateDb.queueConflict(conflict('theirs'));
+        stateDb.markConflictResolved(row.id, 'keep-remote');
+        stateDb.markConflictResolved(row.id, 'keep-local', 'copy.txt');
+        expect(stateDb.getConflictById(row.id)).toMatchObject({ resolved: 1, resolution: 'keep-remote', conflictCopyPath: null });
+        stateDb.close();
+    });
+
     test('duplicates left by earlier versions are folded into one when the database opens', () => {
         const stateDb = new SyncStateDatabase(dbPath);
         stateDb.connection.run('DROP INDEX IF EXISTS idx_conflicts_one_unresolved_per_path');
