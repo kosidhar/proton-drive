@@ -9151,7 +9151,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
                 moveToDesktopTrash: async () => false,
                 settle: { quietMs: 0 },
-                localChangeConcurrency: 3,
+                localChangeConcurrency: 2,
             });
             d.add('Kept.txt', 'kept');
             engine.availability.setPin(d.root.uid, 'pinned', false);
@@ -9159,23 +9159,25 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const local = (rel: string) => path.join(engine.localRoot(), rel);
             await writeFile(local('big.bin'), 'v1');
             await writeFile(local('other.txt'), 'other');
-            // big.bin's upload waits on the network
+            // big.bin's upload waits on the network, inside its look (which then holds its turn and its place in the queue)
             let release!: () => void;
             const gate = new Promise<void>((resolve) => (release = resolve));
-            const now = (engine as any).handleLocalFileChangeNow.bind(engine);
-            (engine as any).handleLocalFileChangeNow = async (rel: string) => {
+            const uploadNewFile = (engine as any).uploadNewFile.bind(engine);
+            (engine as any).uploadNewFile = async (rel: string, ...rest: unknown[]) => {
                 if (rel === 'big.bin') await gate;
-                return now(rel);
+                return uploadNewFile(rel, ...rest);
             };
             const first = (engine as any).handleLocalFileChange('big.bin');
             await Bun.sleep(5);
             const again = [1, 2, 3].map(() => (engine as any).handleLocalFileChange('big.bin')); // it keeps changing
             await Bun.sleep(5);
-            await (engine as any).handleLocalFileChange('other.txt');
-            expect(d.calls.uploads).toEqual(['other.txt']); // not kept waiting behind big.bin
+            const other = (engine as any).handleLocalFileChange('other.txt');
+            const done = await Promise.race([other.then(() => 'done'), Bun.sleep(500).then(() => 'kept waiting')]);
+            expect(done).toBe('done'); // not kept waiting behind big.bin
+            expect(d.calls.uploads).toEqual(['other.txt']);
             release();
             await Promise.all([first, ...again]);
-            expect(d.calls.uploads.filter((u) => u === 'big.bin').length).toBeGreaterThanOrEqual(1);
+            expect(d.calls.uploads).toContain('big.bin');
         });
 
         test('thirty new files reported at once: never more than the limit at a time, and all of them upload', async () => {
