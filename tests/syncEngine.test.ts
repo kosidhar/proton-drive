@@ -8698,6 +8698,30 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.first().resolution).toBeNull();
         });
 
+        test('reverted here: the cloud version comes down, and the next pass closes the conflict as in-sync', async () => {
+            const d = await queued();
+            await writeFile(d.local('Docs/a.txt'), 'original'); // back to what was synced: only the cloud changed now
+            await d.engine.reconcileNow();
+            expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('remote edit');
+            await d.engine.reconcileNow();
+            expect(d.waiting()).toEqual([]);
+            expect(d.first()).toMatchObject({ resolved: 1, resolution: 'in-sync' });
+        });
+
+        test('switched to keep-both whose copy fails to upload: both stay, and the next pass closes the conflict', async () => {
+            const d = await queued();
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+            d.failNext('getFileUploader');
+            await d.engine.reconcileNow();
+            expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('remote edit');
+            await d.engine.reconcileNow(); // the copy uploads as a new file; the file now matches the cloud
+            expect(d.waiting()).toEqual([]);
+            const copies = [...d.nodes.values()].filter((n) => n.parentUid === 'vol~Docs' && d.nameOf(n) !== 'a.txt');
+            expect(copies.map((n) => n.content)).toEqual(['local edit']);
+            expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('remote edit');
+            expect(d.calls.trashed).toEqual([]);
+        });
+
         test('keep-local by hand is labelled as the user chose', async () => {
             const d = await queued();
             await d.engine.resolveConflictManually(d.first().id, 'keep-local');
