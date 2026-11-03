@@ -9297,4 +9297,51 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(kept === 'BBBBBBBB' || kept === 'handed to the Trash').toBe(true);
         });
     });
+
+    describe('two looks at one file never run at once (#108)', () => {
+        test('looks that found the same running one take turns after it, never together', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const file = path.join(engine.localRoot(), 'a.txt');
+            await writeFile(file, 'v1');
+            let running = 0;
+            let most = 0;
+            let uploads = 0;
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            const real = (engine as any).uploadLocalToRemote.bind(engine);
+            (engine as any).uploadLocalToRemote = async (rel: string, ...rest: unknown[]) => {
+                if (rel !== 'a.txt') return real(rel, ...rest);
+                const nth = ++uploads;
+                running++;
+                most = Math.max(most, running);
+                try {
+                    const result = await real(rel, ...rest);
+                    await Bun.sleep(5);
+                    if (nth === 1) await gate; // the first look stays at work after its upload
+                    return result;
+                } finally {
+                    running--;
+                }
+            };
+            // Straight to the look, past the turns of #90: as looks resumed together after an availability change
+            const look = (engine as any).handleLocalFileChangeNow.bind(engine);
+            const first = look('a.txt');
+            for (let i = 0; i < 100 && uploads === 0; i++) await Bun.sleep(5); // v1 is up, and the first look holds on
+            await writeFile(file, 'v2 is longer'); // changed again: both later looks have something to upload
+            const later = [look('a.txt'), look('a.txt')];
+            await Bun.sleep(10);
+            release();
+            await Promise.all([first, ...later]);
+            expect(most).toBe(1);
+            const inCloud = [...d.nodes.values()].filter((n) => n.parentUid === d.root.uid && d.nameOf(n) === 'a.txt');
+            expect(inCloud.map((n) => n.content)).toEqual(['v2 is longer']);
+        });
+    });
 });

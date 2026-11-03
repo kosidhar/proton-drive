@@ -2512,9 +2512,10 @@ export class ProtonDriveSyncEngine {
         if (this.awaitsRemoteOp(relPath)) {
             return;
         }
-        const existingTask = this.localQueue.get(relPath);
-        if (existingTask) {
-            await existingTask.catch(() => {});
+        // Every look already running for the path first, one after another: looks that found the same one running would
+        // otherwise all go on together once it ends (#108). Nothing awaits between the last check and taking the place
+        for (let running = this.localQueue.get(relPath); running; running = this.localQueue.get(relPath)) {
+            await running.catch(() => {});
         }
 
         const task = this.observingLocal(async (since) => {
@@ -2642,7 +2643,9 @@ export class ProtonDriveSyncEngine {
         try {
             await task;
         } finally {
-            this.localQueue.delete(relPath);
+            if (this.localQueue.get(relPath) === task) {
+                this.localQueue.delete(relPath); // Only its own place: the next look may have taken it already
+            }
         }
     }
 
