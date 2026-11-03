@@ -5604,6 +5604,27 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await d.expectEveryRecordHasItsFile();
         });
 
+        // #62: with an unrelated change through the drive pending, a file deleted here (not through the drive) is trashed
+        // in the cloud as usual; it used to throw in trashForDeletedLocal, and was left alone only by that error
+        test('a synced file deleted on disk while an unrelated drive change waits is trashed as usual', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            d.add('Other/x.txt', 'x');
+            await pinnedAndSynced(d, d.root.uid);
+            d.down.add('renameNode');
+            await d.engine.renameItem('Other/x.txt', 'Other/y.txt');
+            expect(d.journal()).toHaveLength(1);
+            await rm(d.local('Docs/a.txt')); // not through the drive
+
+            await d.engine.reconcileNow();
+
+            expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+            expect(stateDb.getItemByPath('Docs/a.txt')).toBeNull();
+            expect(stateDb.listActivity(50).filter((a) => a.action === 'error')).toEqual([]);
+            expect(d.journal()).toHaveLength(1); // the rename still waits
+            await d.expectEveryRecordHasItsFile();
+        });
+
         // Its records moved, and its rename went into the journal, but the item itself had not moved yet: its records would
         // read as the user deleting it once the rename reaches the cloud, which trashes it there
         test('a crash between journalling a rename and moving the item is finished on the next start, and nothing is trashed', async () => {
