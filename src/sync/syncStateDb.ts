@@ -623,6 +623,13 @@ export class SyncStateDatabase {
         );
     }
 
+    // Marks a record as current as of `at` (when its file was last read whole), without changing what it says
+    touchItem(localRelPath: string, at: number): void {
+        this.db
+            .query('UPDATE synced_items SET updatedAt = MAX(updatedAt, $at) WHERE localRelPath = $localRelPath')
+            .run({ $at: at, $localRelPath: localRelPath });
+    }
+
     // Closes the conflict waiting at a path, if any, as `resolution` (a sync pass found both sides holding the same
     // content: 'in-sync'). True when one was waiting.
     closeWaitingConflict(localRelPath: string, resolution: string): boolean {

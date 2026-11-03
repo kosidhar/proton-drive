@@ -1368,6 +1368,7 @@ export class ProtonDriveSyncEngine {
                     return;
                 }
 
+                const hashedFrom = Date.now(); // a write from here on is newer than what the hash below reads
                 const localSha1 = await computeLocalFileSha1(localFullPath).catch((error: unknown) => {
                     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
                         this.logger.warn(`Could not read ${relPath} to compare it with Proton Drive: ${error}`);
@@ -1431,6 +1432,11 @@ export class ProtonDriveSyncEngine {
                         since,
                         dbRecord,
                     );
+                } else if (dbRecord && dbRecord.syncStatus === 'synced' && localSha1 === dbRecord.localSha1) {
+                    // Neither side changed: only the ctime moved (a chmod, a rename, a layout move). The record is current
+                    // as of before the hash, so the next pass's fast path applies again instead of hashing on every pass
+                    // (a cloud file with no sha1 never reaches the equal-content branch that would re-record it, #105)
+                    this.stateDb.touchItem(relPath, hashedFrom);
                 }
             }
         }
@@ -5955,8 +5961,6 @@ function driveOpErrorOf(failure: unknown, toRel: string): unknown {
     return failure;
 }
 
-// Whether a local file differs from its record by size or time (as a pass's fast path tells), or has none: an upload
-// is what it would come to
 // Whether nothing has written to a file since its record was made, by its ctime, which the system sets on every write
 // (unlike the mtime, which cp -p, touch -r or an encrypted container can put back). Without a ctime it can't be told,
 // which counts as written: the caller then compares contents (#105).
@@ -5964,6 +5968,8 @@ function notWrittenSince(local: { ctimeMs?: number }, record: SyncedItemRecord):
     return local.ctimeMs !== undefined && local.ctimeMs <= record.updatedAt + 1;
 }
 
+// Whether a local file differs from its record by size or time (as a pass's fast path tells), or has none: an upload
+// is what it would come to
 function changedSinceRecord(local: { size: number; mtimeMs: number }, record: SyncedItemRecord | null | undefined): boolean {
     return !record || local.size !== record.size || Math.abs(local.mtimeMs - record.localMtimeMs) >= 10;
 }
