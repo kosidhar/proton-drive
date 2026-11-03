@@ -1201,6 +1201,9 @@ export class ProtonDriveSyncEngine {
             if (recorded?.localRelPath === relPath) {
                 return; // Moved here earlier in this pass, after the listing was read: the next look at it syncs it
             }
+            if (recorded && this.manualResolvingPaths.has(recorded.localRelPath)) {
+                return; // Moved in Proton Drive while the user resolves its conflict by hand: the next pass follows it (#104)
+            }
             if (
                 recorded &&
                 (await this.existsLocally(recorded.localRelPath)) &&
@@ -1773,7 +1776,23 @@ export class ProtonDriveSyncEngine {
                 await this.uploadLocalToRemote(conflict.localRelPath, localFullPath, parentNode, since, remoteNode.uid);
                 this.stateDb.markConflictResolved(conflictId, 'keep-local');
             } else if (choice === 'keep-remote') {
-                await this.downloadRemoteToLocal(conflict.localRelPath, remoteNode, localFullPath, since);
+                // The local file as the user chose to replace it: a save made while the cloud's version downloads is
+                // newer than what they chose about, so it is never replaced (#104), as keep-both never does (#67)
+                const chosenOver = await stat(localFullPath).catch(() => null);
+                const chosenSha1 = chosenOver ? await computeLocalFileSha1(localFullPath).catch(() => null) : null;
+                const asChosen = async () => {
+                    const st = await stat(localFullPath).catch(() => null);
+                    if (!chosenOver || !st?.isFile() || st.size !== chosenOver.size || st.mtimeMs !== chosenOver.mtimeMs) {
+                        return !chosenOver && !st; // gone then and now: nothing to keep
+                    }
+                    return (await computeLocalFileSha1(localFullPath).catch(() => null)) === chosenSha1;
+                };
+                if (!(await this.downloadRemoteToLocal(conflict.localRelPath, remoteNode, localFullPath, since, asChosen))) {
+                    throw new ConflictRefusedError(
+                        409,
+                        `${conflict.localRelPath} changed (saved, moved or deleted) while Proton Drive's version downloaded, so it was left as it is; try again`,
+                    );
+                }
                 this.stateDb.markConflictResolved(conflictId, 'keep-remote');
             } else {
                 const localSha1 = await computeLocalFileSha1(localFullPath);
@@ -2100,6 +2119,11 @@ export class ProtonDriveSyncEngine {
     // that replaced the one synced here. Those stay in the cloud: only the items that had local copies are trashed, and
     // the folder is left online-only.
     private async trashForDeletedLocal(relPath: string, remoteNode: NodeEntity): Promise<void> {
+        if (this.manualResolvingPaths.has(relPath)) {
+            // The user is resolving its conflict by hand: their choice decides, and the next look after it sees the delete
+            this.logger.info(`Not acting on ${relPath} gone here yet: its conflict is being resolved`);
+            return;
+        }
         // A rename, move or delete through the drive pending in it makes the remote index show it as it will be, not as
         // the cloud has it: nothing is trashed from that picture; the next look, once those have run, decides
         const { uids, paths } = this.journal.guard();
@@ -2990,6 +3014,9 @@ export class ProtonDriveSyncEngine {
         const record = this.stateDb.getItemByPath(relPath);
         if (!record) {
             return;
+        }
+        if (this.manualResolvingPaths.has(relPath)) {
+            return; // Its conflict is being resolved by hand: the next pass decides where it went, or that it went (#104)
         }
         const now = await this.currentRemotePath(record.nodeUid, relPath);
         if (now === undefined || now === relPath) {

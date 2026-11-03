@@ -9297,4 +9297,82 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(kept === 'BBBBBBBB' || kept === 'handed to the Trash').toBe(true);
         });
     });
+
+    describe('nothing else acts on a file while the user resolves its conflict by hand (#104)', () => {
+        const queued = async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'original');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            stateDb.updateSettings({ conflictStrategy: 'prompt' });
+            await writeFile(local('a.txt'), 'local edit');
+            d.nodes.set(d.uid('a.txt'), makeMockNode({ uid: d.uid('a.txt'), parentUid: d.root.uid, nameStr: 'a.txt', type: NodeType.File, content: 'cloud edit' }));
+            await engine.reconcileNow();
+            const [conflict] = stateDb.listConflicts();
+            return { ...d, engine, local, conflict, files: localFiles(stateDb, () => engine.localRoot()) };
+        };
+        // Holds the next call of an SDK method until released
+        const hold = (d: Awaited<ReturnType<typeof queued>>, method: string) => {
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            const real = (d.sdk as any)[method].bind(d.sdk);
+            (d.sdk as any)[method] = async (...args: unknown[]) => {
+                (d.sdk as any)[method] = real;
+                entered();
+                await gate;
+                return real(...args);
+            };
+            return { release, inside };
+        };
+
+        test('keep-remote by hand never replaces a save made while the cloud version downloads', async () => {
+            const d = await queued();
+            const held = hold(d, 'getFileRevisionDownloader');
+            const manual = d.engine.resolveConflictManually(d.conflict.id, 'keep-remote');
+            await held.inside;
+            await writeFile(d.local('a.txt'), 'saved meanwhile');
+            held.release();
+            await expect(manual).rejects.toMatchObject({ status: 409 });
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('saved meanwhile');
+            expect(stateDb.getConflictById(d.conflict.id)?.resolved).toBe(0);
+        });
+
+        test('a delete here seen while the user resolves by hand ends nothing and records nothing', async () => {
+            const d = await queued();
+            const held = hold(d, 'getNode');
+            const manual = d.engine.resolveConflictManually(d.conflict.id, 'keep-local');
+            await held.inside;
+            await rm(d.local('a.txt'));
+            await (d.engine as any).handleLocalFileChange('a.txt');
+            expect(stateDb.getItemByPath('a.txt')).not.toBeNull();
+            expect(stateDb.getConflictById(d.conflict.id)?.resolved).toBe(0);
+            expect(d.calls.trashed).toEqual([]);
+            held.release();
+            await manual.catch(() => {});
+        });
+
+        test('a move in Proton Drive is not followed here while the user resolves by hand', async () => {
+            const d = await queued();
+            const folder = d.add('Moved');
+            const held = hold(d, 'getNode');
+            const manual = d.engine.resolveConflictManually(d.conflict.id, 'keep-local');
+            await held.inside;
+            const node = d.nodes.get(d.uid('a.txt'))!;
+            d.nodes.set(d.uid('a.txt'), { ...node, parentUid: folder.uid });
+            await d.engine.reconcileNow();
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
+            expect(await d.files.exists('Moved/a.txt')).toBe(false); // not downloaded again as a new file there
+            expect(stateDb.getItemByPath('a.txt')?.nodeUid).toBe(d.uid('a.txt'));
+            held.release();
+            await manual.catch(() => {});
+        });
+    });
 });
