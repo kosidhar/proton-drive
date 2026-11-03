@@ -188,6 +188,9 @@ function eventStream(req: Request, source: FileManagerSource): Response {
                 };
                 feed = new EventFeed(sink, source);
                 req.signal.addEventListener('abort', done, { once: true });
+                if (req.signal.aborted) {
+                    done(); // gone before the listener was there: it never fires, and the stream would stay counted
+                }
             },
             cancel() {
                 done();
