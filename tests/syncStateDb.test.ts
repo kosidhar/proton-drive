@@ -72,6 +72,29 @@ describe('SyncStateDatabase paths', () => {
         expect(stateDb.getItemByPath('Z/A/B/y')?.nodeUid).toBe('uid-A/B/y');
     });
 
+    // #103: a folder recorded with its node is the cloud parent of the items directly in it, and of nothing else
+    test('setParentOfChildren names the folder as the parent of what is directly in it only', () => {
+        for (const p of ['my_docs', 'my_docs/a', 'my_docs/b', 'my_docs/sub/c', 'myXdocs/d', 'my_docs0/e', 'my_docs.txt', '😀😀/a/b', '😀😀/x']) {
+            stateDb.upsertItem(record(p));
+        }
+        const before = stateDb.getItemByPath('my_docs/a')!.updatedAt;
+        stateDb.setParentOfChildren('my_docs', 'uid-folder');
+        stateDb.setParentOfChildren('😀😀', 'uid-emoji');
+        const parents = Object.fromEntries(stateDb.getAllItems().map((i) => [i.localRelPath, i.parentNodeUid]));
+        expect(parents).toEqual({
+            my_docs: null,
+            'my_docs/a': 'uid-folder',
+            'my_docs/b': 'uid-folder',
+            'my_docs/sub/c': null,
+            'myXdocs/d': null,
+            'my_docs0/e': null,
+            'my_docs.txt': null,
+            '😀😀/a/b': null,
+            '😀😀/x': 'uid-emoji',
+        });
+        expect(stateDb.getItemByPath('my_docs/a')!.updatedAt).toBe(before);
+    });
+
     test('renameItemPath never moves the root, a path into itself, or onto records already there', () => {
         for (const p of ['A', 'A/x', 'Z/A/old']) {
             stateDb.upsertItem(record(p));
