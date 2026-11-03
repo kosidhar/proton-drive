@@ -1407,6 +1407,7 @@ export class ProtonDriveSyncEngine {
                         remoteMap,
                         settings,
                         since,
+                        dbRecord,
                     );
                 }
             }
@@ -1424,8 +1425,14 @@ export class ProtonDriveSyncEngine {
         remoteMap: Map<string, NodeEntity>,
         settings: SyncSettings,
         since: number,
+        // The record this conflict was found against: one written since (a resolution by hand, say) means the pass's view
+        // of the file is out of date, and acting on it would undo what was done meanwhile (#77)
+        recordSeen?: SyncedItemRecord,
     ): Promise<void> {
         const strategy = settings.conflictStrategy;
+        if ((this.stateDb.getItemByPath(relPath)?.updatedAt ?? null) !== (recordSeen?.updatedAt ?? null)) {
+            return; // The next pass decides, from what the file and its record are then
+        }
         if (this.manualResolvingPaths.has(relPath)) {
             return; // The user is resolving it by hand right now: their choice is what happens to it (#77)
         }
