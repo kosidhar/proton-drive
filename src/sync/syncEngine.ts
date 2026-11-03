@@ -302,6 +302,8 @@ export class ProtonDriveSyncEngine {
     // The conflict copy a keep-both made of a file (by its path), and of what content, until that keep-both finishes or
     // the file's conflict is over some other way (resolved by hand, or the file synced): a retry after its download failed
     // goes on from it rather than make another (#25)
+    // Files whose keep-both waits for them to stop changing, already said in the log (see handleFileConflict)
+    private readonly keepBothDeferred = new Set<string>();
     private readonly keepBothCopies = new Map<string, { copyRelPath: string; sha1: string }>();
     // Items that keep failing in sync passes (#18), by path: the error last logged for each (logged once until it
     // changes), and how many times in a row each failed and when a pass tries it again (backoff). Both go when the item
@@ -313,7 +315,17 @@ export class ProtonDriveSyncEngine {
     // A file let through (settled) is kept a while with what it was then, so that looking at it again doesn't wait
     private readonly settlingFiles = new Map<
         string,
-        { seen: string; since: number; quietMs: number; changingSince: number; settled: boolean; cancel: () => void }
+        {
+            seen: string;
+            since: number;
+            quietMs: number;
+            changingSince: number;
+            settled: boolean;
+            // Let through only because it had changed for SETTLE_MAX_WAIT_MS, not because it went quiet: still being
+            // written, as far as anyone knows (see stillChangingWhenLetThrough)
+            forced?: boolean;
+            cancel: () => void;
+        }
     >();
     // Looks again at settling files that are running now (stop() waits for them)
     private readonly runningLooks = new Set<Promise<void>>();
@@ -1401,6 +1413,17 @@ export class ProtonDriveSyncEngine {
         since: number,
     ): Promise<void> {
         const strategy = settings.conflictStrategy;
+        if (strategy === 'keep-both' && this.stillChangingWhenLetThrough(relPath)) {
+            // Still being written: the cloud version would be downloaded only to be thrown away once the file changes
+            // again (#67 keeps the newer local writes), every time it is let through. Nothing is touched; a pass once
+            // it has gone quiet keeps both (#70). Said once in the log, so that a file that never stops is explained
+            if (!this.keepBothDeferred.has(relPath)) {
+                this.keepBothDeferred.add(relPath);
+                this.logger.info(`Keeping both versions of ${relPath} once it stops changing: it is still being written`);
+            }
+            return;
+        }
+        this.keepBothDeferred.delete(relPath);
         const notify = () =>
             sendDesktopNotification({
                 title: 'Proton Drive Sync Conflict',
@@ -2511,6 +2534,9 @@ export class ProtonDriveSyncEngine {
         const seen = `${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
         const earlier = this.settlingFiles.get(relPath);
         if (earlier?.settled && earlier.seen === seen) {
+            if (earlier.forced && (now - earlier.since >= earlier.quietMs || Date.now() - st.ctimeMs >= earlier.quietMs)) {
+                earlier.forced = false; // Let through while it changed, and quiet since: settled after all
+            }
             return false;
         }
         earlier?.cancel();
@@ -2526,8 +2552,9 @@ export class ProtonDriveSyncEngine {
         const changingSince = ongoing?.changingSince ?? now;
         const maxWaitMs = settle.maxWaitMs ?? SETTLE_MAX_WAIT_MS;
         // ctime is by the system clock: so is Date.now(), whatever clock the looks are timed by
-        if (now - since >= quietMs || Date.now() - st.ctimeMs >= quietMs || now - changingSince >= maxWaitMs) {
-            this.settlingFiles.set(relPath, { seen, since: now, quietMs, changingSince: now, settled: true, cancel: () => {} });
+        const quiet = now - since >= quietMs || Date.now() - st.ctimeMs >= quietMs;
+        if (quiet || now - changingSince >= maxWaitMs) {
+            this.settlingFiles.set(relPath, { seen, since: now, quietMs, changingSince: now, settled: true, forced: !quiet, cancel: () => {} });
             return false;
         }
         const schedule =
@@ -2575,6 +2602,13 @@ export class ProtonDriveSyncEngine {
             return true;
         }
         return settlesWithin(running, timeoutMs);
+    }
+
+    // Whether a file was let through only because it kept changing for SETTLE_MAX_WAIT_MS, and hasn't gone quiet since:
+    // it uploads as it is, but anything that would replace it (keep-both downloading the cloud version) waits (#70)
+    private stillChangingWhenLetThrough(relPath: string): boolean {
+        const entry = this.settlingFiles.get(relPath);
+        return entry?.settled === true && entry.forced === true;
     }
 
     private forgetSettling(relPath: string): void {

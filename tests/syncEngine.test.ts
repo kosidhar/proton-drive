@@ -3289,6 +3289,17 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(d.pendingLooks()).toBe(0);
                 });
 
+                test('a file not in conflict that keeps changing still uploads once it has for 2 minutes', async () => {
+                    const d = await started();
+                    await d.files.writeLocal('busy.log', 'start\n');
+                    for (let i = 1; i <= 130 && d.calls.uploads.length === 0; i++) {
+                        appendFileSync(d.local('busy.log'), `line ${i}\n`);
+                        await d.changed('busy.log');
+                        await d.advance(1000);
+                    }
+                    expect(d.calls.uploads).toEqual(['busy.log']);
+                });
+
                 test('a file saved in one go uploads once, a couple of seconds after the save', async () => {
                     const d = await started();
                     await d.files.writeLocal('note.txt', 'saved');
@@ -8587,6 +8598,83 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 self: { availability: 'downloaded', transfer: 'syncing' },
                 children: { 'one.txt': { availability: 'downloaded', transfer: 'syncing' }, node_modules: null },
             });
+        });
+    });
+    describe('keep-both of a file that keeps changing (#70)', () => {
+        // Only sync passes look at the file here: the looks the settle wait schedules (the watcher's way in) never run, so
+        // what is tested is a pass meeting a file still being written. The settle clock is moved by hand.
+        test('keep-both waits until the file goes quiet, then downloads the cloud version once', async () => {
+            const d = makeMockDrive();
+            let now = Date.now();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                settle: { quietMs: 2000, maxQuietMs: 16_000, maxWaitMs: 120_000, now: () => now, schedule: () => () => {} },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('log.txt', 'line 0\n');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+            d.nodes.set(
+                d.uid('log.txt'),
+                makeMockNode({ uid: d.uid('log.txt'), parentUid: d.root.uid, nameStr: 'log.txt', type: NodeType.File, content: 'cloud edit' }),
+            );
+            const downloadsBefore = d.calls.downloads.length;
+
+            // Written to every second for well over the 2 minutes after which a changing file is let through anyway
+            for (let i = 1; i <= 150; i++) {
+                appendFileSync(local('log.txt'), `line ${i}\n`);
+                await engine.reconcileNow();
+                expect(d.calls.downloads.length).toBe(downloadsBefore); // nothing downloaded only to be thrown away
+                now += 1000;
+            }
+            expect(d.nodes.get(d.uid('log.txt'))?.content).toBe('cloud edit');
+            expect(stateDb.listConflicts(true)).toEqual([]);
+
+            // Quiet now: the keep-both runs once, keeping all of the log as a conflict copy
+            await engine.reconcileNow(); // seen as it is
+            now += 20_000;
+            await engine.reconcileNow();
+            expect(d.calls.downloads.length).toBe(downloadsBefore + 1);
+            expect(await readFile(local('log.txt'), 'utf8')).toBe('cloud edit');
+            const copies = (await readdir(engine.localRoot())).filter((n) => n.startsWith('log') && n !== 'log.txt');
+            expect(copies.length).toBe(1);
+            expect(await readFile(local(copies[0]), 'utf8')).toContain('line 150');
+            expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-both']);
+            expect(d.calls.trashed).toEqual([]);
+        });
+
+        test('a file let through while changing that then stops keeps both once it has been quiet, without waiting for the minute-long purge', async () => {
+            const d = makeMockDrive();
+            let now = Date.now();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                settle: { quietMs: 2000, maxQuietMs: 16_000, maxWaitMs: 120_000, now: () => now, schedule: () => () => {} },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('log.txt', 'line 0\n');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+            d.nodes.set(
+                d.uid('log.txt'),
+                makeMockNode({ uid: d.uid('log.txt'), parentUid: d.root.uid, nameStr: 'log.txt', type: NodeType.File, content: 'cloud edit' }),
+            );
+            const downloadsBefore = d.calls.downloads.length;
+            const forced = () => (engine as any).settlingFiles.get('log.txt')?.forced === true;
+            // Written to every second until a pass lets it through only because it kept changing; then it stops
+            for (let i = 1; i <= 200 && !forced(); i++) {
+                appendFileSync(local('log.txt'), `line ${i}\n`);
+                await engine.reconcileNow();
+                now += 1000;
+            }
+            expect(forced()).toBe(true);
+            expect(d.calls.downloads.length).toBe(downloadsBefore);
+
+            now += 20_000; // quiet for longer than its wait, well before the 60 s after which a settled entry is forgotten
+            await engine.reconcileNow();
+            expect(d.calls.downloads.length).toBe(downloadsBefore + 1);
+            expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-both']);
         });
     });
 });
