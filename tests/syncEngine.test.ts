@@ -4275,6 +4275,80 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         }
     });
 
+    // #18: an item that fails is marked and retried next pass; the pass goes on with everything else
+    describe('an item that fails in a sync pass (#18)', () => {
+        const withFailingDownload = async (layout: 'plain' | 'virtual', failure: () => Error) => {
+            if (layout === 'virtual') {
+                stateDb.setMeta('driveLayout', 'virtual');
+            }
+            const drive = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+            });
+            const a = drive.add('A');
+            drive.add('A/bad.txt', 'bad');
+            drive.add('A/fine.txt', 'fine');
+            const b = drive.add('B');
+            drive.add('B/good.txt', 'good');
+            drive.add('Z/Deep/x.txt', 'x'); // online-only
+            engine.availability.setPin(a.uid, 'pinned', false);
+            engine.availability.setPin(b.uid, 'pinned', false);
+            let failing = true;
+            const real = (drive.sdk as any).getFileRevisionDownloader;
+            (drive.sdk as any).getFileRevisionDownloader = async (revisionUid: string) => {
+                if (failing && revisionUid.startsWith('vol~A/bad.txt')) {
+                    throw failure();
+                }
+                return real(revisionUid);
+            };
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            const exists = (rel: string) => stat(local(rel)).then(() => true, () => false);
+            return { ...drive, engine, local, exists, heal: () => (failing = false) };
+        };
+
+        for (const layout of ['plain', 'virtual'] as const) {
+            describe(`in the ${layout} layout`, () => {
+                test('a download that keeps failing is marked and retried, while the pass syncs everything else', async () => {
+                    const d = await withFailingDownload(layout, () => new Error('Integrity check failed'));
+
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(await readFile(d.local('A/fine.txt'), 'utf8')).toBe('fine');
+                    expect(await readFile(d.local('B/good.txt'), 'utf8')).toBe('good');
+                    expect(await d.exists('A/bad.txt')).toBe(false);
+                    expect(d.engine.remoteIndex.getByPath('Z/Deep/x.txt')).not.toBeNull(); // the crawl still ran
+                    const status = d.engine.getStatus();
+                    expect(status.state).toBe('error');
+                    expect(status.lastError).toContain('A/bad.txt');
+                    const failures = stateDb.listActivity(100).filter((a) => a.action === 'error' && a.localRelPath === 'A/bad.txt');
+                    expect(failures.length).toBeGreaterThan(0);
+                    expect(d.calls.trashed).toEqual([]);
+
+                    d.heal();
+                    await d.engine.reconcileNow();
+
+                    expect(await readFile(d.local('A/bad.txt'), 'utf8')).toBe('bad');
+                    expect(d.engine.getStatus().state).toBe('idle');
+                    expect(d.engine.getStatus().lastError).toBeNull();
+                    expect(d.calls.trashed).toEqual([]);
+                });
+
+                test('offline, the pass still stops at the first failure rather than fail every item', async () => {
+                    const d = await withFailingDownload(layout, () => new ConnectionError('Network unreachable'));
+
+                    await d.engine.reconcileNow();
+
+                    expect(d.engine.getStatus().state).toBe('error');
+                    expect(await d.exists('B/good.txt')).toBe(false);
+                    expect(d.calls.downloads).not.toContain('B/good.txt');
+                    expect(d.calls.trashed).toEqual([]);
+                });
+            });
+        }
+    });
+
     // Renames, moves and deletes made through the virtual drive: done here at once, and in Proton Drive from a persistent,
     // ordered journal, so they also work offline (spec §5.2)
     describe('drive operations', () => {
