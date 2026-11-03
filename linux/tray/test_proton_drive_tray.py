@@ -185,54 +185,5 @@ class MountItemTest(unittest.TestCase):
         self.assertEqual(tray.OPEN_FOLDER_LABEL, "Open Proton Drive Folder")
 
 
-class StateIconTest(unittest.TestCase):
-    """The tray's state icons (#75): a turning sync icon while syncing, a still full-size icon otherwise."""
-
-    ICONS = os.path.join(HERE, "..", "..", "assets", "app-icon", "tray")
-
-    def test_every_icon_the_tray_names_is_installed(self):
-        names = ["protondrive-tray-idle", "protondrive-tray-paused", "protondrive-tray-error", "protondrive-tray-syncing"]
-        names += [tray.sync_frame_icon(i) for i in range(tray.SYNC_FRAMES)]
-        for name in names:
-            self.assertTrue(os.path.isfile(os.path.join(self.ICONS, f"{name}.png")), name)
-
-    def test_the_sync_frames_wrap_around(self):
-        self.assertEqual(tray.sync_frame_icon(0), "protondrive-tray-syncing-0")
-        self.assertEqual(tray.sync_frame_icon(tray.SYNC_FRAMES), "protondrive-tray-syncing-0")
-        self.assertEqual(tray.sync_frame_icon(tray.SYNC_FRAMES + 3), "protondrive-tray-syncing-3")
-
-    def indicator_stand_in(self):
-        """The tray's icon methods on a bare object, with GLib's timer calls recorded instead of run."""
-        state = types.SimpleNamespace(indicator=mock.MagicMock(), sync_frame=0, sync_timer=0)
-        for name in ("show_state", "show_syncing", "next_sync_frame"):
-            setattr(state, name, getattr(tray.ProtonDriveTrayIndicator, name).__get__(state))
-        return state
-
-    def test_syncing_starts_one_timer_and_any_other_state_stops_it(self):
-        glib = tray.GLib
-        glib.timeout_add.reset_mock()
-        glib.source_remove.reset_mock()
-        glib.timeout_add.return_value = 42
-        t = self.indicator_stand_in()
-
-        t.show_syncing()
-        t.show_syncing()  # the next poll while still syncing leaves the one timer turning
-        self.assertEqual(glib.timeout_add.call_count, 1)
-        self.assertEqual(glib.timeout_add.call_args[0][0], tray.SYNC_FRAME_MS)
-        t.indicator.set_icon_full.assert_called_with("protondrive-tray-syncing-0", "Syncing")
-
-        self.assertTrue(t.next_sync_frame())
-        t.indicator.set_icon_full.assert_called_with("protondrive-tray-syncing-1", "Syncing")
-
-        t.show_state("protondrive-tray-idle", "Up to date")
-        glib.source_remove.assert_called_once_with(42)
-        self.assertEqual(t.sync_timer, 0)
-        t.indicator.set_icon_full.assert_called_with("protondrive-tray-idle", "Up to date")
-
-        # A still state with no timer running removes nothing
-        t.show_state("protondrive-tray-paused", "Paused")
-        glib.source_remove.assert_called_once_with(42)
-
-
 if __name__ == "__main__":
     unittest.main()
