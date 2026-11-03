@@ -4498,6 +4498,37 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
                 });
 
+                test('keep-both of a file that keeps changing leaves no pile of conflict copies, one per try (#67)', async () => {
+                    const d = await synced(layout);
+                    d.changeInCloud('theirs');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    // Written to again during every download of the cloud version, until it stops
+                    const sdk = d.sdk as any;
+                    const real = sdk.getFileRevisionDownloader.bind(sdk);
+                    let writing = true;
+                    let line = 0;
+                    sdk.getFileRevisionDownloader = async (revisionUid: string) => {
+                        if (writing) {
+                            appendFileSync(d.local('Docs/doc.txt'), ` ${++line}`);
+                        }
+                        return real(revisionUid);
+                    };
+
+                    for (let pass = 0; pass < 5; pass++) {
+                        await d.engine.reconcileNow();
+                    }
+                    expect(await d.copiesIn('Docs')).toEqual([]);
+                    expect(d.cloudCopies()).toEqual([]);
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('mine 1 2 3 4 5');
+
+                    writing = false;
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
+                    expect(d.cloudCopies().map((n) => n.content)).toEqual(['mine 1 2 3 4 5']);
+                    expect((await d.copiesIn('Docs')).length).toBe(1);
+                });
+
                 // #25: a keep-both whose download of the cloud version fails makes its conflict copy once
                 test('keep-both makes one conflict copy while the cloud version fails to download, then brings it down (#25)', async () => {
                     const d = await synced(layout);
