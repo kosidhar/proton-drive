@@ -4587,6 +4587,80 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 });
             });
 
+            // Review of #39: the day counts only unmapped-code failures in a row, never time spent offline
+            describe('the day an unmapped API code is given', () => {
+                afterEach(() => setSystemTime());
+                const refusingWith = async () => {
+                    let now = Date.parse('2026-11-02T08:00:00Z');
+                    setSystemTime(now);
+                    let next: () => Error = () => new ConnectionError('Network unreachable');
+                    const d = await refusing(() => next());
+                    return {
+                        ...d,
+                        answer: (error: () => Error) => (next = error),
+                        at: (ms: number) => {
+                            now += ms;
+                            setSystemTime(now);
+                        },
+                    };
+                };
+
+                test('two days offline, then one unmapped-code blip, gives nothing up', async () => {
+                    const d = await refusingWith();
+                    for (let hour = 0; hour < 48; hour++) {
+                        d.at(60 * 60_000);
+                        await d.engine.replayRemoteOps();
+                    }
+                    d.answer(() => new APICodeError('Service unavailable', 503));
+                    d.at(60_000);
+                    await d.engine.replayRemoteOps();
+
+                    expect(d.journal()).toHaveLength(2);
+                    expect(activity().filter((a) => a.includes('given up on'))).toEqual([]);
+                });
+
+                test('an unmapped code after other failures starts its day afresh', async () => {
+                    const d = await refusingWith();
+                    d.answer(() => new APICodeError('Service unavailable', 503));
+                    for (let hour = 0; hour < 20; hour++) {
+                        d.at(60 * 60_000);
+                        await d.engine.replayRemoteOps();
+                    }
+                    d.answer(() => new APIHTTPError('Bad Gateway', 502)); // a failure of another kind ends the run
+                    d.at(60 * 60_000);
+                    await d.engine.replayRemoteOps();
+                    d.answer(() => new APICodeError('Service unavailable', 503));
+                    for (let hour = 0; hour < 10; hour++) {
+                        d.at(60 * 60_000);
+                        await d.engine.replayRemoteOps();
+                    }
+
+                    expect(d.journal()).toHaveLength(2);
+                    expect(activity().filter((a) => a.includes('given up on'))).toEqual([]);
+                });
+
+                test('a day with fewer than 5 unmapped-code tries gives nothing up yet; the 5th does', async () => {
+                    const d = await refusingWith();
+                    d.answer(() => new APICodeError('Unknown', 98765));
+                    d.at(60_000);
+                    await d.engine.replayRemoteOps(); // 1st
+                    d.at(25 * 60 * 60_000); // asleep for a day
+                    await d.engine.replayRemoteOps(); // 2nd
+                    d.at(2 * 60 * 60_000);
+                    await d.engine.replayRemoteOps(); // 3rd
+                    d.at(2 * 60 * 60_000);
+                    await d.engine.replayRemoteOps(); // 4th
+                    expect(d.journal()).toHaveLength(2);
+
+                    d.at(2 * 60 * 60_000);
+                    await d.engine.replayRemoteOps(); // 5th
+
+                    expect(d.journal()).toEqual([]);
+                    expect(d.calls.renamed).toEqual([{ uid: 'vol~Docs/b.txt', name: 'b2.txt' }]);
+                    expect(activity().filter((a) => a.includes('Docs/a2.txt') && a.includes('given up on'))).toHaveLength(1);
+                });
+            });
+
             test('refused with an HTTP 401 (a session that expired), it is never given up on quickly', async () => {
                 const d = await refusing(() => new APIHTTPError('Unauthorized', 401));
 
