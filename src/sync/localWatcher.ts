@@ -152,7 +152,7 @@ export class LocalFolderWatcher {
                 if (entry.isDirectory()) {
                     await this.watchDirectoryTree(childPath, reportExisting);
                 } else if (reportExisting && newlyWatched) {
-                    // As if its watcher had seen it made: suppression and ignore rules apply as to any event
+                    // As if its watcher had seen it made: suppression and ignore rules apply to the file's own path
                     this.handleRawFsEvent('rename', path.relative(rootDir, childPath).split(path.sep).join('/'), childPath);
                 }
             }
@@ -195,7 +195,9 @@ export class LocalFolderWatcher {
                 this.unwatchTree(fullPath);
             }
             if (isDirectory) {
-                await this.watchDirectoryTree(fullPath, true);
+                // Its files are reported only if the folder itself is: one the engine made or moved is suppressed, and
+                // its files, synced already, aren't each worth a look (a whole moved folder would be hashed file by file)
+                await this.watchDirectoryTree(fullPath, report);
             }
 
             if (report) {

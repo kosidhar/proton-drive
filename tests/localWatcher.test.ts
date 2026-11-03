@@ -70,6 +70,17 @@ describe('LocalFolderWatcher', () => {
         expect(changes).not.toContain('New/skip.txt');
     });
 
+    // A folder the engine made or moved itself is suppressed: its files, synced already, are not reported one by one
+    test('files in a new folder whose own event is suppressed are not reported', async () => {
+        await start();
+        watcher.suppressPath('Moved', 5000);
+        await mkdir(path.join(root, 'Moved'));
+        await writeFile(path.join(root, 'Moved', 'a.txt'), 'a');
+        await Bun.sleep(300);
+        expect(changes.filter((c) => c.startsWith('Moved'))).toEqual([]);
+        expect(isWatched('Moved')).toBe(true); // still watched, for what the user does in it later
+    });
+
     test('folders already there at start are not reported file by file', async () => {
         await mkdir(path.join(root, 'Old'));
         await writeFile(path.join(root, 'Old', 'a.txt'), 'a');
