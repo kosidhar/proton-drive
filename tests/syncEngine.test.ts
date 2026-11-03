@@ -9536,6 +9536,142 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
     });
 
+    describe('a drive rename or delete and a resolution by hand of the same file never overlap (#112)', () => {
+        const queued = async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'original');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            stateDb.updateSettings({ conflictStrategy: 'prompt' });
+            await writeFile(local('a.txt'), 'local edit');
+            d.nodes.set(d.uid('a.txt'), makeMockNode({ uid: d.uid('a.txt'), parentUid: d.root.uid, nameStr: 'a.txt', type: NodeType.File, content: 'cloud edit' }));
+            await engine.reconcileNow();
+            const [conflict] = stateDb.listConflicts();
+            expect(conflict.localRelPath).toBe('a.txt');
+            // Holds the resolution's first look at the node until released
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            const getNode = d.sdk.getNode.bind(d.sdk);
+            const holdResolution = () => {
+                (d.sdk as any).getNode = async (u: string) => {
+                    if (u === d.uid('a.txt')) {
+                        (d.sdk as any).getNode = getNode;
+                        entered();
+                        await gate;
+                    }
+                    return getNode(u);
+                };
+                return { release, inside };
+            };
+            return { ...d, engine, local, conflict, holdResolution };
+        };
+
+        test('a rename through the drive waits for the resolution, then moves what it left', async () => {
+            const d = await queued();
+            const held = d.holdResolution();
+            const manual = d.engine.resolveConflictManually(d.conflict.id, 'keep-local');
+            await held.inside;
+            let renamed = false;
+            const rename = d.engine.renameItem('a.txt', 'b.txt').then(() => (renamed = true));
+            await Bun.sleep(20);
+            expect(renamed).toBe(false);
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
+            held.release();
+            await manual;
+            await rename;
+            expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-local']);
+            expect(await readFile(d.local('b.txt'), 'utf8')).toBe('local edit');
+            expect(stateDb.getItemByPath('b.txt')?.nodeUid).toBe(d.uid('a.txt'));
+            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('local edit');
+        });
+
+        test('a delete through the drive waits no longer than its deadline, and then changes nothing', async () => {
+            const d = await queued();
+            const held = d.holdResolution();
+            const manual = d.engine.resolveConflictManually(d.conflict.id, 'keep-local');
+            await held.inside;
+            await expect(d.engine.deleteItem('a.txt', { deadlineMs: Date.now() + 30 })).rejects.toMatchObject({ code: 'EIO' });
+            held.release();
+            await manual;
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
+            expect(stateDb.getItemByPath('a.txt')?.nodeUid).toBe(d.uid('a.txt'));
+            expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-local']);
+        });
+
+        test('a delete of the folder holding the file waits for a keep-remote, then deletes what it left', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('F/a.txt', 'original');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            stateDb.updateSettings({ conflictStrategy: 'prompt' });
+            const file = path.join(engine.localRoot(), 'F/a.txt');
+            await writeFile(file, 'local edit');
+            const node = d.nodes.get(d.uid('F/a.txt'))!;
+            d.nodes.set(d.uid('F/a.txt'), makeMockNode({ uid: d.uid('F/a.txt'), parentUid: node.parentUid, nameStr: 'a.txt', type: NodeType.File, content: 'cloud edit' }));
+            await engine.reconcileNow();
+            const [conflict] = stateDb.listConflicts();
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            const getNode = d.sdk.getNode.bind(d.sdk);
+            (d.sdk as any).getNode = async (u: string) => {
+                if (u === d.uid('F/a.txt')) {
+                    (d.sdk as any).getNode = getNode;
+                    entered();
+                    await gate;
+                }
+                return getNode(u);
+            };
+            const manual = engine.resolveConflictManually(conflict.id, 'keep-remote');
+            await inside;
+            let deleted = false;
+            const del = engine.deleteItem('F').then(() => (deleted = true));
+            await Bun.sleep(20);
+            expect(deleted).toBe(false);
+            release();
+            await manual;
+            await del;
+            expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-remote']);
+            expect(await stat(path.join(engine.localRoot(), 'F')).catch(() => null)).toBeNull();
+            expect(stateDb.getItemByPath('F/a.txt')).toBeNull();
+        });
+
+        test('a resolution asked for while a drive rename of the file runs is refused, and changes nothing', async () => {
+            const d = await queued();
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            const renameLocally = (d.engine as any).renameLocally.bind(d.engine);
+            (d.engine as any).renameLocally = async (...args: unknown[]) => {
+                entered();
+                await gate;
+                return renameLocally(...args);
+            };
+            const rename = d.engine.renameItem('a.txt', 'b.txt');
+            await inside;
+            await expect(d.engine.resolveConflictManually(d.conflict.id, 'keep-local')).rejects.toMatchObject({ status: 409 });
+            release();
+            await rename;
+            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('cloud edit'); // nothing uploaded by a resolution
+            expect(await readFile(d.local('b.txt'), 'utf8')).toBe('local edit');
+        });
+    });
+
     describe("a record's parent once its folder is in Proton Drive, and after an adopted stray node (#103)", () => {
         test('virtual: a move through the drive into a folder made here gets that folder as its parent once it is created', async () => {
             stateDb.setMeta('driveLayout', 'virtual');
