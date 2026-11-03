@@ -1328,10 +1328,13 @@ export class ProtonDriveSyncEngine {
 
                 // Fast path: the local file's time and size match the record, and the cloud hasn't changed since it: no
                 // SHA1 recomputation needed
+                // A conflict still waiting here is looked at in full, so that once both sides hold the same content
+                // (synced by a download, say) it is closed (#68)
                 if (
                     dbRecord &&
                     remoteAtSync &&
                     dbRecord.syncStatus === 'synced' &&
+                    !this.stateDb.hasWaitingConflict(relPath) &&
                     Math.abs(localInfo.mtimeMs - dbRecord.localMtimeMs) < 10 &&
                     localInfo.size === dbRecord.size &&
                     !cloudChangedSince(remoteAtSync, remoteNow)
@@ -1349,7 +1352,7 @@ export class ProtonDriveSyncEngine {
                     return; // Gone (freed, say) or unreadable since it was listed: the next pass looks again
                 }
                 if (remoteSha1 && localSha1 === remoteSha1) {
-                    this.recordSynced({
+                    const synced = this.recordSynced({
                         localRelPath: relPath,
                         nodeUid: remoteNode.uid,
                         parentNodeUid: remoteNode.parentUid ?? null,
@@ -1362,6 +1365,12 @@ export class ProtonDriveSyncEngine {
                         syncStatus: 'synced',
                         lastError: null,
                     }, since);
+                    // Both sides were just compared and hold the same content: a conflict waiting for the user here is
+                    // over (#68). Only here: a record written as synced elsewhere (an upload by the watcher, say) says
+                    // nothing about what the other side holds
+                    if (synced) {
+                        this.stateDb.closeWaitingConflict(relPath, 'in-sync');
+                    }
                     return;
                 }
 
@@ -1458,14 +1467,13 @@ export class ProtonDriveSyncEngine {
         if (strategy === 'keep-local') {
             const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
             await this.uploadLocalToRemote(relPath, localFullPath, parentNode, since, remoteNode.uid);
-            this.stateDb.recordConflict({
+            this.stateDb.settleConflict({
                 localRelPath: relPath,
                 nodeUid: remoteNode.uid,
                 localSha1,
                 remoteSha1,
                 localMtimeMs,
                 remoteMtimeMs,
-                resolved: true,
                 resolution: 'keep-local',
             });
             this.keepBothCopies.delete(relPath);
@@ -1474,14 +1482,13 @@ export class ProtonDriveSyncEngine {
 
         if (strategy === 'keep-remote') {
             await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
-            this.stateDb.recordConflict({
+            this.stateDb.settleConflict({
                 localRelPath: relPath,
                 nodeUid: remoteNode.uid,
                 localSha1,
                 remoteSha1,
                 localMtimeMs,
                 remoteMtimeMs,
-                resolved: true,
                 resolution: 'keep-remote',
             });
             this.keepBothCopies.delete(relPath);
@@ -1491,17 +1498,16 @@ export class ProtonDriveSyncEngine {
         // Default: keep-both
         const conflictCopyRelPath = await this.keepBoth(relPath, localFullPath, localSha1, remoteNode, remoteMap, since);
         if (conflictCopyRelPath === null) {
-            return; // Changed meanwhile: the next pass keeps both again
+            return; // Changed meanwhile: the next pass keeps both again, and a conflict waiting there keeps waiting
         }
 
-        this.stateDb.recordConflict({
+        this.stateDb.settleConflict({
             localRelPath: relPath,
             nodeUid: remoteNode.uid,
             localSha1,
             remoteSha1,
             localMtimeMs,
             remoteMtimeMs,
-            resolved: true,
             resolution: 'keep-both',
             conflictCopyPath: conflictCopyRelPath,
         });
