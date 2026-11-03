@@ -44,6 +44,13 @@ export class RemoteOpsJournal {
             )
         `);
         this.db.run('CREATE INDEX IF NOT EXISTS remote_ops_node ON remote_ops (nodeUid, id)');
+        // When an operation first failed, and when it may be tried again (null: at once); added to older databases
+        const columns = new Set((this.db.query('PRAGMA table_info(remote_ops)').all() as Array<{ name: string }>).map((c) => c.name));
+        for (const column of ['firstFailedAt', 'retryAfter']) {
+            if (!columns.has(column)) {
+                this.db.run(`ALTER TABLE remote_ops ADD COLUMN ${column} INTEGER`);
+            }
+        }
     }
 
     enqueue(op: NewRemoteOp): number {
@@ -94,10 +101,25 @@ export class RemoteOpsJournal {
         this.db.query('DELETE FROM remote_ops WHERE id = $id').run({ $id: id });
     }
 
-    failed(id: number, error: string): void {
+    // Counts a failed attempt, keeping its error and when the first failure was; with retryAfter, the operation isn't
+    // tried again before then
+    failed(id: number, error: string, retryAfter: number | null = null): void {
         this.db
-            .query('UPDATE remote_ops SET attempts = attempts + 1, lastError = $error WHERE id = $id')
-            .run({ $id: id, $error: error });
+            .query(
+                `UPDATE remote_ops SET attempts = attempts + 1, lastError = $error,
+                     firstFailedAt = COALESCE(firstFailedAt, $now), retryAfter = $retryAfter
+                 WHERE id = $id`,
+            )
+            .run({ $id: id, $error: error, $now: Date.now(), $retryAfter: retryAfter });
+    }
+
+    // When an operation first failed (null: it hasn't), and when it may be tried again (null: at once)
+    failures(id: number): { firstFailedAt: number | null; retryAfter: number | null } {
+        const row = this.db.query('SELECT firstFailedAt, retryAfter FROM remote_ops WHERE id = $id').get({ $id: id }) as {
+            firstFailedAt: number | null;
+            retryAfter: number | null;
+        } | null;
+        return row ?? { firstFailedAt: null, retryAfter: null };
     }
 
     // A local rename of fromRel to toRel takes along the targets of pending renames and moves at or under it, so they
@@ -133,8 +155,8 @@ export class RemoteOpsJournal {
         this.db.transaction(() => {
             this.db.run('DELETE FROM remote_ops');
             const insert = this.db.query(
-                `INSERT INTO remote_ops (id, kind, nodeUid, path, toPath, createdAt, attempts, lastError)
-                 VALUES ($id, $kind, $nodeUid, $path, $toPath, $createdAt, $attempts, $lastError)`,
+                `INSERT INTO remote_ops (id, kind, nodeUid, path, toPath, createdAt, attempts, lastError, firstFailedAt, retryAfter)
+                 VALUES ($id, $kind, $nodeUid, $path, $toPath, $createdAt, $attempts, $lastError, $firstFailedAt, $retryAfter)`,
             );
             for (const row of rows as Array<Record<string, unknown>>) {
                 insert.run({
@@ -146,6 +168,8 @@ export class RemoteOpsJournal {
                     $createdAt: row.createdAt as number,
                     $attempts: row.attempts as number,
                     $lastError: row.lastError as string | null,
+                    $firstFailedAt: (row.firstFailedAt as number | null | undefined) ?? null,
+                    $retryAfter: (row.retryAfter as number | null | undefined) ?? null,
                 });
             }
         })();
