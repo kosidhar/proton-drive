@@ -4236,6 +4236,58 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             return { ...drive, engine, local, changeInCloud, copiesIn, cloudCopies };
         };
 
+        // #63: in the plain layout, a file deleted here while its conflict waits for the user (prompt) is this computer's
+        // side going away: the other device's revision stays in the cloud, as through the drive (#29)
+        describe('deleted here while its conflict waits for the user (#63)', () => {
+            const queued = async () => {
+                stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                const d = await synced('plain');
+                d.changeInCloud('theirs');
+                await writeFile(d.local('Docs/doc.txt'), 'mine');
+                await d.engine.reconcileNow();
+                expect(stateDb.listConflicts().map((c) => c.localRelPath)).toEqual(['Docs/doc.txt']);
+                expect(stateDb.getItemByPath('Docs/doc.txt')?.syncStatus).toBe('conflict');
+                return d;
+            };
+            const expectTheirsKept = async (d: Awaited<ReturnType<typeof queued>>) => {
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                expect(stateDb.listConflicts()).toEqual([]);
+                expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-remote']);
+                await d.engine.reconcileNow();
+                expect(d.calls.trashed).toEqual([]);
+                // The cloud's version comes down in its place (the root is pinned)
+                expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
+            };
+
+            test('reported by the watcher, it keeps the cloud file and the conflict ends as keep-remote', async () => {
+                const d = await queued();
+                await rm(d.local('Docs/doc.txt'));
+                await (d.engine as any).handleLocalFileChange('Docs/doc.txt');
+                await expectTheirsKept(d);
+            });
+
+            test('found by a pass, the same', async () => {
+                const d = await queued();
+                await rm(d.local('Docs/doc.txt'));
+                await d.engine.reconcileNow();
+                await expectTheirsKept(d);
+            });
+
+            test('with its folder deleted, the rest of the folder goes to the Proton Drive trash, never that file', async () => {
+                const d = await queued();
+                d.add('Docs/other.txt', 'o');
+                d.add('Kept.txt', 'k'); // so that Docs gone isn't every file missing from the folder (#45)
+                await d.engine.reconcileNow();
+                expect(await readFile(d.local('Docs/other.txt'), 'utf8')).toBe('o');
+                await rm(d.local('Docs'), { recursive: true });
+                await d.engine.reconcileNow();
+                expect(d.calls.trashed.flat()).toEqual(['vol~Docs/other.txt']);
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                expect(stateDb.listConflicts()).toEqual([]);
+            });
+        });
+
         for (const layout of ['plain', 'virtual'] as const) {
             describe(`in the ${layout} layout`, () => {
                 // #24: with no SHA1 on either side, the record and the cloud are compared by claimed time and size
