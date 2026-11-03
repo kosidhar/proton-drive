@@ -461,7 +461,8 @@ export class SyncStateDatabase {
 
     // The records of the items directly in a folder name it as their cloud parent: a folder recorded with its node (one
     // made here, say, that items were moved into before Proton Drive had it) is where they are now (#103). Leaves
-    // updatedAt as it was: it says when an item's own record was written, which this isn't.
+    // updatedAt as it was: it says when an item's own record was written, and is trusted as such (a file whose ctime is
+    // no newer counts as not written since, #89/#105; a record written meanwhile stops a conflict pass, #77).
     setParentOfChildren(folderRel: string, folderUid: string): void {
         if (folderRel === '') {
             return;
@@ -470,11 +471,12 @@ export class SyncStateDatabase {
             .query(
                 `UPDATE synced_items SET parentNodeUid = $uid
                  WHERE localRelPath > $lo AND localRelPath < $hi
-                   AND instr(substr(localRelPath, $start), '/') = 0
+                   AND instr(substr(localRelPath, length($lo) + 1), '/') = 0
                    AND parentNodeUid IS NOT $uid`,
             )
             // '0' follows '/': the range is exactly the paths under the folder, found by the primary key
-            .run({ $uid: folderUid, $lo: `${folderRel}/`, $hi: `${folderRel}0`, $start: folderRel.length + 2 });
+            // (SQLite counts the offset in characters, as substr does: a JS length would be off for emoji, #103 review)
+            .run({ $uid: folderUid, $lo: `${folderRel}/`, $hi: `${folderRel}0` });
     }
 
     recordEditBaseline(baseline: Omit<EditBaseline, 'createdAt'>): void {
