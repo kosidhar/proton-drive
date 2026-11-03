@@ -12,3 +12,7 @@ native-vfs/target/
 .DS_Store
 .env
 *.tsbuildinfo
+
+# Python bytecode caches
+__pycache__/
+*.pyc
