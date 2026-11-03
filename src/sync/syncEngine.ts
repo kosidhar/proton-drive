@@ -1779,7 +1779,32 @@ export class ProtonDriveSyncEngine {
             const remoteNode = await this.sdk.getNode(conflict.nodeUid);
             if (choice === 'keep-local') {
                 const parentNode = await this.ensureParentFolderNode(conflict.localRelPath, remoteMap, since);
-                await this.uploadLocalToRemote(conflict.localRelPath, localFullPath, parentNode, since, remoteNode.uid);
+                const root = await this.getRootFolder().catch(() => null);
+                if (!root || (parentNode.uid !== root.uid && (parentNode.trashTime || (await this.inTrashedFolder(parentNode))))) {
+                    // The folder it goes in is in the Proton Drive trash (or that couldn't be checked): a file put
+                    // there would be trash too, and the next pass would remove it here as deleted in the cloud (#111)
+                    throw new ConflictRefusedError(
+                        409,
+                        `The folder holding ${conflict.localRelPath} is in the Proton Drive trash, or Proton Drive couldn't check: nothing was changed. Restore the folder there, or try again later`,
+                    );
+                }
+                if (remoteNode.trashTime || (await this.inTrashedFolder(remoteNode))) {
+                    // In the Proton Drive trash: a revision would land there, and the next pass would take the file for
+                    // deleted in the cloud and remove it here (#111). Kept as a new file at its place instead; a file
+                    // made there meanwhile isn't overwritten
+                    const result = await this.uploadLocalToRemote(conflict.localRelPath, localFullPath, parentNode, since, undefined, 'skip');
+                    if (result.status !== 'uploaded') {
+                        // Not uploaded (the trash still holds its name, say), or matched to a node that may be the
+                        // trashed one: the file is let go of the trashed node, so the next pass takes it for a new file
+                        // on this computer and keeps it, rather than for one deleted in the cloud
+                        this.stateDb.removeItemByPath(conflict.localRelPath);
+                        this.logger.warn(
+                            `Keep Local: ${conflict.localRelPath} is in the Proton Drive trash; it stays on this computer and uploads as a new file once its name is free`,
+                        );
+                    }
+                } else {
+                    await this.uploadLocalToRemote(conflict.localRelPath, localFullPath, parentNode, since, remoteNode.uid);
+                }
                 this.stateDb.markConflictResolved(conflictId, 'keep-local');
             } else if (choice === 'keep-remote') {
                 // The local file as the user chose to replace it: a save made while the cloud's version downloads is
