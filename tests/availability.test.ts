@@ -312,13 +312,14 @@ describe("AvailabilityPolicy.childStates", () => {
     };
     fill("big", "Big", 5000);
     fill("small", "Small", 10);
+    // Every way to run SQL on the connection is counted, so a query per child can't slip in through another one
     const queriesFor = (rel: string) => {
-      const spy = spyOn(stateDb.connection, "query");
+      const spies = (["query", "prepare", "run", "exec"] as const).map((method) => spyOn(stateDb.connection, method));
       try {
         const states = policy.childStates(rel);
-        return { states, queries: spy.mock.calls.length };
+        return { states, queries: spies.reduce((n, spy) => n + spy.mock.calls.length, 0) };
       } finally {
-        spy.mockRestore();
+        spies.forEach((spy) => spy.mockRestore());
       }
     };
     const big = queriesFor("Big");
