@@ -50,6 +50,34 @@ describe('LocalFolderWatcher', () => {
         await rm(base, { recursive: true, force: true });
     });
 
+    // #13: files saved into a new folder before its watcher attaches raised no event of their own
+    test('files already in a new folder when its watcher attaches are reported, nested ones too', async () => {
+        await start();
+        await mkdir(path.join(root, 'New', 'Inner'), { recursive: true });
+        await writeFile(path.join(root, 'New', 'a.txt'), 'a');
+        await writeFile(path.join(root, 'New', 'Inner', 'b.txt'), 'b');
+        expect(await waitFor(() => changes.includes('New/a.txt') && changes.includes('New/Inner/b.txt'))).toBe(true);
+    });
+
+    test('files in a new folder that are ignored are not reported', async () => {
+        hidden = ['New/skip.txt'];
+        await start();
+        await mkdir(path.join(root, 'New'));
+        await writeFile(path.join(root, 'New', 'skip.txt'), 'x');
+        await writeFile(path.join(root, 'New', 'keep.txt'), 'y');
+        expect(await waitFor(() => changes.includes('New/keep.txt'))).toBe(true);
+        await Bun.sleep(150);
+        expect(changes).not.toContain('New/skip.txt');
+    });
+
+    test('folders already there at start are not reported file by file', async () => {
+        await mkdir(path.join(root, 'Old'));
+        await writeFile(path.join(root, 'Old', 'a.txt'), 'a');
+        await start();
+        await Bun.sleep(200);
+        expect(changes).toEqual([]);
+    });
+
     test('keeps watching a folder that is deleted and created again', async () => {
         await mkdir(path.join(root, 'Projects'));
         await start();
