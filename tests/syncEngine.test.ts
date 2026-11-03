@@ -7142,6 +7142,92 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             }
         });
 
+        // #29: a local file and another device's different cloud file at one path, not resolved yet. The drive shows the
+        // local file (what the user has), and a delete through it removes that, never the other device's file.
+        describe('a path in an unresolved collision (#29)', () => {
+            const docEntry = (d: ReturnType<typeof setup>) => d.engine.vfsChildren('Docs').find((e) => e.name === 'doc.txt');
+            // Another device's 'theirs' (6 bytes) in the cloud, and 'mine' (4 bytes) made here, never uploaded
+            const collided = async (strategy: 'keep-both' | 'prompt') => {
+                stateDb.updateSettings({ conflictStrategy: strategy });
+                const d = setup();
+                d.add('Docs/doc.txt', 'theirs');
+                await d.engine.reconcileNow();
+                await d.files.writeLocal('Docs/doc.txt', 'mine');
+                return d;
+            };
+            const expectCloudFileKept = async (d: ReturnType<typeof setup>) => {
+                await d.engine.replayRemoteOps();
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                expect(await d.files.exists('Docs/doc.txt')).toBe(false);
+                await d.engine.reconcileNow();
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.calls.uploads).not.toContain('Docs/doc.txt');
+                // Back to what the cloud has, online-only
+                expect(docEntry(d)?.size).toBe(6);
+            };
+
+            test('waiting for the conflict handling, the drive lists the local file, and a delete trashes nothing', async () => {
+                const d = await collided('keep-both');
+                const st = await stat(d.local('Docs/doc.txt'));
+
+                expect(docEntry(d)).toEqual({ name: 'doc.txt', type: 'file', size: 4, mtimeMs: st.mtimeMs });
+                await d.engine.deleteItem('Docs/doc.txt');
+
+                await expectCloudFileKept(d);
+            });
+
+            test('queued for the user (prompt), the same, and the conflict is over once its local file is deleted', async () => {
+                const d = await collided('prompt');
+                await (d.engine as any).handleLocalFileChange('Docs/doc.txt');
+                expect(stateDb.listConflicts().map((c) => c.localRelPath)).toEqual(['Docs/doc.txt']);
+
+                expect(docEntry(d)?.size).toBe(4);
+                await d.engine.deleteItem('Docs/doc.txt');
+
+                await expectCloudFileKept(d);
+                expect(stateDb.listConflicts()).toEqual([]);
+            });
+
+            test('a recorded file changed on both sides and queued for the user: a delete leaves the cloud revision', async () => {
+                stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                await d.engine.reconcileNow();
+                await d.engine.setAvailability('Docs/doc.txt', 'pin');
+                expect(stateDb.getItemByPath('Docs/doc.txt')).not.toBeNull();
+                // Another device's revision (later, 6 bytes), and this computer's edit (4 bytes)
+                const node = d.nodes.get('vol~Docs/doc.txt')!;
+                const later = new Date(node.modificationTime.getTime() + 60_000);
+                const changed = makeMockNode({ uid: node.uid, parentUid: node.parentUid, nameStr: 'doc.txt', type: NodeType.File, content: 'theirs', modificationTime: later });
+                d.nodes.set(node.uid, { ...changed, activeRevision: { ...changed.activeRevision!, claimedModificationTime: later } });
+                await d.files.writeLocal('Docs/doc.txt', 'mine');
+                await d.engine.reconcileNow();
+                expect(stateDb.listConflicts().map((c) => c.localRelPath)).toEqual(['Docs/doc.txt']);
+
+                expect(docEntry(d)?.size).toBe(4);
+                await d.engine.deleteItem('Docs/doc.txt');
+                expect(stateDb.getItemByPath('Docs/doc.txt')).toBeNull();
+                expect(stateDb.listConflicts()).toEqual([]);
+
+                await expectCloudFileKept(d);
+                // Still pinned: the other device's version comes down in its place
+                expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
+            });
+
+            test('a file synced as usual still goes to the Proton Drive trash when deleted through the drive', async () => {
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                await d.engine.reconcileNow();
+                await d.engine.setAvailability('Docs/doc.txt', 'pin');
+
+                await d.engine.deleteItem('Docs/doc.txt');
+                await d.engine.replayRemoteOps();
+
+                expect(d.calls.trashed).toEqual([['vol~Docs/doc.txt']]);
+            });
+        });
+
         // S22: Move to Trash through the drive keeps what exists only on this computer, as a cloud delete does (#16)
         describe('a delete through the drive that is a Move to Trash', () => {
             const withDesktopTrash = () => {
