@@ -426,26 +426,28 @@ def summarize(names, limit=3):
 class ProtonDriveFiles:
     """What the extension knows and does, apart from Nautilus: everything here runs on the main loop. request(method,
     path, body, timeout) talks to the control socket, run(work, done) runs work() on a worker thread and done(result,
-    error) back on the main loop, notify(title, body) tells the user, complete(handle, closure, ok) finishes an
-    asynchronous emblem update."""
+    error) back on the main loop, notify(title, body) tells the user.
 
-    def __init__(self, request, run, notify, complete, clock=time.monotonic, later=None):
+    Files is always answered at once (#131). Answering later, through info_provider_update_complete_invoke, can't work
+    with nautilus-python: the handle it gives is never filled in, so every request carries the same value, and Nautilus
+    takes an answer for whichever request it is waiting on, logging the rest as "Unexpected plugin response". So a file
+    whose folder's states aren't known yet is answered with no emblem, and gets it when they arrive: add_emblem works
+    on a file at any time."""
+
+    def __init__(self, request, run, notify, clock=time.monotonic, later=None):
         self.request = request
         self.run = run
         self.notify = notify
-        self.complete = complete
         self.clock = clock
         self.later = later or (lambda fn, seconds: None)  # later(fn, seconds): fn on the main loop that much later
         self.root = None
         self.root_asked_at = None
-        self.root_waiting = []  # [(handle, closure, file)] asked about before the root was known
-        self.root_in_flight = False
         self.root_retry_due = False
         self.fetch_failures = {}  # folder -> how many fetches of its states failed in a row
         self.stream_up = False
         self.cache = FolderCache()
         self.tracker = FileTracker()
-        self.waiting = {}  # folder -> [(handle, closure, file)] waiting for its states
+        self.waiting = {}  # folder -> {id(file): file} answered without an emblem, waiting for its states
         self.generation = 0  # bumped by every change, so a fetch that started before it isn't cached
         self.busy = set()  # paths an action is working on, shown as syncing
 
@@ -456,20 +458,12 @@ class ProtonDriveFiles:
         if self.root_asked_at is not None and now - self.root_asked_at < ROOT_RETRY:
             return
         self.root_asked_at = now
-        self.root_in_flight = True
 
         def done(result, error):
-            self.root_in_flight = False
             if error is None and isinstance(result, dict) and isinstance(result.get("syncDir"), str):
                 self.set_root(result["syncDir"])
                 return
-            # Not known yet (the daemon starting, say): what waited gets no emblem for now, but is tracked, so that the
-            # root arriving later refreshes it (forget_everything); and the root is asked for again
-            for handle, closure, file in self.root_waiting:
-                if file.get_uri_scheme() == "file":
-                    self.tracker.track(file.get_location().get_path(), file)
-                self.complete(handle, closure, False)
-            self.root_waiting = []
+            # Not known yet (the daemon starting, say): asked again a little later
             if not self.root_retry_due:
                 self.root_retry_due = True
                 self.later(self.retry_root, ROOT_RETRY)
@@ -482,63 +476,48 @@ class ProtonDriveFiles:
             self.root_asked_at = None
             self.ask_root()
 
-    def answer_root_waiting(self):
-        """The root is known: what was asked about before it gets its emblem now (#86)."""
-        waiting, self.root_waiting = self.root_waiting, []
-        for handle, closure, file in waiting:
-            if self.file_info(file, handle, closure):
-                self.complete(handle, closure, True)
-
     def set_root(self, sync_dir):
         if sync_dir != self.root:
             self.root = sync_dir
+            # Files asks again about everything it was told about, the files seen before the root was known among them
+            # (#86): they got no emblem then
             self.forget_everything()
-        # However the root became known (its answer, or the change stream's hello), what waited for it is answered
-        self.answer_root_waiting()
 
     # Emblems
 
-    def file_info(self, file, handle, closure):
-        """True when done at once, False when the emblem comes later through complete()."""
+    def file_info(self, file):
+        """Answers Files at once: the emblem now if the folder's states are known, else later through add_emblem."""
         if file.get_uri_scheme() != "file":
-            return True
+            return
         path = file.get_location().get_path()
         if self.root is None:
-            self.ask_root()
-            if self.root_in_flight:
-                # Answered once the root is known (#86): answering "no emblem" now left it without one until a refresh
-                self.root_waiting.append((handle, closure, file))
-                return False
-            # Not being asked right now (the daemon isn't running, say): no emblem for now, without holding Files up;
-            # tracked, so that the root arriving refreshes it
+            # Tracked, so that the root arriving makes Files ask again (set_root)
             self.tracker.track(path, file)
-            return True
+            self.ask_root()
+            return
         rel = rel_to_root(self.root, path)
         if not rel or skipped(rel):
-            return True
+            return
         self.tracker.track(path, file)
         folder = os.path.dirname(path)
         entry = self.cache.get(folder, self.clock(), None if self.stream_up else STALE_WITHOUT_EVENTS)
         if entry is not None:
             self.apply(file, path, entry)
-            return True
+            return
         queue = self.waiting.get(folder)
         if queue is not None:
-            queue.append((handle, closure, file))
-            return False
-        self.waiting[folder] = [(handle, closure, file)]
+            queue[id(file)] = file
+            return
+        self.waiting[folder] = {id(file): file}
         self.fetch(folder)
-        return False
 
     def fetch(self, folder):
         generation = self.generation
         query = "/fm/states?path=" + urllib.parse.quote(folder, safe="/")
 
         def done(result, error):
-            queue = self.waiting.pop(folder, [])
+            files = list(self.waiting.pop(folder, {}).values())
             if error is not None or not isinstance(result, dict):
-                for handle, closure, _file in queue:
-                    self.complete(handle, closure, False)
                 if not _transient(error):
                     self.fetch_failures.pop(folder, None)  # an answer, like "not a folder in Proton Drive": not asked again
                     return
@@ -548,16 +527,14 @@ class ProtonDriveFiles:
                     self.fetch_failures.clear()  # folders left while the daemon was away: kept bounded
                 failures = self.fetch_failures.get(folder, 0) + 1
                 self.fetch_failures[folder] = failures
-                files = [file for _handle, _closure, file in queue]
                 self.later(lambda: [self.invalidate(file) for file in files], min(2 ** failures, 60))
                 return
             self.fetch_failures.pop(folder, None)
             entry = {"self": result.get("self"), "children": result.get("children") or {}}
             if generation == self.generation:
                 self.cache.put(folder, result, self.clock())
-            for handle, closure, file in queue:
+            for file in files:
                 self.apply(file, file.get_location().get_path(), entry)
-                self.complete(handle, closure, True)
 
         self.run(lambda: self.request("GET", query, None, STATES_READ_TIMEOUT), done)
 
@@ -568,11 +545,6 @@ class ProtonDriveFiles:
         emblem = emblem_for(entry["children"].get(os.path.basename(path)))
         if emblem:
             file.add_emblem(emblem)
-
-    def cancel(self, handle):
-        for queue in self.waiting.values():
-            queue[:] = [item for item in queue if item[0] is not handle]
-        self.root_waiting = [item for item in self.root_waiting if item[0] is not handle]
 
     def state_of(self, path):
         entry = self.cache.get(os.path.dirname(path), self.clock(), None if self.stream_up else STALE_WITHOUT_EVENTS)
@@ -781,8 +753,52 @@ def _later(fn, seconds):
     GLib.timeout_add_seconds(max(1, int(seconds)), call)
 
 
+class GilPump:
+    """Lets the extension's threads run (#131). nautilus-python starts Python with Py_InitializeFromConfig and never
+    lets go of the GIL, so while Files waits in its own main loop no Python thread runs at all: a request, the root's,
+    an action's, the change stream's reader, each moves on only while Files happens to call into Python, which made a
+    folder's emblems wait until it was opened again. This gives the GIL away briefly from the main loop: often while a
+    request is out (busy_ms), and now and then always (idle_ms), for the change stream."""
+
+    BUSY_MS = 10
+    IDLE_MS = 200
+    SLICE = 0.002  # seconds the threads get each time
+
+    def __init__(self, add_timeout, sleep=time.sleep):
+        self.add_timeout = add_timeout  # add_timeout(ms, fn): fn() on the main loop every ms while it returns True
+        self.sleep = sleep
+        self.busy = 0
+        self.fast = False
+        self.add_timeout(self.IDLE_MS, self.give)
+
+    def give(self):
+        self.sleep(self.SLICE)  # sleeping lets go of the GIL
+        return True
+
+    def begin(self):
+        self.busy += 1
+        if not self.fast:
+            self.fast = True
+            self.add_timeout(self.BUSY_MS, self._give_while_busy)
+
+    def end(self):
+        self.busy = max(0, self.busy - 1)
+
+    def _give_while_busy(self):
+        self.give()
+        if self.busy > 0:
+            return True
+        self.fast = False
+        return False
+
+
+_pump = None  # the GilPump, made with the extension
+
+
 def _run_in_thread(work, done):
     """work() on a worker thread, then done(result, error) on the main loop."""
+    if _pump is not None:
+        _pump.begin()
 
     def main():
         try:
@@ -791,10 +807,12 @@ def _run_in_thread(work, done):
             result, error = None, err
 
         def deliver():
+            if _pump is not None:
+                _pump.end()
             done(result, error)
             return False
 
-        GLib.idle_add(deliver)
+        GLib.idle_add(deliver, priority=GLib.PRIORITY_DEFAULT)
 
     threading.Thread(target=main, name="proton-drive-request", daemon=True).start()
 
@@ -808,7 +826,7 @@ def _on_main_loop(fn, *args):
         fn(*args)
         return False
 
-    GLib.idle_add(call)
+    GLib.idle_add(call, priority=GLib.PRIORITY_DEFAULT)
 
 
 class ProtonDriveNautilusExtension(
@@ -818,11 +836,13 @@ class ProtonDriveNautilusExtension(
 ):
     def __init__(self):
         super().__init__()
+        global _pump
+        if _pump is None:
+            _pump = GilPump(GLib.timeout_add)
         self.files = ProtonDriveFiles(
             request=_socket_request,
             run=_run_in_thread,
             notify=_notify,
-            complete=self._complete,
             later=_later,
         )
         self.files.ask_root()
@@ -833,17 +853,13 @@ class ProtonDriveNautilusExtension(
             daemon=True,
         ).start()
 
-    def _complete(self, handle, closure, ok):
-        result = Nautilus.OperationResult.COMPLETE if ok else Nautilus.OperationResult.FAILED
-        Nautilus.info_provider_update_complete_invoke(closure, self, handle, result)
-
     def update_file_info_full(self, provider, handle, closure, file):
-        if self.files.file_info(file, handle, closure):
-            return Nautilus.OperationResult.COMPLETE
-        return Nautilus.OperationResult.IN_PROGRESS
+        # Always done at once: an answer given later can't be matched to its request (#131, see ProtonDriveFiles)
+        self.files.file_info(file)
+        return Nautilus.OperationResult.COMPLETE
 
     def cancel_update(self, provider, handle):
-        self.files.cancel(handle)
+        pass  # nothing is ever in progress
 
     def get_file_items(self, *args):
         _neutralize_legacy_extension()
