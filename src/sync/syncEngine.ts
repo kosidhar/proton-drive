@@ -2486,7 +2486,41 @@ export class ProtonDriveSyncEngine {
                     void this.replayRemoteOps(); // A move into it may have been waiting for it
                 }
             } else if (st.isFile() && dbRecord) {
-                await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, dbRecord.nodeUid);
+                // The cloud may have moved on since the record: another device's edit that no event has brought yet, or
+                // one an event brought while this file was being written (#51 left it alone then). That is a conflict,
+                // decided as a sync pass decides it, never an upload over the newer version (#72); so is a conflict
+                // already waiting here. A node that can't be looked at leaves it to the upload, as before
+                const node = await this.sdk.getNode(dbRecord.nodeUid).catch(() => null);
+                if (!(await stat(fullPath).catch(() => null))?.isFile()) {
+                    return; // Gone while Proton Drive was asked (freed, deleted): the next look at it decides
+                }
+                const elsewhere =
+                    node !== null &&
+                    !node.trashTime &&
+                    (getName(node) !== path.posix.basename(relPath) ||
+                        (dbRecord.parentNodeUid !== null && node.parentUid !== dbRecord.parentNodeUid));
+                if (elsewhere) {
+                    return; // Moved in Proton Drive: the sync pass follows the move (#16), then compares; never an upload over it
+                }
+                const cloudMovedOn =
+                    node !== null &&
+                    !node.trashTime &&
+                    node.type === NodeType.File &&
+                    (dbRecord.syncStatus === 'conflict' ||
+                        cloudChangedSince(
+                            { sha1: dbRecord.remoteSha1, mtimeMs: dbRecord.remoteMtimeMs, size: dbRecord.size },
+                            {
+                                sha1: node.activeRevision?.claimedDigests?.sha1 ?? null,
+                                mtimeMs: (node.activeRevision?.claimedModificationTime ?? node.modificationTime).getTime(),
+                                size: getClaimedSize(node) ?? dbRecord.size,
+                            },
+                        ));
+                if (node && cloudMovedOn) {
+                    const localInfo = { isDirectory: false, size: st.size, mtimeMs: st.mtimeMs };
+                    await this.reconcileSinglePath(relPath, node, localInfo, dbRecord, remoteMap, this.stateDb.getSettings(), since);
+                } else {
+                    await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, dbRecord.nodeUid);
+                }
             } else if (st.isFile()) {
                 // No record: where Proton Drive has a file of that name, it is decided as a sync pass decides it (an
                 // edit of what the drive showed, with a baseline; the conflict handling otherwise), never by uploading

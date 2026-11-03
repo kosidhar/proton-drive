@@ -8677,4 +8677,90 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-both']);
         });
     });
+    describe('the watcher never uploads over a cloud version it has not seen (#72)', () => {
+        for (const layout of ['plain', 'virtual'] as const) {
+            const setup = async () => {
+                if (layout === 'virtual') stateDb.setMeta('driveLayout', 'virtual');
+                const d = makeMockDrive();
+                const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                    ...(layout === 'virtual' ? { backingDir: path.join(tempDir, 'files'), moveToDesktopTrash: async () => false } : {}),
+                    settle: { quietMs: 0 },
+                });
+                d.add('Kept.txt', 'kept');
+                d.add('a.txt', 'original');
+                engine.availability.setPin(d.root.uid, 'pinned', false);
+                await engine.reconcileNow();
+                d.calls.uploads.length = 0;
+                const local = (rel: string) => path.join(engine.localRoot(), rel);
+                // Another device's edit, which no event has told this one about yet
+                const cloudEdit = (content: string) =>
+                    d.nodes.set(
+                        d.uid('a.txt'),
+                        makeMockNode({ uid: d.uid('a.txt'), parentUid: d.root.uid, nameStr: 'a.txt', type: NodeType.File, content }),
+                    );
+                const watcherSees = (rel: string) => (engine as any).handleLocalFileChange(rel) as Promise<void>;
+                return { ...d, engine, local, cloudEdit, watcherSees };
+            };
+
+            test(`${layout}, keep-both: both versions are kept, and the cloud's stays at the file's name`, async () => {
+                stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+                const d = await setup();
+                d.cloudEdit('cloud edit');
+                await writeFile(d.local('a.txt'), 'local edit');
+                await d.watcherSees('a.txt');
+
+                expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('cloud edit');
+                expect(await readFile(d.local('a.txt'), 'utf8')).toBe('cloud edit');
+                const copies = (await readdir(d.engine.localRoot())).filter((n) => n.startsWith('a') && n !== 'a.txt');
+                expect(copies.length).toBe(1);
+                expect(await readFile(d.local(copies[0]), 'utf8')).toBe('local edit');
+                expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-both']);
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test(`${layout}, prompt: the conflict waits for the user, and neither side is touched`, async () => {
+                stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                const d = await setup();
+                d.cloudEdit('cloud edit');
+                await writeFile(d.local('a.txt'), 'local edit');
+                await d.watcherSees('a.txt');
+
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('cloud edit');
+                expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
+                expect(stateDb.listConflicts().map((c) => c.localRelPath)).toEqual(['a.txt']);
+                // Saved again while it waits: still nothing goes up
+                await writeFile(d.local('a.txt'), 'local edit 2');
+                await d.watcherSees('a.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('cloud edit');
+                expect(stateDb.listConflicts().length).toBe(1);
+            });
+
+            test(`${layout}: a file another device moved and edited is left to the sync pass, not uploaded over`, async () => {
+                stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+                const d = await setup();
+                const folder = d.add('Elsewhere');
+                d.nodes.set(
+                    d.uid('a.txt'),
+                    makeMockNode({ uid: d.uid('a.txt'), parentUid: folder.uid, nameStr: 'moved.txt', type: NodeType.File, content: 'cloud edit' }),
+                );
+                await writeFile(d.local('a.txt'), 'local edit');
+                await d.watcherSees('a.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.downloads.filter((p) => p !== 'Kept.txt' && p !== 'a.txt')).toEqual([]);
+                expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('cloud edit');
+                expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
+            });
+
+            test(`${layout}: an edit here with the cloud unchanged still uploads as a new revision, at once`, async () => {
+                const d = await setup();
+                await writeFile(d.local('a.txt'), 'local edit');
+                await d.watcherSees('a.txt');
+                expect(d.calls.uploads).toEqual(['a.txt']);
+                expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('local edit');
+                expect(stateDb.listConflicts(true)).toEqual([]);
+            });
+        }
+    });
 });
