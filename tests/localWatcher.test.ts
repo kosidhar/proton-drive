@@ -89,6 +89,33 @@ describe('LocalFolderWatcher', () => {
         expect(changes).toEqual([]);
     });
 
+    // #12: a deleted folder's own watcher reports it under its own name, which joined onto its path made P/P
+    test('deleting a watched folder reports the folder only, not a phantom path inside it', async () => {
+        await mkdir(path.join(root, 'P'));
+        await writeFile(path.join(root, 'P', 'a.txt'), 'a');
+        await start();
+
+        await rm(path.join(root, 'P'), { recursive: true });
+        expect(await waitFor(() => changes.includes('P'))).toBe(true);
+        await Bun.sleep(200); // past the debounce, for anything else to come
+        expect(changes).not.toContain('P/P');
+    });
+
+    // The sync folder's own report of itself going is what tells the engine at once that its files are missing (#45)
+    test('the sync folder itself moved away is still reported at once', async () => {
+        await start();
+        await rename(root, path.join(base, 'moved-away'));
+        expect(await waitFor(() => changes.length > 0)).toBe(true);
+    });
+
+    test('a real child named like its folder is still reported', async () => {
+        await mkdir(path.join(root, 'P'));
+        await start();
+
+        await writeFile(path.join(root, 'P', 'P'), 'same name as its folder');
+        expect(await waitFor(() => changes.includes('P/P'))).toBe(true);
+    });
+
     test('keeps watching a folder that is deleted and created again', async () => {
         await mkdir(path.join(root, 'Projects'));
         await start();
