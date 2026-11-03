@@ -38,6 +38,7 @@ import { APICodeError, APIHTTPError } from '@protontech/drive-sdk/internal/apiSe
 import { localFiles } from './helpers/localFiles';
 import { makeMockDrive } from './helpers/mockDrive';
 import { makeMockNode } from './helpers/mockNodes';
+import { uploadAtOnce } from './helpers/engineOptions';
 
 describe('Proton Drive Ubuntu Sync Suite', () => {
     let tempDir: string;
@@ -201,7 +202,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             mockEventsManager,
             { isLoggedIn: () => true },
             stateDb,
-            mockLogger,
+            mockLogger, uploadAtOnce,
         );
 
         // Only pinned items come to this computer; pinning the root brings everything
@@ -319,7 +320,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 },
             } as unknown as ProtonDriveClient;
             const logger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
-            const engine = new ProtonDriveSyncEngine(mockSdk, mockEventsManager, { isLoggedIn: () => true }, stateDb, logger);
+            const engine = new ProtonDriveSyncEngine(mockSdk, mockEventsManager, { isLoggedIn: () => true }, stateDb, logger, uploadAtOnce);
             return { engine, remoteNodes, rootNode, archive, fire: (e: DriveEvent) => eventCallback!('drive', e) };
         };
 
@@ -407,7 +408,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
     describe('availability', () => {
         const setup = () => {
             const drive = makeMockDrive();
-            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger);
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, uploadAtOnce);
             return { ...drive, engine, files: localFiles(stateDb) };
         };
         const local = (rel: string) => path.join(stateDb.getSettings().syncDir, rel);
@@ -798,7 +799,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
         const setup = () => {
             const drive = makeMockDrive();
-            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger);
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, uploadAtOnce);
             engines.push(engine);
             // Every listing and download, in order, by path ('' is the root)
             const log: string[] = [];
@@ -899,7 +900,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
     describe('availability actions', () => {
         const setup = () => {
             const drive = makeMockDrive();
-            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger);
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, uploadAtOnce);
             return { ...drive, engine, files: localFiles(stateDb) };
         };
         const local = (rel: string) => path.join(stateDb.getSettings().syncDir, rel);
@@ -1780,7 +1781,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
     describe('relocating the plain sync folder', () => {
         const setup = (loggedIn = true) => {
             const drive = makeMockDrive();
-            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => loggedIn }, stateDb, drive.logger);
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => loggedIn }, stateDb, drive.logger, uploadAtOnce);
             return { ...drive, engine, oldDir: stateDb.getSettings().syncDir, newDir: path.join(tempDir, 'Elsewhere') };
         };
 
@@ -1843,6 +1844,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             stateDb.setMeta('driveLayout', 'virtual');
             const drive = makeMockDrive();
             const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                ...uploadAtOnce,
                 backingDir,
             });
             const files = localFiles(stateDb, () => backingDir);
@@ -1872,6 +1874,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await writeFile(path.join(backingDir, 'a.txt'), 'a');
             const drive = makeMockDrive();
             const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                ...uploadAtOnce,
                 backingDir,
             });
             const target = path.join(tempDir, 'Elsewhere');
@@ -1893,6 +1896,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const drive = makeMockDrive();
             const backingDir = path.join(tempDir, 'files');
             const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                ...uploadAtOnce,
                 backingDir,
             });
             // Cloud listings, counted, and held up while `gate` is set
@@ -1990,6 +1994,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
                 // A fresh engine on the same database, as `protondrive sync` or `conflicts resolve` builds one
                 const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                    ...uploadAtOnce,
                     backingDir: path.join(tempDir, 'files'),
                 });
                 try {
@@ -2061,6 +2066,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             // A new engine on the same database and drive is what a restart of the daemon gives
             const restart = () =>
                 new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                    ...uploadAtOnce,
                     backingDir,
                     filesMissingCacheMs: opts.cacheMs ?? 0,
                 });
@@ -3080,6 +3086,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const backingDir = path.join(tempDir, 'files');
             const localRoot = layout === 'virtual' ? backingDir : stateDb.getSettings().syncDir;
             const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                ...uploadAtOnce,
                 backingDir,
             });
             return { ...drive, engine, localRoot, files: localFiles(stateDb, () => localRoot), local: (rel: string) => path.join(localRoot, rel) };
@@ -3200,6 +3207,316 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
     });
 
+    // #51: a copy that stalls longer than the watcher's debounce used to upload the half-written file as a new revision.
+    // A changed file now uploads only once it has stayed as it is for a while (longer each time it is seen growing).
+    describe('a file still being written (#51)', () => {
+        for (const layout of ['plain', 'virtual'] as const) {
+            describe(`in the ${layout} layout`, () => {
+                // The engine's settle clock runs ahead of the real one by what advance() adds; the looks it schedules run
+                // when advance() reaches them
+                // quietMs: the wait (2 s by default here)
+                const setup = (opts: { quietMs?: number } = {}) => {
+                    const backingDir = path.join(tempDir, 'files');
+                    if (layout === 'virtual') {
+                        stateDb.setMeta('driveLayout', 'virtual');
+                    }
+                    const drive = makeMockDrive();
+                    let offset = 0;
+                    const now = () => Date.now() + offset;
+                    let looks: Array<{ at: number; run: () => Promise<void> }> = [];
+                    const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                        ...(layout === 'virtual' ? { backingDir, moveToDesktopTrash: async () => false } : {}),
+                        settle: {
+                            quietMs: opts.quietMs ?? 2000,
+                            maxQuietMs: 16_000,
+                            maxWaitMs: 120_000,
+                            now,
+                            schedule: (run, delayMs) => {
+                                const look = { at: now() + delayMs, run };
+                                looks.push(look);
+                                return () => {
+                                    looks = looks.filter((l) => l !== look);
+                                };
+                            },
+                        },
+                    });
+                    const advance = async (ms: number) => {
+                        offset += ms;
+                        const due = looks.filter((l) => l.at <= now());
+                        looks = looks.filter((l) => !due.includes(l));
+                        await Promise.all(due.map((l) => l.run()));
+                    };
+                    const files = localFiles(stateDb, () => engine.localRoot());
+                    const local = (rel: string) => path.join(engine.localRoot(), rel);
+                    const changed = (rel: string) => (engine as any).handleLocalFileChange(rel) as Promise<void>;
+                    return { ...drive, engine, advance, files, local, changed, pendingLooks: () => looks.length };
+                };
+                // Something on Proton Drive already, so that the folder never reads as missing its files (#45)
+                const started = async (opts: { quietMs?: number } = {}) => {
+                    const d = setup(opts);
+                    d.add('Kept.txt', 'kept');
+                    d.engine.availability.setPin(d.root.uid, 'pinned', false);
+                    await d.engine.reconcileNow();
+                    d.calls.uploads.length = 0;
+                    return d;
+                };
+
+                test('a file that grows across several looks uploads once, when it is complete', async () => {
+                    const d = await started();
+                    await d.files.writeLocal('big.bin', 'part 1;');
+                    await d.changed('big.bin'); // the watcher, once the copy stalls
+                    expect(d.calls.uploads).toEqual([]);
+
+                    await d.advance(1000);
+                    appendFileSync(d.local('big.bin'), ' part 2;');
+                    await d.changed('big.bin');
+                    await d.engine.reconcileNow(); // a pass meanwhile leaves it alone too
+                    expect(d.calls.uploads).toEqual([]);
+
+                    await d.advance(3000); // stalled again, longer than the first wait
+                    appendFileSync(d.local('big.bin'), ' part 3.');
+                    await d.changed('big.bin');
+                    await d.advance(4000);
+                    expect(d.calls.uploads).toEqual([]); // seen growing twice: it waits longer each time
+
+                    await d.advance(8000);
+                    expect(d.calls.uploads).toEqual(['big.bin']);
+                    expect([...d.nodes.values()].find((n) => n.parentUid === d.root.uid && d.nameOf(n) === 'big.bin')?.content).toBe(
+                        'part 1; part 2; part 3.',
+                    );
+                    await d.engine.reconcileNow();
+                    expect(d.calls.uploads).toEqual(['big.bin']);
+                    expect(d.pendingLooks()).toBe(0);
+                });
+
+                test('a file saved in one go uploads once, a couple of seconds after the save', async () => {
+                    const d = await started();
+                    await d.files.writeLocal('note.txt', 'saved');
+                    await d.changed('note.txt');
+                    expect(d.calls.uploads).toEqual([]);
+
+                    await d.advance(2000);
+                    expect(d.calls.uploads).toEqual(['note.txt']);
+                    await d.changed('note.txt'); // a late watcher report changes nothing
+                    await d.engine.reconcileNow();
+                    expect(d.calls.uploads).toEqual(['note.txt']);
+                });
+
+                const cloudNamed = (d: ReturnType<typeof setup>, name: string) =>
+                    [...d.nodes.values()].filter((n) => n.parentUid === d.root.uid && d.nameOf(n) === name);
+                const conflictCopies = (d: ReturnType<typeof setup>) =>
+                    [...d.nodes.values()].filter((n) => n.parentUid === d.root.uid && d.nameOf(n).includes(' (conflict '));
+
+                test('a new file where Proton Drive has another of that name meets the conflict handling once it settles', async () => {
+                    const d = await started();
+                    d.add('doc.txt', 'theirs'); // since the last listing: the root is pinned, and it would come down
+                    await d.files.writeLocal('doc.txt', 'mine');
+                    await d.changed('doc.txt');
+                    await d.engine.reconcileNow();
+                    expect(conflictCopies(d)).toEqual([]);
+
+                    await d.advance(2000);
+                    expect(conflictCopies(d).map((n) => n.content)).toEqual(['mine']);
+                    expect(cloudNamed(d, 'doc.txt')[0]?.content).toBe('theirs');
+                    expect(d.pendingLooks()).toBe(0);
+                });
+
+                // cp -a or rsync of files whose times are ahead (a camera's SD card, say): its own mtime never says it
+                // settled, and the look that settles it must not schedule another
+                test('a file with an mtime in the future settles, meets the conflict handling, and is not looked at again', async () => {
+                    stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                    const d = await started();
+                    d.add('extra.txt', 'theirs'); // since the last listing
+                    await d.files.writeLocal('extra.txt', 'mine');
+                    const tomorrow = new Date(Date.now() + 24 * 60 * 60_000);
+                    await utimes(d.local('extra.txt'), tomorrow, tomorrow);
+                    await d.changed('extra.txt');
+
+                    await d.advance(2000);
+                    expect(stateDb.listConflicts().map((c) => c.localRelPath)).toEqual(['extra.txt']);
+                    expect(d.pendingLooks()).toBe(0);
+                    await d.engine.reconcileNow(); // a pass after: settled already, by its ctime
+                    expect(d.pendingLooks()).toBe(0);
+                    expect(d.calls.uploads).toEqual([]);
+                });
+
+                test('a file deleted while it waits uploads nothing, and is not looked at again', async () => {
+                    const d = await started();
+                    await d.files.writeLocal('gone.txt', 'half');
+                    await d.changed('gone.txt');
+                    await rm(d.local('gone.txt'));
+                    await d.changed('gone.txt');
+                    expect(d.pendingLooks()).toBe(0);
+
+                    await d.advance(20_000);
+                    expect(d.calls.uploads).toEqual([]);
+                    expect(d.calls.trashed).toEqual([]);
+                });
+
+                test('a file renamed while it waits uploads once, under its new name', async () => {
+                    const d = await started();
+                    await d.files.writeLocal('draft.txt', 'text');
+                    await d.changed('draft.txt');
+                    await rename(d.local('draft.txt'), d.local('final.txt'));
+                    await d.changed('draft.txt');
+                    await d.changed('final.txt');
+
+                    await d.advance(2000);
+                    expect(d.calls.uploads).toEqual(['final.txt']);
+                    await d.engine.reconcileNow();
+                    expect(d.calls.uploads).toEqual(['final.txt']);
+                    expect(d.pendingLooks()).toBe(0);
+                });
+
+                test('after a restart, a file last changed longer ago than the wait uploads at the first look', async () => {
+                    const d = await started({ quietMs: 50 });
+                    await d.files.writeLocal('old.txt', 'written while the daemon was down');
+                    await Bun.sleep(80); // by the system clock, as file times are; the settle clock is not moved
+
+                    await d.engine.reconcileNow();
+                    expect(d.calls.uploads).toEqual(['old.txt']);
+                    expect(d.pendingLooks()).toBe(0);
+                });
+
+                test('stop() calls off the looks, and waitForRunningLooks waits for one already running', async () => {
+                    const d = await started();
+                    await d.files.writeLocal('a.txt', 'a');
+                    await d.changed('a.txt');
+                    expect(d.pendingLooks()).toBe(1);
+                    await d.engine.stop();
+                    expect(d.pendingLooks()).toBe(0);
+
+                    // A look whose upload is held: waitForRunningLooks returns only once it is done, or at its timeout
+                    await d.engine.start({ backgroundInitialReconcile: false });
+                    await d.files.writeLocal('b.txt', 'b');
+                    await d.changed('b.txt');
+                    const sdk = d.sdk as any;
+                    const real = sdk.getFileUploader.bind(sdk);
+                    let release!: () => void;
+                    const held = new Promise<void>((resolve) => (release = resolve));
+                    sdk.getFileUploader = async (...args: unknown[]) => {
+                        await held;
+                        return real(...args);
+                    };
+                    const looking = d.advance(2000);
+                    await Bun.sleep(20);
+                    await d.engine.stop(); // never waits for it (holdForMove does, within its timeout)
+                    expect(await d.engine.waitForRunningLooks(20)).toBe(false);
+                    let done = false;
+                    const waiting = d.engine.waitForRunningLooks().then(() => (done = true));
+                    await Bun.sleep(20);
+                    expect(done).toBe(false);
+                    release();
+                    await Promise.all([looking, waiting]);
+                    expect(done).toBe(true);
+                    expect(d.calls.uploads).toContain('b.txt');
+                });
+
+                test('holdForMove still gives up after its timeout while a look is uploading', async () => {
+                    const d = await started();
+                    await d.files.writeLocal('big.bin', 'big');
+                    await d.changed('big.bin');
+                    const sdk = d.sdk as any;
+                    const real = sdk.getFileUploader.bind(sdk);
+                    let release!: () => void;
+                    const held = new Promise<void>((resolve) => (release = resolve));
+                    sdk.getFileUploader = async (...args: unknown[]) => {
+                        await held;
+                        return real(...args);
+                    };
+                    const looking = d.advance(2000);
+                    await Bun.sleep(20);
+
+                    const outcome = await Promise.race([
+                        d.engine.holdForMove({ timeoutMs: 200 }).then(
+                            () => 'held',
+                            (e: Error) => e.message,
+                        ),
+                        Bun.sleep(1500).then(() => 'still waiting'),
+                    ]);
+                    expect(outcome).toBe('Proton Drive is still busy syncing; try again in a moment');
+                    release();
+                    await looking;
+                    expect(d.calls.uploads).toEqual(['big.bin']);
+                });
+
+                test('waitForSettling (a one-off sync) waits for a file being written to upload, and says how many still wait', async () => {
+                    const drive = makeMockDrive();
+                    drive.add('Kept.txt', 'kept');
+                    const backingDir = path.join(tempDir, 'files');
+                    if (layout === 'virtual') {
+                        stateDb.setMeta('driveLayout', 'virtual');
+                    }
+                    const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                        ...(layout === 'virtual' ? { backingDir, moveToDesktopTrash: async () => false } : {}),
+                        settle: { quietMs: 100 }, // real timers
+                    });
+                    engine.availability.setPin(drive.root.uid, 'pinned', false);
+                    await engine.reconcileNow();
+                    await localFiles(stateDb, () => engine.localRoot()).writeLocal('new.txt', 'new');
+                    await engine.reconcileNow();
+                    expect(drive.calls.uploads).toEqual([]);
+
+                    expect(await engine.waitForSettling(5000)).toBe(0);
+                    expect(drive.calls.uploads).toEqual(['new.txt']);
+
+                    // One that keeps changing outlasts a short wait: it is counted, and stop() calls its look off
+                    appendFileSync(path.join(engine.localRoot(), 'new.txt'), ' more');
+                    await (engine as any).handleLocalFileChange('new.txt');
+                    expect(await engine.waitForSettling(10)).toBe(1);
+                    await engine.stop();
+                    expect(drive.calls.uploads).toEqual(['new.txt']);
+                });
+
+                test('a file that never stops changing still uploads after 2 minutes, and then at most every 2 minutes', async () => {
+                    const d = await started();
+                    await d.files.writeLocal('log.txt', 'line 0\n');
+                    await d.changed('log.txt');
+                    for (let second = 1; second <= 119; second++) {
+                        await d.advance(1000);
+                        appendFileSync(d.local('log.txt'), `line ${second}\n`);
+                        await d.changed('log.txt');
+                    }
+                    expect(d.calls.uploads).toEqual([]);
+                    await d.advance(1000);
+                    appendFileSync(d.local('log.txt'), 'line 120\n');
+                    await d.changed('log.txt');
+                    expect(d.calls.uploads).toEqual(['log.txt']);
+
+                    for (let second = 121; second <= 230; second++) {
+                        await d.advance(1000);
+                        appendFileSync(d.local('log.txt'), `line ${second}\n`);
+                        await d.changed('log.txt');
+                    }
+                    expect(d.calls.uploads).toEqual(['log.txt']); // not again within 2 minutes
+                    for (let second = 231; second <= 245; second++) {
+                        await d.advance(1000);
+                        appendFileSync(d.local('log.txt'), `line ${second}\n`);
+                        await d.changed('log.txt');
+                    }
+                    expect(d.calls.uploads).toEqual(['log.txt', 'log.txt']);
+                });
+
+                test('an edit of a synced file waits the same way, and a file not changed since its sync never waits', async () => {
+                    const d = await started();
+                    expect(d.pendingLooks()).toBe(0); // Kept.txt, just downloaded, is as its record says
+                    await d.files.writeLocal('Kept.txt', 'kept, half');
+                    await d.engine.reconcileNow();
+                    expect(d.calls.uploads).toEqual([]);
+                    appendFileSync(d.local('Kept.txt'), ' and the rest');
+                    await d.changed('Kept.txt');
+                    expect(d.calls.uploads).toEqual([]);
+
+                    await d.advance(4000);
+                    expect(d.calls.uploads).toEqual(['Kept.txt']);
+                    expect(d.nodes.get(d.uid('Kept.txt'))?.content).toBe('kept, half and the rest');
+                    await d.engine.reconcileNow();
+                    expect(d.pendingLooks()).toBe(0);
+                });
+            });
+        }
+    });
+
     // Projects is deleted or trashed in the cloud (on the web, or on another device) while this computer holds things
     // in it that exist nowhere else: they must survive, in the desktop Trash or where they are (issue #16)
     describe('cloud-side deletes', () => {
@@ -3225,6 +3542,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 return true;
             };
             const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                ...uploadAtOnce,
                 backingDir: path.join(tempDir, 'files'),
                 moveToDesktopTrash,
             });
@@ -3507,6 +3825,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const trashDir = path.join(tempDir, 'Trash');
             const handedToTrash: string[] = [];
             const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                ...uploadAtOnce,
                 backingDir: path.join(tempDir, 'files'),
                 moveToDesktopTrash: async (fullPath: string) => {
                     handedToTrash.push(fullPath);
@@ -3880,6 +4199,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             }
             const drive = makeMockDrive();
             const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                ...uploadAtOnce,
                 backingDir: path.join(tempDir, 'files'),
                 moveToDesktopTrash: async () => false,
             });
@@ -4284,6 +4604,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             }
             const drive = makeMockDrive();
             const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                ...uploadAtOnce,
                 backingDir: path.join(tempDir, 'files'),
                 moveToDesktopTrash: async () => false,
             });
@@ -4484,6 +4805,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             // A new engine on the same database and drive is what a restart of the daemon gives
             const start = () =>
                 new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                    ...uploadAtOnce,
                     backingDir,
                     moveToDesktopTrash: async (fullPath: string) => {
                         handedToTrash.push(fullPath);
@@ -5659,6 +5981,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             // A new engine on the same database and drive is what a restart of the daemon gives
             const start = () =>
                 new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                    ...uploadAtOnce,
                     backingDir,
                     moveToDesktopTrash: async () => false,
                     forgetFailedThumbnail: async (mountFullPath: string) => {
@@ -5863,6 +6186,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 let answer!: (choice: string | null) => void;
                 const d = setup();
                 const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                    ...uploadAtOnce,
                     backingDir: path.join(tempDir, 'files'),
                     moveToDesktopTrash: async () => false,
                     askWithActions: (n) => {
@@ -5899,6 +6223,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 const d = setup();
                 let asked = 0;
                 const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                    ...uploadAtOnce,
                     backingDir: path.join(tempDir, 'files'),
                     moveToDesktopTrash: async () => false,
                     askWithActions: async () => {
@@ -6772,7 +7097,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
             test('in the plain layout, where the online-only file never showed, a file of that name stays a conflict', async () => {
                 const drive = makeMockDrive();
-                const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger);
+                const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, uploadAtOnce);
                 const files = localFiles(stateDb);
                 drive.add('Docs/doc.txt', 'old');
                 await engine.reconcileNow();
@@ -6891,7 +7216,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
             test('in the plain layout too', async () => {
                 const drive = makeMockDrive();
-                const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger);
+                const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, uploadAtOnce);
                 const files = localFiles(stateDb);
                 drive.add('Docs/doc.txt', 'old');
                 await engine.reconcileNow();
@@ -6957,7 +7282,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
             test("found by a pass's upload in the plain layout too", async () => {
                 const drive = makeMockDrive();
-                const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger);
+                const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, uploadAtOnce);
                 const files = localFiles(stateDb);
                 drive.add('Docs/keep.txt', 'k');
                 await engine.reconcileNow();
@@ -7142,6 +7467,204 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             }
         });
 
+        // #29: a local file and another device's different cloud file at one path, not resolved yet. The drive shows the
+        // local file (what the user has), and a delete through it removes that, never the other device's file.
+        describe('a path in an unresolved collision (#29)', () => {
+            const docEntry = (d: ReturnType<typeof setup>) => d.engine.vfsChildren('Docs').find((e) => e.name === 'doc.txt');
+            // Another device's 'theirs' (6 bytes) in the cloud, and 'mine' (4 bytes) made here, never uploaded
+            const collided = async (strategy: 'keep-both' | 'prompt') => {
+                stateDb.updateSettings({ conflictStrategy: strategy });
+                const d = setup();
+                d.add('Docs/doc.txt', 'theirs');
+                await d.engine.reconcileNow();
+                await d.files.writeLocal('Docs/doc.txt', 'mine');
+                return d;
+            };
+            const expectCloudFileKept = async (d: ReturnType<typeof setup>) => {
+                await d.engine.replayRemoteOps();
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                expect(await d.files.exists('Docs/doc.txt')).toBe(false);
+                await d.engine.reconcileNow();
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.calls.uploads).not.toContain('Docs/doc.txt');
+                // Back to what the cloud has, online-only
+                expect(docEntry(d)?.size).toBe(6);
+            };
+
+            test('waiting for the conflict handling, the drive lists the local file, and a delete trashes nothing', async () => {
+                const d = await collided('keep-both');
+                const st = await stat(d.local('Docs/doc.txt'));
+
+                expect(docEntry(d)).toEqual({ name: 'doc.txt', type: 'file', size: 4, mtimeMs: st.mtimeMs });
+                await d.engine.deleteItem('Docs/doc.txt');
+
+                await expectCloudFileKept(d);
+            });
+
+            test('queued for the user (prompt), the same, and the conflict is over once its local file is deleted', async () => {
+                const d = await collided('prompt');
+                await (d.engine as any).handleLocalFileChange('Docs/doc.txt');
+                expect(stateDb.listConflicts().map((c) => c.localRelPath)).toEqual(['Docs/doc.txt']);
+
+                expect(docEntry(d)?.size).toBe(4);
+                await d.engine.deleteItem('Docs/doc.txt');
+
+                await expectCloudFileKept(d);
+                expect(stateDb.listConflicts()).toEqual([]);
+            });
+
+            test('a recorded file changed on both sides and queued for the user: a delete leaves the cloud revision', async () => {
+                stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                await d.engine.reconcileNow();
+                await d.engine.setAvailability('Docs/doc.txt', 'pin');
+                expect(stateDb.getItemByPath('Docs/doc.txt')).not.toBeNull();
+                // Another device's revision (later, 6 bytes), and this computer's edit (4 bytes)
+                const node = d.nodes.get('vol~Docs/doc.txt')!;
+                const later = new Date(node.modificationTime.getTime() + 60_000);
+                const changed = makeMockNode({ uid: node.uid, parentUid: node.parentUid, nameStr: 'doc.txt', type: NodeType.File, content: 'theirs', modificationTime: later });
+                d.nodes.set(node.uid, { ...changed, activeRevision: { ...changed.activeRevision!, claimedModificationTime: later } });
+                await d.files.writeLocal('Docs/doc.txt', 'mine');
+                await d.engine.reconcileNow();
+                expect(stateDb.listConflicts().map((c) => c.localRelPath)).toEqual(['Docs/doc.txt']);
+
+                expect(docEntry(d)?.size).toBe(4);
+                await d.engine.deleteItem('Docs/doc.txt');
+                expect(stateDb.getItemByPath('Docs/doc.txt')).toBeNull();
+                expect(stateDb.listConflicts()).toEqual([]);
+
+                await expectCloudFileKept(d);
+                // Still pinned: the other device's version comes down in its place
+                expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
+            });
+
+            test('a local file with the very content of the cloud file, not recorded yet, is that file: a delete trashes it', async () => {
+                const d = setup();
+                d.add('Docs/doc.txt', 'theirs');
+                await d.engine.reconcileNow();
+                await d.files.writeLocal('Docs/doc.txt', 'theirs');
+
+                await d.engine.deleteItem('Docs/doc.txt');
+                await d.engine.replayRemoteOps();
+
+                expect(d.calls.trashed).toEqual([['vol~Docs/doc.txt']]);
+            });
+
+            test('one whose cloud file claims no SHA1 can not be told apart: a delete keeps the cloud file', async () => {
+                const d = setup();
+                const node = d.add('Docs/doc.txt', 'theirs');
+                d.nodes.set(node.uid, { ...node, activeRevision: { ...node.activeRevision!, claimedDigests: undefined } } as any);
+                await d.engine.reconcileNow();
+                await d.files.writeLocal('Docs/doc.txt', 'theirs');
+
+                await d.engine.deleteItem('Docs/doc.txt');
+
+                await expectCloudFileKept(d);
+            });
+
+            // Docs holds the collision, another file and a folder, all in Proton Drive
+            const collidedInFolder = async () => {
+                stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+                const d = setup();
+                d.add('Docs/doc.txt', 'theirs');
+                d.add('Docs/other.txt', 'o');
+                d.add('Docs/Sub/x.txt', 'x');
+                await d.engine.reconcileNow();
+                await d.files.writeLocal('Docs/doc.txt', 'mine');
+                return d;
+            };
+            const driveRoute = async (d: ReturnType<typeof setup>, route: string, body: object) => {
+                const socketPath = path.join(tempDir, 'sock', 'control.sock');
+                const server = await startControlServer({ socketPath, engine: d.engine });
+                try {
+                    const res = await fetch(`http://localhost${route}`, { unix: socketPath, method: 'POST', body: JSON.stringify(body) } as RequestInit);
+                    return { status: res.status, body: await res.json() };
+                } finally {
+                    await server.stop();
+                }
+            };
+
+            for (const trash of [false, true]) {
+                test(`a folder ${trash ? 'moved to the Trash' : 'deleted'} through the drive trashes what else is in it, never the colliding cloud file`, async () => {
+                    const d = await collidedInFolder();
+
+                    expect(await driveRoute(d, '/vfs/delete', { path: 'Docs', trash })).toEqual({ status: 200, body: { ok: true } });
+                    await d.engine.replayRemoteOps();
+
+                    expect(d.calls.trashed.flat().sort()).toEqual(['vol~Docs/Sub', 'vol~Docs/other.txt']);
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                    expect(d.nodes.get('vol~Docs')).toBeDefined();
+                    expect(d.engine.remoteIndex.getByPath('Docs/other.txt')).toBeNull();
+                    expect(d.engine.vfsChildren('').map((e) => e.name)).toEqual(['Docs']);
+                    expect(d.engine.vfsChildren('Docs').map((e) => e.name)).toEqual(['doc.txt']);
+                    await d.engine.reconcileNow();
+                    expect(d.calls.trashed.flat().sort()).toEqual(['vol~Docs/Sub', 'vol~Docs/other.txt']);
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                });
+            }
+
+            test("an editor's save over a colliding file is no new revision of the cloud file: the conflict handling decides", async () => {
+                const d = await collided('keep-both');
+                await d.files.writeLocal('Docs/doc.txt.new', 'mine, saved again');
+
+                await d.engine.renameItem('Docs/doc.txt.new', 'Docs/doc.txt');
+                await d.engine.replayRemoteOps();
+                await (d.engine as any).handleLocalFileChange('Docs/doc.txt');
+                await d.engine.reconcileNow();
+
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                const copies = [...d.nodes.values()].filter((n) => n.parentUid === 'vol~Docs' && d.nameOf(n).includes(' (conflict '));
+                expect(copies.map((n) => n.content)).toEqual(['mine, saved again']);
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test('renaming a colliding file moves only the local file: the cloud file keeps its name', async () => {
+                const d = await collided('keep-both');
+
+                await d.engine.renameItem('Docs/doc.txt', 'Docs/mine.txt');
+                await d.engine.replayRemoteOps();
+
+                expect(d.calls.renamed).toEqual([]);
+                expect(d.nameOf(d.nodes.get('vol~Docs/doc.txt')!)).toBe('doc.txt');
+                expect(await readFile(d.local('Docs/mine.txt'), 'utf8')).toBe('mine');
+                expect(docEntry(d)?.size).toBe(6);
+                await d.engine.reconcileNow();
+                expect(d.calls.uploads).toEqual(['Docs/mine.txt']);
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test('renaming a file in a conflict queued for the user moves only the local file, and ends that conflict', async () => {
+                stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                const d = await collided('prompt');
+                await (d.engine as any).handleLocalFileChange('Docs/doc.txt');
+                expect(stateDb.listConflicts().map((c) => c.localRelPath)).toEqual(['Docs/doc.txt']);
+
+                await d.engine.renameItem('Docs/doc.txt', 'Docs/mine.txt');
+                await d.engine.replayRemoteOps();
+
+                expect(d.calls.renamed).toEqual([]);
+                expect(stateDb.listConflicts()).toEqual([]);
+                await d.engine.reconcileNow();
+                expect(d.calls.uploads).toEqual(['Docs/mine.txt']);
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+            });
+
+            test('a file synced as usual still goes to the Proton Drive trash when deleted through the drive', async () => {
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                await d.engine.reconcileNow();
+                await d.engine.setAvailability('Docs/doc.txt', 'pin');
+
+                await d.engine.deleteItem('Docs/doc.txt');
+                await d.engine.replayRemoteOps();
+
+                expect(d.calls.trashed).toEqual([['vol~Docs/doc.txt']]);
+            });
+        });
+
         // S22: Move to Trash through the drive keeps what exists only on this computer, as a cloud delete does (#16)
         describe('a delete through the drive that is a Move to Trash', () => {
             const withDesktopTrash = () => {
@@ -7158,6 +7681,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     return true;
                 };
                 const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                    ...uploadAtOnce,
                     backingDir,
                     moveToDesktopTrash,
                 });
@@ -7702,6 +8226,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const drive = makeMockDrive();
             let due: (() => void) | null = null;
             const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                ...uploadAtOnce,
                 ...(opts.virtual ? { backingDir: path.join(tempDir, 'files'), moveToDesktopTrash: async () => false } : {}),
                 stateEventSchedule: (run) => {
                     due = run;
@@ -7788,7 +8313,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
     describe('itemStates', () => {
         const setup = () => {
             const drive = makeMockDrive();
-            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger);
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, uploadAtOnce);
             return { ...drive, engine, files: localFiles(stateDb) };
         };
         const record = (relPath: string, syncStatus: 'synced' | 'uploading' | 'error' = 'synced') =>

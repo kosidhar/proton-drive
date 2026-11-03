@@ -24,6 +24,9 @@ import { isTrustedLocalRequest } from './requestGuard';
 import { refuseOnTcp } from './tcpRefusals';
 import { findHelper, fuseAvailable, mergeStrayInto, VfsSupervisor } from './vfsSupervisor';
 
+// How long the shutdown waits for a look at a file just written that is uploading it (see waitForRunningLooks)
+const SHUTDOWN_LOOK_WAIT_MS = 5000;
+
 export const DEFAULT_DAEMON_PORT = Number(process.env.PROTON_DRIVE_DAEMON_PORT || 49152);
 export const DEFAULT_DAEMON_HOST = '127.0.0.1';
 
@@ -334,6 +337,10 @@ export async function startSyncDaemon(options: {
         server.stop();
         controlServer?.stop();
         await engine.stop();
+        // A file being uploaded once written gets a few seconds to finish; the shutdown never waits longer
+        if (!(await engine.waitForRunningLooks(SHUTDOWN_LOOK_WAIT_MS))) {
+            runtime.logger.warn('Shutting down with an upload of a file still under way; it uploads again at the next start');
+        }
         stateDb.close();
         await runtime.dispose();
     };
