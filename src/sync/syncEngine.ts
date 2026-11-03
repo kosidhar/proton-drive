@@ -1937,7 +1937,6 @@ export class ProtonDriveSyncEngine {
         const entries = this.index.listSubtree(relPath);
         const syncedUid = new Map(this.stateDb.getItemsUnder(relPath).map((item) => [item.localRelPath, item.nodeUid]));
         const hidden = this.policy.hiddenWithin(relPath);
-        const isWithin = (p: string, dir: string) => p === dir || p.startsWith(`${dir}/`);
         // Everything that never was on this computer, with every folder above it up to the deleted one
         const holdsCloudOnly = new Set<string>();
         const markWithAncestors = (from: string) => {
