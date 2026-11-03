@@ -439,6 +439,7 @@ class ProtonDriveFiles:
         self.root = None
         self.root_asked_at = None
         self.root_waiting = []  # [(handle, closure, file)] asked about before the root was known
+        self.root_in_flight = False
         self.root_retry_due = False
         self.fetch_failures = {}  # folder -> how many fetches of its states failed in a row
         self.stream_up = False
@@ -455,11 +456,12 @@ class ProtonDriveFiles:
         if self.root_asked_at is not None and now - self.root_asked_at < ROOT_RETRY:
             return
         self.root_asked_at = now
+        self.root_in_flight = True
 
         def done(result, error):
+            self.root_in_flight = False
             if error is None and isinstance(result, dict) and isinstance(result.get("syncDir"), str):
                 self.set_root(result["syncDir"])
-                self.answer_root_waiting()
                 return
             # Not known yet (the daemon starting, say): what waited gets no emblem for now, but is tracked, so that the
             # root arriving later refreshes it (forget_everything); and the root is asked for again
@@ -488,10 +490,11 @@ class ProtonDriveFiles:
                 self.complete(handle, closure, True)
 
     def set_root(self, sync_dir):
-        if sync_dir == self.root:
-            return
-        self.root = sync_dir
-        self.forget_everything()
+        if sync_dir != self.root:
+            self.root = sync_dir
+            self.forget_everything()
+        # However the root became known (its answer, or the change stream's hello), what waited for it is answered
+        self.answer_root_waiting()
 
     # Emblems
 
@@ -501,10 +504,15 @@ class ProtonDriveFiles:
             return True
         path = file.get_location().get_path()
         if self.root is None:
-            # Answered once the root is known (#86): answering "no emblem" now left it without one until a refresh
-            self.root_waiting.append((handle, closure, file))
             self.ask_root()
-            return False
+            if self.root_in_flight:
+                # Answered once the root is known (#86): answering "no emblem" now left it without one until a refresh
+                self.root_waiting.append((handle, closure, file))
+                return False
+            # Not being asked right now (the daemon isn't running, say): no emblem for now, without holding Files up;
+            # tracked, so that the root arriving refreshes it
+            self.tracker.track(path, file)
+            return True
         rel = rel_to_root(self.root, path)
         if not rel or skipped(rel):
             return True
@@ -531,8 +539,13 @@ class ProtonDriveFiles:
             if error is not None or not isinstance(result, dict):
                 for handle, closure, _file in queue:
                     self.complete(handle, closure, False)
+                if not _transient(error):
+                    self.fetch_failures.pop(folder, None)  # an answer, like "not a folder in Proton Drive": not asked again
+                    return
                 # Asked again a little later, waiting longer after each failure in a row: the files are invalidated, so
                 # Files asks about them again (#86)
+                if len(self.fetch_failures) > 256:
+                    self.fetch_failures.clear()  # folders left while the daemon was away: kept bounded
                 failures = self.fetch_failures.get(folder, 0) + 1
                 self.fetch_failures[folder] = failures
                 files = [file for _handle, _closure, file in queue]
@@ -660,6 +673,7 @@ class ProtonDriveFiles:
     def forget_everything(self):
         self.generation += 1
         self.cache.clear()
+        self.fetch_failures.clear()
         for file in self.tracker.all():
             self.invalidate(file)
         self.tracker.clear()
@@ -747,6 +761,14 @@ def _launch_native_gui():
             return
         except OSError:
             continue
+
+
+def _transient(error):
+    """Whether a failed request may well work if asked again: the daemon not reachable or not answering in time."""
+    if error is None or not isinstance(error, ControlError):
+        return True  # no error but no answer either, or something unexpected
+    text = str(error)
+    return text.startswith("Can't reach") or text.startswith("Proton Drive is still working")
 
 
 def _later(fn, seconds):
