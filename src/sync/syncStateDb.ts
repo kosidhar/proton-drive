@@ -572,6 +572,53 @@ export class SyncStateDatabase {
         })();
     }
 
+    // A conflict a strategy has just resolved. The one waiting at the path for the user, if any (queued under the
+    // prompt strategy before it changed: #68), is this one: it is resolved, as the conflict now stands, rather than left
+    // waiting beside a new row. With none waiting, it is recorded as a new, resolved one.
+    settleConflict(conflict: Omit<NewConflict, 'resolved'> & { resolution: string }): ConflictRecord {
+        return this.db.transaction(() => {
+            const waiting = this.db
+                .query('SELECT id FROM conflicts WHERE localRelPath = $localRelPath AND resolved = 0')
+                .get({ $localRelPath: conflict.localRelPath }) as { id: number } | null;
+            if (!waiting) {
+                return this.insertConflict({ ...conflict, resolved: true });
+            }
+            this.db
+                .query(`
+                    UPDATE conflicts
+                    SET nodeUid = $nodeUid, localSha1 = $localSha1, remoteSha1 = $remoteSha1,
+                        localMtimeMs = $localMtimeMs, remoteMtimeMs = $remoteMtimeMs, resolved = 1,
+                        resolution = $resolution, conflictCopyPath = COALESCE($conflictCopyPath, conflictCopyPath)
+                    WHERE id = $id
+                `)
+                .run({
+                    $id: waiting.id,
+                    $nodeUid: conflict.nodeUid,
+                    $localSha1: conflict.localSha1,
+                    $remoteSha1: conflict.remoteSha1,
+                    $localMtimeMs: Math.round(conflict.localMtimeMs),
+                    $remoteMtimeMs: Math.round(conflict.remoteMtimeMs),
+                    $resolution: conflict.resolution,
+                    $conflictCopyPath: conflict.conflictCopyPath ?? null,
+                });
+            this.onChange?.(conflict.localRelPath, false);
+            return this.getConflictById(waiting.id)!;
+        })();
+    }
+
+    // Closes the conflict waiting at a path, if any, as `resolution` (a sync pass found both sides holding the same
+    // content: 'in-sync'). True when one was waiting.
+    closeWaitingConflict(localRelPath: string, resolution: string): boolean {
+        const waiting = this.db
+            .query('SELECT id FROM conflicts WHERE localRelPath = $localRelPath AND resolved = 0')
+            .get({ $localRelPath: localRelPath }) as { id: number } | null;
+        if (!waiting) {
+            return false;
+        }
+        this.markConflictResolved(waiting.id, resolution);
+        return true;
+    }
+
     private insertConflict(conflict: NewConflict): ConflictRecord {
         const detectedAt = Date.now();
         const res = this.db
