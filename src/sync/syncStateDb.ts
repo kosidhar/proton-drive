@@ -425,7 +425,9 @@ export class SyncStateDatabase {
     // Moves the record at a path, and every record under it, to another path, in one transaction (a local copy moved to
     // follow a rename in the cloud). The root never moves, nor does a path into itself, and records already at the
     // target are never merged into or overwritten: each of these throws, changing nothing.
-    renameItemPath(fromRel: string, toRel: string): void {
+    // newParentUid, when given, is the cloud folder the moved item is now in: its record's parentNodeUid follows the move
+    // (#80). The records below it keep theirs: their parent didn't change.
+    renameItemPath(fromRel: string, toRel: string, newParentUid?: string): void {
         if (fromRel === '' || toRel === '') {
             throw new Error("The root of the sync folder can't be moved");
         }
@@ -447,6 +449,11 @@ export class SyncStateDatabase {
                      WHERE ${selfOrDescendantWhere('localRelPath')}`,
                 )
                 .run({ $toRel: toRel, $fromRel: fromRel, $updatedAt: Date.now(), ...selfOrDescendant(fromRel) });
+            if (newParentUid !== undefined) {
+                this.db
+                    .query('UPDATE synced_items SET parentNodeUid = $parent WHERE localRelPath = $toRel')
+                    .run({ $parent: newParentUid, $toRel: toRel });
+            }
         })();
         this.onChange?.(fromRel, true);
         this.onChange?.(toRel, true);
