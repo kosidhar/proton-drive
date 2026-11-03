@@ -4195,6 +4195,42 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(await d.copiesIn('Docs')).toEqual([d.nameOf(cloud[0]!)]);
                 });
 
+                test('a conflict resolved another way forgets its copy: a later conflict of the same content makes its own (#25)', async () => {
+                    const d = await synced(layout);
+                    d.changeInCloud('theirs');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    d.down.add('getFileRevisionDownloader');
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    const [made] = d.cloudCopies();
+                    expect(made?.content).toBe('mine'); // the keep-both's copy, uploaded by a pass, its download still to come
+
+                    // Resolved by hand, keeping the local version, instead
+                    stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                    d.down.clear();
+                    await d.engine.reconcileNow();
+                    const [conflict] = stateDb.listConflicts().filter((c) => c.localRelPath === 'Docs/doc.txt');
+                    await d.engine.resolveConflictManually(conflict!.id, 'keep-local');
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('mine');
+                    await writeFile(d.local('Docs/doc.txt'), 'other');
+                    await d.engine.reconcileNow();
+
+                    // A later conflict, with the same local content as the first
+                    stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    d.changeInCloud('theirs again');
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs again');
+                    const mine = d.cloudCopies().filter((n) => n.content === 'mine');
+                    expect(mine).toHaveLength(2);
+                    const latest = stateDb.listConflicts(true).find((c) => c.resolution === 'keep-both');
+                    expect(latest?.conflictCopyPath).toBeDefined();
+                    expect(latest?.conflictCopyPath).not.toBe(`Docs/${d.nameOf(made!)}`);
+                    expect(d.calls.trashed).toEqual([]);
+                });
+
                 // Review of #25: the copy an earlier, finished conflict made (synced, and since edited in the cloud by
                 // another device) is never taken for this conflict's copy: nothing renames it, and nothing trashes it
                 test('a later keep-both never takes the synced copy of an earlier conflict for its own (#25 review)', async () => {

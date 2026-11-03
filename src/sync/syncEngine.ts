@@ -279,8 +279,9 @@ export class ProtonDriveSyncEngine {
     private missingConfirmed: { root: string; names: Set<string> } | null = null;
     // Conflicts being resolved by hand right now, so that a second request for the same one is refused
     private readonly resolvingConflicts = new Set<number>();
-    // The conflict copy a keep-both made of a file (by its path), and of what content, until that keep-both finishes: a
-    // retry after its download failed goes on from it rather than make another (#25)
+    // The conflict copy a keep-both made of a file (by its path), and of what content, until that keep-both finishes or
+    // the file's conflict is over some other way (resolved by hand, or the file synced): a retry after its download failed
+    // goes on from it rather than make another (#25)
     private readonly keepBothCopies = new Map<string, { copyRelPath: string; sha1: string }>();
 
     constructor(
@@ -1364,6 +1365,7 @@ export class ProtonDriveSyncEngine {
                 resolved: true,
                 resolution: 'keep-local',
             });
+            this.keepBothCopies.delete(relPath);
             return;
         }
 
@@ -1379,6 +1381,7 @@ export class ProtonDriveSyncEngine {
                 resolved: true,
                 resolution: 'keep-remote',
             });
+            this.keepBothCopies.delete(relPath);
             return;
         }
 
@@ -1556,6 +1559,8 @@ export class ProtonDriveSyncEngine {
                 const conflictCopyRelPath = await this.keepBoth(conflict.localRelPath, localFullPath, localSha1, remoteNode, remoteMap, since);
                 this.stateDb.markConflictResolved(conflictId, 'keep-both', conflictCopyRelPath);
             }
+            // Resolved, whichever way: a keep-both of it left unfinished before is over too (see keepBoth)
+            this.keepBothCopies.delete(conflict.localRelPath);
         });
     }
 
@@ -2041,6 +2046,8 @@ export class ProtonDriveSyncEngine {
             return false;
         }
         this.stateDb.upsertItem(item);
+        // Synced: whatever conflict it was in is over, and a keep-both of it left unfinished with it (see keepBoth)
+        this.keepBothCopies.delete(relPath);
         return true;
     }
 
