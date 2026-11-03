@@ -4296,17 +4296,36 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             engine.availability.setPin(a.uid, 'pinned', false);
             engine.availability.setPin(b.uid, 'pinned', false);
             let failing = true;
+            let tries = 0;
+            let currentFailure = failure;
             const real = (drive.sdk as any).getFileRevisionDownloader;
             (drive.sdk as any).getFileRevisionDownloader = async (revisionUid: string) => {
                 if (failing && revisionUid.startsWith('vol~A/bad.txt')) {
-                    throw failure();
+                    tries += 1;
+                    throw currentFailure();
                 }
                 return real(revisionUid);
             };
             const local = (rel: string) => path.join(engine.localRoot(), rel);
             const exists = (rel: string) => stat(local(rel)).then(() => true, () => false);
-            return { ...drive, engine, local, exists, heal: () => (failing = false) };
+            return {
+                ...drive,
+                engine,
+                local,
+                exists,
+                heal: () => (failing = false),
+                tries: () => tries,
+                failWith: (next: () => Error) => (currentFailure = next),
+            };
         };
+        let now = Date.parse('2026-11-02T08:00:00Z');
+        const later = (ms: number) => {
+            now += ms;
+            setSystemTime(now);
+        };
+        beforeEach(() => setSystemTime(now));
+        afterEach(() => setSystemTime());
+        const errorsFor = (rel: string) => stateDb.listActivity(500).filter((a) => a.action === 'error' && a.localRelPath === rel);
 
         for (const layout of ['plain', 'virtual'] as const) {
             describe(`in the ${layout} layout`, () => {
@@ -4328,6 +4347,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(d.calls.trashed).toEqual([]);
 
                     d.heal();
+                    later(2 * 60_000); // past its backoff
                     await d.engine.reconcileNow();
 
                     expect(await readFile(d.local('A/bad.txt'), 'utf8')).toBe('bad');
@@ -4344,6 +4364,58 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(await readFile(d.local('B/good.txt'), 'utf8')).toBe('good');
                     expect(d.engine.getStatus().lastError).toContain('A/bad.txt');
                     expect(d.calls.trashed).toEqual([]);
+                });
+
+                test('an item that keeps failing is logged once, until its error changes', async () => {
+                    const d = await withFailingDownload(layout, () => new Error('Integrity check failed'));
+                    for (let pass = 0; pass < 4; pass++) {
+                        await d.engine.reconcileNow();
+                        later(2 * 60 * 60_000); // past any backoff
+                    }
+                    expect(d.tries()).toBe(4);
+                    expect(errorsFor('A/bad.txt')).toHaveLength(1);
+
+                    d.failWith(() => new Error('Decryption failed'));
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(errorsFor('A/bad.txt').map((a) => a.details.includes('Decryption failed'))).toEqual([true, false]);
+                });
+
+                test('an item that keeps failing backs off, 1 minute doubling up to an hour, and still shows as failing', async () => {
+                    const d = await withFailingDownload(layout, () => new Error('Integrity check failed'));
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    expect(d.tries()).toBe(1);
+                    expect(d.engine.getStatus().lastError).toContain('A/bad.txt');
+                    expect(await readFile(d.local('B/good.txt'), 'utf8')).toBe('good');
+
+                    later(61_000);
+                    await d.engine.reconcileNow();
+                    expect(d.tries()).toBe(2);
+                    later(61_000); // its second failure waits 2 minutes
+                    await d.engine.reconcileNow();
+                    expect(d.tries()).toBe(2);
+                    later(60_000);
+                    await d.engine.reconcileNow();
+                    expect(d.tries()).toBe(3);
+
+                    for (let i = 0; i < 10; i++) {
+                        later(61 * 60_000); // never more than an hour apart
+                        await d.engine.reconcileNow();
+                    }
+                    expect(d.tries()).toBe(13);
+                });
+
+                test('a local change to an item backing off has it looked at again at once', async () => {
+                    const d = await withFailingDownload(layout, () => new Error('Integrity check failed'));
+                    await d.engine.reconcileNow();
+                    expect(d.tries()).toBe(1);
+
+                    await (d.engine as any).handleLocalFileChange('A/bad.txt');
+                    await d.engine.reconcileNow();
+
+                    expect(d.tries()).toBe(2);
                 });
 
                 test('offline, the pass still stops at the first failure rather than fail every item', async () => {
