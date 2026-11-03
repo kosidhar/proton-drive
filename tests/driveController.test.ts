@@ -29,6 +29,7 @@ import { moveWithoutReplacing } from '../src/sync/localMove';
 import { LOCAL_MOVE_IN_PROGRESS, ProtonDriveSyncEngine } from '../src/sync/syncEngine';
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
 import { makeMockDrive } from './helpers/mockDrive';
+import { uploadAtOnce } from './helpers/engineOptions';
 
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => {
@@ -120,6 +121,7 @@ function setup(opts: { fuseOk?: boolean; wanted?: boolean; loggedIn?: boolean; m
     // A daemon start: a new engine and controller on the same database and folders
     const start = (more: { fuseOk?: boolean; moveSeams?: MoveSeams } = {}) => {
         engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => opts.loggedIn ?? false }, stateDb, logger, {
+            ...uploadAtOnce,
             backingDir,
             moveSeams: more.moveSeams ?? opts.moveSeams,
         });
