@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -122,6 +122,42 @@ describe("AvailabilityPolicy", () => {
     expect(policy.stateOf("Docs")).toBe("downloaded");
     expect(policy.stateOf("Docs/a.txt")).toBe("downloaded");
     expect(policy.stateOf("Music/s.mp3")).toBe("online-only");
+  });
+
+  // #17: a cloud folder indexed one level deep (its contents not crawled yet) has no indexed file below it that lacks a
+  // record, but nothing in it is on this computer either
+  test("a folder whose contents aren't indexed yet, with nothing of it here, is online-only", () => {
+    index.replaceChildren("root", "", [
+      folder("docs", "root", "Docs"),
+      folder("music", "root", "Music"),
+      folder("photos", "root", "Photos"),
+      folder("photos-lc", "root", "photos"),
+      folder("fresh", "root", "Fresh"),
+    ]);
+    expect(policy.stateOf("Fresh")).toBe("online-only");
+    expect(policy.childStates("").get("Fresh")).toBe("online-only");
+  });
+
+  test("a nested folder whose contents aren't indexed yet is online-only, beside one that is all here", () => {
+    index.replaceChildren("docs", "Docs", [
+      file("a", "docs", "Docs/a.txt"),
+      file("b", "docs", "Docs/b.txt"),
+      folder("deep", "docs", "Docs/Deep"),
+      folder("docs-fresh", "docs", "Docs/Fresh"),
+    ]);
+    addLocalRecord("Docs/Deep/c.txt");
+    expect(policy.stateOf("Docs/Fresh")).toBe("online-only");
+    expect(policy.childStates("Docs").get("Fresh")).toBe("online-only");
+    expect(policy.childStates("Docs").get("Deep")).toBe("downloaded");
+  });
+
+  test("a folder whose files are all here is downloaded, though the folder itself has no record (opened on demand)", () => {
+    addLocalRecord("Docs/a.txt");
+    addLocalRecord("Docs/b.txt");
+    addLocalRecord("Docs/Deep/c.txt");
+    expect(policy.stateOf("Docs")).toBe("downloaded");
+    expect(policy.stateOf("Docs/Deep")).toBe("downloaded");
+    expect(policy.childStates("").get("Docs")).toBe("downloaded");
   });
 
   test("a pinned item reports pinned", () => {
@@ -248,7 +284,11 @@ describe("AvailabilityPolicy.childStates", () => {
       for (const child of children) {
         if (child.type === "folder") {
           folders.push({ uid: child.uid, relPath: child.relPath });
-          grow(child.uid, child.relPath, depth + 1);
+          // Some folders' contents are never crawled (indexed one level deep, #17); some folders are recorded
+          // themselves; some hold a local item the index doesn't know
+          if (next() < 0.75) grow(child.uid, child.relPath, depth + 1);
+          if (next() < 0.3) record(child.relPath);
+          if (next() < 0.2) record(`${child.relPath}/local-only.txt`);
         } else if (next() < 0.5) {
           record(child.relPath);
         }
@@ -294,26 +334,41 @@ describe("AvailabilityPolicy.childStates", () => {
     expect(policy.childStates("only.txt").size).toBe(0);
   });
 
-  test("answers a folder of 5,000 children quickly", () => {
+  // A fixed number of queries, whatever the size of the folder: counted, not timed, so a busy machine can't fail it (#69)
+  test("answers a folder of 5,000 children in as many queries as a folder of 10", () => {
     const index = new RemoteIndex(stateDb.connection);
     const policy = new AvailabilityPolicy(stateDb.connection, index);
     index.setRoot("root");
-    index.replaceChildren("root", "", [folder("big", "root", "Big")]);
-    const children: RemoteIndexEntry[] = [];
-    for (let i = 0; i < 5000; i++) {
-      children.push(i % 10 === 0 ? folder(`d${i}`, "big", `Big/d${i}`) : file(`f${i}`, "big", `Big/f${i}.jpg`));
-    }
-    index.replaceChildren("big", "Big", children);
-    for (let i = 0; i < 5000; i += 3) {
-      if (i % 10 !== 0) record(`Big/f${i}.jpg`);
-    }
-    policy.childStates("Big"); // warm the statements
-    const started = performance.now();
-    const states = policy.childStates("Big");
-    const took = performance.now() - started;
-    expect(states.size).toBe(5000);
-    expect(states.get("f3.jpg")).toBe("downloaded");
-    expect(states.get("f1.jpg")).toBe("online-only");
-    expect(took).toBeLessThan(50);
+    index.replaceChildren("root", "", [folder("big", "root", "Big"), folder("small", "root", "Small")]);
+    const fill = (uid: string, rel: string, n: number) => {
+      const children: RemoteIndexEntry[] = [];
+      for (let i = 0; i < n; i++) {
+        children.push(i % 10 === 0 ? folder(`${uid}-d${i}`, uid, `${rel}/d${i}`) : file(`${uid}-f${i}`, uid, `${rel}/f${i}.jpg`));
+      }
+      index.replaceChildren(uid, rel, children);
+      for (let i = 0; i < n; i += 3) {
+        if (i % 10 !== 0) record(`${rel}/f${i}.jpg`);
+      }
+    };
+    fill("big", "Big", 5000);
+    fill("small", "Small", 10);
+    // Every way to run SQL on the connection is counted, so a query per child can't slip in through another one
+    const queriesFor = (rel: string) => {
+      const spies = (["query", "prepare", "run", "exec"] as const).map((method) => spyOn(stateDb.connection, method));
+      try {
+        const states = policy.childStates(rel);
+        return { states, queries: spies.reduce((n, spy) => n + spy.mock.calls.length, 0) };
+      } finally {
+        spies.forEach((spy) => spy.mockRestore());
+      }
+    };
+    const big = queriesFor("Big");
+    const small = queriesFor("Small");
+    expect(big.states.size).toBe(5000);
+    expect(big.states.get("f3.jpg")).toBe("downloaded");
+    expect(big.states.get("f1.jpg")).toBe("online-only");
+    expect(small.states.size).toBe(10);
+    expect(big.queries).toBe(small.queries);
+    expect(big.queries).toBeLessThan(20);
   });
 });

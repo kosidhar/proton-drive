@@ -116,7 +116,9 @@ export class AvailabilityPolicy {
                        AND NOT EXISTS (SELECT 1 FROM synced_items s WHERE s.localRelPath = n.relPath)`,
         )
         .get(this.rangeParams(relPath));
-      return missing === null ? "downloaded" : "online-only";
+      // Downloaded: nothing below it is missing here, and it is here at all (it, or something in it, is recorded). A
+      // folder whose contents aren't indexed yet has nothing below it to be missing, and may have nothing here (#17)
+      return missing === null && this.anythingHere(relPath) ? "downloaded" : "online-only";
     }
     return this.hasLocalCopy(relPath) ? "downloaded" : "online-only";
   }
@@ -143,6 +145,7 @@ export class AvailabilityPolicy {
     const hiddenAbove = this.hiddenBy(folderRel);
     const pinnedAbove = this.isPinned(folderRel);
     const missing = this.childrenMissingFiles(folderRel);
+    const here = this.childrenWithAnythingHere(folderRel);
     for (const child of children) {
       if (hiddenAbove) {
         out.set(child.name, hiddenAbove.hide === "pending" ? "hiding" : "hidden");
@@ -151,10 +154,39 @@ export class AvailabilityPolicy {
       } else if (child.pin ? child.pin === "pinned" : pinnedAbove) {
         out.set(child.name, "pinned");
       } else {
-        out.set(child.name, missing.has(child.name) ? "online-only" : "downloaded");
+        out.set(child.name, !missing.has(child.name) && here.has(child.name) ? "downloaded" : "online-only");
       }
     }
     return out;
+  }
+
+  // Whether anything at or below a path is recorded as being on this computer
+  private anythingHere(relPath: string): boolean {
+    return (
+      this.db
+        .query(`SELECT 1 FROM synced_items s WHERE ${this.range("s.localRelPath", relPath)} LIMIT 1`)
+        .get(this.rangeParams(relPath)) !== null
+    );
+  }
+
+  // The names of a folder's children that are, or hold, something recorded as being on this computer
+  private childrenWithAnythingHere(folderRel: string): Set<string> {
+    const prefix = folderRel === "" ? "" : `${folderRel}/`;
+    const below =
+      folderRel === ""
+        ? "s.localRelPath != ''"
+        : "(s.localRelPath >= $lo AND s.localRelPath < $hi)";
+    const rows = this.db
+      .query(
+        `SELECT DISTINCT CASE WHEN instr(rest, '/') > 0 THEN substr(rest, 1, instr(rest, '/') - 1) ELSE rest END AS name
+                 FROM (SELECT substr(s.localRelPath, length($prefix) + 1) AS rest FROM synced_items s WHERE ${below})`,
+      )
+      .all({
+        // SQLite measures the prefix in characters, as substr counts them (a JS length counts UTF-16 units)
+        $prefix: prefix,
+        ...(folderRel === "" ? {} : { $lo: prefix, $hi: `${folderRel}0` }),
+      }) as { name: string }[];
+    return new Set(rows.map((row) => row.name));
   }
 
   // The names of a folder's children that are, or hold, a file with no local copy
