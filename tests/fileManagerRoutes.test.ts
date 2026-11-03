@@ -9,6 +9,11 @@ import { StateEvents } from '../src/sync/stateEvents';
 import type { FolderStates } from '../src/sync/syncEngine';
 
 const cleanups: Array<() => void | Promise<void>> = [];
+// Waits for a stream to be let go of: closing one is seen by the server a moment later, a long one under the load of the
+// whole suite (#118)
+const until = async (done: () => boolean, ms = 5000) => {
+    for (const end = Date.now() + ms; !done() && Date.now() < end; ) await Bun.sleep(10);
+};
 afterEach(async () => {
     while (cleanups.length) await cleanups.pop()!();
 });
@@ -220,12 +225,15 @@ describe('file manager routes on the control socket', () => {
         expect(await nextLine()).toEqual({ type: 'changed', paths: [SYNC_DIR, `${SYNC_DIR}/Docs`], subtrees: [] });
 
         abort.abort();
-        for (let i = 0; i < 100 && events.listenerCount > 0; i++) await Bun.sleep(10);
+        await until(() => events.listenerCount === 0);
         expect(events.listenerCount).toBe(0);
         expect(openEventStreams()).toBe(0);
     });
 
     test('a 17th event stream is refused', async () => {
+        // The cap counts every stream in this process: one another test closed may not be let go of yet (#118)
+        await until(() => openEventStreams() === 0);
+        expect(openEventStreams()).toBe(0);
         const { call } = await start();
         const aborts: AbortController[] = [];
         cleanups.push(() => aborts.forEach((a) => a.abort()));
@@ -237,7 +245,7 @@ describe('file manager routes on the control socket', () => {
         }
         expect((await call('/fm/events')).status).toBe(503);
         aborts.forEach((a) => a.abort());
-        for (let i = 0; i < 100 && openEventStreams() > 0; i++) await Bun.sleep(10);
+        await until(() => openEventStreams() === 0);
         expect(openEventStreams()).toBe(0);
     });
 });
