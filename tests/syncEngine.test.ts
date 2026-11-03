@@ -9146,6 +9146,38 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
     });
 
     describe('local changes are handled a few at a time (#90)', () => {
+        test('one file busy uploading never takes every turn from the others', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+                localChangeConcurrency: 3,
+            });
+            d.add('Kept.txt', 'kept');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            await writeFile(local('big.bin'), 'v1');
+            await writeFile(local('other.txt'), 'other');
+            // big.bin's upload waits on the network
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            const now = (engine as any).handleLocalFileChangeNow.bind(engine);
+            (engine as any).handleLocalFileChangeNow = async (rel: string) => {
+                if (rel === 'big.bin') await gate;
+                return now(rel);
+            };
+            const first = (engine as any).handleLocalFileChange('big.bin');
+            await Bun.sleep(5);
+            const again = [1, 2, 3].map(() => (engine as any).handleLocalFileChange('big.bin')); // it keeps changing
+            await Bun.sleep(5);
+            await (engine as any).handleLocalFileChange('other.txt');
+            expect(d.calls.uploads).toEqual(['other.txt']); // not kept waiting behind big.bin
+            release();
+            await Promise.all([first, ...again]);
+            expect(d.calls.uploads.filter((u) => u === 'big.bin').length).toBeGreaterThanOrEqual(1);
+        });
+
         test('thirty new files reported at once: never more than the limit at a time, and all of them upload', async () => {
             const d = makeMockDrive();
             const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
