@@ -259,6 +259,45 @@ class EmblemTest(unittest.TestCase):
         h.release()
         self.assertEqual(a.emblems, ["emblem-protondrive-pinned"])
 
+    def test_a_file_waiting_for_the_root_is_answered_when_the_change_stream_tells_it_first(self):
+        h = Harness({"/fm/root": {"syncDir": ROOT, "mode": "virtual", "mounted": True}}, root=None)
+        outside = FakeFile("/home/u/x")
+        self.assertFalse(h.files.file_info(outside, "hx", None))
+        h.files.on_event({"type": "hello", "syncDir": ROOT, "mode": "virtual"})
+        self.assertEqual(h.completed, [("hx", True)])
+        h.release()  # the root's own answer, later, changes nothing
+        self.assertEqual(h.completed, [("hx", True)])
+
+    def test_while_the_daemon_is_away_files_are_answered_at_once_and_refreshed_when_it_is_back(self):
+        answers = {"/fm/root": ext.ControlError("Can't reach the Proton Drive background service"),
+                   states_query(ROOT + "/Docs"): DOCS_STATES}
+        h = Harness(answers, root=None)
+        h.files.file_info(FakeFile("/home/u/first"), "h0", None)
+        h.release()
+        # No root being asked: nothing is held up, in the drive or out of it
+        outside, inside = FakeFile("/usr/share/doc/x"), FakeFile(f"{ROOT}/Docs/a.txt")
+        self.assertTrue(h.files.file_info(outside, "h1", None))
+        self.assertTrue(h.files.file_info(inside, "h2", None))
+        self.assertEqual(h.runs, [])
+        # Asked again once; a second failure asks again later still
+        fn, _seconds = h.scheduled.pop()
+        fn()
+        h.release()
+        self.assertEqual(len(h.scheduled), 1)
+        answers["/fm/root"] = {"syncDir": ROOT, "mode": "virtual", "mounted": True}
+        h.scheduled.pop()[0]()
+        h.release()
+        self.assertEqual(h.files.root, ROOT)
+        self.assertEqual(inside.invalidated, 1)
+
+    def test_a_folder_the_daemon_says_is_not_in_the_drive_is_not_asked_again(self):
+        h = Harness({states_query(ROOT + "/Docs"): ext.ControlError("Not a folder in Proton Drive")})
+        h.files.file_info(FakeFile(f"{ROOT}/Docs/a.txt"), "ha", None)
+        h.release()
+        self.assertEqual(h.completed, [("ha", False)])
+        self.assertEqual(h.scheduled, [])
+        self.assertEqual(h.files.fetch_failures, {})
+
     def test_cancel_drops_a_file_waiting_for_the_root(self):
         h = Harness({"/fm/root": {"syncDir": ROOT, "mode": "virtual", "mounted": True}}, root=None)
         h.files.file_info(FakeFile("/home/u/x"), "hx", None)
