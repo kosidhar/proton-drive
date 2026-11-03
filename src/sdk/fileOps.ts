@@ -221,7 +221,8 @@ export async function uploadLocalFileToDrive(options: {
 }
 
 export interface DownloadResult {
-    status: 'downloaded' | 'skipped-unsupported' | 'skipped-identical';
+    // skipped-changed: beforePlacing said no, and the local file was left as it is
+    status: 'downloaded' | 'skipped-unsupported' | 'skipped-identical' | 'skipped-changed';
     localPath: string;
     sha1?: string;
     size: number;
@@ -235,6 +236,8 @@ export async function downloadDriveNodeToLocal(options: {
     localPath: string;
     revision?: Revision;
     onProgress?: (downloadedBytes: number, totalBytes: number) => void;
+    // Asked once the download is complete, just before it replaces what is at localPath: false leaves that as it is
+    beforePlacing?: () => Promise<boolean>;
 }): Promise<DownloadResult> {
     const { sdk, logger, remoteNode, localPath, onProgress } = options;
 
@@ -273,6 +276,10 @@ export async function downloadDriveNodeToLocal(options: {
 
     const tempPath = path.join(parentDir, `.proton-drive-tmp-${process.pid}-${Date.now()}-${path.basename(localPath)}`);
     const downloaded = await downloadRevisionToFile({ sdk, logger, remoteNode, revision, filePath: tempPath, onProgress });
+    if (options.beforePlacing && !(await options.beforePlacing().catch(() => false))) {
+        await unlink(tempPath).catch(() => {});
+        return { status: 'skipped-changed', localPath, size: 0, mtimeMs: 0 };
+    }
     try {
         await rename(tempPath, localPath);
     } catch (error) {
