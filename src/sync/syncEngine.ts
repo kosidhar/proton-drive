@@ -1511,13 +1511,22 @@ export class ProtonDriveSyncEngine {
             return st ? { size: st.size, mtimeMs: st.mtimeMs, sha1 } : null;
         };
         const unchangedSince = (copied: { size: number; mtimeMs: number; sha1: string } | null) => async () => {
-            const st = await stat(localFullPath).catch(() => null);
-            if (!copied || !st?.isFile() || st.size !== copied.size || st.mtimeMs !== copied.mtimeMs) {
+            const asCopied = async () => {
+                const st = await stat(localFullPath).catch(() => null);
+                return Boolean(copied && st?.isFile() && st.size === copied.size && st.mtimeMs === copied.mtimeMs);
+            };
+            if (!(await asCopied())) {
                 return false;
             }
-            return (await computeLocalFileSha1(localFullPath).catch(() => null)) === copied.sha1;
+            const sha1 = await computeLocalFileSha1(localFullPath).catch(() => null);
+            // Looked at again after reading it all: a write while it was being read is a change too
+            return sha1 === copied!.sha1 && (await asCopied());
         };
-        const changedMeanwhile = () => {
+        const changedMeanwhile = async (madeAs?: string, copySha1?: string) => {
+            if (madeAs !== undefined && copySha1 !== undefined) {
+                await this.dropUntrackedCopy(madeAs, copySha1);
+                this.keepBothCopies.delete(relPath);
+            }
             this.logger.info(`Keeping both versions of ${relPath} next time: it changed after its conflict copy was made`);
             return null;
         };
@@ -1535,7 +1544,7 @@ export class ProtonDriveSyncEngine {
             // The earlier copy holds localSha1: the local file must still be that
             const copied = await snapshot(localSha1);
             if (!(await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since, unchangedSince(copied)))) {
-                return changedMeanwhile();
+                return changedMeanwhile(); // Uploaded already: that copy stays
             }
             this.keepBothCopies.delete(relPath);
             return copyRelPath;
@@ -1546,12 +1555,28 @@ export class ProtonDriveSyncEngine {
         const copied = await snapshot(copySha1);
         this.keepBothCopies.set(relPath, { copyRelPath: madeAs, sha1: copySha1 });
         if (!(await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since, unchangedSince(copied)))) {
-            return changedMeanwhile();
+            // The copy goes: the local file holds what it does, or newer. One copy per try would otherwise pile up (and
+            // upload) for as long as the file keeps changing.
+            return changedMeanwhile(madeAs, copySha1);
         }
         // Past the download no retry comes (the file now holds the cloud's version): a copy whose upload fails here is
         // a new local file to the next pass
         this.keepBothCopies.delete(relPath);
         return await this.uploadConflictCopy(madeAs, remoteMap, since);
+    }
+
+    // Removes a conflict copy just made, while nothing tracks it (no record, no index entry) and it still holds what it
+    // was made with; otherwise it stays, as a file of its own
+    private async dropUntrackedCopy(copyRelPath: string, sha1: string): Promise<void> {
+        const fullPath = path.join(this.localRoot(), copyRelPath);
+        if (this.stateDb.getItemByPath(copyRelPath) || this.index.getByPath(copyRelPath)) {
+            return;
+        }
+        if ((await computeLocalFileSha1(fullPath).catch(() => null)) !== sha1) {
+            return;
+        }
+        this.watcher.suppressPath(copyRelPath);
+        await unlink(fullPath).catch(() => {});
     }
 
     // The copy an earlier, unfinished keep-both of this file made of this same content, if it can still be it: as made
