@@ -66,24 +66,29 @@ describe('RemoteOpsJournal', () => {
         expect(journal.pending()).toEqual([]);
     });
 
-    test('failed keeps when an operation first failed, and when it may be tried again', () => {
+    test('failed keeps the run of unmapped-code failures, which any other failure ends, and when to try again', () => {
         const journal = new RemoteOpsJournal(stateDb.connection);
         const a = journal.enqueue({ kind: 'rename', nodeUid: 'vol~a', toPath: 'A2' });
-        expect(journal.failures(a)).toEqual({ firstFailedAt: null, retryAfter: null });
+        expect(journal.failures(a)).toEqual({ firstFailedAt: null, unmappedFailures: 0, retryAfter: null });
+
+        journal.failed(a, 'Network unreachable'); // not a run
+        expect(journal.failures(a)).toEqual({ firstFailedAt: null, unmappedFailures: 0, retryAfter: null });
 
         const first = Date.now();
-        journal.failed(a, 'Refused', first + 60_000);
-        const after = journal.failures(a);
-        expect(after.firstFailedAt).toBeGreaterThanOrEqual(first);
-        expect(after.retryAfter).toBe(first + 60_000);
-
-        journal.failed(a, 'Refused again');
-        expect(journal.failures(a)).toEqual({ firstFailedAt: after.firstFailedAt, retryAfter: null });
+        journal.failed(a, 'Unknown', { retryAfter: first + 60_000, unmapped: true });
+        journal.failed(a, 'Unknown', { retryAfter: first + 120_000, unmapped: true });
+        const run = journal.failures(a);
+        expect(run.firstFailedAt).toBeGreaterThanOrEqual(first);
+        expect(run.unmappedFailures).toBe(2);
+        expect(run.retryAfter).toBe(first + 120_000);
         // Kept through a snapshot and its restore
         const rows = journal.snapshot();
         journal.complete(a);
         journal.restore(rows);
-        expect(journal.failures(a).firstFailedAt).toBe(after.firstFailedAt);
+        expect(journal.failures(a)).toEqual(run);
+
+        journal.failed(a, 'Bad Gateway'); // ends the run
+        expect(journal.failures(a)).toEqual({ firstFailedAt: null, unmappedFailures: 0, retryAfter: null });
     });
 
     test('hasLaterOn tells whether a later operation on the same node is pending', () => {

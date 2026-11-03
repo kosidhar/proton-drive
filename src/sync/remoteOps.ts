@@ -44,11 +44,16 @@ export class RemoteOpsJournal {
             )
         `);
         this.db.run('CREATE INDEX IF NOT EXISTS remote_ops_node ON remote_ops (nodeUid, id)');
-        // When an operation first failed, and when it may be tried again (null: at once); added to older databases
+        // The run of failures with an unmapped API code an operation is in (when it began, how many), and when it may be
+        // tried again (null: at once); added to older databases
         const columns = new Set((this.db.query('PRAGMA table_info(remote_ops)').all() as Array<{ name: string }>).map((c) => c.name));
-        for (const column of ['firstFailedAt', 'retryAfter']) {
+        for (const [column, type] of [
+            ['firstFailedAt', 'INTEGER'],
+            ['retryAfter', 'INTEGER'],
+            ['unmappedFailures', 'INTEGER NOT NULL DEFAULT 0'],
+        ] as const) {
             if (!columns.has(column)) {
-                this.db.run(`ALTER TABLE remote_ops ADD COLUMN ${column} INTEGER`);
+                this.db.run(`ALTER TABLE remote_ops ADD COLUMN ${column} ${type}`);
             }
         }
     }
@@ -101,25 +106,29 @@ export class RemoteOpsJournal {
         this.db.query('DELETE FROM remote_ops WHERE id = $id').run({ $id: id });
     }
 
-    // Counts a failed attempt, keeping its error and when the first failure was; with retryAfter, the operation isn't
-    // tried again before then
-    failed(id: number, error: string, retryAfter: number | null = null): void {
+    // Counts a failed attempt, keeping its error. A failure with an unmapped API code (`unmapped`) continues the run of
+    // them, or begins one now; any other failure ends the run. With retryAfter, the operation isn't tried again before
+    // then.
+    failed(id: number, error: string, opts: { retryAfter?: number | null; unmapped?: boolean } = {}): void {
         this.db
             .query(
-                `UPDATE remote_ops SET attempts = attempts + 1, lastError = $error,
-                     firstFailedAt = COALESCE(firstFailedAt, $now), retryAfter = $retryAfter
+                `UPDATE remote_ops SET attempts = attempts + 1, lastError = $error, retryAfter = $retryAfter,
+                     firstFailedAt = CASE WHEN $unmapped THEN COALESCE(firstFailedAt, $now) ELSE NULL END,
+                     unmappedFailures = CASE WHEN $unmapped THEN unmappedFailures + 1 ELSE 0 END
                  WHERE id = $id`,
             )
-            .run({ $id: id, $error: error, $now: Date.now(), $retryAfter: retryAfter });
+            .run({ $id: id, $error: error, $now: Date.now(), $retryAfter: opts.retryAfter ?? null, $unmapped: opts.unmapped ? 1 : 0 });
     }
 
-    // When an operation first failed (null: it hasn't), and when it may be tried again (null: at once)
-    failures(id: number): { firstFailedAt: number | null; retryAfter: number | null } {
-        const row = this.db.query('SELECT firstFailedAt, retryAfter FROM remote_ops WHERE id = $id').get({ $id: id }) as {
+    // The run of unmapped-code failures an operation is in: when it began (null: none) and how many; and when it may be
+    // tried again (null: at once)
+    failures(id: number): { firstFailedAt: number | null; unmappedFailures: number; retryAfter: number | null } {
+        const row = this.db.query('SELECT firstFailedAt, unmappedFailures, retryAfter FROM remote_ops WHERE id = $id').get({ $id: id }) as {
             firstFailedAt: number | null;
+            unmappedFailures: number;
             retryAfter: number | null;
         } | null;
-        return row ?? { firstFailedAt: null, retryAfter: null };
+        return row ?? { firstFailedAt: null, unmappedFailures: 0, retryAfter: null };
     }
 
     // A local rename of fromRel to toRel takes along the targets of pending renames and moves at or under it, so they
@@ -155,8 +164,10 @@ export class RemoteOpsJournal {
         this.db.transaction(() => {
             this.db.run('DELETE FROM remote_ops');
             const insert = this.db.query(
-                `INSERT INTO remote_ops (id, kind, nodeUid, path, toPath, createdAt, attempts, lastError, firstFailedAt, retryAfter)
-                 VALUES ($id, $kind, $nodeUid, $path, $toPath, $createdAt, $attempts, $lastError, $firstFailedAt, $retryAfter)`,
+                `INSERT INTO remote_ops (id, kind, nodeUid, path, toPath, createdAt, attempts, lastError, firstFailedAt, retryAfter,
+                     unmappedFailures)
+                 VALUES ($id, $kind, $nodeUid, $path, $toPath, $createdAt, $attempts, $lastError, $firstFailedAt, $retryAfter,
+                     $unmappedFailures)`,
             );
             for (const row of rows as Array<Record<string, unknown>>) {
                 insert.run({
@@ -170,6 +181,7 @@ export class RemoteOpsJournal {
                     $lastError: row.lastError as string | null,
                     $firstFailedAt: (row.firstFailedAt as number | null | undefined) ?? null,
                     $retryAfter: (row.retryAfter as number | null | undefined) ?? null,
+                    $unmappedFailures: (row.unmappedFailures as number | undefined) ?? 0,
                 });
             }
         })();

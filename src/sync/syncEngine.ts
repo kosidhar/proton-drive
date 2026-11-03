@@ -79,8 +79,10 @@ const MAX_UNEXPECTED_FAILURES = 10;
 // such a refusal doesn't change, and the journal waits behind it meanwhile (#39)
 const MAX_PERMANENT_REFUSALS = 3;
 // An operation refused with an API code outside the 2xxx family, which a server outage or an expired session can answer
-// with too, is tried again with backoff (up to an hour between tries) and given up on only after failing for this long
+// with too, is tried again with backoff (up to an hour between tries) and given up on only after failing that way, and
+// no other, for this long and at least this many times in a row (time offline, say, never counts)
 const GIVE_UP_UNMAPPED_AFTER_MS = 24 * 60 * 60_000;
+const MIN_UNMAPPED_FAILURES = 5;
 const MAX_REPLAY_BACKOFF_MS = 60 * 60_000;
 // An item that keeps failing in sync passes is tried again after 1 minute, doubling each time, up to this (#18)
 const MAX_ITEM_BACKOFF_MS = 60 * 60_000;
@@ -4256,12 +4258,13 @@ export class ProtonDriveSyncEngine {
     // Refusals Proton Drive answers with are ServerErrors too, yet not all are trouble a later try gets past (#39): a
     // permanent one (see permanentRefusal) is given up on after MAX_PERMANENT_REFUSALS tries; an API code outside the
     // 2xxx family, which an outage or an expired session can answer with, only after GIVE_UP_UNMAPPED_AFTER_MS of
-    // failing, tried again with backoff meanwhile. Network failures, 5xx, 401 and rate limits are never given up on.
+    // failing in a row (MIN_UNMAPPED_FAILURES times at least), tried again with backoff meanwhile; a failure of any other
+    // kind ends that run. Network failures, 5xx, 401 and rate limits are never given up on.
     private async replayFailed(op: RemoteOp, where: string, error: unknown): Promise<'next' | 'stop'> {
         const message = messageOf(error);
         const now = Date.now();
-        const keep = (retryAfter: number | null = null): 'stop' => {
-            this.journal.failed(op.id, message, retryAfter);
+        const keep = (opts: { retryAfter?: number; unmapped?: boolean } = {}): 'stop' => {
+            this.journal.failed(op.id, message, opts);
             this.logger.warn(`Could not apply a change to ${where} in Proton Drive yet; trying again later: ${message}`);
             return 'stop';
         };
@@ -4270,9 +4273,11 @@ export class ProtonDriveSyncEngine {
                 return keep();
             }
         } else if (unmappedApiCode(error)) {
-            const firstFailedAt = this.journal.failures(op.id).firstFailedAt ?? now;
-            if (now - firstFailedAt < GIVE_UP_UNMAPPED_AFTER_MS) {
-                return keep(now + Math.min(2 ** op.attempts * 60_000, MAX_REPLAY_BACKOFF_MS));
+            const run = this.journal.failures(op.id);
+            const firstFailedAt = run.firstFailedAt ?? now;
+            if (now - firstFailedAt < GIVE_UP_UNMAPPED_AFTER_MS || run.unmappedFailures + 1 < MIN_UNMAPPED_FAILURES) {
+                const retryAfter = now + Math.min(2 ** run.unmappedFailures * 60_000, MAX_REPLAY_BACKOFF_MS);
+                return keep({ retryAfter, unmapped: true });
             }
         } else if (isTransient(error) || op.attempts + 1 < MAX_UNEXPECTED_FAILURES) {
             return keep();
