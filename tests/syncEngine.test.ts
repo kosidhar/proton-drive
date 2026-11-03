@@ -9671,4 +9671,45 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(await readFile(d.local('b.txt'), 'utf8')).toBe('local edit');
         });
     });
+
+    describe('keep-both by hand when the user deletes or moves its conflict copy meanwhile (#122)', () => {
+        for (const what of ['deleted', 'moved'] as const) {
+            test(`a conflict copy ${what} before its upload: kept both as asked, nothing recorded for the copy`, async () => {
+                const d = makeMockDrive();
+                const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                    moveToDesktopTrash: async () => false,
+                    settle: { quietMs: 0 },
+                });
+                d.add('Kept.txt', 'kept');
+                d.add('a.txt', 'original');
+                engine.availability.setPin(d.root.uid, 'pinned', false);
+                await engine.reconcileNow();
+                stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                const local = (rel: string) => path.join(engine.localRoot(), rel);
+                await writeFile(local('a.txt'), 'local edit');
+                d.nodes.set(d.uid('a.txt'), makeMockNode({ uid: d.uid('a.txt'), parentUid: d.root.uid, nameStr: 'a.txt', type: NodeType.File, content: 'cloud edit' }));
+                await engine.reconcileNow();
+                const [conflict] = stateDb.listConflicts();
+                const upload = (engine as any).uploadConflictCopy.bind(engine);
+                let copy = '';
+                (engine as any).uploadConflictCopy = async (rel: string, ...rest: unknown[]) => {
+                    copy = rel;
+                    if (what === 'deleted') await rm(local(rel));
+                    else await rename(local(rel), local('elsewhere.txt'));
+                    return upload(rel, ...rest);
+                };
+                const resolved = await engine.resolveConflictManually(conflict.id, 'keep-both');
+                expect(resolved.resolution).toBe('keep-both');
+                expect(await readFile(local('a.txt'), 'utf8')).toBe('cloud edit');
+                expect(stateDb.getItemByPath(copy)).toBeNull();
+                if (what === 'moved') expect(await readFile(local('elsewhere.txt'), 'utf8')).toBe('local edit');
+                await engine.reconcileNow();
+                expect(await readFile(local('a.txt'), 'utf8')).toBe('cloud edit');
+                if (what === 'moved') {
+                    const uploaded = [...d.nodes.values()].filter((n) => n.parentUid === d.root.uid && d.nameOf(n) === 'elsewhere.txt');
+                    expect(uploaded.map((n) => n.content)).toEqual(['local edit']);
+                }
+            });
+        }
+    });
 });
