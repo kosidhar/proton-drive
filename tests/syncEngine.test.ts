@@ -8643,5 +8643,38 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-both']);
             expect(d.calls.trashed).toEqual([]);
         });
+
+        test('a file let through while changing that then stops keeps both once it has been quiet, without waiting for the minute-long purge', async () => {
+            const d = makeMockDrive();
+            let now = Date.now();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                settle: { quietMs: 2000, maxQuietMs: 16_000, maxWaitMs: 120_000, now: () => now, schedule: () => () => {} },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('log.txt', 'line 0\n');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+            d.nodes.set(
+                d.uid('log.txt'),
+                makeMockNode({ uid: d.uid('log.txt'), parentUid: d.root.uid, nameStr: 'log.txt', type: NodeType.File, content: 'cloud edit' }),
+            );
+            const downloadsBefore = d.calls.downloads.length;
+            const forced = () => (engine as any).settlingFiles.get('log.txt')?.forced === true;
+            // Written to every second until a pass lets it through only because it kept changing; then it stops
+            for (let i = 1; i <= 200 && !forced(); i++) {
+                appendFileSync(local('log.txt'), `line ${i}\n`);
+                await engine.reconcileNow();
+                now += 1000;
+            }
+            expect(forced()).toBe(true);
+            expect(d.calls.downloads.length).toBe(downloadsBefore);
+
+            now += 20_000; // quiet for longer than its wait, well before the 60 s after which a settled entry is forgotten
+            await engine.reconcileNow();
+            expect(d.calls.downloads.length).toBe(downloadsBefore + 1);
+            expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-both']);
+        });
     });
 });
