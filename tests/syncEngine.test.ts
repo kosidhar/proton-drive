@@ -7165,6 +7165,66 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(await readFile(path.join(files.syncDir(), 'Docs/doc.txt'), 'utf8')).toBe('old');
             });
 
+            // #65: another device changed the node since the drive showed it, and the remote index has heard (a listing,
+            // an event): the file here is no longer an edit of what the cloud has, so a delete or rename through the
+            // drive leaves the cloud node alone, as for a collision (#29), for the conflict handling to see
+            const changedSinceShown = async () => {
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                await d.engine.reconcileNow();
+                await truncatedAndWritten(d, 'Docs/doc.txt', 'mine');
+                changeInCloud(d, 'vol~Docs/doc.txt', 'theirs, longer');
+                d.engine.remoteIndex.upsert(entryFromNode(d.nodes.get('vol~Docs/doc.txt')!, 'Docs')!); // as a listing would
+                expect(stateDb.getEditBaseline('Docs/doc.txt')?.nodeUid).toBe('vol~Docs/doc.txt');
+                return d;
+            };
+            const docEntry = (d: ReturnType<typeof setup>) => d.engine.vfsChildren('Docs').find((e) => e.name === 'doc.txt');
+
+            test('changed in the cloud since the drive showed it, it lists as the local file, and a delete keeps the cloud node', async () => {
+                const d = await changedSinceShown();
+                expect(docEntry(d)?.size).toBe(4);
+
+                await d.engine.deleteItem('Docs/doc.txt');
+                await d.engine.replayRemoteOps();
+
+                expect(d.journal()).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs, longer');
+                expect(await d.files.exists('Docs/doc.txt')).toBe(false);
+                expect(stateDb.getEditBaseline('Docs/doc.txt')).toBeNull();
+                expect(docEntry(d)?.size).toBe('theirs, longer'.length);
+                await d.engine.reconcileNow();
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.calls.uploads).toEqual([]);
+            });
+
+            test('changed in the cloud since the drive showed it, a rename moves only the local file', async () => {
+                const d = await changedSinceShown();
+
+                await d.engine.renameItem('Docs/doc.txt', 'Docs/mine.txt');
+                await d.engine.replayRemoteOps();
+
+                expect(d.calls.renamed).toEqual([]);
+                expect(d.nameOf(d.nodes.get('vol~Docs/doc.txt')!)).toBe('doc.txt');
+                expect(stateDb.getEditBaseline('Docs/mine.txt')).toBeNull();
+                await d.engine.reconcileNow();
+                expect(d.calls.uploads).toEqual(['Docs/mine.txt']);
+                expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs, longer');
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test('unchanged in the cloud since the drive showed it, a delete through the drive still trashes the node', async () => {
+                const d = setup();
+                d.add('Docs/doc.txt', 'old');
+                await d.engine.reconcileNow();
+                await truncatedAndWritten(d, 'Docs/doc.txt', 'mine');
+
+                await d.engine.deleteItem('Docs/doc.txt');
+                await d.engine.replayRemoteOps();
+
+                expect(d.calls.trashed).toEqual([['vol~Docs/doc.txt']]);
+            });
+
             // Final review M-3 (deferred L157): a file being edited through the drive with no record yet is an edit of
             // its baseline's node. Another device may have put a node of its own at that path since, which the index then
             // holds: deleting or renaming the file here acts on the baseline's node, never on that one.
