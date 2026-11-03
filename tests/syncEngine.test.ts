@@ -34,6 +34,7 @@ import {
 import { LAYOUT_MOVING } from '../src/sync/layoutMigration';
 import { RemoteOpsJournal } from '../src/sync/remoteOps';
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
+import { APICodeError, APIHTTPError } from '@protontech/drive-sdk/internal/apiService/errors';
 import { localFiles } from './helpers/localFiles';
 import { makeMockDrive } from './helpers/mockDrive';
 import { makeMockNode } from './helpers/mockNodes';
@@ -3869,6 +3870,608 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         }
     });
 
+    // A recorded file on both sides: whether the cloud changed since the record, and the keep-both conflict handling
+    describe('a recorded file changed on both sides', () => {
+        // Docs/doc.txt downloaded through the engine (pinned), so its record is real; withoutChecksum makes its cloud node
+        // one another client uploaded with no claimed SHA1
+        const synced = async (layout: 'plain' | 'virtual', withoutChecksum = false) => {
+            if (layout === 'virtual') {
+                stateDb.setMeta('driveLayout', 'virtual');
+            }
+            const drive = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+            });
+            drive.add('Docs/doc.txt', 'old');
+            const stripChecksum = (uid: string) => {
+                const node = drive.nodes.get(uid)!;
+                drive.nodes.set(uid, { ...node, activeRevision: { ...node.activeRevision!, claimedDigests: undefined } } as any);
+            };
+            if (withoutChecksum) {
+                stripChecksum('vol~Docs/doc.txt');
+            }
+            engine.availability.setPin(drive.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            expect(drive.calls.downloads).toEqual(['Docs/doc.txt']);
+            drive.calls.downloads.length = 0;
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            // Another device's new revision: a later time, and a new size and content (with no claimed SHA1 if asked)
+            const changeInCloud = (content: string, checksum = true) => {
+                const node = drive.nodes.get('vol~Docs/doc.txt')!;
+                const later = new Date(node.modificationTime.getTime() + 60_000);
+                drive.nodes.set(
+                    node.uid,
+                    makeMockNode({ uid: node.uid, parentUid: node.parentUid, nameStr: 'doc.txt', type: NodeType.File, content, modificationTime: later }),
+                );
+                const changed = drive.nodes.get(node.uid)!;
+                drive.nodes.set(node.uid, { ...changed, activeRevision: { ...changed.activeRevision!, claimedModificationTime: later } });
+                if (!checksum) {
+                    stripChecksum(node.uid);
+                }
+            };
+            const copiesIn = async (dir: string) => (await readdir(local(dir))).filter((n) => n.startsWith('doc (conflict ')).sort();
+            const cloudCopies = () =>
+                [...drive.nodes.values()].filter((n) => n.parentUid === 'vol~Docs' && drive.nameOf(n).startsWith('doc (conflict '));
+            return { ...drive, engine, local, changeInCloud, copiesIn, cloudCopies };
+        };
+
+        for (const layout of ['plain', 'virtual'] as const) {
+            describe(`in the ${layout} layout`, () => {
+                // #24: with no SHA1 on either side, the record and the cloud are compared by claimed time and size
+                describe('with no checksum on either side (#24)', () => {
+                    // As a record made from what the remote index knows of such a node (a file replaced through the
+                    // drive) has it: no SHA1 for the cloud side
+                    const withRecordWithoutChecksum = async () => {
+                        const d = await synced(layout, true);
+                        const record = stateDb.getItemByPath('Docs/doc.txt')!;
+                        stateDb.upsertItem({ ...record, remoteSha1: null });
+                        return d;
+                    };
+
+                    test("another device's edit comes down", async () => {
+                        const d = await withRecordWithoutChecksum();
+                        d.changeInCloud('theirs!', false);
+
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs!');
+                        expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs!');
+                        expect(d.calls.uploads).toEqual([]);
+                        expect(d.calls.trashed).toEqual([]);
+                    });
+
+                    test('a local edit after it is a conflict, never uploaded over it', async () => {
+                        const d = await withRecordWithoutChecksum();
+                        d.changeInCloud('theirs!', false);
+                        await writeFile(d.local('Docs/doc.txt'), 'mine');
+
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs!');
+                        expect(d.calls.uploads).not.toContain('Docs/doc.txt');
+                        expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs!');
+                        const copies = d.cloudCopies();
+                        expect(copies.length).toBe(1);
+                        expect(copies[0]?.content).toBe('mine');
+                        expect(d.calls.trashed).toEqual([]);
+                    });
+
+                    test('unchanged in the cloud, nothing comes down, and a local edit uploads as a new revision', async () => {
+                        const d = await withRecordWithoutChecksum();
+                        await d.engine.reconcileNow();
+                        expect(d.calls.downloads).toEqual([]);
+                        expect(d.calls.uploads).toEqual([]);
+
+                        await writeFile(d.local('Docs/doc.txt'), 'mine');
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('mine');
+                        expect(d.calls.uploads).toEqual(['Docs/doc.txt']);
+                        expect(d.calls.downloads).toEqual([]);
+                        expect(d.cloudCopies()).toEqual([]);
+                    });
+                });
+
+                // A record keeps what the cloud claims, never a SHA1 computed here in place of one it doesn't claim: a
+                // node with none then reads as unchanged until its time or size change (#24 follow-up)
+                describe('downloaded from a cloud node with no checksum', () => {
+                    test('the record keeps no SHA1 for the cloud side, and later passes bring nothing more down', async () => {
+                        const d = await synced(layout, true);
+                        expect(stateDb.getItemByPath('Docs/doc.txt')?.remoteSha1).toBeNull();
+                        expect(stateDb.getItemByPath('Docs/doc.txt')?.localSha1).toHaveLength(40);
+
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(d.calls.downloads).toEqual([]);
+                        expect(d.calls.uploads).toEqual([]);
+                    });
+
+                    test('a local edit uploads as a new revision, not a conflict', async () => {
+                        const d = await synced(layout, true);
+                        await writeFile(d.local('Docs/doc.txt'), 'mine');
+
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('mine');
+                        expect(d.calls.uploads).toEqual(['Docs/doc.txt']);
+                        expect(d.calls.downloads).toEqual([]);
+                        expect(d.cloudCopies()).toEqual([]);
+                    });
+
+                    test("another device's edit (a new time and size, still with no checksum) comes down once", async () => {
+                        const d = await synced(layout, true);
+                        d.changeInCloud('theirs!', false);
+
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs!');
+                        expect(d.calls.downloads).toEqual(['Docs/doc.txt']);
+                        expect(d.calls.uploads).toEqual([]);
+                    });
+
+                    test('a new time alone in the cloud is a change too', async () => {
+                        const d = await synced(layout, true);
+                        const node = d.nodes.get('vol~Docs/doc.txt')!;
+                        const later = new Date(node.modificationTime.getTime() + 60_000);
+                        d.nodes.set(node.uid, {
+                            ...node,
+                            content: 'new',
+                            modificationTime: later,
+                            activeRevision: { ...node.activeRevision!, claimedModificationTime: later },
+                        });
+
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('new');
+                        expect(d.calls.downloads).toEqual(['Docs/doc.txt']);
+                    });
+
+                    test('with no claimed size either, later passes still bring nothing more down', async () => {
+                        const d = await synced(layout, true);
+                        const node = d.nodes.get('vol~Docs/doc.txt')!;
+                        d.nodes.set(node.uid, { ...node, activeRevision: { ...node.activeRevision!, claimedSize: undefined } } as any);
+
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(d.calls.downloads).toEqual([]);
+                        expect(d.calls.uploads).toEqual([]);
+                    });
+
+                    test('its unchanged local copy can still be freed', async () => {
+                        const d = await synced(layout, true);
+
+                        const result = await d.engine.setAvailability('Docs/doc.txt', 'free');
+
+                        expect(result.kept).toEqual([]);
+                        expect(await stat(d.local('Docs/doc.txt')).then(() => true, () => false)).toBe(false);
+                        expect(d.calls.trashed).toEqual([]);
+                    });
+                });
+
+                // The common case stays as it was: with a SHA1 on both sides, the SHA1 alone decides
+                describe('with a checksum on both sides', () => {
+                    test('a new time in the cloud for the same content brings nothing down, and a local edit uploads', async () => {
+                        const d = await synced(layout);
+                        const node = d.nodes.get('vol~Docs/doc.txt')!;
+                        const later = new Date(node.modificationTime.getTime() + 60_000);
+                        d.nodes.set(node.uid, {
+                            ...node,
+                            modificationTime: later,
+                            activeRevision: { ...node.activeRevision!, claimedModificationTime: later },
+                        });
+
+                        await d.engine.reconcileNow();
+                        expect(d.calls.downloads).toEqual([]);
+                        expect(d.calls.uploads).toEqual([]);
+
+                        await writeFile(d.local('Docs/doc.txt'), 'mine');
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('mine');
+                        expect(d.calls.uploads).toEqual(['Docs/doc.txt']);
+                        expect(d.calls.downloads).toEqual([]);
+                        expect(d.cloudCopies()).toEqual([]);
+                    });
+
+                    test("another device's edit comes down once", async () => {
+                        const d = await synced(layout);
+                        d.changeInCloud('theirs!');
+
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs!');
+                        expect(d.calls.downloads).toEqual(['Docs/doc.txt']);
+                        expect(d.calls.uploads).toEqual([]);
+                    });
+                });
+
+                // #25: a keep-both whose download of the cloud version fails makes its conflict copy once
+                test('keep-both makes one conflict copy while the cloud version fails to download, then brings it down (#25)', async () => {
+                    const d = await synced(layout);
+                    d.changeInCloud('theirs');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    d.down.add('getFileRevisionDownloader'); // offline for downloads, pass after pass
+
+                    for (let pass = 0; pass < 3; pass++) {
+                        await d.engine.reconcileNow();
+                    }
+                    expect(await d.copiesIn('Docs')).toHaveLength(1);
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('mine');
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+
+                    d.down.delete('getFileRevisionDownloader');
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
+                    const copies = await d.copiesIn('Docs');
+                    expect(copies).toHaveLength(1);
+                    expect(await readFile(d.local(`Docs/${copies[0]}`), 'utf8')).toBe('mine');
+                    expect(d.cloudCopies().map((n) => [d.nameOf(n), n.content])).toEqual([[copies[0], 'mine']]);
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                    expect(d.calls.uploads).not.toContain('Docs/doc.txt');
+                    expect(d.calls.trashed).toEqual([]);
+                    const resolved = stateDb.listConflicts(true).filter((c) => c.localRelPath === 'Docs/doc.txt');
+                    expect(resolved.map((c) => c.conflictCopyPath)).toEqual([`Docs/${copies[0]}`]);
+                });
+
+                test('a retry while fully offline uploads the copy it made, and makes no other (#25)', async () => {
+                    const d = await synced(layout);
+                    d.changeInCloud('theirs');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    d.down.add('getFileRevisionDownloader');
+                    d.down.add('getFileUploader');
+
+                    for (let pass = 0; pass < 3; pass++) {
+                        await d.engine.reconcileNow();
+                    }
+                    expect(await d.copiesIn('Docs')).toHaveLength(1);
+                    expect(d.cloudCopies()).toEqual([]);
+
+                    d.down.clear();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    const copies = await d.copiesIn('Docs');
+                    expect(copies).toHaveLength(1);
+                    expect(d.cloudCopies().map((n) => [d.nameOf(n), n.content])).toEqual([[copies[0], 'mine']]);
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
+                    expect(d.calls.trashed).toEqual([]);
+                });
+
+                test('a copy edited in the cloud while the download fails is left as it is, and a new copy keeps the local version (#25)', async () => {
+                    const d = await synced(layout);
+                    d.changeInCloud('theirs');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    d.down.add('getFileRevisionDownloader');
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    const [made] = d.cloudCopies();
+                    expect(made?.content).toBe('mine'); // uploaded by a pass, as a new local file
+                    d.nodes.set(made!.uid, makeMockNode({ uid: made!.uid, parentUid: 'vol~Docs', nameStr: d.nameOf(made!), type: NodeType.File, content: 'their edit' }));
+
+                    d.down.clear();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.nodes.get(made!.uid)?.content).toBe('their edit');
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
+                    const cloud = d.cloudCopies().map((n) => n.content);
+                    expect(cloud.sort()).toEqual(['mine', 'their edit']);
+                });
+
+                test('a copy deleted in the cloud while the download fails is not taken for the copy: a new one keeps the local version (#25)', async () => {
+                    const d = await synced(layout);
+                    d.changeInCloud('theirs');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    d.down.add('getFileRevisionDownloader');
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    const [made] = d.cloudCopies();
+                    expect(made?.content).toBe('mine');
+                    d.nodes.delete(made!.uid); // another device deletes it
+
+                    d.down.clear();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.nodes.has(made!.uid)).toBe(false);
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
+                    const cloud = d.cloudCopies();
+                    expect(cloud.map((n) => n.content)).toEqual(['mine']);
+                    expect(cloud[0]?.uid).not.toBe(made!.uid);
+                    expect(await d.copiesIn('Docs')).toEqual([d.nameOf(cloud[0]!)]);
+                });
+
+                test('a conflict resolved another way forgets its copy: a later conflict of the same content makes its own (#25)', async () => {
+                    const d = await synced(layout);
+                    d.changeInCloud('theirs');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    d.down.add('getFileRevisionDownloader');
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    const [made] = d.cloudCopies();
+                    expect(made?.content).toBe('mine'); // the keep-both's copy, uploaded by a pass, its download still to come
+
+                    // Resolved by hand, keeping the local version, instead
+                    stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                    d.down.clear();
+                    await d.engine.reconcileNow();
+                    const [conflict] = stateDb.listConflicts().filter((c) => c.localRelPath === 'Docs/doc.txt');
+                    await d.engine.resolveConflictManually(conflict!.id, 'keep-local');
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('mine');
+                    await writeFile(d.local('Docs/doc.txt'), 'other');
+                    await d.engine.reconcileNow();
+
+                    // A later conflict, with the same local content as the first
+                    stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    d.changeInCloud('theirs again');
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs again');
+                    const mine = d.cloudCopies().filter((n) => n.content === 'mine');
+                    expect(mine).toHaveLength(2);
+                    const latest = stateDb.listConflicts(true).find((c) => c.resolution === 'keep-both');
+                    expect(latest?.conflictCopyPath).toBeDefined();
+                    expect(latest?.conflictCopyPath).not.toBe(`Docs/${d.nameOf(made!)}`);
+                    expect(d.calls.trashed).toEqual([]);
+                });
+
+                // Review of #25: the copy an earlier, finished conflict made (synced, and since edited in the cloud by
+                // another device) is never taken for this conflict's copy: nothing renames it, and nothing trashes it
+                test('a later keep-both never takes the synced copy of an earlier conflict for its own (#25 review)', async () => {
+                    const d = await synced(layout);
+                    d.changeInCloud('theirs');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    const [first] = await d.copiesIn('Docs');
+                    expect(first).toBeDefined();
+                    expect(d.cloudCopies().map((n) => d.nameOf(n))).toEqual([first!]);
+
+                    // A second conflict, left to the user, with the same local content as the first
+                    stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    d.changeInCloud('theirs again');
+                    await d.engine.reconcileNow();
+                    const [conflict] = stateDb.listConflicts().filter((c) => c.localRelPath === 'Docs/doc.txt');
+                    expect(conflict).toBeDefined();
+
+                    // Another device edits the first conflict's copy in the cloud
+                    const firstCopy = d.cloudCopies()[0]!;
+                    d.nodes.set(
+                        firstCopy.uid,
+                        makeMockNode({ uid: firstCopy.uid, parentUid: 'vol~Docs', nameStr: first!, type: NodeType.File, content: 'their edit of the copy' }),
+                    );
+
+                    await d.engine.resolveConflictManually(conflict!.id, 'keep-both');
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.nodes.get(firstCopy.uid)?.content).toBe('their edit of the copy');
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs again');
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs again');
+                    const cloud = d.cloudCopies().map((n) => [d.nameOf(n), n.content]);
+                    expect(cloud).toHaveLength(2);
+                    expect(cloud).toContainEqual([first!, 'their edit of the copy']);
+                    expect(cloud.filter(([, content]) => content === 'mine')).toHaveLength(1);
+                });
+            });
+        }
+    });
+
+    // #18: an item that fails is marked and retried next pass; the pass goes on with everything else
+    describe('an item that fails in a sync pass (#18)', () => {
+        const withFailingDownload = async (layout: 'plain' | 'virtual', failure: () => Error) => {
+            if (layout === 'virtual') {
+                stateDb.setMeta('driveLayout', 'virtual');
+            }
+            const drive = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+            });
+            const a = drive.add('A');
+            drive.add('A/bad.txt', 'bad');
+            drive.add('A/fine.txt', 'fine');
+            const b = drive.add('B');
+            drive.add('B/good.txt', 'good');
+            drive.add('Z/Deep/x.txt', 'x'); // online-only
+            engine.availability.setPin(a.uid, 'pinned', false);
+            engine.availability.setPin(b.uid, 'pinned', false);
+            let failing = true;
+            let tries = 0;
+            let currentFailure = failure;
+            const real = (drive.sdk as any).getFileRevisionDownloader;
+            (drive.sdk as any).getFileRevisionDownloader = async (revisionUid: string) => {
+                if (failing && revisionUid.startsWith('vol~A/bad.txt')) {
+                    tries += 1;
+                    throw currentFailure();
+                }
+                return real(revisionUid);
+            };
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            const exists = (rel: string) => stat(local(rel)).then(() => true, () => false);
+            return {
+                ...drive,
+                engine,
+                local,
+                exists,
+                heal: () => (failing = false),
+                tries: () => tries,
+                failWith: (next: () => Error) => (currentFailure = next),
+            };
+        };
+        let now = Date.parse('2026-11-02T08:00:00Z');
+        const later = (ms: number) => {
+            now += ms;
+            setSystemTime(now);
+        };
+        beforeEach(() => setSystemTime(now));
+        afterEach(() => setSystemTime());
+        const errorsFor = (rel: string) => stateDb.listActivity(500).filter((a) => a.action === 'error' && a.localRelPath === rel);
+
+        for (const layout of ['plain', 'virtual'] as const) {
+            describe(`in the ${layout} layout`, () => {
+                test('a download that keeps failing is marked and retried, while the pass syncs everything else', async () => {
+                    const d = await withFailingDownload(layout, () => new Error('Integrity check failed'));
+
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(await readFile(d.local('A/fine.txt'), 'utf8')).toBe('fine');
+                    expect(await readFile(d.local('B/good.txt'), 'utf8')).toBe('good');
+                    expect(await d.exists('A/bad.txt')).toBe(false);
+                    expect(d.engine.remoteIndex.getByPath('Z/Deep/x.txt')).not.toBeNull(); // the crawl still ran
+                    const status = d.engine.getStatus();
+                    expect(status.state).toBe('error');
+                    expect(status.lastError).toContain('A/bad.txt');
+                    const failures = stateDb.listActivity(100).filter((a) => a.action === 'error' && a.localRelPath === 'A/bad.txt');
+                    expect(failures.length).toBeGreaterThan(0);
+                    expect(d.calls.trashed).toEqual([]);
+
+                    d.heal();
+                    later(2 * 60_000); // past its backoff
+                    await d.engine.reconcileNow();
+
+                    expect(await readFile(d.local('A/bad.txt'), 'utf8')).toBe('bad');
+                    expect(d.engine.getStatus().state).toBe('idle');
+                    expect(d.engine.getStatus().lastError).toBeNull();
+                    expect(d.calls.trashed).toEqual([]);
+                });
+
+                test('a request refused for that item alone (an HTTP 4xx) fails only that item', async () => {
+                    const d = await withFailingDownload(layout, () => new APIHTTPError('Forbidden', 403));
+
+                    await d.engine.reconcileNow();
+
+                    expect(await readFile(d.local('B/good.txt'), 'utf8')).toBe('good');
+                    expect(d.engine.getStatus().lastError).toContain('A/bad.txt');
+                    expect(d.calls.trashed).toEqual([]);
+                });
+
+                test('an item that keeps failing is logged once, until its error changes', async () => {
+                    const d = await withFailingDownload(layout, () => new Error('Integrity check failed'));
+                    for (let pass = 0; pass < 4; pass++) {
+                        await d.engine.reconcileNow();
+                        later(2 * 60 * 60_000); // past any backoff
+                    }
+                    expect(d.tries()).toBe(4);
+                    expect(errorsFor('A/bad.txt')).toHaveLength(1);
+
+                    d.failWith(() => new Error('Decryption failed'));
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(errorsFor('A/bad.txt').map((a) => a.details.includes('Decryption failed'))).toEqual([true, false]);
+                });
+
+                test('an item that keeps failing backs off, 1 minute doubling up to an hour, and still shows as failing', async () => {
+                    const d = await withFailingDownload(layout, () => new Error('Integrity check failed'));
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    expect(d.tries()).toBe(1);
+                    expect(d.engine.getStatus().lastError).toContain('A/bad.txt');
+                    expect(await readFile(d.local('B/good.txt'), 'utf8')).toBe('good');
+
+                    later(61_000);
+                    await d.engine.reconcileNow();
+                    expect(d.tries()).toBe(2);
+                    later(61_000); // its second failure waits 2 minutes
+                    await d.engine.reconcileNow();
+                    expect(d.tries()).toBe(2);
+                    later(60_000);
+                    await d.engine.reconcileNow();
+                    expect(d.tries()).toBe(3);
+
+                    for (let i = 0; i < 10; i++) {
+                        later(61 * 60_000); // never more than an hour apart
+                        await d.engine.reconcileNow();
+                    }
+                    expect(d.tries()).toBe(13);
+                });
+
+                test('a local change to an item backing off has it looked at again at once', async () => {
+                    const d = await withFailingDownload(layout, () => new Error('Integrity check failed'));
+                    await d.engine.reconcileNow();
+                    expect(d.tries()).toBe(1);
+
+                    await (d.engine as any).handleLocalFileChange('A/bad.txt');
+                    await d.engine.reconcileNow();
+
+                    expect(d.tries()).toBe(2);
+                });
+
+                // Review of #18: an unmapped API code can be that one item's (an outage ends the pass through the SDK's
+                // plain ServerError once its requests keep failing)
+                test('an unmapped API code for one item fails only that item', async () => {
+                    const d = await withFailingDownload(layout, () => new APICodeError('Unknown', 98765));
+
+                    await d.engine.reconcileNow();
+
+                    expect(await readFile(d.local('A/fine.txt'), 'utf8')).toBe('fine');
+                    expect(await readFile(d.local('B/good.txt'), 'utf8')).toBe('good');
+                    expect(d.engine.getStatus().lastError).toContain('A/bad.txt');
+                    expect(d.calls.trashed).toEqual([]);
+                });
+
+                test('a folder whose listing keeps failing backs off and is logged once', async () => {
+                    const d = await withFailingDownload(layout, () => new Error('unused'));
+                    d.heal();
+                    let listingsOfA = 0;
+                    const iterate = (d.sdk as any).iterateFolderChildren;
+                    (d.sdk as any).iterateFolderChildren = (parent: NodeEntity | string) => {
+                        if ((typeof parent === 'string' ? parent : parent.uid) === 'vol~A') {
+                            listingsOfA += 1;
+                        }
+                        return iterate(parent);
+                    };
+                    d.failListing.add('vol~A');
+
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    expect(listingsOfA).toBe(1);
+                    expect(await readFile(d.local('B/good.txt'), 'utf8')).toBe('good');
+                    expect(d.engine.getStatus().lastError).toContain('A');
+
+                    for (let pass = 0; pass < 3; pass++) {
+                        later(2 * 60 * 60_000);
+                        await d.engine.reconcileNow();
+                    }
+                    expect(listingsOfA).toBe(4);
+                    expect(errorsFor('A')).toHaveLength(1);
+                });
+
+                test('offline, the pass still stops at the first failure rather than fail every item', async () => {
+                    const d = await withFailingDownload(layout, () => new ConnectionError('Network unreachable'));
+
+                    await d.engine.reconcileNow();
+
+                    expect(d.engine.getStatus().state).toBe('error');
+                    expect(await d.exists('B/good.txt')).toBe(false);
+                    expect(d.calls.downloads).not.toContain('B/good.txt');
+                    expect(d.calls.trashed).toEqual([]);
+                });
+            });
+        }
+    });
+
     // Renames, moves and deletes made through the virtual drive: done here at once, and in Proton Drive from a persistent,
     // ordered journal, so they also work offline (spec §5.2)
     describe('drive operations', () => {
@@ -3918,6 +4521,254 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await d.engine.reconcileNow();
             await d.engine.reconcileNow(); // records the folders made to hold what came down
         };
+
+        // #39: a refusal the SDK doesn't map (an APICodeError, or an APIHTTPError with a 4xx) never stalls the journal
+        describe('an operation Proton Drive keeps refusing (#39)', () => {
+            const refusing = async (error: () => Error) => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                d.add('Docs/b.txt', 'b');
+                await d.engine.reconcileNow();
+                const rename = (d.sdk as any).renameNode;
+                let refusals = 0;
+                (d.sdk as any).renameNode = async (uid: string, name: string) => {
+                    if (uid === 'vol~Docs/a.txt') {
+                        refusals += 1;
+                        throw error();
+                    }
+                    return rename(uid, name);
+                };
+                await d.engine.renameItem('Docs/a.txt', 'Docs/a2.txt');
+                await d.engine.renameItem('Docs/b.txt', 'Docs/b2.txt'); // later, and independent of it
+                return { ...d, refusals: () => refusals };
+            };
+
+            for (const [kind, error, tries] of [
+                ['an HTTP 4xx', () => new APIHTTPError('Unprocessable Entity', 422), 3],
+                // The 2xxx family of API codes are validation refusals, which don't change
+                ['an API code of the 2xxx validation family', () => new APICodeError('Operation not allowed', 2061), 3],
+            ] as const) {
+                test(`refused with ${kind}, it is given up on after ${tries} tries, the user told once, and later operations go on`, async () => {
+                    const d = await refusing(error);
+
+                    for (let i = 0; i < tries + 3; i++) {
+                        await d.engine.replayRemoteOps();
+                    }
+
+                    expect(d.refusals()).toBe(tries);
+                    expect(d.calls.renamed).toEqual([{ uid: 'vol~Docs/b.txt', name: 'b2.txt' }]);
+                    expect(d.journal()).toEqual([]);
+                    const told = activity().filter((a) => a.includes('Docs/a2.txt') && a.includes('given up on'));
+                    expect(told).toHaveLength(1);
+
+                    // The next sync follows what Proton Drive has: the item is back under its old name, nothing lost
+                    await d.engine.reconcileNow();
+                    expect(d.engine.remoteIndex.getByPath('Docs/a.txt')?.uid).toBe('vol~Docs/a.txt');
+                    expect(d.engine.remoteIndex.getByPath('Docs/a2.txt')).toBeNull();
+                    expect(d.engine.remoteIndex.getByPath('Docs/b2.txt')?.uid).toBe('vol~Docs/b.txt');
+                    expect(d.nodes.has('vol~Docs/a.txt')).toBe(true);
+                    expect(d.calls.trashed).toEqual([]);
+                });
+            }
+
+            // An API code outside the 2xxx family may be what a 5xx outage or an expired session answers with (the SDK
+            // keeps no HTTP status with it): only a day of failing gives it up
+            describe('refused with an API code outside the 2xxx family, which a server outage can answer with', () => {
+                afterEach(() => setSystemTime());
+
+                test('it is still tried after many tries and over an hour, keeping the order', async () => {
+                    let now = Date.parse('2026-11-02T08:00:00Z');
+                    setSystemTime(now);
+                    const d = await refusing(() => new APICodeError('Service unavailable', 503));
+
+                    for (let i = 0; i < 30; i++) {
+                        now += 3 * 60_000;
+                        setSystemTime(now);
+                        await d.engine.replayRemoteOps();
+                    }
+
+                    expect(d.refusals()).toBeGreaterThanOrEqual(5); // with backoff, never given up on
+                    expect(d.journal().map((op) => (op.kind === 'trash' ? op.path : op.toPath))).toEqual(['Docs/a2.txt', 'Docs/b2.txt']);
+                    expect(d.calls.renamed).toEqual([]);
+                    expect(activity().filter((a) => a.includes('given up on'))).toEqual([]);
+                });
+
+                test('it is retried with backoff, not on every replay', async () => {
+                    const now = Date.parse('2026-11-02T08:00:00Z');
+                    setSystemTime(now);
+                    const d = await refusing(() => new APICodeError('Service unavailable', 503));
+                    for (let i = 0; i < 10; i++) {
+                        await d.engine.replayRemoteOps(); // all at the same moment
+                    }
+                    expect(d.refusals()).toBeLessThanOrEqual(3);
+                });
+
+                test('it is given up on after a day of failing, the user told once, and later operations go on', async () => {
+                    let now = Date.parse('2026-11-02T08:00:00Z');
+                    setSystemTime(now);
+                    const d = await refusing(() => new APICodeError('Unknown', 98765));
+
+                    for (let hour = 0; hour < 23; hour++) {
+                        now += 60 * 60_000;
+                        setSystemTime(now);
+                        await d.engine.replayRemoteOps();
+                    }
+                    expect(d.journal()).toHaveLength(2);
+                    for (let i = 0; i < 3; i++) {
+                        now += 60 * 60_000;
+                        setSystemTime(now);
+                        await d.engine.replayRemoteOps();
+                    }
+
+                    expect(d.journal()).toEqual([]);
+                    expect(d.calls.renamed).toEqual([{ uid: 'vol~Docs/b.txt', name: 'b2.txt' }]);
+                    expect(activity().filter((a) => a.includes('Docs/a2.txt') && a.includes('given up on'))).toHaveLength(1);
+                    expect(d.calls.trashed).toEqual([]);
+                });
+            });
+
+            // Review of #39: the day counts only unmapped-code failures in a row, never time spent offline
+            describe('the day an unmapped API code is given', () => {
+                afterEach(() => setSystemTime());
+                const refusingWith = async () => {
+                    let now = Date.parse('2026-11-02T08:00:00Z');
+                    setSystemTime(now);
+                    let next: () => Error = () => new ConnectionError('Network unreachable');
+                    const d = await refusing(() => next());
+                    return {
+                        ...d,
+                        answer: (error: () => Error) => (next = error),
+                        at: (ms: number) => {
+                            now += ms;
+                            setSystemTime(now);
+                        },
+                    };
+                };
+
+                test('two days offline, then one unmapped-code blip, gives nothing up', async () => {
+                    const d = await refusingWith();
+                    for (let hour = 0; hour < 48; hour++) {
+                        d.at(60 * 60_000);
+                        await d.engine.replayRemoteOps();
+                    }
+                    d.answer(() => new APICodeError('Service unavailable', 503));
+                    d.at(60_000);
+                    await d.engine.replayRemoteOps();
+
+                    expect(d.journal()).toHaveLength(2);
+                    expect(activity().filter((a) => a.includes('given up on'))).toEqual([]);
+                });
+
+                test('an unmapped code after other failures starts its day afresh', async () => {
+                    const d = await refusingWith();
+                    d.answer(() => new APICodeError('Service unavailable', 503));
+                    for (let hour = 0; hour < 20; hour++) {
+                        d.at(60 * 60_000);
+                        await d.engine.replayRemoteOps();
+                    }
+                    d.answer(() => new APIHTTPError('Bad Gateway', 502)); // a failure of another kind ends the run
+                    d.at(60 * 60_000);
+                    await d.engine.replayRemoteOps();
+                    d.answer(() => new APICodeError('Service unavailable', 503));
+                    for (let hour = 0; hour < 10; hour++) {
+                        d.at(60 * 60_000);
+                        await d.engine.replayRemoteOps();
+                    }
+
+                    expect(d.journal()).toHaveLength(2);
+                    expect(activity().filter((a) => a.includes('given up on'))).toEqual([]);
+                });
+
+                test('a day with fewer than 5 unmapped-code tries gives nothing up yet; the 5th does', async () => {
+                    const d = await refusingWith();
+                    d.answer(() => new APICodeError('Unknown', 98765));
+                    d.at(60_000);
+                    await d.engine.replayRemoteOps(); // 1st
+                    d.at(25 * 60 * 60_000); // asleep for a day
+                    await d.engine.replayRemoteOps(); // 2nd
+                    d.at(2 * 60 * 60_000);
+                    await d.engine.replayRemoteOps(); // 3rd
+                    d.at(2 * 60 * 60_000);
+                    await d.engine.replayRemoteOps(); // 4th
+                    expect(d.journal()).toHaveLength(2);
+
+                    d.at(2 * 60 * 60_000);
+                    await d.engine.replayRemoteOps(); // 5th
+
+                    expect(d.journal()).toEqual([]);
+                    expect(d.calls.renamed).toEqual([{ uid: 'vol~Docs/b.txt', name: 'b2.txt' }]);
+                    expect(activity().filter((a) => a.includes('Docs/a2.txt') && a.includes('given up on'))).toHaveLength(1);
+                });
+            });
+
+            test('refused with an HTTP 401 (a session that expired), it is never given up on quickly', async () => {
+                const d = await refusing(() => new APIHTTPError('Unauthorized', 401));
+
+                for (let i = 0; i < 12; i++) {
+                    await d.engine.replayRemoteOps();
+                }
+
+                expect(d.journal()).toHaveLength(2);
+                expect(d.calls.renamed).toEqual([]);
+                expect(activity().filter((a) => a.includes('given up on'))).toEqual([]);
+            });
+
+            test('a rename of a file kept on this computer, given up on, puts its local copy back under the old name', async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                await pinnedAndSynced(d, d.nodes.get('vol~Docs')!.uid);
+                (d.sdk as any).renameNode = async () => {
+                    throw new APICodeError('Operation not allowed', 2061);
+                };
+                await d.engine.renameItem('Docs/a.txt', 'Docs/a2.txt');
+                for (let i = 0; i < 12; i++) {
+                    await d.engine.replayRemoteOps();
+                }
+                expect(d.journal()).toEqual([]);
+
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+
+                expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('a');
+                expect(await d.files.exists('Docs/a2.txt')).toBe(false);
+                expect(stateDb.getItemByPath('Docs/a.txt')?.nodeUid).toBe('vol~Docs/a.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+                await d.expectEveryRecordHasItsFile();
+            });
+
+            test('a delete given up on brings the item back, never losing it', async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                d.add('Docs/b.txt', 'b');
+                await d.engine.reconcileNow();
+                (d.sdk as any).trashNodes = async function* (uids: string[]) {
+                    for (const uid of uids) yield { uid, ok: false as const, error: new APIHTTPError('Forbidden', 403) };
+                };
+                await d.engine.deleteItem('Docs/a.txt');
+                expect(d.engine.remoteIndex.getByPath('Docs/a.txt')).toBeNull();
+                for (let i = 0; i < 4; i++) {
+                    await d.engine.replayRemoteOps();
+                }
+
+                expect(d.journal()).toEqual([]);
+                expect(d.nodes.has('vol~Docs/a.txt')).toBe(true);
+                expect(d.engine.remoteIndex.getByPath('Docs/a.txt')?.uid).toBe('vol~Docs/a.txt');
+                expect(activity().filter((a) => a.includes('Docs/a.txt') && a.includes('given up on'))).toHaveLength(1);
+            });
+
+            test('refused with an HTTP 5xx, it stays pending and is tried again, keeping the order', async () => {
+                const d = await refusing(() => new APIHTTPError('Bad Gateway', 502));
+
+                for (let i = 0; i < 6; i++) {
+                    await d.engine.replayRemoteOps();
+                }
+
+                expect(d.refusals()).toBeGreaterThanOrEqual(6); // never given up on
+                expect(d.journal().map((op) => (op.kind === 'trash' ? op.path : op.toPath))).toEqual(['Docs/a2.txt', 'Docs/b2.txt']);
+                expect(d.calls.renamed).toEqual([]);
+            });
+        });
 
         test('renaming a folder holding online-only items offline shows at once, survives a restart, and renames once in the cloud when back online', async () => {
             const d = setup();
@@ -4741,6 +5592,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
             await d.engine.reconcileNow();
             expect(d.calls.trashed).toEqual([]);
+            // Left for later on purpose, not by an error
+            expect(stateDb.listActivity(50).filter((a) => a.action === 'error')).toEqual([]);
             d.down.clear();
             await d.engine.reconcileNow();
             await d.engine.reconcileNow();
@@ -4748,6 +5601,27 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.nodes.get('vol~Docs/a.txt')?.parentUid).toBe('vol~Other');
             expect(await readFile(d.local('Other/a.txt'), 'utf8')).toBe('a');
             expect(d.calls.trashed).toEqual([['vol~Docs']]); // the folder, with only b.txt in it by then
+            await d.expectEveryRecordHasItsFile();
+        });
+
+        // #62: with an unrelated change through the drive pending, a file deleted here (not through the drive) is trashed
+        // in the cloud as usual; it used to throw in trashForDeletedLocal, and was left alone only by that error
+        test('a synced file deleted on disk while an unrelated drive change waits is trashed as usual', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            d.add('Other/x.txt', 'x');
+            await pinnedAndSynced(d, d.root.uid);
+            d.down.add('renameNode');
+            await d.engine.renameItem('Other/x.txt', 'Other/y.txt');
+            expect(d.journal()).toHaveLength(1);
+            await rm(d.local('Docs/a.txt')); // not through the drive
+
+            await d.engine.reconcileNow();
+
+            expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+            expect(stateDb.getItemByPath('Docs/a.txt')).toBeNull();
+            expect(stateDb.listActivity(50).filter((a) => a.action === 'error')).toEqual([]);
+            expect(d.journal()).toHaveLength(1); // the rename still waits
             await d.expectEveryRecordHasItsFile();
         });
 
@@ -5580,7 +6454,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
                 expect(d.calls.uploads).not.toContain('Docs/doc.txt');
                 const copies = cloudNamesIn(d, 'vol~Docs').filter((n) => n.startsWith('doc (conflict '));
-                expect(copies.length).toBeGreaterThan(0);
+                expect(copies.length).toBe(1); // one conflict, one copy, even when a download failed after it was made (#25)
                 for (const copy of copies) {
                     expect(d.named('vol~Docs', copy)[0]?.content).toBe('mine');
                 }

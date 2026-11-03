@@ -14,7 +14,6 @@ import {
     NodeType,
     NodeWithSameNameExistsValidationError,
     type ProtonDriveClient,
-    ServerError,
     ValidationError,
 } from '@protontech/drive-sdk';
 
@@ -37,6 +36,7 @@ import { problemWithBlockedApps } from './settingsRules';
 import { StateEvents } from './stateEvents';
 import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
 import { createLocalConflictCopy, formatConflictFileName } from './conflictResolver';
+import { isTransient, permanentRefusal, unmappedApiCode } from './remoteErrors';
 import { homeTrash, type MoveToDesktopTrash } from './desktopTrash';
 import { readDriveLayout } from './driveMode';
 import { LAYOUT_MOVING, type MoveSeams, relocateFiles, SYNC_DIR_MOVING } from './layoutMigration';
@@ -47,7 +47,7 @@ import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
 import { pathsOverlap } from './mountPoint';
 import { entryFromNode, RemoteIndex, type RemoteIndexEntry } from './remoteIndex';
 import { type RemoteOp, RemoteOpsJournal } from './remoteOps';
-import type { ConflictRecord, EditBaseline, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
+import type { ConflictRecord, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
 import { forgetFailedThumbnail } from './thumbnailCache';
 
 export { DriveOpError, type DriveOpErrorCode, type VfsEntry } from './driveOps';
@@ -75,6 +75,17 @@ export const LOCAL_MOVE_IN_PROGRESS = 'localMoveInProgress';
 // How many times a journalled change may fail for a reason other than the network or the server before it is given up
 // on, so that it can't hold up everything after it for ever
 const MAX_UNEXPECTED_FAILURES = 10;
+// How many times an operation Proton Drive refuses for good (see permanentRefusal) is tried before it is given up on:
+// such a refusal doesn't change, and the journal waits behind it meanwhile (#39)
+const MAX_PERMANENT_REFUSALS = 3;
+// An operation refused with an API code outside the 2xxx family, which a server outage or an expired session can answer
+// with too, is tried again with backoff (up to an hour between tries) and given up on only after failing that way, and
+// no other, for this long and at least this many times in a row (time offline, say, never counts)
+const GIVE_UP_UNMAPPED_AFTER_MS = 24 * 60 * 60_000;
+const MIN_UNMAPPED_FAILURES = 5;
+const MAX_REPLAY_BACKOFF_MS = 60 * 60_000;
+// An item that keeps failing in sync passes is tried again after 1 minute, doubling each time, up to this (#18)
+const MAX_ITEM_BACKOFF_MS = 60 * 60_000;
 // Uid prefix of the remote index entries that stand for folders made here that Proton Drive doesn't have yet, holding
 // what a pending move puts in them (see applyPendingOpsToIndex). Never a node: never resolved, moved or trashed.
 const PROVISIONAL = 'provisional:';
@@ -279,6 +290,15 @@ export class ProtonDriveSyncEngine {
     private missingConfirmed: { root: string; names: Set<string> } | null = null;
     // Conflicts being resolved by hand right now, so that a second request for the same one is refused
     private readonly resolvingConflicts = new Set<number>();
+    // The conflict copy a keep-both made of a file (by its path), and of what content, until that keep-both finishes or
+    // the file's conflict is over some other way (resolved by hand, or the file synced): a retry after its download failed
+    // goes on from it rather than make another (#25)
+    private readonly keepBothCopies = new Map<string, { copyRelPath: string; sha1: string }>();
+    // Items that keep failing in sync passes (#18), by path: the error last logged for each (logged once until it
+    // changes), and how many times in a row each failed and when a pass tries it again (backoff). Both go when the item
+    // syncs, or changes here.
+    private readonly loggedFailures = new Map<string, string>();
+    private readonly failingItems = new Map<string, { message: string; failures: number; retryAt: number }>();
 
     constructor(
         private readonly sdk: ProtonDriveClient,
@@ -910,17 +930,16 @@ export class ProtonDriveSyncEngine {
         st: { size: number; mtimeMs: number },
     ): Promise<boolean> {
         const record = this.stateDb.getItemByPath(relPath);
-        if (!record || record.type !== 'file' || record.syncStatus !== 'synced' || !record.remoteSha1) {
+        // What Proton Drive held when the record was made: the SHA1 it claims, or for a node that claims none, the SHA1
+        // of what came down from it (a record with no SHA1 for the cloud side is only made by a download)
+        const held = record?.remoteSha1 ?? record?.localSha1;
+        if (!record || record.type !== 'file' || record.syncStatus !== 'synced' || !held) {
             return false;
         }
-        if (
-            st.size === record.size &&
-            Math.abs(st.mtimeMs - record.localMtimeMs) < 10 &&
-            record.localSha1 === record.remoteSha1
-        ) {
+        if (st.size === record.size && Math.abs(st.mtimeMs - record.localMtimeMs) < 10 && record.localSha1 === held) {
             return true;
         }
-        return (await computeLocalFileSha1(fullPath).catch(() => null)) === record.remoteSha1;
+        return (await computeLocalFileSha1(fullPath).catch(() => null)) === held;
     }
 
     markFoldersSyncing(folderNames: string[]): void {
@@ -955,8 +974,10 @@ export class ProtonDriveSyncEngine {
         if (this.filesGone(true)) {
             return; // Looked at again at the next pass
         }
-        // This pass takes the items the user confirmed as deleted for deletes, and uses the confirmation up
+        // This pass takes the items the user confirmed as deleted for deletes, and uses the confirmation up (unless an
+        // item it touches failed: then the next pass does)
         const confirmation = this.missingConfirmed;
+        let keepConfirmation = false;
 
         this.reconcileRunning = true;
         this.state = 'syncing';
@@ -988,11 +1009,18 @@ export class ProtonDriveSyncEngine {
             // and in the GUI dashboard immediately instead of waiting for a full tree scan.
             const remoteMap = new Map<string, NodeEntity>();
             const onlineOnly: OnlineOnlyFolder[] = [];
+            const failed: SyncFailure[] = [];
             await this.observingLocal((since) =>
-                this.reconcileDirectoryIncremental(root, '', remoteMap, this.stateDb.getSettings(), since, onlineOnly),
+                this.reconcileDirectoryIncremental(root, '', remoteMap, this.stateDb.getSettings(), since, onlineOnly, failed),
             );
-            if (confirmation !== null) {
+            // The user's confirmed deletes wait for a pass that got through everything they touch
+            const confirmedTouchFailed =
+                confirmation !== null &&
+                failed.some((f) => [...confirmation.names].some((name) => isWithin(f.relPath, name) || isWithin(name, f.relPath)));
+            if (confirmation !== null && !confirmedTouchFailed) {
                 await this.trashConfirmedOutOfReach(confirmation);
+            } else if (confirmedTouchFailed) {
+                keepConfirmation = true;
             }
             // Hides that were waiting for uploads finish once those are done
             await this.completePendingHides();
@@ -1002,7 +1030,16 @@ export class ProtonDriveSyncEngine {
             }
 
             this.lastSyncAt = Date.now();
-            if (this.syncingFolders.size === 0) {
+            if (failed.length > 0) {
+                // Everything else synced; these are tried again at the next pass
+                const first = failed[0]!;
+                this.lastError =
+                    failed.length === 1
+                        ? `Could not sync ${first.relPath}: ${first.message}`
+                        : `Could not sync ${failed.length} items (${first.relPath}: ${first.message}, and others)`;
+                this.currentAction = null;
+                this.state = 'error';
+            } else if (this.syncingFolders.size === 0) {
                 this.currentAction = null;
                 this.state = this.stateDb.getSettings().paused ? 'paused' : 'idle';
             }
@@ -1028,7 +1065,7 @@ export class ProtonDriveSyncEngine {
             } catch (error: unknown) {
                 this.logger.warn(`Could not look at what is missing after the files came back; the next pass looks again: ${error}`);
             }
-            if (confirmation !== null && this.missingConfirmed === confirmation) {
+            if (confirmation !== null && this.missingConfirmed === confirmation && !keepConfirmation) {
                 this.missingConfirmed = null;
             }
             if (this.replayAfterPass) {
@@ -1224,13 +1261,27 @@ export class ProtonDriveSyncEngine {
                     remoteNode.activeRevision?.claimedModificationTime ?? remoteNode.modificationTime
                 ).getTime();
 
-                // Fast path: if mtime & size match DB record and remoteSha1 matches DB record, no SHA1 recomputation needed
+                // What the record says the cloud held when it was made (its size is the local one, the same then)
+                const remoteAtSync: CloudVersion | null = dbRecord
+                    ? { sha1: dbRecord.remoteSha1, mtimeMs: dbRecord.remoteMtimeMs, size: dbRecord.size }
+                    : null;
+                // A node that claims no size has none to compare: against a record, its size is no change (its time and
+                // SHA1 still count); an edit baseline kept it as 0, as the remote index does
+                const remoteNow: CloudVersion = {
+                    sha1: remoteSha1,
+                    mtimeMs: remoteMtimeMs,
+                    size: getClaimedSize(remoteNode) ?? remoteAtSync?.size ?? 0,
+                };
+
+                // Fast path: the local file's time and size match the record, and the cloud hasn't changed since it: no
+                // SHA1 recomputation needed
                 if (
                     dbRecord &&
+                    remoteAtSync &&
                     dbRecord.syncStatus === 'synced' &&
                     Math.abs(localInfo.mtimeMs - dbRecord.localMtimeMs) < 10 &&
                     localInfo.size === dbRecord.size &&
-                    remoteSha1 === dbRecord.remoteSha1
+                    !cloudChangedSince(remoteAtSync, remoteNow)
                 ) {
                     return;
                 }
@@ -1267,9 +1318,9 @@ export class ProtonDriveSyncEngine {
                 const edit = dbRecord ? null : this.stateDb.getEditBaseline(relPath);
                 const editOfThis = edit?.nodeUid === remoteNode.uid ? edit : null;
                 const localChangedSinceSync = !dbRecord || localSha1 !== dbRecord.localSha1;
-                const remoteChangedSinceSync = dbRecord
-                    ? remoteSha1 !== dbRecord.remoteSha1
-                    : !editOfThis || cloudChangedSince(editOfThis, remoteSha1, remoteMtimeMs, getClaimedSize(remoteNode) ?? 0);
+                const remoteChangedSinceSync = remoteAtSync
+                    ? cloudChangedSince(remoteAtSync, remoteNow)
+                    : !editOfThis || cloudChangedSince(editOfThis, remoteNow);
 
                 if (localChangedSinceSync && !remoteChangedSinceSync) {
                     const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
@@ -1348,6 +1399,7 @@ export class ProtonDriveSyncEngine {
                 resolved: true,
                 resolution: 'keep-local',
             });
+            this.keepBothCopies.delete(relPath);
             return;
         }
 
@@ -1363,14 +1415,12 @@ export class ProtonDriveSyncEngine {
                 resolved: true,
                 resolution: 'keep-remote',
             });
+            this.keepBothCopies.delete(relPath);
             return;
         }
 
         // Default: keep-both
-        const conflictCopyFullPath = await createLocalConflictCopy(localFullPath);
-        const madeAs = path.relative(this.localRoot(), conflictCopyFullPath).split(path.sep).join('/');
-        await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
-        const conflictCopyRelPath = await this.uploadConflictCopy(madeAs, remoteMap, since);
+        const conflictCopyRelPath = await this.keepBoth(relPath, localFullPath, localSha1, remoteNode, remoteMap, since);
 
         this.stateDb.recordConflict({
             localRelPath: relPath,
@@ -1388,6 +1438,69 @@ export class ProtonDriveSyncEngine {
             localRelPath: relPath,
             details: `Resolved conflict with keep-both: saved ${conflictCopyRelPath}`,
         });
+    }
+
+    // Keeps both versions of a file in conflict: its local content as a conflict copy, uploaded as a new file, and the
+    // cloud's version in its place. Returns where the copy ends up. One conflict makes one copy (#25): a retry after the
+    // download failed goes on from the copy the earlier try made (see earlierKeepBothCopy), and nothing else is ever
+    // taken for it. A copy nothing tracks yet is uploaded as made; refused (its name taken in Proton Drive), it stays as
+    // it is and a new copy is made, so no file anything tracks is ever renamed.
+    private async keepBoth(
+        relPath: string,
+        localFullPath: string,
+        localSha1: string,
+        remoteNode: NodeEntity,
+        remoteMap: Map<string, NodeEntity>,
+        since: number,
+    ): Promise<string> {
+        const earlier = await this.earlierKeepBothCopy(relPath, localSha1);
+        let copyRelPath: string | null = null;
+        if (earlier?.inCloud) {
+            copyRelPath = earlier.relPath;
+        } else if (earlier) {
+            const parentNode = await this.ensureParentFolderNode(earlier.relPath, remoteMap, since);
+            const fullPath = path.join(this.localRoot(), earlier.relPath);
+            const result = await this.uploadLocalToRemote(earlier.relPath, fullPath, parentNode, since, undefined, 'skip');
+            copyRelPath = result.status === 'skipped' ? null : earlier.relPath;
+        }
+        if (copyRelPath !== null) {
+            await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
+            this.keepBothCopies.delete(relPath);
+            return copyRelPath;
+        }
+        const madeAs = path.relative(this.localRoot(), await createLocalConflictCopy(localFullPath)).split(path.sep).join('/');
+        this.keepBothCopies.set(relPath, { copyRelPath: madeAs, sha1: localSha1 });
+        await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
+        // Past the download no retry comes (the file now holds the cloud's version): a copy whose upload fails here is
+        // a new local file to the next pass
+        this.keepBothCopies.delete(relPath);
+        return await this.uploadConflictCopy(madeAs, remoteMap, since);
+    }
+
+    // The copy an earlier, unfinished keep-both of this file made of this same content, if it can still be it: as made
+    // (a file nothing tracks: no record and no index entry), or uploaded since, when Proton Drive holds that copy there
+    // with that content now (inCloud: nothing more to upload). A copy of an earlier conflict, finished, is never in
+    // keepBothCopies; one changed, moved or edited in the cloud since is no longer it.
+    private async earlierKeepBothCopy(relPath: string, localSha1: string): Promise<{ relPath: string; inCloud: boolean } | null> {
+        const earlier = this.keepBothCopies.get(relPath);
+        if (!earlier || earlier.sha1 !== localSha1) {
+            return null;
+        }
+        const copyRelPath = earlier.copyRelPath;
+        const fullPath = path.join(this.localRoot(), copyRelPath);
+        const st = lstatSync(fullPath, { throwIfNoEntry: false });
+        if (!st?.isFile() || (await computeLocalFileSha1(fullPath).catch(() => null)) !== localSha1) {
+            return null;
+        }
+        const record = this.stateDb.getItemByPath(copyRelPath);
+        if (!record && !this.index.getByPath(copyRelPath)) {
+            return { relPath: copyRelPath, inCloud: false };
+        }
+        if (record?.type !== 'file' || record.syncStatus !== 'synced' || record.localSha1 !== localSha1) {
+            return null;
+        }
+        const there = await this.nodeStillAt(record.nodeUid, record.parentNodeUid, copyRelPath);
+        return there?.activeRevision?.claimedDigests?.sha1 === localSha1 ? { relPath: copyRelPath, inCloud: true } : null;
     }
 
     // Uploads a conflict copy just made here as a new file, never over a cloud file that already has its name: refused,
@@ -1476,12 +1589,12 @@ export class ProtonDriveSyncEngine {
                 await this.downloadRemoteToLocal(conflict.localRelPath, remoteNode, localFullPath, since);
                 this.stateDb.markConflictResolved(conflictId, 'keep-remote');
             } else {
-                const conflictCopyFullPath = await createLocalConflictCopy(localFullPath);
-                const madeAs = path.relative(this.localRoot(), conflictCopyFullPath).split(path.sep).join('/');
-                await this.downloadRemoteToLocal(conflict.localRelPath, remoteNode, localFullPath, since);
-                const conflictCopyRelPath = await this.uploadConflictCopy(madeAs, remoteMap, since);
+                const localSha1 = await computeLocalFileSha1(localFullPath);
+                const conflictCopyRelPath = await this.keepBoth(conflict.localRelPath, localFullPath, localSha1, remoteNode, remoteMap, since);
                 this.stateDb.markConflictResolved(conflictId, 'keep-both', conflictCopyRelPath);
             }
+            // Resolved, whichever way: a keep-both of it left unfinished before is over too (see keepBoth)
+            this.keepBothCopies.delete(conflict.localRelPath);
         });
     }
 
@@ -1527,7 +1640,8 @@ export class ProtonDriveSyncEngine {
                     parentNodeUid: remoteNode.parentUid ?? null,
                     type: 'file',
                     localSha1: result.sha1 ?? null,
-                    remoteSha1: remoteNode.activeRevision?.claimedDigests?.sha1 ?? result.sha1 ?? null,
+                    // What the cloud claims, null when it claims none: never the SHA1 computed here in its place
+                    remoteSha1: remoteNode.activeRevision?.claimedDigests?.sha1 ?? null,
                     localMtimeMs: result.mtimeMs,
                     remoteMtimeMs,
                     size: result.size,
@@ -1547,11 +1661,7 @@ export class ProtonDriveSyncEngine {
         } catch (error: unknown) {
             const msg = error instanceof Error ? error.message : String(error);
             this.stateDb.setItemStatus(relPath, 'error', msg);
-            this.stateDb.logActivity({
-                action: 'error',
-                localRelPath: relPath,
-                details: `Download failed: ${msg}`,
-            });
+            this.logFailureOnce(relPath, msg, `Download failed: ${msg}`);
             throw error;
         } finally {
             this.activeTransfers.delete(transferId);
@@ -1832,7 +1942,6 @@ export class ProtonDriveSyncEngine {
         const entries = this.index.listSubtree(relPath);
         const syncedUid = new Map(this.stateDb.getItemsUnder(relPath).map((item) => [item.localRelPath, item.nodeUid]));
         const hidden = this.policy.hiddenWithin(relPath);
-        const isWithin = (p: string, dir: string) => p === dir || p.startsWith(`${dir}/`);
         // Everything that never was on this computer, with every folder above it up to the deleted one
         const holdsCloudOnly = new Set<string>();
         const markWithAncestors = (from: string) => {
@@ -1966,6 +2075,9 @@ export class ProtonDriveSyncEngine {
             return false;
         }
         this.stateDb.upsertItem(item);
+        // Synced: whatever conflict it was in is over, and a keep-both of it left unfinished with it (see keepBoth)
+        this.keepBothCopies.delete(relPath);
+        this.forgetFailure(relPath);
         return true;
     }
 
@@ -2125,6 +2237,7 @@ export class ProtonDriveSyncEngine {
 
     private async handleLocalFileChange(relPath: string): Promise<void> {
         this.stateEvents.touch(relPath); // a new file shows as waiting to upload; a removed one goes
+        this.failingItems.delete(relPath); // Changed here: the next pass looks at it again at once
         if (this.holding() || !this.auth.isLoggedIn()) {
             return;
         }
@@ -3151,7 +3264,7 @@ export class ProtonDriveSyncEngine {
                         parentNodeUid: node.parentUid ?? null,
                         type: 'file',
                         localSha1: downloaded.sha1,
-                        remoteSha1: node.activeRevision?.claimedDigests?.sha1 ?? downloaded.sha1,
+                        remoteSha1: node.activeRevision?.claimedDigests?.sha1 ?? null, // as the cloud claims it
                         localMtimeMs: st.mtimeMs,
                         remoteMtimeMs: (node.activeRevision?.claimedModificationTime ?? node.modificationTime).getTime(),
                         size: st.size,
@@ -3289,6 +3402,10 @@ export class ProtonDriveSyncEngine {
                 runsLeft = 3;
             }
             previousId = op.id;
+            const { retryAfter } = this.journal.failures(op.id);
+            if (retryAfter !== null && Date.now() < retryAfter) {
+                return; // Backing off (see replayFailed): everything after it waits, keeping the order
+            }
             const next = op.kind === 'trash' ? await this.replayTrash(op) : await this.replayMove(op);
             if (next === 'stop') {
                 return;
@@ -4132,27 +4249,61 @@ export class ProtonDriveSyncEngine {
 
     // A later operation on the same item decides where it ends up, or trashes it: an earlier one has nothing left to do
     private isSuperseded(op: RemoteOp): boolean {
-        return this.journal.pending().some((later) => later.id > op.id && later.nodeUid === op.nodeUid);
+        return this.journal.hasLaterOn(op.id, op.nodeUid);
     }
 
     // A failed operation stays pending and replay stops, keeping the order; one that keeps failing for a reason that
     // isn't the network or the server is given up on in the end, and the user told (the next sync then follows what the
     // cloud has).
-    private replayFailed(op: RemoteOp, where: string, error: unknown): 'next' | 'stop' {
+    // Refusals Proton Drive answers with are ServerErrors too, yet not all are trouble a later try gets past (#39): a
+    // permanent one (see permanentRefusal) is given up on after MAX_PERMANENT_REFUSALS tries; an API code outside the
+    // 2xxx family, which an outage or an expired session can answer with, only after GIVE_UP_UNMAPPED_AFTER_MS of
+    // failing in a row (MIN_UNMAPPED_FAILURES times at least), tried again with backoff meanwhile; a failure of any other
+    // kind ends that run. Network failures, 5xx, 401 and rate limits are never given up on.
+    private async replayFailed(op: RemoteOp, where: string, error: unknown): Promise<'next' | 'stop'> {
         const message = messageOf(error);
-        if (isTransient(error) || op.attempts + 1 < MAX_UNEXPECTED_FAILURES) {
-            this.journal.failed(op.id, message);
+        const now = Date.now();
+        const keep = (opts: { retryAfter?: number; unmapped?: boolean } = {}): 'stop' => {
+            this.journal.failed(op.id, message, opts);
             this.logger.warn(`Could not apply a change to ${where} in Proton Drive yet; trying again later: ${message}`);
             return 'stop';
+        };
+        if (permanentRefusal(error)) {
+            if (op.attempts + 1 < MAX_PERMANENT_REFUSALS) {
+                return keep();
+            }
+        } else if (unmappedApiCode(error)) {
+            const run = this.journal.failures(op.id);
+            const firstFailedAt = run.firstFailedAt ?? now;
+            if (now - firstFailedAt < GIVE_UP_UNMAPPED_AFTER_MS || run.unmappedFailures + 1 < MIN_UNMAPPED_FAILURES) {
+                const retryAfter = now + Math.min(2 ** run.unmappedFailures * 60_000, MAX_REPLAY_BACKOFF_MS);
+                return keep({ retryAfter, unmapped: true });
+            }
+        } else if (isTransient(error) || op.attempts + 1 < MAX_UNEXPECTED_FAILURES) {
+            return keep();
         }
         this.journal.complete(op.id);
         this.tellUser(
             'error',
             'Proton Drive: change not applied',
             where,
-            `A change to ${where} could not be made in Proton Drive, and was given up on: ${message}`,
+            `A change to ${where} could not be made in Proton Drive, and was given up on: ${message}. The next sync follows what Proton Drive has`,
         );
+        await this.followCloudAfterGivingUp(op);
         return 'next';
+    }
+
+    // After an operation is given up on, this computer follows what Proton Drive has of its node: its index entry goes
+    // back to where the cloud has it now (a local copy follows at the next pass, as for a move made in the cloud), and the
+    // next pass crawls the online-only folders, so listings show the item where it is (#39). Nothing is deleted: a
+    // rename or move given up on leaves the item under its old name, a delete given up on brings it back.
+    private async followCloudAfterGivingUp(op: RemoteOp): Promise<void> {
+        this.onlineOnlyCrawlDue = true;
+        try {
+            this.indexFromCloud(await this.sdk.getNode(op.nodeUid));
+        } catch (error: unknown) {
+            this.logger.warn(`Could not look up ${op.nodeUid} in Proton Drive after giving up on a change to it; the next crawl does: ${error}`);
+        }
     }
 
     private async isGoneFromCloud(uid: string): Promise<boolean | undefined> {
@@ -4906,6 +5057,7 @@ export class ProtonDriveSyncEngine {
         _initialSettings: SyncSettings,
         since: number,
         onlineOnly: OnlineOnlyFolder[],
+        failed: SyncFailure[] = [],
     ): Promise<void> {
         const liveSettings = this.stateDb.getSettings();
         if (liveSettings.paused) {
@@ -4994,20 +5146,34 @@ export class ProtonDriveSyncEngine {
                 continue; // Nor what is in it: a rename, move or delete through the drive is on its way to Proton Drive
             }
 
+            const backingOff = this.failingItems.get(relPath);
+            if (backingOff && Date.now() < backingOff.retryAt) {
+                failed.push({ relPath, message: backingOff.message }); // Still failing, as far as this pass knows
+                continue;
+            }
+
             this.currentAction = `Syncing ${relPath}`;
             const remoteChild = remoteChildByName.get(name);
             const localChild = localChildByName.get(name);
             const dbRecord = dbChildByName.get(name);
 
-            await this.reconcileSinglePath(relPath, remoteChild, localChild, dbRecord, remoteMap, stepSettings, since);
+            try {
+                await this.reconcileSinglePath(relPath, remoteChild, localChild, dbRecord, remoteMap, stepSettings, since);
+            } catch (error: unknown) {
+                this.itemFailed(relPath, error, failed);
+                continue; // Nor what is in it, this pass
+            }
 
             const resolvedFolderNode = remoteMap.get(relPath) ?? remoteChild;
             const localStillExists = await stat(path.join(this.localRoot(), relPath))
                 .then((s) => s.isDirectory())
                 .catch(() => false);
             if (resolvedFolderNode && resolvedFolderNode.type === NodeType.Folder && localStillExists) {
-                subFoldersToRecurse.push({ node: resolvedFolderNode, relPath });
-            } else if (resolvedFolderNode && resolvedFolderNode.type === NodeType.Folder) {
+                subFoldersToRecurse.push({ node: resolvedFolderNode, relPath }); // Its failure is forgotten once listed
+                continue;
+            }
+            this.forgetFailure(relPath);
+            if (resolvedFolderNode && resolvedFolderNode.type === NodeType.Folder) {
                 onlineOnly.push({ node: resolvedFolderNode, relPath });
             }
         }
@@ -5023,9 +5189,57 @@ export class ProtonDriveSyncEngine {
             ) {
                 continue;
             }
-            await this.reconcileDirectoryIncremental(sub.node, sub.relPath, remoteMap, nextSettings, since, onlineOnly);
+            try {
+                await this.reconcileDirectoryIncremental(sub.node, sub.relPath, remoteMap, nextSettings, since, onlineOnly, failed);
+            } catch (error: unknown) {
+                this.itemFailed(sub.relPath, error, failed); // Its listing, say: nothing in it is looked at this pass
+                continue;
+            }
+            this.forgetFailure(sub.relPath);
         }
     }
+
+    // An item a sync pass couldn't sync (#18): marked as failed, logged, and left for the next pass to try again, while
+    // this one goes on with the rest. Nothing is decided about it, or about what is in it, this pass. A failure of the
+    // network or the server (offline, a 5xx, a rate limit) would fail every item alike: it ends the pass, as before. A
+    // refusal of this one request (see permanentRefusal and unmappedApiCode) is this item's failure: an outage ends the
+    // pass all the same, as the SDK answers with a plain ServerError once its requests keep failing.
+    private itemFailed(relPath: string, error: unknown, failed: SyncFailure[]): void {
+        if (isTransient(error) && !permanentRefusal(error) && !unmappedApiCode(error)) {
+            throw error;
+        }
+        const message = messageOf(error);
+        const failures = (this.failingItems.get(relPath)?.failures ?? 0) + 1;
+        const waitMs = Math.min(2 ** (failures - 1) * 60_000, MAX_ITEM_BACKOFF_MS);
+        this.failingItems.set(relPath, { message, failures, retryAt: Date.now() + waitMs });
+        this.logger.warn(`Could not sync ${relPath}; trying again in ${Math.round(waitMs / 60_000)} min: ${message}`);
+        if (this.stateDb.getItemByPath(relPath)) {
+            this.stateDb.setItemStatus(relPath, 'error', message);
+        }
+        this.logFailureOnce(relPath, message, `Could not sync: ${message}; trying again later`);
+        failed.push({ relPath, message });
+    }
+
+    // An item's failure goes to the activity log once, until its error changes: one that keeps failing pass after
+    // pass would otherwise fill the log
+    private logFailureOnce(relPath: string, message: string, details: string): void {
+        if (this.loggedFailures.get(relPath) === message) {
+            return;
+        }
+        this.loggedFailures.set(relPath, message);
+        this.stateDb.logActivity({ action: 'error', localRelPath: relPath, details });
+    }
+
+    private forgetFailure(relPath: string): void {
+        this.loggedFailures.delete(relPath);
+        this.failingItems.delete(relPath);
+    }
+}
+
+// An item a sync pass couldn't sync, and why (see itemFailed)
+interface SyncFailure {
+    relPath: string;
+    message: string;
 }
 
 // What is missing while held (see stillMissing)
@@ -5163,18 +5377,22 @@ function messageOf(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
 }
 
-// The network or the server, which a later try may get past (a rate limit is a ServerError too)
-function isTransient(error: unknown): boolean {
-    return error instanceof ConnectionError || error instanceof AbortError || error instanceof ServerError;
+// A version of a cloud file, as its active revision claims it: its SHA1 (null when the uploader gave none), modified
+// time and size
+interface CloudVersion {
+    sha1: string | null;
+    mtimeMs: number;
+    size: number;
 }
 
-// Whether the cloud's file has changed since the drive showed it. Two missing checksums don't make it the same: then its
-// time and size must match too.
-function cloudChangedSince(edit: EditBaseline, sha1: string | null, mtimeMs: number, size: number): boolean {
-    if (edit.sha1 !== null) {
-        return sha1 !== edit.sha1;
+// Whether the cloud's file has changed since a version of it seen before: what the drive showed (an edit baseline), or
+// what a record says it held. Two checksums decide it alone. A missing checksum never makes it the same (#24): then the
+// checksums, the time and the size must all match.
+function cloudChangedSince(seen: CloudVersion, now: CloudVersion): boolean {
+    if (seen.sha1 !== null && now.sha1 !== null) {
+        return now.sha1 !== seen.sha1;
     }
-    return sha1 !== null || mtimeMs !== edit.mtimeMs || size !== edit.size;
+    return now.sha1 !== seen.sha1 || now.mtimeMs !== seen.mtimeMs || now.size !== seen.size;
 }
 
 // A record for a file only the remote index knows (online-only), as replaced through the drive: its node, and what the
