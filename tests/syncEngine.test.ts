@@ -9501,4 +9501,38 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(await readFile(d.file, 'utf8')).toBe('local edit');
         });
     });
+
+    describe('a waiting conflict on a cloud file that claims no sha1 closes too (#88)', () => {
+        test('reverted here, the cloud version comes down, and the next pass closes the conflict, hashing once more at most', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            const noSha1 = (uid: string) => {
+                const node = d.nodes.get(uid)!;
+                d.nodes.set(uid, { ...node, activeRevision: { ...node.activeRevision!, claimedDigests: { sha1: undefined } } } as any);
+            };
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'original');
+            noSha1(d.uid('a.txt'));
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const file = path.join(engine.localRoot(), 'a.txt');
+            stateDb.updateSettings({ conflictStrategy: 'prompt' });
+            await writeFile(file, 'local edit');
+            await Bun.sleep(5);
+            d.nodes.set(d.uid('a.txt'), makeMockNode({ uid: d.uid('a.txt'), parentUid: d.root.uid, nameStr: 'a.txt', type: NodeType.File, content: 'a cloud edit' }));
+            noSha1(d.uid('a.txt'));
+            await engine.reconcileNow();
+            const [conflict] = stateDb.listConflicts();
+            expect(conflict.localRelPath).toBe('a.txt');
+
+            await writeFile(file, 'original'); // back to what was synced: only the cloud changed now
+            await engine.reconcileNow();
+            expect(await readFile(file, 'utf8')).toBe('a cloud edit');
+            await engine.reconcileNow();
+            expect(stateDb.getConflictById(conflict.id)).toMatchObject({ resolved: 1, resolution: 'in-sync' });
+        });
+    });
 });
