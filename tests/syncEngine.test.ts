@@ -8684,7 +8684,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         test('saved again while it waits: the conflict keeps waiting, never closed as if the sides agreed', async () => {
             const d = await queued();
             await writeFile(d.local('Docs/a.txt'), 'local edit 2');
-            await (d.engine as any).handleLocalFileChange('Docs/a.txt'); // the watcher (#72: it uploads without a look at the cloud)
+            await (d.engine as any).handleLocalFileChange('Docs/a.txt'); // the watcher: since #72 it hands a waiting conflict to the pass's handling
             await d.engine.reconcileNow();
             expect(d.first().resolved).toBe(0);
             expect(d.waiting().length).toBe(1);
