@@ -429,14 +429,19 @@ class ProtonDriveFiles:
     error) back on the main loop, notify(title, body) tells the user, complete(handle, closure, ok) finishes an
     asynchronous emblem update."""
 
-    def __init__(self, request, run, notify, complete, clock=time.monotonic):
+    def __init__(self, request, run, notify, complete, clock=time.monotonic, later=None):
         self.request = request
         self.run = run
         self.notify = notify
         self.complete = complete
         self.clock = clock
+        self.later = later or (lambda fn, seconds: None)  # later(fn, seconds): fn on the main loop that much later
         self.root = None
         self.root_asked_at = None
+        self.root_waiting = []  # [(handle, closure, file)] asked about before the root was known
+        self.root_in_flight = False
+        self.root_retry_due = False
+        self.fetch_failures = {}  # folder -> how many fetches of its states failed in a row
         self.stream_up = False
         self.cache = FolderCache()
         self.tracker = FileTracker()
@@ -451,18 +456,45 @@ class ProtonDriveFiles:
         if self.root_asked_at is not None and now - self.root_asked_at < ROOT_RETRY:
             return
         self.root_asked_at = now
+        self.root_in_flight = True
 
         def done(result, error):
+            self.root_in_flight = False
             if error is None and isinstance(result, dict) and isinstance(result.get("syncDir"), str):
                 self.set_root(result["syncDir"])
+                return
+            # Not known yet (the daemon starting, say): what waited gets no emblem for now, but is tracked, so that the
+            # root arriving later refreshes it (forget_everything); and the root is asked for again
+            for handle, closure, file in self.root_waiting:
+                if file.get_uri_scheme() == "file":
+                    self.tracker.track(file.get_location().get_path(), file)
+                self.complete(handle, closure, False)
+            self.root_waiting = []
+            if not self.root_retry_due:
+                self.root_retry_due = True
+                self.later(self.retry_root, ROOT_RETRY)
 
         self.run(lambda: self.request("GET", "/fm/root", None, STATES_READ_TIMEOUT), done)
 
+    def retry_root(self):
+        self.root_retry_due = False
+        if self.root is None:
+            self.root_asked_at = None
+            self.ask_root()
+
+    def answer_root_waiting(self):
+        """The root is known: what was asked about before it gets its emblem now (#86)."""
+        waiting, self.root_waiting = self.root_waiting, []
+        for handle, closure, file in waiting:
+            if self.file_info(file, handle, closure):
+                self.complete(handle, closure, True)
+
     def set_root(self, sync_dir):
-        if sync_dir == self.root:
-            return
-        self.root = sync_dir
-        self.forget_everything()
+        if sync_dir != self.root:
+            self.root = sync_dir
+            self.forget_everything()
+        # However the root became known (its answer, or the change stream's hello), what waited for it is answered
+        self.answer_root_waiting()
 
     # Emblems
 
@@ -473,6 +505,13 @@ class ProtonDriveFiles:
         path = file.get_location().get_path()
         if self.root is None:
             self.ask_root()
+            if self.root_in_flight:
+                # Answered once the root is known (#86): answering "no emblem" now left it without one until a refresh
+                self.root_waiting.append((handle, closure, file))
+                return False
+            # Not being asked right now (the daemon isn't running, say): no emblem for now, without holding Files up;
+            # tracked, so that the root arriving refreshes it
+            self.tracker.track(path, file)
             return True
         rel = rel_to_root(self.root, path)
         if not rel or skipped(rel):
@@ -500,7 +539,19 @@ class ProtonDriveFiles:
             if error is not None or not isinstance(result, dict):
                 for handle, closure, _file in queue:
                     self.complete(handle, closure, False)
+                if not _transient(error):
+                    self.fetch_failures.pop(folder, None)  # an answer, like "not a folder in Proton Drive": not asked again
+                    return
+                # Asked again a little later, waiting longer after each failure in a row: the files are invalidated, so
+                # Files asks about them again (#86)
+                if len(self.fetch_failures) > 256:
+                    self.fetch_failures.clear()  # folders left while the daemon was away: kept bounded
+                failures = self.fetch_failures.get(folder, 0) + 1
+                self.fetch_failures[folder] = failures
+                files = [file for _handle, _closure, file in queue]
+                self.later(lambda: [self.invalidate(file) for file in files], min(2 ** failures, 60))
                 return
+            self.fetch_failures.pop(folder, None)
             entry = {"self": result.get("self"), "children": result.get("children") or {}}
             if generation == self.generation:
                 self.cache.put(folder, result, self.clock())
@@ -521,6 +572,7 @@ class ProtonDriveFiles:
     def cancel(self, handle):
         for queue in self.waiting.values():
             queue[:] = [item for item in queue if item[0] is not handle]
+        self.root_waiting = [item for item in self.root_waiting if item[0] is not handle]
 
     def state_of(self, path):
         entry = self.cache.get(os.path.dirname(path), self.clock(), None if self.stream_up else STALE_WITHOUT_EVENTS)
@@ -621,6 +673,7 @@ class ProtonDriveFiles:
     def forget_everything(self):
         self.generation += 1
         self.cache.clear()
+        self.fetch_failures.clear()
         for file in self.tracker.all():
             self.invalidate(file)
         self.tracker.clear()
@@ -710,6 +763,24 @@ def _launch_native_gui():
             continue
 
 
+def _transient(error):
+    """Whether a failed request may well work if asked again: the daemon not reachable or not answering in time."""
+    if error is None or not isinstance(error, ControlError):
+        return True  # no error but no answer either, or something unexpected
+    text = str(error)
+    return text.startswith("Can't reach") or text.startswith("Proton Drive is still working")
+
+
+def _later(fn, seconds):
+    """fn() on the main loop, that many seconds from now."""
+
+    def call():
+        fn()
+        return False
+
+    GLib.timeout_add_seconds(max(1, int(seconds)), call)
+
+
 def _run_in_thread(work, done):
     """work() on a worker thread, then done(result, error) on the main loop."""
 
@@ -752,6 +823,7 @@ class ProtonDriveNautilusExtension(
             run=_run_in_thread,
             notify=_notify,
             complete=self._complete,
+            later=_later,
         )
         self.files.ask_root()
         threading.Thread(
