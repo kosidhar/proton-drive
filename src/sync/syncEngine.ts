@@ -281,8 +281,11 @@ export class ProtonDriveSyncEngine {
     private replayAfterPass = false;
     // Downloads for the virtual drive under way, by path: a second open of the same file waits for the same one
     private hydrations = new Map<string, Promise<void>>();
-    // Local changes handled at once (see handleLocalFileChange)
+    // Local changes handled at once, and the look of each path waiting for its turn (see handleLocalFileChange)
     private readonly localChangeSlots: Slots;
+    private readonly localWaiting = new Map<string, Promise<void>>();
+    // Stopped: changes still waiting for their turn do nothing when it comes
+    private stopped = false;
     // Downloads by app, to tell the user when one app downloads many files (see DownloadWatch)
     private readonly downloadWatch = new DownloadWatch();
     private hydrateStaging = new Set<string>(); // their staging files
@@ -459,6 +462,7 @@ export class ProtonDriveSyncEngine {
     }
 
     async start(options: { backgroundInitialReconcile?: boolean } = {}): Promise<void> {
+        this.stopped = false;
         if (this.holding()) {
             return; // Started again once the files have moved
         }
@@ -506,6 +510,7 @@ export class ProtonDriveSyncEngine {
     }
 
     async stop(): Promise<void> {
+        this.stopped = true;
         this.watcher.stop();
         for (const settling of this.settlingFiles.values()) {
             settling.cancel(); // The pass at the next start looks at them again
@@ -2439,17 +2444,38 @@ export class ProtonDriveSyncEngine {
     private async handleLocalFileChange(relPath: string): Promise<void> {
         this.stateEvents.touch(relPath); // a new file shows as waiting to upload; a removed one goes
         this.failingItems.delete(relPath); // Changed here: the next pass looks at it again at once
-        // A few at a time: a large folder copied in reports thousands of files within milliseconds, and each hashes and
-        // uploads (#90). The hold and sign-in checks come once its turn has come, as they may have changed meanwhile
-        await this.localChangeSlots.run(async () => {
-            if (this.holding() || !this.auth.isLoggedIn()) {
-                return;
+        // A report for a path whose look hasn't started yet joins it: it will see the file as it is when it runs
+        const waiting = this.localWaiting.get(relPath);
+        if (waiting) {
+            return waiting;
+        }
+        const look = (async () => {
+            // One already running for the path is waited for before a turn is taken, not while holding one: a file busy
+            // uploading would otherwise hold every turn and keep all other changes waiting (#90)
+            await this.localQueue.get(relPath)?.catch(() => {});
+            // A few at a time: a large folder copied in reports thousands of files within milliseconds, and each hashes
+            // and uploads (#90). The stop, hold and sign-in checks come once its turn has come: they may have changed
+            await this.localChangeSlots.run(async () => {
+                if (this.localWaiting.get(relPath) === look) {
+                    this.localWaiting.delete(relPath); // Started: a report from now on is for a later look
+                }
+                if (this.stopped || this.holding() || !this.auth.isLoggedIn()) {
+                    return;
+                }
+                if (this.filesGone()) {
+                    return; // Not a change to sync: the files are missing from the folder (see filesGone); the pass after catches up
+                }
+                await this.tracked(() => this.handleLocalFileChangeNow(relPath));
+            });
+        })();
+        this.localWaiting.set(relPath, look);
+        try {
+            await look;
+        } finally {
+            if (this.localWaiting.get(relPath) === look) {
+                this.localWaiting.delete(relPath);
             }
-            if (this.filesGone()) {
-                return; // Not a change to sync: the files are missing from the folder (see filesGone); the pass after catches up
-            }
-            await this.tracked(() => this.handleLocalFileChangeNow(relPath));
-        });
+        }
     }
 
     private async handleLocalFileChangeNow(relPath: string): Promise<void> {
