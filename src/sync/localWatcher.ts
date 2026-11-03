@@ -109,7 +109,10 @@ export class LocalFolderWatcher {
         }
     }
 
-    private async watchDirectoryTree(dirPath: string): Promise<void> {
+    // `reportExisting`: the folder appeared while running (an event found it), so files saved into it before its watcher
+    // attached raised no event of their own; those already in it are reported now (#13). Not at start: the first sync
+    // pass looks at everything then.
+    private async watchDirectoryTree(dirPath: string, reportExisting = false): Promise<void> {
         if (!this.running) {
             return;
         }
@@ -119,7 +122,8 @@ export class LocalFolderWatcher {
             return;
         }
 
-        if (!this.watchers.has(dirPath)) {
+        const newlyWatched = !this.watchers.has(dirPath);
+        if (newlyWatched) {
             try {
                 const watcher = watch(dirPath, (eventType, filename) => {
                     if (!filename) {
@@ -144,8 +148,12 @@ export class LocalFolderWatcher {
         try {
             const entries = await readdir(dirPath, { withFileTypes: true });
             for (const entry of entries) {
+                const childPath = path.join(dirPath, entry.name);
                 if (entry.isDirectory()) {
-                    await this.watchDirectoryTree(path.join(dirPath, entry.name));
+                    await this.watchDirectoryTree(childPath, reportExisting);
+                } else if (reportExisting && newlyWatched) {
+                    // As if its watcher had seen it made: suppression and ignore rules apply as to any event
+                    this.handleRawFsEvent('rename', path.relative(rootDir, childPath).split(path.sep).join('/'), childPath);
                 }
             }
         } catch {}
@@ -187,7 +195,7 @@ export class LocalFolderWatcher {
                 this.unwatchTree(fullPath);
             }
             if (isDirectory) {
-                await this.watchDirectoryTree(fullPath);
+                await this.watchDirectoryTree(fullPath, true);
             }
 
             if (report) {
