@@ -2350,6 +2350,9 @@ export class ProtonDriveSyncEngine {
             return false;
         }
         this.stateDb.upsertItem(item);
+        if (item.type === 'folder' && !isProvisional(item.nodeUid)) {
+            this.stateDb.setParentOfChildren(relPath, item.nodeUid);
+        }
         // Synced: whatever conflict it was in is over, and a keep-both of it left unfinished with it (see keepBoth)
         this.keepBothCopies.delete(relPath);
         this.forgetFailure(relPath);
@@ -2397,7 +2400,8 @@ export class ProtonDriveSyncEngine {
         try {
             this.stateDb.connection.transaction(() => {
                 if (follows) {
-                    this.stateDb.upsertItem({ ...item, localRelPath: now });
+                    // Its record's cloud parent is where the move puts it, as renameItemPath does (#103)
+                    this.stateDb.upsertItem({ ...item, localRelPath: now, parentNodeUid: this.cloudParentOf(now) ?? item.parentNodeUid });
                     this.journal.enqueue({
                         kind: parentOf(relPath) === parentOf(now) ? 'rename' : 'move',
                         nodeUid: item.nodeUid,

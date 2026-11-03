@@ -459,6 +459,24 @@ export class SyncStateDatabase {
         this.onChange?.(toRel, true);
     }
 
+    // The records of the items directly in a folder name it as their cloud parent: a folder recorded with its node (one
+    // made here, say, that items were moved into before Proton Drive had it) is where they are now (#103). Leaves
+    // updatedAt as it was: it says when an item's own record was written, which this isn't.
+    setParentOfChildren(folderRel: string, folderUid: string): void {
+        if (folderRel === '') {
+            return;
+        }
+        this.db
+            .query(
+                `UPDATE synced_items SET parentNodeUid = $uid
+                 WHERE localRelPath > $lo AND localRelPath < $hi
+                   AND instr(substr(localRelPath, $start), '/') = 0
+                   AND parentNodeUid IS NOT $uid`,
+            )
+            // '0' follows '/': the range is exactly the paths under the folder, found by the primary key
+            .run({ $uid: folderUid, $lo: `${folderRel}/`, $hi: `${folderRel}0`, $start: folderRel.length + 2 });
+    }
+
     recordEditBaseline(baseline: Omit<EditBaseline, 'createdAt'>): void {
         this.db
             .query(
