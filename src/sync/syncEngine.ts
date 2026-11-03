@@ -977,7 +977,7 @@ export class ProtonDriveSyncEngine {
     private async isUnchangedSyncedCopy(
         relPath: string,
         fullPath: string,
-        st: { size: number; mtimeMs: number },
+        st: { size: number; mtimeMs: number; ctimeMs?: number },
     ): Promise<boolean> {
         const record = this.stateDb.getItemByPath(relPath);
         // What Proton Drive held when the record was made: the SHA1 it claims, or for a node that claims none, the SHA1
@@ -986,7 +986,14 @@ export class ProtonDriveSyncEngine {
         if (!record || record.type !== 'file' || record.syncStatus !== 'synced' || !held) {
             return false;
         }
-        if (st.size === record.size && Math.abs(st.mtimeMs - record.localMtimeMs) < 10 && record.localSha1 === held) {
+        // Size and mtime say unchanged only if nothing wrote to it since the record: the ctime, which the system sets on
+        // every write, says so; an edit that keeps the size and puts the old mtime back (a container, cp -p) is hashed (#105)
+        if (
+            st.size === record.size &&
+            Math.abs(st.mtimeMs - record.localMtimeMs) < 10 &&
+            notWrittenSince(st, record) &&
+            record.localSha1 === held
+        ) {
             return true;
         }
         return (await computeLocalFileSha1(fullPath).catch(() => null)) === held;
@@ -1132,7 +1139,7 @@ export class ProtonDriveSyncEngine {
     private async reconcileSinglePath(
         relPath: string,
         remoteNode: NodeEntity | undefined,
-        localInfo: { isDirectory: boolean; size: number; mtimeMs: number } | undefined,
+        localInfo: { isDirectory: boolean; size: number; mtimeMs: number; ctimeMs?: number } | undefined,
         dbRecord: SyncedItemRecord | undefined,
         remoteMap: Map<string, NodeEntity>,
         settings: SyncSettings,
@@ -1339,6 +1346,7 @@ export class ProtonDriveSyncEngine {
                     remoteAtSync &&
                     dbRecord.syncStatus === 'synced' &&
                     !this.stateDb.hasWaitingConflict(relPath) &&
+                    notWrittenSince(localInfo, dbRecord) &&
                     Math.abs(localInfo.mtimeMs - dbRecord.localMtimeMs) < 10 &&
                     localInfo.size === dbRecord.size &&
                     !cloudChangedSince(remoteAtSync, remoteNow)
@@ -2475,7 +2483,7 @@ export class ProtonDriveSyncEngine {
                 dbRecord?.type === 'file' &&
                 dbRecord.syncStatus === 'synced' &&
                 !changedSinceRecord(st, dbRecord) &&
-                st.ctimeMs <= dbRecord.updatedAt + 1
+                notWrittenSince(st, dbRecord)
             ) {
                 // As it was recorded, and not written since (a spurious report, an app opening it read-write): nothing here
                 // to upload, so no hash and no look at Proton Drive; a sync pass compares it with the cloud (#89). The ctime
@@ -2565,7 +2573,7 @@ export class ProtonDriveSyncEngine {
                         },
                     );
                 if (cloudMovedOn) {
-                    const localInfo = { isDirectory: false, size: st.size, mtimeMs: st.mtimeMs };
+                    const localInfo = { isDirectory: false, size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs };
                     await this.reconcileSinglePath(relPath, node, localInfo, record, remoteMap, this.stateDb.getSettings(), since);
                 } else {
                     await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, record.nodeUid);
@@ -2574,7 +2582,7 @@ export class ProtonDriveSyncEngine {
                 // No record: where Proton Drive has a file of that name, it is decided as a sync pass decides it (an
                 // edit of what the drive showed, with a baseline; the conflict handling otherwise), never by uploading
                 // over it. Such a file found only by its upload being refused goes the same way.
-                const localInfo = { isDirectory: false, size: st.size, mtimeMs: st.mtimeMs };
+                const localInfo = { isDirectory: false, size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs };
                 const there =
                     (await this.cloudFileAt(relPath)) ?? (await this.uploadNewFile(relPath, fullPath, parentNode, since));
                 if (there) {
@@ -5264,7 +5272,7 @@ export class ProtonDriveSyncEngine {
             await mkdir(path.dirname(localFullPath), { recursive: true });
             const st = await stat(localFullPath).catch(() => null);
             const localInfo = st
-                ? { isDirectory: st.isDirectory(), size: st.isDirectory() ? 0 : st.size, mtimeMs: st.mtimeMs }
+                ? { isDirectory: st.isDirectory(), size: st.isDirectory() ? 0 : st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs }
                 : undefined;
             const remoteMap = new Map<string, NodeEntity>([[relPath, node]]);
             const onlineOnly: OnlineOnlyFolder[] = [];
@@ -5647,7 +5655,7 @@ export class ProtonDriveSyncEngine {
         }
 
         const localEntries = await readdir(localDirFullPath, { withFileTypes: true }).catch(() => []);
-        const localChildByName = new Map<string, { isDirectory: boolean; size: number; mtimeMs: number }>();
+        const localChildByName = new Map<string, { isDirectory: boolean; size: number; mtimeMs: number; ctimeMs: number }>();
         for (const entry of localEntries) {
             const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
             if (matchesIgnorePatterns(relPath, freshSettings.ignorePatterns)) {
@@ -5660,6 +5668,7 @@ export class ProtonDriveSyncEngine {
                     isDirectory: st.isDirectory(),
                     size: st.isDirectory() ? 0 : st.size,
                     mtimeMs: st.mtimeMs,
+                    ctimeMs: st.ctimeMs,
                 });
             }
         }
@@ -5909,6 +5918,13 @@ function driveOpErrorOf(failure: unknown, toRel: string): unknown {
 
 // Whether a local file differs from its record by size or time (as a pass's fast path tells), or has none: an upload
 // is what it would come to
+// Whether nothing has written to a file since its record was made, by its ctime, which the system sets on every write
+// (unlike the mtime, which cp -p, touch -r or an encrypted container can put back). Without a ctime it can't be told,
+// which counts as written: the caller then compares contents (#105).
+function notWrittenSince(local: { ctimeMs?: number }, record: SyncedItemRecord): boolean {
+    return local.ctimeMs !== undefined && local.ctimeMs <= record.updatedAt + 1;
+}
+
 function changedSinceRecord(local: { size: number; mtimeMs: number }, record: SyncedItemRecord | null | undefined): boolean {
     return !record || local.size !== record.size || Math.abs(local.mtimeMs - record.localMtimeMs) >= 10;
 }
