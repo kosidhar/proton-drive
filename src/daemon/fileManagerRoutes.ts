@@ -161,43 +161,54 @@ function eventStream(req: Request, source: FileManagerSource): Response {
     if (openStreams >= MAX_STREAMS) {
         return Response.json({ error: 'Too many event streams' }, { status: 503 });
     }
-    openStreams++;
     let feed: EventFeed | null = null;
+    // Counted from before the feed is made to its end, released exactly once however it ends: closed, aborted,
+    // cancelled, or never started because making the feed threw (#125)
+    let counted = true;
+    openStreams++;
     const done = () => {
         if (feed && !feed.isClosed) {
             feed.stop();
         }
-        if (feed) {
+        if (counted) {
+            counted = false;
             openStreams--;
-            feed = null;
         }
     };
     const encoder = new TextEncoder();
-    const stream = new ReadableStream<Uint8Array>(
-        {
-            start(controller) {
-                const sink: LineSink = {
-                    enqueue: (line) => controller.enqueue(encoder.encode(line)),
-                    close: () => {
-                        controller.close();
-                        done();
-                    },
-                    get desiredSize() {
-                        return controller.desiredSize;
-                    },
-                };
-                feed = new EventFeed(sink, source);
-                req.signal.addEventListener('abort', done, { once: true });
-                if (req.signal.aborted) {
-                    done(); // gone before the listener was there: it never fires, and the stream would stay counted
-                }
+    let stream: ReadableStream<Uint8Array>;
+    try {
+        stream = new ReadableStream<Uint8Array>(
+            {
+                start(controller) {
+                    const sink: LineSink = {
+                        enqueue: (line) => controller.enqueue(encoder.encode(line)),
+                        close: () => {
+                            controller.close();
+                            done();
+                        },
+                        get desiredSize() {
+                            return controller.desiredSize;
+                        },
+                    };
+                    feed = new EventFeed(sink, source);
+                    req.signal.addEventListener('abort', done, { once: true });
+                    if (req.signal.aborted) {
+                        done(); // gone before the listener was there: it never fires, and the stream would stay counted
+                    }
+                },
+                cancel() {
+                    done();
+                },
             },
-            cancel() {
-                done();
-            },
-        },
-        new CountQueuingStrategy({ highWaterMark: QUEUE_LINES }),
-    );
+            new CountQueuingStrategy({ highWaterMark: QUEUE_LINES }),
+        );
+    } catch (error: unknown) {
+        // The feed couldn't start (asking for the root threw, say)
+        done();
+        const message = error instanceof Error ? error.message : String(error);
+        return Response.json({ error: `Can't stream changes: ${message}` }, { status: 503 });
+    }
     return new Response(stream, {
         headers: { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store' },
     });
