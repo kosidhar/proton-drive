@@ -33,6 +33,7 @@ import { getClaimedSize, getName } from '../sdk/node';
 import { AvailabilityPolicy, type ItemAvailability } from './availability';
 import { DownloadWatch } from './downloadWatch';
 import { problemWithBlockedApps } from './settingsRules';
+import { Slots } from './slots';
 import { StateEvents } from './stateEvents';
 import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
 import { createLocalConflictCopy, formatConflictFileName } from './conflictResolver';
@@ -90,6 +91,9 @@ const MAX_ITEM_BACKOFF_MS = 60 * 60_000;
 // stalls (a slow disk, a network share, a paused cp) doesn't upload half a file (#51). One seen changing again waits
 // twice as long each time, up to SETTLE_MAX_QUIET_MS.
 const SETTLE_QUIET_MS = 2000;
+// How many local changes are handled at once: enough to keep uploads going, few enough that a large folder copied in
+// doesn't start thousands of hashes and uploads together (#90)
+const LOCAL_CHANGE_CONCURRENCY = 6;
 const SETTLE_MAX_QUIET_MS = 16_000;
 // A file that never stops changing (a log, say) uploads anyway after this long, and then at most this often
 const SETTLE_MAX_WAIT_MS = 2 * 60_000;
@@ -277,6 +281,11 @@ export class ProtonDriveSyncEngine {
     private replayAfterPass = false;
     // Downloads for the virtual drive under way, by path: a second open of the same file waits for the same one
     private hydrations = new Map<string, Promise<void>>();
+    // Local changes handled at once, and the look of each path waiting for its turn (see handleLocalFileChange)
+    private readonly localChangeSlots: Slots;
+    private readonly localWaiting = new Map<string, Promise<void>>();
+    // Stopped: changes still waiting for their turn do nothing when it comes
+    private stopped = false;
     // Downloads by app, to tell the user when one app downloads many files (see DownloadWatch)
     private readonly downloadWatch = new DownloadWatch();
     private hydrateStaging = new Set<string>(); // their staging files
@@ -348,6 +357,8 @@ export class ProtonDriveSyncEngine {
             moveSeams?: MoveSeams; // for tests: moving the sync folder
             // How the user is asked about an app downloading many files (sendActionNotification; for tests)
             askWithActions?: typeof sendActionNotification;
+            // How many local changes are handled at once (LOCAL_CHANGE_CONCURRENCY; for tests)
+            localChangeConcurrency?: number;
             // For tests: when the coalesced state changes go out (see StateEvents)
             stateEventSchedule?: (run: () => void, delayMs: number) => () => void;
             // For tests: how long what is missing while held is taken as known (FILES_MISSING_CACHE_MS; see stillMissing)
@@ -365,6 +376,7 @@ export class ProtonDriveSyncEngine {
     ) {
         this.index = new RemoteIndex(this.stateDb.connection);
         this.policy = new AvailabilityPolicy(this.stateDb.connection, this.index);
+        this.localChangeSlots = new Slots(options.localChangeConcurrency ?? LOCAL_CHANGE_CONCURRENCY);
         this.stateEvents = new StateEvents(options.stateEventSchedule ? { schedule: options.stateEventSchedule } : {});
         const changed = (relPath: string, subtree: boolean) =>
             subtree ? this.stateEvents.touchSubtree(relPath) : this.stateEvents.touch(relPath);
@@ -450,6 +462,7 @@ export class ProtonDriveSyncEngine {
     }
 
     async start(options: { backgroundInitialReconcile?: boolean } = {}): Promise<void> {
+        this.stopped = false;
         if (this.holding()) {
             return; // Started again once the files have moved
         }
@@ -497,6 +510,7 @@ export class ProtonDriveSyncEngine {
     }
 
     async stop(): Promise<void> {
+        this.stopped = true;
         this.watcher.stop();
         for (const settling of this.settlingFiles.values()) {
             settling.cancel(); // The pass at the next start looks at them again
@@ -977,7 +991,7 @@ export class ProtonDriveSyncEngine {
     private async isUnchangedSyncedCopy(
         relPath: string,
         fullPath: string,
-        st: { size: number; mtimeMs: number },
+        st: { size: number; mtimeMs: number; ctimeMs?: number },
     ): Promise<boolean> {
         const record = this.stateDb.getItemByPath(relPath);
         // What Proton Drive held when the record was made: the SHA1 it claims, or for a node that claims none, the SHA1
@@ -986,7 +1000,14 @@ export class ProtonDriveSyncEngine {
         if (!record || record.type !== 'file' || record.syncStatus !== 'synced' || !held) {
             return false;
         }
-        if (st.size === record.size && Math.abs(st.mtimeMs - record.localMtimeMs) < 10 && record.localSha1 === held) {
+        // Size and mtime say unchanged only if nothing wrote to it since the record: the ctime, which the system sets on
+        // every write, says so; an edit that keeps the size and puts the old mtime back (a container, cp -p) is hashed (#105)
+        if (
+            st.size === record.size &&
+            Math.abs(st.mtimeMs - record.localMtimeMs) < 10 &&
+            notWrittenSince(st, record) &&
+            record.localSha1 === held
+        ) {
             return true;
         }
         return (await computeLocalFileSha1(fullPath).catch(() => null)) === held;
@@ -1132,7 +1153,7 @@ export class ProtonDriveSyncEngine {
     private async reconcileSinglePath(
         relPath: string,
         remoteNode: NodeEntity | undefined,
-        localInfo: { isDirectory: boolean; size: number; mtimeMs: number } | undefined,
+        localInfo: { isDirectory: boolean; size: number; mtimeMs: number; ctimeMs?: number } | undefined,
         dbRecord: SyncedItemRecord | undefined,
         remoteMap: Map<string, NodeEntity>,
         settings: SyncSettings,
@@ -1342,6 +1363,7 @@ export class ProtonDriveSyncEngine {
                     remoteAtSync &&
                     dbRecord.syncStatus === 'synced' &&
                     !this.stateDb.hasWaitingConflict(relPath) &&
+                    notWrittenSince(localInfo, dbRecord) &&
                     Math.abs(localInfo.mtimeMs - dbRecord.localMtimeMs) < 10 &&
                     localInfo.size === dbRecord.size &&
                     !cloudChangedSince(remoteAtSync, remoteNow)
@@ -1349,6 +1371,7 @@ export class ProtonDriveSyncEngine {
                     return;
                 }
 
+                const hashedFrom = Date.now(); // a write from here on is newer than what the hash below reads
                 const localSha1 = await computeLocalFileSha1(localFullPath).catch((error: unknown) => {
                     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
                         this.logger.warn(`Could not read ${relPath} to compare it with Proton Drive: ${error}`);
@@ -1412,6 +1435,11 @@ export class ProtonDriveSyncEngine {
                         since,
                         dbRecord,
                     );
+                } else if (dbRecord && dbRecord.syncStatus === 'synced' && localSha1 === dbRecord.localSha1) {
+                    // Neither side changed: only the ctime moved (a chmod, a rename, a layout move). The record is current
+                    // as of before the hash, so the next pass's fast path applies again instead of hashing on every pass
+                    // (a cloud file with no sha1 never reaches the equal-content branch that would re-record it, #105)
+                    this.stateDb.touchItem(relPath, hashedFrom);
                 }
             }
         }
@@ -1762,7 +1790,7 @@ export class ProtonDriveSyncEngine {
                 if (!(await this.downloadRemoteToLocal(conflict.localRelPath, remoteNode, localFullPath, since, asChosen))) {
                     throw new ConflictRefusedError(
                         409,
-                        `${conflict.localRelPath} was saved while Proton Drive's version downloaded, so it was kept; try again`,
+                        `${conflict.localRelPath} changed (saved, moved or deleted) while Proton Drive's version downloaded, so it was left as it is; try again`,
                     );
                 }
                 this.stateDb.markConflictResolved(conflictId, 'keep-remote');
@@ -2454,13 +2482,38 @@ export class ProtonDriveSyncEngine {
     private async handleLocalFileChange(relPath: string): Promise<void> {
         this.stateEvents.touch(relPath); // a new file shows as waiting to upload; a removed one goes
         this.failingItems.delete(relPath); // Changed here: the next pass looks at it again at once
-        if (this.holding() || !this.auth.isLoggedIn()) {
-            return;
+        // A report for a path whose look hasn't started yet joins it: it will see the file as it is when it runs
+        const waiting = this.localWaiting.get(relPath);
+        if (waiting) {
+            return waiting;
         }
-        if (this.filesGone()) {
-            return; // Not a change to sync: the files are missing from the folder (see filesGone); the pass after catches up
+        const look = (async () => {
+            // One already running for the path is waited for before a turn is taken, not while holding one: a file busy
+            // uploading would otherwise hold every turn and keep all other changes waiting (#90)
+            await this.localQueue.get(relPath)?.catch(() => {});
+            // A few at a time: a large folder copied in reports thousands of files within milliseconds, and each hashes
+            // and uploads (#90). The stop, hold and sign-in checks come once its turn has come: they may have changed
+            await this.localChangeSlots.run(async () => {
+                if (this.localWaiting.get(relPath) === look) {
+                    this.localWaiting.delete(relPath); // Started: a report from now on is for a later look
+                }
+                if (this.stopped || this.holding() || !this.auth.isLoggedIn()) {
+                    return;
+                }
+                if (this.filesGone()) {
+                    return; // Not a change to sync: the files are missing from the folder (see filesGone); the pass after catches up
+                }
+                await this.tracked(() => this.handleLocalFileChangeNow(relPath));
+            });
+        })();
+        this.localWaiting.set(relPath, look);
+        try {
+            await look;
+        } finally {
+            if (this.localWaiting.get(relPath) === look) {
+                this.localWaiting.delete(relPath);
+            }
         }
-        await this.tracked(() => this.handleLocalFileChangeNow(relPath));
     }
 
     private async handleLocalFileChangeNow(relPath: string): Promise<void> {
@@ -2499,7 +2552,7 @@ export class ProtonDriveSyncEngine {
                 dbRecord?.type === 'file' &&
                 dbRecord.syncStatus === 'synced' &&
                 !changedSinceRecord(st, dbRecord) &&
-                st.ctimeMs <= dbRecord.updatedAt + 1
+                notWrittenSince(st, dbRecord)
             ) {
                 // As it was recorded, and not written since (a spurious report, an app opening it read-write): nothing here
                 // to upload, so no hash and no look at Proton Drive; a sync pass compares it with the cloud (#89). The ctime
@@ -2589,7 +2642,7 @@ export class ProtonDriveSyncEngine {
                         },
                     );
                 if (cloudMovedOn) {
-                    const localInfo = { isDirectory: false, size: st.size, mtimeMs: st.mtimeMs };
+                    const localInfo = { isDirectory: false, size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs };
                     await this.reconcileSinglePath(relPath, node, localInfo, record, remoteMap, this.stateDb.getSettings(), since);
                 } else {
                     await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, record.nodeUid);
@@ -2598,7 +2651,7 @@ export class ProtonDriveSyncEngine {
                 // No record: where Proton Drive has a file of that name, it is decided as a sync pass decides it (an
                 // edit of what the drive showed, with a baseline; the conflict handling otherwise), never by uploading
                 // over it. Such a file found only by its upload being refused goes the same way.
-                const localInfo = { isDirectory: false, size: st.size, mtimeMs: st.mtimeMs };
+                const localInfo = { isDirectory: false, size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs };
                 const there =
                     (await this.cloudFileAt(relPath)) ?? (await this.uploadNewFile(relPath, fullPath, parentNode, since));
                 if (there) {
@@ -5291,7 +5344,7 @@ export class ProtonDriveSyncEngine {
             await mkdir(path.dirname(localFullPath), { recursive: true });
             const st = await stat(localFullPath).catch(() => null);
             const localInfo = st
-                ? { isDirectory: st.isDirectory(), size: st.isDirectory() ? 0 : st.size, mtimeMs: st.mtimeMs }
+                ? { isDirectory: st.isDirectory(), size: st.isDirectory() ? 0 : st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs }
                 : undefined;
             const remoteMap = new Map<string, NodeEntity>([[relPath, node]]);
             const onlineOnly: OnlineOnlyFolder[] = [];
@@ -5674,7 +5727,7 @@ export class ProtonDriveSyncEngine {
         }
 
         const localEntries = await readdir(localDirFullPath, { withFileTypes: true }).catch(() => []);
-        const localChildByName = new Map<string, { isDirectory: boolean; size: number; mtimeMs: number }>();
+        const localChildByName = new Map<string, { isDirectory: boolean; size: number; mtimeMs: number; ctimeMs: number }>();
         for (const entry of localEntries) {
             const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
             if (matchesIgnorePatterns(relPath, freshSettings.ignorePatterns)) {
@@ -5687,6 +5740,7 @@ export class ProtonDriveSyncEngine {
                     isDirectory: st.isDirectory(),
                     size: st.isDirectory() ? 0 : st.size,
                     mtimeMs: st.mtimeMs,
+                    ctimeMs: st.ctimeMs,
                 });
             }
         }
@@ -5932,6 +5986,13 @@ function driveOpErrorOf(failure: unknown, toRel: string): unknown {
         return new DriveOpError('ENOENT', messageOf(failure), { cause: failure });
     }
     return failure;
+}
+
+// Whether nothing has written to a file since its record was made, by its ctime, which the system sets on every write
+// (unlike the mtime, which cp -p, touch -r or an encrypted container can put back). Without a ctime it can't be told,
+// which counts as written: the caller then compares contents (#105).
+function notWrittenSince(local: { ctimeMs?: number }, record: SyncedItemRecord): boolean {
+    return local.ctimeMs !== undefined && local.ctimeMs <= record.updatedAt + 1;
 }
 
 // Whether a local file differs from its record by size or time (as a pass's fast path tells), or has none: an upload
