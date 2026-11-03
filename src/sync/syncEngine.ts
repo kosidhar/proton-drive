@@ -2992,7 +2992,7 @@ export class ProtonDriveSyncEngine {
                     return false;
                 }
                 try {
-                    this.stateDb.renameItemPath(fromRel, toRel);
+                    this.stateDb.renameItemPath(fromRel, toRel, this.cloudParentOf(toRel));
                 } catch (error: unknown) {
                     this.logger.warn(`Could not move the records of ${fromRel} to ${toRel}, so it goes back: ${error}`);
                     let back = false;
@@ -3882,7 +3882,7 @@ export class ProtonDriveSyncEngine {
                             // Into an ignored name nothing follows it; and records with no local copy would read as deletes
                             this.stateDb.removeItemByPath(fromRel);
                         } else {
-                            this.stateDb.renameItemPath(fromRel, toRel);
+                            this.stateDb.renameItemPath(fromRel, toRel, this.cloudParentOf(toRel));
                         }
                         this.journal.retarget(fromRel, toRel);
                         if (!ignoredTo) {
@@ -4179,6 +4179,13 @@ export class ProtonDriveSyncEngine {
                 this.stateDb.markConflictResolved(conflict.id, 'keep-remote');
             }
         }
+    }
+
+    // The uid of the cloud folder a path is in, as the remote index has it now, or undefined while that isn't known (a
+    // folder not in Proton Drive yet has only a provisional uid): what a moved item's record names as its parent (#80)
+    private cloudParentOf(relPath: string): string | undefined {
+        const parent = this.index.getByPath(parentOf(relPath));
+        return parent && parent.type === 'folder' && !isProvisional(parent.uid) ? parent.uid : undefined;
     }
 
     private unresolvedConflictsAt(relPath: string): ConflictRecord[] {
@@ -4987,7 +4994,7 @@ export class ProtonDriveSyncEngine {
         await this.whileRemoving(async (records) => {
             const snapshot = this.snapshotLocalStep([fromRel, toRel], [uid]);
             this.stateDb.connection.transaction(() => {
-                this.stateDb.renameItemPath(fromRel, toRel);
+                this.stateDb.renameItemPath(fromRel, toRel, this.cloudParentOf(toRel));
                 this.journal.retarget(fromRel, toRel);
                 this.stateDb.setMeta(LOCAL_MOVE_IN_PROGRESS, JSON.stringify({ from: fromRel, to: toRel, replace: false }));
             })();
