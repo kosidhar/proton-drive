@@ -109,6 +109,10 @@ const SLOW_DOWNLOAD_NOTICE_MS = 2000;
 const HYDRATE_STAGING_PREFIX = '.proton-drive-tmp-hydrate-';
 // What everything that would touch the files answers while they move between the sync folder and the backing store
 const BUSY_MOVING = 'Proton Drive is busy moving files';
+// Whether a relative path is base itself or inside it
+function isSameOrUnder(relPath: string, base: string): boolean {
+    return relPath === base || relPath.startsWith(`${base}/`);
+}
 // The status, and what everything that would make something in the folder answers, while the files are missing from it
 // (see filesGone): that all of them are missing from `where` (see missingPlace), or, when only some are, the one item
 // missing or how many items are
@@ -312,6 +316,10 @@ export class ProtonDriveSyncEngine {
     // or the strategy would act against the user's choice and the row would say what didn't happen (#77)
     private readonly manualResolvingPaths = new Set<string>();
     private readonly strategyResolvingPaths = new Set<string>();
+    // When each resolution by hand ends (by its path), for a drive rename or delete of it to wait for; and the paths a
+    // drive rename or delete is working on right now, which a resolution by hand is refused for (#112)
+    private readonly manualResolutionEnds = new Map<string, Promise<void>>();
+    private readonly drivingPaths = new Map<string, number>();
     // The conflict copy a keep-both made of a file (by its path), and of what content, until that keep-both finishes or
     // the file's conflict is over some other way (resolved by hand, or the file synced): a retry after its download failed
     // goes on from it rather than make another (#25)
@@ -1756,13 +1764,23 @@ export class ProtonDriveSyncEngine {
                 `Proton Drive is resolving ${conflict.localRelPath} by your conflict setting right now; try again in a moment`,
             );
         }
+        if ([...this.drivingPaths.keys()].some((p) => isSameOrUnder(conflict.localRelPath, p))) {
+            throw new ConflictRefusedError(
+                409,
+                `${conflict.localRelPath} is being renamed, moved or deleted on this computer right now; try again in a moment`,
+            );
+        }
         this.resolvingConflicts.add(conflictId);
         this.manualResolvingPaths.add(conflict.localRelPath);
+        let ended!: () => void;
+        this.manualResolutionEnds.set(conflict.localRelPath, new Promise<void>((resolve) => (ended = resolve)));
         try {
             await this.resolveUnresolvedConflict(conflict, choice);
         } finally {
             this.resolvingConflicts.delete(conflictId);
             this.manualResolvingPaths.delete(conflict.localRelPath);
+            this.manualResolutionEnds.delete(conflict.localRelPath);
+            ended();
         }
         return this.stateDb.getConflictById(conflictId)!;
     }
@@ -3248,9 +3266,10 @@ export class ProtonDriveSyncEngine {
         if (to.startsWith(`${from}/`)) {
             throw new Error(`Can't move ${from} into itself`);
         }
+        await this.afterManualResolutions([from, to], opts.deadlineMs);
         await this.inAvailabilityRun(() => {
             this.inTime(opts.deadlineMs, from);
-            return this.renameLocally(from, to, opts.noReplace === true);
+            return this.drivingAt([from, to], () => this.renameLocally(from, to, opts.noReplace === true));
         });
         void this.replayRemoteOps();
     }
@@ -3272,11 +3291,53 @@ export class ProtonDriveSyncEngine {
         if (rel === '') {
             throw new Error("The whole of Proton Drive can't be deleted");
         }
+        await this.afterManualResolutions([rel], opts.deadlineMs);
         await this.inAvailabilityRun(() => {
             this.inTime(opts.deadlineMs, rel);
-            return this.deleteLocally(rel, opts.onlyIfEmpty === true, opts.trash === true);
+            return this.drivingAt([rel], () => this.deleteLocally(rel, opts.onlyIfEmpty === true, opts.trash === true));
         });
         void this.replayRemoteOps();
+    }
+
+    // A drive rename or delete of a file being resolved by hand (or of a folder holding one) waits for that to finish:
+    // done meanwhile, it would end the conflict and drop the record under the resolution, whose upload could still land
+    // (#112). Waits no longer than the drive op's deadline, which then refuses it
+    private async afterManualResolutions(paths: string[], deadlineMs?: number): Promise<void> {
+        for (;;) {
+            const ends = [...this.manualResolutionEnds].filter(([r]) => paths.some((p) => isSameOrUnder(r, p))).map(([, end]) => end);
+            if (ends.length === 0) {
+                return;
+            }
+            const left = deadlineMs === undefined ? null : deadlineMs - Date.now();
+            if (left !== null && left <= 0) {
+                return; // inTime refuses it
+            }
+            await (left === null ? Promise.all(ends) : Promise.race([Promise.all(ends), Bun.sleep(left)]));
+        }
+    }
+
+    // Runs a drive rename or delete with its paths marked, so that a resolution by hand doesn't start on them meanwhile;
+    // one that started since the wait above (its turn came while this one queued) refuses this one instead (#112)
+    private async drivingAt<T>(paths: string[], work: () => Promise<T>): Promise<T> {
+        const resolving = [...this.manualResolvingPaths].find((r) => paths.some((p) => isSameOrUnder(r, p)));
+        if (resolving !== undefined) {
+            throw new DriveOpError('EIO', `Busy resolving a conflict: ${resolving}`);
+        }
+        for (const p of paths) {
+            this.drivingPaths.set(p, (this.drivingPaths.get(p) ?? 0) + 1);
+        }
+        try {
+            return await work();
+        } finally {
+            for (const p of paths) {
+                const left = (this.drivingPaths.get(p) ?? 1) - 1;
+                if (left > 0) {
+                    this.drivingPaths.set(p, left);
+                } else {
+                    this.drivingPaths.delete(p);
+                }
+            }
+        }
     }
 
     // Turns an online-only file into an empty local one for the virtual drive (an app opened it with O_TRUNC, or cut it
