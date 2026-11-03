@@ -62,6 +62,13 @@ describe('LocalFolderWatcher', () => {
         expect(changes).not.toContain('P/P');
     });
 
+    // The sync folder's own report of itself going is what tells the engine at once that its files are missing (#45)
+    test('the sync folder itself moved away is still reported at once', async () => {
+        await start();
+        await rename(root, path.join(base, 'moved-away'));
+        expect(await waitFor(() => changes.length > 0)).toBe(true);
+    });
+
     test('a real child named like its folder is still reported', async () => {
         await mkdir(path.join(root, 'P'));
         await start();
