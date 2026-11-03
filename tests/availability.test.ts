@@ -138,6 +138,19 @@ describe("AvailabilityPolicy", () => {
     expect(policy.childStates("").get("Fresh")).toBe("online-only");
   });
 
+  test("a nested folder whose contents aren't indexed yet is online-only, beside one that is all here", () => {
+    index.replaceChildren("docs", "Docs", [
+      file("a", "docs", "Docs/a.txt"),
+      file("b", "docs", "Docs/b.txt"),
+      folder("deep", "docs", "Docs/Deep"),
+      folder("docs-fresh", "docs", "Docs/Fresh"),
+    ]);
+    addLocalRecord("Docs/Deep/c.txt");
+    expect(policy.stateOf("Docs/Fresh")).toBe("online-only");
+    expect(policy.childStates("Docs").get("Fresh")).toBe("online-only");
+    expect(policy.childStates("Docs").get("Deep")).toBe("downloaded");
+  });
+
   test("a folder whose files are all here is downloaded, though the folder itself has no record (opened on demand)", () => {
     addLocalRecord("Docs/a.txt");
     addLocalRecord("Docs/b.txt");
@@ -271,7 +284,11 @@ describe("AvailabilityPolicy.childStates", () => {
       for (const child of children) {
         if (child.type === "folder") {
           folders.push({ uid: child.uid, relPath: child.relPath });
-          grow(child.uid, child.relPath, depth + 1);
+          // Some folders' contents are never crawled (indexed one level deep, #17); some folders are recorded
+          // themselves; some hold a local item the index doesn't know
+          if (next() < 0.75) grow(child.uid, child.relPath, depth + 1);
+          if (next() < 0.3) record(child.relPath);
+          if (next() < 0.2) record(`${child.relPath}/local-only.txt`);
         } else if (next() < 0.5) {
           record(child.relPath);
         }
