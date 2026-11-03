@@ -5406,6 +5406,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
             await d.engine.reconcileNow();
             expect(d.calls.trashed).toEqual([]);
+            // Left for later on purpose, not by an error
+            expect(stateDb.listActivity(50).filter((a) => a.action === 'error')).toEqual([]);
             d.down.clear();
             await d.engine.reconcileNow();
             await d.engine.reconcileNow();
