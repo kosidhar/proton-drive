@@ -66,6 +66,19 @@ describe('RemoteOpsJournal', () => {
         expect(journal.pending()).toEqual([]);
     });
 
+    test('hasLaterOn tells whether a later operation on the same node is pending', () => {
+        const journal = new RemoteOpsJournal(stateDb.connection);
+        const a = journal.enqueue({ kind: 'rename', nodeUid: 'vol~a', toPath: 'A2' });
+        const b = journal.enqueue({ kind: 'rename', nodeUid: 'vol~b', toPath: 'B2' });
+        const a2 = journal.enqueue({ kind: 'move', nodeUid: 'vol~a', toPath: 'X/A2' });
+
+        expect(journal.hasLaterOn(a, 'vol~a')).toBe(true);
+        expect(journal.hasLaterOn(a2, 'vol~a')).toBe(false);
+        expect(journal.hasLaterOn(b, 'vol~b')).toBe(false);
+        journal.complete(a2);
+        expect(journal.hasLaterOn(a, 'vol~a')).toBe(false);
+    });
+
     test('a later local rename takes the targets of pending moves along, and leaves look-alike paths alone', () => {
         const journal = new RemoteOpsJournal(stateDb.connection);
         const intoNew = journal.enqueue({ kind: 'move', nodeUid: 'vol~x', toPath: 'New/x.txt' });

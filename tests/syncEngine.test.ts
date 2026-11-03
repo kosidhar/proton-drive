@@ -34,6 +34,7 @@ import {
 import { LAYOUT_MOVING } from '../src/sync/layoutMigration';
 import { RemoteOpsJournal } from '../src/sync/remoteOps';
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
+import { APICodeError, APIHTTPError } from '@protontech/drive-sdk/internal/apiService/errors';
 import { localFiles } from './helpers/localFiles';
 import { makeMockDrive } from './helpers/mockDrive';
 import { makeMockNode } from './helpers/mockNodes';
@@ -4335,6 +4336,16 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(d.calls.trashed).toEqual([]);
                 });
 
+                test('a request refused for that item alone (an HTTP 4xx) fails only that item', async () => {
+                    const d = await withFailingDownload(layout, () => new APIHTTPError('Forbidden', 403));
+
+                    await d.engine.reconcileNow();
+
+                    expect(await readFile(d.local('B/good.txt'), 'utf8')).toBe('good');
+                    expect(d.engine.getStatus().lastError).toContain('A/bad.txt');
+                    expect(d.calls.trashed).toEqual([]);
+                });
+
                 test('offline, the pass still stops at the first failure rather than fail every item', async () => {
                     const d = await withFailingDownload(layout, () => new ConnectionError('Network unreachable'));
 
@@ -4398,6 +4409,112 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await d.engine.reconcileNow();
             await d.engine.reconcileNow(); // records the folders made to hold what came down
         };
+
+        // #39: a refusal the SDK doesn't map (an APICodeError, or an APIHTTPError with a 4xx) never stalls the journal
+        describe('an operation Proton Drive keeps refusing (#39)', () => {
+            const refusing = async (error: () => Error) => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                d.add('Docs/b.txt', 'b');
+                await d.engine.reconcileNow();
+                const rename = (d.sdk as any).renameNode;
+                let refusals = 0;
+                (d.sdk as any).renameNode = async (uid: string, name: string) => {
+                    if (uid === 'vol~Docs/a.txt') {
+                        refusals += 1;
+                        throw error();
+                    }
+                    return rename(uid, name);
+                };
+                await d.engine.renameItem('Docs/a.txt', 'Docs/a2.txt');
+                await d.engine.renameItem('Docs/b.txt', 'Docs/b2.txt'); // later, and independent of it
+                return { ...d, refusals: () => refusals };
+            };
+
+            for (const [kind, error, tries] of [
+                ['an HTTP 4xx', () => new APIHTTPError('Unprocessable Entity', 422), 3],
+                // An API error code may come with a 5xx too: it gets the longer limit of unexpected failures
+                ['an unmapped API code', () => new APICodeError('Operation not allowed', 2061), 10],
+            ] as const) {
+                test(`refused with ${kind}, it is given up on after ${tries} tries, the user told once, and later operations go on`, async () => {
+                    const d = await refusing(error);
+
+                    for (let i = 0; i < tries + 3; i++) {
+                        await d.engine.replayRemoteOps();
+                    }
+
+                    expect(d.refusals()).toBe(tries);
+                    expect(d.calls.renamed).toEqual([{ uid: 'vol~Docs/b.txt', name: 'b2.txt' }]);
+                    expect(d.journal()).toEqual([]);
+                    const told = activity().filter((a) => a.includes('Docs/a2.txt') && a.includes('given up on'));
+                    expect(told).toHaveLength(1);
+
+                    // The next sync follows what Proton Drive has: the item is back under its old name, nothing lost
+                    await d.engine.reconcileNow();
+                    expect(d.engine.remoteIndex.getByPath('Docs/a.txt')?.uid).toBe('vol~Docs/a.txt');
+                    expect(d.engine.remoteIndex.getByPath('Docs/a2.txt')).toBeNull();
+                    expect(d.engine.remoteIndex.getByPath('Docs/b2.txt')?.uid).toBe('vol~Docs/b.txt');
+                    expect(d.nodes.has('vol~Docs/a.txt')).toBe(true);
+                    expect(d.calls.trashed).toEqual([]);
+                });
+            }
+
+            test('a rename of a file kept on this computer, given up on, puts its local copy back under the old name', async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                await pinnedAndSynced(d, d.nodes.get('vol~Docs')!.uid);
+                (d.sdk as any).renameNode = async () => {
+                    throw new APICodeError('Operation not allowed', 2061);
+                };
+                await d.engine.renameItem('Docs/a.txt', 'Docs/a2.txt');
+                for (let i = 0; i < 12; i++) {
+                    await d.engine.replayRemoteOps();
+                }
+                expect(d.journal()).toEqual([]);
+
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+
+                expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('a');
+                expect(await d.files.exists('Docs/a2.txt')).toBe(false);
+                expect(stateDb.getItemByPath('Docs/a.txt')?.nodeUid).toBe('vol~Docs/a.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+                await d.expectEveryRecordHasItsFile();
+            });
+
+            test('a delete given up on brings the item back, never losing it', async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                d.add('Docs/b.txt', 'b');
+                await d.engine.reconcileNow();
+                (d.sdk as any).trashNodes = async function* (uids: string[]) {
+                    for (const uid of uids) yield { uid, ok: false as const, error: new APIHTTPError('Forbidden', 403) };
+                };
+                await d.engine.deleteItem('Docs/a.txt');
+                expect(d.engine.remoteIndex.getByPath('Docs/a.txt')).toBeNull();
+                for (let i = 0; i < 4; i++) {
+                    await d.engine.replayRemoteOps();
+                }
+
+                expect(d.journal()).toEqual([]);
+                expect(d.nodes.has('vol~Docs/a.txt')).toBe(true);
+                expect(d.engine.remoteIndex.getByPath('Docs/a.txt')?.uid).toBe('vol~Docs/a.txt');
+                expect(activity().filter((a) => a.includes('Docs/a.txt') && a.includes('given up on'))).toHaveLength(1);
+            });
+
+            test('refused with an HTTP 5xx, it stays pending and is tried again, keeping the order', async () => {
+                const d = await refusing(() => new APIHTTPError('Bad Gateway', 502));
+
+                for (let i = 0; i < 6; i++) {
+                    await d.engine.replayRemoteOps();
+                }
+
+                expect(d.refusals()).toBeGreaterThanOrEqual(6); // never given up on
+                expect(d.journal().map((op) => (op.kind === 'trash' ? op.path : op.toPath))).toEqual(['Docs/a2.txt', 'Docs/b2.txt']);
+                expect(d.calls.renamed).toEqual([]);
+            });
+        });
 
         test('renaming a folder holding online-only items offline shows at once, survives a restart, and renames once in the cloud when back online', async () => {
             const d = setup();
