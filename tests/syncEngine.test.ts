@@ -8935,5 +8935,41 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
         }
     });
-});
 
+    describe("a record's parent follows a move (#80)", () => {
+        for (const layout of ['plain', 'virtual'] as const) {
+            const setup = async () => {
+                if (layout === 'virtual') stateDb.setMeta('driveLayout', 'virtual');
+                const d = makeMockDrive();
+                const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                    ...(layout === 'virtual' ? { backingDir: path.join(tempDir, 'files'), moveToDesktopTrash: async () => false } : { moveToDesktopTrash: async () => false }),
+                    settle: { quietMs: 0 },
+                });
+                d.add('Kept.txt', 'kept');
+                d.add('a.txt', 'a');
+                const folder = d.add('Folder');
+                engine.availability.setPin(d.root.uid, 'pinned', false);
+                await engine.reconcileNow();
+                expect(stateDb.getItemByPath('a.txt')?.parentNodeUid).toBe(d.root.uid);
+                return { ...d, engine, folder };
+            };
+
+            test(`${layout}: a move in Proton Drive the sync follows`, async () => {
+                const d = await setup();
+                const node = d.nodes.get(d.uid('a.txt'))!;
+                d.nodes.set(d.uid('a.txt'), { ...node, parentUid: d.folder.uid });
+                await d.engine.reconcileNow();
+                expect(stateDb.getItemByPath('Folder/a.txt')?.parentNodeUid).toBe(d.folder.uid);
+            });
+
+            if (layout === 'virtual') {
+                test('virtual: a move through the drive', async () => {
+                    const d = await setup();
+                    await d.engine.renameItem('a.txt', 'Folder/a.txt');
+                    await d.engine.replayRemoteOps();
+                    expect(stateDb.getItemByPath('Folder/a.txt')?.parentNodeUid).toBe(d.folder.uid);
+                });
+            }
+        }
+    });
+});
