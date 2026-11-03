@@ -124,6 +124,29 @@ describe("AvailabilityPolicy", () => {
     expect(policy.stateOf("Music/s.mp3")).toBe("online-only");
   });
 
+  // #17: a cloud folder indexed one level deep (its contents not crawled yet) has no indexed file below it that lacks a
+  // record, but nothing in it is on this computer either
+  test("a folder whose contents aren't indexed yet, with nothing of it here, is online-only", () => {
+    index.replaceChildren("root", "", [
+      folder("docs", "root", "Docs"),
+      folder("music", "root", "Music"),
+      folder("photos", "root", "Photos"),
+      folder("photos-lc", "root", "photos"),
+      folder("fresh", "root", "Fresh"),
+    ]);
+    expect(policy.stateOf("Fresh")).toBe("online-only");
+    expect(policy.childStates("").get("Fresh")).toBe("online-only");
+  });
+
+  test("a folder whose files are all here is downloaded, though the folder itself has no record (opened on demand)", () => {
+    addLocalRecord("Docs/a.txt");
+    addLocalRecord("Docs/b.txt");
+    addLocalRecord("Docs/Deep/c.txt");
+    expect(policy.stateOf("Docs")).toBe("downloaded");
+    expect(policy.stateOf("Docs/Deep")).toBe("downloaded");
+    expect(policy.childStates("").get("Docs")).toBe("downloaded");
+  });
+
   test("a pinned item reports pinned", () => {
     policy.setPin("docs", "pinned", false);
     expect(policy.stateOf("Docs")).toBe("pinned");
