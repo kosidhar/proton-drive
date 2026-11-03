@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 
 import { selfOrDescendant, selfOrDescendantWhere } from './pathRange';
-import { type ConflictStrategy, isConflictStrategy, usableIgnorePatterns } from './settingsRules';
+import { type ConflictStrategy, isConflictStrategy, problemWithBlockedApps, usableIgnorePatterns } from './settingsRules';
 
 export type ItemSyncStatus = 'synced' | 'uploading' | 'downloading' | 'conflict' | 'error' | 'ignored';
 export { CONFLICT_STRATEGIES, type ConflictStrategy } from './settingsRules';
@@ -66,6 +66,8 @@ export interface SyncSettings {
     reconcileIntervalSec: number;
     paused: boolean;
     ignorePatterns: string[];
+    // Apps (by process name) that may not download online-only files from the virtual drive
+    blockedApps: string[];
 }
 
 export const DEFAULT_IGNORE_PATTERNS = [
@@ -81,8 +83,17 @@ export const DEFAULT_IGNORE_PATTERNS = [
     '.Trash-*',
 ];
 
+// Meta keys whose change changes where the files are, so every emblem may be stale
+const RESET_META_KEYS: readonly string[] = ['driveLayout', 'virtualDriveWanted'];
+
 export class SyncStateDatabase {
     private db: Database;
+
+    // Told of every path whose state may have changed (subtree: everything below it too), for the file manager's
+    // emblems (see StateEvents)
+    onChange: ((relPath: string, subtree: boolean) => void) | null = null;
+    // Told when every state may have changed at once: the sync folder moved, the ignore patterns or the layout changed
+    onReset: (() => void) | null = null;
 
     // For modules that keep their own tables in this database file, such as RemoteIndex.
     get connection(): Database {
@@ -200,6 +211,19 @@ export class SyncStateDatabase {
         return [...value];
     }
 
+    // A stored list that can't be used reads as none blocked, with a warning: a bad value must never stop the drive
+    private storedBlockedApps(raw: string | undefined): string[] {
+        if (raw === undefined) return [];
+        try {
+            const apps: unknown = JSON.parse(raw);
+            if (problemWithBlockedApps(apps) === null) return apps as string[];
+        } catch {
+            // not JSON
+        }
+        this.warnBadSetting('blockedApps', raw);
+        return [];
+    }
+
     getSettings(): SyncSettings {
         const defaultSyncDir = process.env.PROTON_DRIVE_SYNC_DIR || path.join(homedir(), 'ProtonDrive');
         const rows = this.db.query('SELECT key, value FROM settings').all() as Array<{ key: string; value: string }>;
@@ -221,6 +245,7 @@ export class SyncStateDatabase {
             reconcileIntervalSec: Number(map.get('reconcileIntervalSec') || 120),
             paused: map.get('paused') === 'true',
             ignorePatterns,
+            blockedApps: this.storedBlockedApps(map.get('blockedApps')),
         };
     }
 
@@ -240,7 +265,14 @@ export class SyncStateDatabase {
         store('reconcileIntervalSec', String(next.reconcileIntervalSec));
         store('paused', String(next.paused));
         store('ignorePatterns', JSON.stringify(next.ignorePatterns));
+        store('blockedApps', JSON.stringify(next.blockedApps));
 
+        if (
+            (partial.syncDir !== undefined && partial.syncDir !== current.syncDir) ||
+            (partial.ignorePatterns !== undefined && JSON.stringify(partial.ignorePatterns) !== JSON.stringify(current.ignorePatterns))
+        ) {
+            this.onReset?.();
+        }
         return next;
     }
 
@@ -251,7 +283,11 @@ export class SyncStateDatabase {
     }
 
     setMeta(key: string, value: string): void {
+        const before = RESET_META_KEYS.includes(key) ? this.getMeta(key) : value;
         this.db.query('INSERT OR REPLACE INTO settings (key, value) VALUES ($key, $value)').run({ $key: key, $value: value });
+        if (before !== value) {
+            this.onReset?.();
+        }
     }
 
     deleteMeta(key: string): void {
@@ -299,6 +335,7 @@ export class SyncStateDatabase {
                 $lastError: item.lastError,
                 $updatedAt: updatedAt,
             });
+        this.onChange?.(item.localRelPath, false);
     }
 
     getItemByPath(localRelPath: string): SyncedItemRecord | null {
@@ -354,6 +391,7 @@ export class SyncStateDatabase {
     removeItemByPath(localRelPath: string): void {
         this.topLevelNames = null;
         this.db.query(`DELETE FROM synced_items WHERE ${selfOrDescendantWhere('localRelPath')}`).run(selfOrDescendant(localRelPath));
+        this.onChange?.(localRelPath, true);
     }
 
     // Moves the record at a path, and every record under it, to another path, in one transaction (a local copy moved to
@@ -382,6 +420,8 @@ export class SyncStateDatabase {
                 )
                 .run({ $toRel: toRel, $fromRel: fromRel, $updatedAt: Date.now(), ...selfOrDescendant(fromRel) });
         })();
+        this.onChange?.(fromRel, true);
+        this.onChange?.(toRel, true);
     }
 
     recordEditBaseline(baseline: Omit<EditBaseline, 'createdAt'>): void {
@@ -462,6 +502,7 @@ export class SyncStateDatabase {
                 $lastError: lastError,
                 $updatedAt: Date.now(),
             });
+        this.onChange?.(localRelPath, false);
     }
 
     recordConflict(conflict: {
@@ -501,6 +542,7 @@ export class SyncStateDatabase {
                 $conflictCopyPath: conflict.conflictCopyPath ?? null,
             });
 
+        this.onChange?.(conflict.localRelPath, false);
         return this.getConflictById(Number(res.lastInsertRowid))!;
     }
 
@@ -530,6 +572,10 @@ export class SyncStateDatabase {
                 $resolution: resolution,
                 $conflictCopyPath: conflictCopyPath ?? null,
             });
+        const resolved = this.getConflictById(id);
+        if (resolved) {
+            this.onChange?.(resolved.localRelPath, false);
+        }
     }
 
     logActivity(entry: {

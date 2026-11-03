@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { lstatSync, renameSync, statSync, utimesSync } from 'node:fs';
+import { lstatSync, readdirSync, renameSync, statSync, utimesSync } from 'node:fs';
 import { lstat, mkdir, readdir, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -18,7 +18,7 @@ import {
     ValidationError,
 } from '@protontech/drive-sdk';
 
-import { sendDesktopNotification } from '../linux/notifications';
+import { sendActionNotification, sendDesktopNotification } from '../linux/notifications';
 import type { Manager as EventsManager } from '../sdk/events/manager';
 import {
     computeLocalFileSha1,
@@ -32,9 +32,12 @@ import {
 } from '../sdk/fileOps';
 import { getClaimedSize, getName } from '../sdk/node';
 import { AvailabilityPolicy, type ItemAvailability } from './availability';
+import { DownloadWatch } from './downloadWatch';
+import { problemWithBlockedApps } from './settingsRules';
+import { StateEvents } from './stateEvents';
 import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
 import { createLocalConflictCopy, formatConflictFileName } from './conflictResolver';
-import { gioTrash, type MoveToDesktopTrash } from './desktopTrash';
+import { homeTrash, type MoveToDesktopTrash } from './desktopTrash';
 import { readDriveLayout } from './driveMode';
 import { LAYOUT_MOVING, type MoveSeams, relocateFiles, SYNC_DIR_MOVING } from './layoutMigration';
 import { DriveOpError, type VfsEntry } from './driveOps';
@@ -243,6 +246,8 @@ export class ProtonDriveSyncEngine {
     private workSince = new Map<number, number>();
     private readonly index: RemoteIndex;
     private readonly policy: AvailabilityPolicy;
+    // What changed, for the file manager's emblems (see StateEvents and the control socket's /fm/events)
+    readonly stateEvents: StateEvents;
     // Renames, moves and deletes made through the virtual drive that Proton Drive has yet to get, and the replay of them:
     // one at a time (replayRun), again when asked meanwhile (replayAgain), and after the sync pass when asked during one
     // (replayAfterPass)
@@ -252,6 +257,8 @@ export class ProtonDriveSyncEngine {
     private replayAfterPass = false;
     // Downloads for the virtual drive under way, by path: a second open of the same file waits for the same one
     private hydrations = new Map<string, Promise<void>>();
+    // Downloads by app, to tell the user when one app downloads many files (see DownloadWatch)
+    private readonly downloadWatch = new DownloadWatch();
     private hydrateStaging = new Set<string>(); // their staging files
     private slowDownloadNoticeMs = SLOW_DOWNLOAD_NOTICE_MS;
     // Held while the files move between the sync folder and the backing store (see holdForMove): nothing new starts, and
@@ -285,12 +292,23 @@ export class ProtonDriveSyncEngine {
             // Deletes GNOME's failed-thumbnail record of a file by its path under the mount (see thumbnailCache)
             forgetFailedThumbnail?: (mountFullPath: string) => Promise<void>;
             moveSeams?: MoveSeams; // for tests: moving the sync folder
+            // How the user is asked about an app downloading many files (sendActionNotification; for tests)
+            askWithActions?: typeof sendActionNotification;
+            // For tests: when the coalesced state changes go out (see StateEvents)
+            stateEventSchedule?: (run: () => void, delayMs: number) => () => void;
             // For tests: how long what is missing while held is taken as known (FILES_MISSING_CACHE_MS; see stillMissing)
             filesMissingCacheMs?: number;
         } = {},
     ) {
         this.index = new RemoteIndex(this.stateDb.connection);
         this.policy = new AvailabilityPolicy(this.stateDb.connection, this.index);
+        this.stateEvents = new StateEvents(options.stateEventSchedule ? { schedule: options.stateEventSchedule } : {});
+        const changed = (relPath: string, subtree: boolean) =>
+            subtree ? this.stateEvents.touchSubtree(relPath) : this.stateEvents.touch(relPath);
+        this.index.onChange = changed;
+        this.policy.onChange = changed;
+        this.stateDb.onChange = changed;
+        this.stateDb.onReset = () => this.stateEvents.reset();
         this.journal = new RemoteOpsJournal(this.stateDb.connection);
         this.watcher = new LocalFolderWatcher(
             () => this.localRoot(),
@@ -2106,6 +2124,7 @@ export class ProtonDriveSyncEngine {
     }
 
     private async handleLocalFileChange(relPath: string): Promise<void> {
+        this.stateEvents.touch(relPath); // a new file shows as waiting to upload; a removed one goes
         if (this.holding() || !this.auth.isLoggedIn()) {
             return;
         }
@@ -2395,8 +2414,10 @@ export class ProtonDriveSyncEngine {
                 continue; // Gone meanwhile, or an empty folder: nothing in it to keep
             }
             let wasMoved = false;
+            // In the virtual layout the item is in the hidden store, but the user knows it under the drive (#40)
+            const shownPath = this.inBackingStore() ? path.join(this.stateDb.getSettings().syncDir, rel) : undefined;
             try {
-                wasMoved = await this.moveToDesktopTrash(fullPath);
+                wasMoved = await this.moveToDesktopTrash(fullPath, shownPath);
             } catch {
                 // Counts as not moved
             }
@@ -2417,7 +2438,7 @@ export class ProtonDriveSyncEngine {
     }
 
     private get moveToDesktopTrash(): MoveToDesktopTrash {
-        return this.options.moveToDesktopTrash ?? gioTrash;
+        return this.options.moveToDesktopTrash ?? homeTrash();
     }
 
     // A synced item the cloud no longer lists at its path. Renamed or moved there, its local copy follows; deleted or
@@ -2756,6 +2777,120 @@ export class ProtonDriveSyncEngine {
         return entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     }
 
+    // What the file manager shows on a folder and each of its children, in a fixed number of queries (see
+    // AvailabilityPolicy.childStates): the availability, and a transfer under way, an error or a conflict at the item or
+    // anywhere below it, as recorded. A child that is a local item matching an ignore pattern gets null (no emblem); one not in Proton
+    // Drive yet is waiting to upload (syncing). Hidden items are left out, as the drive leaves them out. Null when the
+    // path isn't a folder of the drive, or while the files are moving.
+    itemStates(relPath: string): FolderStates | null {
+        let rel: string;
+        try {
+            rel = normalizeDrivePath(relPath);
+        } catch {
+            return null;
+        }
+        if (this.holding()) {
+            return null;
+        }
+        const ignorePatterns = this.stateDb.getSettings().ignorePatterns;
+        if (rel !== '' && (matchesIgnorePatterns(rel, ignorePatterns) || this.policy.hiddenBy(rel) !== null)) {
+            return null;
+        }
+        const localNames = this.localChildNames(rel);
+        const folder = this.liveIndexEntry(rel);
+        if (!folder || folder.type !== 'folder') {
+            // A folder made here and not uploaded yet: everything in it waits to upload
+            if (localNames === null || folder) {
+                return null;
+            }
+            const children: Record<string, ItemState | null> = {};
+            for (const name of localNames) {
+                children[name] = this.localOnlyState(childRel(rel, name), ignorePatterns);
+            }
+            return { self: { availability: 'downloaded', transfer: 'syncing' }, children };
+        }
+
+        const availability = this.policy.childStates(rel);
+        const transfers = this.transfersBelow(rel);
+        const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
+        const children: Record<string, ItemState | null> = {};
+        for (const child of this.index.listChildren(rel)) {
+            const state = availability.get(child.name);
+            if (
+                takesAway(latest.get(child.uid), child) ||
+                matchesIgnorePatterns(child.relPath, ignorePatterns) ||
+                state === undefined ||
+                state === 'hidden' ||
+                state === 'hiding'
+            ) {
+                continue;
+            }
+            children[child.name] = { availability: state, transfer: transfers.get(child.name) ?? null };
+        }
+        for (const name of localNames ?? []) {
+            if (!(name in children) && !availability.has(name)) {
+                // Shown as syncing on itself only: what waits to upload is known by looking at the disk, which a folder's
+                // emblem can't do for everything below it, so folders sum up what the records say, the same from any view
+                children[name] = this.localOnlyState(childRel(rel, name), ignorePatterns);
+            }
+        }
+        let below: Transfer = null;
+        for (const transfer of transfers.values()) {
+            below = worseTransfer(below, transfer);
+        }
+        const selfState = this.policy.stateOf(rel);
+        const self =
+            rel === '' || selfState === 'hidden' || selfState === 'hiding' ? null : { availability: selfState, transfer: below };
+        return { self, children };
+    }
+
+    // The names in a folder of the local root (engine temp files left out), or null when it isn't a folder here
+    private localChildNames(rel: string): string[] | null {
+        try {
+            return readdirSync(path.join(this.localRoot(), rel)).filter((name) => !isEngineTempName(name));
+        } catch {
+            return null;
+        }
+    }
+
+    private localOnlyState(rel: string, ignorePatterns: string[]): ItemState | null {
+        return matchesIgnorePatterns(rel, ignorePatterns) ? null : { availability: 'downloaded', transfer: 'syncing' };
+    }
+
+    // The worst transfer at or below each child of a folder, by the child's name: uploads and downloads under way and
+    // opens of online-only files (syncing), errors, and unresolved conflicts
+    private transfersBelow(folderRel: string): Map<string, Transfer> {
+        const prefix = folderRel === '' ? '' : `${folderRel}/`;
+        const below = (column: string) => (folderRel === '' ? `${column} != ''` : `(${column} >= $lo AND ${column} < $hi)`);
+        const params = { $prefix: prefix, ...(folderRel === '' ? {} : { $lo: prefix, $hi: `${folderRel}0` }) };
+        const firstSegment = (column: string) =>
+            `CASE WHEN instr(substr(${column}, length($prefix) + 1), '/') > 0
+                  THEN substr(substr(${column}, length($prefix) + 1), 1, instr(substr(${column}, length($prefix) + 1), '/') - 1)
+                  ELSE substr(${column}, length($prefix) + 1) END`;
+        const rows = this.stateDb.connection
+            .query(
+                `SELECT ${firstSegment('localRelPath')} AS name,
+                        CASE WHEN syncStatus = 'error' THEN 'error' ELSE 'syncing' END AS transfer
+                   FROM synced_items
+                  WHERE syncStatus IN ('uploading', 'downloading', 'error') AND ${below('localRelPath')}
+                 UNION ALL
+                 SELECT ${firstSegment('localRelPath')} AS name, 'conflict' AS transfer
+                   FROM conflicts WHERE resolved = 0 AND ${below('localRelPath')}`,
+            )
+            .all(params) as { name: string; transfer: Exclude<Transfer, null> }[];
+        const out = new Map<string, Transfer>();
+        for (const row of rows) {
+            out.set(row.name, worseTransfer(out.get(row.name) ?? null, row.transfer));
+        }
+        for (const opening of this.hydrations.keys()) {
+            if (opening.startsWith(prefix) && opening !== folderRel) {
+                const name = opening.slice(prefix.length).split('/')[0];
+                out.set(name, worseTransfer(out.get(name) ?? null, 'syncing'));
+            }
+        }
+        return out;
+    }
+
     // Downloads an online-only file into the backing store, for the virtual drive to open it (an app opened it). Calls for
     // the same path while one runs get that one; a file already here resolves at once. Nothing waits for the download,
     // and whatever happens to the item meanwhile wins (see hydrateFile). The user is told when the download takes over
@@ -2763,9 +2898,13 @@ export class ProtonDriveSyncEngine {
     // A rename, delete or cloud move of it meanwhile makes it reject with ENOENT. Rejects with a DriveOpError:
     // `Hidden: <path>` (EACCES) for an item hidden or being hidden, `Not in Proton Drive: <path>` (ENOENT), `Not a file:
     // <path>` (EIO), or the download's error (EIO); with `Invalid path: <path>` for a path that climbs out of My files.
-    hydrate(relPath: string): Promise<void> {
+    hydrate(relPath: string, opts: { opener?: string } = {}): Promise<void> {
         let rel: string;
         try {
+            // An app the user blocked is refused first, quietly: it may be walking a whole folder
+            if (opts.opener !== undefined && this.stateDb.getSettings().blockedApps.includes(opts.opener)) {
+                throw new DriveOpError('EACCES', `Blocked: ${opts.opener}`);
+            }
             this.refuseWhileHeld();
             this.refuseWhileFilesGone();
             rel = normalizeDrivePath(relPath);
@@ -2776,18 +2915,67 @@ export class ProtonDriveSyncEngine {
         if (running) {
             return running;
         }
-        const run = this.hydrateNow(rel).finally(() => {
+        const run = this.hydrateNow(rel, opts.opener).finally(() => {
             this.hydrations.delete(rel);
+            this.stateEvents.touch(rel);
         });
         this.hydrations.set(rel, run);
+        this.stateEvents.touch(rel); // shown as syncing while it opens
         return run;
     }
 
-    private async hydrateNow(rel: string): Promise<void> {
+    // One app downloaded many files in the last minute: the user is told, and can block it from the notification. Without
+    // buttons (an old notify-send), the notification says where to block it instead.
+    private noticeMassDownload(app: string, count: number): void {
+        const enabled = this.stateDb.getSettings().notificationsEnabled;
+        if (!enabled) {
+            return;
+        }
+        const title = `${app} is downloading many files from Proton Drive`;
+        const body = `It has downloaded ${count} files in the last minute.`;
+        this.logger.info(`${title} (${count} in the last minute)`);
+        const ask = this.options.askWithActions ?? sendActionNotification;
+        void ask({ title, body, actions: [{ key: 'block', label: 'Block this app' }], enabled })
+            .then((choice) => {
+                if (choice === 'block') {
+                    this.blockApp(app);
+                } else if (choice === 'unsupported') {
+                    sendDesktopNotification({ title, body: `${body} You can block it in Proton Drive's Settings.`, enabled });
+                }
+            })
+            .catch(() => {});
+    }
+
+    // Adds an app to the blocklist (the user chose Block this app), unless it is there already or the list is full
+    private blockApp(app: string): void {
+        const current = this.stateDb.getSettings().blockedApps;
+        const next = current.includes(app) ? current : [...current, app];
+        if (problemWithBlockedApps(next) !== null) {
+            this.logger.warn(`Can't block ${app}: ${problemWithBlockedApps(next)}`);
+            return;
+        }
+        if (next !== current) {
+            this.stateDb.updateSettings({ blockedApps: next });
+            this.logger.info(`Blocked ${app} from downloading files from Proton Drive`);
+        }
+        sendDesktopNotification({
+            title: `${app} is blocked`,
+            body: "It can't download files from Proton Drive any more. Unblock it in Settings.",
+            enabled: this.stateDb.getSettings().notificationsEnabled,
+        });
+    }
+
+    private async hydrateNow(rel: string, opener: string | undefined): Promise<void> {
         const name = path.posix.basename(rel);
         // Counted from when the download itself starts: a refusal, or a slow look-up before it, says nothing
         let slowNotice: ReturnType<typeof setTimeout> | undefined;
         const downloadStarted = () => {
+            if (slowNotice === undefined) {
+                const count = this.downloadWatch.record(opener);
+                if (count !== null && opener !== undefined) {
+                    this.noticeMassDownload(opener, count);
+                }
+            }
             slowNotice ??= setTimeout(() => {
                 sendDesktopNotification({
                     title: `Downloading ${name}…`,
@@ -4897,6 +5085,27 @@ async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boo
 
 // A path from the virtual drive as a path of My files: no slash at either end, and no empty, '.' or '..' segment, so
 // it can't climb out of it.
+export type Transfer = 'syncing' | 'error' | 'conflict' | null;
+export interface ItemState {
+    availability: 'pinned' | 'downloaded' | 'online-only';
+    transfer: Transfer;
+}
+export interface FolderStates {
+    self: ItemState | null; // null for the root
+    children: Record<string, ItemState | null>; // null: no emblem (a local item matching an ignore pattern)
+}
+
+const TRANSFER_RANK: Record<string, number> = { syncing: 1, error: 2, conflict: 3 };
+
+// A conflict shows over an error, and an error over a transfer under way
+function worseTransfer(a: Transfer, b: Transfer): Transfer {
+    return (b ? TRANSFER_RANK[b] : 0) > (a ? TRANSFER_RANK[a] : 0) ? b : a;
+}
+
+function childRel(parentRel: string, name: string): string {
+    return parentRel === '' ? name : `${parentRel}/${name}`;
+}
+
 function normalizeDrivePath(relPath: string): string {
     const trimmed = relPath.replace(/^\/+|\/+$/g, '');
     if (trimmed.includes('\0') || trimmed.split('/').some((s) => s === '.' || s === '..' || (s === '' && trimmed !== ''))) {

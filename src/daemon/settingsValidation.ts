@@ -1,16 +1,16 @@
-import { isConflictStrategy, CONFLICT_STRATEGIES, problemWithIgnorePatterns } from '../sync/settingsRules';
+import { isConflictStrategy, CONFLICT_STRATEGIES, problemWithBlockedApps, problemWithIgnorePatterns } from '../sync/settingsRules';
 import type { SyncSettings } from '../sync/syncStateDb';
 
 export { MAX_IGNORE_PATTERN_LENGTH, MAX_IGNORE_PATTERNS } from '../sync/settingsRules';
 
 export type ParsedSettings = { ok: true; value: Partial<SyncSettings> } | { ok: false; error: string };
 
-// The plain settings the app may change: ignorePatterns, conflictStrategy and notificationsEnabled (see
+// The plain settings the app may change: ignorePatterns, conflictStrategy, notificationsEnabled and blockedApps (see
 // sync/settingsRules.ts for what they may hold). Checks all of them before anything is stored; keys it doesn't know
 // are left out of the value (parseSettingsRequest refuses them).
 export function parseSettings(body: Record<string, unknown>): ParsedSettings {
     const value: Partial<SyncSettings> = {};
-    const { ignorePatterns, conflictStrategy, notificationsEnabled } = body;
+    const { ignorePatterns, conflictStrategy, notificationsEnabled, blockedApps } = body;
     if (ignorePatterns !== undefined) {
         const problem = problemWithIgnorePatterns(ignorePatterns);
         if (problem) return { ok: false, error: problem };
@@ -26,6 +26,11 @@ export function parseSettings(body: Record<string, unknown>): ParsedSettings {
         if (typeof notificationsEnabled !== 'boolean') return { ok: false, error: 'notificationsEnabled must be true or false' };
         value.notificationsEnabled = notificationsEnabled;
     }
+    if (blockedApps !== undefined) {
+        const problem = problemWithBlockedApps(blockedApps);
+        if (problem) return { ok: false, error: problem };
+        value.blockedApps = blockedApps as string[];
+    }
     return { ok: true, value };
 }
 
@@ -37,7 +42,14 @@ export interface SettingsChange {
     virtualDriveWanted?: boolean;
 }
 
-const SETTING_KEYS: readonly string[] = ['ignorePatterns', 'conflictStrategy', 'notificationsEnabled', 'syncDir', 'virtualDriveWanted'];
+const SETTING_KEYS: readonly string[] = [
+    'ignorePatterns',
+    'conflictStrategy',
+    'notificationsEnabled',
+    'blockedApps',
+    'syncDir',
+    'virtualDriveWanted',
+];
 
 // Checks every field of a request (unknown keys are refused) before anything is stored
 export function parseSettingsRequest(body: Record<string, unknown>): { ok: true; value: SettingsChange } | { ok: false; error: string } {

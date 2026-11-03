@@ -182,6 +182,12 @@ struct Failure {
     line: Option<String>,
 }
 
+/// The daemon's refusal of an app the user blocked: EACCES, and no log line, since a blocked tool walking a big
+/// folder would otherwise write one for every file it tries.
+fn blocked_refusal(err: &DaemonError) -> Option<Failure> {
+    (err.errno == libc::EACCES && err.message.starts_with("Blocked:")).then_some(Failure { errno: Errno::EACCES, line: None })
+}
+
 impl Failure {
     fn log(&self) {
         if let Some(line) = &self.line {
@@ -485,7 +491,11 @@ impl State {
     fn hydrate_unlogged(&self, tid: u32, rel: &Path) -> Result<(), Failure> {
         // An online-only entry came from a UTF-8 listing, so its path is UTF-8
         let Some(rel_str) = rel.to_str() else { return Err(Failure { errno: Errno::EIO, line: None }) };
-        if let Err(err) = self.daemon.hydrate(rel_str, &|| opener_interrupted(tid)) {
+        let opener = if tid == 0 { None } else { process_comm(tid) };
+        if let Err(err) = self.daemon.hydrate(rel_str, opener.as_deref(), &|| opener_interrupted(tid)) {
+            if let Some(failure) = blocked_refusal(&err) {
+                return Err(failure);
+            }
             if err.errno == libc::EINTR {
                 let line = format!("protondrive-vfs: stopped waiting for {rel_str:?}: the app waiting for it gave up");
                 return Err(Failure { errno: Errno::EINTR, line: Some(line) });
@@ -1431,6 +1441,16 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn a_blocked_app_is_refused_quietly_and_nothing_else_is() {
+        let err = |errno: i32, message: &str| DaemonError { errno, message: message.into(), stuck: false };
+        let blocked = blocked_refusal(&err(libc::EACCES, "Blocked: rg")).expect("a blocked app is refused");
+        assert_eq!(blocked.errno, Errno::EACCES);
+        assert!(blocked.line.is_none());
+        assert!(blocked_refusal(&err(libc::EACCES, "Hidden: Docs/a.txt")).is_none());
+        assert!(blocked_refusal(&err(libc::EIO, "Blocked: rg")).is_none());
+    }
 
     /// A daemon on a temp socket that holds every request until the gate opens, then lists `a.txt` in any folder, or
     /// downloads a file by writing it into the backing store. It counts listings and downloads.

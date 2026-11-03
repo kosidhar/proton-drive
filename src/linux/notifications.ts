@@ -63,6 +63,55 @@ export function sendDesktopNotification(options: {
     }
 }
 
+export interface NotificationAction {
+    key: string;
+    label: string;
+}
+
+// How long a notification with buttons is waited on before it is taken as ignored
+const ACTION_WAIT_MS = 30 * 60_000;
+// A notify-send that fails this fast didn't show anything: too old for --action (libnotify before 0.7.10)
+const UNSUPPORTED_WITHIN_MS = 2_000;
+
+// A desktop notification with buttons. Resolves the key of the button the user chose; null when they dismissed it,
+// ignored it for 30 minutes, notifications are off, or notify-send is missing; 'unsupported' when notify-send can't
+// show buttons, so the caller can say the same thing another way.
+export async function sendActionNotification(options: {
+    title: string;
+    body: string;
+    actions: NotificationAction[];
+    urgency?: NotificationUrgency;
+    icon?: string;
+    enabled?: boolean;
+    command?: string; // for tests
+}): Promise<string | 'unsupported' | null> {
+    if (options.enabled === false) {
+        return null;
+    }
+    const argv = [
+        options.command ?? 'notify-send',
+        '--app-name=Proton Drive',
+        `--urgency=${options.urgency ?? 'normal'}`,
+        `--icon=${options.icon ?? 'ch.proton.drive'}`,
+        '--wait',
+        ...options.actions.map((action) => `--action=${action.key}=${action.label}`),
+        options.title,
+        options.body,
+    ];
+    const started = Date.now();
+    try {
+        const proc = Bun.spawn(argv, { stdin: 'ignore', stdout: 'pipe', stderr: 'ignore', timeout: ACTION_WAIT_MS });
+        const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+        if (code !== 0) {
+            return Date.now() - started < UNSUPPORTED_WITHIN_MS && out.trim() === '' ? 'unsupported' : null;
+        }
+        const chosen = out.trim().split('\n').pop() ?? '';
+        return options.actions.some((action) => action.key === chosen) ? chosen : null;
+    } catch {
+        return null; // notify-send missing, or no session bus
+    }
+}
+
 export async function getSystemdServiceStatus(serviceName = 'proton-drive-ubuntu.service'): Promise<{
     installed: boolean;
     enabled: boolean;

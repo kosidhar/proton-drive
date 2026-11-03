@@ -3212,8 +3212,10 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const drive = makeMockDrive();
             const trashDir = path.join(tempDir, 'Trash');
             const handedToTrash: string[] = [];
-            const moveToDesktopTrash = async (fullPath: string) => {
+            const shownToTrash: Array<string | undefined> = [];
+            const moveToDesktopTrash = async (fullPath: string, shownPath?: string) => {
                 handedToTrash.push(fullPath);
+                shownToTrash.push(shownPath);
                 if (!trashWorks) {
                     return false;
                 }
@@ -3233,7 +3235,9 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(drive.calls.downloads.sort()).toEqual(['Projects/app/index.ts', 'Projects/notes.txt', 'Projects/readme.txt']);
             const local = (rel: string) => path.join(engine.localRoot(), rel);
             const trashed = () => handedToTrash.map((p) => path.relative(engine.localRoot(), p)).sort();
-            return { ...drive, engine, files: localFiles(stateDb, () => engine.localRoot()), local, trashDir, trashed };
+            // Where the Trash is told each came from: under the drive in the virtual layout (#40), nothing extra in the plain
+            const shown = () => shownToTrash.map((p) => (p === undefined ? p : path.relative(stateDb.getSettings().syncDir, p))).sort();
+            return { ...drive, engine, files: localFiles(stateDb, () => engine.localRoot()), local, trashDir, trashed, shown };
         };
         type Drive = Awaited<ReturnType<typeof downloadedProjects>>;
         // An ignored .git, which is never uploaded, and an edit that hasn't uploaded yet
@@ -3289,6 +3293,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
                     // The topmost local-only things, not the folders holding them
                     expect(d.trashed()).toEqual(['Projects/app/.git', 'Projects/notes.txt']);
+                    expect(d.shown()).toEqual(layout === 'virtual' ? ['Projects/app/.git', 'Projects/notes.txt'] : [undefined, undefined]);
                     expect(await readFile(path.join(d.trashDir, '.git/HEAD'), 'utf8')).toBe('ref: refs/heads/main');
                     expect(await readFile(path.join(d.trashDir, 'notes.txt'), 'utf8')).toBe('edited, not uploaded yet');
                     expect(await d.files.exists('Projects')).toBe(false); // emptied, so removed
@@ -4978,6 +4983,94 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
 
         describe('hydrate', () => {
+            test('one app downloading more than 20 files in a minute is told about once, and Block this app blocks it', async () => {
+                stateDb.updateSettings({ notificationsEnabled: true });
+                const asked: Array<{ title: string; body: string }> = [];
+                let answer!: (choice: string | null) => void;
+                const d = setup();
+                const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                    backingDir: path.join(tempDir, 'files'),
+                    moveToDesktopTrash: async () => false,
+                    askWithActions: (n) => {
+                        asked.push({ title: n.title, body: n.body });
+                        return new Promise((resolve) => (answer = resolve));
+                    },
+                });
+                for (let i = 0; i < 25; i++) d.add(`Big/f${i}.txt`, `${i}`);
+                d.add('Big/here.txt', 'here');
+                await engine.reconcileNow();
+                await engine.hydrate('Big/here.txt', { opener: 'rg' }); // already here afterwards: asking again counts nothing
+                for (let i = 0; i < 19; i++) await engine.hydrate('Big/here.txt', { opener: 'rg' });
+                const notify = spyOn(notifications, 'sendDesktopNotification').mockImplementation(() => {});
+                try {
+                    for (let i = 0; i < 19; i++) await engine.hydrate(`Big/f${i}.txt`, { opener: 'rg' });
+                    expect(asked).toEqual([]); // 20 downloads so far
+                    await engine.hydrate('Big/f19.txt', { opener: 'rg' });
+                    expect(asked).toEqual([{ title: 'rg is downloading many files from Proton Drive', body: 'It has downloaded 21 files in the last minute.' }]);
+                    await engine.hydrate('Big/f20.txt', { opener: 'rg' });
+                    expect(asked.length).toBe(1);
+
+                    answer('block');
+                    await Bun.sleep(10);
+                    expect(stateDb.getSettings().blockedApps).toEqual(['rg']);
+                    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ title: 'rg is blocked' }));
+                    await expect(engine.hydrate('Big/f21.txt', { opener: 'rg' })).rejects.toMatchObject({ code: 'EACCES' });
+                    await engine.hydrate('Big/f22.txt', { opener: 'gedit' });
+                } finally {
+                    notify.mockRestore();
+                }
+            });
+
+            test('without buttons the notice says where to block the app, and with notifications off nothing is said', async () => {
+                const d = setup();
+                let asked = 0;
+                const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                    backingDir: path.join(tempDir, 'files'),
+                    moveToDesktopTrash: async () => false,
+                    askWithActions: async () => {
+                        asked += 1;
+                        return 'unsupported';
+                    },
+                });
+                for (let i = 0; i < 50; i++) d.add(`Big/f${i}.txt`, `${i}`);
+                await engine.reconcileNow();
+                const notify = spyOn(notifications, 'sendDesktopNotification').mockImplementation(() => {});
+                try {
+                    for (let i = 0; i < 25; i++) await engine.hydrate(`Big/f${i}.txt`, { opener: 'code' });
+                    expect(asked).toBe(0); // notificationsEnabled is off in this suite
+                    stateDb.updateSettings({ notificationsEnabled: true });
+                    for (let i = 25; i < 50; i++) await engine.hydrate(`Big/f${i}.txt`, { opener: 'backup' });
+                    await Bun.sleep(10);
+                    expect(asked).toBe(1);
+                    expect(notify).toHaveBeenCalledWith(
+                        expect.objectContaining({ body: "It has downloaded 21 files in the last minute. You can block it in Proton Drive's Settings." }),
+                    );
+                    expect(stateDb.getSettings().blockedApps).toEqual([]);
+                } finally {
+                    notify.mockRestore();
+                }
+            });
+
+            test('an app the user blocked is refused, quietly, and downloads nothing; others and unknown openers download', async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                d.add('Docs/b.txt', 'b');
+                d.add('Docs/c.txt', 'c');
+                await d.engine.reconcileNow();
+                stateDb.updateSettings({ blockedApps: ['rg'] });
+                const notify = spyOn(notifications, 'sendDesktopNotification');
+                try {
+                    await expect(d.engine.hydrate('Docs/a.txt', { opener: 'rg' })).rejects.toMatchObject({ code: 'EACCES', message: 'Blocked: rg' });
+                    expect(d.calls.downloads).toEqual([]);
+                    expect(notify).not.toHaveBeenCalled();
+                    await d.engine.hydrate('Docs/b.txt', { opener: 'gedit' });
+                    await d.engine.hydrate('Docs/c.txt'); // an older helper sends no opener
+                    expect(d.calls.downloads.sort()).toEqual(['Docs/b.txt', 'Docs/c.txt']);
+                } finally {
+                    notify.mockRestore();
+                }
+            });
+
             test('downloads a file once for concurrent calls, records it, and forgets its failed thumbnail', async () => {
                 const d = setup();
                 d.add('Docs/été/a b.txt', 'hello');
@@ -6725,6 +6818,179 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(d.journal()).toEqual([]);
                 expect(d.calls.trashed).toEqual([[d.uid('F')]]);
                 expect(d.nodes.get(d.uid('F/c.txt'))?.parentUid).toBe(d.uid('G'));
+            });
+        });
+    });
+    describe('state events', () => {
+        // Changes go out when the test says (flush), not on a timer
+        const setup = (opts: { virtual?: boolean } = {}) => {
+            if (opts.virtual) stateDb.setMeta('driveLayout', 'virtual');
+            const drive = makeMockDrive();
+            let due: (() => void) | null = null;
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                ...(opts.virtual ? { backingDir: path.join(tempDir, 'files'), moveToDesktopTrash: async () => false } : {}),
+                stateEventSchedule: (run) => {
+                    due = run;
+                    return () => {
+                        due = null;
+                    };
+                },
+            });
+            const seen: unknown[] = [];
+            engine.stateEvents.subscribe((change) => seen.push(change));
+            const flush = () => {
+                const run = due;
+                due = null;
+                run?.();
+                const out = [...seen];
+                seen.length = 0;
+                return out;
+            };
+            return { ...drive, engine, flush };
+        };
+
+        test('Free up space on a folder sends its subtree, and a download sends the file and its folders', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            await d.engine.reconcileNow();
+            d.flush();
+            await d.engine.setAvailability('Docs', 'pin');
+            await d.engine.reconcileNow();
+            const afterPin = d.flush() as Array<{ paths: string[]; subtrees: string[] }>;
+            expect(afterPin.length).toBe(1);
+            expect(afterPin[0].subtrees).toContain('Docs');
+
+            await d.engine.setAvailability('Docs', 'free');
+            const afterFree = d.flush() as Array<{ paths: string[]; subtrees: string[] }>;
+            expect(afterFree[0].subtrees).toEqual(['Docs']);
+            expect(afterFree[0].paths).toContain('');
+        });
+
+        test('a download recorded for a file sends the file, its folder and the root', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            await d.engine.reconcileNow();
+            d.flush();
+            stateDb.upsertItem({
+                localRelPath: 'Docs/a.txt', nodeUid: d.uid('Docs/a.txt'), parentNodeUid: d.uid('Docs'), type: 'file',
+                localSha1: null, remoteSha1: null, localMtimeMs: 0, remoteMtimeMs: 0, size: 1, syncStatus: 'synced', lastError: null,
+            });
+            expect(d.flush()).toEqual([{ paths: ['', 'Docs', 'Docs/a.txt'], subtrees: [] }]);
+        });
+
+        test('a crawl that finds nothing new sends nothing', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            await d.engine.reconcileNow();
+            d.flush();
+            await d.engine.reconcileNow();
+            expect(d.flush()).toEqual([]);
+        });
+
+        test('a rename through the drive sends both subtrees', async () => {
+            const d = setup({ virtual: true });
+            d.add('Projects/a.txt', 'a');
+            await d.engine.reconcileNow();
+            d.flush();
+            await d.engine.renameItem('Projects', 'Work');
+            const [change] = d.flush() as Array<{ paths: string[]; subtrees: string[] }>;
+            expect(change.subtrees).toEqual(expect.arrayContaining(['Projects', 'Work']));
+        });
+
+        test('moving the sync folder, changing the ignore patterns or the layout sends a reset', () => {
+            const d = setup();
+            stateDb.updateSettings({ syncDir: path.join(tempDir, 'Elsewhere') });
+            expect(d.flush()).toEqual(['reset']);
+            stateDb.updateSettings({ ignorePatterns: ['*.bak'] });
+            expect(d.flush()).toEqual(['reset']);
+            stateDb.updateSettings({ ignorePatterns: ['*.bak'], notificationsEnabled: false });
+            expect(d.flush()).toEqual([]);
+            stateDb.setMeta('driveLayout', 'virtual');
+            expect(d.flush()).toEqual(['reset']);
+            stateDb.setMeta('driveLayout', 'virtual');
+            expect(d.flush()).toEqual([]);
+        });
+    });
+    describe('itemStates', () => {
+        const setup = () => {
+            const drive = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger);
+            return { ...drive, engine, files: localFiles(stateDb) };
+        };
+        const record = (relPath: string, syncStatus: 'synced' | 'uploading' | 'error' = 'synced') =>
+            stateDb.upsertItem({
+                localRelPath: relPath, nodeUid: `vol~${relPath}`, parentNodeUid: null, type: 'file', localSha1: null,
+                remoteSha1: null, localMtimeMs: 0, remoteMtimeMs: 0, size: 1, syncStatus, lastError: null,
+            });
+
+        test('a folder and its children: availability, local-only items, and nothing hidden', async () => {
+            const d = setup();
+            const docs = d.add('Docs');
+            d.add('Docs/a.txt', 'a');
+            d.add('Docs/b.txt', 'b');
+            d.add('Docs/Secret/s.txt', 's');
+            d.add('Other/c.txt', 'c');
+            d.engine.availability.setPin(docs.uid, 'pinned', false);
+            await d.engine.reconcileNow();
+            await d.engine.setAvailability('Docs/b.txt', 'free');
+            await d.engine.setAvailability('Docs/Secret', 'hide');
+            await d.files.writeLocal('Docs/new.txt', 'not uploaded yet');
+            await d.files.writeLocal('Docs/.git/HEAD', 'ref');
+
+            const docsStates = d.engine.itemStates('Docs')!;
+            // A file waiting to upload shows on itself; its folders sum up only what is recorded, the same from any view
+            expect(docsStates.self).toEqual({ availability: 'pinned', transfer: null });
+            expect(docsStates.children).toEqual({
+                'a.txt': { availability: 'pinned', transfer: null },
+                'b.txt': { availability: 'online-only', transfer: null },
+                'new.txt': { availability: 'downloaded', transfer: 'syncing' },
+                '.git': null,
+            });
+
+            const root = d.engine.itemStates('')!;
+            expect(root.self).toBeNull();
+            expect(root.children.Other).toEqual({ availability: 'online-only', transfer: null });
+            expect(root.children.Docs).toEqual(docsStates.self);
+        });
+
+        test('an error makes its folders show it, and a conflict wins over an error', async () => {
+            const d = setup();
+            d.add('A/B/x.txt', 'x');
+            d.add('A/B/y.txt', 'y');
+            await d.engine.reconcileNow();
+            record('A/B/x.txt', 'error');
+            expect(d.engine.itemStates('')!.children.A?.transfer).toBe('error');
+            expect(d.engine.itemStates('A')!.children.B?.transfer).toBe('error');
+            expect(d.engine.itemStates('A/B')!.children['x.txt']?.transfer).toBe('error');
+            expect(d.engine.itemStates('A/B')!.children['y.txt']?.transfer).toBeNull();
+
+            stateDb.recordConflict({
+                localRelPath: 'A/B/y.txt', nodeUid: 'vol~A/B/y.txt', localSha1: null, remoteSha1: null, localMtimeMs: 0, remoteMtimeMs: 0,
+            });
+            expect(d.engine.itemStates('A')!.children.B?.transfer).toBe('conflict');
+            expect(d.engine.itemStates('A')!.self?.transfer).toBe('conflict');
+        });
+
+        test('a file, a hidden folder or a path out of the drive answers null', async () => {
+            const d = setup();
+            d.add('Docs/a.txt', 'a');
+            d.add('Hidden/h.txt', 'h');
+            await d.engine.reconcileNow();
+            await d.engine.setAvailability('Hidden', 'hide');
+            expect(d.engine.itemStates('Docs/a.txt')).toBeNull();
+            expect(d.engine.itemStates('Hidden')).toBeNull();
+            expect(d.engine.itemStates('../x')).toBeNull();
+            expect(d.engine.itemStates('Nope')).toBeNull();
+        });
+
+        test('a folder made here and not uploaded yet waits to upload, all of it', async () => {
+            const d = setup();
+            await d.engine.reconcileNow();
+            await d.files.writeLocal('Fresh/one.txt', '1');
+            await d.files.writeLocal('Fresh/node_modules/x.js', 'x');
+            expect(d.engine.itemStates('Fresh')).toEqual({
+                self: { availability: 'downloaded', transfer: 'syncing' },
+                children: { 'one.txt': { availability: 'downloaded', transfer: 'syncing' }, node_modules: null },
             });
         });
     });
