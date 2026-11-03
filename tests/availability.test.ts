@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -294,26 +294,40 @@ describe("AvailabilityPolicy.childStates", () => {
     expect(policy.childStates("only.txt").size).toBe(0);
   });
 
-  test("answers a folder of 5,000 children quickly", () => {
+  // A fixed number of queries, whatever the size of the folder: counted, not timed, so a busy machine can't fail it (#69)
+  test("answers a folder of 5,000 children in as many queries as a folder of 10", () => {
     const index = new RemoteIndex(stateDb.connection);
     const policy = new AvailabilityPolicy(stateDb.connection, index);
     index.setRoot("root");
-    index.replaceChildren("root", "", [folder("big", "root", "Big")]);
-    const children: RemoteIndexEntry[] = [];
-    for (let i = 0; i < 5000; i++) {
-      children.push(i % 10 === 0 ? folder(`d${i}`, "big", `Big/d${i}`) : file(`f${i}`, "big", `Big/f${i}.jpg`));
-    }
-    index.replaceChildren("big", "Big", children);
-    for (let i = 0; i < 5000; i += 3) {
-      if (i % 10 !== 0) record(`Big/f${i}.jpg`);
-    }
-    policy.childStates("Big"); // warm the statements
-    const started = performance.now();
-    const states = policy.childStates("Big");
-    const took = performance.now() - started;
-    expect(states.size).toBe(5000);
-    expect(states.get("f3.jpg")).toBe("downloaded");
-    expect(states.get("f1.jpg")).toBe("online-only");
-    expect(took).toBeLessThan(50);
+    index.replaceChildren("root", "", [folder("big", "root", "Big"), folder("small", "root", "Small")]);
+    const fill = (uid: string, rel: string, n: number) => {
+      const children: RemoteIndexEntry[] = [];
+      for (let i = 0; i < n; i++) {
+        children.push(i % 10 === 0 ? folder(`${uid}-d${i}`, uid, `${rel}/d${i}`) : file(`${uid}-f${i}`, uid, `${rel}/f${i}.jpg`));
+      }
+      index.replaceChildren(uid, rel, children);
+      for (let i = 0; i < n; i += 3) {
+        if (i % 10 !== 0) record(`${rel}/f${i}.jpg`);
+      }
+    };
+    fill("big", "Big", 5000);
+    fill("small", "Small", 10);
+    const queriesFor = (rel: string) => {
+      const spy = spyOn(stateDb.connection, "query");
+      try {
+        const states = policy.childStates(rel);
+        return { states, queries: spy.mock.calls.length };
+      } finally {
+        spy.mockRestore();
+      }
+    };
+    const big = queriesFor("Big");
+    const small = queriesFor("Small");
+    expect(big.states.size).toBe(5000);
+    expect(big.states.get("f3.jpg")).toBe("downloaded");
+    expect(big.states.get("f1.jpg")).toBe("online-only");
+    expect(small.states.size).toBe(10);
+    expect(big.queries).toBe(small.queries);
+    expect(big.queries).toBeLessThan(20);
   });
 });
