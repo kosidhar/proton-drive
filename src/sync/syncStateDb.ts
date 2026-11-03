@@ -155,14 +155,21 @@ export class SyncStateDatabase {
             )
         `);
         // At most one unresolved conflict per path (#66): duplicates earlier versions queued, pass after pass, fold into
-        // the latest of them
-        this.db.run(`
-            DELETE FROM conflicts
-            WHERE resolved = 0 AND id NOT IN (SELECT MAX(id) FROM conflicts WHERE resolved = 0 GROUP BY localRelPath)
-        `);
-        this.db.run(
-            'CREATE UNIQUE INDEX IF NOT EXISTS idx_conflicts_one_unresolved_per_path ON conflicts(localRelPath) WHERE resolved = 0',
-        );
+        // the latest of them, once. Only then, as an open that writes needs the write lock, which the daemon may hold.
+        const indexed = this.db
+            .query("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_conflicts_one_unresolved_per_path'")
+            .get();
+        if (!indexed) {
+            this.db.transaction(() => {
+                this.db.run(`
+                    DELETE FROM conflicts
+                    WHERE resolved = 0 AND id NOT IN (SELECT MAX(id) FROM conflicts WHERE resolved = 0 GROUP BY localRelPath)
+                `);
+                this.db.run(
+                    'CREATE UNIQUE INDEX IF NOT EXISTS idx_conflicts_one_unresolved_per_path ON conflicts(localRelPath) WHERE resolved = 0',
+                );
+            })();
+        }
 
         this.db.run(`
             CREATE TABLE IF NOT EXISTS activity_log (

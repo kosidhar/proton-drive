@@ -151,3 +151,31 @@ describe('SyncStateDatabase conflicts', () => {
         reopened.close();
     });
 });
+
+// #66 follow-up: opening the database never needs the write lock once it is set up, so a CLI command opens it while the
+// daemon is in the middle of a write
+describe('SyncStateDatabase opening', () => {
+    test('opens while another connection holds a write transaction', async () => {
+        const tempDir = await mkdtemp(path.join(tmpdir(), 'proton-drive-statedb-test-'));
+        const dbPath = path.join(tempDir, 'state.sqlite');
+        try {
+            const daemon = new SyncStateDatabase(dbPath);
+            daemon.connection.run('PRAGMA busy_timeout = 0');
+            daemon.connection.run('BEGIN IMMEDIATE');
+            const started = Date.now();
+            let opened: SyncStateDatabase | null = null;
+            try {
+                opened = new SyncStateDatabase(dbPath);
+                opened.connection.run('PRAGMA busy_timeout = 0');
+                expect(opened.listConflicts()).toEqual([]);
+            } finally {
+                opened?.close();
+                daemon.connection.run('ROLLBACK');
+                daemon.close();
+            }
+            expect(Date.now() - started).toBeLessThan(2000);
+        } finally {
+            await rm(tempDir, { recursive: true, force: true });
+        }
+    }, 15_000);
+});
