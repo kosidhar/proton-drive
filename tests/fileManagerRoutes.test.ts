@@ -239,12 +239,19 @@ describe('file manager routes on the control socket', () => {
     });
 
     // #125: the count went up before the feed existed, and stayed up when making it threw
-    test('a stream whose feed cannot start is answered with an error and not left counted', () => {
+    test('a stream whose feed cannot start is answered with an error and not left counted', async () => {
+        await until(() => openEventStreams() === 0);
         const { events } = manualEvents();
         const url = new URL('http://localhost/fm/events');
-        const failing = { ...makeSource(events, []), root: () => { throw new Error('no settings yet'); } } as FileManagerSource;
-        const res = fileManagerRoute(new Request(url), url, failing);
-        expect(res.status).toBe(503);
+        const noRoot = { ...makeSource(events, []), root: () => { throw new Error('no settings yet'); } } as FileManagerSource;
+        expect(fileManagerRoute(new Request(url), url, noRoot).status).toBe(503);
+        expect(openEventStreams()).toBe(0);
+        // Failing after the hello was queued: no subscription is left either
+        const noEvents = {
+            ...makeSource(events, []),
+            events: { subscribe: () => { throw new Error('closed'); } },
+        } as unknown as FileManagerSource;
+        expect(fileManagerRoute(new Request(url), url, noEvents).status).toBe(503);
         expect(openEventStreams()).toBe(0);
     });
 
