@@ -1773,7 +1773,20 @@ export class ProtonDriveSyncEngine {
             const remoteNode = await this.sdk.getNode(conflict.nodeUid);
             if (choice === 'keep-local') {
                 const parentNode = await this.ensureParentFolderNode(conflict.localRelPath, remoteMap, since);
-                await this.uploadLocalToRemote(conflict.localRelPath, localFullPath, parentNode, since, remoteNode.uid);
+                if (remoteNode.trashTime || (await this.inTrashedFolder(remoteNode))) {
+                    // In the Proton Drive trash: a revision would land there, and the next pass would take the file for
+                    // deleted in the cloud and remove it here (#111). Kept as a new file at its place instead; a file
+                    // made there meanwhile isn't overwritten: the user is asked to try again
+                    const result = await this.uploadLocalToRemote(conflict.localRelPath, localFullPath, parentNode, since, undefined, 'skip');
+                    if (result.status === 'skipped') {
+                        throw new ConflictRefusedError(
+                            409,
+                            `${conflict.localRelPath} is in the Proton Drive trash, which still holds its name: it stays on this computer as it is. Restore it there, or rename this file, then choose again`,
+                        );
+                    }
+                } else {
+                    await this.uploadLocalToRemote(conflict.localRelPath, localFullPath, parentNode, since, remoteNode.uid);
+                }
                 this.stateDb.markConflictResolved(conflictId, 'keep-local');
             } else if (choice === 'keep-remote') {
                 // The local file as the user chose to replace it: a save made while the cloud's version downloads is

@@ -9375,4 +9375,50 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await manual.catch(() => {});
         });
     });
+
+    describe('Keep Local by hand on a file another device trashed (#111)', () => {
+        const trashedWhileWaiting = async (trashKeepsName: boolean) => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'original');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const file = path.join(engine.localRoot(), 'a.txt');
+            stateDb.updateSettings({ conflictStrategy: 'prompt' });
+            await writeFile(file, 'local edit');
+            d.nodes.set(d.uid('a.txt'), makeMockNode({ uid: d.uid('a.txt'), parentUid: d.root.uid, nameStr: 'a.txt', type: NodeType.File, content: 'cloud edit' }));
+            await engine.reconcileNow();
+            const [conflict] = stateDb.listConflicts();
+            // Another device moves it to the Proton Drive trash; whether the trash still holds its name there is the API's
+            const node = d.nodes.get(d.uid('a.txt'))!;
+            d.nodes.set(d.uid('a.txt'), { ...node, trashTime: new Date(), ...(trashKeepsName ? {} : { parentUid: 'vol~trash' }) });
+            const liveCopies = () => [...d.nodes.values()].filter((n) => n.parentUid === d.root.uid && d.nameOf(n) === 'a.txt' && !n.trashTime);
+            return { ...d, engine, file, conflict, liveCopies };
+        };
+
+        test('with its name free, the local version uploads as a new file, never into the trash', async () => {
+            const d = await trashedWhileWaiting(false);
+            await d.engine.resolveConflictManually(d.conflict.id, 'keep-local');
+            expect(d.liveCopies().map((n) => n.content)).toEqual(['local edit']);
+            expect(stateDb.getItemByPath('a.txt')?.nodeUid).toBe(d.liveCopies()[0].uid);
+            expect(stateDb.getConflictById(d.conflict.id)?.resolution).toBe('keep-local');
+            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('cloud edit'); // nothing landed in the trashed one
+            await d.engine.reconcileNow();
+            expect(await readFile(d.file, 'utf8')).toBe('local edit');
+            expect(d.calls.trashed).toEqual([]);
+        });
+
+        test('with its name still held by the trashed file, it is refused, nothing lands in the trash, and the file stays here', async () => {
+            const d = await trashedWhileWaiting(true);
+            await expect(d.engine.resolveConflictManually(d.conflict.id, 'keep-local')).rejects.toMatchObject({ status: 409 });
+            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('cloud edit');
+            expect(stateDb.getConflictById(d.conflict.id)?.resolved).toBe(0);
+            await d.engine.reconcileNow();
+            expect(await readFile(d.file, 'utf8')).toBe('local edit'); // never taken for an unchanged copy and removed
+        });
+    });
 });
