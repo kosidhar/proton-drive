@@ -126,8 +126,10 @@ export class LocalFolderWatcher {
                         return;
                     }
                     // A folder deleted reports itself to its own watcher, under its own name: joined onto its path that
-                    // would be a phantom child (P/P). The parent's watcher reports the folder itself (#12)
-                    if (filename.toString() === path.basename(dirPath) && !existsSync(dirPath)) {
+                    // would be a phantom child (P/P). The parent's watcher reports the folder itself (#12). Not so for the
+                    // sync folder, which has no parent watched: that report is how the engine learns at once that its
+                    // files are missing (#45)
+                    if (filename.toString() === path.basename(dirPath) && dirPath !== rootDir && !existsSync(dirPath)) {
                         return;
                     }
                     const fullPath = path.join(dirPath, filename.toString());
