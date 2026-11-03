@@ -3749,7 +3749,9 @@ export class ProtonDriveSyncEngine {
                 }
                 // An edit baseline follows its file, unless the file now stands for the target (its record) or leaves
                 // what is synced
-                if (keepsTarget || ignoredTo) {
+                // A colliding file goes on as a new one: what it was an edit of stays where it is (#65). A colliding target
+                // keeps its own baseline, if any: what replaces it is judged by it, as an edit of what the drive showed
+                if (keepsTarget || ignoredTo || sourceCollides || targetCollides) {
                     this.stateDb.dropEditBaselines(fromRel);
                 } else {
                     this.stateDb.moveEditBaselines(fromRel, toRel);
@@ -3890,9 +3892,10 @@ export class ProtonDriveSyncEngine {
 
     // The local file at a path in an unresolved collision (#29), or null: a file made or changed here and another file,
     // or another version, in Proton Drive at that path, with neither chosen yet. That is a conflict waiting for the user
-    // (prompt), or a local file with no record and no edit baseline where the remote index has a file, which the
-    // conflict handling has yet to see (see uploadNewFile). The drive shows the local file there (vfsChildren), and a
-    // delete through it removes only that (deleteLocally): the cloud file is the other device's, never seen here.
+    // (prompt), a local file with no record and no edit baseline where the remote index has a file, which the conflict
+    // handling has yet to see (see uploadNewFile), or a file edited through the drive whose node has changed since (#65).
+    // The drive shows the local file there (vfsChildren), and a delete through it removes only that (deleteLocally): the
+    // cloud file is the other device's, never seen here.
     // conflictPaths: the paths of the unresolved conflicts, when the caller has them already (a listing looks at many)
     private unresolvedCollision(relPath: string, entry: RemoteIndexEntry | null, conflictPaths?: Set<string>): Stats | null {
         if (!entry || entry.type !== 'file' || isProvisional(entry.uid)) {
@@ -3903,10 +3906,14 @@ export class ProtonDriveSyncEngine {
             return null;
         }
         const record = this.stateDb.getItemByPath(relPath);
-        const colliding = record
-            ? record.syncStatus === 'conflict' ||
-              (conflictPaths ? conflictPaths.has(relPath) : this.unresolvedConflictsAt(relPath).length > 0)
-            : this.stateDb.getEditBaseline(relPath) === null;
+        if (record) {
+            return this.inQueuedConflict(relPath, record, conflictPaths) ? local : null;
+        }
+        // A file edited through the drive is an edit of its baseline: a collision once the node it is an edit of has
+        // changed in the cloud since, as far as the index knows (#65). Another node at its path since is left to the
+        // baseline's own node (see trashTargets).
+        const edit = this.stateDb.getEditBaseline(relPath);
+        const colliding = !edit || (edit.nodeUid === entry.uid && cloudChangedSince(edit, entry));
         return colliding ? local : null;
     }
 
