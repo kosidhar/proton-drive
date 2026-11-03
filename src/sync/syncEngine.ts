@@ -82,6 +82,8 @@ const MAX_PERMANENT_REFUSALS = 3;
 // with too, is tried again with backoff (up to an hour between tries) and given up on only after failing for this long
 const GIVE_UP_UNMAPPED_AFTER_MS = 24 * 60 * 60_000;
 const MAX_REPLAY_BACKOFF_MS = 60 * 60_000;
+// An item that keeps failing in sync passes is tried again after 1 minute, doubling each time, up to this (#18)
+const MAX_ITEM_BACKOFF_MS = 60 * 60_000;
 // Uid prefix of the remote index entries that stand for folders made here that Proton Drive doesn't have yet, holding
 // what a pending move puts in them (see applyPendingOpsToIndex). Never a node: never resolved, moved or trashed.
 const PROVISIONAL = 'provisional:';
@@ -290,6 +292,11 @@ export class ProtonDriveSyncEngine {
     // the file's conflict is over some other way (resolved by hand, or the file synced): a retry after its download failed
     // goes on from it rather than make another (#25)
     private readonly keepBothCopies = new Map<string, { copyRelPath: string; sha1: string }>();
+    // Items that keep failing in sync passes (#18), by path: the error last logged for each (logged once until it
+    // changes), and how many times in a row each failed and when a pass tries it again (backoff). Both go when the item
+    // syncs, or changes here.
+    private readonly loggedFailures = new Map<string, string>();
+    private readonly failingItems = new Map<string, { message: string; failures: number; retryAt: number }>();
 
     constructor(
         private readonly sdk: ProtonDriveClient,
@@ -1652,11 +1659,7 @@ export class ProtonDriveSyncEngine {
         } catch (error: unknown) {
             const msg = error instanceof Error ? error.message : String(error);
             this.stateDb.setItemStatus(relPath, 'error', msg);
-            this.stateDb.logActivity({
-                action: 'error',
-                localRelPath: relPath,
-                details: `Download failed: ${msg}`,
-            });
+            this.logFailureOnce(relPath, msg, `Download failed: ${msg}`);
             throw error;
         } finally {
             this.activeTransfers.delete(transferId);
@@ -2072,6 +2075,7 @@ export class ProtonDriveSyncEngine {
         this.stateDb.upsertItem(item);
         // Synced: whatever conflict it was in is over, and a keep-both of it left unfinished with it (see keepBoth)
         this.keepBothCopies.delete(relPath);
+        this.forgetFailure(relPath);
         return true;
     }
 
@@ -2231,6 +2235,7 @@ export class ProtonDriveSyncEngine {
 
     private async handleLocalFileChange(relPath: string): Promise<void> {
         this.stateEvents.touch(relPath); // a new file shows as waiting to upload; a removed one goes
+        this.failingItems.delete(relPath); // Changed here: the next pass looks at it again at once
         if (this.holding() || !this.auth.isLoggedIn()) {
             return;
         }
@@ -5136,6 +5141,12 @@ export class ProtonDriveSyncEngine {
                 continue; // Nor what is in it: a rename, move or delete through the drive is on its way to Proton Drive
             }
 
+            const backingOff = this.failingItems.get(relPath);
+            if (backingOff && Date.now() < backingOff.retryAt) {
+                failed.push({ relPath, message: backingOff.message }); // Still failing, as far as this pass knows
+                continue;
+            }
+
             this.currentAction = `Syncing ${relPath}`;
             const remoteChild = remoteChildByName.get(name);
             const localChild = localChildByName.get(name);
@@ -5147,6 +5158,7 @@ export class ProtonDriveSyncEngine {
                 this.itemFailed(relPath, error, failed);
                 continue; // Nor what is in it, this pass
             }
+            this.forgetFailure(relPath);
 
             const resolvedFolderNode = remoteMap.get(relPath) ?? remoteChild;
             const localStillExists = await stat(path.join(this.localRoot(), relPath))
@@ -5187,16 +5199,30 @@ export class ProtonDriveSyncEngine {
             throw error;
         }
         const message = messageOf(error);
-        this.logger.warn(`Could not sync ${relPath}; trying again at the next sync: ${message}`);
+        const failures = (this.failingItems.get(relPath)?.failures ?? 0) + 1;
+        const waitMs = Math.min(2 ** (failures - 1) * 60_000, MAX_ITEM_BACKOFF_MS);
+        this.failingItems.set(relPath, { message, failures, retryAt: Date.now() + waitMs });
+        this.logger.warn(`Could not sync ${relPath}; trying again in ${Math.round(waitMs / 60_000)} min: ${message}`);
         if (this.stateDb.getItemByPath(relPath)) {
             this.stateDb.setItemStatus(relPath, 'error', message);
         }
-        this.stateDb.logActivity({
-            action: 'error',
-            localRelPath: relPath,
-            details: `Could not sync: ${message}; trying again at the next sync`,
-        });
+        this.logFailureOnce(relPath, message, `Could not sync: ${message}; trying again later`);
         failed.push({ relPath, message });
+    }
+
+    // An item's failure goes to the activity log once, until its error changes: one that keeps failing pass after
+    // pass would otherwise fill the log
+    private logFailureOnce(relPath: string, message: string, details: string): void {
+        if (this.loggedFailures.get(relPath) === message) {
+            return;
+        }
+        this.loggedFailures.set(relPath, message);
+        this.stateDb.logActivity({ action: 'error', localRelPath: relPath, details });
+    }
+
+    private forgetFailure(relPath: string): void {
+        this.loggedFailures.delete(relPath);
+        this.failingItems.delete(relPath);
     }
 }
 
