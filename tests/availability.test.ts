@@ -160,6 +160,15 @@ describe("AvailabilityPolicy", () => {
     expect(policy.childStates("").get("Docs")).toBe("downloaded");
   });
 
+  // stateOf takes the nearest hide flag, the item's own first; childStates must too
+  test("a child's own hide wins over a hide above its folder, in childStates as in stateOf", () => {
+    policy.setHide("docs", "pending");
+    policy.setHide("deep", "hidden"); // flags follow uids: a hidden folder moved into one being hidden keeps its own
+    expect(policy.stateOf("Docs/Deep")).toBe("hidden");
+    expect(policy.childStates("Docs").get("Deep")).toBe("hidden");
+    expect(policy.childStates("Docs").get("a.txt")).toBe("hiding");
+  });
+
   test("a pinned item reports pinned", () => {
     policy.setPin("docs", "pinned", false);
     expect(policy.stateOf("Docs")).toBe("pinned");
