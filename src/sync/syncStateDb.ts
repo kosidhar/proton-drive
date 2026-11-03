@@ -50,6 +50,18 @@ export interface ConflictRecord {
     conflictCopyPath: string | null;
 }
 
+export interface NewConflict {
+    localRelPath: string;
+    nodeUid: string;
+    localSha1: string | null;
+    remoteSha1: string | null;
+    localMtimeMs: number;
+    remoteMtimeMs: number;
+    resolved?: boolean;
+    resolution?: string | null;
+    conflictCopyPath?: string | null;
+}
+
 export interface ActivityRecord {
     id: number;
     timestamp: number;
@@ -142,6 +154,15 @@ export class SyncStateDatabase {
                 conflictCopyPath TEXT
             )
         `);
+        // At most one unresolved conflict per path (#66): duplicates earlier versions queued, pass after pass, fold into
+        // the latest of them
+        this.db.run(`
+            DELETE FROM conflicts
+            WHERE resolved = 0 AND id NOT IN (SELECT MAX(id) FROM conflicts WHERE resolved = 0 GROUP BY localRelPath)
+        `);
+        this.db.run(
+            'CREATE UNIQUE INDEX IF NOT EXISTS idx_conflicts_one_unresolved_per_path ON conflicts(localRelPath) WHERE resolved = 0',
+        );
 
         this.db.run(`
             CREATE TABLE IF NOT EXISTS activity_log (
@@ -505,17 +526,46 @@ export class SyncStateDatabase {
         this.onChange?.(localRelPath, false);
     }
 
-    recordConflict(conflict: {
-        localRelPath: string;
-        nodeUid: string;
-        localSha1: string | null;
-        remoteSha1: string | null;
-        localMtimeMs: number;
-        remoteMtimeMs: number;
-        resolved?: boolean;
-        resolution?: string | null;
-        conflictCopyPath?: string | null;
-    }): ConflictRecord {
+    // A conflict, as decided (resolved), or waiting for the user; one waiting at a path where another already waits
+    // refreshes that one (see queueConflict)
+    recordConflict(conflict: NewConflict): ConflictRecord {
+        return conflict.resolved ? this.insertConflict(conflict) : this.queueConflict(conflict).conflict;
+    }
+
+    // A conflict waiting for the user, kept once per path (#66): queued again while it waits, it is the same conflict as
+    // it now stands, with the same id (what the GUI resolves it by) and the time it was first found. `queued` says
+    // whether it is new.
+    queueConflict(conflict: Omit<NewConflict, 'resolved' | 'resolution'>): { conflict: ConflictRecord; queued: boolean } {
+        return this.db.transaction(() => {
+            const waiting = this.db
+                .query('SELECT id FROM conflicts WHERE localRelPath = $localRelPath AND resolved = 0')
+                .get({ $localRelPath: conflict.localRelPath }) as { id: number } | null;
+            if (!waiting) {
+                return { conflict: this.insertConflict({ ...conflict, resolved: false }), queued: true };
+            }
+            this.db
+                .query(`
+                    UPDATE conflicts
+                    SET nodeUid = $nodeUid, localSha1 = $localSha1, remoteSha1 = $remoteSha1,
+                        localMtimeMs = $localMtimeMs, remoteMtimeMs = $remoteMtimeMs,
+                        conflictCopyPath = COALESCE($conflictCopyPath, conflictCopyPath)
+                    WHERE id = $id
+                `)
+                .run({
+                    $id: waiting.id,
+                    $nodeUid: conflict.nodeUid,
+                    $localSha1: conflict.localSha1,
+                    $remoteSha1: conflict.remoteSha1,
+                    $localMtimeMs: Math.round(conflict.localMtimeMs),
+                    $remoteMtimeMs: Math.round(conflict.remoteMtimeMs),
+                    $conflictCopyPath: conflict.conflictCopyPath ?? null,
+                });
+            this.onChange?.(conflict.localRelPath, false);
+            return { conflict: this.getConflictById(waiting.id)!, queued: false };
+        })();
+    }
+
+    private insertConflict(conflict: NewConflict): ConflictRecord {
         const detectedAt = Date.now();
         const res = this.db
             .query(`
