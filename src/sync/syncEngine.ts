@@ -958,8 +958,10 @@ export class ProtonDriveSyncEngine {
         if (this.filesGone(true)) {
             return; // Looked at again at the next pass
         }
-        // This pass takes the items the user confirmed as deleted for deletes, and uses the confirmation up
+        // This pass takes the items the user confirmed as deleted for deletes, and uses the confirmation up (unless an
+        // item it touches failed: then the next pass does)
         const confirmation = this.missingConfirmed;
+        let keepConfirmation = false;
 
         this.reconcileRunning = true;
         this.state = 'syncing';
@@ -991,11 +993,18 @@ export class ProtonDriveSyncEngine {
             // and in the GUI dashboard immediately instead of waiting for a full tree scan.
             const remoteMap = new Map<string, NodeEntity>();
             const onlineOnly: OnlineOnlyFolder[] = [];
+            const failed: SyncFailure[] = [];
             await this.observingLocal((since) =>
-                this.reconcileDirectoryIncremental(root, '', remoteMap, this.stateDb.getSettings(), since, onlineOnly),
+                this.reconcileDirectoryIncremental(root, '', remoteMap, this.stateDb.getSettings(), since, onlineOnly, failed),
             );
-            if (confirmation !== null) {
+            // The user's confirmed deletes wait for a pass that got through everything they touch
+            const confirmedTouchFailed =
+                confirmation !== null &&
+                failed.some((f) => [...confirmation.names].some((name) => isWithin(f.relPath, name) || isWithin(name, f.relPath)));
+            if (confirmation !== null && !confirmedTouchFailed) {
                 await this.trashConfirmedOutOfReach(confirmation);
+            } else if (confirmedTouchFailed) {
+                keepConfirmation = true;
             }
             // Hides that were waiting for uploads finish once those are done
             await this.completePendingHides();
@@ -1005,7 +1014,16 @@ export class ProtonDriveSyncEngine {
             }
 
             this.lastSyncAt = Date.now();
-            if (this.syncingFolders.size === 0) {
+            if (failed.length > 0) {
+                // Everything else synced; these are tried again at the next pass
+                const first = failed[0]!;
+                this.lastError =
+                    failed.length === 1
+                        ? `Could not sync ${first.relPath}: ${first.message}`
+                        : `Could not sync ${failed.length} items (${first.relPath}: ${first.message}, and others)`;
+                this.currentAction = null;
+                this.state = 'error';
+            } else if (this.syncingFolders.size === 0) {
                 this.currentAction = null;
                 this.state = this.stateDb.getSettings().paused ? 'paused' : 'idle';
             }
@@ -1031,7 +1049,7 @@ export class ProtonDriveSyncEngine {
             } catch (error: unknown) {
                 this.logger.warn(`Could not look at what is missing after the files came back; the next pass looks again: ${error}`);
             }
-            if (confirmation !== null && this.missingConfirmed === confirmation) {
+            if (confirmation !== null && this.missingConfirmed === confirmation && !keepConfirmation) {
                 this.missingConfirmed = null;
             }
             if (this.replayAfterPass) {
@@ -4988,6 +5006,7 @@ export class ProtonDriveSyncEngine {
         _initialSettings: SyncSettings,
         since: number,
         onlineOnly: OnlineOnlyFolder[],
+        failed: SyncFailure[] = [],
     ): Promise<void> {
         const liveSettings = this.stateDb.getSettings();
         if (liveSettings.paused) {
@@ -5081,7 +5100,12 @@ export class ProtonDriveSyncEngine {
             const localChild = localChildByName.get(name);
             const dbRecord = dbChildByName.get(name);
 
-            await this.reconcileSinglePath(relPath, remoteChild, localChild, dbRecord, remoteMap, stepSettings, since);
+            try {
+                await this.reconcileSinglePath(relPath, remoteChild, localChild, dbRecord, remoteMap, stepSettings, since);
+            } catch (error: unknown) {
+                this.itemFailed(relPath, error, failed);
+                continue; // Nor what is in it, this pass
+            }
 
             const resolvedFolderNode = remoteMap.get(relPath) ?? remoteChild;
             const localStillExists = await stat(path.join(this.localRoot(), relPath))
@@ -5105,9 +5129,39 @@ export class ProtonDriveSyncEngine {
             ) {
                 continue;
             }
-            await this.reconcileDirectoryIncremental(sub.node, sub.relPath, remoteMap, nextSettings, since, onlineOnly);
+            try {
+                await this.reconcileDirectoryIncremental(sub.node, sub.relPath, remoteMap, nextSettings, since, onlineOnly, failed);
+            } catch (error: unknown) {
+                this.itemFailed(sub.relPath, error, failed); // Its listing, say: nothing in it is looked at this pass
+            }
         }
     }
+
+    // An item a sync pass couldn't sync (#18): marked as failed, logged, and left for the next pass to try again, while
+    // this one goes on with the rest. Nothing is decided about it, or about what is in it, this pass. A failure of the
+    // network or the server (offline, a 5xx, a rate limit) would fail every item alike: it ends the pass, as before.
+    private itemFailed(relPath: string, error: unknown, failed: SyncFailure[]): void {
+        if (isTransient(error)) {
+            throw error;
+        }
+        const message = messageOf(error);
+        this.logger.warn(`Could not sync ${relPath}; trying again at the next sync: ${message}`);
+        if (this.stateDb.getItemByPath(relPath)) {
+            this.stateDb.setItemStatus(relPath, 'error', message);
+        }
+        this.stateDb.logActivity({
+            action: 'error',
+            localRelPath: relPath,
+            details: `Could not sync: ${message}; trying again at the next sync`,
+        });
+        failed.push({ relPath, message });
+    }
+}
+
+// An item a sync pass couldn't sync, and why (see itemFailed)
+interface SyncFailure {
+    relPath: string;
+    message: string;
 }
 
 // What is missing while held (see stillMissing)
