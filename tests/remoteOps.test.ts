@@ -66,6 +66,44 @@ describe('RemoteOpsJournal', () => {
         expect(journal.pending()).toEqual([]);
     });
 
+    test('failed keeps the run of unmapped-code failures, which any other failure ends, and when to try again', () => {
+        const journal = new RemoteOpsJournal(stateDb.connection);
+        const a = journal.enqueue({ kind: 'rename', nodeUid: 'vol~a', toPath: 'A2' });
+        expect(journal.failures(a)).toEqual({ firstFailedAt: null, unmappedFailures: 0, retryAfter: null });
+
+        journal.failed(a, 'Network unreachable'); // not a run
+        expect(journal.failures(a)).toEqual({ firstFailedAt: null, unmappedFailures: 0, retryAfter: null });
+
+        const first = Date.now();
+        journal.failed(a, 'Unknown', { retryAfter: first + 60_000, unmapped: true });
+        journal.failed(a, 'Unknown', { retryAfter: first + 120_000, unmapped: true });
+        const run = journal.failures(a);
+        expect(run.firstFailedAt).toBeGreaterThanOrEqual(first);
+        expect(run.unmappedFailures).toBe(2);
+        expect(run.retryAfter).toBe(first + 120_000);
+        // Kept through a snapshot and its restore
+        const rows = journal.snapshot();
+        journal.complete(a);
+        journal.restore(rows);
+        expect(journal.failures(a)).toEqual(run);
+
+        journal.failed(a, 'Bad Gateway'); // ends the run
+        expect(journal.failures(a)).toEqual({ firstFailedAt: null, unmappedFailures: 0, retryAfter: null });
+    });
+
+    test('hasLaterOn tells whether a later operation on the same node is pending', () => {
+        const journal = new RemoteOpsJournal(stateDb.connection);
+        const a = journal.enqueue({ kind: 'rename', nodeUid: 'vol~a', toPath: 'A2' });
+        const b = journal.enqueue({ kind: 'rename', nodeUid: 'vol~b', toPath: 'B2' });
+        const a2 = journal.enqueue({ kind: 'move', nodeUid: 'vol~a', toPath: 'X/A2' });
+
+        expect(journal.hasLaterOn(a, 'vol~a')).toBe(true);
+        expect(journal.hasLaterOn(a2, 'vol~a')).toBe(false);
+        expect(journal.hasLaterOn(b, 'vol~b')).toBe(false);
+        journal.complete(a2);
+        expect(journal.hasLaterOn(a, 'vol~a')).toBe(false);
+    });
+
     test('a later local rename takes the targets of pending moves along, and leaves look-alike paths alone', () => {
         const journal = new RemoteOpsJournal(stateDb.connection);
         const intoNew = journal.enqueue({ kind: 'move', nodeUid: 'vol~x', toPath: 'New/x.txt' });
