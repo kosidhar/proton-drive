@@ -82,12 +82,14 @@ class Harness:
         self.completed = []
         self.now = 1000.0
         self.threads = []
+        self.scheduled = []  # [(fn, seconds)] handed to later()
         self.files = ext.ProtonDriveFiles(
             request=self.request,
             run=lambda work, done: self.runs.append((work, done)),
             notify=lambda title, body: self.notes.append((title, body)),
             complete=lambda handle, closure, ok: self.completed.append((handle, ok)),
             clock=lambda: self.now,
+            later=lambda fn, seconds: self.scheduled.append((fn, seconds)),
         )
         if root:
             self.files.set_root(root)
@@ -218,11 +220,110 @@ class EmblemTest(unittest.TestCase):
 
     def test_without_a_root_nothing_is_asked_per_file_and_the_root_is_asked_once_a_while(self):
         h = Harness({"/fm/root": {"syncDir": ROOT, "mode": "virtual", "mounted": True}}, root=None)
-        self.assertTrue(h.files.file_info(FakeFile(f"{ROOT}/a"), "h", None))
-        self.assertTrue(h.files.file_info(FakeFile(f"{ROOT}/b"), "h", None))
+        self.assertFalse(h.files.file_info(FakeFile(f"{ROOT}/a"), "h", None))
+        self.assertFalse(h.files.file_info(FakeFile(f"{ROOT}/b"), "h", None))
         self.assertEqual(len(h.runs), 1)
         h.release()
         self.assertEqual(h.files.root, ROOT)
+
+    # #86: the first folder opened before the root was known kept no emblems until a refresh
+    def test_a_file_asked_about_before_the_root_is_known_gets_its_emblem_once_it_is(self):
+        h = Harness({"/fm/root": {"syncDir": ROOT, "mode": "virtual", "mounted": True},
+                     states_query(ROOT + "/Docs"): DOCS_STATES}, root=None)
+        a = FakeFile(f"{ROOT}/Docs/a.txt")
+        outside = FakeFile("/home/u/elsewhere.txt")
+        self.assertFalse(h.files.file_info(a, "ha", None))
+        self.assertFalse(h.files.file_info(outside, "ho", None))
+        h.release()
+        self.assertEqual(sorted(h.completed), [("ha", True), ("ho", True)])
+        self.assertEqual(a.emblems, ["emblem-protondrive-pinned"])
+        self.assertEqual(outside.emblems, [])
+
+    def test_a_root_that_cannot_be_asked_yet_is_asked_again_and_what_waited_is_refreshed(self):
+        answers = {"/fm/root": ext.ControlError("Can't reach the Proton Drive background service"),
+                   states_query(ROOT + "/Docs"): DOCS_STATES}
+        h = Harness(answers, root=None)
+        a = FakeFile(f"{ROOT}/Docs/a.txt")
+        self.assertFalse(h.files.file_info(a, "ha", None))
+        h.release()
+        self.assertEqual(h.completed, [("ha", False)])
+        self.assertEqual(len(h.scheduled), 1)
+        # The daemon is up by the time it is asked again: Files is told to ask about the file again
+        answers["/fm/root"] = {"syncDir": ROOT, "mode": "virtual", "mounted": True}
+        fn, _seconds = h.scheduled.pop()
+        fn()
+        h.release()
+        self.assertEqual(h.files.root, ROOT)
+        self.assertEqual(a.invalidated, 1)
+        self.assertFalse(h.files.file_info(a, "ha2", None))
+        h.release()
+        self.assertEqual(a.emblems, ["emblem-protondrive-pinned"])
+
+    def test_a_file_waiting_for_the_root_is_answered_when_the_change_stream_tells_it_first(self):
+        h = Harness({"/fm/root": {"syncDir": ROOT, "mode": "virtual", "mounted": True}}, root=None)
+        outside = FakeFile("/home/u/x")
+        self.assertFalse(h.files.file_info(outside, "hx", None))
+        h.files.on_event({"type": "hello", "syncDir": ROOT, "mode": "virtual"})
+        self.assertEqual(h.completed, [("hx", True)])
+        h.release()  # the root's own answer, later, changes nothing
+        self.assertEqual(h.completed, [("hx", True)])
+
+    def test_while_the_daemon_is_away_files_are_answered_at_once_and_refreshed_when_it_is_back(self):
+        answers = {"/fm/root": ext.ControlError("Can't reach the Proton Drive background service"),
+                   states_query(ROOT + "/Docs"): DOCS_STATES}
+        h = Harness(answers, root=None)
+        h.files.file_info(FakeFile("/home/u/first"), "h0", None)
+        h.release()
+        # No root being asked: nothing is held up, in the drive or out of it
+        outside, inside = FakeFile("/usr/share/doc/x"), FakeFile(f"{ROOT}/Docs/a.txt")
+        self.assertTrue(h.files.file_info(outside, "h1", None))
+        self.assertTrue(h.files.file_info(inside, "h2", None))
+        self.assertEqual(h.runs, [])
+        # Asked again once; a second failure asks again later still
+        fn, _seconds = h.scheduled.pop()
+        fn()
+        h.release()
+        self.assertEqual(len(h.scheduled), 1)
+        answers["/fm/root"] = {"syncDir": ROOT, "mode": "virtual", "mounted": True}
+        h.scheduled.pop()[0]()
+        h.release()
+        self.assertEqual(h.files.root, ROOT)
+        self.assertEqual(inside.invalidated, 1)
+
+    def test_a_folder_the_daemon_says_is_not_in_the_drive_is_not_asked_again(self):
+        h = Harness({states_query(ROOT + "/Docs"): ext.ControlError("Not a folder in Proton Drive")})
+        h.files.file_info(FakeFile(f"{ROOT}/Docs/a.txt"), "ha", None)
+        h.release()
+        self.assertEqual(h.completed, [("ha", False)])
+        self.assertEqual(h.scheduled, [])
+        self.assertEqual(h.files.fetch_failures, {})
+
+    def test_cancel_drops_a_file_waiting_for_the_root(self):
+        h = Harness({"/fm/root": {"syncDir": ROOT, "mode": "virtual", "mounted": True}}, root=None)
+        h.files.file_info(FakeFile("/home/u/x"), "hx", None)
+        h.files.cancel("hx")
+        h.release()
+        self.assertEqual(h.completed, [])
+
+    def test_a_failed_states_fetch_is_asked_again_later_with_a_growing_wait(self):
+        answers = {states_query(ROOT + "/Docs"): ext.ControlError("Can't reach the Proton Drive background service")}
+        h = Harness(answers)
+        a = FakeFile(f"{ROOT}/Docs/a.txt")
+        h.files.file_info(a, "ha", None)
+        h.release()
+        self.assertEqual(h.completed, [("ha", False)])
+        fn, first_wait = h.scheduled.pop()
+        h.files.file_info(a, "ha2", None)
+        h.release()
+        _fn, second_wait = h.scheduled.pop()
+        self.assertGreater(second_wait, first_wait)
+        # Files is told to ask again; this time the daemon answers
+        answers[states_query(ROOT + "/Docs")] = DOCS_STATES
+        fn()
+        self.assertEqual(a.invalidated, 1)
+        self.assertFalse(h.files.file_info(a, "ha3", None))
+        h.release()
+        self.assertEqual(a.emblems, ["emblem-protondrive-pinned"])
 
     def test_cancel_drops_a_waiting_file(self):
         h = Harness({states_query(ROOT + "/Docs"): DOCS_STATES})
