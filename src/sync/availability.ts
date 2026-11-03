@@ -147,10 +147,11 @@ export class AvailabilityPolicy {
     const missing = this.childrenMissingFiles(folderRel);
     const here = this.childrenWithAnythingHere(folderRel);
     for (const child of children) {
-      if (hiddenAbove) {
-        out.set(child.name, hiddenAbove.hide === "pending" ? "hiding" : "hidden");
-      } else if (child.hide) {
+      // The nearest hide flag wins, the child's own first, as stateOf has it
+      if (child.hide) {
         out.set(child.name, child.hide === "pending" ? "hiding" : "hidden");
+      } else if (hiddenAbove) {
+        out.set(child.name, hiddenAbove.hide === "pending" ? "hiding" : "hidden");
       } else if (child.pin ? child.pin === "pinned" : pinnedAbove) {
         out.set(child.name, "pinned");
       } else {

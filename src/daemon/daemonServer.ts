@@ -240,7 +240,6 @@ export async function startSyncDaemon(options: {
         }));
     };
 
-
     if (runtime.auth.isLoggedIn()) {
         void fetchRemotePathItems('/my-files').catch(() => {});
     }
