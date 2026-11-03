@@ -1969,6 +1969,18 @@ export class ProtonDriveSyncEngine {
             if (!record || (await this.existsLocally(relPath))) {
                 return;
             }
+            if (this.inQueuedConflict(relPath, record)) {
+                // This computer's side of a conflict waiting for the user is what went (#63): the cloud has another
+                // device's revision, never seen here, which stays, as a delete through the drive leaves it (#29)
+                this.stateDb.removeItemByPath(relPath);
+                this.endConflictsAsKeepRemote([relPath]);
+                this.stateDb.logActivity({
+                    action: 'delete-local',
+                    localRelPath: relPath,
+                    details: "Deleted on this computer while in conflict; the other device's version stays in Proton Drive",
+                });
+                return;
+            }
             if (record.nodeUid === remoteNode.uid) {
                 await this.trashRemoteNodeForDeletedLocal(relPath, remoteNode);
             } else if (recorded && !recorded.trashTime && recorded.uid === record.nodeUid) {
@@ -1986,7 +1998,16 @@ export class ProtonDriveSyncEngine {
             return;
         }
         const entries = this.index.listSubtree(relPath);
-        const syncedUid = new Map(this.stateDb.getItemsUnder(relPath).map((item) => [item.localRelPath, item.nodeUid]));
+        const recordsUnder = this.stateDb.getItemsUnder(relPath);
+        // Files in a conflict waiting for the user are kept, as never on this computer: the cloud has another device's
+        // revision of them (#63)
+        const conflictPaths = new Set(this.stateDb.listConflicts().map((conflict) => conflict.localRelPath));
+        const inConflict = recordsUnder
+            .filter((item) => this.inQueuedConflict(item.localRelPath, item, conflictPaths))
+            .map((item) => item.localRelPath);
+        const syncedUid = new Map(
+            recordsUnder.filter((item) => !inConflict.includes(item.localRelPath)).map((item) => [item.localRelPath, item.nodeUid]),
+        );
         const hidden = this.policy.hiddenWithin(relPath);
         // Everything that never was on this computer, with every folder above it up to the deleted one
         const holdsCloudOnly = new Set<string>();
@@ -2060,6 +2081,7 @@ export class ProtonDriveSyncEngine {
         // Online-only from now on: no records, so nothing below reads as deleted later, and not pinned, so it isn't
         // downloaded again
         this.stateDb.removeItemByPath(relPath);
+        this.endConflictsAsKeepRemote(inConflict);
         if (this.policy.isPinned(relPath) || this.policy.hasPinnedBelow(relPath)) {
             this.policy.setPin(remoteNode.uid, 'unpinned', true);
         }
@@ -3801,12 +3823,7 @@ export class ProtonDriveSyncEngine {
                     this.stateDb.dropEditBaselines(relPath);
                     if (collision) {
                         // Nothing is left of this computer's side: what stays is the cloud's version
-                        const conflictPaths = new Set(collisions);
-                        for (const conflict of this.stateDb.listConflicts()) {
-                            if (conflictPaths.has(conflict.localRelPath)) {
-                                this.stateDb.markConflictResolved(conflict.id, 'keep-remote');
-                            }
-                        }
+                        this.endConflictsAsKeepRemote(collisions);
                         for (const uid of toTrash.keys()) {
                             this.index.removeSubtree(uid);
                         }
@@ -3967,6 +3984,27 @@ export class ProtonDriveSyncEngine {
             }
         }
         return targets;
+    }
+
+    // Whether a recorded item is in a conflict waiting for the user (prompt)
+    private inQueuedConflict(relPath: string, record: SyncedItemRecord, conflictPaths?: Set<string>): boolean {
+        return (
+            record.syncStatus === 'conflict' ||
+            (conflictPaths ? conflictPaths.has(relPath) : this.unresolvedConflictsAt(relPath).length > 0)
+        );
+    }
+
+    // This computer's side of the conflicts waiting at these paths is gone: what stays is the cloud's version
+    private endConflictsAsKeepRemote(paths: string[]): void {
+        if (paths.length === 0) {
+            return;
+        }
+        const ending = new Set(paths);
+        for (const conflict of this.stateDb.listConflicts()) {
+            if (ending.has(conflict.localRelPath)) {
+                this.stateDb.markConflictResolved(conflict.id, 'keep-remote');
+            }
+        }
     }
 
     private unresolvedConflictsAt(relPath: string): ConflictRecord[] {
