@@ -340,6 +340,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
             // still being written after that are left for the next sync, and said so
             const stillWritten = failed === null ? await engine.waitForSettling(CLI_SETTLE_WAIT_MS) : 0;
             await engine.stop();
+            await engine.waitForRunningLooks(); // one uploading now finishes before the database closes
             if (failed !== null) {
                 stateDb.close();
                 throw new Error(failed);
