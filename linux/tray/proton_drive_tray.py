@@ -38,6 +38,14 @@ MOUNT_REASONS = ("ejected", "crashed", "mount-point-busy")
 CONTROL_CONNECT_TIMEOUT = 2.0
 # Mounting readies the mount point first; past this the daemon is still at it, and the menu says so on the next poll
 MOUNT_READ_TIMEOUT = 15.0
+# While syncing the tray cycles through these frames so the arrows turn, as a full-size icon is still small in the
+# panel and motion is what gets noticed (#75); scripts/make-tray-icons.py draws them
+SYNC_FRAMES = 8
+SYNC_FRAME_MS = 125
+
+
+def sync_frame_icon(frame: int) -> str:
+    return f"protondrive-tray-syncing-{frame % SYNC_FRAMES}"
 
 
 class ControlError(Exception):
@@ -234,6 +242,9 @@ class ProtonDriveTrayIndicator:
 
         self.paused = False
         self.sync_dir = os.path.expanduser("~/ProtonDrive")
+        # The turning sync icon: the timer runs only while syncing, so an idle tray costs nothing
+        self.sync_frame = 0
+        self.sync_timer = 0
 
         self.menu = Gtk.Menu()
 
@@ -294,6 +305,25 @@ class ProtonDriveTrayIndicator:
         self.poll_status()
         GLib.timeout_add_seconds(2, self.poll_status)
 
+    def show_state(self, icon: str, description: str) -> None:
+        """Shows a still state icon, ending the turning sync icon if it runs."""
+        if self.sync_timer:
+            GLib.source_remove(self.sync_timer)
+            self.sync_timer = 0
+        self.indicator.set_icon_full(icon, description)
+
+    def show_syncing(self) -> None:
+        """Starts the turning sync icon; a poll that finds it running leaves it turning."""
+        if self.sync_timer:
+            return
+        self.indicator.set_icon_full(sync_frame_icon(self.sync_frame), "Syncing")
+        self.sync_timer = GLib.timeout_add(SYNC_FRAME_MS, self.next_sync_frame)
+
+    def next_sync_frame(self) -> bool:
+        self.sync_frame = (self.sync_frame + 1) % SYNC_FRAMES
+        self.indicator.set_icon_full(sync_frame_icon(self.sync_frame), "Syncing")
+        return True
+
     def poll_status(self) -> bool:
         try:
             req = urllib.request.Request(f"{DAEMON_URL}/api/status", method="GET")
@@ -335,28 +365,28 @@ class ProtonDriveTrayIndicator:
             self.stats_item.set_label(f"Local Sync: {format_bytes(total_bytes)}  •  {total_files} files")
 
             if not logged_in:
-                self.indicator.set_icon_full("protondrive-tray-error", "Sign in required")
+                self.show_state("protondrive-tray-error", "Sign in required")
                 self.status_item.set_label("Status: Sign in required")
             elif self.paused or state == "paused":
-                self.indicator.set_icon_full("protondrive-tray-paused", "Paused")
+                self.show_state("protondrive-tray-paused", "Paused")
                 self.status_item.set_label("Status: Sync Paused")
             elif state == "syncing":
                 action = data.get("currentAction") or "Syncing..."
                 if len(action) > 42:
                     action = action[:20] + "…" + action[-18:]
-                self.indicator.set_icon_full("protondrive-tray-syncing", "Syncing")
+                self.show_syncing()
                 self.status_item.set_label(f"Syncing: {action}")
             elif state == "error":
-                self.indicator.set_icon_full("protondrive-tray-error", "Sync Error")
+                self.show_state("protondrive-tray-error", "Sync Error")
                 self.status_item.set_label("Status: Sync Error")
             else:
-                self.indicator.set_icon_full("protondrive-tray-idle", "Up to date")
+                self.show_state("protondrive-tray-idle", "Up to date")
                 self.status_item.set_label("Status: Up to date")
 
             self.pause_item.set_label("Resume Sync" if self.paused else "Pause Sync")
             self.mount_item.set_visible(offers_mount(data))
         except Exception:
-            self.indicator.set_icon_full("protondrive-tray-error", "Daemon Offline")
+            self.show_state("protondrive-tray-error", "Daemon Offline")
             self.status_item.set_label("Status: Daemon Offline")
             self.mount_item.set_visible(False)
         return True
