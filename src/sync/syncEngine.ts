@@ -1715,7 +1715,12 @@ export class ProtonDriveSyncEngine {
         for (let attempt = 0; attempt < 10; attempt++) {
             const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
             const fullPath = path.join(root, relPath);
-            const gone = async () => !(await lstat(fullPath).catch(() => null));
+            // Only a copy that isn't there: one that can't be looked at (EACCES, EIO) is still the user's edit, uploaded
+            const gone = async () =>
+                lstat(fullPath).then(
+                    () => false,
+                    (error: NodeJS.ErrnoException) => error.code === 'ENOENT',
+                );
             // The user deleted or moved the copy meanwhile (through Files, say): theirs to do, and both were kept as asked.
             // A copy moved is a new local file wherever it went, which a later look uploads (#122)
             if (await gone()) {

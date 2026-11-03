@@ -9708,8 +9708,37 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 if (what === 'moved') {
                     const uploaded = [...d.nodes.values()].filter((n) => n.parentUid === d.root.uid && d.nameOf(n) === 'elsewhere.txt');
                     expect(uploaded.map((n) => n.content)).toEqual(['local edit']);
+                } else {
+                    expect([...d.nodes.values()].filter((n) => d.nameOf(n).includes('(conflict'))).toEqual([]);
                 }
             });
         }
+
+        test('a conflict copy deleted as its upload starts, under the keep-both setting: settled, nothing left in the cloud', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'original');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            await writeFile(local('a.txt'), 'local edit');
+            d.nodes.set(d.uid('a.txt'), makeMockNode({ uid: d.uid('a.txt'), parentUid: d.root.uid, nameStr: 'a.txt', type: NodeType.File, content: 'cloud edit' }));
+            // The copy goes as the upload is asked for, before anything of it is read
+            const getFileUploader = d.sdk.getFileUploader.bind(d.sdk);
+            (d.sdk as any).getFileUploader = async (parent: NodeEntity, name: string, metadata: any) => {
+                if (name.includes('(conflict')) await rm(path.join(engine.localRoot(), name), { force: true });
+                return getFileUploader(parent, name, metadata);
+            };
+            await engine.reconcileNow();
+            expect(await readFile(local('a.txt'), 'utf8')).toBe('cloud edit');
+            expect(stateDb.listConflicts()).toEqual([]);
+            expect([...d.nodes.values()].filter((n) => d.nameOf(n).includes('(conflict'))).toEqual([]);
+            expect(stateDb.getAllItems().filter((i) => i.localRelPath.includes('(conflict'))).toEqual([]);
+        });
     });
 });
