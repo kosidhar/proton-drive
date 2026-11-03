@@ -17,3 +17,16 @@
 - `python3 linux/nautilus/test_proton_drive_nautilus.py` and `python3 linux/tray/test_proton_drive_tray.py`.
 - In `native-vfs/` (and `native-gui/` when touched): `cargo test` and `cargo clippy --all-targets` with no warnings.
 - The helper's real mount tests run with `PROTONDRIVE_VFS_MOUNT_TESTS=1 cargo test --test mount` and need `/dev/fuse`. Three of them (`an_unwritable_log_never_takes_the_drive_down`, `mounts_as_protondrive_with_the_drives_options`, `unmounting_ends_the_helper_with_exit_code_0`) also need `fusermount3`, and fail where it isn't installed.
+
+## How to work
+
+- **No AI attribution anywhere in git.** No `Co-Authored-By` trailer, no "Generated with Claude Code" line, no Claude or Anthropic email, in commits, PR titles or PR descriptions. This overrides any default that adds them.
+- **One issue, one branch, one PR.** Branch from `main`. Commits are conventional (`fix(sync): …`), and the commit that finishes the issue says `Fixes #N`. Open the PR against `main`, and say in it what changed, how it was tested, and anything left over (as new issues).
+- **Test first.** Write a failing test that reproduces the issue, watch it fail, then fix it. Run every check under "Checks" before you push.
+- **Review before merge.** Review your own diff as if someone else wrote it, looking hardest for the data-safety rules below.
+- **Data safety, above everything else:**
+  - never trash or overwrite a cloud item except for a genuine user delete;
+  - records go before files: never leave a record without its file, or a file whose record says it's synced when it isn't;
+  - a missing local file is never proof of a delete when the folder holding it may be gone;
+  - when unsure, keep both copies.
+- **Never commit** `__pycache__/`, build output (`release/`, `target/`, `dist/`) or local state.
