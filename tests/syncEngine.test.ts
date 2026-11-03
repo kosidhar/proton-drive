@@ -8935,5 +8935,35 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
         }
     });
-});
 
+    describe('the watcher does nothing for a recorded file that has not changed (#89)', () => {
+        for (const layout of ['plain', 'virtual'] as const) {
+            test(`${layout}: no hash, no look-up, no upload; an edit still goes up`, async () => {
+                if (layout === 'virtual') stateDb.setMeta('driveLayout', 'virtual');
+                const d = makeMockDrive();
+                const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                    ...(layout === 'virtual' ? { backingDir: path.join(tempDir, 'files') } : {}),
+                    moveToDesktopTrash: async () => false,
+                    settle: { quietMs: 0 },
+                });
+                d.add('Kept.txt', 'kept');
+                d.add('a.txt', 'a');
+                engine.availability.setPin(d.root.uid, 'pinned', false);
+                await engine.reconcileNow();
+                d.calls.uploads.length = 0;
+                const getNode = spyOn(d.sdk, 'getNode');
+                try {
+                    await (engine as any).handleLocalFileChange('a.txt'); // a spurious report: nothing changed
+                    expect(getNode).not.toHaveBeenCalled();
+                    expect(d.calls.uploads).toEqual([]);
+
+                    await writeFile(path.join(engine.localRoot(), 'a.txt'), 'edited');
+                    await (engine as any).handleLocalFileChange('a.txt');
+                    expect(d.calls.uploads).toEqual(['a.txt']);
+                } finally {
+                    getNode.mockRestore();
+                }
+            });
+        }
+    });
+});

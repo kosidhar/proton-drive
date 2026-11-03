@@ -2443,6 +2443,10 @@ export class ProtonDriveSyncEngine {
 
             if (!st?.isFile()) {
                 this.forgetSettling(relPath);
+            } else if (dbRecord?.type === 'file' && !changedSinceRecord(st, dbRecord)) {
+                // As it was recorded (a spurious report, an app opening it read-write, a move the engine made): nothing
+                // here to upload, so no hash and no look at Proton Drive; a sync pass compares it with the cloud (#89)
+                return;
             } else if (changedSinceRecord(st, dbRecord) && this.stillBeingWritten(relPath, st)) {
                 return; // Looked at again once it has stayed as it is
             }
