@@ -3005,6 +3005,7 @@ export class ProtonDriveSyncEngine {
         // The folder is where its entry is, so only a child's own pending operation can take the child away
         const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
         const localNames = new Set(this.localChildNames(rel) ?? []);
+        const conflictPaths = new Set(this.stateDb.listConflicts().map((conflict) => conflict.localRelPath));
         const entries: VfsEntry[] = [];
         for (const child of this.index.listChildren(rel)) {
             if (
@@ -3015,7 +3016,7 @@ export class ProtonDriveSyncEngine {
                 continue;
             }
             // Where a local file and another cloud file collide, the local one is what the drive shows (#29)
-            const local = localNames.has(child.name) ? this.unresolvedCollision(child.relPath, child) : null;
+            const local = localNames.has(child.name) ? this.unresolvedCollision(child.relPath, child, conflictPaths) : null;
             entries.push(
                 local
                     ? { name: child.name, type: 'file', size: local.size, mtimeMs: local.mtimeMs }
@@ -3571,9 +3572,13 @@ export class ProtonDriveSyncEngine {
         }
         // A file being edited through the drive with no record yet is an edit of its baseline's node: the index may hold
         // another node at its path since (another device's), which isn't the one this file stands for
-        const sourceUid = ignoredFrom
-            ? null
-            : (this.stateDb.getItemByPath(fromRel)?.nodeUid ?? this.stateDb.getEditBaseline(fromRel)?.nodeUid ?? nodeUidOf(sourceEntry));
+        // A local file in an unresolved collision stands for no node: the cloud file at its path is another device's,
+        // which stays where it is (#29)
+        const sourceCollides = !ignoredFrom && source?.isFile() === true && (await this.collidingLocalFile(fromRel, sourceEntry)) !== null;
+        const sourceUid =
+            ignoredFrom || sourceCollides
+                ? null
+                : (this.stateDb.getItemByPath(fromRel)?.nodeUid ?? this.stateDb.getEditBaseline(fromRel)?.nodeUid ?? nodeUidOf(sourceEntry));
         const target = lstatSync(path.join(root, toRel), { throwIfNoEntry: false });
         const targetRecord = this.stateDb.getItemByPath(toRel);
         const targetEntry = ignoredTo ? null : this.liveIndexEntry(toRel);
@@ -3586,7 +3591,14 @@ export class ProtonDriveSyncEngine {
         if (replacing && noReplace) {
             throw new DriveOpError('EEXIST', `Already exists: ${toRel}`);
         }
-        const targetUid = !replacing || ignoredTo ? null : (targetRecord?.nodeUid ?? nodeUidOf(targetEntry));
+        // Nor does a target in an unresolved collision: what replaces it stays unrecorded, for the conflict handling to
+        // decide, rather than turning into a new revision of the other device's file (#29). Only something with no node
+        // of its own replaces it, as an editor's save does: one with a node would be moved onto that file's name.
+        const targetCollides = replacing && !ignoredTo && target?.isFile() === true && (await this.collidingLocalFile(toRel, targetEntry)) !== null;
+        if (targetCollides && sourceUid !== null) {
+            throw new DriveOpError('EEXIST', `Already exists: ${toRel}`);
+        }
+        const targetUid = !replacing || ignoredTo || targetCollides ? null : (targetRecord?.nodeUid ?? nodeUidOf(targetEntry));
         if (replacing) {
             // Only a file on this computer replaces, and only a file
             const targetIsFile = target ? target.isFile() : (targetRecord?.type ?? targetEntry?.type) === 'file';
@@ -3615,7 +3627,7 @@ export class ProtonDriveSyncEngine {
                 ? this.topmostRecordedUnder(fromRel).filter((item) => item.localRelPath !== fromRel && !pendingUids.has(item.nodeUid))
                 : [];
         this.watcher.suppressPath(fromRel);
-        if (!keepsTarget && (sourceUid !== null || this.stateDb.hasItemsUnder(fromRel))) {
+        if (!keepsTarget && !sourceCollides && (sourceUid !== null || this.stateDb.hasItemsUnder(fromRel))) {
             this.watcher.suppressPath(toRel); // Its records go with it: reported as something new, it would upload again
         }
         // Not toRel when the target is kept: its new content is reported, and uploads as a new revision
@@ -3651,7 +3663,14 @@ export class ProtonDriveSyncEngine {
                         }
                     } else {
                         this.stateDb.removeItemByPath(toRel); // Only something that exists only here (or nothing) is there
-                        if (ignoredTo || !source) {
+                        if (sourceCollides) {
+                            // Its record (one of a conflict) stands for the cloud file, which stays: the local file goes
+                            // on as a new one, and the conflict is over, both kept
+                            this.stateDb.removeItemByPath(fromRel);
+                            for (const conflict of this.unresolvedConflictsAt(fromRel)) {
+                                this.stateDb.markConflictResolved(conflict.id, 'keep-both');
+                            }
+                        } else if (ignoredTo || !source) {
                             // Into an ignored name nothing follows it; and records with no local copy would read as deletes
                             this.stateDb.removeItemByPath(fromRel);
                         } else {
@@ -3730,9 +3749,15 @@ export class ProtonDriveSyncEngine {
             }
         }
         // A local file in an unresolved collision is what the drive shows there (#29): only it goes, and the other file
-        // Proton Drive has at that name stays, listed again once the local one is gone
-        const collision = ignored ? null : await this.collisionToDelete(relPath, entry);
-        const toTrash = ignored || collision ? new Map<string, string>() : this.trashTargets(relPath, entry);
+        // Proton Drive has at that name stays (with the folders it is in), listed again once the local one is gone.
+        // Everything else in a folder being deleted goes to the Proton Drive trash, item by item.
+        const collisions = ignored || onlyIfEmpty ? [] : await this.collisionsAt(relPath, entry, local);
+        const collision = collisions.length > 0;
+        const toTrash = ignored
+            ? new Map<string, string>()
+            : collision
+              ? this.trashTargetsKeeping(relPath, collisions)
+              : this.trashTargets(relPath, entry);
         this.watcher.suppressPath(relPath);
         // For a Move to Trash, what is only here is told apart from unchanged synced copies while the records still say
         // which those are
@@ -3757,8 +3782,14 @@ export class ProtonDriveSyncEngine {
                     this.stateDb.dropEditBaselines(relPath);
                     if (collision) {
                         // Nothing is left of this computer's side: what stays is the cloud's version
-                        for (const conflict of this.unresolvedConflictsAt(relPath)) {
-                            this.stateDb.markConflictResolved(conflict.id, 'keep-remote');
+                        const conflictPaths = new Set(collisions);
+                        for (const conflict of this.stateDb.listConflicts()) {
+                            if (conflictPaths.has(conflict.localRelPath)) {
+                                this.stateDb.markConflictResolved(conflict.id, 'keep-remote');
+                            }
+                        }
+                        for (const uid of toTrash.keys()) {
+                            this.index.removeSubtree(uid);
                         }
                     } else if (entry) {
                         this.index.removeSubtree(entry.uid);
@@ -3826,7 +3857,8 @@ export class ProtonDriveSyncEngine {
     // (prompt), or a local file with no record and no edit baseline where the remote index has a file, which the
     // conflict handling has yet to see (see uploadNewFile). The drive shows the local file there (vfsChildren), and a
     // delete through it removes only that (deleteLocally): the cloud file is the other device's, never seen here.
-    private unresolvedCollision(relPath: string, entry: RemoteIndexEntry | null): Stats | null {
+    // conflictPaths: the paths of the unresolved conflicts, when the caller has them already (a listing looks at many)
+    private unresolvedCollision(relPath: string, entry: RemoteIndexEntry | null, conflictPaths?: Set<string>): Stats | null {
         if (!entry || entry.type !== 'file' || isProvisional(entry.uid)) {
             return null;
         }
@@ -3836,21 +3868,81 @@ export class ProtonDriveSyncEngine {
         }
         const record = this.stateDb.getItemByPath(relPath);
         const colliding = record
-            ? record.syncStatus === 'conflict' || this.unresolvedConflictsAt(relPath).length > 0
+            ? record.syncStatus === 'conflict' ||
+              (conflictPaths ? conflictPaths.has(relPath) : this.unresolvedConflictsAt(relPath).length > 0)
             : this.stateDb.getEditBaseline(relPath) === null;
         return colliding ? local : null;
     }
 
-    // The local file a delete through the drive finds in an unresolved collision, or null. With no record, a local file
-    // with the very content of the cloud file (by its SHA1) is that file, not recorded yet: it goes as a synced file
-    // does. One whose content can't be compared stays a collision, so the cloud file is kept.
-    private async collisionToDelete(relPath: string, entry: RemoteIndexEntry | null): Promise<Stats | null> {
+    // The local file a delete or rename through the drive finds in an unresolved collision, or null. With no record, a
+    // local file with the very content of the cloud file (by its SHA1) is that file, not recorded yet: it goes, or moves,
+    // as a synced file does. One whose content can't be compared stays a collision, so the cloud file is kept.
+    private async collidingLocalFile(relPath: string, entry: RemoteIndexEntry | null): Promise<Stats | null> {
         const local = this.unresolvedCollision(relPath, entry);
         if (!local || !entry?.sha1 || this.stateDb.getItemByPath(relPath)) {
             return local;
         }
         const localSha1 = await computeLocalFileSha1(path.join(this.localRoot(), relPath)).catch(() => null);
         return localSha1 === entry.sha1 ? null : local;
+    }
+
+    // The local files at or under relPath that are in an unresolved collision (see collidingLocalFile)
+    private async collisionsAt(relPath: string, entry: RemoteIndexEntry | null, local: Stats | undefined): Promise<string[]> {
+        if (!local) {
+            return [];
+        }
+        if (!local.isDirectory()) {
+            return (await this.collidingLocalFile(relPath, entry)) ? [relPath] : [];
+        }
+        const ignorePatterns = this.stateDb.getSettings().ignorePatterns;
+        const found: string[] = [];
+        const walk = async (dirRel: string) => {
+            const children = await readdir(path.join(this.localRoot(), dirRel), { withFileTypes: true }).catch(() => []);
+            for (const child of children) {
+                const rel = `${dirRel}/${child.name}`;
+                if (isEngineTempName(child.name) || matchesIgnorePatterns(rel, ignorePatterns)) {
+                    continue;
+                }
+                if (child.isDirectory()) {
+                    await walk(rel);
+                } else if (child.isFile() && (await this.collidingLocalFile(rel, this.liveIndexEntry(rel)))) {
+                    found.push(rel);
+                }
+            }
+        };
+        await walk(relPath);
+        return found;
+    }
+
+    // What goes to the Proton Drive trash for a delete of relPath that keeps the cloud files of the collisions in it, and
+    // the folders they are in: everything else in those folders, item by item (as trashTargets otherwise), and whatever
+    // a pending move puts in it
+    private trashTargetsKeeping(relPath: string, collisions: string[]): Map<string, string> {
+        const targets = new Map<string, string>();
+        const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
+        const holdsCollision = (folderRel: string) => collisions.some((rel) => rel.startsWith(`${folderRel}/`));
+        const visit = (folderRel: string) => {
+            for (const child of this.index.listChildren(folderRel)) {
+                if (takesAway(latest.get(child.uid), child) || collisions.includes(child.relPath)) {
+                    continue;
+                }
+                if (child.type === 'folder' && holdsCollision(child.relPath)) {
+                    visit(child.relPath);
+                    continue;
+                }
+                const uid = nodeUidOf(child);
+                if (uid !== null) {
+                    targets.set(uid, child.relPath);
+                }
+            }
+        };
+        visit(relPath);
+        for (const op of latest.values()) {
+            if (op.kind !== 'trash' && op.toPath.startsWith(`${relPath}/`) && !targets.has(op.nodeUid)) {
+                targets.set(op.nodeUid, op.toPath);
+            }
+        }
+        return targets;
     }
 
     private unresolvedConflictsAt(relPath: string): ConflictRecord[] {
