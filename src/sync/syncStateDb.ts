@@ -606,6 +606,16 @@ export class SyncStateDatabase {
         })();
     }
 
+    // Whether a conflict waits for the user at a path (one query on the index of waiting conflicts, for every file a pass
+    // looks at)
+    hasWaitingConflict(localRelPath: string): boolean {
+        return (
+            this.db.query('SELECT 1 FROM conflicts WHERE localRelPath = $localRelPath AND resolved = 0 LIMIT 1').get({
+                $localRelPath: localRelPath,
+            }) !== null
+        );
+    }
+
     // Closes the conflict waiting at a path, if any, as `resolution` (a sync pass found both sides holding the same
     // content: 'in-sync'). True when one was waiting.
     closeWaitingConflict(localRelPath: string, resolution: string): boolean {

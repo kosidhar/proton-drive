@@ -1328,10 +1328,13 @@ export class ProtonDriveSyncEngine {
 
                 // Fast path: the local file's time and size match the record, and the cloud hasn't changed since it: no
                 // SHA1 recomputation needed
+                // A conflict still waiting here is looked at in full, so that once both sides hold the same content
+                // (synced by a download, say) it is closed (#68)
                 if (
                     dbRecord &&
                     remoteAtSync &&
                     dbRecord.syncStatus === 'synced' &&
+                    !this.stateDb.hasWaitingConflict(relPath) &&
                     Math.abs(localInfo.mtimeMs - dbRecord.localMtimeMs) < 10 &&
                     localInfo.size === dbRecord.size &&
                     !cloudChangedSince(remoteAtSync, remoteNow)
