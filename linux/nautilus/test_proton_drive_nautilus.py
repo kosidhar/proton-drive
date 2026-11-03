@@ -79,7 +79,6 @@ class Harness:
         self.requests = []
         self.runs = []
         self.notes = []
-        self.completed = []
         self.now = 1000.0
         self.threads = []
         self.scheduled = []  # [(fn, seconds)] handed to later()
@@ -87,7 +86,6 @@ class Harness:
             request=self.request,
             run=lambda work, done: self.runs.append((work, done)),
             notify=lambda title, body: self.notes.append((title, body)),
-            complete=lambda handle, closure, ok: self.completed.append((handle, ok)),
             clock=lambda: self.now,
             later=lambda fn, seconds: self.scheduled.append((fn, seconds)),
         )
@@ -172,16 +170,15 @@ class EmblemTest(unittest.TestCase):
             self.assertTrue(ext.skipped(rel), rel)
         self.assertFalse(ext.skipped("Docs/Trash-notes.txt"))
 
-    def test_one_request_per_folder_and_every_file_completes(self):
+    def test_one_request_per_folder_and_every_file_gets_its_emblem_when_it_arrives(self):
         h = Harness({states_query(ROOT + "/Docs"): DOCS_STATES})
         files = {name: FakeFile(f"{ROOT}/Docs/{name}") for name in DOCS_STATES["children"]}
-        for i, f in enumerate(files.values()):
-            self.assertFalse(h.files.file_info(f, f"h{i}", None))
+        for f in files.values():
+            h.files.file_info(f)
+            self.assertEqual(f.emblems, [])  # answered at once, with nothing yet
         self.assertEqual(len(h.runs), 1)
         h.release()
         self.assertEqual(h.requests, [("GET", states_query(ROOT + "/Docs"), None)])
-        self.assertEqual(len(h.completed), len(files))
-        self.assertTrue(all(ok for _h, ok in h.completed))
         self.assertIsNot(h.threads[0], threading.main_thread())
         self.assertEqual(files["a.txt"].emblems, ["emblem-protondrive-pinned"])
         self.assertEqual(files["b.txt"].emblems, ["emblem-protondrive-local"])
@@ -190,11 +187,20 @@ class EmblemTest(unittest.TestCase):
         self.assertEqual(files["e.txt"].emblems, ["emblem-important"])
         self.assertEqual(files["f.txt"].emblems, ["emblem-important"])
         self.assertEqual(files[".git"].emblems, [])
-        # Cached: the next file of that folder is answered at once, with no request
+        # Cached: the next file of that folder gets its emblem at once, with no request
         again = FakeFile(f"{ROOT}/Docs/a.txt")
-        self.assertTrue(h.files.file_info(again, "h", None))
+        h.files.file_info(again)
         self.assertEqual(again.emblems, ["emblem-protondrive-pinned"])
         self.assertEqual(len(h.requests), 1)
+
+    # #131: Files cancels and asks again about a file while its folder's states are on the way; the emblem is added once
+    def test_a_file_asked_about_twice_while_waiting_gets_one_emblem(self):
+        h = Harness({states_query(ROOT + "/Docs"): DOCS_STATES})
+        a = FakeFile(f"{ROOT}/Docs/a.txt")
+        h.files.file_info(a)
+        h.files.file_info(a)
+        h.release()
+        self.assertEqual(a.emblems, ["emblem-protondrive-pinned"])
 
     def test_files_outside_the_drive_the_drive_itself_and_its_own_files_get_nothing(self):
         h = Harness()
@@ -205,23 +211,24 @@ class EmblemTest(unittest.TestCase):
             FakeFile(f"{ROOT}/.Trash-1000"),
             FakeFile(f"{ROOT}/x", scheme="sftp"),
         ):
-            self.assertTrue(h.files.file_info(f, "h", None), f.path)
+            h.files.file_info(f)
+            self.assertEqual(f.emblems, [], f.path)
         self.assertEqual(h.runs, [])
 
-    def test_a_daemon_that_fails_completes_every_file_as_failed_and_caches_nothing(self):
+    def test_a_daemon_that_fails_gives_no_emblem_and_caches_nothing(self):
         h = Harness({states_query(ROOT + "/Docs"): ext.ControlError("Can't reach the Proton Drive background service")})
         a, b = FakeFile(f"{ROOT}/Docs/a.txt"), FakeFile(f"{ROOT}/Docs/b.txt")
-        h.files.file_info(a, "ha", None)
-        h.files.file_info(b, "hb", None)
+        h.files.file_info(a)
+        h.files.file_info(b)
         h.release()
-        self.assertEqual(h.completed, [("ha", False), ("hb", False)])
-        self.assertEqual(a.emblems, [])
-        self.assertFalse(h.files.file_info(a, "ha2", None))  # asks again
+        self.assertEqual((a.emblems, b.emblems), ([], []))
+        h.files.file_info(a)
+        self.assertEqual(len(h.runs), 1)  # asks again
 
     def test_without_a_root_nothing_is_asked_per_file_and_the_root_is_asked_once_a_while(self):
         h = Harness({"/fm/root": {"syncDir": ROOT, "mode": "virtual", "mounted": True}}, root=None)
-        self.assertFalse(h.files.file_info(FakeFile(f"{ROOT}/a"), "h", None))
-        self.assertFalse(h.files.file_info(FakeFile(f"{ROOT}/b"), "h", None))
+        h.files.file_info(FakeFile(f"{ROOT}/a"))
+        h.files.file_info(FakeFile(f"{ROOT}/b"))
         self.assertEqual(len(h.runs), 1)
         h.release()
         self.assertEqual(h.files.root, ROOT)
@@ -231,22 +238,21 @@ class EmblemTest(unittest.TestCase):
         h = Harness({"/fm/root": {"syncDir": ROOT, "mode": "virtual", "mounted": True},
                      states_query(ROOT + "/Docs"): DOCS_STATES}, root=None)
         a = FakeFile(f"{ROOT}/Docs/a.txt")
-        outside = FakeFile("/home/u/elsewhere.txt")
-        self.assertFalse(h.files.file_info(a, "ha", None))
-        self.assertFalse(h.files.file_info(outside, "ho", None))
+        h.files.file_info(a)
         h.release()
-        self.assertEqual(sorted(h.completed), [("ha", True), ("ho", True)])
+        self.assertEqual(h.files.root, ROOT)
+        self.assertEqual(a.invalidated, 1)  # Files asks again
+        h.files.file_info(a)
+        h.release()
         self.assertEqual(a.emblems, ["emblem-protondrive-pinned"])
-        self.assertEqual(outside.emblems, [])
 
     def test_a_root_that_cannot_be_asked_yet_is_asked_again_and_what_waited_is_refreshed(self):
         answers = {"/fm/root": ext.ControlError("Can't reach the Proton Drive background service"),
                    states_query(ROOT + "/Docs"): DOCS_STATES}
         h = Harness(answers, root=None)
         a = FakeFile(f"{ROOT}/Docs/a.txt")
-        self.assertFalse(h.files.file_info(a, "ha", None))
+        h.files.file_info(a)
         h.release()
-        self.assertEqual(h.completed, [("ha", False)])
         self.assertEqual(len(h.scheduled), 1)
         # The daemon is up by the time it is asked again: Files is told to ask about the file again
         answers["/fm/root"] = {"syncDir": ROOT, "mode": "virtual", "mounted": True}
@@ -255,31 +261,29 @@ class EmblemTest(unittest.TestCase):
         h.release()
         self.assertEqual(h.files.root, ROOT)
         self.assertEqual(a.invalidated, 1)
-        self.assertFalse(h.files.file_info(a, "ha2", None))
+        h.files.file_info(a)
         h.release()
         self.assertEqual(a.emblems, ["emblem-protondrive-pinned"])
 
-    def test_a_file_waiting_for_the_root_is_answered_when_the_change_stream_tells_it_first(self):
+    def test_a_file_seen_before_the_root_is_refreshed_when_the_change_stream_tells_it_first(self):
         h = Harness({"/fm/root": {"syncDir": ROOT, "mode": "virtual", "mounted": True}}, root=None)
-        outside = FakeFile("/home/u/x")
-        self.assertFalse(h.files.file_info(outside, "hx", None))
+        a = FakeFile(f"{ROOT}/Docs/a.txt")
+        h.files.file_info(a)
         h.files.on_event({"type": "hello", "syncDir": ROOT, "mode": "virtual"})
-        self.assertEqual(h.completed, [("hx", True)])
+        self.assertEqual(a.invalidated, 1)
         h.release()  # the root's own answer, later, changes nothing
-        self.assertEqual(h.completed, [("hx", True)])
+        self.assertEqual(a.invalidated, 1)
 
-    def test_while_the_daemon_is_away_files_are_answered_at_once_and_refreshed_when_it_is_back(self):
+    def test_while_the_daemon_is_away_the_root_is_asked_again_later_still(self):
         answers = {"/fm/root": ext.ControlError("Can't reach the Proton Drive background service"),
                    states_query(ROOT + "/Docs"): DOCS_STATES}
         h = Harness(answers, root=None)
-        h.files.file_info(FakeFile("/home/u/first"), "h0", None)
+        inside = FakeFile(f"{ROOT}/Docs/a.txt")
+        h.files.file_info(inside)
         h.release()
-        # No root being asked: nothing is held up, in the drive or out of it
-        outside, inside = FakeFile("/usr/share/doc/x"), FakeFile(f"{ROOT}/Docs/a.txt")
-        self.assertTrue(h.files.file_info(outside, "h1", None))
-        self.assertTrue(h.files.file_info(inside, "h2", None))
+        # Asked once a while, not per file
+        h.files.file_info(FakeFile("/usr/share/doc/x"))
         self.assertEqual(h.runs, [])
-        # Asked again once; a second failure asks again later still
         fn, _seconds = h.scheduled.pop()
         fn()
         h.release()
@@ -292,28 +296,19 @@ class EmblemTest(unittest.TestCase):
 
     def test_a_folder_the_daemon_says_is_not_in_the_drive_is_not_asked_again(self):
         h = Harness({states_query(ROOT + "/Docs"): ext.ControlError("Not a folder in Proton Drive")})
-        h.files.file_info(FakeFile(f"{ROOT}/Docs/a.txt"), "ha", None)
+        h.files.file_info(FakeFile(f"{ROOT}/Docs/a.txt"))
         h.release()
-        self.assertEqual(h.completed, [("ha", False)])
         self.assertEqual(h.scheduled, [])
         self.assertEqual(h.files.fetch_failures, {})
-
-    def test_cancel_drops_a_file_waiting_for_the_root(self):
-        h = Harness({"/fm/root": {"syncDir": ROOT, "mode": "virtual", "mounted": True}}, root=None)
-        h.files.file_info(FakeFile("/home/u/x"), "hx", None)
-        h.files.cancel("hx")
-        h.release()
-        self.assertEqual(h.completed, [])
 
     def test_a_failed_states_fetch_is_asked_again_later_with_a_growing_wait(self):
         answers = {states_query(ROOT + "/Docs"): ext.ControlError("Can't reach the Proton Drive background service")}
         h = Harness(answers)
         a = FakeFile(f"{ROOT}/Docs/a.txt")
-        h.files.file_info(a, "ha", None)
+        h.files.file_info(a)
         h.release()
-        self.assertEqual(h.completed, [("ha", False)])
         fn, first_wait = h.scheduled.pop()
-        h.files.file_info(a, "ha2", None)
+        h.files.file_info(a)
         h.release()
         _fn, second_wait = h.scheduled.pop()
         self.assertGreater(second_wait, first_wait)
@@ -321,33 +316,28 @@ class EmblemTest(unittest.TestCase):
         answers[states_query(ROOT + "/Docs")] = DOCS_STATES
         fn()
         self.assertEqual(a.invalidated, 1)
-        self.assertFalse(h.files.file_info(a, "ha3", None))
+        h.files.file_info(a)
         h.release()
         self.assertEqual(a.emblems, ["emblem-protondrive-pinned"])
 
-    def test_cancel_drops_a_waiting_file(self):
-        h = Harness({states_query(ROOT + "/Docs"): DOCS_STATES})
-        h.files.file_info(FakeFile(f"{ROOT}/Docs/a.txt"), "ha", None)
-        h.files.file_info(FakeFile(f"{ROOT}/Docs/b.txt"), "hb", None)
-        h.files.cancel("ha")
-        h.release()
-        self.assertEqual(h.completed, [("hb", True)])
-
     def test_without_the_change_stream_states_are_fetched_again_after_ten_seconds(self):
         h = Harness({states_query(ROOT + "/Docs"): DOCS_STATES})
-        h.files.file_info(FakeFile(f"{ROOT}/Docs/a.txt"), "h", None)
+        h.files.file_info(FakeFile(f"{ROOT}/Docs/a.txt"))
         h.release()
         h.now += 5
-        self.assertTrue(h.files.file_info(FakeFile(f"{ROOT}/Docs/a.txt"), "h", None))
+        h.files.file_info(FakeFile(f"{ROOT}/Docs/a.txt"))
+        self.assertEqual(h.runs, [])
         h.now += 6
-        self.assertFalse(h.files.file_info(FakeFile(f"{ROOT}/Docs/a.txt"), "h", None))
+        h.files.file_info(FakeFile(f"{ROOT}/Docs/a.txt"))
+        self.assertEqual(len(h.runs), 1)
         h.release()
         # With the stream up, the cache holds until a change says otherwise
         h.files.on_event({"type": "hello", "syncDir": ROOT, "mode": "virtual"})
-        h.files.file_info(FakeFile(f"{ROOT}/Docs/a.txt"), "h", None)
+        h.files.file_info(FakeFile(f"{ROOT}/Docs/a.txt"))
         h.release()
         h.now += 3600
-        self.assertTrue(h.files.file_info(FakeFile(f"{ROOT}/Docs/a.txt"), "h", None))
+        h.files.file_info(FakeFile(f"{ROOT}/Docs/a.txt"))
+        self.assertEqual(h.runs, [])
 
     def test_the_folder_cache_lets_the_least_recently_used_go(self):
         cache = ext.FolderCache(limit=2)
@@ -360,18 +350,82 @@ class EmblemTest(unittest.TestCase):
     def test_a_fetch_that_started_before_a_change_is_shown_but_not_kept(self):
         h = Harness({states_query(ROOT + "/Docs"): DOCS_STATES})
         f = FakeFile(f"{ROOT}/Docs/a.txt")
-        h.files.file_info(f, "h", None)
+        h.files.file_info(f)
         h.files.on_event({"type": "changed", "paths": [f"{ROOT}/Docs/a.txt"], "subtrees": []})
         h.release()
-        self.assertEqual(h.completed, [("h", True)])
+        self.assertEqual(f.emblems, ["emblem-protondrive-pinned"])
         self.assertIsNone(h.files.cache.get(f"{ROOT}/Docs", h.now))
+
+    def test_files_is_always_answered_at_once(self):
+        """#131: an answer given later can't be matched to its request with nautilus-python, so none is."""
+        with open(os.path.join(HERE, "proton_drive_nautilus.py")) as f:
+            source = f.read().split("class ProtonDriveNautilusExtension(")[1]
+        self.assertNotIn("IN_PROGRESS", source)
+        self.assertNotIn("info_provider_update_complete_invoke", source)
+
+
+class GilPumpTest(unittest.TestCase):
+    """#131: nautilus-python never lets go of the GIL, so the extension's threads run only when it is given away."""
+
+    def setUp(self):
+        self.timers = []  # [ms, fn, alive]
+        self.slept = []
+        self.pump = ext.GilPump(lambda ms, fn: self.timers.append([ms, fn, True]), sleep=self.slept.append)
+
+    def tick(self, ms):
+        for timer in self.timers:
+            if timer[2] and timer[0] == ms:
+                timer[2] = timer[1]()
+
+    def live(self, ms):
+        return [t for t in self.timers if t[2] and t[0] == ms]
+
+    def test_always_gives_the_gil_away_now_and_then_for_the_change_stream(self):
+        self.assertEqual(len(self.live(ext.GilPump.IDLE_MS)), 1)
+        for _ in range(3):
+            self.tick(ext.GilPump.IDLE_MS)
+        self.assertEqual(self.slept, [ext.GilPump.SLICE] * 3)
+        self.assertEqual(len(self.live(ext.GilPump.IDLE_MS)), 1)  # never stops
+
+    def test_gives_it_away_often_only_while_a_request_is_out(self):
+        self.pump.begin()
+        self.pump.begin()  # one fast timer however many requests are out
+        self.assertEqual(len(self.live(ext.GilPump.BUSY_MS)), 1)
+        self.pump.end()
+        self.tick(ext.GilPump.BUSY_MS)
+        self.assertEqual(len(self.live(ext.GilPump.BUSY_MS)), 1)
+        self.pump.end()
+        self.tick(ext.GilPump.BUSY_MS)
+        self.assertEqual(self.live(ext.GilPump.BUSY_MS), [])
+        self.pump.begin()  # a later request starts it again
+        self.assertEqual(len(self.live(ext.GilPump.BUSY_MS)), 1)
+
+    def test_a_worker_thread_finishes_while_the_main_thread_only_gives_the_gil_away_through_the_pump(self):
+        """A busy worker thread finishes while the main thread does nothing but give the GIL away through the pump."""
+        done = threading.Event()
+
+        def work():
+            total = 0
+            for i in range(200000):  # pure Python: needs the GIL throughout
+                total += i
+            done.set()
+
+        pump = ext.GilPump(lambda ms, fn: None)
+        thread = threading.Thread(target=work)
+        thread.start()
+        for _ in range(2000):
+            if done.is_set():
+                break
+            pump.give()
+        thread.join(5)
+        self.assertTrue(done.is_set())
 
 
 class MenuTest(unittest.TestCase):
     def setUp(self):
         self.h = Harness({states_query(ROOT + "/Docs"): DOCS_STATES})
         for name in DOCS_STATES["children"]:
-            self.h.files.file_info(FakeFile(f"{ROOT}/Docs/{name}"), "h", None)
+            self.h.files.file_info(FakeFile(f"{ROOT}/Docs/{name}"))
         self.h.release()
 
     def actions(self, *names):
@@ -403,12 +457,12 @@ class MenuTest(unittest.TestCase):
         h.answers["/availability"] = lambda body: {"state": "online-only", "kept": [], "refused": None}
         a, b = FakeFile(f"{ROOT}/Docs/a.txt"), FakeFile(f"{ROOT}/Docs/b.txt")
         for f in (a, b):
-            h.files.file_info(f, "h", None)
+            h.files.file_info(f)
         h.requests.clear()
         h.threads.clear()
         h.files.act("free", [f"{ROOT}/Docs/a.txt", f"{ROOT}/Docs/b.txt", f"{ROOT}/Docs/.git"])
         self.assertEqual(a.invalidated, 1)
-        h.files.file_info(a, "h", None)
+        h.files.file_info(a)
         self.assertEqual(a.emblems, ["emblem-synchronizing"])
         h.release()
         self.assertEqual(
@@ -469,12 +523,12 @@ class ChangeTest(unittest.TestCase):
         self.b = FakeFile(f"{ROOT}/Docs/b.txt")
         self.song = FakeFile(f"{ROOT}/Music/s.mp3")
         for f in (self.docs, self.music, self.a, self.b, self.song):
-            self.h.files.file_info(f, "h", None)
+            self.h.files.file_info(f)
         self.h.release()
         self.h.files.on_event({"type": "hello", "syncDir": ROOT, "mode": "virtual"})
         for f in (self.docs, self.music, self.a, self.b, self.song):
             f.invalidated = 0
-            self.h.files.file_info(f, "h", None)
+            self.h.files.file_info(f)
         self.h.release()
 
     def test_a_change_invalidates_the_file_and_its_folders_and_drops_their_states(self):
@@ -497,7 +551,8 @@ class ChangeTest(unittest.TestCase):
         self.assertEqual(h.files.root, "/home/u/Elsewhere")
         for f in (self.docs, self.music, self.a, self.b, self.song):
             self.assertEqual(f.invalidated, 1)
-            self.assertTrue(h.files.file_info(f, "h", None))  # outside the new root: no emblem
+            h.files.file_info(f)  # outside the new root: no emblem
+            self.assertEqual(h.runs, [])
             self.assertEqual(f.emblems, [])
         self.assertEqual(h.files.cache.entries, {})
 
