@@ -36,7 +36,7 @@ import { DownloadWatch } from './downloadWatch';
 import { problemWithBlockedApps } from './settingsRules';
 import { StateEvents } from './stateEvents';
 import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
-import { createLocalConflictCopy, findLocalConflictCopy, formatConflictFileName } from './conflictResolver';
+import { createLocalConflictCopy, formatConflictFileName } from './conflictResolver';
 import { homeTrash, type MoveToDesktopTrash } from './desktopTrash';
 import { readDriveLayout } from './driveMode';
 import { LAYOUT_MOVING, type MoveSeams, relocateFiles, SYNC_DIR_MOVING } from './layoutMigration';
@@ -279,6 +279,9 @@ export class ProtonDriveSyncEngine {
     private missingConfirmed: { root: string; names: Set<string> } | null = null;
     // Conflicts being resolved by hand right now, so that a second request for the same one is refused
     private readonly resolvingConflicts = new Set<number>();
+    // The conflict copy a keep-both made of a file (by its path), and of what content, until that keep-both finishes: a
+    // retry after its download failed goes on from it rather than make another (#25)
+    private readonly keepBothCopies = new Map<string, { copyRelPath: string; sha1: string }>();
 
     constructor(
         private readonly sdk: ProtonDriveClient,
@@ -1380,9 +1383,7 @@ export class ProtonDriveSyncEngine {
         }
 
         // Default: keep-both
-        const madeAs = await this.keepBothCopy(localFullPath, localSha1);
-        await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
-        const conflictCopyRelPath = await this.uploadConflictCopy(madeAs, remoteMap, since);
+        const conflictCopyRelPath = await this.keepBoth(relPath, localFullPath, localSha1, remoteNode, remoteMap, since);
 
         this.stateDb.recordConflict({
             localRelPath: relPath,
@@ -1402,11 +1403,67 @@ export class ProtonDriveSyncEngine {
         });
     }
 
-    // The local conflict copy of a keep-both, as a path under the local root: the one an earlier try made of this same
-    // content, when the download of the cloud version failed after it (#25), or else a new one. One conflict, one copy.
-    private async keepBothCopy(localFullPath: string, localSha1: string): Promise<string> {
-        const copyFullPath = (await findLocalConflictCopy(localFullPath, localSha1)) ?? (await createLocalConflictCopy(localFullPath));
-        return path.relative(this.localRoot(), copyFullPath).split(path.sep).join('/');
+    // Keeps both versions of a file in conflict: its local content as a conflict copy, uploaded as a new file, and the
+    // cloud's version in its place. Returns where the copy ends up. One conflict makes one copy (#25): a retry after the
+    // download failed goes on from the copy the earlier try made (see earlierKeepBothCopy), and nothing else is ever
+    // taken for it. A copy nothing tracks yet is uploaded as made; refused (its name taken in Proton Drive), it stays as
+    // it is and a new copy is made, so no file anything tracks is ever renamed.
+    private async keepBoth(
+        relPath: string,
+        localFullPath: string,
+        localSha1: string,
+        remoteNode: NodeEntity,
+        remoteMap: Map<string, NodeEntity>,
+        since: number,
+    ): Promise<string> {
+        const earlier = await this.earlierKeepBothCopy(relPath, localSha1);
+        let copyRelPath: string | null = null;
+        if (earlier?.inCloud) {
+            copyRelPath = earlier.relPath;
+        } else if (earlier) {
+            const parentNode = await this.ensureParentFolderNode(earlier.relPath, remoteMap, since);
+            const fullPath = path.join(this.localRoot(), earlier.relPath);
+            const result = await this.uploadLocalToRemote(earlier.relPath, fullPath, parentNode, since, undefined, 'skip');
+            copyRelPath = result.status === 'skipped' ? null : earlier.relPath;
+        }
+        if (copyRelPath !== null) {
+            await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
+            this.keepBothCopies.delete(relPath);
+            return copyRelPath;
+        }
+        const madeAs = path.relative(this.localRoot(), await createLocalConflictCopy(localFullPath)).split(path.sep).join('/');
+        this.keepBothCopies.set(relPath, { copyRelPath: madeAs, sha1: localSha1 });
+        await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
+        // Past the download no retry comes (the file now holds the cloud's version): a copy whose upload fails here is
+        // a new local file to the next pass
+        this.keepBothCopies.delete(relPath);
+        return await this.uploadConflictCopy(madeAs, remoteMap, since);
+    }
+
+    // The copy an earlier, unfinished keep-both of this file made of this same content, if it can still be it: as made
+    // (a file nothing tracks: no record and no index entry), or uploaded since, when Proton Drive holds that copy there
+    // with that content now (inCloud: nothing more to upload). A copy of an earlier conflict, finished, is never in
+    // keepBothCopies; one changed, moved or edited in the cloud since is no longer it.
+    private async earlierKeepBothCopy(relPath: string, localSha1: string): Promise<{ relPath: string; inCloud: boolean } | null> {
+        const earlier = this.keepBothCopies.get(relPath);
+        if (!earlier || earlier.sha1 !== localSha1) {
+            return null;
+        }
+        const copyRelPath = earlier.copyRelPath;
+        const fullPath = path.join(this.localRoot(), copyRelPath);
+        const st = lstatSync(fullPath, { throwIfNoEntry: false });
+        if (!st?.isFile() || (await computeLocalFileSha1(fullPath).catch(() => null)) !== localSha1) {
+            return null;
+        }
+        const record = this.stateDb.getItemByPath(copyRelPath);
+        if (!record && !this.index.getByPath(copyRelPath)) {
+            return { relPath: copyRelPath, inCloud: false };
+        }
+        if (record?.type !== 'file' || record.syncStatus !== 'synced' || record.localSha1 !== localSha1) {
+            return null;
+        }
+        const there = await this.nodeStillAt(record.nodeUid, record.parentNodeUid, copyRelPath);
+        return there?.activeRevision?.claimedDigests?.sha1 === localSha1 ? { relPath: copyRelPath, inCloud: true } : null;
     }
 
     // Uploads a conflict copy just made here as a new file, never over a cloud file that already has its name: refused,
@@ -1495,9 +1552,8 @@ export class ProtonDriveSyncEngine {
                 await this.downloadRemoteToLocal(conflict.localRelPath, remoteNode, localFullPath, since);
                 this.stateDb.markConflictResolved(conflictId, 'keep-remote');
             } else {
-                const madeAs = await this.keepBothCopy(localFullPath, await computeLocalFileSha1(localFullPath));
-                await this.downloadRemoteToLocal(conflict.localRelPath, remoteNode, localFullPath, since);
-                const conflictCopyRelPath = await this.uploadConflictCopy(madeAs, remoteMap, since);
+                const localSha1 = await computeLocalFileSha1(localFullPath);
+                const conflictCopyRelPath = await this.keepBoth(conflict.localRelPath, localFullPath, localSha1, remoteNode, remoteMap, since);
                 this.stateDb.markConflictResolved(conflictId, 'keep-both', conflictCopyRelPath);
             }
         });
