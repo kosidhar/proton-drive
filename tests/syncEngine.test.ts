@@ -8935,5 +8935,83 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
         }
     });
-});
 
+    describe('a manual resolution and a strategy pass never both act on one conflict (#77)', () => {
+        const queued = async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'original');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            stateDb.updateSettings({ conflictStrategy: 'prompt' });
+            await writeFile(local('a.txt'), 'local edit');
+            d.nodes.set(d.uid('a.txt'), makeMockNode({ uid: d.uid('a.txt'), parentUid: d.root.uid, nameStr: 'a.txt', type: NodeType.File, content: 'cloud edit' }));
+            await engine.reconcileNow();
+            const [conflict] = stateDb.listConflicts();
+            expect(conflict.localRelPath).toBe('a.txt');
+            return { ...d, engine, local, conflict };
+        };
+        // Holds the next getNode of a uid until released
+        const holdGetNode = (d: Awaited<ReturnType<typeof queued>>, uid: string) => {
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            const getNode = d.sdk.getNode.bind(d.sdk);
+            (d.sdk as any).getNode = async (u: string) => {
+                if (u === uid) {
+                    (d.sdk as any).getNode = getNode;
+                    entered();
+                    await gate;
+                }
+                return getNode(u);
+            };
+            return { release, inside };
+        };
+
+        test('a pass under keep-remote leaves alone the conflict the user is keeping local by hand', async () => {
+            const d = await queued();
+            stateDb.updateSettings({ conflictStrategy: 'keep-remote' });
+            const held = holdGetNode(d, d.uid('a.txt'));
+            const manual = d.engine.resolveConflictManually(d.conflict.id, 'keep-local');
+            await held.inside;
+            await d.engine.reconcileNow(); // the pass, while the user's choice waits on the network
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
+            held.release();
+            await manual;
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
+            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('local edit');
+            expect(stateDb.listConflicts(true).map((c) => [c.id, c.resolution])).toEqual([[d.conflict.id, 'keep-local']]);
+        });
+
+        test('the user resolving by hand while a pass resolves the same conflict is told to try again, and nothing is relabelled', async () => {
+            const d = await queued();
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+            // A keep-both pass starts on it and waits on the network, in its download
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            const getFileDownloader = (d.sdk as any).getFileRevisionDownloader.bind(d.sdk);
+            (d.sdk as any).getFileRevisionDownloader = async (...args: unknown[]) => {
+                (d.sdk as any).getFileRevisionDownloader = getFileDownloader;
+                entered();
+                await gate;
+                return (getFileDownloader as any)(...args);
+            };
+            const held = { release, inside };
+            const pass = d.engine.reconcileNow();
+            await held.inside;
+            await expect(d.engine.resolveConflictManually(d.conflict.id, 'keep-local')).rejects.toMatchObject({ status: 409 });
+            held.release();
+            await pass;
+            expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-both']);
+            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('cloud edit');
+            expect(d.calls.trashed).toEqual([]);
+        });
+    });
+});

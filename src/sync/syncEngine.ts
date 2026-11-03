@@ -299,6 +299,10 @@ export class ProtonDriveSyncEngine {
     private missingConfirmed: { root: string; names: Set<string> } | null = null;
     // Conflicts being resolved by hand right now, so that a second request for the same one is refused
     private readonly resolvingConflicts = new Set<number>();
+    // The paths of conflicts being resolved right now, by hand or by the strategy in a sync pass: never both at once,
+    // or the strategy would act against the user's choice and the row would say what didn't happen (#77)
+    private readonly manualResolvingPaths = new Set<string>();
+    private readonly strategyResolvingPaths = new Set<string>();
     // The conflict copy a keep-both made of a file (by its path), and of what content, until that keep-both finishes or
     // the file's conflict is over some other way (resolved by hand, or the file synced): a retry after its download failed
     // goes on from it rather than make another (#25)
@@ -1368,7 +1372,7 @@ export class ProtonDriveSyncEngine {
                     // Both sides were just compared and hold the same content: a conflict waiting for the user here is
                     // over (#68). Only here: a record written as synced elsewhere (an upload by the watcher, say) says
                     // nothing about what the other side holds
-                    if (synced) {
+                    if (synced && !this.manualResolvingPaths.has(relPath)) {
                         this.stateDb.closeWaitingConflict(relPath, 'in-sync');
                     }
                     return;
@@ -1422,6 +1426,9 @@ export class ProtonDriveSyncEngine {
         since: number,
     ): Promise<void> {
         const strategy = settings.conflictStrategy;
+        if (this.manualResolvingPaths.has(relPath)) {
+            return; // The user is resolving it by hand right now: their choice is what happens to it (#77)
+        }
         if (strategy === 'keep-both' && this.stillChangingWhenLetThrough(relPath)) {
             // Still being written: the cloud version would be downloaded only to be thrown away once the file changes
             // again (#67 keeps the newer local writes), every time it is let through. Nothing is touched; a pass once
@@ -1464,9 +1471,46 @@ export class ProtonDriveSyncEngine {
         }
         notify();
 
-        if (strategy === 'keep-local') {
-            const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
-            await this.uploadLocalToRemote(relPath, localFullPath, parentNode, since, remoteNode.uid);
+        // Claimed until it is done: a manual resolution of it meanwhile is refused (#77)
+        this.strategyResolvingPaths.add(relPath);
+        try {
+            if (strategy === 'keep-local') {
+                const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
+                await this.uploadLocalToRemote(relPath, localFullPath, parentNode, since, remoteNode.uid);
+                this.stateDb.settleConflict({
+                    localRelPath: relPath,
+                    nodeUid: remoteNode.uid,
+                    localSha1,
+                    remoteSha1,
+                    localMtimeMs,
+                    remoteMtimeMs,
+                    resolution: 'keep-local',
+                });
+                this.keepBothCopies.delete(relPath);
+                return;
+            }
+
+            if (strategy === 'keep-remote') {
+                await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
+                this.stateDb.settleConflict({
+                    localRelPath: relPath,
+                    nodeUid: remoteNode.uid,
+                    localSha1,
+                    remoteSha1,
+                    localMtimeMs,
+                    remoteMtimeMs,
+                    resolution: 'keep-remote',
+                });
+                this.keepBothCopies.delete(relPath);
+                return;
+            }
+
+            // Default: keep-both
+            const conflictCopyRelPath = await this.keepBoth(relPath, localFullPath, localSha1, remoteNode, remoteMap, since);
+            if (conflictCopyRelPath === null) {
+                return; // Changed meanwhile: the next pass keeps both again, and a conflict waiting there keeps waiting
+            }
+
             this.stateDb.settleConflict({
                 localRelPath: relPath,
                 nodeUid: remoteNode.uid,
@@ -1474,48 +1518,17 @@ export class ProtonDriveSyncEngine {
                 remoteSha1,
                 localMtimeMs,
                 remoteMtimeMs,
-                resolution: 'keep-local',
+                resolution: 'keep-both',
+                conflictCopyPath: conflictCopyRelPath,
             });
-            this.keepBothCopies.delete(relPath);
-            return;
-        }
-
-        if (strategy === 'keep-remote') {
-            await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
-            this.stateDb.settleConflict({
+            this.stateDb.logActivity({
+                action: 'conflict',
                 localRelPath: relPath,
-                nodeUid: remoteNode.uid,
-                localSha1,
-                remoteSha1,
-                localMtimeMs,
-                remoteMtimeMs,
-                resolution: 'keep-remote',
+                details: `Resolved conflict with keep-both: saved ${conflictCopyRelPath}`,
             });
-            this.keepBothCopies.delete(relPath);
-            return;
+        } finally {
+            this.strategyResolvingPaths.delete(relPath);
         }
-
-        // Default: keep-both
-        const conflictCopyRelPath = await this.keepBoth(relPath, localFullPath, localSha1, remoteNode, remoteMap, since);
-        if (conflictCopyRelPath === null) {
-            return; // Changed meanwhile: the next pass keeps both again, and a conflict waiting there keeps waiting
-        }
-
-        this.stateDb.settleConflict({
-            localRelPath: relPath,
-            nodeUid: remoteNode.uid,
-            localSha1,
-            remoteSha1,
-            localMtimeMs,
-            remoteMtimeMs,
-            resolution: 'keep-both',
-            conflictCopyPath: conflictCopyRelPath,
-        });
-        this.stateDb.logActivity({
-            action: 'conflict',
-            localRelPath: relPath,
-            details: `Resolved conflict with keep-both: saved ${conflictCopyRelPath}`,
-        });
     }
 
     // Keeps both versions of a file in conflict: its local content as a conflict copy, uploaded as a new file, and the
@@ -1693,11 +1706,19 @@ export class ProtonDriveSyncEngine {
         if (this.resolvingConflicts.has(conflictId)) {
             throw new ConflictRefusedError(409, `Conflict #${conflictId} is being resolved`);
         }
+        if (this.strategyResolvingPaths.has(conflict.localRelPath)) {
+            throw new ConflictRefusedError(
+                409,
+                `Proton Drive is resolving ${conflict.localRelPath} by your conflict setting right now; try again in a moment`,
+            );
+        }
         this.resolvingConflicts.add(conflictId);
+        this.manualResolvingPaths.add(conflict.localRelPath);
         try {
             await this.resolveUnresolvedConflict(conflict, choice);
         } finally {
             this.resolvingConflicts.delete(conflictId);
+            this.manualResolvingPaths.delete(conflict.localRelPath);
         }
         return this.stateDb.getConflictById(conflictId)!;
     }

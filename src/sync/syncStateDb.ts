@@ -674,12 +674,13 @@ export class SyncStateDatabase {
             .all() as ConflictRecord[];
     }
 
+    // Only a conflict still waiting is resolved: one resolved already keeps what it says happened (#77)
     markConflictResolved(id: number, resolution: string, conflictCopyPath?: string | null): void {
         this.db
             .query(`
                 UPDATE conflicts
                 SET resolved = 1, resolution = $resolution, conflictCopyPath = COALESCE($conflictCopyPath, conflictCopyPath)
-                WHERE id = $id
+                WHERE id = $id AND resolved = 0
             `)
             .run({
                 $id: id,
