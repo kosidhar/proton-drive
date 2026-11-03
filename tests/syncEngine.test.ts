@@ -9256,6 +9256,30 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             }
         });
 
+        test('a cloud file that claims no sha1 is hashed once too after a chmod', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            const added = d.add('legacy.txt', 'from an older client');
+            const node = d.nodes.get(added.uid)!;
+            d.nodes.set(added.uid, { ...node, activeRevision: { ...node.activeRevision!, claimedDigests: { sha1: undefined } } } as any);
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            await Bun.sleep(20);
+            await chmod(path.join(engine.localRoot(), 'legacy.txt'), 0o600);
+            const hashes = spyOn(fileOpsModule, 'computeLocalFileSha1');
+            try {
+                for (let i = 0; i < 3; i++) await engine.reconcileNow();
+                expect(hashes.mock.calls.filter(([p]) => String(p).endsWith('legacy.txt')).length).toBe(1);
+                expect(d.calls.uploads).toEqual([]);
+            } finally {
+                hashes.mockRestore();
+            }
+        });
+
         test('a sync pass uploads it', async () => {
             const d = await written();
             await d.engine.reconcileNow();
