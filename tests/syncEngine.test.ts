@@ -3378,7 +3378,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(d.pendingLooks()).toBe(0);
                 });
 
-                test('stop() calls off the looks, and waits for one already running', async () => {
+                test('stop() calls off the looks, and waitForRunningLooks waits for one already running', async () => {
                     const d = await started();
                     await d.files.writeLocal('a.txt', 'a');
                     await d.changed('a.txt');
@@ -3386,7 +3386,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     await d.engine.stop();
                     expect(d.pendingLooks()).toBe(0);
 
-                    // A look whose upload is held: stop() returns only once it is done
+                    // A look whose upload is held: waitForRunningLooks returns only once it is done, or at its timeout
                     await d.engine.start({ backgroundInitialReconcile: false });
                     await d.files.writeLocal('b.txt', 'b');
                     await d.changed('b.txt');
@@ -3400,13 +3400,44 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     };
                     const looking = d.advance(2000);
                     await Bun.sleep(20);
-                    let stopped = false;
-                    const stopping = d.engine.stop().then(() => (stopped = true));
+                    await d.engine.stop(); // never waits for it (holdForMove does, within its timeout)
+                    expect(await d.engine.waitForRunningLooks(20)).toBe(false);
+                    let done = false;
+                    const waiting = d.engine.waitForRunningLooks().then(() => (done = true));
                     await Bun.sleep(20);
-                    expect(stopped).toBe(false);
+                    expect(done).toBe(false);
                     release();
-                    await Promise.all([looking, stopping]);
+                    await Promise.all([looking, waiting]);
+                    expect(done).toBe(true);
                     expect(d.calls.uploads).toContain('b.txt');
+                });
+
+                test('holdForMove still gives up after its timeout while a look is uploading', async () => {
+                    const d = await started();
+                    await d.files.writeLocal('big.bin', 'big');
+                    await d.changed('big.bin');
+                    const sdk = d.sdk as any;
+                    const real = sdk.getFileUploader.bind(sdk);
+                    let release!: () => void;
+                    const held = new Promise<void>((resolve) => (release = resolve));
+                    sdk.getFileUploader = async (...args: unknown[]) => {
+                        await held;
+                        return real(...args);
+                    };
+                    const looking = d.advance(2000);
+                    await Bun.sleep(20);
+
+                    const outcome = await Promise.race([
+                        d.engine.holdForMove({ timeoutMs: 200 }).then(
+                            () => 'held',
+                            (e: Error) => e.message,
+                        ),
+                        Bun.sleep(1500).then(() => 'still waiting'),
+                    ]);
+                    expect(outcome).toBe('Proton Drive is still busy syncing; try again in a moment');
+                    release();
+                    await looking;
+                    expect(d.calls.uploads).toEqual(['big.bin']);
                 });
 
                 test('waitForSettling (a one-off sync) waits for a file being written to upload, and says how many still wait', async () => {

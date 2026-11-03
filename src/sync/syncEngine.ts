@@ -486,7 +486,8 @@ export class ProtonDriveSyncEngine {
             settling.cancel(); // The pass at the next start looks at them again
         }
         this.settlingFiles.clear();
-        await Promise.all(this.runningLooks);
+        // A look already running isn't waited for here: holdForMove waits for it (see idleForMove), as long as it
+        // allows, and a caller about to close the database waits with waitForRunningLooks
         if (this.unsubscribeDriveEvents) {
             this.unsubscribeDriveEvents();
             this.unsubscribeDriveEvents = null;
@@ -870,7 +871,8 @@ export class ProtonDriveSyncEngine {
             !this.reconcileRunning &&
             this.replayRun === null &&
             this.localQueue.size === 0 &&
-            this.hydrations.size === 0
+            this.hydrations.size === 0 &&
+            this.runningLooks.size === 0
         );
     }
 
@@ -2458,7 +2460,8 @@ export class ProtonDriveSyncEngine {
     }
 
     // For a one-off sync (the CLI's): waits, up to timeoutMs, for the files still being written to settle and be looked
-    // at again. Answers how many are still waiting.
+    // at again. Answers how many are still waiting. A look already running when the time is up (an upload, say) is
+    // waited for without limit, as a sync pass's upload is.
     async waitForSettling(timeoutMs: number): Promise<number> {
         const deadline = Date.now() + timeoutMs;
         const waiting = () => [...this.settlingFiles.values()].filter((entry) => !entry.settled).length;
@@ -2467,6 +2470,17 @@ export class ProtonDriveSyncEngine {
         }
         await Promise.all(this.runningLooks);
         return waiting();
+    }
+
+    // Waits for the looks at settling files that are running now (after stop(), before the database is closed), up to
+    // timeoutMs if given. Answers whether none is still running.
+    async waitForRunningLooks(timeoutMs?: number): Promise<boolean> {
+        const running = Promise.all(this.runningLooks);
+        if (timeoutMs === undefined) {
+            await running;
+            return true;
+        }
+        return settlesWithin(running, timeoutMs);
     }
 
     private forgetSettling(relPath: string): void {
@@ -3877,8 +3891,12 @@ export class ProtonDriveSyncEngine {
     // The local file a delete or rename through the drive finds in an unresolved collision, or null. With no record, a
     // local file with the very content of the cloud file (by its SHA1) is that file, not recorded yet: it goes, or moves,
     // as a synced file does. One whose content can't be compared stays a collision, so the cloud file is kept.
-    private async collidingLocalFile(relPath: string, entry: RemoteIndexEntry | null): Promise<Stats | null> {
-        const local = this.unresolvedCollision(relPath, entry);
+    private async collidingLocalFile(
+        relPath: string,
+        entry: RemoteIndexEntry | null,
+        conflictPaths?: Set<string>,
+    ): Promise<Stats | null> {
+        const local = this.unresolvedCollision(relPath, entry, conflictPaths);
         if (!local || !entry?.sha1 || this.stateDb.getItemByPath(relPath)) {
             return local;
         }
@@ -3895,6 +3913,7 @@ export class ProtonDriveSyncEngine {
             return (await this.collidingLocalFile(relPath, entry)) ? [relPath] : [];
         }
         const ignorePatterns = this.stateDb.getSettings().ignorePatterns;
+        const conflictPaths = new Set(this.stateDb.listConflicts().map((conflict) => conflict.localRelPath));
         const found: string[] = [];
         const walk = async (dirRel: string) => {
             const children = await readdir(path.join(this.localRoot(), dirRel), { withFileTypes: true }).catch(() => []);
@@ -3905,7 +3924,7 @@ export class ProtonDriveSyncEngine {
                 }
                 if (child.isDirectory()) {
                     await walk(rel);
-                } else if (child.isFile() && (await this.collidingLocalFile(rel, this.liveIndexEntry(rel)))) {
+                } else if (child.isFile() && (await this.collidingLocalFile(rel, this.liveIndexEntry(rel), conflictPaths))) {
                     found.push(rel);
                 }
             }
