@@ -302,6 +302,8 @@ export class ProtonDriveSyncEngine {
     // The conflict copy a keep-both made of a file (by its path), and of what content, until that keep-both finishes or
     // the file's conflict is over some other way (resolved by hand, or the file synced): a retry after its download failed
     // goes on from it rather than make another (#25)
+    // Files whose keep-both waits for them to stop changing, already said in the log (see handleFileConflict)
+    private readonly keepBothDeferred = new Set<string>();
     private readonly keepBothCopies = new Map<string, { copyRelPath: string; sha1: string }>();
     // Items that keep failing in sync passes (#18), by path: the error last logged for each (logged once until it
     // changes), and how many times in a row each failed and when a pass tries it again (backoff). Both go when the item
@@ -1414,9 +1416,14 @@ export class ProtonDriveSyncEngine {
         if (strategy === 'keep-both' && this.stillChangingWhenLetThrough(relPath)) {
             // Still being written: the cloud version would be downloaded only to be thrown away once the file changes
             // again (#67 keeps the newer local writes), every time it is let through. Nothing is touched; a pass once
-            // it has gone quiet keeps both (#70)
+            // it has gone quiet keeps both (#70). Said once in the log, so that a file that never stops is explained
+            if (!this.keepBothDeferred.has(relPath)) {
+                this.keepBothDeferred.add(relPath);
+                this.logger.info(`Keeping both versions of ${relPath} once it stops changing: it is still being written`);
+            }
             return;
         }
+        this.keepBothDeferred.delete(relPath);
         const notify = () =>
             sendDesktopNotification({
                 title: 'Proton Drive Sync Conflict',
