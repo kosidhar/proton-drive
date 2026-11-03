@@ -1467,6 +1467,9 @@ export class ProtonDriveSyncEngine {
 
         // Default: keep-both
         const conflictCopyRelPath = await this.keepBoth(relPath, localFullPath, localSha1, remoteNode, remoteMap, since);
+        if (conflictCopyRelPath === null) {
+            return; // Changed meanwhile: the next pass keeps both again
+        }
 
         this.stateDb.recordConflict({
             localRelPath: relPath,
@@ -1491,6 +1494,9 @@ export class ProtonDriveSyncEngine {
     // download failed goes on from the copy the earlier try made (see earlierKeepBothCopy), and nothing else is ever
     // taken for it. A copy nothing tracks yet is uploaded as made; refused (its name taken in Proton Drive), it stays as
     // it is and a new copy is made, so no file anything tracks is ever renamed.
+    // Returns null, with the local file left as it is, when it changed after its copy was taken (still being written,
+    // say: #67): what was written since would be lost under the cloud's version. The next pass keeps both again, from
+    // what it holds then; the copy made here stays, a new local file to that pass.
     private async keepBoth(
         relPath: string,
         localFullPath: string,
@@ -1498,7 +1504,23 @@ export class ProtonDriveSyncEngine {
         remoteNode: NodeEntity,
         remoteMap: Map<string, NodeEntity>,
         since: number,
-    ): Promise<string> {
+    ): Promise<string | null> {
+        // The local file as it was when copied: checked again just before the cloud's version replaces it
+        const snapshot = async (sha1: string) => {
+            const st = await stat(localFullPath).catch(() => null);
+            return st ? { size: st.size, mtimeMs: st.mtimeMs, sha1 } : null;
+        };
+        const unchangedSince = (copied: { size: number; mtimeMs: number; sha1: string } | null) => async () => {
+            const st = await stat(localFullPath).catch(() => null);
+            if (!copied || !st?.isFile() || st.size !== copied.size || st.mtimeMs !== copied.mtimeMs) {
+                return false;
+            }
+            return (await computeLocalFileSha1(localFullPath).catch(() => null)) === copied.sha1;
+        };
+        const changedMeanwhile = () => {
+            this.logger.info(`Keeping both versions of ${relPath} next time: it changed after its conflict copy was made`);
+            return null;
+        };
         const earlier = await this.earlierKeepBothCopy(relPath, localSha1);
         let copyRelPath: string | null = null;
         if (earlier?.inCloud) {
@@ -1510,13 +1532,22 @@ export class ProtonDriveSyncEngine {
             copyRelPath = result.status === 'skipped' ? null : earlier.relPath;
         }
         if (copyRelPath !== null) {
-            await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
+            // The earlier copy holds localSha1: the local file must still be that
+            const copied = await snapshot(localSha1);
+            if (!(await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since, unchangedSince(copied)))) {
+                return changedMeanwhile();
+            }
             this.keepBothCopies.delete(relPath);
             return copyRelPath;
         }
         const madeAs = path.relative(this.localRoot(), await createLocalConflictCopy(localFullPath)).split(path.sep).join('/');
-        this.keepBothCopies.set(relPath, { copyRelPath: madeAs, sha1: localSha1 });
-        await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
+        // What the copy holds, which may be newer than localSha1 (read before): the local file must still be that
+        const copySha1 = await computeLocalFileSha1(path.join(this.localRoot(), madeAs));
+        const copied = await snapshot(copySha1);
+        this.keepBothCopies.set(relPath, { copyRelPath: madeAs, sha1: copySha1 });
+        if (!(await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since, unchangedSince(copied)))) {
+            return changedMeanwhile();
+        }
         // Past the download no retry comes (the file now holds the cloud's version): a copy whose upload fails here is
         // a new local file to the next pass
         this.keepBothCopies.delete(relPath);
@@ -1637,6 +1668,9 @@ export class ProtonDriveSyncEngine {
             } else {
                 const localSha1 = await computeLocalFileSha1(localFullPath);
                 const conflictCopyRelPath = await this.keepBoth(conflict.localRelPath, localFullPath, localSha1, remoteNode, remoteMap, since);
+                if (conflictCopyRelPath === null) {
+                    throw new ConflictRefusedError(409, `${conflict.localRelPath} changed while both were being kept; try again`);
+                }
                 this.stateDb.markConflictResolved(conflictId, 'keep-both', conflictCopyRelPath);
             }
             // Resolved, whichever way: a keep-both of it left unfinished before is over too (see keepBoth)
@@ -1644,12 +1678,15 @@ export class ProtonDriveSyncEngine {
         });
     }
 
+    // With beforePlacing, the download replaces the local file only if it answers true just before (see keepBoth).
+    // Answers whether the local file is now the cloud's version (or one the cloud's can't be).
     private async downloadRemoteToLocal(
         relPath: string,
         remoteNode: NodeEntity,
         localFullPath: string,
         since: number,
-    ): Promise<void> {
+        beforePlacing?: () => Promise<boolean>,
+    ): Promise<boolean> {
         const transferId = `dl:${relPath}`;
         this.watcher.suppressPath(relPath, 10000);
         this.activeTransfers.set(transferId, {
@@ -1674,7 +1711,11 @@ export class ProtonDriveSyncEngine {
                         current.totalBytes = totalBytes;
                     }
                 },
+                beforePlacing,
             });
+            if (result.status === 'skipped-changed') {
+                return false;
+            }
 
             if (result.status === 'downloaded' || result.status === 'skipped-identical') {
                 const remoteMtimeMs = (
@@ -1704,6 +1745,7 @@ export class ProtonDriveSyncEngine {
                     });
                 }
             }
+            return true;
         } catch (error: unknown) {
             const msg = error instanceof Error ? error.message : String(error);
             this.stateDb.setItemStatus(relPath, 'error', msg);

@@ -4468,6 +4468,36 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     });
                 });
 
+                // #67: what is written to the local file after keep-both took its copy (it was still being written) must
+                // not be lost under the cloud's version
+                test('keep-both never puts the cloud version over local content written after its copy (#67)', async () => {
+                    const d = await synced(layout);
+                    d.changeInCloud('theirs');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    // Written to again while the cloud version downloads
+                    const sdk = d.sdk as any;
+                    const real = sdk.getFileRevisionDownloader.bind(sdk);
+                    sdk.getFileRevisionDownloader = async (revisionUid: string) => {
+                        appendFileSync(d.local('Docs/doc.txt'), ' and more');
+                        sdk.getFileRevisionDownloader = real;
+                        return real(revisionUid);
+                    };
+
+                    await d.engine.reconcileNow();
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('mine and more');
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+
+                    // The next pass keeps both again, from what the file holds now
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
+                    const copies = await d.copiesIn('Docs');
+                    const contents = await Promise.all(copies.map((c) => readFile(d.local(`Docs/${c}`), 'utf8')));
+                    expect(contents).toContain('mine and more');
+                    expect(d.cloudCopies().map((n) => n.content)).toContain('mine and more');
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                });
+
                 // #25: a keep-both whose download of the cloud version fails makes its conflict copy once
                 test('keep-both makes one conflict copy while the cloud version fails to download, then brings it down (#25)', async () => {
                     const d = await synced(layout);
