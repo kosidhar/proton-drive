@@ -50,6 +50,45 @@ describe('LocalFolderWatcher', () => {
         await rm(base, { recursive: true, force: true });
     });
 
+    // #13: files saved into a new folder before its watcher attaches raised no event of their own
+    test('files already in a new folder when its watcher attaches are reported, nested ones too', async () => {
+        await start();
+        await mkdir(path.join(root, 'New', 'Inner'), { recursive: true });
+        await writeFile(path.join(root, 'New', 'a.txt'), 'a');
+        await writeFile(path.join(root, 'New', 'Inner', 'b.txt'), 'b');
+        expect(await waitFor(() => changes.includes('New/a.txt') && changes.includes('New/Inner/b.txt'))).toBe(true);
+    });
+
+    test('files in a new folder that are ignored are not reported', async () => {
+        hidden = ['New/skip.txt'];
+        await start();
+        await mkdir(path.join(root, 'New'));
+        await writeFile(path.join(root, 'New', 'skip.txt'), 'x');
+        await writeFile(path.join(root, 'New', 'keep.txt'), 'y');
+        expect(await waitFor(() => changes.includes('New/keep.txt'))).toBe(true);
+        await Bun.sleep(150);
+        expect(changes).not.toContain('New/skip.txt');
+    });
+
+    // A folder the engine made or moved itself is suppressed: its files, synced already, are not reported one by one
+    test('files in a new folder whose own event is suppressed are not reported', async () => {
+        await start();
+        watcher.suppressPath('Moved', 5000);
+        await mkdir(path.join(root, 'Moved'));
+        await writeFile(path.join(root, 'Moved', 'a.txt'), 'a');
+        await Bun.sleep(300);
+        expect(changes.filter((c) => c.startsWith('Moved'))).toEqual([]);
+        expect(isWatched('Moved')).toBe(true); // still watched, for what the user does in it later
+    });
+
+    test('folders already there at start are not reported file by file', async () => {
+        await mkdir(path.join(root, 'Old'));
+        await writeFile(path.join(root, 'Old', 'a.txt'), 'a');
+        await start();
+        await Bun.sleep(200);
+        expect(changes).toEqual([]);
+    });
+
     // #12: a deleted folder's own watcher reports it under its own name, which joined onto its path made P/P
     test('deleting a watched folder reports the folder only, not a phantom path inside it', async () => {
         await mkdir(path.join(root, 'P'));
