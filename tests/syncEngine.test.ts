@@ -9535,4 +9535,63 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(stateDb.getConflictById(conflict.id)).toMatchObject({ resolved: 1, resolution: 'in-sync' });
         });
     });
+
+    describe("a record's parent once its folder is in Proton Drive, and after an adopted stray node (#103)", () => {
+        test('virtual: a move through the drive into a folder made here gets that folder as its parent once it is created', async () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'a');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            await mkdir(path.join(engine.localRoot(), 'N'));
+            await engine.renameItem('a.txt', 'N/a.txt');
+            await engine.replayRemoteOps();
+            await engine.reconcileNow();
+            await engine.replayRemoteOps();
+            await engine.reconcileNow();
+            const folder = [...d.nodes.values()].find((n) => n.parentUid === d.root.uid && d.nameOf(n) === 'N')!;
+            expect(folder).toBeDefined();
+            expect(d.nodes.get(d.uid('a.txt'))?.parentUid).toBe(folder.uid);
+            expect(stateDb.getItemByPath('N/a.txt')?.parentNodeUid).toBe(folder.uid);
+        });
+
+        test('virtual: a new file moved through the drive into another folder while it uploads names that folder', async () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            const folder = d.add('Folder');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            await writeFile(path.join(engine.localRoot(), 'new.txt'), 'new');
+            const getFileUploader = d.sdk.getFileUploader.bind(d.sdk);
+            (d.sdk as any).getFileUploader = async (parent: NodeEntity, name: string, metadata: any) => {
+                const uploader = await getFileUploader(parent, name, metadata);
+                if (name !== 'new.txt') return uploader;
+                return {
+                    uploadFromStream: async (...args: Parameters<typeof uploader.uploadFromStream>) => {
+                        const result = await uploader.uploadFromStream(...args);
+                        await engine.renameItem('new.txt', 'Folder/new.txt'); // the user moves it as it uploads
+                        return result;
+                    },
+                };
+            };
+            await (engine as any).handleLocalFileChange('new.txt');
+            await engine.replayRemoteOps();
+            const record = stateDb.getItemByPath('Folder/new.txt');
+            expect(record).not.toBeNull();
+            expect(d.nodes.get(record!.nodeUid)?.parentUid).toBe(folder.uid);
+            expect(record!.parentNodeUid).toBe(folder.uid);
+        });
+    });
 });
