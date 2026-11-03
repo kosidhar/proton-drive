@@ -14,6 +14,7 @@ import {
     NodeType,
     NodeWithSameNameExistsValidationError,
     type ProtonDriveClient,
+    RateLimitedError,
     ServerError,
     ValidationError,
 } from '@protontech/drive-sdk';
@@ -75,6 +76,9 @@ export const LOCAL_MOVE_IN_PROGRESS = 'localMoveInProgress';
 // How many times a journalled change may fail for a reason other than the network or the server before it is given up
 // on, so that it can't hold up everything after it for ever
 const MAX_UNEXPECTED_FAILURES = 10;
+// How many times an operation Proton Drive refuses with an HTTP 4xx (one the SDK doesn't map to a ValidationError) is
+// tried before it is given up on: such a refusal doesn't change, and the journal waits behind it meanwhile (#39)
+const MAX_HTTP_REFUSALS = 3;
 // Uid prefix of the remote index entries that stand for folders made here that Proton Drive doesn't have yet, holding
 // what a pending move puts in them (see applyPendingOpsToIndex). Never a node: never resolved, moved or trashed.
 const PROVISIONAL = 'provisional:';
@@ -4232,15 +4236,19 @@ export class ProtonDriveSyncEngine {
 
     // A later operation on the same item decides where it ends up, or trashes it: an earlier one has nothing left to do
     private isSuperseded(op: RemoteOp): boolean {
-        return this.journal.pending().some((later) => later.id > op.id && later.nodeUid === op.nodeUid);
+        return this.journal.hasLaterOn(op.id, op.nodeUid);
     }
 
     // A failed operation stays pending and replay stops, keeping the order; one that keeps failing for a reason that
     // isn't the network or the server is given up on in the end, and the user told (the next sync then follows what the
     // cloud has).
-    private replayFailed(op: RemoteOp, where: string, error: unknown): 'next' | 'stop' {
+    // A refusal the SDK doesn't map (see isRefusal) is no network or server trouble, though it is a ServerError: it is
+    // given up on in the end too, rather than retried forever with the journal waiting behind it (#39); an HTTP 4xx after
+    // MAX_HTTP_REFUSALS tries, an API error code (which may come with a 5xx) after MAX_UNEXPECTED_FAILURES.
+    private async replayFailed(op: RemoteOp, where: string, error: unknown): Promise<'next' | 'stop'> {
         const message = messageOf(error);
-        if (isTransient(error) || op.attempts + 1 < MAX_UNEXPECTED_FAILURES) {
+        const limit = httpClientError(error) ? MAX_HTTP_REFUSALS : MAX_UNEXPECTED_FAILURES;
+        if ((isTransient(error) && !isRefusal(error)) || op.attempts + 1 < limit) {
             this.journal.failed(op.id, message);
             this.logger.warn(`Could not apply a change to ${where} in Proton Drive yet; trying again later: ${message}`);
             return 'stop';
@@ -4250,9 +4258,23 @@ export class ProtonDriveSyncEngine {
             'error',
             'Proton Drive: change not applied',
             where,
-            `A change to ${where} could not be made in Proton Drive, and was given up on: ${message}`,
+            `A change to ${where} could not be made in Proton Drive, and was given up on: ${message}. The next sync follows what Proton Drive has`,
         );
+        await this.followCloudAfterGivingUp(op);
         return 'next';
+    }
+
+    // After an operation is given up on, this computer follows what Proton Drive has of its node: its index entry goes
+    // back to where the cloud has it now (a local copy follows at the next pass, as for a move made in the cloud), and the
+    // next pass crawls the online-only folders, so listings show the item where it is (#39). Nothing is deleted: a
+    // rename or move given up on leaves the item under its old name, a delete given up on brings it back.
+    private async followCloudAfterGivingUp(op: RemoteOp): Promise<void> {
+        this.onlineOnlyCrawlDue = true;
+        try {
+            this.indexFromCloud(await this.sdk.getNode(op.nodeUid));
+        } catch (error: unknown) {
+            this.logger.warn(`Could not look up ${op.nodeUid} in Proton Drive after giving up on a change to it; the next crawl does: ${error}`);
+        }
     }
 
     private async isGoneFromCloud(uid: string): Promise<boolean | undefined> {
@@ -5139,9 +5161,10 @@ export class ProtonDriveSyncEngine {
 
     // An item a sync pass couldn't sync (#18): marked as failed, logged, and left for the next pass to try again, while
     // this one goes on with the rest. Nothing is decided about it, or about what is in it, this pass. A failure of the
-    // network or the server (offline, a 5xx, a rate limit) would fail every item alike: it ends the pass, as before.
+    // network or the server (offline, a 5xx, a rate limit) would fail every item alike: it ends the pass, as before. A
+    // refusal of this one request (see isRefusal) is this item's failure.
     private itemFailed(relPath: string, error: unknown, failed: SyncFailure[]): void {
-        if (isTransient(error)) {
+        if (isTransient(error) && !isRefusal(error)) {
             throw error;
         }
         const message = messageOf(error);
@@ -5302,6 +5325,24 @@ function messageOf(error: unknown): string {
 // The network or the server, which a later try may get past (a rate limit is a ServerError too)
 function isTransient(error: unknown): boolean {
     return error instanceof ConnectionError || error instanceof AbortError || error instanceof ServerError;
+}
+
+// A request Proton Drive refused that the SDK doesn't map to a ValidationError: an APICodeError (an API error code it
+// has no class for), or an APIHTTPError with a 4xx other than a timeout or a rate limit. Both are ServerErrors, but no
+// later try is likely to get past them. (Neither class is exported by the SDK, so they are told by name.)
+function isRefusal(error: unknown): boolean {
+    return (
+        error instanceof ServerError && !(error instanceof RateLimitedError) && (error.name === 'APICodeError' || httpClientError(error))
+    );
+}
+
+// An APIHTTPError with a 4xx other than a timeout or a rate limit
+function httpClientError(error: unknown): boolean {
+    if (!(error instanceof ServerError) || error.name !== 'APIHTTPError') {
+        return false;
+    }
+    const status = (error as { statusCode?: unknown }).statusCode;
+    return typeof status === 'number' && status >= 400 && status < 500 && status !== 408 && status !== 429;
 }
 
 // A version of a cloud file, as its active revision claims it: its SHA1 (null when the uploader gave none), modified

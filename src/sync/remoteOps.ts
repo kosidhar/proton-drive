@@ -43,6 +43,7 @@ export class RemoteOpsJournal {
                 lastError TEXT
             )
         `);
+        this.db.run('CREATE INDEX IF NOT EXISTS remote_ops_node ON remote_ops (nodeUid, id)');
     }
 
     enqueue(op: NewRemoteOp): number {
@@ -78,6 +79,11 @@ export class RemoteOpsJournal {
             .query('SELECT id, kind, nodeUid, path, toPath, attempts FROM remote_ops WHERE id = $id')
             .get({ $id: id }) as RemoteOpRow | null;
         return row ? toOp(row) : null;
+    }
+
+    // Whether a later operation on the same node is pending: it decides where the node ends up, or trashes it
+    hasLaterOn(id: number, nodeUid: string): boolean {
+        return this.db.query('SELECT 1 FROM remote_ops WHERE nodeUid = $nodeUid AND id > $id LIMIT 1').get({ $nodeUid: nodeUid, $id: id }) !== null;
     }
 
     hasPending(): boolean {
