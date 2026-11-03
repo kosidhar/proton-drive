@@ -86,6 +86,11 @@ const MIN_UNMAPPED_FAILURES = 5;
 const MAX_REPLAY_BACKOFF_MS = 60 * 60_000;
 // An item that keeps failing in sync passes is tried again after 1 minute, doubling each time, up to this (#18)
 const MAX_ITEM_BACKOFF_MS = 60 * 60_000;
+// A local file that changed uploads only once it has stayed as it is (size and times) this long, so that a copy that
+// stalls (a slow disk, a network share, a paused cp) doesn't upload half a file (#51). One seen changing again waits
+// twice as long each time, up to SETTLE_MAX_QUIET_MS.
+const SETTLE_QUIET_MS = 2000;
+const SETTLE_MAX_QUIET_MS = 16_000;
 // Uid prefix of the remote index entries that stand for folders made here that Proton Drive doesn't have yet, holding
 // what a pending move puts in them (see applyPendingOpsToIndex). Never a node: never resolved, moved or trashed.
 const PROVISIONAL = 'provisional:';
@@ -299,6 +304,9 @@ export class ProtonDriveSyncEngine {
     // syncs, or changes here.
     private readonly loggedFailures = new Map<string, string>();
     private readonly failingItems = new Map<string, { message: string; failures: number; retryAt: number }>();
+    // Local files waiting to stay as they are before they upload (see stillBeingWritten): what they were at the last look
+    // (size and times), since when (by the settle clock), how long they must stay so, and the next look
+    private readonly settlingFiles = new Map<string, { seen: string; since: number; quietMs: number; cancel: () => void }>();
 
     constructor(
         private readonly sdk: ProtonDriveClient,
@@ -318,6 +326,14 @@ export class ProtonDriveSyncEngine {
             stateEventSchedule?: (run: () => void, delayMs: number) => () => void;
             // For tests: how long what is missing while held is taken as known (FILES_MISSING_CACHE_MS; see stillMissing)
             filesMissingCacheMs?: number;
+            // How long a changed file must stay as it is before it uploads (see stillBeingWritten); quietMs 0 uploads
+            // at once. For tests: the clock it is timed by, and how the look once it should have settled is scheduled.
+            settle?: {
+                quietMs?: number;
+                maxQuietMs?: number;
+                now?: () => number;
+                schedule?: (run: () => Promise<void>, delayMs: number) => () => void;
+            };
         } = {},
     ) {
         this.index = new RemoteIndex(this.stateDb.connection);
@@ -455,6 +471,10 @@ export class ProtonDriveSyncEngine {
 
     async stop(): Promise<void> {
         this.watcher.stop();
+        for (const settling of this.settlingFiles.values()) {
+            settling.cancel(); // The pass at the next start looks at them again
+        }
+        this.settlingFiles.clear();
         if (this.unsubscribeDriveEvents) {
             this.unsubscribeDriveEvents();
             this.unsubscribeDriveEvents = null;
@@ -1099,6 +1119,13 @@ export class ProtonDriveSyncEngine {
         // Being hidden: its local changes (edits, new files, deletes) sync as for a visible item, so the hide can
         // finish, but nothing new comes down from the cloud
         const hiding = hiddenBy !== null;
+        // A file still being written is left alone (not uploaded, nor downloaded over) until it stays as it is
+        if (localInfo && !localInfo.isDirectory && changedSinceRecord(localInfo, dbRecord)) {
+            const st = await stat(localFullPath).catch(() => null);
+            if (st?.isFile() && this.stillBeingWritten(relPath, st)) {
+                return;
+            }
+        }
 
         // Case 1: Present remotely, not present locally
         if (remoteNode && !localInfo) {
@@ -2277,6 +2304,12 @@ export class ProtonDriveSyncEngine {
             const st = await stat(fullPath).catch(() => null);
             const dbRecord = this.stateDb.getItemByPath(relPath);
 
+            if (!st?.isFile()) {
+                this.forgetSettling(relPath);
+            } else if (changedSinceRecord(st, dbRecord) && this.stillBeingWritten(relPath, st)) {
+                return; // Looked at again once it has stayed as it is
+            }
+
             if (!st) {
                 // Not a delete of this item: every file is missing from the folder; or the files came back after a hold
                 // and no pass has looked at what is still missing yet (a copy cancelled part-way removes what it wrote)
@@ -2344,6 +2377,55 @@ export class ProtonDriveSyncEngine {
         } finally {
             this.localQueue.delete(relPath);
         }
+    }
+
+    // Whether a local file that changed is still being written, by what it was at earlier looks (#51): its size and
+    // times must stay the same for a while (SETTLE_QUIET_MS, longer each time it is seen changing again) before it
+    // uploads. Until then it is left alone, and looked at again (as the watcher reports a change) once it should have
+    // settled. A file last changed longer ago than that, by its own times, has settled already: such files (edited while
+    // the daemon was down, say) upload at the first look, without a wait each.
+    private stillBeingWritten(relPath: string, st: Stats): boolean {
+        const settle = this.options.settle ?? {};
+        const baseQuietMs = settle.quietMs ?? SETTLE_QUIET_MS;
+        if (baseQuietMs <= 0) {
+            return false;
+        }
+        const now = (settle.now ?? Date.now)();
+        const seen = `${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
+        const earlier = this.settlingFiles.get(relPath);
+        earlier?.cancel();
+        const same = earlier?.seen === seen;
+        const quietMs = !earlier
+            ? baseQuietMs
+            : same
+              ? earlier.quietMs
+              : Math.min(earlier.quietMs * 2, settle.maxQuietMs ?? SETTLE_MAX_QUIET_MS);
+        const since = same ? earlier.since : now;
+        // File times are by the system clock: so is Date.now(), whatever clock the looks are timed by
+        const lastChangeMs = Math.max(st.mtimeMs, st.ctimeMs);
+        if (now - since >= quietMs || Date.now() - lastChangeMs >= quietMs) {
+            this.settlingFiles.delete(relPath);
+            return false;
+        }
+        const schedule =
+            settle.schedule ??
+            ((run: () => Promise<void>, delayMs: number) => {
+                const timer = setTimeout(() => void run(), delayMs);
+                timer.unref?.(); // Never what keeps a one-off run (the CLI's sync) going
+                return () => clearTimeout(timer);
+            });
+        const lookAgain = () =>
+            this.handleLocalFileChange(relPath).catch((error: unknown) => {
+                this.logger.warn(`Could not look at ${relPath} again once written: ${error}`);
+            });
+        const cancel = schedule(lookAgain, since + quietMs - now);
+        this.settlingFiles.set(relPath, { seen, since, quietMs, cancel });
+        return true;
+    }
+
+    private forgetSettling(relPath: string): void {
+        this.settlingFiles.get(relPath)?.cancel();
+        this.settlingFiles.delete(relPath);
     }
 
     private async handleRemoteDriveEvent(event: DriveEvent): Promise<void> {
@@ -5403,6 +5485,12 @@ function driveOpErrorOf(failure: unknown, toRel: string): unknown {
         return new DriveOpError('ENOENT', messageOf(failure), { cause: failure });
     }
     return failure;
+}
+
+// Whether a local file differs from its record by size or time (as a pass's fast path tells), or has none: an upload
+// is what it would come to
+function changedSinceRecord(local: { size: number; mtimeMs: number }, record: SyncedItemRecord | null | undefined): boolean {
+    return !record || local.size !== record.size || Math.abs(local.mtimeMs - record.localMtimeMs) >= 10;
 }
 
 // The node an index entry stands for; none for a provisional one

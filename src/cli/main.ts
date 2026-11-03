@@ -333,6 +333,8 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
             console.log(`Syncing ${stateDb.getSettings().syncDir} with Proton Drive...`);
             await engine.reconcileNow();
             const failed = syncPassError(engine.getStatus());
+            // A file still being written was left for a later look (see stillBeingWritten): none comes in this run
+            await engine.stop();
             if (failed !== null) {
                 stateDb.close();
                 throw new Error(failed);
