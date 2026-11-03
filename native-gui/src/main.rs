@@ -1,3 +1,5 @@
+mod single_instance;
+
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -995,6 +997,10 @@ enum WorkerCommand {
 /// Set once in `main` when the app only renders a screenshot: nothing that changes anything is ever sent then, and
 /// the control socket is never called.
 static SCREENSHOT_MODE: AtomicBool = AtomicBool::new(false);
+/// A later start asked this GUI to bring its window to the front (#129); the next frame does it
+static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// The running app's context, so the single-instance listener can wake it
+static APP_CONTEXT: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
 
 /// What screenshot mode may ask the worker for: reads only.
 fn allowed_in_screenshot_mode(cmd: &WorkerCommand) -> bool {
@@ -4312,6 +4318,12 @@ impl ProtonDriveNativeApp {
 
 impl eframe::App for ProtonDriveNativeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if SHOW_REQUESTED.swap(false, AtomicOrdering::SeqCst) {
+            // Opened again from the tray or the launcher: bring this window back instead of a second one (#129)
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         self.process_worker_events();
         self.frames_rendered += 1;
 
@@ -5662,7 +5674,27 @@ fn main() -> eframe::Result {
         }
     }
 
+    // One app window per user (#129): a second start shows the running window and exits. A screenshot runs beside it
+    let mut _instance_lock: Option<std::fs::File> = None;
     if screenshot_target.is_none() {
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty());
+        let in_runtime_dir = runtime_dir.is_some();
+        let paths = single_instance::instance_paths(runtime_dir, node_tmpdir(|name| std::env::var_os(name)), own_uid());
+        match single_instance::claim(&paths, own_uid(), in_runtime_dir, Duration::from_secs(5)) {
+            Ok(single_instance::Claim::Signalled) => return Ok(()),
+            Ok(single_instance::Claim::Primary { lock, listener }) => {
+                _instance_lock = Some(lock);
+                thread::spawn(move || {
+                    single_instance::serve(listener, || {
+                        SHOW_REQUESTED.store(true, AtomicOrdering::SeqCst);
+                        if let Some(ctx) = APP_CONTEXT.get() {
+                            ctx.request_repaint();
+                        }
+                    })
+                });
+            }
+            Err(e) => eprintln!("protondrive-gui: couldn't check for a running app window ({e}); starting anyway"),
+        }
         try_autostart_tray();
     }
 
@@ -5717,6 +5749,7 @@ fn main() -> eframe::Result {
         "Proton Drive",
         options,
         Box::new(move |cc| {
+            let _ = APP_CONTEXT.set(cc.egui_ctx.clone());
             let mut app = ProtonDriveNativeApp::new(
                 cc,
                 screenshot_target,
