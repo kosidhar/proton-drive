@@ -910,17 +910,16 @@ export class ProtonDriveSyncEngine {
         st: { size: number; mtimeMs: number },
     ): Promise<boolean> {
         const record = this.stateDb.getItemByPath(relPath);
-        if (!record || record.type !== 'file' || record.syncStatus !== 'synced' || !record.remoteSha1) {
+        // What Proton Drive held when the record was made: the SHA1 it claims, or for a node that claims none, the SHA1
+        // of what came down from it (a record with no SHA1 for the cloud side is only made by a download)
+        const held = record?.remoteSha1 ?? record?.localSha1;
+        if (!record || record.type !== 'file' || record.syncStatus !== 'synced' || !held) {
             return false;
         }
-        if (
-            st.size === record.size &&
-            Math.abs(st.mtimeMs - record.localMtimeMs) < 10 &&
-            record.localSha1 === record.remoteSha1
-        ) {
+        if (st.size === record.size && Math.abs(st.mtimeMs - record.localMtimeMs) < 10 && record.localSha1 === held) {
             return true;
         }
-        return (await computeLocalFileSha1(fullPath).catch(() => null)) === record.remoteSha1;
+        return (await computeLocalFileSha1(fullPath).catch(() => null)) === held;
     }
 
     markFoldersSyncing(folderNames: string[]): void {
@@ -1224,11 +1223,17 @@ export class ProtonDriveSyncEngine {
                     remoteNode.activeRevision?.claimedModificationTime ?? remoteNode.modificationTime
                 ).getTime();
 
-                const remoteNow: CloudVersion = { sha1: remoteSha1, mtimeMs: remoteMtimeMs, size: getClaimedSize(remoteNode) ?? 0 };
                 // What the record says the cloud held when it was made (its size is the local one, the same then)
                 const remoteAtSync: CloudVersion | null = dbRecord
                     ? { sha1: dbRecord.remoteSha1, mtimeMs: dbRecord.remoteMtimeMs, size: dbRecord.size }
                     : null;
+                // A node that claims no size has none to compare: against a record, its size is no change (its time and
+                // SHA1 still count); an edit baseline kept it as 0, as the remote index does
+                const remoteNow: CloudVersion = {
+                    sha1: remoteSha1,
+                    mtimeMs: remoteMtimeMs,
+                    size: getClaimedSize(remoteNode) ?? remoteAtSync?.size ?? 0,
+                };
 
                 // Fast path: the local file's time and size match the record, and the cloud hasn't changed since it: no
                 // SHA1 recomputation needed
@@ -1540,7 +1545,8 @@ export class ProtonDriveSyncEngine {
                     parentNodeUid: remoteNode.parentUid ?? null,
                     type: 'file',
                     localSha1: result.sha1 ?? null,
-                    remoteSha1: remoteNode.activeRevision?.claimedDigests?.sha1 ?? result.sha1 ?? null,
+                    // What the cloud claims, null when it claims none: never the SHA1 computed here in its place
+                    remoteSha1: remoteNode.activeRevision?.claimedDigests?.sha1 ?? null,
                     localMtimeMs: result.mtimeMs,
                     remoteMtimeMs,
                     size: result.size,
@@ -3164,7 +3170,7 @@ export class ProtonDriveSyncEngine {
                         parentNodeUid: node.parentUid ?? null,
                         type: 'file',
                         localSha1: downloaded.sha1,
-                        remoteSha1: node.activeRevision?.claimedDigests?.sha1 ?? downloaded.sha1,
+                        remoteSha1: node.activeRevision?.claimedDigests?.sha1 ?? null, // as the cloud claims it
                         localMtimeMs: st.mtimeMs,
                         remoteMtimeMs: (node.activeRevision?.claimedModificationTime ?? node.modificationTime).getTime(),
                         size: st.size,

@@ -3988,6 +3988,87 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     });
                 });
 
+                // A record keeps what the cloud claims, never a SHA1 computed here in place of one it doesn't claim: a
+                // node with none then reads as unchanged until its time or size change (#24 follow-up)
+                describe('downloaded from a cloud node with no checksum', () => {
+                    test('the record keeps no SHA1 for the cloud side, and later passes bring nothing more down', async () => {
+                        const d = await synced(layout, true);
+                        expect(stateDb.getItemByPath('Docs/doc.txt')?.remoteSha1).toBeNull();
+                        expect(stateDb.getItemByPath('Docs/doc.txt')?.localSha1).toHaveLength(40);
+
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(d.calls.downloads).toEqual([]);
+                        expect(d.calls.uploads).toEqual([]);
+                    });
+
+                    test('a local edit uploads as a new revision, not a conflict', async () => {
+                        const d = await synced(layout, true);
+                        await writeFile(d.local('Docs/doc.txt'), 'mine');
+
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('mine');
+                        expect(d.calls.uploads).toEqual(['Docs/doc.txt']);
+                        expect(d.calls.downloads).toEqual([]);
+                        expect(d.cloudCopies()).toEqual([]);
+                    });
+
+                    test("another device's edit (a new time and size, still with no checksum) comes down once", async () => {
+                        const d = await synced(layout, true);
+                        d.changeInCloud('theirs!', false);
+
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs!');
+                        expect(d.calls.downloads).toEqual(['Docs/doc.txt']);
+                        expect(d.calls.uploads).toEqual([]);
+                    });
+
+                    test('a new time alone in the cloud is a change too', async () => {
+                        const d = await synced(layout, true);
+                        const node = d.nodes.get('vol~Docs/doc.txt')!;
+                        const later = new Date(node.modificationTime.getTime() + 60_000);
+                        d.nodes.set(node.uid, {
+                            ...node,
+                            content: 'new',
+                            modificationTime: later,
+                            activeRevision: { ...node.activeRevision!, claimedModificationTime: later },
+                        });
+
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('new');
+                        expect(d.calls.downloads).toEqual(['Docs/doc.txt']);
+                    });
+
+                    test('with no claimed size either, later passes still bring nothing more down', async () => {
+                        const d = await synced(layout, true);
+                        const node = d.nodes.get('vol~Docs/doc.txt')!;
+                        d.nodes.set(node.uid, { ...node, activeRevision: { ...node.activeRevision!, claimedSize: undefined } } as any);
+
+                        await d.engine.reconcileNow();
+                        await d.engine.reconcileNow();
+
+                        expect(d.calls.downloads).toEqual([]);
+                        expect(d.calls.uploads).toEqual([]);
+                    });
+
+                    test('its unchanged local copy can still be freed', async () => {
+                        const d = await synced(layout, true);
+
+                        const result = await d.engine.setAvailability('Docs/doc.txt', 'free');
+
+                        expect(result.kept).toEqual([]);
+                        expect(await stat(d.local('Docs/doc.txt')).then(() => true, () => false)).toBe(false);
+                        expect(d.calls.trashed).toEqual([]);
+                    });
+                });
+
                 // The common case stays as it was: with a SHA1 on both sides, the SHA1 alone decides
                 describe('with a checksum on both sides', () => {
                     test('a new time in the cloud for the same content brings nothing down, and a local edit uploads', async () => {
