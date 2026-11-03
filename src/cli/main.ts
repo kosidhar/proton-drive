@@ -28,6 +28,9 @@ import { backingDirFor } from '../sync/driveMode';
 import { formatBytes, ProtonDriveSyncEngine } from '../sync/syncEngine';
 import { SyncStateDatabase } from '../sync/syncStateDb';
 
+// How long a one-off sync waits for files still being written to settle and upload (see waitForSettling)
+const CLI_SETTLE_WAIT_MS = 30_000;
+
 const DAEMON_BASE_URL = `http://${DEFAULT_DAEMON_HOST}:${DEFAULT_DAEMON_PORT}`;
 
 // The daemon runs when its control socket accepts a connection, or else its TCP API answers
@@ -333,6 +336,11 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
             console.log(`Syncing ${stateDb.getSettings().syncDir} with Proton Drive...`);
             await engine.reconcileNow();
             const failed = syncPassError(engine.getStatus());
+            // Files still being written upload once they settle (see stillBeingWritten): waited for a while, and any
+            // still being written after that are left for the next sync, and said so
+            const stillWritten = failed === null ? await engine.waitForSettling(CLI_SETTLE_WAIT_MS) : 0;
+            await engine.stop();
+            await engine.waitForRunningLooks(); // one uploading now finishes before the database closes
             if (failed !== null) {
                 stateDb.close();
                 throw new Error(failed);
@@ -341,6 +349,9 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
             console.log(
                 `Sync complete: ${stats.totalFiles} files (${formatBytes(stats.totalBytes)}), ${stats.totalFolders} folders.`,
             );
+            if (stillWritten > 0) {
+                console.log(`${stillWritten} file(s) still being written were not synced; they sync next time.`);
+            }
             stateDb.close();
         } finally {
             await runtime.dispose();

@@ -10,6 +10,7 @@ import { matchesIgnorePatterns } from '../src/sync/localWatcher';
 import { ProtonDriveSyncEngine } from '../src/sync/syncEngine';
 import { DEFAULT_IGNORE_PATTERNS, SyncStateDatabase } from '../src/sync/syncStateDb';
 import { makeMockDrive } from './helpers/mockDrive';
+import { uploadAtOnce } from './helpers/engineOptions';
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -219,6 +220,7 @@ describe('a bad stored setting is not used, and not overwritten (#34)', () => {
             stateDb.setMeta('ignorePatterns', raw);
             const drive = makeMockDrive();
             const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                ...uploadAtOnce,
                 backingDir: path.join(dir, 'files'),
             });
             cleanups.push(() => void engine.stop());
@@ -258,6 +260,7 @@ describe('a bad stored setting is not used, and not overwritten (#34)', () => {
         stateDb.setMeta('ignorePatterns', raw);
         stateDb.setMeta('conflictStrategy', 'old-value');
         const engine = new ProtonDriveSyncEngine(makeMockDrive().sdk, makeMockDrive().eventsManager, { isLoggedIn: () => true }, stateDb, makeMockDrive().logger, {
+            ...uploadAtOnce,
             backingDir: path.join(dir, 'files'),
         });
         cleanups.push(() => void engine.stop());

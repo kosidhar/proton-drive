@@ -11,6 +11,7 @@ import { ProtonDriveSyncEngine } from '../src/sync/syncEngine';
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
 import { localFiles } from './helpers/localFiles';
 import { makeMockDrive } from './helpers/mockDrive';
+import { uploadAtOnce } from './helpers/engineOptions';
 
 describe('availability migration', () => {
     let tempDir: string;
@@ -124,7 +125,7 @@ describe('availability migration', () => {
     const engineOnDrive = () => {
         const drive = makeMockDrive();
         drive.add('welcome.txt', 'hello');
-        const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger);
+        const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, uploadAtOnce);
         return { ...drive, engine };
     };
 

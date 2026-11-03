@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { lstatSync, readdirSync, renameSync, statSync, utimesSync } from 'node:fs';
+import { lstatSync, readdirSync, renameSync, type Stats, statSync, utimesSync } from 'node:fs';
 import { lstat, mkdir, readdir, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -86,6 +86,15 @@ const MIN_UNMAPPED_FAILURES = 5;
 const MAX_REPLAY_BACKOFF_MS = 60 * 60_000;
 // An item that keeps failing in sync passes is tried again after 1 minute, doubling each time, up to this (#18)
 const MAX_ITEM_BACKOFF_MS = 60 * 60_000;
+// A local file that changed uploads only once it has stayed as it is (size and times) this long, so that a copy that
+// stalls (a slow disk, a network share, a paused cp) doesn't upload half a file (#51). One seen changing again waits
+// twice as long each time, up to SETTLE_MAX_QUIET_MS.
+const SETTLE_QUIET_MS = 2000;
+const SETTLE_MAX_QUIET_MS = 16_000;
+// A file that never stops changing (a log, say) uploads anyway after this long, and then at most this often
+const SETTLE_MAX_WAIT_MS = 2 * 60_000;
+// How long a file let through is remembered as it was then (see stillBeingWritten)
+const SETTLED_KEPT_MS = 60_000;
 // Uid prefix of the remote index entries that stand for folders made here that Proton Drive doesn't have yet, holding
 // what a pending move puts in them (see applyPendingOpsToIndex). Never a node: never resolved, moved or trashed.
 const PROVISIONAL = 'provisional:';
@@ -299,6 +308,15 @@ export class ProtonDriveSyncEngine {
     // syncs, or changes here.
     private readonly loggedFailures = new Map<string, string>();
     private readonly failingItems = new Map<string, { message: string; failures: number; retryAt: number }>();
+    // Local files waiting to stay as they are before they upload (see stillBeingWritten): what they were at the last look
+    // (size and times), since when (by the settle clock), how long they must stay so, and the next look
+    // A file let through (settled) is kept a while with what it was then, so that looking at it again doesn't wait
+    private readonly settlingFiles = new Map<
+        string,
+        { seen: string; since: number; quietMs: number; changingSince: number; settled: boolean; cancel: () => void }
+    >();
+    // Looks again at settling files that are running now (stop() waits for them)
+    private readonly runningLooks = new Set<Promise<void>>();
 
     constructor(
         private readonly sdk: ProtonDriveClient,
@@ -318,6 +336,15 @@ export class ProtonDriveSyncEngine {
             stateEventSchedule?: (run: () => void, delayMs: number) => () => void;
             // For tests: how long what is missing while held is taken as known (FILES_MISSING_CACHE_MS; see stillMissing)
             filesMissingCacheMs?: number;
+            // How long a changed file must stay as it is before it uploads (see stillBeingWritten); quietMs 0 uploads
+            // at once. For tests: the clock it is timed by, and how the look once it should have settled is scheduled.
+            settle?: {
+                quietMs?: number;
+                maxQuietMs?: number;
+                maxWaitMs?: number;
+                now?: () => number;
+                schedule?: (run: () => Promise<void>, delayMs: number) => () => void;
+            };
         } = {},
     ) {
         this.index = new RemoteIndex(this.stateDb.connection);
@@ -455,6 +482,12 @@ export class ProtonDriveSyncEngine {
 
     async stop(): Promise<void> {
         this.watcher.stop();
+        for (const settling of this.settlingFiles.values()) {
+            settling.cancel(); // The pass at the next start looks at them again
+        }
+        this.settlingFiles.clear();
+        // A look already running isn't waited for here: holdForMove waits for it (see idleForMove), as long as it
+        // allows, and a caller about to close the database waits with waitForRunningLooks
         if (this.unsubscribeDriveEvents) {
             this.unsubscribeDriveEvents();
             this.unsubscribeDriveEvents = null;
@@ -838,7 +871,8 @@ export class ProtonDriveSyncEngine {
             !this.reconcileRunning &&
             this.replayRun === null &&
             this.localQueue.size === 0 &&
-            this.hydrations.size === 0
+            this.hydrations.size === 0 &&
+            this.runningLooks.size === 0
         );
     }
 
@@ -1099,6 +1133,13 @@ export class ProtonDriveSyncEngine {
         // Being hidden: its local changes (edits, new files, deletes) sync as for a visible item, so the hide can
         // finish, but nothing new comes down from the cloud
         const hiding = hiddenBy !== null;
+        // A file still being written is left alone (not uploaded, nor downloaded over) until it stays as it is
+        if (localInfo && !localInfo.isDirectory && changedSinceRecord(localInfo, dbRecord)) {
+            const st = await stat(localFullPath).catch(() => null);
+            if (st?.isFile() && this.stillBeingWritten(relPath, st)) {
+                return;
+            }
+        }
 
         // Case 1: Present remotely, not present locally
         if (remoteNode && !localInfo) {
@@ -2277,6 +2318,12 @@ export class ProtonDriveSyncEngine {
             const st = await stat(fullPath).catch(() => null);
             const dbRecord = this.stateDb.getItemByPath(relPath);
 
+            if (!st?.isFile()) {
+                this.forgetSettling(relPath);
+            } else if (changedSinceRecord(st, dbRecord) && this.stillBeingWritten(relPath, st)) {
+                return; // Looked at again once it has stayed as it is
+            }
+
             if (!st) {
                 // Not a delete of this item: every file is missing from the folder; or the files came back after a hold
                 // and no pass has looked at what is still missing yet (a copy cancelled part-way removes what it wrote)
@@ -2344,6 +2391,101 @@ export class ProtonDriveSyncEngine {
         } finally {
             this.localQueue.delete(relPath);
         }
+    }
+
+    // Whether a local file that changed is still being written, by what it was at earlier looks (#51): its size and
+    // times must stay the same for a while (SETTLE_QUIET_MS, longer each time it is seen changing again) before it
+    // uploads. Until then it is left alone, and looked at again (as the watcher reports a change) once it should have
+    // settled. A file whose ctime (set by the system as it changes, unlike an mtime, which cp -a or rsync can put
+    // anywhere) is older than that has settled already: such files (edited while the daemon was down, say) upload at the
+    // first look, without a wait each. A file that keeps changing is let through anyway once it has for
+    // SETTLE_MAX_WAIT_MS, and then at most that often: it uploads as it is (a change during the upload uploads again),
+    // and its path is never kept from syncing for long. A file let through stays so while it is as it was then, so the
+    // look after the one that settled it (as handling it goes on) never waits again.
+    private stillBeingWritten(relPath: string, st: Stats): boolean {
+        const settle = this.options.settle ?? {};
+        const baseQuietMs = settle.quietMs ?? SETTLE_QUIET_MS;
+        if (baseQuietMs <= 0) {
+            return false;
+        }
+        const now = (settle.now ?? Date.now)();
+        for (const [rel, entry] of this.settlingFiles) {
+            if (entry.settled && now - entry.since > SETTLED_KEPT_MS) {
+                this.settlingFiles.delete(rel); // Long settled: its ctime says so by now
+            }
+        }
+        const seen = `${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
+        const earlier = this.settlingFiles.get(relPath);
+        if (earlier?.settled && earlier.seen === seen) {
+            return false;
+        }
+        earlier?.cancel();
+        // A file let through that changes again starts over
+        const ongoing = earlier && !earlier.settled ? earlier : null;
+        const same = ongoing?.seen === seen;
+        const quietMs = !ongoing
+            ? baseQuietMs
+            : same
+              ? ongoing.quietMs
+              : Math.min(ongoing.quietMs * 2, settle.maxQuietMs ?? SETTLE_MAX_QUIET_MS);
+        const since = ongoing && same ? ongoing.since : now;
+        const changingSince = ongoing?.changingSince ?? now;
+        const maxWaitMs = settle.maxWaitMs ?? SETTLE_MAX_WAIT_MS;
+        // ctime is by the system clock: so is Date.now(), whatever clock the looks are timed by
+        if (now - since >= quietMs || Date.now() - st.ctimeMs >= quietMs || now - changingSince >= maxWaitMs) {
+            this.settlingFiles.set(relPath, { seen, since: now, quietMs, changingSince: now, settled: true, cancel: () => {} });
+            return false;
+        }
+        const schedule =
+            settle.schedule ??
+            ((run: () => Promise<void>, delayMs: number) => {
+                const timer = setTimeout(() => void run(), delayMs);
+                timer.unref?.(); // Never what keeps a one-off run (the CLI's sync) going
+                return () => clearTimeout(timer);
+            });
+        const lookAgain = async () => {
+            const look = this.handleLocalFileChange(relPath).catch((error: unknown) => {
+                this.logger.warn(`Could not look at ${relPath} again once written: ${error}`);
+            });
+            this.runningLooks.add(look);
+            try {
+                await look;
+            } finally {
+                this.runningLooks.delete(look);
+            }
+        };
+        const cancel = schedule(lookAgain, Math.min(since + quietMs, changingSince + maxWaitMs) - now);
+        this.settlingFiles.set(relPath, { seen, since, quietMs, changingSince, settled: false, cancel });
+        return true;
+    }
+
+    // For a one-off sync (the CLI's): waits, up to timeoutMs, for the files still being written to settle and be looked
+    // at again. Answers how many are still waiting. A look already running when the time is up (an upload, say) is
+    // waited for without limit, as a sync pass's upload is.
+    async waitForSettling(timeoutMs: number): Promise<number> {
+        const deadline = Date.now() + timeoutMs;
+        const waiting = () => [...this.settlingFiles.values()].filter((entry) => !entry.settled).length;
+        while ((waiting() > 0 || this.runningLooks.size > 0) && Date.now() < deadline) {
+            await Bun.sleep(Math.min(100, deadline - Date.now()));
+        }
+        await Promise.all(this.runningLooks);
+        return waiting();
+    }
+
+    // Waits for the looks at settling files that are running now (after stop(), before the database is closed), up to
+    // timeoutMs if given. Answers whether none is still running.
+    async waitForRunningLooks(timeoutMs?: number): Promise<boolean> {
+        const running = Promise.all(this.runningLooks);
+        if (timeoutMs === undefined) {
+            await running;
+            return true;
+        }
+        return settlesWithin(running, timeoutMs);
+    }
+
+    private forgetSettling(relPath: string): void {
+        this.settlingFiles.get(relPath)?.cancel();
+        this.settlingFiles.delete(relPath);
     }
 
     private async handleRemoteDriveEvent(event: DriveEvent): Promise<void> {
@@ -2876,6 +3018,8 @@ export class ProtonDriveSyncEngine {
         }
         // The folder is where its entry is, so only a child's own pending operation can take the child away
         const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
+        const localNames = new Set(this.localChildNames(rel) ?? []);
+        const conflictPaths = new Set(this.stateDb.listConflicts().map((conflict) => conflict.localRelPath));
         const entries: VfsEntry[] = [];
         for (const child of this.index.listChildren(rel)) {
             if (
@@ -2885,7 +3029,13 @@ export class ProtonDriveSyncEngine {
             ) {
                 continue;
             }
-            entries.push({ name: child.name, type: child.type, size: child.size, mtimeMs: child.mtimeMs });
+            // Where a local file and another cloud file collide, the local one is what the drive shows (#29)
+            const local = localNames.has(child.name) ? this.unresolvedCollision(child.relPath, child, conflictPaths) : null;
+            entries.push(
+                local
+                    ? { name: child.name, type: 'file', size: local.size, mtimeMs: local.mtimeMs }
+                    : { name: child.name, type: child.type, size: child.size, mtimeMs: child.mtimeMs },
+            );
         }
         return entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     }
@@ -3436,9 +3586,13 @@ export class ProtonDriveSyncEngine {
         }
         // A file being edited through the drive with no record yet is an edit of its baseline's node: the index may hold
         // another node at its path since (another device's), which isn't the one this file stands for
-        const sourceUid = ignoredFrom
-            ? null
-            : (this.stateDb.getItemByPath(fromRel)?.nodeUid ?? this.stateDb.getEditBaseline(fromRel)?.nodeUid ?? nodeUidOf(sourceEntry));
+        // A local file in an unresolved collision stands for no node: the cloud file at its path is another device's,
+        // which stays where it is (#29)
+        const sourceCollides = !ignoredFrom && source?.isFile() === true && (await this.collidingLocalFile(fromRel, sourceEntry)) !== null;
+        const sourceUid =
+            ignoredFrom || sourceCollides
+                ? null
+                : (this.stateDb.getItemByPath(fromRel)?.nodeUid ?? this.stateDb.getEditBaseline(fromRel)?.nodeUid ?? nodeUidOf(sourceEntry));
         const target = lstatSync(path.join(root, toRel), { throwIfNoEntry: false });
         const targetRecord = this.stateDb.getItemByPath(toRel);
         const targetEntry = ignoredTo ? null : this.liveIndexEntry(toRel);
@@ -3451,7 +3605,14 @@ export class ProtonDriveSyncEngine {
         if (replacing && noReplace) {
             throw new DriveOpError('EEXIST', `Already exists: ${toRel}`);
         }
-        const targetUid = !replacing || ignoredTo ? null : (targetRecord?.nodeUid ?? nodeUidOf(targetEntry));
+        // Nor does a target in an unresolved collision: what replaces it stays unrecorded, for the conflict handling to
+        // decide, rather than turning into a new revision of the other device's file (#29). Only something with no node
+        // of its own replaces it, as an editor's save does: one with a node would be moved onto that file's name.
+        const targetCollides = replacing && !ignoredTo && target?.isFile() === true && (await this.collidingLocalFile(toRel, targetEntry)) !== null;
+        if (targetCollides && sourceUid !== null) {
+            throw new DriveOpError('EEXIST', `Already exists: ${toRel}`);
+        }
+        const targetUid = !replacing || ignoredTo || targetCollides ? null : (targetRecord?.nodeUid ?? nodeUidOf(targetEntry));
         if (replacing) {
             // Only a file on this computer replaces, and only a file
             const targetIsFile = target ? target.isFile() : (targetRecord?.type ?? targetEntry?.type) === 'file';
@@ -3480,7 +3641,7 @@ export class ProtonDriveSyncEngine {
                 ? this.topmostRecordedUnder(fromRel).filter((item) => item.localRelPath !== fromRel && !pendingUids.has(item.nodeUid))
                 : [];
         this.watcher.suppressPath(fromRel);
-        if (!keepsTarget && (sourceUid !== null || this.stateDb.hasItemsUnder(fromRel))) {
+        if (!keepsTarget && !sourceCollides && (sourceUid !== null || this.stateDb.hasItemsUnder(fromRel))) {
             this.watcher.suppressPath(toRel); // Its records go with it: reported as something new, it would upload again
         }
         // Not toRel when the target is kept: its new content is reported, and uploads as a new revision
@@ -3516,7 +3677,14 @@ export class ProtonDriveSyncEngine {
                         }
                     } else {
                         this.stateDb.removeItemByPath(toRel); // Only something that exists only here (or nothing) is there
-                        if (ignoredTo || !source) {
+                        if (sourceCollides) {
+                            // Its record (one of a conflict) stands for the cloud file, which stays: the local file goes
+                            // on as a new one, and the conflict is over, both kept
+                            this.stateDb.removeItemByPath(fromRel);
+                            for (const conflict of this.unresolvedConflictsAt(fromRel)) {
+                                this.stateDb.markConflictResolved(conflict.id, 'keep-both');
+                            }
+                        } else if (ignoredTo || !source) {
                             // Into an ignored name nothing follows it; and records with no local copy would read as deletes
                             this.stateDb.removeItemByPath(fromRel);
                         } else {
@@ -3594,7 +3762,16 @@ export class ProtonDriveSyncEngine {
                 throw new DriveOpError('ENOTEMPTY', `Not empty: ${relPath}`);
             }
         }
-        const toTrash = ignored ? new Map<string, string>() : this.trashTargets(relPath, entry);
+        // A local file in an unresolved collision is what the drive shows there (#29): only it goes, and the other file
+        // Proton Drive has at that name stays (with the folders it is in), listed again once the local one is gone.
+        // Everything else in a folder being deleted goes to the Proton Drive trash, item by item.
+        const collisions = ignored || onlyIfEmpty ? [] : await this.collisionsAt(relPath, entry, local);
+        const collision = collisions.length > 0;
+        const toTrash = ignored
+            ? new Map<string, string>()
+            : collision
+              ? this.trashTargetsKeeping(relPath, collisions)
+              : this.trashTargets(relPath, entry);
         this.watcher.suppressPath(relPath);
         // For a Move to Trash, what is only here is told apart from unchanged synced copies while the records still say
         // which those are
@@ -3617,7 +3794,18 @@ export class ProtonDriveSyncEngine {
                 this.stateDb.connection.transaction(() => {
                     records.dropSubtree(relPath);
                     this.stateDb.dropEditBaselines(relPath);
-                    if (entry) {
+                    if (collision) {
+                        // Nothing is left of this computer's side: what stays is the cloud's version
+                        const conflictPaths = new Set(collisions);
+                        for (const conflict of this.stateDb.listConflicts()) {
+                            if (conflictPaths.has(conflict.localRelPath)) {
+                                this.stateDb.markConflictResolved(conflict.id, 'keep-remote');
+                            }
+                        }
+                        for (const uid of toTrash.keys()) {
+                            this.index.removeSubtree(uid);
+                        }
+                    } else if (entry) {
                         this.index.removeSubtree(entry.uid);
                     }
                     for (const [uid, where] of toTrash) {
@@ -3658,7 +3846,11 @@ export class ProtonDriveSyncEngine {
             told.push(`${kept.stayed} item(s) that existed only on this computer were kept at ${where} and will upload again.`);
         }
         const deleted =
-            toTrash.size > 0 ? 'Deleted on this computer; it goes to Proton Drive Trash' : 'Deleted on this computer';
+            toTrash.size > 0
+                ? 'Deleted on this computer; it goes to Proton Drive Trash'
+                : collision
+                  ? 'Deleted on this computer; the other file Proton Drive has at that name stays'
+                  : 'Deleted on this computer';
         this.stateDb.logActivity({
             action: 'delete-local',
             localRelPath: relPath,
@@ -3672,6 +3864,108 @@ export class ProtonDriveSyncEngine {
                 enabled: this.stateDb.getSettings().notificationsEnabled,
             });
         }
+    }
+
+    // The local file at a path in an unresolved collision (#29), or null: a file made or changed here and another file,
+    // or another version, in Proton Drive at that path, with neither chosen yet. That is a conflict waiting for the user
+    // (prompt), or a local file with no record and no edit baseline where the remote index has a file, which the
+    // conflict handling has yet to see (see uploadNewFile). The drive shows the local file there (vfsChildren), and a
+    // delete through it removes only that (deleteLocally): the cloud file is the other device's, never seen here.
+    // conflictPaths: the paths of the unresolved conflicts, when the caller has them already (a listing looks at many)
+    private unresolvedCollision(relPath: string, entry: RemoteIndexEntry | null, conflictPaths?: Set<string>): Stats | null {
+        if (!entry || entry.type !== 'file' || isProvisional(entry.uid)) {
+            return null;
+        }
+        const local = lstatSync(path.join(this.localRoot(), relPath), { throwIfNoEntry: false });
+        if (!local?.isFile()) {
+            return null;
+        }
+        const record = this.stateDb.getItemByPath(relPath);
+        const colliding = record
+            ? record.syncStatus === 'conflict' ||
+              (conflictPaths ? conflictPaths.has(relPath) : this.unresolvedConflictsAt(relPath).length > 0)
+            : this.stateDb.getEditBaseline(relPath) === null;
+        return colliding ? local : null;
+    }
+
+    // The local file a delete or rename through the drive finds in an unresolved collision, or null. With no record, a
+    // local file with the very content of the cloud file (by its SHA1) is that file, not recorded yet: it goes, or moves,
+    // as a synced file does. One whose content can't be compared stays a collision, so the cloud file is kept.
+    private async collidingLocalFile(
+        relPath: string,
+        entry: RemoteIndexEntry | null,
+        conflictPaths?: Set<string>,
+    ): Promise<Stats | null> {
+        const local = this.unresolvedCollision(relPath, entry, conflictPaths);
+        if (!local || !entry?.sha1 || this.stateDb.getItemByPath(relPath)) {
+            return local;
+        }
+        const localSha1 = await computeLocalFileSha1(path.join(this.localRoot(), relPath)).catch(() => null);
+        return localSha1 === entry.sha1 ? null : local;
+    }
+
+    // The local files at or under relPath that are in an unresolved collision (see collidingLocalFile)
+    private async collisionsAt(relPath: string, entry: RemoteIndexEntry | null, local: Stats | undefined): Promise<string[]> {
+        if (!local) {
+            return [];
+        }
+        if (!local.isDirectory()) {
+            return (await this.collidingLocalFile(relPath, entry)) ? [relPath] : [];
+        }
+        const ignorePatterns = this.stateDb.getSettings().ignorePatterns;
+        const conflictPaths = new Set(this.stateDb.listConflicts().map((conflict) => conflict.localRelPath));
+        const found: string[] = [];
+        const walk = async (dirRel: string) => {
+            const children = await readdir(path.join(this.localRoot(), dirRel), { withFileTypes: true }).catch(() => []);
+            for (const child of children) {
+                const rel = `${dirRel}/${child.name}`;
+                if (isEngineTempName(child.name) || matchesIgnorePatterns(rel, ignorePatterns)) {
+                    continue;
+                }
+                if (child.isDirectory()) {
+                    await walk(rel);
+                } else if (child.isFile() && (await this.collidingLocalFile(rel, this.liveIndexEntry(rel), conflictPaths))) {
+                    found.push(rel);
+                }
+            }
+        };
+        await walk(relPath);
+        return found;
+    }
+
+    // What goes to the Proton Drive trash for a delete of relPath that keeps the cloud files of the collisions in it, and
+    // the folders they are in: everything else in those folders, item by item (as trashTargets otherwise), and whatever
+    // a pending move puts in it
+    private trashTargetsKeeping(relPath: string, collisions: string[]): Map<string, string> {
+        const targets = new Map<string, string>();
+        const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
+        const holdsCollision = (folderRel: string) => collisions.some((rel) => rel.startsWith(`${folderRel}/`));
+        const visit = (folderRel: string) => {
+            for (const child of this.index.listChildren(folderRel)) {
+                if (takesAway(latest.get(child.uid), child) || collisions.includes(child.relPath)) {
+                    continue;
+                }
+                if (child.type === 'folder' && holdsCollision(child.relPath)) {
+                    visit(child.relPath);
+                    continue;
+                }
+                const uid = nodeUidOf(child);
+                if (uid !== null) {
+                    targets.set(uid, child.relPath);
+                }
+            }
+        };
+        visit(relPath);
+        for (const op of latest.values()) {
+            if (op.kind !== 'trash' && op.toPath.startsWith(`${relPath}/`) && !targets.has(op.nodeUid)) {
+                targets.set(op.nodeUid, op.toPath);
+            }
+        }
+        return targets;
+    }
+
+    private unresolvedConflictsAt(relPath: string): ConflictRecord[] {
+        return this.stateDb.listConflicts().filter((conflict) => conflict.localRelPath === relPath);
     }
 
     // Whether a folder holds anything: on this computer, in Proton Drive as this computer sees it (hidden and ignored items
@@ -5348,6 +5642,12 @@ function driveOpErrorOf(failure: unknown, toRel: string): unknown {
         return new DriveOpError('ENOENT', messageOf(failure), { cause: failure });
     }
     return failure;
+}
+
+// Whether a local file differs from its record by size or time (as a pass's fast path tells), or has none: an upload
+// is what it would come to
+function changedSinceRecord(local: { size: number; mtimeMs: number }, record: SyncedItemRecord | null | undefined): boolean {
+    return !record || local.size !== record.size || Math.abs(local.mtimeMs - record.localMtimeMs) >= 10;
 }
 
 // The node an index entry stands for; none for a provisional one

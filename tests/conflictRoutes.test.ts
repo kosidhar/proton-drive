@@ -8,6 +8,7 @@ import { refuseOnTcp } from '../src/daemon/tcpRefusals';
 import { ProtonDriveSyncEngine } from '../src/sync/syncEngine';
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
 import { makeMockDrive } from './helpers/mockDrive';
+import { uploadAtOnce } from './helpers/engineOptions';
 
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => {
@@ -28,6 +29,7 @@ function setup() {
     const drive = makeMockDrive();
     const logger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
     const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => false }, stateDb, logger, {
+        ...uploadAtOnce,
         backingDir: path.join(appDir, 'files'),
     });
     cleanups.push(() => engine.stop());
