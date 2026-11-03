@@ -1440,6 +1440,12 @@ export class ProtonDriveSyncEngine {
                     // as of before the hash, so the next pass's fast path applies again instead of hashing on every pass
                     // (a cloud file with no sha1 never reaches the equal-content branch that would re-record it, #105)
                     this.stateDb.touchItem(relPath, hashedFrom);
+                    // And both sides hold what the record says, the cloud's version (synced by a download, say): a
+                    // conflict still waiting here is over, as the equal-content branch closes one for a cloud with a
+                    // sha1 (#68, #88)
+                    if (!this.manualResolvingPaths.has(relPath)) {
+                        this.stateDb.closeWaitingConflict(relPath, 'in-sync');
+                    }
                 }
             }
         }
