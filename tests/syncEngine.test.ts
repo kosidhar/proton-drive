@@ -9144,4 +9144,70 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
         }
     });
+
+    describe('local changes are handled a few at a time (#90)', () => {
+        test('one file busy uploading never takes every turn from the others', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+                localChangeConcurrency: 2,
+            });
+            d.add('Kept.txt', 'kept');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            await writeFile(local('big.bin'), 'v1');
+            await writeFile(local('other.txt'), 'other');
+            // big.bin's upload waits on the network, inside its look (which then holds its turn and its place in the queue)
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            const uploadNewFile = (engine as any).uploadNewFile.bind(engine);
+            (engine as any).uploadNewFile = async (rel: string, ...rest: unknown[]) => {
+                if (rel === 'big.bin') await gate;
+                return uploadNewFile(rel, ...rest);
+            };
+            const first = (engine as any).handleLocalFileChange('big.bin');
+            await Bun.sleep(5);
+            const again = [1, 2, 3].map(() => (engine as any).handleLocalFileChange('big.bin')); // it keeps changing
+            await Bun.sleep(5);
+            const other = (engine as any).handleLocalFileChange('other.txt');
+            const done = await Promise.race([other.then(() => 'done'), Bun.sleep(500).then(() => 'kept waiting')]);
+            expect(done).toBe('done'); // not kept waiting behind big.bin
+            expect(d.calls.uploads).toEqual(['other.txt']);
+            release();
+            await Promise.all([first, ...again]);
+            expect(d.calls.uploads).toContain('big.bin');
+        });
+
+        test('thirty new files reported at once: never more than the limit at a time, and all of them upload', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+                localChangeConcurrency: 3,
+            });
+            d.add('Kept.txt', 'kept');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const names = Array.from({ length: 30 }, (_, i) => `new-${i}.txt`);
+            for (const name of names) await writeFile(path.join(engine.localRoot(), name), name);
+            let running = 0;
+            let most = 0;
+            const now = (engine as any).handleLocalFileChangeNow.bind(engine);
+            (engine as any).handleLocalFileChangeNow = async (rel: string) => {
+                running++;
+                most = Math.max(most, running);
+                try {
+                    await Bun.sleep(2);
+                    return await now(rel);
+                } finally {
+                    running--;
+                }
+            };
+            await Promise.all(names.map((name) => (engine as any).handleLocalFileChange(name)));
+            expect(most).toBe(3);
+            expect(d.calls.uploads.sort()).toEqual([...names].sort());
+        });
+    });
 });
