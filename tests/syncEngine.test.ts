@@ -20,7 +20,7 @@ import { computeLocalFileSha1, detectMediaType, THIRD_PARTY_DISCLOSURE } from '.
 import { PIN_ROOT_ON_FIRST_SYNC } from '../src/sync/availabilityMigration';
 import { entryFromNode } from '../src/sync/remoteIndex';
 import { startControlServer } from '../src/daemon/controlServer';
-import { createLocalConflictCopy, formatConflictFileName } from '../src/sync/conflictResolver';
+import { createLocalConflictCopy, formatConflictFileName, isConflictCopyOf } from '../src/sync/conflictResolver';
 import { DriveOpError } from '../src/sync/driveOps';
 import { matchesIgnorePatterns } from '../src/sync/localWatcher';
 import {
@@ -86,6 +86,19 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         await writeFile(origPath, 'local version');
         const copyPath = await createLocalConflictCopy(origPath);
         expect(await readFile(copyPath, 'utf8')).toBe('local version');
+    });
+
+    test('tells the conflict copies made on this host of a file from other names', () => {
+        const at = new Date('2026-10-20T12:30:45Z');
+        const copy = formatConflictFileName('budget.xlsx', at, 'ubuntu-laptop');
+        expect(isConflictCopyOf(copy, 'budget.xlsx', 'ubuntu-laptop')).toBe(true);
+        expect(isConflictCopyOf(copy.replace('.xlsx', '-2.xlsx'), 'budget.xlsx', 'ubuntu-laptop')).toBe(true);
+        expect(isConflictCopyOf(copy, 'budget.xlsx', 'other-host')).toBe(false);
+        expect(isConflictCopyOf(copy, 'budget.csv', 'ubuntu-laptop')).toBe(false);
+        expect(isConflictCopyOf(copy, 'budget (2).xlsx', 'ubuntu-laptop')).toBe(false);
+        expect(isConflictCopyOf('budget (conflict notes).xlsx', 'budget.xlsx', 'ubuntu-laptop')).toBe(false);
+        expect(isConflictCopyOf(formatConflictFileName('Makefile', at, 'ubuntu-laptop'), 'Makefile', 'ubuntu-laptop')).toBe(true);
+        expect(isConflictCopyOf(formatConflictFileName('a+b (1).txt', at, 'h'), 'a+b (1).txt', 'h')).toBe(true);
     });
 
     test('performs two-way sync: downloads remote files, uploads local files, and handles remote delete events', async () => {
@@ -4013,6 +4026,36 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                         expect(d.calls.uploads).toEqual([]);
                     });
                 });
+
+                // #25: a keep-both whose download of the cloud version fails makes its conflict copy once
+                test('keep-both makes one conflict copy while the cloud version fails to download, then brings it down (#25)', async () => {
+                    const d = await synced(layout);
+                    d.changeInCloud('theirs');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    d.down.add('getFileRevisionDownloader'); // offline for downloads, pass after pass
+
+                    for (let pass = 0; pass < 3; pass++) {
+                        await d.engine.reconcileNow();
+                    }
+                    expect(await d.copiesIn('Docs')).toHaveLength(1);
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('mine');
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+
+                    d.down.delete('getFileRevisionDownloader');
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('theirs');
+                    const copies = await d.copiesIn('Docs');
+                    expect(copies).toHaveLength(1);
+                    expect(await readFile(d.local(`Docs/${copies[0]}`), 'utf8')).toBe('mine');
+                    expect(d.cloudCopies().map((n) => [d.nameOf(n), n.content])).toEqual([[copies[0], 'mine']]);
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
+                    expect(d.calls.uploads).not.toContain('Docs/doc.txt');
+                    expect(d.calls.trashed).toEqual([]);
+                    const resolved = stateDb.listConflicts(true).filter((c) => c.localRelPath === 'Docs/doc.txt');
+                    expect(resolved.map((c) => c.conflictCopyPath)).toEqual([`Docs/${copies[0]}`]);
+                });
             });
         }
     });
@@ -5728,7 +5771,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('theirs');
                 expect(d.calls.uploads).not.toContain('Docs/doc.txt');
                 const copies = cloudNamesIn(d, 'vol~Docs').filter((n) => n.startsWith('doc (conflict '));
-                expect(copies.length).toBeGreaterThan(0);
+                expect(copies.length).toBe(1); // one conflict, one copy, even when a download failed after it was made (#25)
                 for (const copy of copies) {
                     expect(d.named('vol~Docs', copy)[0]?.content).toBe('mine');
                 }
