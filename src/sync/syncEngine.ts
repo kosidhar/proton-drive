@@ -2604,6 +2604,7 @@ export class ProtonDriveSyncEngine {
         removal: (records: {
             drop(relPath: string): void;
             dropSubtree(relPath: string): void;
+            noteSubtree(relPath: string): void;
             putBack(stayed: string[]): Promise<void>;
         }) => Promise<T>,
         drive?: DriveChange,
@@ -4334,8 +4335,9 @@ export class ProtonDriveSyncEngine {
                     this.applyPendingOpsToIndex();
                 })();
                 // Noted for work under way once it has happened: a transaction that threw rolled everything back, and no
-                // delete is there to see (#154). Nothing runs between the commit and this
-                records.dropSubtree(relPath);
+                // delete is there to see (#154). Nothing runs between the commit and this, which writes nothing (the
+                // records went in the transaction), so it can't fail after the delete committed
+                records.noteSubtree(relPath);
                 if (local && onlyIfEmpty) {
                     // Never what was put in it since the look above: that stays, and syncs as new, folder and all
                     await rmdir(path.join(root, relPath)).catch((error: NodeJS.ErrnoException) => {
@@ -5514,6 +5516,10 @@ export class ProtonDriveSyncEngine {
             dropSubtree: (relPath: string) => {
                 takenAway.subtrees.add(relPath);
                 this.stateDb.removeItemByPath(relPath);
+            },
+            // Only notes a subtree whose records are gone already
+            noteSubtree: (relPath: string) => {
+                takenAway.subtrees.add(relPath);
             },
             putBack: async (stayed: string[]) => {
                 for (const relPath of stayed) {
