@@ -28,6 +28,11 @@ function makeFake(rejectWith?: string) {
             if (relPath === 'typo.txt') throw new Error(`Not in Proton Drive: ${relPath}`);
             return relPath === 'Docs' ? ('pinned' as const) : ('online-only' as const);
         },
+        // What is hidden from this computer, as the engine lists it (sorted by path)
+        hidden: [] as Array<{ path: string; state: 'hidden' | 'hiding' }>,
+        hiddenItems() {
+            return this.hidden;
+        },
         // The drive's routes: each call is noted; some paths fail as the engine fails them
         driveCalls,
         vfsChildren(relPath: string): VfsEntry[] {
@@ -97,6 +102,39 @@ describe('control socket', () => {
         const res = await call(socketPath, '/availability?path=typo.txt');
         expect(res.status).toBe(400);
         expect(await res.json()).toEqual({ error: 'Not in Proton Drive: typo.txt' });
+    });
+
+    test('GET /availability/hidden lists what is hidden from this computer, and nothing when nothing is', async () => {
+        const { socketPath, engine } = await start();
+        let res = await call(socketPath, '/availability/hidden');
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ items: [] });
+
+        engine.hidden = [
+            { path: 'Docs/Private', state: 'hiding' },
+            { path: 'Music', state: 'hidden' },
+        ];
+        res = await call(socketPath, '/availability/hidden');
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({
+            items: [
+                { path: 'Docs/Private', state: 'hiding' },
+                { path: 'Music', state: 'hidden' },
+            ],
+        });
+        expect(engine.calls).toEqual([]);
+    });
+
+    test('GET /availability/hidden is GET only and changes nothing', async () => {
+        const { socketPath, engine } = await start();
+        for (const method of ['POST', 'PUT', 'DELETE']) {
+            const res = await call(socketPath, '/availability/hidden', {
+                method,
+                body: JSON.stringify({ path: 'Music', action: 'unhide' }),
+            });
+            expect(res.status).toBe(405);
+        }
+        expect(engine.calls).toEqual([]);
     });
 
     test('socket is user-only', async () => {

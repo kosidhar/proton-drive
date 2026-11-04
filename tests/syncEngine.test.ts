@@ -453,6 +453,24 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(engine.availability.stateOf('A/B/C')).toBe('pinned');
         });
 
+        test('hiddenItems lists what is hidden from this computer by path, sorted, a pending hide as hiding', async () => {
+            const { engine, add, root } = setup();
+            add('welcome.txt', 'hello');
+            add('Work/Secret/s.txt', 'secret');
+            add('Archive/old.txt', 'old');
+            engine.availability.setPin(root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            expect(engine.hiddenItems()).toEqual([]);
+
+            engine.availability.setHide('vol~Work/Secret', 'pending');
+            engine.availability.setHide('vol~Archive', 'hidden');
+
+            expect(engine.hiddenItems()).toEqual([
+                { path: 'Archive', state: 'hidden' },
+                { path: 'Work/Secret', state: 'hiding' },
+            ]);
+        });
+
         test('hidden items are never downloaded or uploaded', async () => {
             const { engine, add, root, calls, files } = setup();
             add('welcome.txt', 'hello');
