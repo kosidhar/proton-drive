@@ -1484,6 +1484,12 @@ export class ProtonDriveSyncEngine {
             // in another look (a pass and a watcher look can reach one conflict at once), which holds the claim (#140)
             return;
         }
+        if (this.driveTouched(relPath, since)) {
+            // Renamed, deleted or replaced through the drive since this work read it: what was read is no longer what is
+            // at this path, even with no record to say so (a file the drive made local has only an edit baseline; one a
+            // rename put here, replacing it). The next pass decides, from what is there then (#139)
+            return;
+        }
         if (strategy === 'keep-both' && this.stillChangingWhenLetThrough(relPath)) {
             // Still being written: the cloud version would be downloaded only to be thrown away once the file changes
             // again (#67 keeps the newer local writes), every time it is let through. Nothing is touched; a pass once
@@ -2449,6 +2455,18 @@ export class ProtonDriveSyncEngine {
         this.keepBothCopies.delete(relPath);
         this.forgetFailure(relPath);
         return true;
+    }
+
+    // Whether a rename or delete through the drive since `since` took the item at this path away, or put another there
+    // (renamed onto it, or into a folder above it)
+    private driveTouched(relPath: string, since: number): boolean {
+        const changes = [
+            ...this.removalBatches.filter((batch) => batch.n > since).map((batch) => batch.takenAway),
+            ...this.runningRemovals,
+        ];
+        return changes.some(
+            ({ drive }) => drive !== undefined && (isWithin(relPath, drive.from) || (drive.to !== null && isWithin(relPath, drive.to))),
+        );
     }
 
     // Where a rename or delete through the drive took an item that work begun when `since` removals had finished was
