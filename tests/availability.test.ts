@@ -274,6 +274,25 @@ describe("AvailabilityPolicy", () => {
     expect(policy.hiddenBy("Docs/a.txt")).toBeNull();
   });
 
+  test("hiddenItems lists each hidden or hiding item once, by path, sorted, with its flag", () => {
+    expect(policy.hiddenItems()).toEqual([]);
+    policy.setHide("music", "hidden");
+    policy.setHide("deep", "pending");
+    policy.setHide("a", "hidden");
+    policy.setPin("photos", "pinned", false); // a pin alone is not hidden
+    expect(policy.hiddenItems()).toEqual([
+      { relPath: "Docs/Deep", hide: "pending" },
+      { relPath: "Docs/a.txt", hide: "hidden" },
+      { relPath: "Music", hide: "hidden" },
+    ]);
+    // A hide above them supersedes them: only Docs is listed
+    policy.setHide("docs", "hidden");
+    expect(policy.hiddenItems()).toEqual([
+      { relPath: "Docs", hide: "hidden" },
+      { relPath: "Music", hide: "hidden" },
+    ]);
+  });
+
   test("flags follow a moved uid", () => {
     policy.setPin("docs", "pinned", false);
     index.upsert(folder("docs", "root", "Archive/Docs"));

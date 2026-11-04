@@ -5571,6 +5571,14 @@ export class ProtonDriveSyncEngine {
         return this.availabilityResult(relPath);
     }
 
+    // What is hidden from this computer, for the app's list with Unhide: each hidden item by its path, sorted, a hide
+    // still waiting on uploads as hiding. Reads only.
+    hiddenItems(): Array<{ path: string; state: 'hidden' | 'hiding' }> {
+        return this.policy
+            .hiddenItems()
+            .map(({ relPath, hide }) => ({ path: relPath, state: hide === 'pending' ? 'hiding' : 'hidden' }));
+    }
+
     // The availability of an item of My files by its path, for `status <path>`. A path the remote index doesn't hold
     // resolves through its nearest indexed folder only while it exists on this computer (new local items aren't indexed
     // until they are uploaded, ruling R3); otherwise this rejects with `Not in Proton Drive: <path>`.

@@ -38,7 +38,14 @@ export interface ControlServerOptions {
     socketPath: string;
     engine: Pick<
         ProtonDriveSyncEngine,
-        'setAvailability' | 'availabilityOf' | 'vfsChildren' | 'hydrate' | 'renameItem' | 'deleteItem' | 'truncateItem'
+        | 'setAvailability'
+        | 'availabilityOf'
+        | 'hiddenItems'
+        | 'vfsChildren'
+        | 'hydrate'
+        | 'renameItem'
+        | 'deleteItem'
+        | 'truncateItem'
     >;
     // What the file manager extension reads: where the drive is, the states of a folder's items, and what changes (see
     // fileManagerRoutes.ts)
@@ -401,6 +408,11 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
             }
             if (url.pathname === '/drive/settings') {
                 return driveSettingsRoute(req, opts.driveSettings);
+            }
+            // What is hidden from this computer, for the app's list with Unhide (which is POST /availability). Reads only.
+            if (url.pathname === '/availability/hidden') {
+                if (req.method !== 'GET') return jsonError('Method not allowed', 405);
+                return Response.json({ items: engine.hiddenItems() });
             }
             if (url.pathname !== '/availability') {
                 return jsonError('Not found', 404);
