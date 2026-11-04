@@ -13,6 +13,7 @@ export function controlServerOptions(deps: {
         Pick<
             ProtonDriveSyncEngine,
             | 'resolveConflictManually'
+            | 'startFreshForThisAccount'
             | 'reconcileNow'
             | 'confirmFilesMissingDeleted'
             | 'keepFilesMissingOnlineOnly'
@@ -50,6 +51,11 @@ export function controlServerOptions(deps: {
         login: deps.signIn,
         logout: deps.signOut,
         resolveConflict: (id, choice) => engine.resolveConflictManually(id, choice),
+        // Then the first sync with this account, as a fresh install's (#35)
+        startFresh: async () => {
+            await engine.startFreshForThisAccount();
+            void engine.reconcileNow();
+        },
         // Only the exact delete action reaches the delete: an action not wired here reaches nothing
         resolveFilesMissing: async (action, expected) => {
             switch (action) {
