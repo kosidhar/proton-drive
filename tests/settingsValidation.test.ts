@@ -406,6 +406,17 @@ describe('ignore patterns are matched as plain globs, never extglobs or negation
         }
     });
 
+    test('what the user escaped already stays as they wrote it', () => {
+        expect(matchesIgnorePatterns('(x)', ['\\(x\\)'])).toBe(true);
+        expect(matchesIgnorePatterns('Report (copy).pdf', ['Report \\(copy\\).pdf'])).toBe(true);
+        expect(matchesIgnorePatterns('a(', ['a[(]'])).toBe(true);
+        expect(matchesIgnorePatterns('a\\', ['a[(]'])).toBe(false);
+        expect(matchesIgnorePatterns('a(', ['a[\\(]'])).toBe(true);
+        expect(matchesIgnorePatterns('a\\', ['a[\\(]'])).toBe(false);
+        expect(matchesIgnorePatterns('ac', ['a!(b)'])).toBe(false);
+        expect(matchesIgnorePatterns('Report.pdf', [' !(x)'])).toBe(false);
+    });
+
     test('ordinary globs still work', () => {
         expect(matchesIgnorePatterns('a.bak', ['*.bak'])).toBe(true);
         expect(matchesIgnorePatterns('b', ['[!a]*'])).toBe(true);
