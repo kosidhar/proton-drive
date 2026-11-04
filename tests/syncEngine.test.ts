@@ -11364,4 +11364,25 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('mine now');
         });
     });
+
+    describe('freeing up space and hiding are logged as such, never as a removal (#94)', () => {
+        test('free up space is logged as free-up, and hide as hide', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('Docs/a.txt', 'a');
+            d.add('Music/m.mp3', 'm');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            await engine.setAvailability('Docs', 'free');
+            await engine.setAvailability('Music', 'hide');
+            const logged = stateDb.listActivity(50).map((a) => [a.action, a.localRelPath]);
+            expect(logged).toContainEqual(['free-up', 'Docs']);
+            expect(logged).toContainEqual(['hide', 'Music']);
+            expect(logged.filter(([action]) => action === 'delete-local')).toEqual([]);
+        });
+    });
 });

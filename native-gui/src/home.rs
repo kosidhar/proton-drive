@@ -406,6 +406,47 @@ fn spawn_opener(target: &std::ffi::OsStr) {
     let _ = spawn_reaped(Command::new("xdg-open").arg(target));
 }
 
+/// Opens a file with its default app; a screenshot opens nothing.
+pub(crate) fn open_file(file: &std::path::Path) {
+    open_externally(file.as_os_str(), screenshot());
+}
+
+/// Shows an item in the file manager, selected in its folder (the file manager's ShowItems), or, where no file manager
+/// answers that, opens the folder it is in; a screenshot shows nothing. Tests see "show:<path>" in LAUNCHED (#94).
+pub(crate) fn show_in_files(item: &std::path::Path) {
+    if screenshot() {
+        return;
+    }
+    #[cfg(test)]
+    LAUNCHED.with(|launched| launched.borrow_mut().push(format!("show:{}", item.display())));
+    #[cfg(not(test))]
+    spawn_show_items(item.to_path_buf());
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn spawn_show_items(item: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        let shown = Command::new("dbus-send")
+            .args([
+                "--session",
+                "--print-reply",
+                "--dest=org.freedesktop.FileManager1",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+            ])
+            .arg(format!("array:string:{}", crate::activity::file_uri(&item)))
+            .arg("string:")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !shown {
+            let folder = if item.is_dir() { item.as_path() } else { item.parent().unwrap_or(&item) };
+            let _ = spawn_reaped(Command::new("xdg-open").arg(folder));
+        }
+    });
+}
+
 #[cfg(test)]
 thread_local! {
     /// What open_externally would have opened, on this test's thread
