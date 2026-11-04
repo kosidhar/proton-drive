@@ -1,3 +1,4 @@
+mod activity;
 mod home;
 mod settings;
 mod single_instance;
@@ -1218,6 +1219,10 @@ struct ProtonDriveNativeApp {
     account_error: Option<String>,
     /// Activity's search: rows whose path or details hold it, whatever the case
     search_query: String,
+    /// Activity's filter: all, uploads, downloads, or problems (#94)
+    activity_filter: activity::ActivityFilter,
+    /// The Activity row opened to show its full details and actions (see activity_key)
+    expanded_activity: Option<String>,
     /// The sidebar's account footer was clicked: Settings brings its Account card into view once
     jump_to_account: bool,
 
@@ -1363,6 +1368,8 @@ impl ProtonDriveNativeApp {
             login_url: None,
             account_error: None,
             search_query: String::new(),
+            activity_filter: activity::ActivityFilter::All,
+            expanded_activity: None,
             jump_to_account: false,
             hidden: None,
             hidden_loading: false,
@@ -1916,6 +1923,15 @@ impl ProtonDriveNativeApp {
                         .hint_text("Search activity")
                         .vertical_align(Align::Center),
                 );
+                ui.add_space(8.0);
+                // The filter, laid out from the right: All first, reading left to right
+                for (filter, label) in activity::FILTERS.iter().rev() {
+                    let on = self.activity_filter == *filter;
+                    let text = RichText::new(*label).size(12.5).color(if on { PROTON_PURPLE_TEXT() } else { TEXT_MUTED() });
+                    if ui.selectable_label(on, text).clicked() {
+                        self.activity_filter = *filter;
+                    }
+                }
             });
         });
 
@@ -2002,21 +2018,38 @@ impl ProtonDriveNativeApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    let shown: Vec<&ActivityRecord> =
-                        self.activities.iter().filter(|a| activity_matches(a, &query)).take(50).collect();
+                    let filter = self.activity_filter;
+                    let shown: Vec<ActivityRecord> = self
+                        .activities
+                        .iter()
+                        .filter(|a| activity_matches(a, &query))
+                        .filter(|a| activity::in_filter(activity::activity_kind(&a.action, &a.details), filter))
+                        .take(50)
+                        .cloned()
+                        .collect();
                     if self.activities.is_empty() || shown.is_empty() {
                         let text = if self.activities.is_empty() {
                             "No synchronization activity recorded yet.".to_string()
-                        } else {
+                        } else if !query.trim().is_empty() {
                             format!("No activity matches \"{}\".", query.trim())
+                        } else {
+                            match filter {
+                                activity::ActivityFilter::Uploads => "No uploads yet.".to_string(),
+                                activity::ActivityFilter::Downloads => "No downloads yet.".to_string(),
+                                activity::ActivityFilter::Problems => "No conflicts or failures.".to_string(),
+                                activity::ActivityFilter::All => "No synchronization activity recorded yet.".to_string(),
+                            }
                         };
                         ui.add_space(16.0);
                         ui.label(RichText::new(text).size(13.0).color(TEXT_MUTED()));
                     } else {
-                        for act in shown {
+                        for act in &shown {
+                            let kind = activity::activity_kind(&act.action, &act.details);
+                            let key = activity_key(act);
+                            let expanded = self.expanded_activity.as_deref() == Some(key.as_str());
                             let (row_rect, row_resp) = ui.allocate_exact_size(
                                 Vec2::new(ui.available_width(), 38.0),
-                                Sense::hover(),
+                                Sense::click(),
                             );
                             if row_resp.hovered() {
                                 ui.painter().rect_filled(
@@ -2039,15 +2072,23 @@ impl ProtonDriveNativeApp {
                                 (row_rect.min.x + row_rect.width() * 0.44).max(r_file_x + 210.0);
                             let r_time_right_x = row_rect.max.x - 16.0;
 
-                            let (pill_label, pill_bg, pill_fg) = humanize_activity_action(&act.action);
+                            let pill_label = activity::kind_label(kind);
+                            let (pill_bg, pill_fg) = activity_pill_colors(kind);
                             let pill_rect = egui::Rect::from_min_size(
                                 egui::pos2(row_rect.min.x + 12.0, cy - 11.0),
                                 Vec2::new(124.0, 22.0),
                             );
                             ui.painter()
                                 .rect_filled(pill_rect, CornerRadius::same(99), pill_bg);
+                            // Freed up or hidden: still in Proton Drive, online-only, which the cloud says
+                            let label_center = if activity::shows_cloud(kind) {
+                                draw_cloud_icon(ui.painter(), egui::pos2(pill_rect.min.x + 18.0, cy), pill_fg);
+                                pill_rect.center() + Vec2::new(8.0, 0.0)
+                            } else {
+                                pill_rect.center()
+                            };
                             ui.painter().text(
-                                pill_rect.center(),
+                                label_center,
                                 egui::Align2::CENTER_CENTER,
                                 pill_label,
                                 FontId::new(11.0, FontFamily::Proportional),
@@ -2056,7 +2097,7 @@ impl ProtonDriveNativeApp {
 
                             // File / Folder icon + name
                             let is_folder_act = act.action == "mkdir"
-                                || act.action == "delete-local" && !act.local_rel_path.contains('.');
+                                || matches!(kind, activity::ActivityKind::RemovedLocally) && !act.local_rel_path.contains('.');
                             let ic_rect = egui::Rect::from_center_size(
                                 egui::pos2(r_file_x + 9.0, cy),
                                 Vec2::new(17.0, 14.5),
@@ -2083,7 +2124,6 @@ impl ProtonDriveNativeApp {
                                 truncate_middle_to_width(ui.painter(), &act.local_rel_path, &name_font, name_max_w);
                             let details_text =
                                 truncate_middle_to_width(ui.painter(), &act.details, &details_font, details_max_w);
-                            let truncated = name_text != act.local_rel_path || details_text != act.details;
 
                             ui.painter().text(
                                 egui::pos2(name_x, cy),
@@ -2106,13 +2146,54 @@ impl ProtonDriveNativeApp {
                                 time_font,
                                 TEXT_MUTED(),
                             );
-                            if truncated {
-                                row_resp.on_hover_text(format!("{}\n{}", act.local_rel_path, act.details));
+                            // The whole text shows on hover, and in the row opened by a click
+                            let row_resp = row_resp
+                                .on_hover_text(format!("{}\n{}", act.local_rel_path, act.details))
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if row_resp.clicked() {
+                                self.expanded_activity = if expanded { None } else { Some(key.clone()) };
+                            }
+                            if expanded {
+                                self.render_activity_details(ui, act);
                             }
                         }
                     }
                 });
         });
+    }
+
+    /// An opened Activity row: its whole path and details, and Show in Files and, for a file there now, Open (#94)
+    fn render_activity_details(&mut self, ui: &mut egui::Ui, act: &ActivityRecord) {
+        let sync_dir = self.status.sync_dir.clone();
+        Frame::NONE
+            .fill(BG_CARD_ALT())
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.add(egui::Label::new(RichText::new(&act.local_rel_path).size(13.0).strong().color(TEXT_PRIMARY())).wrap());
+                ui.add_space(2.0);
+                ui.add(egui::Label::new(RichText::new(&act.details).size(12.5).color(TEXT_MUTED())).wrap());
+                let show = activity::show_target(&sync_dir, &act.local_rel_path);
+                let open = activity::open_target(&sync_dir, &act.local_rel_path);
+                if show.is_some() || open.is_some() {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if let Some(path) = &show {
+                            if home::secondary_button(ui, "Show in Files", 28.0).clicked() {
+                                home::show_in_files(path);
+                            }
+                        }
+                        if let Some(path) = &open {
+                            ui.add_space(6.0);
+                            if home::secondary_button(ui, "Open", 28.0).clicked() {
+                                home::open_file(path);
+                            }
+                        }
+                    });
+                }
+            });
+        ui.add_space(4.0);
     }
 
     /// Asks the daemon, over the control socket and off the UI thread, to change availability.
@@ -3445,45 +3526,35 @@ fn draw_file_icon(painter: &egui::Painter, rect: egui::Rect, filename: &str) {
     );
 }
 
-fn humanize_activity_action(action: &str) -> (&'static str, Color32, Color32) {
-    match action {
-        "download" => (
-            "↓ Downloaded",
-            Color32::from_rgba_unmultiplied(30, 168, 133, 34),
-            STATUS_SUCCESS,
-        ),
-        "upload" => (
-            "↑ Uploaded",
-            Color32::from_rgba_unmultiplied(109, 74, 255, 42),
-            PROTON_PURPLE_TEXT(),
-        ),
-        "mkdir" => (
-            "+ Folder created",
-            BG_CARD_ALT(),
-            TEXT_PRIMARY(),
-        ),
-        "delete-local" => (
-            "− Removed locally",
-            BG_CARD_ALT(),
-            TEXT_MUTED(),
-        ),
-        "delete-remote" | "trash-remote" => (
-            "Trash (Cloud)",
-            Color32::from_rgba_unmultiplied(245, 158, 11, 34),
-            STATUS_WARNING,
-        ),
-        "conflict" => (
-            "! Conflict",
-            Color32::from_rgba_unmultiplied(239, 68, 68, 38),
-            STATUS_DANGER,
-        ),
-        "error" => (
-            "✕ Failed",
-            Color32::from_rgba_unmultiplied(239, 68, 68, 38),
-            STATUS_DANGER,
-        ),
-        _ => ("• Synced", BG_CARD_ALT(), TEXT_PRIMARY()),
+/// An Activity row's identity, to keep it open across refreshes
+fn activity_key(act: &ActivityRecord) -> String {
+    format!("{}\u{0}{}\u{0}{}", act.timestamp, act.action, act.local_rel_path)
+}
+
+/// An Activity pill's fill and text colours, by what the entry is
+fn activity_pill_colors(kind: activity::ActivityKind) -> (Color32, Color32) {
+    use activity::ActivityKind::*;
+    match kind {
+        Downloaded => (Color32::from_rgba_unmultiplied(30, 168, 133, 34), STATUS_SUCCESS),
+        Uploaded => (Color32::from_rgba_unmultiplied(109, 74, 255, 42), PROTON_PURPLE_TEXT()),
+        FreedUp | Hidden => (Color32::from_rgba_unmultiplied(109, 74, 255, 26), PROTON_PURPLE_TEXT()),
+        FolderCreated | Other => (BG_CARD_ALT(), TEXT_PRIMARY()),
+        RemovedLocally => (BG_CARD_ALT(), TEXT_MUTED()),
+        MovedToCloudTrash => (Color32::from_rgba_unmultiplied(245, 158, 11, 34), STATUS_WARNING),
+        Conflict | Failed => (Color32::from_rgba_unmultiplied(239, 68, 68, 38), STATUS_DANGER),
     }
+}
+
+/// A small cloud, centred at `c`, as the drive's online-only icon draws it
+fn draw_cloud_icon(painter: &egui::Painter, c: egui::Pos2, color: Color32) {
+    painter.circle_filled(c + Vec2::new(-3.0, 1.5), 2.6, color);
+    painter.circle_filled(c + Vec2::new(0.5, -0.8), 3.4, color);
+    painter.circle_filled(c + Vec2::new(3.6, 1.6), 2.4, color);
+    painter.rect_filled(
+        egui::Rect::from_min_max(c + Vec2::new(-3.0, 1.2), c + Vec2::new(3.6, 4.0)),
+        CornerRadius::ZERO,
+        color,
+    );
 }
 
 fn format_relative_timestamp(ts_ms: u64) -> String {
@@ -4528,6 +4599,8 @@ mod tests {
                 login_url: None,
                 account_error: None,
                 search_query: String::new(),
+                activity_filter: activity::ActivityFilter::All,
+                expanded_activity: None,
                 jump_to_account: false,
                 hidden: None,
                 hidden_loading: false,
@@ -4859,6 +4932,67 @@ mod tests {
         assert_eq!(h.sent(), vec!["sign in".to_string()]);
         h.event(WorkerEvent::LoginStarted(Err("Proton is unreachable".into())));
         assert!(h.text_at("Couldn't start signing in: Proton is unreachable").is_some());
+    }
+
+    // #94: a free-up reads as such, not as a delete; a filter keeps uploads, downloads or problems; a click opens a row
+    // to its full details, with Show in Files and Open, quietly showing where a gone item was
+    #[test]
+    fn activity_rows_say_what_happened_filter_and_open_to_show_in_files() {
+        let dir = std::env::temp_dir().join(format!("pd-activity-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Docs")).unwrap();
+        std::fs::write(dir.join("Docs/report.pdf"), "r").unwrap();
+        let launched = || home::LAUNCHED.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        launched();
+        let mut h = Harness::new();
+        h.app.tab = NavTab::Activity;
+        h.app.status.sync_dir = dir.to_string_lossy().into_owned();
+        let record = |ts: u64, action: &str, path: &str, details: &str| ActivityRecord {
+            timestamp: ts,
+            action: action.into(),
+            local_rel_path: path.into(),
+            details: details.into(),
+        };
+        h.app.activities = vec![
+            record(1, "delete-local", "Photos", "Freed up space (removed the local copies; kept in Proton Drive)"),
+            record(2, "upload", "Docs/report.pdf", "Uploaded to Proton Drive (1 B)"),
+            record(3, "download", "Music/song.mp3", "Downloaded from Proton Drive (4 MB)"),
+            record(4, "error", "Gone/away.txt", "Upload failed: network down"),
+        ];
+        h.frames(2);
+        assert!(h.text_at("Freed up space").is_some());
+        assert!(h.text_at("− Removed locally").is_none(), "a free-up never reads as a delete");
+
+        h.click(h.text_at("Problems").unwrap());
+        h.frames(2);
+        assert!(h.text_at("Gone/away.txt").is_some());
+        for hidden in ["Docs/report.pdf", "Music/song.mp3", "Photos"] {
+            assert!(h.text_at(hidden).is_none(), "{hidden}");
+        }
+        h.click(h.text_at("Uploads").unwrap());
+        h.frames(2);
+        assert!(h.text_at("Docs/report.pdf").is_some());
+        assert!(h.text_at("Gone/away.txt").is_none());
+        h.click(h.text_at("All").unwrap());
+        h.frames(2);
+        assert!(h.text_at("Music/song.mp3").is_some());
+
+        // A click opens the row: its whole details, Show in Files and, as the file is here, Open
+        h.click(h.text_at("Docs/report.pdf").unwrap());
+        h.frames(2);
+        h.click(h.text_at("Show in Files").expect("Show in Files is offered"));
+        assert_eq!(launched(), vec![format!("show:{}", dir.join("Docs/report.pdf").display())]);
+        h.click(h.text_at("Open").expect("Open is offered for a file here"));
+        assert_eq!(launched(), vec![dir.join("Docs/report.pdf").to_string_lossy().into_owned()]);
+        assert_eq!(h.sent(), Vec::<String>::new());
+
+        // An item that is gone: no Open, and Show in Files shows the sync folder it was in, quietly
+        h.click(h.text_at("Gone/away.txt").unwrap());
+        h.frames(2);
+        assert!(h.text_at("Open").is_none());
+        h.click(h.text_at("Show in Files").unwrap());
+        assert_eq!(launched(), vec![format!("show:{}", dir.display())]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
