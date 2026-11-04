@@ -21,6 +21,10 @@ export function isEngineTempName(name: string): boolean {
     return name.startsWith('.proton-drive-tmp-');
 }
 
+// Where a download for the virtual drive is staged (at the root of the backing store) until it is complete: an app is
+// waiting on it (the virtual drive hides every .proton-drive-tmp-* name, and the sync ignores them)
+export const HYDRATE_STAGING_PREFIX = '.proton-drive-tmp-hydrate-';
+
 export function treeEntrySignature(st: { isFile(): boolean; isDirectory(): boolean; size: number; mtimeMs: number }): string {
     // Directory mtimes are left out: a folder that gains an entry fails to delete because it isn't empty
     return st.isFile() ? `file:${st.size}:${st.mtimeMs}` : st.isDirectory() ? 'dir' : 'other';
@@ -51,6 +55,11 @@ export async function scanLocalCopies(opts: {
             return false; // Deleted since the listing, or never here
         }
         if (relPath !== '') {
+            if (st.isFile() && path.posix.basename(relPath).startsWith(HYDRATE_STAGING_PREFIX)) {
+                // Never removed under the app waiting on it, however long it stalls: the open would fail (#41). The
+                // download finishes or cleans it up
+                return false;
+            }
             entries.push({ relPath, signature: treeEntrySignature(st) });
             if (st.isFile() && isEngineTempName(path.posix.basename(relPath))) {
                 return false; // Our own download in progress: removed only while it stays unchanged
