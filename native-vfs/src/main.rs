@@ -121,6 +121,7 @@ fn run() -> i32 {
     ];
     config.n_threads = Some(4);
     let drive = fs::DriveFs::new(args.backing, daemon::DaemonClient::new(args.socket));
+    drive.start_space_refresh();
     let notifier = drive.notifier_slot();
     let session = match Session::new(drive, &mountpoint, &config) {
         Ok(session) => session,

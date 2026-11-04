@@ -367,6 +367,39 @@ describe('POST /vfs/mount', () => {
     });
 });
 
+// #181: what the drive reports as its size: the account's storage, which the helper asks for now and then
+describe('GET /vfs/space', () => {
+    async function startWith(space?: () => Promise<{ usedSpace: number; maxSpace: number } | null>) {
+        const root = mkdtempSync(path.join(os.tmpdir(), 'pd-control-'));
+        cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+        const socketPath = path.join(root, 'control.sock');
+        const server = await startControlServer({ socketPath, engine: makeFake() as never, space });
+        cleanups.push(() => server.stop());
+        return socketPath;
+    }
+
+    test("answers the account's storage", async () => {
+        const socketPath = await startWith(async () => ({ usedSpace: 13_570_000_000, maxSpace: 510_000_000_000 }));
+        const res = await call(socketPath, '/vfs/space');
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ space: { usedSpace: 13_570_000_000, maxSpace: 510_000_000_000 } });
+    });
+
+    test('null while it is not known, when it fails, or with nothing wired', async () => {
+        expect(await (await call(await startWith(async () => null), '/vfs/space')).json()).toEqual({ space: null });
+        const failing = await startWith(async () => {
+            throw new Error('offline');
+        });
+        expect(await (await call(failing, '/vfs/space')).json()).toEqual({ space: null });
+        expect(await (await call(await startWith(), '/vfs/space')).json()).toEqual({ space: null });
+    });
+
+    test('only GET', async () => {
+        const socketPath = await startWith(async () => ({ usedSpace: 1, maxSpace: 2 }));
+        expect((await call(socketPath, '/vfs/space', { method: 'POST' })).status).toBe(405);
+    });
+});
+
 // S39 / #46: the user says the files missing from the folder, as they were shown (root and names), were deleted on
 // purpose, so they go to the Proton Drive trash; #50: or keeps them in Proton Drive, online-only. Anything else than
 // what is missing now is refused
