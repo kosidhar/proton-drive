@@ -1,8 +1,10 @@
 #!/usr/bin/env bun
 
+import { spawn } from 'node:child_process';
 import path from 'node:path';
 
 import { launchDesktopWindow } from '../gui/launcher';
+import { loginCommands } from '../linux/autostart';
 import { ensureSystemTrayIndicator } from '../linux/notifications';
 import { DEFAULT_DAEMON_HOST, DEFAULT_DAEMON_PORT, startSyncDaemon } from '../daemon/daemonServer';
 import {
@@ -180,6 +182,21 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
             console.log(`App Version: ${info.appVersion}`);
             console.log(`SDK Version: ${info.sdkVersion}`);
             console.log(`Disclosure:  ${info.disclosure}`);
+        }
+        return;
+    }
+
+    // At login (the entry startAtLogin puts in ~/.config/autostart): the daemon, and with it the drive, and the tray,
+    // each detached; each refuses to run twice, so this never starts a second one (#92)
+    if (cmd === 'autostart') {
+        for (const argv of loginCommands(process.execPath, process.argv)) {
+            try {
+                const child = spawn(argv[0]!, argv.slice(1), { detached: true, stdio: 'ignore' });
+                child.on('error', () => {});
+                child.unref();
+            } catch {
+                // the next one all the same
+            }
         }
         return;
     }
