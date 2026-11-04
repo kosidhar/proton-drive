@@ -10258,5 +10258,28 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(stateDb.getItemByPath('a.txt')?.nodeUid).toBe(d.uid('a.txt'));
             expect(await readFile(path.join(engine.localRoot(), 'a.txt'), 'utf8')).toBe('a');
         });
+
+        test('virtual: a delete that happened is seen, and work under way records nothing in it', async () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('Docs/a.txt', 'a');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const record = stateDb.getItemByPath('Docs/a.txt')!;
+            await (engine as any).observingLocal(async (since: number) => {
+                await engine.deleteItem('Docs');
+                expect((engine as any).driveTouched('Docs/a.txt', since)).toBe(true);
+                expect((engine as any).driveDestination('Docs/a.txt', since)).toBeNull();
+                // An upload begun before the delete, finishing after it, records nothing
+                expect((engine as any).recordSynced({ ...record, updatedAt: undefined }, since)).toBe(false);
+            });
+            expect(stateDb.getItemByPath('Docs/a.txt')).toBeNull();
+        });
     });
 });
