@@ -136,7 +136,7 @@ describe('settings are validated, every field, before any is stored (#34, #36)',
         const s = setup();
         const res = await s.save({ notificationsEnabled: false, theme: 'dark' });
         expect([res.status, res.json.code]).toEqual([400, 'EINVAL']);
-        for (const key of ['paused', 'reconcileIntervalSec', '__proto__', 'constructor']) {
+        for (const key of ['paused', 'pausedUntil', 'reconcileIntervalSec', '__proto__', 'constructor']) {
             expect([key, (await s.save(JSON.parse(`{"${key}": 1}`))).status]).toEqual([key, 400]);
         }
         expect(s.stateDb.getSettings()).toEqual(s.before);
