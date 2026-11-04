@@ -3,9 +3,9 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { type NodeEntity, NodeType, type ProtonDriveClient } from '@protontech/drive-sdk';
+import { type NodeEntity, NodeType, NodeWithSameNameExistsValidationError, type ProtonDriveClient } from '@protontech/drive-sdk';
 
-import { downloadRevisionToFile } from '../src/sdk/fileOps';
+import { createRemoteFolder, downloadRevisionToFile } from '../src/sdk/fileOps';
 import { makeMockNode } from './helpers/mockNodes';
 
 const cleanups: Array<() => void> = [];
@@ -66,5 +66,31 @@ describe('downloadRevisionToFile', () => {
         expect(await Promise.race([done, Bun.sleep(2000).then(() => 'waited for a slot for ever')])).toBe('downloaded');
         expect(readFileSync(filePath, 'utf8')).toBe('content');
         expect(free()).toBe(5);
+    });
+});
+
+// #165: a name held by an item in the Proton Drive trash, or by a file, is never taken for the folder asked for
+describe('createRemoteFolder never adopts a trashed node or a file (#165)', () => {
+    const refusing = (existing: NodeEntity) =>
+        ({
+            createFolder: async () => {
+                throw new NodeWithSameNameExistsValidationError('An item with that name already exists', 2500, existing.uid);
+            },
+            getNode: async () => existing,
+        }) as unknown as ProtonDriveClient;
+
+    test('a live folder holding the name is taken, as before', async () => {
+        const live = makeMockNode({ uid: 'vol~f', parentUid: 'vol~root', nameStr: 'Folder', type: NodeType.Folder });
+        expect(await createRemoteFolder(refusing(live), 'vol~root', 'Folder')).toEqual({ node: live, created: false });
+    });
+
+    test('one in the trash is refused', async () => {
+        const trashed = { ...makeMockNode({ uid: 'vol~f', parentUid: 'vol~root', nameStr: 'Folder', type: NodeType.Folder }), trashTime: new Date() };
+        await expect(createRemoteFolder(refusing(trashed), 'vol~root', 'Folder')).rejects.toThrow(/trash/);
+    });
+
+    test('a file holding the name is refused', async () => {
+        const file = makeMockNode({ uid: 'vol~f', parentUid: 'vol~root', nameStr: 'Folder', type: NodeType.File });
+        await expect(createRemoteFolder(refusing(file), 'vol~root', 'Folder')).rejects.toThrow(/not a folder/);
     });
 });
