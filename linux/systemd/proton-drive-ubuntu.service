@@ -9,7 +9,6 @@ Type=simple
 ExecStart=/usr/bin/proton-drive-ubuntu daemon
 Restart=on-failure
 RestartSec=5
-Environment=PROTON_DRIVE_LOG_LEVEL=INFO
 
 [Install]
 WantedBy=default.target
