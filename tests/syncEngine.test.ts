@@ -10659,4 +10659,89 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect([...d.nodes.values()].filter((n) => d.nameOf(n) === 'Folder').length).toBe(1);
         });
     });
+
+    describe('a file deleted while its folder downloads is never downloaded (#179)', () => {
+        const pinning = async () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('Big/a.bin', 'a');
+            d.add('Big/b.bin', 'b');
+            await engine.reconcileNow(); // online-only
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            return { ...d, engine, local };
+        };
+
+        test('deleted through the drive while the pin downloads its folder', async () => {
+            const d = await pinning();
+            // The pin's download of a.bin is held: b.bin is still to come when the user deletes it
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            const download = (d.sdk as any).getFileRevisionDownloader.bind(d.sdk);
+            (d.sdk as any).getFileRevisionDownloader = async (...args: unknown[]) => {
+                (d.sdk as any).getFileRevisionDownloader = download;
+                entered();
+                await gate;
+                return download(...args);
+            };
+            const pin = d.engine.setAvailability('Big', 'pin');
+            await inside;
+            await d.engine.deleteItem('Big/b.bin');
+            await d.engine.replayRemoteOps(); // trashed in Proton Drive
+            release();
+            await pin;
+            await d.engine.reconcileNow();
+            expect(await stat(d.local('Big/b.bin')).catch(() => null)).toBeNull();
+            expect(await readFile(d.local('Big/a.bin'), 'utf8')).toBe('a');
+        });
+
+        test('nor when what Proton Drive says of it still looks live (a cache behind), after a drive delete since', async () => {
+            const d = await pinning();
+            d.engine.availability.setPin(d.uid('Big'), 'pinned', false);
+            const node = d.nodes.get(d.uid('Big/b.bin'))!;
+            await (d.engine as any).observingLocal(async (since: number) => {
+                await d.engine.deleteItem('Big/b.bin');
+                await d.engine.replayRemoteOps();
+                const getNode = d.sdk.getNode.bind(d.sdk);
+                (d.sdk as any).getNode = async (uid: string) => (uid === node.uid ? node : getNode(uid)); // as it was
+                await (d.engine as any).reconcileSinglePath('Big/b.bin', node, undefined, undefined, new Map(), stateDb.getSettings(), since);
+            });
+            expect(await stat(d.local('Big/b.bin')).catch(() => null)).toBeNull();
+        });
+
+        test('a trash refused for a node already in the trash is done, not a failure', async () => {
+            const d = await pinning();
+            const node = d.nodes.get(d.uid('Big/b.bin'))!;
+            // Trashed already (by a trash sent before a restart, say): Proton Drive refuses another
+            d.nodes.set(node.uid, { ...node, trashTime: new Date() });
+            (d.sdk as any).trashNodes = async function* (uids: string[]) {
+                for (const uid of uids) yield { uid, ok: false, error: new ValidationError('Active file/folder not found') };
+            };
+            await d.engine.deleteItem('Big/b.bin');
+            await d.engine.replayRemoteOps();
+            const details = stateDb.listActivity().map((a) => a.details);
+            expect(details).toContain('Already in Proton Drive Trash');
+            expect(details.filter((t) => t.startsWith('Not moved to Proton Drive Trash'))).toEqual([]);
+        });
+
+        test('a pass whose listing still has a file trashed meanwhile never downloads it', async () => {
+            const d = await pinning();
+            d.engine.availability.setPin(d.uid('Big'), 'pinned', false);
+            // Trashed by this computer, but a listing read before still names it (as after a restart)
+            const node = d.nodes.get(d.uid('Big/b.bin'))!;
+            d.nodes.set(node.uid, { ...node, trashTime: new Date() });
+            const st = undefined;
+            await (d.engine as any).observingLocal((since: number) =>
+                (d.engine as any).reconcileSinglePath('Big/b.bin', node, st, undefined, new Map(), stateDb.getSettings(), since),
+            );
+            expect(await stat(d.local('Big/b.bin')).catch(() => null)).toBeNull();
+        });
+    });
 });
