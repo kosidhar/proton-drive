@@ -2,6 +2,7 @@
 
 use crate::{drive_status_line, offers_mount_again, ConflictRecord, DaemonStatus};
 
+#[cfg_attr(not(test), allow(dead_code))] // used by Home in Task 4
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
     Ok,
@@ -11,6 +12,7 @@ pub enum Tone {
     Offline,
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // used by Home in Task 4
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusSummary {
     pub headline: String,
@@ -18,12 +20,14 @@ pub struct StatusSummary {
     pub tone: Tone,
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // used by Home in Task 4
 fn summary(headline: impl Into<String>, detail: Option<String>, tone: Tone) -> StatusSummary {
     StatusSummary { headline: headline.into(), detail, tone }
 }
 
 /// What the app says about the sync in a sentence, in the user's terms. Never echoes the daemon's own wording.
 /// Precedence: unreachable, paused, syncing, needs attention, up to date.
+#[cfg_attr(not(test), allow(dead_code))] // used by Home in Task 4
 pub fn status_summary(status: &DaemonStatus, daemon_online: bool, attention: usize, now_ms: i64) -> StatusSummary {
     if !daemon_online {
         return summary("Can't reach Proton Drive's background service", None, Tone::Offline);
@@ -46,6 +50,7 @@ pub fn status_summary(status: &DaemonStatus, daemon_online: bool, attention: usi
     summary("Up to date", detail, Tone::Ok)
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // used by Home in Task 4
 fn syncing_headline(status: &DaemonStatus) -> String {
     let transfers = &status.active_transfers;
     let uploads = transfers.iter().filter(|t| t.direction == "upload").count();
@@ -66,6 +71,7 @@ fn syncing_headline(status: &DaemonStatus) -> String {
 }
 
 /// "just now", "2 min ago", "2 h ago", "3 days ago"; a negative (future) time reads as "just now".
+#[cfg_attr(not(test), allow(dead_code))] // used by Home in Task 4
 pub fn ago(ms: i64) -> String {
     let secs = ms / 1000;
     if secs < 60 {
