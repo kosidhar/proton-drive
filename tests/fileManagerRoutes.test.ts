@@ -96,6 +96,52 @@ describe('driveRelPath', () => {
 });
 
 describe('EventFeed', () => {
+    // #128: a send that fails ends the stream (so its slot is let go of), and a failure in one feed is that feed's only
+    test('a send that fails closes the stream and lets go of the events', () => {
+        const { events, flush } = manualEvents();
+        const out = fakeSink();
+        new EventFeed(out.sink, makeSource(events), { pingMs: 0 });
+        (out.sink as any).enqueue = () => {
+            throw new Error('reader gone');
+        };
+        events.touch('Docs/a.txt');
+        flush();
+        expect(out.closed).toBe(true);
+        expect(events.listenerCount).toBe(0);
+    });
+
+    test('a feed whose hello cannot be sent subscribes to nothing and keeps no ping', () => {
+        const { events } = manualEvents();
+        const out = fakeSink();
+        (out.sink as any).enqueue = () => {
+            throw new Error('reader gone');
+        };
+        const feed = new EventFeed(out.sink, makeSource(events), { pingMs: 1000 });
+        expect(feed.isClosed).toBe(true);
+        expect(out.closed).toBe(true);
+        expect(events.listenerCount).toBe(0);
+        expect((feed as any).ping).toBeNull();
+    });
+
+    test('the root failing as a change is sent ends that feed only, and the other feeds still get it', () => {
+        const { events, flush } = manualEvents();
+        let rootFails = false;
+        const failing = { ...makeSource(events), root: () => {
+            if (rootFails) throw new Error('settings gone');
+            return { syncDir: SYNC_DIR, mode: 'virtual' as const, mounted: true };
+        } } as FileManagerSource;
+        const broken = fakeSink();
+        const fine = fakeSink();
+        new EventFeed(broken.sink, failing, { pingMs: 0 });
+        new EventFeed(fine.sink, makeSource(events), { pingMs: 0 });
+        rootFails = true;
+        events.touch('Docs/a.txt');
+        expect(() => flush()).not.toThrow();
+        expect(broken.closed).toBe(true);
+        expect(events.listenerCount).toBe(1);
+        expect(fine.lines.at(-1)).toMatchObject({ type: 'changed' });
+    });
+
     test('says hello, then sends changes with absolute paths, and resets', () => {
         const { events, flush } = manualEvents();
         const out = fakeSink();
@@ -253,6 +299,35 @@ describe('file manager routes on the control socket', () => {
         } as unknown as FileManagerSource;
         expect(fileManagerRoute(new Request(url), url, noEvents).status).toBe(503);
         expect(openEventStreams()).toBe(0);
+    });
+
+    // #128: on a real stream, a send that fails (here, the stream errored under it) lets go of the stream's slot
+    test('a stream whose send fails lets go of its slot', async () => {
+        await until(() => openEventStreams() === 0);
+        const { events, flush } = manualEvents();
+        const url = new URL('http://localhost/fm/events');
+        const res = fileManagerRoute(new Request(url), url, makeSource(events, []));
+        expect(openEventStreams()).toBe(1);
+        const reader = res.body!.getReader();
+        await reader.read(); // the hello
+        // The stream errors under the feed (a broken connection): sending and closing it both throw from here on
+        const enqueue = ReadableStreamDefaultController.prototype.enqueue;
+        const close = ReadableStreamDefaultController.prototype.close;
+        ReadableStreamDefaultController.prototype.enqueue = () => {
+            throw new TypeError('Invalid state');
+        };
+        ReadableStreamDefaultController.prototype.close = () => {
+            throw new TypeError('Invalid state');
+        };
+        try {
+            events.touch('Docs');
+            flush();
+        } finally {
+            ReadableStreamDefaultController.prototype.enqueue = enqueue;
+            ReadableStreamDefaultController.prototype.close = close;
+        }
+        expect(openEventStreams()).toBe(0);
+        expect(events.listenerCount).toBe(0);
     });
 
     test('a 17th event stream is refused', async () => {
