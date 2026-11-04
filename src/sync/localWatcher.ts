@@ -8,6 +8,13 @@ export type LocalFileChangeEvent = {
     eventType: 'change' | 'rename';
 };
 
+// An ignore pattern as a plain glob, as in .gitignore: Bun.Glob would take a leading ! as negating the whole pattern and
+// parentheses as extglobs (!(x), @(a|b), +(…), *(…)), which can match nearly anything, so no check of what a pattern
+// hides could hold (#147). Those characters are taken literally instead.
+function plainGlob(pattern: string): string {
+    return pattern.replace(/[()]/g, (c) => `\\${c}`).replace(/^!/, '\\!');
+}
+
 export function matchesIgnorePatterns(relPath: string, patterns: string[]): boolean {
     const normalized = relPath.split(path.sep).join('/');
     if (!normalized || normalized === '.') {
@@ -31,7 +38,7 @@ export function matchesIgnorePatterns(relPath: string, patterns: string[]): bool
         if (segments.includes(trimmed.replace(/\/\*\*$/, ''))) {
             return true;
         }
-        const glob = new Bun.Glob(trimmed);
+        const glob = new Bun.Glob(plainGlob(trimmed));
         if (glob.match(normalized) || glob.match(baseName)) {
             return true;
         }
