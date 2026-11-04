@@ -395,6 +395,14 @@ fn drive_status_line(v: &VfsStatus, sync_dir: &str) -> String {
     }
 }
 
+/// Why the virtual drive switch can't be used right now: the drive is moving files or starting.
+fn switch_wait_reason(v: &VfsStatus) -> Option<String> {
+    matches!(v.reason.as_deref(), Some("moving" | "starting")).then(|| match v.reason.as_deref() {
+        Some("starting") => "Starting the virtual drive…".to_string(),
+        _ => drive_status_line(v, ""),
+    })
+}
+
 /// Mount again is offered for a virtual drive left unmounted by an eject, a crash streak or a busy mount point.
 fn offers_mount_again(v: &VfsStatus) -> bool {
     v.mode == "virtual" && !v.mounted && matches!(v.reason.as_deref(), Some("ejected" | "crashed" | "mount-point-busy"))
@@ -911,6 +919,31 @@ fn allowed_in_screenshot_mode(cmd: &WorkerCommand) -> bool {
     matches!(cmd, WorkerCommand::RefreshAll | WorkerCommand::LoadConflicts)
 }
 
+/// Screenshot-only: `--fake-attention N`: N conflicts named report.pdf, notes.txt and a 120-character name in turn, and
+/// two failed items.
+fn fake_attention_items(n: usize) -> Vec<home::Attention> {
+    let long = format!("{}.docx", "a-very-long-file-name-".repeat(6).chars().take(115).collect::<String>());
+    let names = ["report.pdf".to_string(), "notes.txt".to_string(), long];
+    let mut items: Vec<home::Attention> = (0..n)
+        .map(|i| home::Attention::Conflict { id: i as u64 + 1, rel_path: format!("Documents/{}", names[i % 3]) })
+        .collect();
+    items.push(home::Attention::FailedItems(2));
+    items
+}
+
+/// Screenshot-only: `--fake-transfers N`: N uploads, each 40% of 10 MB done.
+fn fake_transfers(n: usize) -> Vec<ActiveTransfer> {
+    (0..n)
+        .map(|i| ActiveTransfer {
+            id: format!("fake-{i}"),
+            direction: "upload".into(),
+            rel_path: format!("Photos/Holiday/IMG_{:04}.jpg", i + 1),
+            bytes_transferred: 4_000_000,
+            total_bytes: 10_000_000,
+        })
+        .collect()
+}
+
 /// Screenshot-only: the drive status `--drive-status` names (with `--drive-move`, a move that stopped), as the vfs to show
 /// and the switch's state; None for an unknown name.
 fn fake_drive_status(name: &str, move_kind: Option<&str>, sync_dir: &str, home: &str) -> Option<(VfsStatus, bool)> {
@@ -1173,6 +1206,10 @@ struct ProtonDriveNativeApp {
     fake_drive: Option<(String, Option<String>)>,
     /// Screenshot-only: `--files-missing`, the daemon holding with the files missing, laid over every status
     fake_files_missing: bool,
+    /// Screenshot-only: `--fake-attention`, how many conflicts Home lists (plus two failed items)
+    fake_attention: Option<usize>,
+    /// Screenshot-only: `--fake-transfers`, how many uploads Home shows in progress
+    fake_transfers: Option<usize>,
 
     // Window geometry state
     window_geometry: WindowGeometry,
@@ -1276,6 +1313,8 @@ impl ProtonDriveNativeApp {
             edit_notifications,
             fake_drive: None,
             fake_files_missing: false,
+            fake_attention: None,
+            fake_transfers: None,
             window_geometry,
             maximize_applied_on_open: false,
             applied_light_mode: initial_light,
@@ -1287,6 +1326,12 @@ impl ProtonDriveNativeApp {
     }
 
     /// Screenshot-only: lays `--files-missing` over a status from the daemon.
+    fn apply_fake_transfers(&self, status: &mut DaemonStatus) {
+        if let Some(n) = self.fake_transfers {
+            status.active_transfers = fake_transfers(n);
+        }
+    }
+
     fn apply_fake_files_missing(&self, status: &mut DaemonStatus) {
         if !self.fake_files_missing {
             return;
@@ -1364,7 +1409,10 @@ impl ProtonDriveNativeApp {
 
     /// Recomputes what Needs attention lists (and the Home badge counts) from the status and the conflicts.
     fn refresh_attention(&mut self) {
-        self.attention = home::attention_items(&self.status, &self.conflicts);
+        self.attention = match self.fake_attention {
+            Some(n) => fake_attention_items(n),
+            None => home::attention_items(&self.status, &self.conflicts),
+        };
     }
 
     fn process_worker_events(&mut self) {
@@ -1380,6 +1428,7 @@ impl ProtonDriveNativeApp {
                         self.initial_connecting = false;
                         self.apply_fake_drive(&mut s);
                         self.apply_fake_files_missing(&mut s);
+                        self.apply_fake_transfers(&mut s);
                         // Edits being made or saved stay as they are; Save compares them with what they were loaded from
                         if !self.settings_dirty && !self.settings_saving {
                             self.load_settings_form(&s.settings);
@@ -2251,7 +2300,6 @@ impl ProtonDriveNativeApp {
 
     /// The drive: where it is, and the virtual drive switch. Its state, Mount again and a move that stopped are Home's.
     fn render_drive_card(&mut self, ui: &mut egui::Ui, vfs: &VfsStatus) {
-        let moving = vfs.reason.as_deref() == Some("moving");
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.label(RichText::new("Drive").size(16.0).strong().color(TEXT_PRIMARY()));
@@ -2271,7 +2319,7 @@ impl ProtonDriveNativeApp {
             // On is what the user chose (the daemon's virtualDriveWanted); without FUSE the drive is a plain folder anyway
             let on = self.status.virtual_drive_wanted.unwrap_or(vfs.mode == "virtual");
             let clicked = ui
-                .add_enabled_ui(!self.drive_working && !moving, |ui| {
+                .add_enabled_ui(!self.drive_working && switch_wait_reason(vfs).is_none(), |ui| {
                     ui.horizontal(|ui| {
                         let switch = toggle_switch(ui, on);
                         ui.add_space(4.0);
@@ -2311,6 +2359,10 @@ impl ProtonDriveNativeApp {
                     )
                     .wrap(),
                 );
+            } else if let Some(why) = switch_wait_reason(vfs) {
+                // The switch is disabled while the drive moves files or starts: say so
+                ui.add_space(6.0);
+                ui.add(egui::Label::new(RichText::new(why).size(12.5).color(TEXT_MUTED())).wrap());
             }
             if self.drive_working {
                 ui.add_space(10.0);
@@ -3537,6 +3589,8 @@ OPTIONS:
   --confirm-files-missing  with --screenshot: also show the confirmation for deleting them from Proton Drive too
   --login-error <TEXT>  with --screenshot: show TEXT as a failed sign-in
   --hidden-items        with --screenshot: list two items as hidden from this computer in Settings
+  --fake-attention <N>  with --screenshot: list N conflicts (and two failed items) under Needs attention on Home
+  --fake-transfers <N>  with --screenshot: show N uploads in progress on Home
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --version             print the version
   -h, --help            print this help
@@ -3565,6 +3619,8 @@ fn main() -> eframe::Result {
     let mut cli_confirm_files_missing = false;
     let mut cli_login_error: Option<String> = None;
     let mut cli_hidden_items = false;
+    let mut cli_fake_attention: Option<usize> = None;
+    let mut cli_fake_transfers: Option<usize> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -3592,6 +3648,12 @@ fn main() -> eframe::Result {
             "--confirm-files-missing" => {
                 cli_files_missing = true;
                 cli_confirm_files_missing = true;
+            }
+            "--fake-attention" => {
+                cli_fake_attention = args.next().and_then(|v| v.parse().ok());
+            }
+            "--fake-transfers" => {
+                cli_fake_transfers = args.next().and_then(|v| v.parse().ok());
             }
             "--hidden-items" => {
                 cli_hidden_items = true;
@@ -3632,6 +3694,9 @@ fn main() -> eframe::Result {
     // Before any thread starts: a screenshot only reads (see allowed_in_screenshot_mode and control_request_at)
     SCREENSHOT_MODE.store(screenshot_target.is_some(), AtomicOrdering::SeqCst);
 
+    if screenshot_target.is_none() && (cli_fake_attention.is_some() || cli_fake_transfers.is_some()) {
+        eprintln!("protondrive-gui: --fake-attention and --fake-transfers only apply together with --screenshot; ignoring them");
+    }
     let fake_drive = if cli_drive_status.is_some() || cli_drive_move.is_some() {
         // A move alone is shown as the move that failed
         let name = cli_drive_status.unwrap_or_else(|| "move-failed".to_string());
@@ -3743,9 +3808,12 @@ fn main() -> eframe::Result {
                 }
                 app.fake_drive = fake_drive;
                 app.fake_files_missing = cli_files_missing;
+                app.fake_attention = cli_fake_attention;
+                app.fake_transfers = cli_fake_transfers;
                 let mut status = std::mem::take(&mut app.status);
                 app.apply_fake_drive(&mut status);
                 app.apply_fake_files_missing(&mut status);
+                app.apply_fake_transfers(&mut status);
                 app.status = status;
                 app.refresh_attention();
                 if cli_confirm_files_missing {
@@ -3758,6 +3826,9 @@ fn main() -> eframe::Result {
                 if cli_hidden_items {
                     let item = |path: &str, state: &str| HiddenItem { path: path.into(), state: state.into() };
                     app.hidden = Some(Ok(vec![item("Archive/2019 taxes", "hidden"), item("Docs/Private", "hiding")]));
+                } else {
+                    // The worker doesn't read the list in a screenshot: show it empty rather than loading forever
+                    app.hidden = Some(Ok(Vec::new()));
                 }
                 if let Some(error) = cli_login_error {
                     app.show_account_error(format!("Couldn't start signing in: {error}"));
@@ -4217,6 +4288,8 @@ mod tests {
                 edit_notifications: false,
                 fake_drive: None,
                 fake_files_missing: false,
+                fake_attention: None,
+                fake_transfers: None,
                 window_geometry: WindowGeometry::default(),
                 maximize_applied_on_open: true,
                 applied_light_mode: false,
@@ -5511,6 +5584,42 @@ mod tests {
         // Switched off is the user's own choice: nothing to explain
         let h = Harness::settings(Some(vfs("plain", false, Some("switched-off"))), Some(false));
         assert!(h.text_at("Plain folder: virtual drive switched off").is_none());
+    }
+
+    #[test]
+    fn while_the_drive_moves_files_or_starts_the_disabled_switch_says_why() {
+        let h = Harness::settings(Some(vfs("virtual", false, Some("moving"))), Some(true));
+        assert!(h.text_at("Moving files…").is_some());
+        let h = Harness::settings(Some(vfs("virtual", false, Some("starting"))), Some(true));
+        assert!(h.text_at("Starting the virtual drive…").is_some());
+        let h = Harness::settings(Some(vfs("virtual", true, None)), Some(true));
+        assert!(h.text_at("Moving files…").is_none());
+        assert!(h.text_at("Starting the virtual drive…").is_none());
+    }
+
+    #[test]
+    fn fake_attention_cycles_the_names_and_adds_failed_items() {
+        let items = fake_attention_items(4);
+        assert_eq!(items.len(), 5);
+        let name = |i: usize| match &items[i] {
+            home::Attention::Conflict { rel_path, .. } => rel_path.rsplit('/').next().unwrap().to_string(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(name(0), "report.pdf");
+        assert_eq!(name(1), "notes.txt");
+        assert_eq!(name(2).chars().count(), 120);
+        assert_eq!(name(3), "report.pdf");
+        assert_eq!(items[4], home::Attention::FailedItems(2));
+        let ids: std::collections::HashSet<_> =
+            items.iter().filter_map(|a| if let home::Attention::Conflict { id, .. } = a { Some(*id) } else { None }).collect();
+        assert_eq!(ids.len(), 4);
+    }
+
+    #[test]
+    fn fake_transfers_are_uploads_at_forty_percent_of_ten_megabytes() {
+        let t = fake_transfers(3);
+        assert_eq!(t.len(), 3);
+        assert!(t.iter().all(|t| t.direction == "upload" && t.total_bytes == 10_000_000 && t.bytes_transferred == 4_000_000));
     }
 
     #[test]
