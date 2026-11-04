@@ -9808,6 +9808,133 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
     });
 
+    describe('a drive rename or delete and a resolution by the conflict setting never overlap (#121)', () => {
+        const conflicted = async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'original');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            await writeFile(local('a.txt'), 'local edit');
+            d.nodes.set(d.uid('a.txt'), makeMockNode({ uid: d.uid('a.txt'), parentUid: d.root.uid, nameStr: 'a.txt', type: NodeType.File, content: 'cloud edit' }));
+            stateDb.updateSettings({ conflictStrategy: 'keep-local' });
+            return { ...d, engine, local };
+        };
+
+        test('a delete through the drive waits for a keep-local by the setting, then deletes what it left', async () => {
+            const d = await conflicted();
+            // Holds the keep-local's upload of a.txt until released
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            (d.sdk as any).getFileRevisionUploader = ((orig) => async (...args: unknown[]) => {
+                entered();
+                await gate;
+                return orig(...args);
+            })((d.sdk as any).getFileRevisionUploader.bind(d.sdk));
+            const pass = d.engine.reconcileNow();
+            await inside;
+            let deleted = false;
+            const del = d.engine.deleteItem('a.txt').then(() => (deleted = true));
+            await Bun.sleep(20);
+            expect(deleted).toBe(false);
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
+            release();
+            await pass;
+            await del;
+            await d.engine.replayRemoteOps();
+            // The keep-local landed first, then the user's delete took the file: what the delete said is what happened
+            expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-local']);
+            expect(await stat(d.local('a.txt')).catch(() => null)).toBeNull();
+            expect(d.calls.trashed.flat()).toContain(d.uid('a.txt'));
+        });
+
+        test('a delete queued behind another drive change is refused if a resolution by the setting starts meanwhile', async () => {
+            const d = await conflicted();
+            // Another drive change holds the turn
+            let releaseRename!: () => void;
+            const renameGate = new Promise<void>((resolve) => (releaseRename = resolve));
+            let renaming!: () => void;
+            const renameInside = new Promise<void>((resolve) => (renaming = resolve));
+            const renameLocally = (d.engine as any).renameLocally.bind(d.engine);
+            (d.engine as any).renameLocally = async (...args: unknown[]) => {
+                renaming();
+                await renameGate;
+                return renameLocally(...args);
+            };
+            const rename = d.engine.renameItem('Kept.txt', 'Kept2.txt');
+            await renameInside;
+            const del = d.engine.deleteItem('a.txt').then(
+                () => null,
+                (error: unknown) => error,
+            );
+            await Bun.sleep(10); // past its wait for resolutions: queued for its turn
+            // A resolution by the setting starts on a.txt, its upload held
+            let releaseUpload!: () => void;
+            const uploadGate = new Promise<void>((resolve) => (releaseUpload = resolve));
+            let uploading!: () => void;
+            const uploadInside = new Promise<void>((resolve) => (uploading = resolve));
+            (d.sdk as any).getFileRevisionUploader = ((orig) => async (...args: unknown[]) => {
+                uploading();
+                await uploadGate;
+                return orig(...args);
+            })((d.sdk as any).getFileRevisionUploader.bind(d.sdk));
+            const record = stateDb.getItemByPath('a.txt')!;
+            const resolving = (d.engine as any).handleFileConflict(
+                'a.txt', d.local('a.txt'), d.nodes.get(d.uid('a.txt')), 'local-sha1', null, 0, 0, new Map(),
+                stateDb.getSettings(), 0, record,
+            );
+            await uploadInside;
+            releaseRename();
+            await rename;
+            expect(await del).toMatchObject({ code: 'EIO' });
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
+            releaseUpload();
+            await resolving;
+            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('local edit');
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
+        });
+
+        test('a pass reaching the conflict while a drive rename of the file runs leaves it to the next pass', async () => {
+            const d = await conflicted();
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            const renameLocally = (d.engine as any).renameLocally.bind(d.engine);
+            (d.engine as any).renameLocally = async (...args: unknown[]) => {
+                entered();
+                await gate;
+                return renameLocally(...args);
+            };
+            const rename = d.engine.renameItem('a.txt', 'b.txt');
+            await inside;
+            await (d.engine as any).handleFileConflict(
+                'a.txt',
+                d.local('a.txt'),
+                d.nodes.get(d.uid('a.txt')),
+                'local-sha1',
+                null,
+                0,
+                0,
+                new Map(),
+                stateDb.getSettings(),
+                0,
+                stateDb.getItemByPath('a.txt') ?? undefined,
+            );
+            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('cloud edit'); // nothing uploaded under the rename
+            release();
+            await rename;
+            expect(await readFile(d.local('b.txt'), 'utf8')).toBe('local edit');
+        });
+    });
+
     describe('keep-both again after an unfinished one, when the earlier copy goes as it uploads (#137)', () => {
         for (const what of ['deleted', 'moved'] as const) test(`a retry by hand after the earlier copy is ${what} makes a new copy from the file as it is, and no upload is said to have failed`, async () => {
             const d = makeMockDrive();
