@@ -748,13 +748,18 @@ export class SyncStateDatabase {
                 $bytesTransferred: entry.bytesTransferred ?? 0,
             });
 
-        this.onActivity?.({ action: entry.action, localRelPath: entry.localRelPath, details: entry.details });
-
         // Keep last 500 activity log entries
         this.db.run(`
             DELETE FROM activity_log
             WHERE id NOT IN (SELECT id FROM activity_log ORDER BY id DESC LIMIT 500)
         `);
+
+        // Best effort: a log handler failing never fails what logged the entry
+        try {
+            this.onActivity?.({ action: entry.action, localRelPath: entry.localRelPath, details: entry.details });
+        } catch {
+            // the entry is in the activity log all the same
+        }
     }
 
     listActivity(limit = 50): ActivityRecord[] {
