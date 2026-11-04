@@ -193,6 +193,23 @@ class OpenTrashTest(unittest.TestCase):
             tray.ProtonDriveTrayIndicator.on_open_trash(object(), None)
         spawn.assert_called_once_with(["xdg-open", "https://drive.proton.me/trash"])
 
+    def test_the_menu_offers_it_with_the_hover_naming_the_sync_folder(self):
+        tray.Gtk.MenuItem.reset_mock()
+        with mock.patch.object(tray.ProtonDriveTrayIndicator, "poll_status"):
+            indicator = tray.ProtonDriveTrayIndicator()
+        self.assertIn(mock.call(label="Open Proton Drive Trash"), tray.Gtk.MenuItem.call_args_list)
+        item = indicator.open_trash_item
+        item.connect.assert_any_call("activate", indicator.on_open_trash)
+        indicator.menu.append.assert_any_call(item)
+
+    def test_the_hover_says_where_restored_files_come_back(self):
+        home = os.path.expanduser("~")
+        self.assertEqual(
+            tray.trash_tooltip(os.path.join(home, "ProtonDrive")),
+            "Deleted files stay here until you empty the trash or restore them. Restoring brings them back to ~/ProtonDrive.",
+        )
+        self.assertTrue(tray.trash_tooltip("/srv/u/Drive").endswith("back to /srv/u/Drive."))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5154,14 +5154,29 @@ mod tests {
         h.click(h.text_at("Open in Files").unwrap());
         assert_eq!(launched(), vec!["/srv/u/ProtonDrive".to_string()]);
         assert_eq!(h.sent(), Vec::<String>::new()); // nothing goes to the daemon
+        // Not before a folder is set up
+        let h = home_with(|s| s.sync_dir = String::new());
+        assert!(h.text_at("Open Proton Drive Trash").is_none());
 
         let mut h = Harness::settings(None, None);
+        h.app.status.logged_in = true;
+        h.frames(2);
         h.click(h.text_at("Open Proton Drive Trash").expect("the trash is offered in Settings"));
         assert_eq!(launched(), vec!["https://drive.proton.me/trash".to_string()]);
         h.click(h.text_at("Open Proton Drive on the web").expect("Proton Drive on the web is offered"));
         assert_eq!(launched(), vec!["https://drive.proton.me".to_string()]);
+        // Signed out, Sign in is the one thing to do
+        h.app.status.logged_in = false;
+        h.frames(2);
+        assert!(h.text_at("Open Proton Drive Trash").is_none());
+        assert!(h.text_at("Open Proton Drive on the web").is_none());
 
-        home::open_externally(std::ffi::OsStr::new("https://drive.proton.me/trash"), true);
+        // A screenshot opens nothing, from the same buttons
+        home::AS_SCREENSHOT.with(|s| s.set(true));
+        let mut h = home_with(|s| s.sync_dir = "/srv/u/ProtonDrive".into());
+        h.click(h.text_at("Open Proton Drive Trash").unwrap());
+        h.click(h.text_at("Open in Files").unwrap());
+        home::AS_SCREENSHOT.with(|s| s.set(false));
         assert_eq!(launched(), Vec::<String>::new(), "a screenshot opens nothing");
     }
 

@@ -87,17 +87,20 @@ impl ProtonDriveNativeApp {
                     });
                 });
             }
-            // Proton Drive on the web, and its trash, where a delete through the drive puts what was deleted (#201)
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                if secondary_button(ui, "Open Proton Drive on the web", 30.0).clicked() {
-                    open_in_browser(PROTON_DRIVE_WEB_URL);
-                }
-                ui.add_space(8.0);
-                if secondary_button(ui, OPEN_TRASH, 30.0).on_hover_text(trash_hover(&self.status.sync_dir)).clicked() {
-                    open_in_browser(PROTON_DRIVE_TRASH_URL);
-                }
-            });
+            // Proton Drive on the web, and its trash, where a delete through the drive puts what was deleted (#201).
+            // Signed in only: signed out, Sign in is the one thing to do
+            if self.status.logged_in {
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if secondary_button(ui, "Open Proton Drive on the web", 30.0).clicked() {
+                        open_in_browser(PROTON_DRIVE_WEB_URL);
+                    }
+                    ui.add_space(8.0);
+                    if secondary_button(ui, OPEN_TRASH, 30.0).on_hover_text(trash_hover(&self.status.sync_dir)).clicked() {
+                        open_in_browser(PROTON_DRIVE_TRASH_URL);
+                    }
+                });
+            }
             // How signing in or out went (the sign-in page opening, or why it failed)
             if let Some(error) = &self.account_error {
                 ui.add_space(8.0);

@@ -285,7 +285,7 @@ fn tone_color(tone: Tone) -> Color32 {
 
 /// Opens a folder in the file manager; a screenshot opens nothing.
 fn open_in_files(folder: &std::path::Path) {
-    open_externally(folder.as_os_str(), SCREENSHOT_MODE.load(Ordering::SeqCst));
+    open_externally(folder.as_os_str(), screenshot());
 }
 
 /// Proton Drive on the web, and its trash: where a delete through the drive puts what was deleted (#201)
@@ -301,7 +301,17 @@ pub(crate) fn trash_hover(sync_dir: &str) -> String {
 
 /// Opens a page in the default browser; a screenshot opens nothing.
 pub(crate) fn open_in_browser(url: &str) {
-    open_externally(std::ffi::OsStr::new(url), SCREENSHOT_MODE.load(Ordering::SeqCst));
+    open_externally(std::ffi::OsStr::new(url), screenshot());
+}
+
+/// Whether the app only renders a screenshot. A test can say so for its own thread (AS_SCREENSHOT), as the global is
+/// shared by tests running at once
+fn screenshot() -> bool {
+    #[cfg(test)]
+    if AS_SCREENSHOT.with(|s| s.get()) {
+        return true;
+    }
+    SCREENSHOT_MODE.load(Ordering::SeqCst)
 }
 
 /// The one way the app opens a folder or a page, with the desktop's own handler (xdg-open), except in a screenshot.
@@ -325,6 +335,8 @@ fn spawn_opener(target: &std::ffi::OsStr) {
 thread_local! {
     /// What open_externally would have opened, on this test's thread
     pub(crate) static LAUNCHED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// This test's thread renders as a screenshot does (see screenshot)
+    pub(crate) static AS_SCREENSHOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A secondary (outlined) button, as wide as its label.
@@ -580,17 +592,17 @@ impl ProtonDriveNativeApp {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // Laid out from the right: Open in Files, then the trash beside it
+                    // Laid out from the right: Open in Files, then the trash beside it. Neither before a folder is set up
                     if !sync_dir.is_empty() {
                         if secondary_button(ui, "Open in Files", 32.0).clicked() {
                             open_in_files(std::path::Path::new(&sync_dir));
                         }
                         ui.add_space(8.0);
+                        if secondary_button(ui, OPEN_TRASH, 32.0).on_hover_text(trash_hover(&sync_dir)).clicked() {
+                            open_in_browser(PROTON_DRIVE_TRASH_URL);
+                        }
+                        ui.add_space(8.0);
                     }
-                    if secondary_button(ui, OPEN_TRASH, 32.0).on_hover_text(trash_hover(&sync_dir)).clicked() {
-                        open_in_browser(PROTON_DRIVE_TRASH_URL);
-                    }
-                    ui.add_space(8.0);
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
                         let shown = if sync_dir.is_empty() { "Not set up yet".to_string() } else { shown_folder(&sync_dir) };
                         elided(ui, RichText::new(&shown).size(14.0).strong().color(TEXT_PRIMARY()), &sync_dir);
