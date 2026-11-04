@@ -4235,7 +4235,7 @@ export class ProtonDriveSyncEngine {
                     }
                 })();
                 if (source) {
-                    this.moveLocalOrUndo(fromRel, toRel, replacing, snapshot);
+                    this.moveLocalOrUndo(fromRel, toRel, replacing, snapshot, () => records.dropSubtree(fromRel));
                 }
                 // Work still under way anywhere in the old subtree (an upload, say) must not record its old path once
                 // done; a node it makes follows the item (see adoptStrayNode). Noted as soon as the item has moved, so that
@@ -4870,7 +4870,14 @@ export class ProtonDriveSyncEngine {
     // The file system half of a local move, once its records went in one transaction with the note of it: a replacing
     // rename(2) when the user asked to replace, otherwise a move that never replaces what is there. If it fails, the state
     // database is put back as it was and the error is thrown (`Already exists: <path>` for something now at toRel).
-    private moveLocalOrUndo(fromRel: string, toRel: string, replace: boolean, snapshot: LocalStepSnapshot): void {
+    // onMoved runs as soon as the item is where it goes, before anything after that can fail (#145)
+    private moveLocalOrUndo(
+        fromRel: string,
+        toRel: string,
+        replace: boolean,
+        snapshot: LocalStepSnapshot,
+        onMoved?: () => void,
+    ): void {
         const root = this.localRoot();
         let moved = false;
         let failure: unknown = null;
@@ -4888,6 +4895,7 @@ export class ProtonDriveSyncEngine {
             this.restoreLocalStep(snapshot);
             throw driveOpErrorOf(failure, toRel);
         }
+        onMoved?.();
         this.stateDb.deleteMeta(LOCAL_MOVE_IN_PROGRESS);
     }
 
@@ -5322,8 +5330,7 @@ export class ProtonDriveSyncEngine {
                 this.journal.retarget(fromRel, toRel);
                 this.stateDb.setMeta(LOCAL_MOVE_IN_PROGRESS, JSON.stringify({ from: fromRel, to: toRel, replace: false }));
             })();
-            this.moveLocalOrUndo(fromRel, toRel, false, snapshot);
-            records.dropSubtree(fromRel);
+            this.moveLocalOrUndo(fromRel, toRel, false, snapshot, () => records.dropSubtree(fromRel));
         }, { from: fromRel, to: toRel });
     }
 
