@@ -232,19 +232,26 @@ describe('SyncStateDatabase activity hook', () => {
 });
 
 describe('SyncStateDatabase conflict strategy (#91)', () => {
-    test('keep-local or keep-remote, stored by an older version, reads as keep-both; the stored value is left as it is', async () => {
+    test('keep-local or keep-remote, stored by an older version, reads as keep-both, and is stored as keep-both at the next open', async () => {
         const tempDir = await mkdtemp(path.join(tmpdir(), 'proton-drive-statedb-test-'));
         try {
             const dbPath = path.join(tempDir, 'state.sqlite');
             for (const retired of ['keep-local', 'keep-remote']) {
                 const stateDb = new SyncStateDatabase(dbPath);
                 const raw = new Database(dbPath);
+                const stored = () => (raw.query("SELECT value FROM settings WHERE key = 'conflictStrategy'").get() as { value: string }).value;
                 raw.run("INSERT OR REPLACE INTO settings (key, value) VALUES ('conflictStrategy', ?)", [retired]);
                 expect([retired, stateDb.getSettings().conflictStrategy]).toEqual([retired, 'keep-both']);
-                const stored = raw.query("SELECT value FROM settings WHERE key = 'conflictStrategy'").get() as { value: string };
-                expect(stored.value).toBe(retired);
-                raw.close();
                 stateDb.close();
+                expect(stored()).toBe(retired);
+                const reopened = new SyncStateDatabase(dbPath);
+                expect(stored()).toBe('keep-both'); // an older version run next never overwrites by it
+                expect(reopened.getSettings().conflictStrategy).toBe('keep-both');
+                reopened.updateSettings({ conflictStrategy: 'prompt' });
+                reopened.close();
+                expect(stored()).toBe('prompt'); // the other strategies are left as they are
+                expect(new SyncStateDatabase(dbPath).getSettings().conflictStrategy).toBe('prompt');
+                raw.close();
             }
         } finally {
             await rm(tempDir, { recursive: true, force: true });

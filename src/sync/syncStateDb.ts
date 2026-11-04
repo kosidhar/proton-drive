@@ -122,6 +122,27 @@ export class SyncStateDatabase {
         this.db.run('PRAGMA synchronous = NORMAL');
         this.db.run('PRAGMA busy_timeout = 5000');
         this.initSchema();
+        this.retireOverwritingStrategies();
+    }
+
+    // keep-local or keep-remote, stored before #91, is rewritten as keep-both once: read as keep-both already (see
+    // getSettings), it would turn overwriting back on for an older version run after this one. A write, so tried once:
+    // while the daemon holds the write lock (a CLI's own open), it is left for the daemon's open
+    private retireOverwritingStrategies(): void {
+        const stored = this.db.query("SELECT value FROM settings WHERE key = 'conflictStrategy'").get() as { value: string } | null;
+        if (!stored || !RETIRED_CONFLICT_STRATEGIES.includes(stored.value)) {
+            return; // Nothing to write: an open never waits on the write lock for it
+        }
+        try {
+            const changed = this.db
+                .query(`UPDATE settings SET value = 'keep-both' WHERE key = 'conflictStrategy' AND value IN ('keep-local', 'keep-remote')`)
+                .run().changes;
+            if (changed > 0) {
+                console.warn('The stored conflict strategy, which replaced one version with the other, is now keep-both (#91)');
+            }
+        } catch {
+            // Read as keep-both meanwhile
+        }
     }
 
     private initSchema(): void {

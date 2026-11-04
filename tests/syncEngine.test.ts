@@ -1658,10 +1658,10 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             let removalStarted!: () => void;
             const removing = new Promise<void>((resolve) => (removalStarted = resolve));
             files.onRemoval(1, () => removalStarted());
-            let uploading!: () => void;
-            const uploaded = new Promise<void>((resolve) => (uploading = resolve));
+            let downloading!: () => void;
+            const uploaded = new Promise<void>((resolve) => (downloading = resolve));
             duringUpload(sdk, 'Docs/n.txt', async () => {
-                uploading();
+                downloading();
                 await removing;
             });
             const handler = (engine as any).handleLocalFileChange('Docs/n.txt');
@@ -9898,13 +9898,13 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             );
             await Bun.sleep(10); // past its wait for resolutions: queued for its turn
             // A resolution by the setting starts on a.txt, its download held
-            let releaseUpload!: () => void;
-            const uploadGate = new Promise<void>((resolve) => (releaseUpload = resolve));
-            let uploading!: () => void;
-            const uploadInside = new Promise<void>((resolve) => (uploading = resolve));
+            let releaseDownload!: () => void;
+            const downloadGate = new Promise<void>((resolve) => (releaseDownload = resolve));
+            let downloading!: () => void;
+            const downloadInside = new Promise<void>((resolve) => (downloading = resolve));
             (d.sdk as any).getFileRevisionDownloader = ((orig) => async (...args: unknown[]) => {
-                uploading();
-                await uploadGate;
+                downloading();
+                await downloadGate;
                 return orig(...args);
             })((d.sdk as any).getFileRevisionDownloader.bind(d.sdk));
             const record = stateDb.getItemByPath('a.txt')!;
@@ -9912,12 +9912,12 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 'a.txt', d.local('a.txt'), d.nodes.get(d.uid('a.txt')), 'local-sha1', null, 0, 0, new Map(),
                 stateDb.getSettings(), 0, record,
             );
-            await uploadInside;
+            await downloadInside;
             releaseRename();
             await rename;
             expect(await del).toMatchObject({ code: 'EIO' });
             expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
-            releaseUpload();
+            releaseDownload();
             await resolving;
             // Both kept: the cloud's version in place, the local edit in its conflict copy, here and in the cloud
             expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('cloud edit');
