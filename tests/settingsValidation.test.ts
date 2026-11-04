@@ -384,3 +384,44 @@ describe('ignore patterns that are broad but leave files out are allowed (#43)',
         expect(usable.dropped).toBe(20);
     });
 });
+
+// #147: ignore patterns are plain globs, as in .gitignore: no extglob, no negation, which no fixed sample list can check
+describe('ignore patterns are matched as plain globs, never extglobs or negations (#147)', () => {
+    test('a leading ! and parentheses are taken literally', () => {
+        expect(matchesIgnorePatterns('Report.pdf', ['!(Bqk|4y k)'])).toBe(false);
+        expect(matchesIgnorePatterns('Report.pdf', ['!(*q*)'])).toBe(false);
+        expect(matchesIgnorePatterns('Report.pdf', ['!Bqk'])).toBe(false);
+        expect(matchesIgnorePatterns('notes', ['@(notes|todo)'])).toBe(false);
+        expect(matchesIgnorePatterns('aaa', ['+(a)'])).toBe(false);
+        expect(matchesIgnorePatterns('!(x)', ['!(x)'])).toBe(true);
+        expect(matchesIgnorePatterns('!draft', ['!draft'])).toBe(true);
+        expect(matchesIgnorePatterns('f(1).txt', ['*(1).txt'])).toBe(true);
+        expect(matchesIgnorePatterns('f1.txt', ['*(1).txt'])).toBe(false);
+    });
+
+    test('so they can no longer hide the drive past the check', () => {
+        for (const pattern of ['!(Bqk|4y k)', '!(*q*)', '!(*[qk]*)', '!Bqk']) {
+            expect(problemWithIgnorePatterns([pattern])).toBeNull(); // allowed: it hides only files named like that
+            expect(matchesIgnorePatterns('Documents/Report.pdf', [pattern])).toBe(false);
+        }
+    });
+
+    test('what the user escaped already stays as they wrote it', () => {
+        expect(matchesIgnorePatterns('(x)', ['\\(x\\)'])).toBe(true);
+        expect(matchesIgnorePatterns('Report (copy).pdf', ['Report \\(copy\\).pdf'])).toBe(true);
+        expect(matchesIgnorePatterns('a(', ['a[(]'])).toBe(true);
+        expect(matchesIgnorePatterns('a\\', ['a[(]'])).toBe(false);
+        expect(matchesIgnorePatterns('a(', ['a[\\(]'])).toBe(true);
+        expect(matchesIgnorePatterns('a\\', ['a[\\(]'])).toBe(false);
+        expect(matchesIgnorePatterns('ac', ['a!(b)'])).toBe(false);
+        expect(matchesIgnorePatterns('Report.pdf', [' !(x)'])).toBe(false);
+    });
+
+    test('ordinary globs still work', () => {
+        expect(matchesIgnorePatterns('a.bak', ['*.bak'])).toBe(true);
+        expect(matchesIgnorePatterns('b', ['[!a]*'])).toBe(true);
+        expect(matchesIgnorePatterns('a', ['[!a]*'])).toBe(false);
+        expect(matchesIgnorePatterns('x.tmp', ['*.{tmp,log}'])).toBe(true);
+        expect(matchesIgnorePatterns('build/out/x', ['build/**'])).toBe(true);
+    });
+});
