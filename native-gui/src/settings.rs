@@ -5,8 +5,8 @@ use eframe::egui::{self, Align, Color32, CornerRadius, FontFamily, FontId, Frame
 
 use crate::home::{elided, primary_button, secondary_button, storage};
 use crate::{
-    card_frame, is_light_mode, ProtonDriveNativeApp, WorkerCommand, BG_CARD_ALT, PROTON_PURPLE_TEXT, STATUS_DANGER,
-    TEXT_MUTED, TEXT_PRIMARY,
+    card_frame, is_light_mode, ProtonDriveNativeApp, WorkerCommand, BG_CARD_ALT, HIDDEN_NEEDS_RESTART, PROTON_PURPLE_TEXT,
+    STATUS_DANGER, TEXT_MUTED, TEXT_PRIMARY,
 };
 
 /// The plan, as the account's quota tells it.
@@ -124,6 +124,10 @@ impl ProtonDriveNativeApp {
                 None => {
                     ui.label(RichText::new("Loading…").size(13.0).color(TEXT_MUTED()));
                 }
+                // An older daemon, without the list: not an error, a restart brings it
+                Some(Err(e)) if e == HIDDEN_NEEDS_RESTART => {
+                    ui.add(egui::Label::new(RichText::new(e).size(12.5).color(TEXT_MUTED())).wrap());
+                }
                 Some(Err(e)) => {
                     ui.add(
                         egui::Label::new(RichText::new(format!("Couldn't load the list: {e}")).size(12.5).color(STATUS_DANGER))
@@ -165,9 +169,11 @@ impl ProtonDriveNativeApp {
                     }
                 }
             }
+            // How the last Unhide went: the items it had to keep as information, a refusal or failure as an error
             if let Some(notice) = &self.unhide_notice {
                 ui.add_space(6.0);
-                ui.add(egui::Label::new(RichText::new(notice).size(12.5).color(STATUS_DANGER)).wrap());
+                let color = if notice.error { STATUS_DANGER } else { TEXT_MUTED() };
+                ui.add(egui::Label::new(RichText::new(&notice.text).size(12.5).color(color)).wrap());
             }
         });
         if let Some(path) = unhide {

@@ -33,14 +33,30 @@ fn summary(headline: impl Into<String>, detail: Option<String>, tone: Tone) -> S
     StatusSummary { headline: headline.into(), detail, tone }
 }
 
+/// Whether the daemon has no account to sync with.
+pub fn signed_out(status: &DaemonStatus) -> bool {
+    !status.logged_in || status.state == "unauthenticated"
+}
+
 /// What the app says about the sync in a sentence, in the user's terms. Never echoes the daemon's own wording.
-/// Precedence: unreachable, paused, syncing, needs attention, up to date.
-pub fn status_summary(status: &DaemonStatus, daemon_online: bool, attention: usize, now_ms: i64) -> StatusSummary {
+/// `connecting`: the app's first try at reaching the daemon isn't over yet.
+/// Precedence: connecting or unreachable, signed out, paused, moving files, syncing, needs attention, stopped with no
+/// reason given, up to date.
+pub fn status_summary(status: &DaemonStatus, daemon_online: bool, connecting: bool, attention: usize, now_ms: i64) -> StatusSummary {
     if !daemon_online {
+        if connecting {
+            return summary("Connecting…", None, Tone::Busy);
+        }
         return summary("Can't reach Proton Drive's background service", None, Tone::Offline);
+    }
+    if signed_out(status) {
+        return summary("Signed out", Some("Sign in to sync your files".to_string()), Tone::Attention);
     }
     if status.state == "paused" || status.settings.paused {
         return summary("Paused", None, Tone::Paused);
+    }
+    if status.vfs.as_ref().is_some_and(|v| v.reason.as_deref() == Some("moving")) {
+        return summary("Moving files…", None, Tone::Busy);
     }
     if status.state == "syncing" {
         return summary(syncing_headline(status), None, Tone::Busy);
@@ -52,6 +68,10 @@ pub fn status_summary(status: &DaemonStatus, daemon_online: bool, attention: usi
             format!("{attention} problems need you")
         };
         return summary(headline, Some("See Needs attention below".to_string()), Tone::Attention);
+    }
+    // An error the daemon gave no words for (with words, it is in Needs attention and counted above)
+    if status.state == "error" {
+        return summary("Sync stopped", Some("Check the log or try Sync now".to_string()), Tone::Attention);
     }
     let detail = status.last_sync_at.map(|at| format!("Last synced {}", ago(now_ms - at)));
     summary("Up to date", detail, Tone::Ok)
@@ -105,20 +125,28 @@ pub enum Attention {
 
 /// Every problem the user can act on, each once: files missing, stopped move, drive not mounted, unresolved
 /// conflicts by id, failed items, last error (only when no files are missing, which explains it).
+///
+/// A stopped move is listed whenever the daemon reports one with something to do or say about it, whatever the drive
+/// is doing now: it attaches the move to a drive mounted (or ejected) again since the move failed. An unmounted virtual
+/// drive is listed too unless the move explains it or it is still starting or moving files.
 pub fn attention_items(status: &DaemonStatus, conflicts: &[ConflictRecord]) -> Vec<Attention> {
     let mut items = Vec::new();
     if status.files_missing.is_some() {
         items.push(Attention::FilesMissing);
     }
     if let Some(v) = &status.vfs {
-        match v.reason.as_deref() {
-            Some("move-failed") => items.push(Attention::StoppedMove),
-            Some("starting" | "moving") => {}
-            _ if v.mode == "virtual" && !v.mounted => items.push(Attention::DriveNotMounted {
+        let reason = v.reason.as_deref();
+        let move_to_act_on = v.drive_move.as_ref().is_some_and(|m| {
+            !m.actions.is_empty() || m.error.as_deref().is_some_and(|e| !e.trim().is_empty())
+        });
+        if move_to_act_on || reason == Some("move-failed") {
+            items.push(Attention::StoppedMove);
+        }
+        if v.mode == "virtual" && !v.mounted && !matches!(reason, Some("move-failed" | "starting" | "moving")) {
+            items.push(Attention::DriveNotMounted {
                 message: drive_status_line(v, &status.sync_dir),
                 can_mount: offers_mount_again(v),
-            }),
-            _ => {}
+            });
         }
     }
     let mut open: Vec<&ConflictRecord> = conflicts.iter().filter(|c| c.resolved == 0).collect();
@@ -154,6 +182,8 @@ pub fn pause_button(status: &DaemonStatus) -> (&'static str, bool) {
 /// How the drive is shown, under its location.
 pub fn drive_kind(vfs: Option<&VfsStatus>) -> &'static str {
     match vfs {
+        Some(v) if v.reason.as_deref() == Some("moving") => "Moving files…",
+        Some(v) if v.reason.as_deref() == Some("starting") => "Starting the virtual drive…",
         Some(v) if v.mode == "virtual" && v.mounted => "Virtual drive · mounted",
         Some(v) if v.mode == "virtual" => "Virtual drive · not mounted",
         _ => "Plain folder",
@@ -170,10 +200,37 @@ fn file_name(rel_path: &str) -> &str {
     rel_path.rsplit('/').next().unwrap_or(rel_path)
 }
 
-/// What happened to a conflict's file, by its name (its path is in the tooltip).
+/// What happened to a conflict's file, by its name (its path is in the tooltip). Unresolved conflicts only exist under
+/// the "ask me" strategy: the daemon queued the file for the user and kept nothing twice yet.
 pub fn conflict_title(rel_path: &str) -> String {
-    format!("Both copies kept: {}", file_name(rel_path))
+    format!("Changed here and in Proton Drive: {}", file_name(rel_path))
 }
+
+/// One way to resolve a conflict: what it asks the daemon for, its button and what its hover text says it does.
+pub struct ConflictChoice {
+    pub choice: &'static str,
+    pub label: &'static str,
+    pub hint: &'static str,
+}
+
+/// The choices in the order shown: Keep Both first, as the main one, since it replaces nothing.
+pub const CONFLICT_CHOICES: [ConflictChoice; 3] = [
+    ConflictChoice {
+        choice: "keep-both",
+        label: "Keep Both",
+        hint: "Keep both versions: this computer's is saved as a renamed copy next to the Proton Drive version",
+    },
+    ConflictChoice {
+        choice: "keep-local",
+        label: "Keep Local",
+        hint: "Use this computer's version: replaces the one in Proton Drive",
+    },
+    ConflictChoice {
+        choice: "keep-remote",
+        label: "Keep Remote",
+        hint: "Use the Proton Drive version: replaces the one on this computer",
+    },
+];
 
 pub fn failed_items_text(n: u64) -> String {
     if n == 1 {
@@ -280,23 +337,31 @@ impl ProtonDriveNativeApp {
             });
     }
 
+    /// The status in a sentence, with Pause and Sync now, or Sign in while signed out.
     fn render_status_block(&mut self, ui: &mut egui::Ui) {
-        let summary = status_summary(&self.status, self.daemon_online, self.attention.len(), now_ms());
+        let summary = status_summary(&self.status, self.daemon_online, self.initial_connecting, self.attention.len(), now_ms());
         let (pause_label, pause_to) = pause_button(&self.status);
+        // Pause and Sync now mean nothing without an account: Sign in, as Settings › Account offers it
+        let show_sign_in = self.daemon_online && signed_out(&self.status);
         let mut command = None;
+        let mut sign_in = false;
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal_top(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                    ui.add_enabled_ui(self.daemon_online, |ui| {
-                        if primary_button(ui, pause_label, 34.0).clicked() {
-                            command = Some(WorkerCommand::SetPaused(pause_to));
-                        }
-                        ui.add_space(4.0);
-                        if secondary_button(ui, "Sync now", 34.0).clicked() {
-                            command = Some(WorkerCommand::TriggerSync);
-                        }
-                    });
+                    if show_sign_in {
+                        sign_in = primary_button(ui, "Sign in", 34.0).clicked();
+                    } else {
+                        ui.add_enabled_ui(self.daemon_online, |ui| {
+                            if primary_button(ui, pause_label, 34.0).clicked() {
+                                command = Some(WorkerCommand::SetPaused(pause_to));
+                            }
+                            ui.add_space(4.0);
+                            if secondary_button(ui, "Sync now", 34.0).clicked() {
+                                command = Some(WorkerCommand::TriggerSync);
+                            }
+                        });
+                    }
                     ui.add_space(12.0);
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
                         let headline = RichText::new(&summary.headline).size(18.0).strong().color(tone_color(summary.tone));
@@ -305,12 +370,21 @@ impl ProtonDriveNativeApp {
                             ui.add_space(2.0);
                             ui.add(egui::Label::new(RichText::new(detail).size(12.5).color(TEXT_MUTED())).wrap());
                         }
+                        // The sign-in page opening (why it failed is in the notice below)
+                        if show_sign_in && self.login_url.is_some() {
+                            ui.add_space(2.0);
+                            let text = "Opening the Proton sign-in page in your browser…";
+                            ui.add(egui::Label::new(RichText::new(text).size(12.0).color(PROTON_PURPLE_TEXT())).wrap());
+                        }
                     });
                 });
             });
         });
         if let Some(command) = command {
             let _ = self.tx.send(command);
+        }
+        if sign_in {
+            self.send_account_command(WorkerCommand::StartLogin);
         }
     }
 
@@ -354,9 +428,20 @@ impl ProtonDriveNativeApp {
                         ui.add_space(8.0);
                         // Resolving needs the daemon, as Pause and Sync now do
                         let online = self.daemon_online;
-                        for (choice, label) in [("keep-both", "Keep Both"), ("keep-local", "Keep Local"), ("keep-remote", "Keep Remote")] {
-                            if ui.add_enabled_ui(online, |ui| secondary_button(ui, label, 30.0)).inner.clicked() {
-                                let _ = self.tx.send(WorkerCommand::ResolveConflict { id, choice: choice.to_string() });
+                        for (i, c) in CONFLICT_CHOICES.iter().enumerate() {
+                            let clicked = ui
+                                .add_enabled_ui(online, |ui| {
+                                    let button = if i == 0 {
+                                        primary_button(ui, c.label, 30.0)
+                                    } else {
+                                        secondary_button(ui, c.label, 30.0)
+                                    };
+                                    button.on_hover_text(c.hint).on_disabled_hover_text(c.hint)
+                                })
+                                .inner
+                                .clicked();
+                            if clicked {
+                                let _ = self.tx.send(WorkerCommand::ResolveConflict { id, choice: c.choice.to_string() });
                             }
                         }
                     });
@@ -382,11 +467,17 @@ impl ProtonDriveNativeApp {
             Attention::StoppedMove => {
                 let Some(vfs) = self.status.vfs.clone() else { return };
                 attention_row(ui, |ui| {
-                    // The reason the move stopped; render_stopped_move doesn't repeat it
-                    let line = drive_status_line(&vfs, &self.status.sync_dir);
-                    ui.add(egui::Label::new(RichText::new(line).size(13.5).strong().color(TEXT_PRIMARY())).wrap());
+                    // Why the move stopped, while that is the drive's state (render_stopped_move doesn't repeat it).
+                    // Mounted or ejected again since, the drive's own line would be about something else
+                    let failed = vfs.reason.as_deref() == Some("move-failed");
+                    if failed {
+                        let line = drive_status_line(&vfs, &self.status.sync_dir);
+                        ui.add(egui::Label::new(RichText::new(line).size(13.5).strong().color(TEXT_PRIMARY())).wrap());
+                    }
                     if let Some(mv) = &vfs.drive_move {
-                        ui.add_space(8.0);
+                        if failed {
+                            ui.add_space(8.0);
+                        }
                         self.render_stopped_move(ui, &vfs, mv);
                     }
                     self.render_drive_progress(ui);
@@ -544,6 +635,7 @@ mod tests {
         let mut s = DaemonStatus {
             state: state.to_string(),
             active_transfers: transfers,
+            logged_in: true,
             ..Default::default()
         };
         s.settings.paused = paused;
@@ -554,12 +646,12 @@ mod tests {
     fn summary_when_up_to_date() {
         let mut s = status("idle", vec![], false);
         s.last_sync_at = Some(NOW - 120_000);
-        let r = status_summary(&s, true, 0, NOW);
+        let r = status_summary(&s, true, false, 0, NOW);
         assert_eq!(r.headline, "Up to date");
         assert_eq!(r.detail.as_deref(), Some("Last synced 2 min ago"));
         assert_eq!(r.tone, Tone::Ok);
         s.last_sync_at = None;
-        assert_eq!(status_summary(&s, true, 0, NOW).detail, None);
+        assert_eq!(status_summary(&s, true, false, 0, NOW).detail, None);
     }
 
     #[test]
@@ -577,7 +669,7 @@ mod tests {
             (vec![], "Checking for changes…"),
         ];
         for (transfers, want) in cases {
-            let r = status_summary(&status("syncing", transfers, false), true, 0, NOW);
+            let r = status_summary(&status("syncing", transfers, false), true, false, 0, NOW);
             assert_eq!(r.headline, want);
             assert_eq!(r.tone, Tone::Busy);
             assert_eq!(r.detail, None);
@@ -588,7 +680,7 @@ mod tests {
     fn summary_never_shows_engine_text() {
         let mut s = status("syncing", vec![], false);
         s.current_action = Some("Listing /my-files/deployment".to_string());
-        let r = status_summary(&s, true, 0, NOW);
+        let r = status_summary(&s, true, false, 0, NOW);
         let all = format!("{} {}", r.headline, r.detail.unwrap_or_default());
         assert!(!all.contains("/my-files") && !all.contains("Listing"));
     }
@@ -596,7 +688,7 @@ mod tests {
     #[test]
     fn summary_reads_paused_from_either_field() {
         for s in [status("paused", vec![], false), status("idle", vec![], true)] {
-            let r = status_summary(&s, true, 0, NOW);
+            let r = status_summary(&s, true, false, 0, NOW);
             assert_eq!(r.headline, "Paused");
             assert_eq!(r.tone, Tone::Paused);
         }
@@ -605,17 +697,76 @@ mod tests {
     #[test]
     fn summary_when_something_needs_the_user() {
         let s = status("idle", vec![], false);
-        let one = status_summary(&s, true, 1, NOW);
+        let one = status_summary(&s, true, false, 1, NOW);
         assert_eq!(one.headline, "1 problem needs you");
         assert_eq!(one.detail.as_deref(), Some("See Needs attention below"));
         assert_eq!(one.tone, Tone::Attention);
-        assert_eq!(status_summary(&s, true, 3, NOW).headline, "3 problems need you");
+        assert_eq!(status_summary(&s, true, false, 3, NOW).headline, "3 problems need you");
+    }
+
+    #[test]
+    fn summary_when_signed_out() {
+        for s in [
+            DaemonStatus { state: "idle".into(), logged_in: false, ..Default::default() },
+            DaemonStatus { state: "unauthenticated".into(), logged_in: true, ..Default::default() },
+        ] {
+            let r = status_summary(&s, true, false, 0, NOW);
+            assert_eq!(r.headline, "Signed out");
+            assert_eq!(r.detail.as_deref(), Some("Sign in to sync your files"));
+            assert_eq!(r.tone, Tone::Attention);
+            assert!(signed_out(&s));
+        }
+        assert!(!signed_out(&status("idle", vec![], false)));
+        // Unreachable comes first: whether signed in can't be known
+        let out = DaemonStatus { logged_in: false, ..Default::default() };
+        assert_eq!(status_summary(&out, false, false, 0, NOW).tone, Tone::Offline);
+        // Signed out comes before paused
+        let mut paused_out = status("paused", vec![], true);
+        paused_out.logged_in = false;
+        assert_eq!(status_summary(&paused_out, true, false, 0, NOW).headline, "Signed out");
+    }
+
+    #[test]
+    fn summary_while_first_connecting_is_not_the_offline_line() {
+        let s = status("idle", vec![], false);
+        let r = status_summary(&s, false, true, 0, NOW);
+        assert_eq!(r.headline, "Connecting…");
+        assert_eq!(r.tone, Tone::Busy);
+        // Once the first try is over, unreachable says so
+        assert_eq!(status_summary(&s, false, false, 0, NOW).tone, Tone::Offline);
+    }
+
+    #[test]
+    fn summary_while_the_drive_moves_files() {
+        let mut s = status("syncing", vec![transfer("upload", "a.txt")], false);
+        s.vfs = Some(vfs("plain", false, Some("moving")));
+        let r = status_summary(&s, true, false, 0, NOW);
+        assert_eq!(r.headline, "Moving files…");
+        assert_eq!(r.tone, Tone::Busy);
+        // Below unreachable, signed out and paused
+        s.settings.paused = true;
+        assert_eq!(status_summary(&s, true, false, 0, NOW).headline, "Paused");
+        s.logged_in = false;
+        assert_eq!(status_summary(&s, true, false, 0, NOW).headline, "Signed out");
+        assert_eq!(status_summary(&s, false, false, 0, NOW).tone, Tone::Offline);
+    }
+
+    #[test]
+    fn summary_of_an_error_without_a_message_is_not_up_to_date() {
+        let mut s = status("error", vec![], false);
+        s.last_sync_at = Some(NOW - 120_000);
+        let r = status_summary(&s, true, false, 0, NOW);
+        assert_eq!(r.headline, "Sync stopped");
+        assert_eq!(r.detail.as_deref(), Some("Check the log or try Sync now"));
+        assert_eq!(r.tone, Tone::Attention);
+        // With a message, it is in Needs attention and the headline counts it
+        assert_eq!(status_summary(&s, true, false, 1, NOW).headline, "1 problem needs you");
     }
 
     #[test]
     fn summary_when_the_daemon_is_unreachable() {
         for s in [status("idle", vec![], false), status("paused", vec![], true)] {
-            let r = status_summary(&s, false, 2, NOW);
+            let r = status_summary(&s, false, false, 2, NOW);
             assert_eq!(r.headline, "Can't reach Proton Drive's background service");
             assert_eq!(r.tone, Tone::Offline);
         }
@@ -700,6 +851,51 @@ mod tests {
         v.drive_move = Some(crate::DriveMove { actions: vec!["retry".into()], ..Default::default() });
         s.vfs = Some(v);
         assert_eq!(attention_items(&s, &[]), vec![Attention::StoppedMove]);
+        // In plain mode, and without the move's details
+        s.vfs = Some(vfs("plain", false, Some("move-failed")));
+        assert_eq!(attention_items(&s, &[]), vec![Attention::StoppedMove]);
+    }
+
+    #[test]
+    fn a_stopped_move_is_listed_while_the_drive_is_mounted_again() {
+        let mut s = status("idle", vec![], false);
+        let mut v = vfs("virtual", true, None);
+        v.drive_move = Some(crate::DriveMove { actions: vec!["retry".into()], ..Default::default() });
+        s.vfs = Some(v.clone());
+        assert_eq!(attention_items(&s, &[]), vec![Attention::StoppedMove]);
+        // With only its error, too
+        v.drive_move = Some(crate::DriveMove { error: Some("Permission denied".into()), ..Default::default() });
+        s.vfs = Some(v.clone());
+        assert_eq!(attention_items(&s, &[]), vec![Attention::StoppedMove]);
+        // Neither actions nor an error: nothing to do about it
+        v.drive_move = Some(crate::DriveMove::default());
+        s.vfs = Some(v);
+        assert!(attention_items(&s, &[]).is_empty());
+    }
+
+    #[test]
+    fn an_ejected_drive_with_a_stopped_move_lists_both() {
+        let mut s = status("idle", vec![], false);
+        let mut v = vfs("virtual", false, Some("ejected"));
+        v.drive_move = Some(crate::DriveMove { actions: vec!["retry".into()], ..Default::default() });
+        s.vfs = Some(v);
+        assert_eq!(
+            attention_items(&s, &[]),
+            vec![
+                Attention::StoppedMove,
+                Attention::DriveNotMounted { message: "Virtual drive: ejected".into(), can_mount: true },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_virtual_drive_unmounted_for_no_known_reason_cannot_mount_again() {
+        let mut s = status("idle", vec![], false);
+        s.vfs = Some(vfs("virtual", false, None));
+        assert_eq!(
+            attention_items(&s, &[]),
+            vec![Attention::DriveNotMounted { message: "Virtual drive: not mounted".into(), can_mount: false }]
+        );
     }
 
     #[test]
@@ -746,6 +942,10 @@ mod tests {
         assert_eq!(drive_kind(Some(&vfs("virtual", true, None))), "Virtual drive · mounted");
         assert_eq!(drive_kind(Some(&vfs("virtual", false, Some("ejected")))), "Virtual drive · not mounted");
         assert_eq!(drive_kind(Some(&vfs("plain", false, Some("switched-off")))), "Plain folder");
+        // While it moves files or starts, it says so
+        assert_eq!(drive_kind(Some(&vfs("plain", false, Some("moving")))), "Moving files…");
+        assert_eq!(drive_kind(Some(&vfs("virtual", false, Some("moving")))), "Moving files…");
+        assert_eq!(drive_kind(Some(&vfs("virtual", false, Some("starting")))), "Starting the virtual drive…");
         // A daemon before the virtual drive syncs a plain folder
         assert_eq!(drive_kind(None), "Plain folder");
     }
@@ -757,9 +957,23 @@ mod tests {
     }
 
     #[test]
-    fn attention_lines_in_plain_words() {
-        assert_eq!(conflict_title("docs/report.pdf"), "Both copies kept: report.pdf");
-        assert_eq!(conflict_title("report.pdf"), "Both copies kept: report.pdf");
+    fn a_conflict_says_both_versions_changed_not_that_both_were_kept() {
+        assert_eq!(conflict_title("docs/report.pdf"), "Changed here and in Proton Drive: report.pdf");
+        assert_eq!(conflict_title("report.pdf"), "Changed here and in Proton Drive: report.pdf");
+        // Each choice says what it does, and which version it replaces
+        let hints: Vec<_> = CONFLICT_CHOICES.iter().map(|c| (c.choice, c.label, c.hint)).collect();
+        assert_eq!(
+            hints,
+            vec![
+                ("keep-both", "Keep Both", "Keep both versions: this computer's is saved as a renamed copy next to the Proton Drive version"),
+                ("keep-local", "Keep Local", "Use this computer's version: replaces the one in Proton Drive"),
+                ("keep-remote", "Keep Remote", "Use the Proton Drive version: replaces the one on this computer"),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_items_in_plain_words() {
         assert_eq!(failed_items_text(1), "1 file couldn't sync");
         assert_eq!(failed_items_text(4), "4 files couldn't sync");
     }
