@@ -4237,9 +4237,8 @@ impl ProtonDriveNativeApp {
             );
             ui.add_space(6.0);
             egui::ComboBox::from_id_salt("conflict_strategy_combo")
+                // Both versions are always kept (#91): at once, or once the user chose in the Conflicts tab
                 .selected_text(match self.edit_conflict_strategy.as_str() {
-                    "keep-local" => "Keep Local (Overwrite remote revision)",
-                    "keep-remote" => "Keep Remote (Overwrite local file)",
                     "prompt" => "Ask manually in Conflicts tab",
                     _ => "Keep Both (Save conflict copy with timestamp)",
                 })
@@ -4247,8 +4246,6 @@ impl ProtonDriveNativeApp {
                 .show_ui(ui, |ui| {
                     for (val, text) in [
                         ("keep-both", "Keep Both (Save conflict copy with timestamp)"),
-                        ("keep-local", "Keep Local (Overwrite remote revision)"),
-                        ("keep-remote", "Keep Remote (Overwrite local file)"),
                         ("prompt", "Ask manually in Conflicts tab"),
                     ] {
                         if ui
@@ -6954,8 +6951,8 @@ mod tests {
         let same = ".git\n*.part";
         assert_eq!(changes("/home/u/ProtonDrive", "keep-both", true, same), serde_json::json!({}));
         assert_eq!(
-            changes("/home/u/ProtonDrive", "keep-local", true, same),
-            serde_json::json!({ "conflictStrategy": "keep-local" })
+            changes("/home/u/ProtonDrive", "prompt", true, same),
+            serde_json::json!({ "conflictStrategy": "prompt" })
         );
         assert_eq!(changes("/home/u/ProtonDrive", "keep-both", false, same), serde_json::json!({ "notificationsEnabled": false }));
         assert_eq!(changes(" /mnt/b/ProtonDrive ", "keep-both", true, same), serde_json::json!({ "syncDir": "/mnt/b/ProtonDrive" }));
@@ -7057,15 +7054,15 @@ mod tests {
 
     #[test]
     fn settings_are_saved_over_the_control_socket_and_a_400_is_shown() {
-        let reply: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"ok\":true,\"settings\":{\"syncDir\":\"/home/u/ProtonDrive\",\"conflictStrategy\":\"keep-local\",\"notificationsEnabled\":true,\"reconcileIntervalSec\":120,\"paused\":false,\"ignorePatterns\":[]},\"virtualDriveWanted\":true,\"vfs\":{\"mode\":\"virtual\",\"mounted\":true,\"reason\":null},\"folderError\":null,\"switchError\":null}";
+        let reply: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"ok\":true,\"settings\":{\"syncDir\":\"/home/u/ProtonDrive\",\"conflictStrategy\":\"prompt\",\"notificationsEnabled\":true,\"reconcileIntervalSec\":120,\"paused\":false,\"ignorePatterns\":[]},\"virtualDriveWanted\":true,\"vfs\":{\"mode\":\"virtual\",\"mounted\":true,\"reason\":null},\"folderError\":null,\"switchError\":null}";
         let (sock, server) = serve_once(reply);
-        let body = serde_json::json!({ "conflictStrategy": "keep-local" });
+        let body = serde_json::json!({ "conflictStrategy": "prompt" });
         let got = save_settings_at(&sock, &body).unwrap();
         assert_eq!(got.problem(), None);
-        assert_eq!(got.settings.unwrap().conflict_strategy, "keep-local");
+        assert_eq!(got.settings.unwrap().conflict_strategy, "prompt");
         let request = server.join().unwrap();
         assert!(request.starts_with("POST /drive/settings HTTP/1.1\r\n"), "{request}");
-        assert_eq!(request_body(&request), serde_json::json!({ "conflictStrategy": "keep-local" }));
+        assert_eq!(request_body(&request), serde_json::json!({ "conflictStrategy": "prompt" }));
 
         let (sock, server) = serve_once(b"HTTP/1.1 400 Bad Request\r\n\r\n{\"error\":\"Unknown setting: x\",\"code\":\"EINVAL\"}");
         assert_eq!(save_settings_at(&sock, &serde_json::json!({ "x": 1 })).unwrap_err(), "Unknown setting: x");
@@ -7583,11 +7580,11 @@ mod tests {
         assert_eq!(h.sent(), Vec::<String>::new());
         assert!(h.text_at("No changes to save.").is_some());
 
-        h.app.edit_conflict_strategy = "keep-local".into();
+        h.app.edit_conflict_strategy = "prompt".into();
         h.app.settings_dirty = true;
         h.frames(2);
         h.click(h.text_at("Save Preferences").unwrap());
-        assert_eq!(h.sent(), vec![r#"save {"conflictStrategy":"keep-local"}"#.to_string()]);
+        assert_eq!(h.sent(), vec![r#"save {"conflictStrategy":"prompt"}"#.to_string()]);
         assert!(h.app.settings_saving);
     }
 
@@ -7595,10 +7592,10 @@ mod tests {
     fn a_save_refreshes_the_form_from_the_reply_and_shows_what_was_refused() {
         let mut h = Harness::settings(None, None);
         h.app.edit_sync_dir = "/mnt/b/ProtonDrive".into();
-        h.app.edit_conflict_strategy = "keep-local".into();
+        h.app.edit_conflict_strategy = "prompt".into();
         h.app.settings_dirty = true;
         h.app.settings_saving = true;
-        let stored = SyncSettings { conflict_strategy: "keep-local".into(), ..loaded_settings() };
+        let stored = SyncSettings { conflict_strategy: "prompt".into(), ..loaded_settings() };
         let reply = SettingsReply {
             settings: Some(stored.clone()),
             folder_error: Some("The new folder must be empty".into()),
