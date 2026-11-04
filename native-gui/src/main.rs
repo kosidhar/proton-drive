@@ -208,7 +208,6 @@ struct SummaryStats {
     total_folders: u64,
     total_bytes: u64,
     unresolved_conflicts: u64,
-    #[allow(dead_code)]
     error_items: u64,
 }
 
@@ -969,7 +968,7 @@ struct RemoteListResponse {
     items: Vec<RemoteItem>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ConflictRecord {
     id: u64,
