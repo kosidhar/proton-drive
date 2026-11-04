@@ -963,6 +963,8 @@ enum WorkerCommand {
 static SCREENSHOT_MODE: AtomicBool = AtomicBool::new(false);
 /// A later start asked this GUI to bring its window to the front (#129); the next frame does it
 static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// The section a later start asked for, opened with the window (#203)
+static SECTION_REQUESTED: std::sync::Mutex<Option<NavTab>> = std::sync::Mutex::new(None);
 /// The running app's context, so the single-instance listener can wake it
 static APP_CONTEXT: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
 
@@ -2946,14 +2948,25 @@ impl ProtonDriveNativeApp {
     }
 }
 
+impl ProtonDriveNativeApp {
+    /// Opened again from the tray or the launcher: bring this window back instead of a second one (#129), on the section
+    /// it asked for, if any (#203).
+    fn answer_show_request(&mut self, ctx: &egui::Context) {
+        if !SHOW_REQUESTED.swap(false, AtomicOrdering::SeqCst) {
+            return;
+        }
+        if let Some(tab) = SECTION_REQUESTED.lock().map(|mut s| s.take()).unwrap_or(None) {
+            self.tab = tab;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+}
+
 impl eframe::App for ProtonDriveNativeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if SHOW_REQUESTED.swap(false, AtomicOrdering::SeqCst) {
-            // Opened again from the tray or the launcher: bring this window back instead of a second one (#129)
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        }
+        self.answer_show_request(ctx);
         self.process_worker_events();
         self.frames_rendered += 1;
 
@@ -3797,6 +3810,7 @@ fn parse_window_size(s: &str) -> Option<[f32; 2]> {
 fn main() -> eframe::Result {
     let mut screenshot_target: Option<String> = None;
     let mut initial_tab = NavTab::Home;
+    let mut cli_tab: Option<String> = None;
     let mut cli_theme_override: Option<String> = None;
     let mut cli_search: Option<String> = None;
     let mut cli_size: Option<[f32; 2]> = None;
@@ -3875,6 +3889,7 @@ fn main() -> eframe::Result {
             "--tab" => {
                 if let Some(t) = args.next() {
                     initial_tab = parse_tab(&t);
+                    cli_tab = Some(t);
                 }
             }
             "--version" | "-V" => {
@@ -3921,12 +3936,15 @@ fn main() -> eframe::Result {
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty());
         let in_runtime_dir = runtime_dir.is_some();
         let paths = single_instance::instance_paths(runtime_dir, node_tmpdir(|name| std::env::var_os(name)), own_uid());
-        match single_instance::claim(&paths, own_uid(), in_runtime_dir, Duration::from_secs(5)) {
+        match single_instance::claim(&paths, own_uid(), in_runtime_dir, Duration::from_secs(5), cli_tab.as_deref()) {
             Ok(single_instance::Claim::Signalled) => return Ok(()),
             Ok(single_instance::Claim::Primary { lock, listener }) => {
                 _instance_lock = Some(lock);
                 thread::spawn(move || {
-                    single_instance::serve(listener, || {
+                    single_instance::serve(listener, |section| {
+                        if let Ok(mut requested) = SECTION_REQUESTED.lock() {
+                            *requested = section.as_deref().map(parse_tab);
+                        }
                         SHOW_REQUESTED.store(true, AtomicOrdering::SeqCst);
                         if let Some(ctx) = APP_CONTEXT.get() {
                             ctx.request_repaint();
@@ -4657,6 +4675,25 @@ mod tests {
         assert_eq!(h.app.tab, NavTab::Settings, "Settings did not react to a click at {pos:?}");
         h.app.tab = NavTab::Home;
         h.frames(2);
+    }
+
+    // #203: a later start that names a section (the tray's problems item asks for Home) opens the running app there; one
+    // that names none leaves it where it is. The only test that touches these statics, so it can't race another.
+    #[test]
+    fn a_later_start_opens_the_running_app_on_the_section_it_asks_for() {
+        let mut h = Harness::new();
+        h.app.tab = NavTab::Settings;
+        *SECTION_REQUESTED.lock().unwrap() = Some(NavTab::Home);
+        SHOW_REQUESTED.store(true, AtomicOrdering::SeqCst);
+        h.app.answer_show_request(&h.ctx);
+        assert_eq!(h.app.tab, NavTab::Home);
+        assert!(SECTION_REQUESTED.lock().unwrap().is_none(), "taken once");
+
+        h.app.tab = NavTab::Activity;
+        SHOW_REQUESTED.store(true, AtomicOrdering::SeqCst);
+        h.app.answer_show_request(&h.ctx);
+        assert_eq!(h.app.tab, NavTab::Activity);
+        assert!(!SHOW_REQUESTED.load(AtomicOrdering::SeqCst));
     }
 
     #[test]
