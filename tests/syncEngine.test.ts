@@ -9934,4 +9934,60 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(await readFile(d.local('b.txt'), 'utf8')).toBe('local edit');
         });
     });
+
+    describe('keep-both again after an unfinished one, when the earlier copy goes as it uploads (#137)', () => {
+        for (const what of ['deleted', 'moved'] as const) test(`a retry by hand after the earlier copy is ${what} makes a new copy from the file as it is, and no upload is said to have failed`, async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'original');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            stateDb.updateSettings({ conflictStrategy: 'prompt' });
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            await writeFile(local('a.txt'), 'local edit');
+            d.nodes.set(d.uid('a.txt'), makeMockNode({ uid: d.uid('a.txt'), parentUid: d.root.uid, nameStr: 'a.txt', type: NodeType.File, content: 'cloud edit' }));
+            await engine.reconcileNow();
+            const [conflict] = stateDb.listConflicts();
+            // The first keep-both by hand fails at the download: its copy stays, made but not uploaded
+            const download = (d.sdk as any).getFileRevisionDownloader.bind(d.sdk);
+            (d.sdk as any).getFileRevisionDownloader = async () => {
+                (d.sdk as any).getFileRevisionDownloader = download;
+                throw new Error('network down');
+            };
+            await expect(engine.resolveConflictManually(conflict.id, 'keep-both')).rejects.toThrow();
+            const copies = () => readdir(engine.localRoot()).then((names) => names.filter((n) => n.includes('(conflict')));
+            const [earlier] = await copies();
+            expect(earlier).toBeDefined();
+            // The user tries again at once; the earlier copy goes as it uploads
+            const getFileUploader = d.sdk.getFileUploader.bind(d.sdk);
+            (d.sdk as any).getFileUploader = async (parent: NodeEntity, name: string, metadata: any) => {
+                if (name === earlier) {
+                    (d.sdk as any).getFileUploader = getFileUploader;
+                    if (what === 'deleted') await rm(local(name), { force: true });
+                    else await rename(local(name), local('kept elsewhere.txt'));
+                }
+                return getFileUploader(parent, name, metadata);
+            };
+            const resolved = await engine.resolveConflictManually(conflict.id, 'keep-both');
+            expect(resolved.resolution).toBe('keep-both');
+            expect(await readFile(local('a.txt'), 'utf8')).toBe('cloud edit');
+            const now = await copies();
+            expect(now.length).toBe(1);
+            expect(await readFile(local(now[0]), 'utf8')).toBe('local edit');
+            const inCloud = [...d.nodes.values()].filter((n) => d.nameOf(n).includes('(conflict'));
+            expect(inCloud.map((n) => n.content)).toEqual(['local edit']);
+            expect(stateDb.listActivity().filter((a) => (a.details ?? '').startsWith('Upload failed'))).toEqual([]);
+            if (what === 'moved') {
+                // Kept where the user put it: a new local file, uploaded by a later pass. Two copies, nothing lost
+                expect(await readFile(local('kept elsewhere.txt'), 'utf8')).toBe('local edit');
+                await engine.reconcileNow();
+                const elsewhere = [...d.nodes.values()].filter((n) => d.nameOf(n) === 'kept elsewhere.txt');
+                expect(elsewhere.map((n) => n.content)).toEqual(['local edit']);
+            }
+        });
+    });
 });
