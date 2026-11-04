@@ -8547,8 +8547,10 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await d.files.writeLocal('Docs/.git/HEAD', 'ref');
 
             const docsStates = d.engine.itemStates('Docs')!;
-            // A file waiting to upload shows on itself; its folders sum up only what is recorded, the same from any view
-            expect(docsStates.self).toEqual({ availability: 'pinned', transfer: null });
+            // A file waiting to upload shows on itself; its folders sum up only what is recorded, the same from any view.
+            // b.txt was freed inside it, so Docs isn't all kept here any more and reads by its contents (#175); a hidden
+            // item inside doesn't count, it isn't shown at all
+            expect(docsStates.self).toEqual({ availability: 'online-only', transfer: null });
             expect(docsStates.children).toEqual({
                 'a.txt': { availability: 'pinned', transfer: null },
                 'b.txt': { availability: 'online-only', transfer: null },
