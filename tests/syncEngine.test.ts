@@ -10075,4 +10075,58 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(stateDb.getItemByPath('a.txt')?.nodeUid).toBe(d.uid('a.txt'));
         });
     });
+
+    describe('the conflict setting never acts on a file a drive change took since the pass read it (#139)', () => {
+        test('virtual: keep-remote after a drive rename of a file with no record does not bring the cloud version back', async () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'cloud');
+            await engine.reconcileNow(); // online-only: a.txt has no record
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            await writeFile(local('a.txt'), 'mine'); // made local through the drive, say
+            expect(stateDb.getItemByPath('a.txt')).toBeNull();
+            stateDb.updateSettings({ conflictStrategy: 'keep-remote' });
+            // The pass read the file (since = the removals finished then); the user renames it through the drive meanwhile
+            await (engine as any).observingLocal(async (since: number) => {
+                await engine.renameItem('a.txt', 'b.txt');
+                await (engine as any).handleFileConflict(
+                    'a.txt', local('a.txt'), d.nodes.get(d.uid('a.txt')), 'mine-sha1', null, 0, 0, new Map(),
+                    stateDb.getSettings(), since, undefined,
+                );
+            });
+            expect(await stat(local('a.txt')).catch(() => null)).toBeNull(); // not brought back
+            expect(await readFile(local('b.txt'), 'utf8')).toBe('mine');
+        });
+
+        test('virtual: keep-remote after a drive rename onto the file never replaces what the rename put there', async () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'cloud');
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            await writeFile(local('a.txt'), 'mine');
+            await writeFile(local('x.txt'), 'precious'); // only on this computer
+            stateDb.updateSettings({ conflictStrategy: 'keep-remote' });
+            await (engine as any).observingLocal(async (since: number) => {
+                await engine.renameItem('x.txt', 'a.txt'); // the user saves x.txt over a.txt, as an editor does
+                await (engine as any).handleFileConflict(
+                    'a.txt', local('a.txt'), d.nodes.get(d.uid('a.txt')), 'mine-sha1', null, 0, 0, new Map(),
+                    stateDb.getSettings(), since, undefined,
+                );
+            });
+            expect(await readFile(local('a.txt'), 'utf8')).toBe('precious');
+        });
+    });
 });
