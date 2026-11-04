@@ -10163,4 +10163,69 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
         }
     });
+
+    describe('a drive rename stays visible to work under way even if a step after the move fails (#145)', () => {
+        test('virtual: the rename is seen once its edit-baseline step threw after the move', async () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'cloud');
+            await engine.reconcileNow();
+            await writeFile(path.join(engine.localRoot(), 'a.txt'), 'mine');
+            // Whichever way its baselines go, that step fails, after the move
+            const moveEditBaselines = stateDb.moveEditBaselines.bind(stateDb);
+            const dropEditBaselines = stateDb.dropEditBaselines.bind(stateDb);
+            let failing = true;
+            (stateDb as any).moveEditBaselines = (...args: [string, string]) => {
+                if (failing) throw new Error('database is locked');
+                return moveEditBaselines(...args);
+            };
+            (stateDb as any).dropEditBaselines = (rel: string) => {
+                if (failing) throw new Error('database is locked');
+                return dropEditBaselines(rel);
+            };
+            await (engine as any).observingLocal(async (since: number) => {
+                await expect(engine.renameItem('a.txt', 'b.txt')).rejects.toThrow('database is locked');
+                expect(await readFile(path.join(engine.localRoot(), 'b.txt'), 'utf8')).toBe('mine'); // moved, all the same
+                expect((engine as any).driveTouched('a.txt', since)).toBe(true);
+                expect((engine as any).driveDestination('a.txt', since)).toBe('b.txt');
+            });
+            failing = false;
+        });
+
+        test('virtual: the rename is seen once clearing its in-progress marker threw after the move', async () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'cloud');
+            await engine.reconcileNow();
+            await writeFile(path.join(engine.localRoot(), 'a.txt'), 'mine');
+            const deleteMeta = stateDb.deleteMeta.bind(stateDb);
+            let failing = true;
+            (stateDb as any).deleteMeta = (key: string) => {
+                if (failing && key === 'localMoveInProgress') throw new Error('database is locked');
+                return deleteMeta(key);
+            };
+            try {
+                await (engine as any).observingLocal(async (since: number) => {
+                    await expect(engine.renameItem('a.txt', 'b.txt')).rejects.toThrow('database is locked');
+                    expect(await readFile(path.join(engine.localRoot(), 'b.txt'), 'utf8')).toBe('mine');
+                    expect((engine as any).driveTouched('a.txt', since)).toBe(true);
+                    expect((engine as any).driveDestination('a.txt', since)).toBe('b.txt');
+                });
+            } finally {
+                failing = false;
+            }
+        });
+    });
 });
