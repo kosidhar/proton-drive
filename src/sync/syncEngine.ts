@@ -1259,7 +1259,20 @@ export class ProtonDriveSyncEngine {
                 if (await this.existsLocally(relPath)) {
                     return;
                 }
-                await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
+                // Never one the user deleted (or renamed) through the drive since this work began, nor one in the
+                // Proton Drive trash now: the listing it came from may predate its delete, and downloading it would
+                // bring back what was deleted, gigabytes of it for nothing (#179)
+                if (this.driveTouched(relPath, since)) {
+                    return;
+                }
+                const live = await this.liveNode(remoteNode.uid);
+                if (!live) {
+                    return;
+                }
+                // And again once its bytes are in, before it is put in place: deleted while it downloaded, it stays gone
+                const stillWanted = async () =>
+                    !this.driveTouched(relPath, since) && (await this.liveNode(live.uid).catch(() => live)) !== null;
+                await this.downloadRemoteToLocal(relPath, live, localFullPath, since, stillWanted);
             }
             return;
         }
@@ -2247,10 +2260,15 @@ export class ProtonDriveSyncEngine {
         return null;
     }
 
+    // A trash Proton Drive refused for a node that is in its trash already, or gone: done, not a failure (#179)
+    private async alreadyTrashed(uid: string, error: unknown): Promise<boolean> {
+        return error instanceof ValidationError && (await this.liveNode(uid).catch(() => undefined)) === null;
+    }
+
     private async trashRemoteNodeForDeletedLocal(relPath: string, remoteNode: NodeEntity): Promise<void> {
         try {
             for await (const res of this.sdk.trashNodes([remoteNode])) {
-                if (!res.ok) {
+                if (!res.ok && !(await this.alreadyTrashed(remoteNode.uid, res.error))) {
                     throw res.error;
                 }
             }
@@ -2463,7 +2481,7 @@ export class ProtonDriveSyncEngine {
                 if (!item) {
                     continue;
                 }
-                if (!res.ok) {
+                if (!res.ok && !(await this.alreadyTrashed(res.uid, res.error))) {
                     this.logger.warn(`Failed to trash remote node for ${item.relPath}: ${res.error}`);
                     continue;
                 }
@@ -5054,8 +5072,19 @@ export class ProtonDriveSyncEngine {
                 }
             }
         } catch (error: unknown) {
+            if (await this.alreadyTrashed(op.nodeUid, error)) {
+                // In the Proton Drive trash already, or gone (a trash sent before a restart, say): done (#179)
+                this.journal.complete(op.id);
+                this.indexWrite(() => this.index.removeSubtree(op.nodeUid));
+                this.stateDb.logActivity({
+                    action: 'trash-remote',
+                    localRelPath: op.path,
+                    details: 'Already in Proton Drive Trash',
+                });
+                return 'next';
+            }
             if (error instanceof ValidationError) {
-                // Not there any more (deleted, or trashed already), or not allowed: nothing more to do for it
+                // Not allowed, say: nothing more to do for it
                 this.journal.complete(op.id);
                 this.stateDb.logActivity({
                     action: 'sync',
