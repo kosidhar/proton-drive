@@ -491,3 +491,30 @@ describe('defaultControlSocketPath', () => {
         }
     });
 });
+
+// #35: the user's choice when signed in to another account than the records are of
+describe('POST /account/start-fresh', () => {
+    async function startWith(startFresh?: () => Promise<void>) {
+        const root = mkdtempSync(path.join(os.tmpdir(), 'pd-control-'));
+        cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+        const socketPath = path.join(root, 'control.sock');
+        const server = await startControlServer({ socketPath, engine: makeFake() as never, startFresh });
+        cleanups.push(() => server.stop());
+        return socketPath;
+    }
+
+    test('starts fresh, and says why when it can not', async () => {
+        let started = 0;
+        const ok = await startWith(async () => void (started += 1));
+        expect((await call(ok, '/account/start-fresh', { method: 'POST', body: '{}' })).status).toBe(200);
+        expect(started).toBe(1);
+        expect((await call(ok, '/account/start-fresh')).status).toBe(405);
+        const refused = await startWith(async () => {
+            throw new Error('The files on this computer are synced with the same Proton account');
+        });
+        const res = await call(refused, '/account/start-fresh', { method: 'POST', body: '{}' });
+        expect(res.status).toBe(409);
+        expect(((await res.json()) as { error: string }).error).toContain('same Proton account');
+        expect((await call(await startWith(), '/account/start-fresh', { method: 'POST', body: '{}' })).status).toBe(404);
+    });
+});
