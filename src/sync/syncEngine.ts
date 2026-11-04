@@ -1638,8 +1638,22 @@ export class ProtonDriveSyncEngine {
         } else if (earlier) {
             const parentNode = await this.ensureParentFolderNode(earlier.relPath, remoteMap, since);
             const fullPath = path.join(this.localRoot(), earlier.relPath);
-            const result = await this.uploadLocalToRemote(earlier.relPath, fullPath, parentNode, since, undefined, 'skip');
-            copyRelPath = result.status === 'skipped' ? null : earlier.relPath;
+            // Moved or deleted by the user as it uploads: no earlier copy then, and a new one is made below (#137)
+            const gone = async () =>
+                lstat(fullPath).then(
+                    () => false,
+                    (error: NodeJS.ErrnoException) => error.code === 'ENOENT',
+                );
+            const result = await this.uploadLocalToRemote(earlier.relPath, fullPath, parentNode, since, undefined, 'skip', gone).catch(
+                async (error: unknown) => {
+                    if ((error as NodeJS.ErrnoException).code === 'ENOENT' && (await gone())) {
+                        this.keepBothCopies.delete(relPath);
+                        return null;
+                    }
+                    throw error;
+                },
+            );
+            copyRelPath = result === null || result.status === 'skipped' ? null : earlier.relPath;
         }
         if (copyRelPath !== null) {
             // The earlier copy holds localSha1: the local file must still be that
