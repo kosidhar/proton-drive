@@ -17,6 +17,8 @@ import {
 import * as notifications from '../src/linux/notifications';
 import type { Manager as EventsManager } from '../src/sdk/events/manager';
 import * as fileOpsModule from '../src/sdk/fileOps';
+import * as fsPromises from 'node:fs/promises';
+import * as localMoveModule from '../src/sync/localMove';
 import { computeLocalFileSha1, detectMediaType, THIRD_PARTY_DISCLOSURE } from '../src/sdk/fileOps';
 import { PIN_ROOT_ON_FIRST_SYNC } from '../src/sync/availabilityMigration';
 import { entryFromNode } from '../src/sync/remoteIndex';
@@ -11279,6 +11281,70 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             } finally {
                 hashes.mockRestore();
             }
+        });
+    });
+
+    describe('a write as a download is placed is never recorded as the downloaded content (#199)', () => {
+        test('a download: written just after it is renamed into place, the next pass uploads the write', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'original');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const file = path.join(engine.localRoot(), 'a.txt');
+            d.nodes.set(d.uid('a.txt'), makeMockNode({ uid: d.uid('a.txt'), parentUid: d.root.uid, nameStr: 'a.txt', type: NodeType.File, content: 'cloud ed' }));
+            const rename = fsPromises.rename;
+            const spy = spyOn(fsPromises, 'rename').mockImplementation(async (from: any, to: any) => {
+                await rename(from, to);
+                if (String(to) === file) writeFileSync(file, 'mine now'); // an app writes it the moment it is there
+            });
+            try {
+                await engine.reconcileNow();
+            } finally {
+                spy.mockRestore();
+            }
+            expect(await readFile(file, 'utf8')).toBe('mine now');
+            d.calls.uploads.length = 0;
+            await engine.reconcileNow();
+            expect(d.calls.uploads).toEqual(['a.txt']);
+            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('mine now');
+        });
+
+        test('a file opened on demand: written just after it is placed, the next pass uploads the write', async () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'original');
+            await engine.reconcileNow(); // online-only
+            const move = localMoveModule.moveWithoutReplacing;
+            let target = '';
+            const spy = spyOn(localMoveModule, 'moveWithoutReplacing').mockImplementation((from: any, to: any, ...rest: any[]) => {
+                const placed = move(from, to, ...rest);
+                if (placed && String(to).endsWith('a.txt')) {
+                    target = String(to);
+                    writeFileSync(target, 'mine now'); // the app that opened it writes at once
+                }
+                return placed;
+            });
+            try {
+                await engine.hydrate('a.txt');
+            } finally {
+                spy.mockRestore();
+            }
+            expect(await readFile(target, 'utf8')).toBe('mine now');
+            d.calls.uploads.length = 0;
+            await engine.reconcileNow();
+            expect(d.calls.uploads).toEqual(['a.txt']);
+            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('mine now');
         });
     });
 });
