@@ -646,13 +646,23 @@ struct HiddenItem {
 /// Reading the list of hidden items is quick: the daemon answers it from its database.
 const HIDDEN_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// What Settings says when the daemon is older than the list (it answers 404): restarting it brings the list.
+const HIDDEN_NEEDS_RESTART: &str = "Restart Proton Drive to see this list";
+
 /// What is hidden from this computer (GET /availability/hidden on the control socket; it only reads).
 fn hidden_items_at(socket: &std::path::Path) -> Result<Vec<HiddenItem>, String> {
     #[derive(Deserialize)]
     struct Reply {
         items: Vec<HiddenItem>,
     }
-    let reply = control_request_at(socket, "GET", "/availability/hidden", None, HIDDEN_READ_TIMEOUT)?;
+    // A 404 is the daemon's catch-all for a route it doesn't have, with or without its {"error":"Not found"} body
+    let reply = control_request_at(socket, "GET", "/availability/hidden", None, HIDDEN_READ_TIMEOUT).map_err(|e| {
+        if e == "Not found" || e.ends_with("answered 404") {
+            HIDDEN_NEEDS_RESTART.to_string()
+        } else {
+            e
+        }
+    })?;
     serde_json::from_value::<Reply>(reply).map(|r| r.items).map_err(|e| e.to_string())
 }
 
@@ -789,7 +799,8 @@ fn files_missing_resolve_at(socket: &std::path::Path, choice: MissingChoice, roo
 /// An action that waits for the user's confirmation.
 #[derive(Clone, Debug, PartialEq)]
 enum PendingConfirm {
-    /// Free up space for everything in a folder (`rel_path` is empty for the whole drive).
+    /// Free up space for everything in a folder (`rel_path` is empty for the whole drive). Home only asks for the whole
+    /// drive; a folder's `rel_path` is kept for the tray or a later stage to free one folder.
     FreeAll { rel_path: String },
     /// Switching the virtual drive off moves the downloaded files back into a normal folder.
     VirtualDriveOff,
@@ -1159,9 +1170,10 @@ struct ProtonDriveNativeApp {
     /// What is hidden from this computer, as last read (None until the first answer), and whether a read is out
     hidden: Option<Result<Vec<HiddenItem>, String>>,
     hidden_loading: bool,
-    /// The item an Unhide was sent for, and how the last Unhide went when it didn't simply work
+    /// The item an Unhide was sent for, and how the last Unhide went when it didn't simply work (shown in Settings'
+    /// card only: items it had to keep as information, a refusal or a failure as an error)
     unhiding: Option<String>,
-    unhide_notice: Option<String>,
+    unhide_notice: Option<Notice>,
 
     /// Paths (relative to the sync folder; empty is the whole drive) with an availability action still running.
     working: Vec<String>,
@@ -1210,6 +1222,8 @@ struct ProtonDriveNativeApp {
     fake_attention: Option<usize>,
     /// Screenshot-only: `--fake-transfers`, how many uploads Home shows in progress
     fake_transfers: Option<usize>,
+    /// Screenshot-only: `--signed-out`, the daemon without an account, laid over every status
+    fake_signed_out: bool,
 
     // Window geometry state
     window_geometry: WindowGeometry,
@@ -1315,6 +1329,7 @@ impl ProtonDriveNativeApp {
             fake_files_missing: false,
             fake_attention: None,
             fake_transfers: None,
+            fake_signed_out: false,
             window_geometry,
             maximize_applied_on_open: false,
             applied_light_mode: initial_light,
@@ -1325,13 +1340,23 @@ impl ProtonDriveNativeApp {
         }
     }
 
-    /// Screenshot-only: lays `--files-missing` over a status from the daemon.
+    /// Screenshot-only: lays `--fake-transfers` (that many uploads in progress) over a status from the daemon.
     fn apply_fake_transfers(&self, status: &mut DaemonStatus) {
         if let Some(n) = self.fake_transfers {
             status.active_transfers = fake_transfers(n);
         }
     }
 
+    /// Screenshot-only: lays `--signed-out` over a status from the daemon, as the daemon reports no account.
+    fn apply_fake_signed_out(&self, status: &mut DaemonStatus) {
+        if self.fake_signed_out {
+            status.logged_in = false;
+            status.state = "unauthenticated".into();
+            status.account = None;
+        }
+    }
+
+    /// Screenshot-only: lays `--files-missing` over a status from the daemon.
     fn apply_fake_files_missing(&self, status: &mut DaemonStatus) {
         if !self.fake_files_missing {
             return;
@@ -1429,6 +1454,7 @@ impl ProtonDriveNativeApp {
                         self.apply_fake_drive(&mut s);
                         self.apply_fake_files_missing(&mut s);
                         self.apply_fake_transfers(&mut s);
+                        self.apply_fake_signed_out(&mut s);
                         // Edits being made or saved stay as they are; Save compares them with what they were loaded from
                         if !self.settings_dirty && !self.settings_saving {
                             self.load_settings_form(&s.settings);
@@ -1537,16 +1563,24 @@ impl ProtonDriveNativeApp {
                     if let Some(i) = self.working.iter().position(|w| w == &path) {
                         self.working.remove(i);
                     }
-                    self.notice = match result {
-                        Ok(result) => availability_notice(&result),
-                        Err(e) => Some(e),
+                    let notice = match &result {
+                        Ok(r) => availability_notice(r).map(|text| {
+                            if r.refused.as_deref().is_some_and(|m| !m.is_empty()) {
+                                Notice::error(text)
+                            } else {
+                                Notice::info(text)
+                            }
+                        }),
+                        Err(e) => Some(Notice::error(e.clone())),
                     };
-                    // An Unhide from Settings: its list changed, and a refusal shows there too
                     if self.unhiding.as_deref() == Some(path.as_str()) {
+                        // An Unhide from Settings: its list changed, and how it went shows in its card, not on Home
                         self.unhiding = None;
-                        self.unhide_notice = self.notice.clone();
+                        self.unhide_notice = notice;
                         self.hidden_loading = false;
                         self.load_hidden();
+                    } else {
+                        self.notice = notice.map(|n| n.text);
                     }
                     // The status counters change with the action
                     let _ = self.tx.send(WorkerCommand::RefreshAll);
@@ -3591,6 +3625,7 @@ OPTIONS:
   --hidden-items        with --screenshot: list two items as hidden from this computer in Settings
   --fake-attention <N>  with --screenshot: list N conflicts (and two failed items) under Needs attention on Home
   --fake-transfers <N>  with --screenshot: show N uploads in progress on Home
+  --signed-out          with --screenshot: show the daemon without an account
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --version             print the version
   -h, --help            print this help
@@ -3621,6 +3656,7 @@ fn main() -> eframe::Result {
     let mut cli_hidden_items = false;
     let mut cli_fake_attention: Option<usize> = None;
     let mut cli_fake_transfers: Option<usize> = None;
+    let mut cli_signed_out = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -3654,6 +3690,9 @@ fn main() -> eframe::Result {
             }
             "--fake-transfers" => {
                 cli_fake_transfers = args.next().and_then(|v| v.parse().ok());
+            }
+            "--signed-out" => {
+                cli_signed_out = true;
             }
             "--hidden-items" => {
                 cli_hidden_items = true;
@@ -3694,8 +3733,8 @@ fn main() -> eframe::Result {
     // Before any thread starts: a screenshot only reads (see allowed_in_screenshot_mode and control_request_at)
     SCREENSHOT_MODE.store(screenshot_target.is_some(), AtomicOrdering::SeqCst);
 
-    if screenshot_target.is_none() && (cli_fake_attention.is_some() || cli_fake_transfers.is_some()) {
-        eprintln!("protondrive-gui: --fake-attention and --fake-transfers only apply together with --screenshot; ignoring them");
+    if screenshot_target.is_none() && (cli_fake_attention.is_some() || cli_fake_transfers.is_some() || cli_signed_out) {
+        eprintln!("protondrive-gui: --fake-attention, --fake-transfers and --signed-out only apply together with --screenshot; ignoring them");
     }
     let fake_drive = if cli_drive_status.is_some() || cli_drive_move.is_some() {
         // A move alone is shown as the move that failed
@@ -3810,10 +3849,12 @@ fn main() -> eframe::Result {
                 app.fake_files_missing = cli_files_missing;
                 app.fake_attention = cli_fake_attention;
                 app.fake_transfers = cli_fake_transfers;
+                app.fake_signed_out = cli_signed_out;
                 let mut status = std::mem::take(&mut app.status);
                 app.apply_fake_drive(&mut status);
                 app.apply_fake_files_missing(&mut status);
                 app.apply_fake_transfers(&mut status);
+                app.apply_fake_signed_out(&mut status);
                 app.status = status;
                 app.refresh_attention();
                 if cli_confirm_files_missing {
@@ -4290,6 +4331,7 @@ mod tests {
                 fake_files_missing: false,
                 fake_attention: None,
                 fake_transfers: None,
+                fake_signed_out: false,
                 window_geometry: WindowGeometry::default(),
                 maximize_applied_on_open: true,
                 applied_light_mode: false,
@@ -4611,9 +4653,13 @@ mod tests {
         assert_eq!(hidden_items_at(&sock).unwrap(), vec![hidden("Docs/Private", "hiding"), hidden("Music", "hidden")]);
         assert!(server.join().unwrap().starts_with("GET /availability/hidden HTTP/1.1\r\n"));
 
-        // A daemon from before the list answers 404
+        // A daemon from before the list answers 404: restarting it brings the list
         let (sock, server) = serve_once(b"HTTP/1.1 404 Not Found\r\n\r\n{\"error\":\"Not found\"}");
-        assert_eq!(hidden_items_at(&sock).unwrap_err(), "Not found");
+        assert_eq!(hidden_items_at(&sock).unwrap_err(), HIDDEN_NEEDS_RESTART);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+        let (sock, server) = serve_once(b"HTTP/1.1 404 Not Found\r\n\r\n");
+        assert_eq!(hidden_items_at(&sock).unwrap_err(), HIDDEN_NEEDS_RESTART);
         server.join().unwrap();
         let _ = std::fs::remove_file(&sock);
     }
@@ -4644,16 +4690,41 @@ mod tests {
         h.click(unhide);
         assert_eq!(h.sent(), Vec::<String>::new());
 
-        // When it is done the list is read again, and a refusal is shown in the card
+        // When it is done the list is read again, and a refusal is shown in the card, and only there
         let refused = AvailabilityResult { state: "hidden".into(), kept: Vec::new(), refused: Some("Can't unhide Music: busy".into()) };
         h.event(WorkerEvent::AvailabilityDone { path: "Music".into(), result: Ok(refused) });
         assert!(h.app.working.is_empty());
         assert!(h.commands.try_iter().any(|c| matches!(c, WorkerCommand::LoadHidden)));
         assert!(h.text_at("Can't unhide Music: busy").is_some());
+        assert_eq!(h.app.unhide_notice, Some(Notice::error("Can't unhide Music: busy")));
+        assert_eq!(h.app.notice, None, "not on Home too");
 
         // A list that can't be read says so
-        h.event(WorkerEvent::HiddenLoaded(Err("Not found".into())));
-        assert!(h.text_at("Couldn't load the list: Not found").is_some());
+        h.event(WorkerEvent::HiddenLoaded(Err("Proton is unreachable".into())));
+        assert!(h.text_at("Couldn't load the list: Proton is unreachable").is_some());
+        // An older daemon, without the list, needs a restart, not an error
+        h.event(WorkerEvent::HiddenLoaded(Err(HIDDEN_NEEDS_RESTART.into())));
+        assert!(h.text_at("Restart Proton Drive to see this list").is_some());
+        assert!(h.text_at("Couldn't load the list: Restart Proton Drive to see this list").is_none());
+    }
+
+    #[test]
+    fn an_unhide_that_kept_items_says_so_in_the_card_as_information() {
+        let mut h = Harness::settings(None, None);
+        h.event(WorkerEvent::HiddenLoaded(Ok(vec![hidden("Music", "hidden")])));
+        h.click(h.text_at("Unhide").expect("Unhide is painted"));
+        assert_eq!(h.sent(), vec![r#"unhide "Music""#.to_string()]);
+        let kept = AvailabilityResult { state: "pinned".into(), kept: vec!["Music/a.mp3".into()], refused: None };
+        h.event(WorkerEvent::AvailabilityDone { path: "Music".into(), result: Ok(kept) });
+        let text = "1 item stays on this computer because it isn't safely in Proton Drive: Music/a.mp3";
+        assert_eq!(h.app.unhide_notice, Some(Notice::info(text)));
+        assert_eq!(h.app.notice, None);
+        assert!(h.text_at(text).is_some());
+        // A failure is an error
+        h.click(h.text_at("Unhide").unwrap());
+        h.event(WorkerEvent::AvailabilityDone { path: "Music".into(), result: Err("Still working on it".into()) });
+        assert_eq!(h.app.unhide_notice, Some(Notice::error("Still working on it")));
+        assert_eq!(h.app.notice, None);
     }
 
     #[test]
@@ -4711,15 +4782,25 @@ mod tests {
     }
 
     #[test]
-    fn a_conflict_says_both_copies_were_kept_and_its_resolve_buttons_send_the_choice() {
+    fn a_conflict_says_both_versions_changed_and_its_resolve_buttons_send_the_choice() {
         let mut h = home_with(|_| {});
         h.event(WorkerEvent::ConflictsLoaded(vec![
             ConflictRecord { id: 7, local_rel_path: "docs/report.pdf".into(), ..Default::default() },
             ConflictRecord { id: 8, local_rel_path: "old.txt".into(), resolved: 1, ..Default::default() },
         ]));
-        assert!(h.text_at("Both copies kept: report.pdf").is_some());
-        assert!(h.text_at("Both copies kept: old.txt").is_none(), "a resolved conflict is not listed");
+        assert!(h.text_at("Changed here and in Proton Drive: report.pdf").is_some());
+        assert!(h.text_at("Changed here and in Proton Drive: old.txt").is_none(), "a resolved conflict is not listed");
+        for wrong in ["Both copies kept: report.pdf", "Both copies kept: old.txt"] {
+            assert!(h.text_at(wrong).is_none(), "{wrong}");
+        }
         assert!(h.text_at("Show in Files").is_some());
+        // Keep Both, which replaces nothing, is the one that looks like the main choice
+        let both = h.text_at("Keep Both").unwrap();
+        let local = h.text_at("Keep Local").unwrap();
+        assert!(both.x < local.x, "Keep Both comes first");
+        assert_eq!(h.fill_under(both), Some(PROTON_PURPLE));
+        assert_ne!(h.fill_under(local), Some(PROTON_PURPLE));
+        assert_ne!(h.fill_under(h.text_at("Keep Remote").unwrap()), Some(PROTON_PURPLE));
         h.click(h.text_at("Keep Both").expect("the conflict's resolve buttons are painted"));
         assert_eq!(h.sent(), vec!["resolve 7 keep-both".to_string()]);
         h.click(h.text_at("Keep Local").unwrap());
@@ -4785,6 +4866,63 @@ mod tests {
         assert!(h.text_at("Moving the Proton Drive folder didn't finish").is_some());
         h.click(h.text_at("Move files back").expect("the move's actions are offered"));
         assert_eq!(h.sent(), vec!["move-back /home/u/ProtonDrive -> /mnt/b/ProtonDrive".to_string()]);
+    }
+
+    #[test]
+    fn a_stopped_move_is_on_home_while_the_drive_is_mounted_again() {
+        let mounted = VfsStatus {
+            drive_move: Some(drive_move("relocation", Some("Permission denied"), &["retry"])),
+            ..vfs("virtual", true, None)
+        };
+        let mut h = home_with(|s| s.vfs = Some(mounted));
+        assert!(h.text_at("Needs attention").is_some());
+        assert!(h.text_at("Moving the Proton Drive folder didn't finish").is_some());
+        assert!(h.text_at("Permission denied").is_some());
+        // Not the mounted line as if it were a problem
+        assert!(h.text_at("Virtual drive: mounted at /home/u/ProtonDrive").is_none());
+        h.click(h.text_at("Try again").expect("the move's actions are offered"));
+        assert_eq!(h.sent(), vec!["retry /home/u/ProtonDrive -> /mnt/b/ProtonDrive".to_string()]);
+    }
+
+    #[test]
+    fn the_signed_out_screenshot_flag_lays_no_account_over_every_status() {
+        let mut h = Harness::new();
+        h.app.fake_signed_out = true;
+        let mut status = h.app.status.clone();
+        status.account = Some(AccountInfo { email: "gc@proton.me".into(), ..Default::default() });
+        h.event(WorkerEvent::StatusAndActivity { status: Box::new(Ok(status)), activity: Vec::new() });
+        assert!(!h.app.status.logged_in);
+        assert_eq!(h.app.status.state, "unauthenticated");
+        assert!(h.app.status.account.is_none());
+        assert!(h.text_at("Signed out").is_some());
+    }
+
+    #[test]
+    fn signed_out_home_offers_sign_in_and_not_pause() {
+        let mut h = home_with(|s| {
+            s.logged_in = false;
+            s.state = "unauthenticated".into();
+        });
+        assert!(h.text_at("Signed out").is_some());
+        assert!(h.text_at("Sign in to sync your files").is_some());
+        assert!(h.text_at("Up to date").is_none());
+        for gone in ["Pause", "Resume", "Sync now"] {
+            assert!(h.text_at(gone).is_none(), "{gone}");
+        }
+        h.click(h.text_at("Sign in").expect("Sign in is offered on Home while signed out"));
+        assert_eq!(h.sent(), vec!["sign in".to_string()]);
+    }
+
+    #[test]
+    fn home_says_connecting_until_the_first_answer() {
+        let mut h = home_with(|_| {});
+        h.app.daemon_online = false;
+        h.app.initial_connecting = true;
+        h.frames(2);
+        assert!(h.text_at("Connecting…").is_some());
+        assert!(h.text_at("Can't reach Proton Drive's background service").is_none());
+        h.event(WorkerEvent::StatusAndActivity { status: Box::new(Err("refused".into())), activity: Vec::new() });
+        assert!(h.text_at("Can't reach Proton Drive's background service").is_some());
     }
 
     #[test]
