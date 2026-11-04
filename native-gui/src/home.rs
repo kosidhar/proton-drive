@@ -229,13 +229,13 @@ fn open_in_files(folder: &std::path::Path) {
 }
 
 /// A secondary (outlined) button, as wide as its label.
-fn secondary_button(ui: &mut egui::Ui, label: &str, height: f32) -> egui::Response {
+pub(crate) fn secondary_button(ui: &mut egui::Ui, label: &str, height: f32) -> egui::Response {
     let size = Vec2::new(button_width(ui, label), height);
     let stroke = Some(Stroke::new(1.0_f32, BORDER_SUBTLE()));
     proton_button(ui, size, label, BG_CARD_ALT(), btn_secondary_hover_bg(), stroke, TEXT_PRIMARY(), 13.0)
 }
 
-fn primary_button(ui: &mut egui::Ui, label: &str, height: f32) -> egui::Response {
+pub(crate) fn primary_button(ui: &mut egui::Ui, label: &str, height: f32) -> egui::Response {
     let size = Vec2::new(button_width(ui, label), height);
     proton_button(ui, size, label, PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE, 13.0)
 }
@@ -245,7 +245,7 @@ fn card_title(ui: &mut egui::Ui, title: &str) {
 }
 
 /// A line that never wraps: elided to the room left, the whole of `full` on hover.
-fn elided(ui: &mut egui::Ui, text: RichText, full: &str) -> egui::Response {
+pub(crate) fn elided(ui: &mut egui::Ui, text: RichText, full: &str) -> egui::Response {
     ui.add(egui::Label::new(text).truncate()).on_hover_text(full)
 }
 
@@ -352,8 +352,10 @@ impl ProtonDriveNativeApp {
                             open_in_files(&conflict_folder(&self.status.sync_dir, &rel_path));
                         }
                         ui.add_space(8.0);
+                        // Resolving needs the daemon, as Pause and Sync now do
+                        let online = self.daemon_online;
                         for (choice, label) in [("keep-both", "Keep Both"), ("keep-local", "Keep Local"), ("keep-remote", "Keep Remote")] {
-                            if ui.button(label).clicked() {
+                            if ui.add_enabled_ui(online, |ui| secondary_button(ui, label, 30.0)).inner.clicked() {
                                 let _ = self.tx.send(WorkerCommand::ResolveConflict { id, choice: choice.to_string() });
                             }
                         }
