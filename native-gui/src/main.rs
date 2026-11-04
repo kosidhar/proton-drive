@@ -265,6 +265,9 @@ struct DaemonStatus {
     /// While the daemon holds because the files are missing from the folder: what is missing
     #[serde(default)]
     files_missing: Option<FilesMissing>,
+    /// While the daemon holds because the records are of another account than the one signed in to (#35)
+    #[serde(default)]
+    account_mismatch: Option<AccountMismatch>,
     logged_in: bool,
     sync_dir: String,
     active_transfers: Vec<ActiveTransfer>,
@@ -292,6 +295,14 @@ struct FilesMissing {
     root: String,
     names: Vec<String>,
     items: u64,
+    message: String,
+}
+
+/// Signed in to another Proton account than the files on this computer were synced with (`accountMismatch` in
+/// /api/status): nothing syncs until the user signs back in to that account, or starts fresh with this one (#35).
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+struct AccountMismatch {
     message: String,
 }
 
@@ -846,6 +857,11 @@ fn files_missing_resolve_at(socket: &std::path::Path, choice: MissingChoice, roo
     control_request_at(socket, "POST", "/sync/files-missing", Some(&body), DRIVE_READ_TIMEOUT).map(|_| ())
 }
 
+/// POST /account/start-fresh: the files on this computer sync to the account signed in to as new files (#35).
+fn start_fresh_at(socket: &std::path::Path) -> Result<(), String> {
+    control_request_at(socket, "POST", "/account/start-fresh", Some(&serde_json::json!({})), DRIVE_READ_TIMEOUT).map(|_| ())
+}
+
 /// POST /remote/mkdir {parentPath, name}: makes a folder in the cloud.
 fn make_folder_at(socket: &std::path::Path, parent_path: &str, name: &str) -> Result<(), String> {
     let body = serde_json::json!({ "parentPath": parent_path, "name": name });
@@ -885,6 +901,8 @@ enum PendingConfirm {
     /// The files missing from the folder were deleted on purpose: they go to the Proton Drive trash too. What the dialog
     /// was opened for (the status's `filesMissing`) is what it confirms.
     DeleteMissing { root: String, names: Vec<String>, items: u64 },
+    /// Start fresh with the account signed in to: the files on this computer sync to it as new files (#35)
+    StartFresh,
 }
 
 /// What a confirmation dialog says, and what its button asks the daemon to do to which path.
@@ -958,6 +976,16 @@ fn confirm_copy(confirm: &PendingConfirm) -> ConfirmCopy {
             // Not an availability action: render_confirm_modal sends the confirmation instead
             action: "files-missing-delete",
         },
+        PendingConfirm::StartFresh => ConfirmCopy {
+            title: "Start fresh with this account?".to_string(),
+            body: "The files on this computer stay, and sync to the Proton account you are signed in to as new files: they upload to it.".to_string(),
+            detail: "Nothing is deleted, on this computer or in either account. To sync with the other account instead, sign out and sign in to it.",
+            button: "Start fresh",
+            cancel: "Cancel",
+            rel_path: String::new(),
+            // Not an availability action: render_confirm_modal sends the start-fresh instead
+            action: "start-fresh",
+        },
     }
 }
 
@@ -1008,6 +1036,8 @@ enum WorkerCommand {
     SetAvailability { path: String, action: String },
     /// What to do about the files missing from the folder, as shown (POST /sync/files-missing)
     ResolveFilesMissing { choice: MissingChoice, root: String, names: Vec<String> },
+    /// Start fresh with the account signed in to (POST /account/start-fresh, #35)
+    StartFresh,
 }
 
 /// Set once in `main` when the app only renders a screenshot: nothing that changes anything is ever sent then, and
@@ -1083,6 +1113,7 @@ enum WorkerEvent {
     DriveDone(Result<(), String>),
     /// What was asked about the missing files (deleted on purpose, or kept online-only) went through, or why not
     FilesMissingDone(Result<(), String>),
+    StartFreshDone(Result<(), String>),
 }
 
 /// A line telling how something went: done, or why not.
@@ -1285,6 +1316,8 @@ struct ProtonDriveNativeApp {
     /// The confirmation that the missing files were deleted on purpose is still running, and why the last one failed
     files_missing_working: bool,
     files_missing_error: Option<String>,
+    start_fresh_working: bool,
+    start_fresh_error: Option<String>,
 
     // Conflicts state
     conflicts: Vec<ConflictRecord>,
@@ -1411,6 +1444,8 @@ impl ProtonDriveNativeApp {
             blocklist_error: None,
             files_missing_working: false,
             files_missing_error: None,
+            start_fresh_working: false,
+            start_fresh_error: None,
             conflicts: Vec::new(),
             conflict_error: None,
             edit_sync_dir,
@@ -1611,6 +1646,11 @@ impl ProtonDriveNativeApp {
                 WorkerEvent::FilesMissingDone(result) => {
                     self.files_missing_working = false;
                     self.files_missing_error = result.err();
+                    let _ = self.tx.send(WorkerCommand::RefreshAll);
+                }
+                WorkerEvent::StartFreshDone(result) => {
+                    self.start_fresh_working = false;
+                    self.start_fresh_error = result.err();
                     let _ = self.tx.send(WorkerCommand::RefreshAll);
                 }
                 WorkerEvent::RemoteLoaded(res) => {
@@ -3100,6 +3140,10 @@ impl ProtonDriveNativeApp {
                                     self.send_drive_command(WorkerCommand::SetVirtualDrive(false));
                                 } else if let PendingConfirm::DeleteMissing { root, names, .. } = &confirm {
                                     self.resolve_files_missing(MissingChoice::DeleteInCloud, root.clone(), names.clone());
+                                } else if confirm == PendingConfirm::StartFresh {
+                                    self.start_fresh_working = true;
+                                    self.start_fresh_error = None;
+                                    let _ = self.tx.send(WorkerCommand::StartFresh);
                                 } else {
                                     self.send_availability(action_path.clone(), action);
                                 }
@@ -3230,6 +3274,69 @@ impl ProtonDriveNativeApp {
         ui.add_space(14.0);
     }
 
+    /// Above every tab while the daemon holds because the records are of another Proton account than the one signed in
+    /// to: what the daemon says, and the two ways on. Starting fresh asks first; signing out (to sign in to the account
+    /// the files were synced with) asks nothing, as it changes no file.
+    fn render_account_mismatch(&mut self, ui: &mut egui::Ui) {
+        let Some(mismatch) = self.status.account_mismatch.clone() else {
+            return;
+        };
+        Frame::NONE
+            .fill(Color32::from_rgba_unmultiplied(239, 68, 68, 26))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(239, 68, 68, 110)))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::symmetric(16, 12))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.add(
+                    egui::Label::new(RichText::new("Signed in to a different Proton account").size(13.5).strong().color(TEXT_PRIMARY()))
+                        .wrap(),
+                );
+                ui.add_space(2.0);
+                ui.add(egui::Label::new(RichText::new(&mismatch.message).size(12.5).color(TEXT_MUTED())).wrap());
+                if let Some(error) = &self.start_fresh_error {
+                    ui.add_space(2.0);
+                    ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
+                }
+                ui.add_space(8.0);
+                let working = self.start_fresh_working;
+                let mut start_fresh = false;
+                let mut sign_out = false;
+                ui.horizontal(|ui| {
+                    let text = if working { TEXT_MUTED() } else { Color32::WHITE };
+                    if proton_button(ui, Vec2::new(210.0, 32.0), "Start fresh with this account", PROTON_PURPLE, PROTON_PURPLE_HOVER, None, text, 12.5)
+                        .on_hover_text("Asks first. The files on this computer stay, and upload to this account.")
+                        .clicked()
+                    {
+                        start_fresh = true;
+                    }
+                    ui.add_space(4.0);
+                    if proton_button(
+                        ui,
+                        Vec2::new(110.0, 32.0),
+                        "Sign out",
+                        BG_CARD_ALT(),
+                        btn_secondary_hover_bg(),
+                        Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                        if working { TEXT_MUTED() } else { TEXT_PRIMARY() },
+                        12.5,
+                    )
+                    .on_hover_text("Then sign in to the account the files were synced with")
+                    .clicked()
+                    {
+                        sign_out = true;
+                    }
+                });
+                if !working && start_fresh {
+                    self.pending_confirm = Some(PendingConfirm::StartFresh);
+                }
+                if !working && sign_out {
+                    let _ = self.tx.send(WorkerCommand::Logout);
+                }
+            });
+        ui.add_space(14.0);
+    }
+
     /// Asks the daemon to do what the user chose about the missing files, as they were shown.
     fn resolve_files_missing(&mut self, choice: MissingChoice, root: String, names: Vec<String>) {
         self.files_missing_working = true;
@@ -3263,6 +3370,7 @@ impl ProtonDriveNativeApp {
                 if self.pending_confirm.is_some() {
                     ui.disable(); // Nothing under the confirmation dialog takes clicks or keys while it is open
                 }
+                self.render_account_mismatch(ui);
                 self.render_files_missing(ui);
                 match self.tab {
                     NavTab::Overview => self.render_overview_tab(ui),
@@ -5464,6 +5572,9 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
             WorkerCommand::ResolveFilesMissing { choice, root, names } => off_thread(&tx, &ctx, move || {
                 WorkerEvent::FilesMissingDone(files_missing_resolve_at(&control_socket_path(), choice, &root, &names))
             }),
+            WorkerCommand::StartFresh => {
+                off_thread(&tx, &ctx, move || WorkerEvent::StartFreshDone(start_fresh_at(&control_socket_path())))
+            }
         }
     }
 }
@@ -6494,6 +6605,8 @@ mod tests {
                 blocklist_error: None,
                 files_missing_working: false,
                 files_missing_error: None,
+                start_fresh_working: false,
+                start_fresh_error: None,
                 conflicts: Vec::new(),
                 conflict_error: None,
                 edit_sync_dir: String::new(),
@@ -6612,6 +6725,8 @@ mod tests {
                     WorkerCommand::ResolveFilesMissing { choice, root, names } => {
                         Some(format!("files missing: {} {root} {}", choice.action(), names.join(", ")))
                     }
+                    WorkerCommand::StartFresh => Some("start fresh".to_string()),
+                    WorkerCommand::Logout => Some("sign out".to_string()),
                     _ => None,
                 })
                 .collect()
@@ -7162,6 +7277,7 @@ mod tests {
             WorkerCommand::SetAvailability { path: "x".into(), action: "pin".into() },
             WorkerCommand::ResolveFilesMissing { choice: MissingChoice::DeleteInCloud, root: "/r".into(), names: vec!["Docs".into()] },
             WorkerCommand::ResolveFilesMissing { choice: MissingChoice::KeepOnlineOnly, root: "/r".into(), names: vec!["Docs".into()] },
+            WorkerCommand::StartFresh,
         ];
         for cmd in &writes {
             assert!(!allowed_in_screenshot_mode(cmd));
@@ -7201,6 +7317,42 @@ mod tests {
             assert!(h.text_at(KEEP).is_some(), "{tab:?}");
             assert!(h.text_at("Docs and Photos are missing. Proton Drive waits for them to come back and syncs nothing meanwhile.").is_some(), "{tab:?}");
         }
+    }
+
+    // #35: signed in to another account than the files were synced with, the app says so, and offers both ways on
+    #[test]
+    fn another_account_shows_on_every_tab_and_starting_fresh_asks_first() {
+        let mut sent = serde_json::to_value(DaemonStatus::default()).unwrap();
+        sent["accountMismatch"] = serde_json::json!({ "message": "You signed in to a different Proton account." });
+        let status: DaemonStatus = serde_json::from_value(sent).unwrap();
+        assert_eq!(status.account_mismatch, Some(AccountMismatch { message: "You signed in to a different Proton account.".into() }));
+
+        let mut h = Harness::new("/my-files");
+        assert!(h.text_at("Start fresh with this account").is_none());
+        h.app.status.account_mismatch = Some(AccountMismatch { message: "You signed in to a different Proton account.".into() });
+        for tab in [NavTab::CloudBrowser, NavTab::Overview, NavTab::Conflicts, NavTab::Settings] {
+            h.app.tab = tab;
+            h.frames(3);
+            assert!(h.text_at("Start fresh with this account").is_some(), "{tab:?}");
+            assert!(h.text_at("You signed in to a different Proton account.").is_some(), "{tab:?}");
+        }
+        h.app.tab = NavTab::CloudBrowser;
+        h.frames(3);
+        h.click(h.text_at("Start fresh with this account").unwrap());
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::StartFresh));
+        assert_eq!(h.sent(), Vec::<String>::new());
+        h.click(h.text_at("Cancel").expect("the dialog is painted"));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+        h.click(h.text_at("Start fresh with this account").unwrap());
+        h.click(h.text_at("Start fresh").expect("the dialog's button"));
+        assert_eq!(h.sent(), vec!["start fresh".to_string()]);
+        assert!(h.app.start_fresh_working);
+        h.event(WorkerEvent::StartFreshDone(Err("Nothing to start fresh from".into())));
+        assert!(!h.app.start_fresh_working);
+        assert!(h.text_at("Nothing to start fresh from").is_some());
+        h.click(h.text_at("Sign out").unwrap());
+        assert_eq!(h.sent(), vec!["sign out".to_string()]);
     }
 
     #[test]

@@ -10806,4 +10806,322 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(await stat(d.local('Big/b.bin')).catch(() => null)).toBeNull();
         });
     });
+
+    describe('signing in to a different Proton account never reuses the last one\'s records (#35)', () => {
+        const synced = async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('Docs/a.txt', 'a');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            return { ...d, engine, local: (rel: string) => path.join(engine.localRoot(), rel) };
+        };
+
+        test('the account the records belong to is remembered, and the same account syncs on as before', async () => {
+            const d = await synced();
+            expect(stateDb.getMeta('accountRoot')).toBe(d.root.uid);
+            await writeFile(d.local('Docs/new.txt'), 'new');
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toContain('Docs/new.txt');
+            expect(d.engine.getStatus().accountMismatch).toBeNull();
+        });
+
+        test('records of another account: nothing is synced, deleted, trashed or uploaded, and the status says why', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountRoot', 'other~root'); // the records are another account's
+            await writeFile(d.local('Docs/new.txt'), 'new');
+            await rm(d.local('Kept.txt'));
+            d.calls.uploads.length = 0;
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toEqual([]);
+            expect(d.calls.trashed).toEqual([]);
+            expect(stateDb.getItemByPath('Docs/a.txt')).not.toBeNull();
+            expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('a');
+            const status = d.engine.getStatus();
+            expect(status.accountMismatch?.message).toMatch(/different Proton account/);
+            expect(status.state).toBe('error');
+            await expect(d.engine.setAvailability('Docs', 'free')).rejects.toThrow(/different Proton account/);
+            await expect(d.engine.deleteItem('Docs/a.txt')).rejects.toThrow(/different Proton account/);
+            await expect(d.engine.resolveConflictManually(1, 'keep-both')).rejects.toThrow(/different Proton account/);
+            await d.engine.replayRemoteOps();
+            expect(d.calls.trashed).toEqual([]);
+        });
+
+        test('starting fresh keeps every file here and syncs them as new to this account, trashing nothing', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountRoot', 'other~root');
+            await d.engine.reconcileNow();
+            d.calls.uploads.length = 0;
+            await d.engine.startFreshForThisAccount();
+            expect(stateDb.getMeta('accountRoot')).toBe(d.root.uid);
+            expect(d.engine.getStatus().accountMismatch).toBeNull();
+            await d.engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([]);
+            expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('a');
+            expect(await readFile(d.local('Kept.txt'), 'utf8')).toBe('kept');
+            expect(stateDb.getItemByPath('Docs/a.txt')).not.toBeNull();
+        });
+
+        test('passes asked for together never run together (the account check sits inside the guard)', async () => {
+            const d = await synced();
+            let running = 0;
+            let most = 0;
+            const walk = (d.engine as any).reconcileDirectoryIncremental.bind(d.engine);
+            (d.engine as any).reconcileDirectoryIncremental = async (...args: unknown[]) => {
+                if (args[1] === '') {
+                    running++;
+                    most = Math.max(most, running);
+                    try {
+                        return await walk(...args);
+                    } finally {
+                        running--;
+                    }
+                }
+                return walk(...args);
+            };
+            await Promise.all([d.engine.reconcileNow(), d.engine.reconcileNow(), d.engine.reconcileNow()]);
+            for (let i = 0; i < 20 && (d.engine as any).reconcileRunning; i++) await Bun.sleep(5);
+            expect(most).toBe(1);
+        });
+
+        const otherAccount = (d: Awaited<ReturnType<typeof synced>>) => {
+            stateDb.setMeta('accountRoot', 'other~root');
+            // Restarted, signed in to the other account: a new engine on the same records
+            return new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+        };
+
+        test('after a restart the account is checked at start, and local changes act on nothing', async () => {
+            const d = await synced();
+            const engine = otherAccount(d);
+            await engine.start();
+            expect(engine.getStatus().accountMismatch).not.toBeNull();
+            await writeFile(d.local('Docs/new.txt'), 'new');
+            await rm(d.local('Kept.txt'));
+            d.calls.uploads.length = 0;
+            await (engine as any).handleLocalFileChange('Docs/new.txt');
+            await (engine as any).handleLocalFileChange('Kept.txt');
+            expect(d.calls.uploads).toEqual([]);
+            expect(d.calls.trashed).toEqual([]);
+            expect(stateDb.getItemByPath('Kept.txt')).not.toBeNull();
+            await engine.stop();
+        });
+
+        test('a local change before any check looks the account up first, and acts on nothing for another', async () => {
+            const d = await synced();
+            const engine = otherAccount(d);
+            await writeFile(d.local('Docs/new.txt'), 'new');
+            d.calls.uploads.length = 0;
+            await (engine as any).handleLocalFileChange('Docs/new.txt');
+            expect(d.calls.uploads).toEqual([]);
+            expect(engine.getStatus().accountMismatch).not.toBeNull();
+        });
+
+        test('a pass whose root lookup fails acts on nothing, and checks the account before it does', async () => {
+            const d = await synced();
+            const engine = otherAccount(d);
+            const root = d.sdk.getMyFilesRootFolder.bind(d.sdk);
+            let first = true;
+            (d.sdk as any).getMyFilesRootFolder = async () => {
+                if (first) {
+                    first = false;
+                    throw new Error('timeout');
+                }
+                return root();
+            };
+            await writeFile(d.local('Docs/new.txt'), 'new');
+            d.calls.uploads.length = 0;
+            await engine.reconcileNow();
+            await engine.reconcileNow();
+            expect(d.calls.uploads).toEqual([]);
+            expect(engine.getStatus().accountMismatch).not.toBeNull();
+        });
+
+        test('records from before the account was remembered are adopted only if they are of the account signed in to', async () => {
+            const d = await synced();
+            stateDb.deleteMeta('accountRoot');
+            const same = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+            });
+            await same.reconcileNow();
+            expect(stateDb.getMeta('accountRoot')).toBe(d.root.uid);
+            // Another account's, from before an upgrade: their top items name another root
+            stateDb.deleteMeta('accountRoot');
+            for (const item of stateDb.getAllItems().filter((i) => !i.localRelPath.includes('/'))) {
+                stateDb.upsertItem({ ...item, parentNodeUid: 'other~root' });
+            }
+            const other = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+            });
+            await other.reconcileNow();
+            expect(other.getStatus().accountMismatch).not.toBeNull();
+            expect(stateDb.getMeta('accountRoot')).toBeNull();
+        });
+
+        test('starting fresh is refused when there is no other account to start fresh from', async () => {
+            const d = await synced();
+            await expect(d.engine.startFreshForThisAccount()).rejects.toThrow(/same Proton account/);
+        });
+
+        const fresh = (d: Awaited<ReturnType<typeof synced>>) =>
+            new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+        const signInAs = (d: Awaited<ReturnType<typeof synced>>, uid: string) => {
+            (d.sdk as any).getMyFilesRootFolder = async () => ({ ...d.root, uid });
+        };
+
+        test('a check made between sign-out and the next sign-in never stands for the account signed in to next', async () => {
+            const d = await synced();
+            const engine = fresh(d);
+            await engine.start();
+            await engine.stop(); // signing out: still signed in to this account for a moment
+            expect(await (engine as any).verifyAccount()).toBe(true); // as a drive change journalled meanwhile does, with this one's root
+            signInAs(d, 'other~root'); // the next sign-in is to another account
+            await engine.start();
+            expect(engine.getStatus().accountMismatch).not.toBeNull();
+            await engine.stop();
+        });
+
+        test('a root lookup begun before a sign-out never fills in the account after the next sign-in', async () => {
+            const d = await synced();
+            const engine = fresh(d);
+            const lookUp = d.sdk.getMyFilesRootFolder.bind(d.sdk);
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            (d.sdk as any).getMyFilesRootFolder = async () => {
+                const root = await lookUp();
+                await gate;
+                return root;
+            };
+            const held = (engine as any).verifyAccount();
+            await Bun.sleep(5);
+            await engine.stop();
+            signInAs(d, 'other~root');
+            await engine.start();
+            release();
+            expect(await held).toBe(false);
+            expect(engine.getStatus().accountMismatch).not.toBeNull();
+            expect((engine as any).accountVerified).toBe(false);
+            expect((engine as any).rootNode?.uid).toBe('other~root');
+            await engine.stop();
+        });
+
+        test('a mismatch found before still holds after a restart offline, and refuses what would act on the records', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountRoot', 'other~root');
+            await d.engine.reconcileNow();
+            expect(d.engine.getStatus().accountMismatch).not.toBeNull();
+            (d.sdk as any).getMyFilesRootFolder = async () => {
+                throw new Error('offline');
+            };
+            const engine = fresh(d);
+            await engine.start();
+            expect(engine.getStatus().accountMismatch?.message).toMatch(/different Proton account/);
+            await expect(engine.setAvailability('Kept.txt', 'free')).rejects.toThrow(/different Proton account/);
+            await expect(engine.deleteItem('Kept.txt')).rejects.toThrow(/different Proton account/);
+            expect(await readFile(d.local('Kept.txt'), 'utf8')).toBe('kept');
+            expect(stateDb.getItemByPath('Kept.txt')).not.toBeNull();
+            await engine.stop();
+        });
+
+        test('before the account can be checked (offline), availability and conflict choices are refused, and nothing is freed', async () => {
+            const d = await synced();
+            (d.sdk as any).getMyFilesRootFolder = async () => {
+                throw new Error('offline');
+            };
+            const engine = fresh(d);
+            await engine.start();
+            await expect(engine.setAvailability('Kept.txt', 'free')).rejects.toThrow(/try again once online/);
+            await expect(engine.resolveConflictManually(1, 'keep-local')).rejects.toThrow(/try again once online/);
+            expect(await readFile(d.local('Kept.txt'), 'utf8')).toBe('kept');
+            expect(stateDb.getItemByPath('Kept.txt')).not.toBeNull();
+            await engine.stop();
+        });
+
+        test('once online, the same account clears a mismatch remembered from before', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountMismatch', '1');
+            const engine = fresh(d);
+            await engine.start();
+            expect(engine.getStatus().accountMismatch).toBeNull();
+            expect(stateDb.getMeta('accountMismatch')).toBeNull();
+            await engine.stop();
+        });
+
+        test('after starting fresh, local and cloud changes are watched at once, with no restart', async () => {
+            const d = await synced();
+            const engine = otherAccount(d);
+            await engine.start();
+            expect(engine.getStatus().accountMismatch).not.toBeNull();
+            await engine.startFreshForThisAccount();
+            expect(stateDb.getMeta('accountMismatch')).toBeNull();
+            await engine.reconcileNow();
+            expect((engine as any).watcher.running).toBe(true);
+            expect((engine as any).unsubscribeDriveEvents).not.toBeNull();
+            d.calls.uploads.length = 0;
+            await writeFile(d.local('Docs/new.txt'), 'new');
+            await (engine as any).handleLocalFileChange('Docs/new.txt');
+            expect(d.calls.uploads).toContain('Docs/new.txt');
+            await engine.stop();
+        });
+
+        test('starting fresh is refused when a mismatch remembered from before is over: the records and journal stay', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountMismatch', '1'); // from a sign-in to another account, since signed back out of
+            (d.engine as any).accountMismatch = { message: 'remembered' }; // as a start that couldn't check restores it
+            // A drive delete still to be sent
+            stateDb.connection.run("INSERT INTO remote_ops (kind, nodeUid, path, createdAt) VALUES ('trash', 'vol~Kept.txt', 'Kept.txt', 0)");
+            const journalled = () => (stateDb.connection.query('SELECT COUNT(*) AS n FROM remote_ops').get() as { n: number }).n;
+            const records = stateDb.getAllItems().length;
+            await expect(d.engine.startFreshForThisAccount()).rejects.toThrow(/same Proton account/);
+            expect(stateDb.getAllItems().length).toBe(records);
+            expect(journalled()).toBe(1);
+            expect(stateDb.getMeta('accountMismatch')).toBeNull();
+            expect(d.engine.getStatus().accountMismatch).toBeNull();
+        });
+
+        test('starting fresh that waited for its turn across a sign-out changes nothing', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountRoot', 'other~root');
+            await d.engine.reconcileNow();
+            const records = stateDb.getAllItems().length;
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            const held = (d.engine as any).inAvailabilityRun(() => gate); // another availability change holds the turn
+            const fresh = d.engine.startFreshForThisAccount();
+            await Bun.sleep(10);
+            await d.engine.stop();
+            release();
+            await held;
+            await expect(fresh).rejects.toThrow(/nothing was changed/);
+            expect(stateDb.getAllItems().length).toBe(records);
+            expect(stateDb.getMeta('accountRoot')).toBe('other~root');
+        });
+
+        test('a mismatch found by a local change is what the status says', async () => {
+            const d = await synced();
+            const engine = otherAccount(d);
+            await writeFile(d.local('Docs/new.txt'), 'new');
+            await (engine as any).handleLocalFileChange('Docs/new.txt');
+            expect(engine.getStatus()).toMatchObject({ state: 'error', lastError: expect.stringMatching(/different Proton account/) });
+        });
+
+        test('starting fresh is refused while the files move', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountRoot', 'other~root');
+            await d.engine.reconcileNow();
+            await d.engine.holdForMove();
+            await expect(d.engine.startFreshForThisAccount()).rejects.toThrow(/busy moving/);
+            expect(stateDb.getMeta('accountRoot')).toBe('other~root');
+            d.engine.releaseHold();
+        });
+    });
 });

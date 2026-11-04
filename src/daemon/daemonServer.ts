@@ -274,6 +274,9 @@ export async function startSyncDaemon(options: {
                 signInUrlResolver?.(signInUrl);
             })
             .then(async () => {
+                // Signed in, maybe to another account than the engine knew: what it knew of the last one (its root, that
+                // it was checked) goes before anything runs under this session, and start() checks it afresh (#35)
+                await engine.stop();
                 await runtime.eventsManager.startSubscriptions();
                 stateDb.logActivity({
                     action: 'auth',
