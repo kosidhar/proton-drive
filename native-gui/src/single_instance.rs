@@ -4,7 +4,7 @@
 //! The lock decides who is first, not the socket: a socket left by a crashed GUI is just removed by the next one to
 //! get the lock, and two starts at once can't both become the primary, since only one gets the lock.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -79,23 +79,40 @@ fn parse_show(line: &str) -> Option<Option<String>> {
     }
 }
 
-fn send_show(socket: &Path, message: &str) -> bool {
-    let Ok(mut stream) = UnixStream::connect(socket) else { return false };
+/// How a request went: answered, turned down by closing (an app that doesn't know it), or not answered at all.
+#[derive(Debug, PartialEq, Eq)]
+enum Sent {
+    Answered,
+    Closed,
+    NoAnswer,
+}
+
+fn send_show(socket: &Path, message: &str) -> Sent {
+    let Ok(mut stream) = UnixStream::connect(socket) else { return Sent::NoAnswer };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     if stream.write_all(message.as_bytes()).is_err() {
-        return false;
+        return Sent::NoAnswer;
     }
     let mut reply = String::new();
-    BufReader::new(stream).read_line(&mut reply).is_ok() && reply.trim() == "ok"
+    match BufReader::new(stream).take(64).read_line(&mut reply) {
+        Ok(_) if reply.trim() == "ok" => Sent::Answered,
+        Ok(_) => Sent::Closed,
+        Err(_) => Sent::NoAnswer, // timed out: hung, not an older app
+    }
 }
 
 /// Asks the GUI listening at `socket` to show itself, on `section` if one is named. True once it has said it will. An
-/// app from before sections were passed on knows only `show`: it doesn't answer `show <section>`, so the plain request
-/// follows at once and the window still comes to the front.
+/// app from before sections were passed on knows only `show`: it closes the connection on `show <section>` without a
+/// word, so the plain request follows at once and the window still comes to the front. One that doesn't answer at all
+/// is hung, and isn't asked twice.
 pub fn signal_show(socket: &Path, section: Option<&str>) -> bool {
     let message = show_message(section);
-    send_show(socket, &message) || (message != show_message(None) && send_show(socket, &show_message(None)))
+    match send_show(socket, &message) {
+        Sent::Answered => true,
+        Sent::Closed if message != show_message(None) => send_show(socket, &show_message(None)) == Sent::Answered,
+        _ => false,
+    }
 }
 
 /// Becomes the one GUI, or asks the one that runs to show itself (on `section`, if named). `wait` bounds how long a later start keeps trying
@@ -149,7 +166,8 @@ pub fn serve(listener: UnixListener, on_show: impl Fn(Option<String>) + Send + '
         let Ok(mut stream) = stream else { continue };
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
         let mut line = String::new();
-        if BufReader::new(&stream).read_line(&mut line).is_err() {
+        // A request is one short line: never read more than that
+        if BufReader::new(&stream).take(256).read_line(&mut line).is_err() {
             continue;
         }
         if let Some(section) = parse_show(&line) {
@@ -245,6 +263,28 @@ mod tests {
         assert!(matches!(claim(&paths, uid(), true, Duration::from_secs(5), Some("home")).unwrap(), Claim::Signalled));
         assert_eq!(shown.load(Ordering::SeqCst), 1);
         assert!(started.elapsed() < Duration::from_secs(2), "it fell back at once, not after the wait");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hung_app_is_asked_once_per_try_not_again_with_the_plain_request() {
+        let dir = temp_dir("hung");
+        let paths = paths_in(&dir);
+        let Claim::Primary { lock: _lock, listener } = claim(&paths, uid(), true, Duration::from_secs(2), None).unwrap() else {
+            panic!("the first start must be the primary");
+        };
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = connections.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new(); // never answered, never closed: a hung app
+            for stream in listener.incoming().flatten() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+        // No wait beyond one try: one request, and no fallback after its timeout
+        assert!(matches!(claim(&paths, uid(), true, Duration::ZERO, Some("home")).unwrap(), Claim::Signalled));
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
