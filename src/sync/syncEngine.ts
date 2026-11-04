@@ -4233,10 +4233,7 @@ export class ProtonDriveSyncEngine {
                         }
                     }
                     if (source) {
-                        this.stateDb.setMeta(
-                            LOCAL_MOVE_IN_PROGRESS,
-                            JSON.stringify({ from: fromRel, to: toRel, replace: replacing }),
-                        );
+                        this.stateDb.setMeta(LOCAL_MOVE_IN_PROGRESS, this.moveIntent(fromRel, toRel, replacing));
                     }
                 })();
                 if (source) {
@@ -4909,12 +4906,24 @@ export class ProtonDriveSyncEngine {
     // deleting it there, which trashes it. So the move is finished on the next start, and before the files move between
     // the sync folder and the backing store. Whatever happens, no record is left where nothing is: if the item can't be
     // put there, it syncs as a new one from where it is (nothing lost or trashed).
+    // What a local move is about to do, for recoverLocalMove: with the item it moves (device and inode), so that only that
+    // item is ever moved after an interruption, never another put at its old path since (#153)
+    private moveIntent(fromRel: string, toRel: string, replace: boolean): string {
+        const st = lstatSync(path.join(this.localRoot(), fromRel), { throwIfNoEntry: false, bigint: true });
+        return JSON.stringify({
+            from: fromRel,
+            to: toRel,
+            replace,
+            ...(st ? { dev: st.dev.toString(), ino: st.ino.toString() } : {}),
+        });
+    }
+
     recoverLocalMove(): void {
         const raw = this.stateDb.getMeta(LOCAL_MOVE_IN_PROGRESS);
         if (raw === null) {
             return;
         }
-        let intent: { from?: unknown; to?: unknown; replace?: unknown } = {};
+        let intent: { from?: unknown; to?: unknown; replace?: unknown; dev?: unknown; ino?: unknown } = {};
         try {
             intent = JSON.parse(raw) as typeof intent;
         } catch {
@@ -4925,8 +4934,19 @@ export class ProtonDriveSyncEngine {
             const from = path.join(root, intent.from);
             const to = path.join(root, intent.to);
             const exists = (fullPath: string) => lstatSync(fullPath, { throwIfNoEntry: false }) !== undefined;
+            // The item at the source is still the one the move was about (a marker written before #153 has no identity
+            // and is trusted as before): anything else there was put there since, and is never moved over anything
+            const stillTheItem = () => {
+                if (typeof intent.dev !== 'string' || typeof intent.ino !== 'string') {
+                    return true;
+                }
+                const st = lstatSync(from, { throwIfNoEntry: false, bigint: true });
+                return st !== undefined && st.dev.toString() === intent.dev && st.ino.toString() === intent.ino;
+            };
             try {
-                if (intent.replace === true) {
+                if (!stillTheItem()) {
+                    // Moved already (or gone): nothing to finish
+                } else if (intent.replace === true) {
                     // The replaced file is there either way: the source still being there says the rename didn't happen
                     if (exists(from)) {
                         renameSync(from, to);
@@ -5333,7 +5353,7 @@ export class ProtonDriveSyncEngine {
             this.stateDb.connection.transaction(() => {
                 this.stateDb.renameItemPath(fromRel, toRel, this.cloudParentOf(toRel));
                 this.journal.retarget(fromRel, toRel);
-                this.stateDb.setMeta(LOCAL_MOVE_IN_PROGRESS, JSON.stringify({ from: fromRel, to: toRel, replace: false }));
+                this.stateDb.setMeta(LOCAL_MOVE_IN_PROGRESS, this.moveIntent(fromRel, toRel, false));
             })();
             this.moveLocalOrUndo(fromRel, toRel, false, snapshot, () => records.dropSubtree(fromRel));
         }, { from: fromRel, to: toRel });
