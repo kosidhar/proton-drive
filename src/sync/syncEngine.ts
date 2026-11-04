@@ -4259,10 +4259,7 @@ export class ProtonDriveSyncEngine {
                         }
                     }
                     if (source) {
-                        this.stateDb.setMeta(
-                            LOCAL_MOVE_IN_PROGRESS,
-                            JSON.stringify({ from: fromRel, to: toRel, replace: replacing }),
-                        );
+                        this.stateDb.setMeta(LOCAL_MOVE_IN_PROGRESS, this.moveIntent(fromRel, toRel, replacing));
                     }
                 })();
                 if (source) {
@@ -4939,12 +4936,25 @@ export class ProtonDriveSyncEngine {
     // deleting it there, which trashes it. So the move is finished on the next start, and before the files move between
     // the sync folder and the backing store. Whatever happens, no record is left where nothing is: if the item can't be
     // put there, it syncs as a new one from where it is (nothing lost or trashed).
+    // What a local move is about to do, for recoverLocalMove: with the item it moves (inode and birth time, which a rename
+    // keeps, and which a new file never has both of), so that a move found done already is never done again over what
+    // was put at its old path since (#153)
+    private moveIntent(fromRel: string, toRel: string, replace: boolean): string {
+        const st = lstatSync(path.join(this.localRoot(), fromRel), { throwIfNoEntry: false, bigint: true });
+        return JSON.stringify({
+            from: fromRel,
+            to: toRel,
+            replace,
+            ...(st ? { ino: st.ino.toString(), born: st.birthtimeNs.toString() } : {}),
+        });
+    }
+
     recoverLocalMove(): void {
         const raw = this.stateDb.getMeta(LOCAL_MOVE_IN_PROGRESS);
         if (raw === null) {
             return;
         }
-        let intent: { from?: unknown; to?: unknown; replace?: unknown } = {};
+        let intent: { from?: unknown; to?: unknown; replace?: unknown; ino?: unknown; born?: unknown } = {};
         try {
             intent = JSON.parse(raw) as typeof intent;
         } catch {
@@ -4955,8 +4965,21 @@ export class ProtonDriveSyncEngine {
             const from = path.join(root, intent.from);
             const to = path.join(root, intent.to);
             const exists = (fullPath: string) => lstatSync(fullPath, { throwIfNoEntry: false }) !== undefined;
+            // The item the move was about is at its target already: the move happened, and only clearing the marker
+            // didn't. Whatever is at the source now was put there since, and is never moved over it. Only this firm sign
+            // stops a move: an identity that doesn't match (a marker from before #153, an inode renumbered by a remount)
+            // leaves recovery as it always was, as a move not finished is undone in the cloud too otherwise
+            const movedAlready = () => {
+                if (typeof intent.ino !== 'string' || typeof intent.born !== 'string') {
+                    return false;
+                }
+                const st = lstatSync(to, { throwIfNoEntry: false, bigint: true });
+                return st !== undefined && st.ino.toString() === intent.ino && st.birthtimeNs.toString() === intent.born;
+            };
             try {
-                if (intent.replace === true) {
+                if (movedAlready()) {
+                    // Nothing to finish
+                } else if (intent.replace === true) {
                     // The replaced file is there either way: the source still being there says the rename didn't happen
                     if (exists(from)) {
                         renameSync(from, to);
@@ -5363,7 +5386,7 @@ export class ProtonDriveSyncEngine {
             this.stateDb.connection.transaction(() => {
                 this.stateDb.renameItemPath(fromRel, toRel, this.cloudParentOf(toRel));
                 this.journal.retarget(fromRel, toRel);
-                this.stateDb.setMeta(LOCAL_MOVE_IN_PROGRESS, JSON.stringify({ from: fromRel, to: toRel, replace: false }));
+                this.stateDb.setMeta(LOCAL_MOVE_IN_PROGRESS, this.moveIntent(fromRel, toRel, false));
             })();
             this.moveLocalOrUndo(fromRel, toRel, false, snapshot, () => records.dropSubtree(fromRel));
         }, { from: fromRel, to: toRel });
