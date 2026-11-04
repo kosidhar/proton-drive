@@ -516,6 +516,34 @@ class MenuTest(unittest.TestCase):
         self.assertEqual(h.notes, [("Proton Drive couldn't change a.txt, b.txt, c.txt and 2 more", "Not in Proton Drive: x")])
 
 
+class AppItemTest(unittest.TestCase):
+    """#212: inside the drive, the item that opens the app says so; 'Open Proton Drive' is the drive itself (tray, #98)."""
+
+    def test_it_is_named_for_the_app_and_opens_it_on_home(self):
+        self.assertEqual(ext.APP_LABEL, "Proton Drive: Status & Settings…")
+        with mock.patch.object(ext, "_spawn_detached") as spawn:
+            ext._launch_native_gui()
+        argv = spawn.call_args_list[0].args[0]
+        self.assertTrue(argv[0].endswith("protondrive-gui"))
+        self.assertEqual(argv[1:], ["--tab", "home"])
+
+    def test_every_file_manager_uses_the_new_name(self):
+        linux = os.path.join(HERE, "..")
+        with open(os.path.join(HERE, "proton_drive_nautilus.py")) as f:
+            nautilus = f.read()
+        self.assertNotIn('label="Open Proton Drive"', nautilus)
+        self.assertEqual(nautilus.count("label=APP_LABEL"), 2)  # the items' menu and the folder background's
+        with open(os.path.join(linux, "nemo", "proton_drive_nemo.py")) as f:
+            nemo = f.read()
+        self.assertIn('label="Proton Drive: Status & Settings…"', nemo)
+        self.assertIn('"--tab", "home"', nemo)
+        with open(os.path.join(linux, "dolphin", "protondrive.desktop")) as f:
+            dolphin = f.read()
+        # Dolphin groups the actions under a "Proton Drive" submenu, so the item needs no prefix there
+        self.assertIn("Name=Status & Settings…\nIcon=ch.proton.drive\nExec=protondrive-gui --tab home", dolphin)
+        self.assertNotIn("Name=Open Proton Drive", dolphin)
+
+
 class ChangeTest(unittest.TestCase):
     def setUp(self):
         self.h = Harness(

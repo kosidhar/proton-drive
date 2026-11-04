@@ -11,6 +11,6 @@ Icon=ch.proton.drive
 Exec=protondrive sync
 
 [Desktop Action ProtonDriveOpenGui]
-Name=Open Proton Drive
+Name=Status & Settings…
 Icon=ch.proton.drive
-Exec=protondrive-gui
+Exec=protondrive-gui --tab home
