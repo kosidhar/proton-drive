@@ -59,6 +59,11 @@ describe('the login entry', () => {
         expect(entry).toContain('TryExec=/opt/Proton Drive/100%/pro"ton$\n');
         expect(entry).toContain('X-ProtonDrive-Autostart=true\n');
         expect(desktopEntry(['/usr/bin/protondrive', 'daemon'])).toContain('Exec=/usr/bin/protondrive daemon\n');
+        // A newline or a backslash never breaks the line: escaped as a string value, in Exec and TryExec
+        const odd = desktopEntry(['/a b/x\\y\nz', 'daemon']);
+        expect(odd).toContain('Exec="/a b/x\\\\\\\\y\\nz" daemon\n');
+        expect(odd).toContain('TryExec=/a b/x\\\\y\\nz\n');
+        expect(odd.split('\n').filter((line) => line.startsWith('Exec')).length).toBe(1);
     });
 });
 
@@ -112,6 +117,30 @@ describe('the login entry follows the setting', () => {
         writeFileSync(path.join(wants, 'protondrive.service'), '');
         expect(sync()).toBe('systemd');
         expect(existsSync(file)).toBe(false);
+        stateDb.close();
+    });
+
+    test('disabling the systemd unit later reads as turning starting at login off: no entry comes back', () => {
+        const { stateDb, file, sync, env } = setup();
+        const wants = path.join(env.XDG_CONFIG_HOME, 'systemd/user/default.target.wants');
+        mkdirSync(wants, { recursive: true });
+        writeFileSync(path.join(wants, 'protondrive.service'), '');
+        expect(sync()).toBe('systemd');
+        rmSync(path.join(wants, 'protondrive.service'));
+        expect(sync()).toBe('turned-off-by-user');
+        expect(existsSync(file)).toBe(false);
+        expect(stateDb.getSettings().startAtLogin).toBe(false);
+        stateDb.close();
+    });
+
+    test('XDG_CONFIG_HOME changed since: the entry moves there, never left behind, and the setting stays on', () => {
+        const { stateDb, file, sync, dir } = setup();
+        sync();
+        const moved = { XDG_CONFIG_HOME: path.join(dir, 'cfg2'), HOME: dir };
+        expect(syncLoginEntry(stateDb, { command: ['/usr/bin/protondrive', 'daemon'], env: moved, explicit: false })).toBe('written');
+        expect(existsSync(file)).toBe(false);
+        expect(existsSync(autostartEntryPath(moved))).toBe(true);
+        expect(stateDb.getSettings().startAtLogin).toBe(true);
         stateDb.close();
     });
 

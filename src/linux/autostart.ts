@@ -11,7 +11,8 @@ import type { SyncStateDatabase } from '../sync/syncStateDb';
 
 const ENTRY_NAME = 'proton-drive.desktop';
 const OURS = 'X-ProtonDrive-Autostart=true';
-// Set once the daemon has written the entry: gone after that, the user deleted it
+// Where the entry is, once the daemon has written it (or left starting at login to the user's systemd unit): gone from
+// there after that, the user removed it, or disabled the unit (install.sh --uninstall clears it with the entry)
 const WRITTEN = 'autostartWritten';
 const SYSTEMD_UNITS = ['protondrive.service', 'proton-drive-ubuntu.service'];
 
@@ -43,7 +44,7 @@ export function autostartCommand(execPath: string = process.execPath, argv: stri
 // escaped inside the quotes; then, the value being a string, each backslash doubled; and % doubled (a field code)
 function execArg(arg: string): string {
     const quoted = /[\s"'\\><~|&;$*?#()`]/.test(arg) ? `"${arg.replace(/(["`$\\])/g, '\\$1')}"` : arg;
-    return quoted.replace(/\\/g, '\\\\').replace(/%/g, '%%');
+    return stringValue(quoted).replace(/%/g, '%%');
 }
 
 export function desktopEntry(command: string[]): string {
@@ -54,10 +55,9 @@ export function desktopEntry(command: string[]): string {
         'Comment=Sync your Proton Drive folder and mount the drive',
         `Exec=${command.map(execArg).join(' ')}`,
         // Skipped quietly once that program is gone (Proton Drive uninstalled by a package manager)
-        `TryExec=${command[0]}`,
+        `TryExec=${stringValue(command[0]!)}`,
         'Icon=ch.proton.drive',
         'Terminal=false',
-        'NoDisplay=true',
         'X-GNOME-Autostart-enabled=true',
         OURS,
         '',
@@ -77,7 +77,13 @@ const disabledInEntry = (text: string) =>
 
 // The user's own systemd unit for Proton Drive, enabled: it starts the daemon, and an entry would start a second one
 function systemdEnabled(env: Env): boolean {
-    return SYSTEMD_UNITS.some((unit) => existsSync(path.join(configHome(env), 'systemd/user/default.target.wants', unit)));
+    const wants = [path.join(configHome(env), 'systemd/user/default.target.wants'), '/etc/systemd/user/default.target.wants'];
+    return wants.some((dir) => SYSTEMD_UNITS.some((unit) => existsSync(path.join(dir, unit))));
+}
+
+// A desktop entry's string value: backslash, newline, tab and carriage return escaped
+function stringValue(value: string): string {
+    return value.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\t/g, '\\t').replace(/\r/g, '\\r');
 }
 
 export type LoginEntryResult = 'written' | 'unchanged' | 'removed' | 'turned-off-by-user' | 'not-ours' | 'systemd' | 'unsupported';
@@ -98,12 +104,24 @@ export function syncLoginEntry(
         return 'not-ours';
     }
     const enabled = stateDb.getSettings().startAtLogin;
-    if (!enabled || systemdEnabled(env)) {
+    const written = stateDb.getMeta(WRITTEN);
+    // An entry this daemon wrote elsewhere (XDG_CONFIG_HOME changed since): moved here, never left behind
+    if (written !== null && written !== file && written !== 'systemd') {
+        if (readEntry(written)?.split('\n').includes(OURS)) unlinkSync(written);
+    }
+    if (!enabled) {
         if (text !== null) unlinkSync(file);
         stateDb.deleteMeta(WRITTEN);
-        return enabled ? 'systemd' : text !== null ? 'removed' : 'unchanged';
+        return text !== null ? 'removed' : 'unchanged';
     }
-    if (!opts.explicit && ((text !== null && disabledInEntry(text)) || (text === null && stateDb.getMeta(WRITTEN) !== null))) {
+    if (systemdEnabled(env)) {
+        // The user's unit starts it: no entry, but noted, so that disabling the unit later reads as turning it off
+        if (text !== null) unlinkSync(file);
+        stateDb.setMeta(WRITTEN, 'systemd');
+        return 'systemd';
+    }
+    const removedByUser = text === null && (written === file || written === 'systemd');
+    if (!opts.explicit && ((text !== null && disabledInEntry(text)) || removedByUser)) {
         stateDb.updateSettings({ startAtLogin: false });
         stateDb.deleteMeta(WRITTEN);
         return 'turned-off-by-user';
@@ -116,6 +134,6 @@ export function syncLoginEntry(
     const tmp = `${file}.tmp-${process.pid}`;
     writeFileSync(tmp, entry, { mode: 0o644 });
     renameSync(tmp, file);
-    stateDb.setMeta(WRITTEN, '1');
+    stateDb.setMeta(WRITTEN, file);
     return 'written';
 }

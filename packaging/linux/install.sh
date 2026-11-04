@@ -110,6 +110,11 @@ if [ "$UNINSTALL" -eq 1 ]; then
   autostart_entry="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/proton-drive.desktop"
   if [ "$(id -u)" -ne 0 ] && grep -qx 'X-ProtonDrive-Autostart=true' "$autostart_entry" 2>/dev/null; then
     rm -f "$autostart_entry"
+    # Forget it was written, so a reinstall starts at login again rather than reading this as the user turning it off
+    state_db="$(proton_app_dir)/ubuntu-sync-state.sqlite"
+    if [ -f "$state_db" ] && command -v python3 >/dev/null 2>&1; then
+      python3 -c 'import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); db.execute("DELETE FROM settings WHERE key = ?", ("autostartWritten",)); db.commit()' "$state_db" 2>/dev/null || true
+    fi
   fi
   rm -f "$PREFIX/share/icons/hicolor/scalable/emblems/emblem-protondrive-"*.svg
   # The file manager integrations and the tray, so Files, Nemo and Dolphin stop offering Proton Drive (#54)
