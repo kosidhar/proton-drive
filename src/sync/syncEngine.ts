@@ -1577,9 +1577,10 @@ export class ProtonDriveSyncEngine {
             this.stateDb.logActivity({
                 action: 'conflict',
                 localRelPath: relPath,
+                // A copy moved or deleted before it uploaded is in the log already, from uploadConflictCopy
                 details:
                     conflictCopyRelPath === null
-                        ? 'Resolved conflict with keep-both: the conflict copy was moved or deleted before it uploaded'
+                        ? 'Resolved conflict with keep-both'
                         : `Resolved conflict with keep-both: saved ${conflictCopyRelPath}`,
             });
         } finally {
@@ -1885,6 +1886,7 @@ export class ProtonDriveSyncEngine {
                 if (kept === null) {
                     throw new ConflictRefusedError(409, `${conflict.localRelPath} changed while both were being kept; try again`);
                 }
+                // A null copy path leaves the row's as it is (COALESCE), which a waiting row never has set
                 this.stateDb.markConflictResolved(conflictId, 'keep-both', kept.copyPath);
             }
             // Resolved, whichever way: a keep-both of it left unfinished before is over too (see keepBoth)
