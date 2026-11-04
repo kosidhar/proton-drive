@@ -1,4 +1,5 @@
 mod home;
+mod settings;
 mod single_instance;
 
 use std::process::Command;
@@ -433,6 +434,12 @@ struct ActivityRecord {
     details: String,
 }
 
+/// Activity's search: the path or the details hold the query, whatever the case; an empty query matches everything.
+fn activity_matches(act: &ActivityRecord, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    query.is_empty() || act.local_rel_path.to_lowercase().contains(&query) || act.details.to_lowercase().contains(&query)
+}
+
 /// What the daemon's control socket answers to an availability action.
 #[derive(Clone, Debug, Deserialize)]
 struct AvailabilityResult {
@@ -618,6 +625,29 @@ fn set_availability(path: &str, action: &str) -> Result<AvailabilityResult, Stri
     serde_json::from_value(reply).map_err(|e| e.to_string())
 }
 
+/// One item hidden from this computer, as GET /availability/hidden lists it.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default)]
+struct HiddenItem {
+    /// Relative to the sync folder
+    path: String,
+    /// hidden, or hiding while the hide waits on uploads
+    state: String,
+}
+
+/// Reading the list of hidden items is quick: the daemon answers it from its database.
+const HIDDEN_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What is hidden from this computer (GET /availability/hidden on the control socket; it only reads).
+fn hidden_items_at(socket: &std::path::Path) -> Result<Vec<HiddenItem>, String> {
+    #[derive(Deserialize)]
+    struct Reply {
+        items: Vec<HiddenItem>,
+    }
+    let reply = control_request_at(socket, "GET", "/availability/hidden", None, HIDDEN_READ_TIMEOUT)?;
+    serde_json::from_value::<Reply>(reply).map(|r| r.items).map_err(|e| e.to_string())
+}
+
 /// Sign-in answers once the browser has the sign-in page, or after 3 s without it.
 const LOGIN_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Sign-out stops the sync engine first.
@@ -772,13 +802,19 @@ struct ConfirmCopy {
     action: &'static str,
 }
 
-fn confirm_copy(confirm: &PendingConfirm) -> ConfirmCopy {
+/// `virtual_drive`: whether the drive shows online-only files in Files (a plain folder doesn't).
+fn confirm_copy(confirm: &PendingConfirm, virtual_drive: bool) -> ConfirmCopy {
     match confirm {
         PendingConfirm::FreeAll { rel_path } => {
             let (title, body) = if rel_path.is_empty() {
+                let stay = if virtual_drive {
+                    "Your files stay in Proton Drive, and in Files as online-only: they download again when you open them. Nothing is deleted online."
+                } else {
+                    "Your files stay in Proton Drive, and nothing is deleted online. While Proton Drive is a plain folder, files that are only online don't show in Files."
+                };
                 (
                     "Free up space on this computer?".to_string(),
-                    "This removes the copies on this computer of everything that is safely in Proton Drive. Your files stay in Proton Drive, and in Files as online-only: they download again when you open them. Nothing is deleted online.".to_string(),
+                    format!("This removes the copies on this computer of everything that is safely in Proton Drive. {stay}"),
                 )
             } else {
                 (
@@ -856,6 +892,8 @@ enum WorkerCommand {
     LoadConflicts,
     ResolveConflict { id: u64, choice: String },
     SetAvailability { path: String, action: String },
+    /// What is hidden from this computer, for Settings (a read, over the control socket)
+    LoadHidden,
     /// What to do about the files missing from the folder, as shown (POST /sync/files-missing)
     ResolveFilesMissing { choice: MissingChoice, root: String, names: Vec<String> },
 }
@@ -923,6 +961,8 @@ enum WorkerEvent {
     ConflictsLoaded(Vec<ConflictRecord>),
     ConflictResolved(Result<(), String>),
     AvailabilityDone { path: String, result: Result<AvailabilityResult, String> },
+    /// What is hidden from this computer, or why it couldn't be read
+    HiddenLoaded(Result<Vec<HiddenItem>, String>),
     SettingsSaved(Result<SettingsReply, String>),
     VirtualDriveSwitched(Result<SettingsReply, String>),
     BlockedAppsSaved(Result<SettingsReply, String>),
@@ -1078,11 +1118,17 @@ struct ProtonDriveNativeApp {
     login_url: Option<String>,
     /// Why signing in or out failed
     account_error: Option<String>,
+    /// Activity's search: rows whose path or details hold it, whatever the case
     search_query: String,
-    show_account_menu: bool,
-    /// Where the sidebar's account footer was last drawn: a click on it toggles the account popover, so the popover's
-    /// click-outside check leaves it alone
-    account_footer_rect: Option<egui::Rect>,
+    /// The sidebar's account footer was clicked: Settings brings its Account card into view once
+    jump_to_account: bool,
+
+    /// What is hidden from this computer, as last read (None until the first answer), and whether a read is out
+    hidden: Option<Result<Vec<HiddenItem>, String>>,
+    hidden_loading: bool,
+    /// The item an Unhide was sent for, and how the last Unhide went when it didn't simply work
+    unhiding: Option<String>,
+    unhide_notice: Option<String>,
 
     /// Paths (relative to the sync folder; empty is the whole drive) with an availability action still running.
     working: Vec<String>,
@@ -1145,7 +1191,6 @@ impl ProtonDriveNativeApp {
         cc: &eframe::CreationContext<'_>,
         screenshot_target: Option<String>,
         initial_tab: NavTab,
-        initial_account_menu: bool,
         window_geometry: WindowGeometry,
     ) -> Self {
         let sys_light = detect_system_light_mode();
@@ -1203,8 +1248,11 @@ impl ProtonDriveNativeApp {
             login_url: None,
             account_error: None,
             search_query: String::new(),
-            show_account_menu: initial_account_menu,
-            account_footer_rect: None,
+            jump_to_account: false,
+            hidden: None,
+            hidden_loading: false,
+            unhiding: None,
+            unhide_notice: None,
             working: Vec::new(),
             pending_confirm: None,
             notice: None,
@@ -1298,7 +1346,7 @@ impl ProtonDriveNativeApp {
         let _ = self.tx.send(cmd);
     }
 
-    /// Sign-in and sign-out problems show under Activity's title and on Home, until the next try.
+    /// Sign-in and sign-out problems show under Activity's title, in Settings' Account card and on Home, until the next try.
     fn show_account_error(&mut self, text: String) {
         self.login_url = None;
         self.notice = Some(text.clone());
@@ -1353,6 +1401,10 @@ impl ProtonDriveNativeApp {
                         self.status = s;
                         self.activities = activity;
                         save_startup_cache(&self.status, &self.activities);
+                        // A hide finishing, or one made in Files, shows in Settings' list by the next status
+                        if self.tab == NavTab::Settings {
+                            self.load_hidden();
+                        }
                     }
                     Err(_) => {
                         self.daemon_online = false;
@@ -1425,6 +1477,10 @@ impl ProtonDriveNativeApp {
                     self.files_missing_error = result.err();
                     let _ = self.tx.send(WorkerCommand::RefreshAll);
                 }
+                WorkerEvent::HiddenLoaded(result) => {
+                    self.hidden_loading = false;
+                    self.hidden = Some(result);
+                }
                 WorkerEvent::ConflictsLoaded(conflicts) => {
                     self.conflicts = conflicts;
                 }
@@ -1436,6 +1492,13 @@ impl ProtonDriveNativeApp {
                         Ok(result) => availability_notice(&result),
                         Err(e) => Some(e),
                     };
+                    // An Unhide from Settings: its list changed, and a refusal shows there too
+                    if self.unhiding.as_deref() == Some(path.as_str()) {
+                        self.unhiding = None;
+                        self.unhide_notice = self.notice.clone();
+                        self.hidden_loading = false;
+                        self.load_hidden();
+                    }
                     // The status counters change with the action
                     let _ = self.tx.send(WorkerCommand::RefreshAll);
                 }
@@ -1550,7 +1613,7 @@ impl ProtonDriveNativeApp {
                         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
                     if response.clicked() {
-                        self.tab = tab;
+                        self.open_tab(tab);
                     }
                     ui.add_space(3.0);
                 }
@@ -1570,7 +1633,6 @@ impl ProtonDriveNativeApp {
                     None => ("Not signed in".to_string(), "PD".to_string()),
                 };
                 let footer = Frame::NONE
-                    .fill(if self.show_account_menu { PROTON_PURPLE_SOFT() } else { Color32::TRANSPARENT })
                     .corner_radius(CornerRadius::same(8))
                     .inner_margin(Margin::symmetric(8, 6))
                     .show(ui, |ui| {
@@ -1598,11 +1660,11 @@ impl ProtonDriveNativeApp {
                 if footer.hovered() {
                     ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
-                // Until Settings has its Account section, the account opens the popover that holds it
+                // The account is Settings' first card
                 if footer.clicked() {
-                    self.show_account_menu = !self.show_account_menu;
+                    self.open_tab(NavTab::Settings);
+                    self.jump_to_account = true;
                 }
-                self.account_footer_rect = Some(footer.rect);
 
                 ui.add_space(6.0);
                 ui.label(
@@ -1613,241 +1675,43 @@ impl ProtonDriveNativeApp {
             });
     }
 
-    fn render_account_popover(&mut self, ctx: &egui::Context) {
-        if !self.show_account_menu {
-            return;
+    /// Shows a section; Settings reads what is hidden as it opens.
+    fn open_tab(&mut self, tab: NavTab) {
+        if tab == NavTab::Settings && self.tab != NavTab::Settings {
+            self.load_hidden();
         }
+        self.tab = tab;
+    }
 
-        let pop_w = 264.0;
-        // Opens upwards from the sidebar's account footer
-        let footer = self.account_footer_rect;
-        let pop_pos = footer.map_or_else(
-            || egui::pos2(16.0, ctx.screen_rect().max.y - 80.0),
-            |r| egui::pos2(r.min.x, r.min.y - 8.0),
-        );
-
-        let (display_name, email, initials, plan_badge) = if let Some(acct) = &self.status.account {
-            let plan = if acct.max_space >= 400 * 1024 * 1024 * 1024 {
-                "Proton Unlimited"
-            } else if acct.max_space >= 15 * 1024 * 1024 * 1024 {
-                "Proton Drive Plus"
-            } else {
-                "Proton Free"
-            };
-            (
-                if acct.display_name.is_empty() {
-                    "Proton Account".to_string()
-                } else {
-                    acct.display_name.clone()
-                },
-                acct.email.clone(),
-                if acct.initials.is_empty() {
-                    "PD".to_string()
-                } else {
-                    acct.initials.clone()
-                },
-                plan.to_string(),
-            )
-        } else {
-            (
-                "Proton Account".to_string(),
-                "Not Signed In".to_string(),
-                "PD".to_string(),
-                "Proton Drive".to_string(),
-            )
-        };
-
-        let area_resp = egui::Area::new(egui::Id::new("proton_account_popover"))
-            .order(egui::Order::Foreground)
-            .pivot(egui::Align2::LEFT_BOTTOM)
-            .fixed_pos(pop_pos)
-            .show(ctx, |ui| {
-                Frame::NONE
-                    .fill(if is_light_mode() { Color32::WHITE } else { Color32::from_rgb(28, 25, 38) })
-                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
-                    .corner_radius(CornerRadius::same(12))
-                    .show(ui, |ui| {
-                        ui.set_min_width(pop_w);
-                        ui.set_max_width(pop_w);
-
-                        // Top header strip ("End-to-end encrypted sync  ›")
-                        Frame::NONE
-                            .inner_margin(Margin::symmetric(16, 12))
-                            .show(ui, |ui| {
-                                ui.set_min_width(pop_w - 32.0);
-                                ui.vertical_centered(|ui| {
-                                    ui.label(
-                                        RichText::new("✓  End-to-end encrypted sync   ›")
-                                            .size(12.5)
-                                            .color(TEXT_MUTED()),
-                                    );
-                                });
-                            });
-
-                        let (sep_rect, _) =
-                            ui.allocate_exact_size(Vec2::new(pop_w, 1.0), Sense::hover());
-                        ui.painter()
-                            .rect_filled(sep_rect, 0, BORDER_SUBTLE());
-
-                        // Main Popover Body
-                        Frame::NONE
-                            .inner_margin(Margin::symmetric(18, 18))
-                            .show(ui, |ui| {
-                                ui.set_min_width(pop_w - 36.0);
-                                ui.vertical_centered(|ui| {
-                                    // Centered 44x44 Initials Avatar
-                                    let (av_rect, _) = ui.allocate_exact_size(
-                                        Vec2::new(44.0, 44.0),
-                                        Sense::hover(),
-                                    );
-                                    ui.painter().rect_filled(
-                                        av_rect,
-                                        CornerRadius::same(10),
-                                        Color32::from_rgb(61, 46, 110),
-                                    );
-                                    ui.painter().text(
-                                        av_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        &initials,
-                                        FontId::new(16.0, FontFamily::Proportional),
-                                        Color32::WHITE,
-                                    );
-
-                                    ui.add_space(12.0);
-
-                                    // Display Name
-                                    ui.label(
-                                        RichText::new(&display_name)
-                                            .size(14.5)
-                                            .strong()
-                                            .color(TEXT_PRIMARY()),
-                                    );
-
-                                    ui.add_space(2.0);
-
-                                    // Email
-                                    ui.label(
-                                        RichText::new(&email).size(12.5).color(TEXT_MUTED()),
-                                    );
-
-                                    ui.add_space(8.0);
-
-                                    // Compact Plan Pill Badge ("Proton Unlimited") matching Proton Mail
-                                    let (pill_rect, _) = ui.allocate_exact_size(
-                                        Vec2::new(112.0, 20.0),
-                                        Sense::hover(),
-                                    );
-                                    ui.painter().rect_filled(
-                                        pill_rect,
-                                        CornerRadius::same(5),
-                                        Color32::from_rgb(47, 36, 84),
-                                    );
-                                    ui.painter().text(
-                                        pill_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        &plan_badge,
-                                        FontId::new(11.0, FontFamily::Proportional),
-                                        Color32::from_rgb(198, 180, 255),
-                                    );
-
-                                    ui.add_space(16.0);
-
-                                    // Button 1: Open local folder (outlined button matching Proton Mail)
-                                    let btn_w = pop_w - 36.0;
-                                    if proton_button(
-                                        ui,
-                                        Vec2::new(btn_w, 34.0),
-                                        "Open local sync folder",
-                                        BG_CARD(),
-                                        BG_CARD_ALT(),
-                                        Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                                        TEXT_PRIMARY(),
-                                        13.0,
-                                    )
-                                    .clicked()
-                                    {
-                                        let folder = if self.status.sync_dir.is_empty() {
-                                            "~/ProtonDrive"
-                                        } else {
-                                            &self.status.sync_dir
-                                        };
-                                        let _ = spawn_reaped(Command::new("xdg-open").arg(folder));
-                                        self.show_account_menu = false;
-                                    }
-
-                                    ui.add_space(8.0);
-
-                                    // Button 2: Sign out / Sign in (outlined with Proton purple border matching Proton Mail)
-                                    if self.status.logged_in {
-                                        if proton_button(
-                                            ui,
-                                            Vec2::new(btn_w, 34.0),
-                                            "Sign out",
-                                            BG_CARD(),
-                                            PROTON_PURPLE_SOFT(),
-                                            Some(Stroke::new(1.2_f32, PROTON_PURPLE)),
-                                            TEXT_PRIMARY(),
-                                            13.0,
-                                        )
-                                        .clicked()
-                                        {
-                                            self.send_account_command(WorkerCommand::Logout);
-                                            self.show_account_menu = false;
-                                        }
-                                    } else if proton_button(
-                                        ui,
-                                        Vec2::new(btn_w, 34.0),
-                                        "Sign in",
-                                        PROTON_PURPLE,
-                                        PROTON_PURPLE_HOVER,
-                                        None,
-                                        Color32::WHITE,
-                                        13.0,
-                                    )
-                                    .clicked()
-                                    {
-                                        self.send_account_command(WorkerCommand::StartLogin);
-                                        self.show_account_menu = false;
-                                    }
-                                });
-                            });
-                    });
-            });
-
-        // Close the popover on a click outside it; the footer toggles it itself
-        if ctx.input(|i| i.pointer.any_pressed()) {
-            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                if !area_resp.response.rect.contains(pos) && !footer.is_some_and(|r| r.contains(pos)) {
-                    self.show_account_menu = false;
-                }
-            }
+    /// Asks for what is hidden from this computer, unless a read is already out.
+    fn load_hidden(&mut self) {
+        if !self.hidden_loading {
+            self.hidden_loading = true;
+            let _ = self.tx.send(WorkerCommand::LoadHidden);
         }
     }
 
-    fn render_overview_tab(&mut self, ui: &mut egui::Ui) {
-        // The page scrolls when the window is too short for the stat cards plus a usable activity
-        // table; on taller windows the table fills the rest exactly, so no page scrollbar appears.
+    /// Activity: what was synced, newest first, with a search over it. Storage and transfers are Home's.
+    fn render_activity(&mut self, ui: &mut egui::Ui) {
+        // The page scrolls when the window is too short for a usable activity table; on taller windows the table
+        // fills the rest exactly, so no page scrollbar appears.
         let viewport_h = ui.available_height();
         ScrollArea::vertical()
-            .id_salt("overview_scroll")
+            .id_salt("activity_scroll")
             .auto_shrink([false, false])
-            .show(ui, |ui| self.render_overview_content(ui, viewport_h));
+            .show(ui, |ui| self.render_activity_content(ui, viewport_h));
     }
 
-    fn render_overview_content(&mut self, ui: &mut egui::Ui, viewport_h: f32) {
+    fn render_activity_content(&mut self, ui: &mut egui::Ui, viewport_h: f32) {
         let content_top = ui.cursor().top();
 
-        // Section Title Bar
+        // The title, and the search at the top right (or Sign in while signed out)
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Sync Activity & Storage")
-                    .size(20.0)
-                    .strong()
-                    .color(TEXT_PRIMARY()),
-            );
-            if !self.status.logged_in {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if proton_button(
+            ui.set_min_height(34.0);
+            ui.label(RichText::new("Activity").size(20.0).strong().color(TEXT_PRIMARY()));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if !self.status.logged_in
+                    && proton_button(
                         ui,
                         Vec2::new(165.0, 34.0),
                         "Sign in to Proton Drive",
@@ -1858,11 +1722,18 @@ impl ProtonDriveNativeApp {
                         13.0,
                     )
                     .clicked()
-                    {
-                        self.send_account_command(WorkerCommand::StartLogin);
-                    }
-                });
-            }
+                {
+                    self.send_account_command(WorkerCommand::StartLogin);
+                }
+                ui.add_space(8.0);
+                let width = ui.available_width().clamp(120.0, 280.0);
+                ui.add_sized(
+                    [width, 32.0],
+                    egui::TextEdit::singleline(&mut self.search_query)
+                        .hint_text("Search activity")
+                        .vertical_align(Align::Center),
+                );
+            });
         });
 
         if let Some(error) = &self.account_error {
@@ -1878,118 +1749,11 @@ impl ProtonDriveNativeApp {
             ui.label(RichText::new(text).size(12.0).color(PROTON_PURPLE_TEXT()));
         }
 
-        ui.add_space(12.0);
-
-        // 4 Stat Metric Cards (including Proton Cloud Storage Quota!)
-        let cloud_quota_str = if let Some(acct) = &self.status.account {
-            if acct.max_space > 0 {
-                format!(
-                    "{} / {}",
-                    format_bytes_precise(acct.used_space),
-                    format_bytes_precise(acct.max_space)
-                )
-            } else {
-                format_bytes(self.status.stats.total_bytes)
-            }
-        } else {
-            format_bytes(self.status.stats.total_bytes)
-        };
-
-        let stat_cards = [
-            ("Proton Cloud Storage", cloud_quota_str),
-            ("Local Synced Size", format_bytes_precise(self.status.stats.total_bytes)),
-            ("Synced Files", self.status.stats.total_files.to_string()),
-            ("Synced Folders", self.status.stats.total_folders.to_string()),
-        ];
-        let spacing = ui.spacing().item_spacing.x;
-        let per_row = stat_cards_per_row(ui.painter(), &stat_cards, ui.available_width(), spacing);
-        let content_width = stat_card_content_width(ui.available_width(), spacing, per_row);
-        // One shared value size so the longest value (usually the quota) fits on a single line
-        // and all cards stay visually consistent.
-        let value_size = stat_cards
-            .iter()
-            .map(|(_, value)| {
-                fit_font_size(ui.painter(), value, STAT_VALUE_SIZE, STAT_VALUE_MIN_SIZE, content_width)
-            })
-            .fold(STAT_VALUE_SIZE, f32::min);
-        for (row_idx, row) in stat_cards.chunks(per_row).enumerate() {
-            if row_idx > 0 {
-                // Make the gap between rows match the gap between columns
-                ui.add_space((spacing - ui.spacing().item_spacing.y).max(0.0));
-            }
-            ui.columns(per_row, |cols| {
-                for ((label, value), col) in row.iter().zip(cols.iter_mut()) {
-                    render_stat_card(col, label, value, value_size);
-                }
-            });
-        }
-
-        // Active Transfers Card (if any)
-        if !self.status.active_transfers.is_empty() {
-            ui.add_space(14.0);
-            card_frame().show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.label(
-                    RichText::new("Active Transfers")
-                        .size(15.0)
-                        .strong()
-                        .color(TEXT_PRIMARY()),
-                );
-                ui.add_space(10.0);
-                for t in &self.status.active_transfers {
-                    let frac = if t.total_bytes > 0 {
-                        (t.bytes_transferred as f32 / t.total_bytes as f32).clamp(0.0, 1.0)
-                    } else {
-                        0.5
-                    };
-                    render_transfer_line(ui, t);
-                    ui.add_space(4.0);
-                    ui.add(
-                        egui::ProgressBar::new(frac)
-                            .fill(PROTON_PURPLE)
-                            .desired_height(6.0)
-                            .corner_radius(CornerRadius::same(4)),
-                    );
-                    ui.add_space(8.0);
-                }
-            });
-        }
-
         ui.add_space(14.0);
 
-        // Recent Sync Activity Card (filtered by top search box)
-        let query_lower = self.search_query.trim().to_lowercase();
+        let query = self.search_query.clone();
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Recent Sync Activity")
-                        .size(15.5)
-                        .strong()
-                        .color(TEXT_PRIMARY()),
-                );
-                if let Some(acct) = &self.status.account {
-                    if acct.used_drive_space > 0 {
-                        let usage =
-                            format!("Drive Cloud Usage: {}", format_bytes_precise(acct.used_drive_space));
-                        let full = format!("{usage}  •  Syncing {}", self.status.sync_dir);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            // Fit the space left of the title instead of running over it
-                            let font = FontId::new(12.0, FontFamily::Proportional);
-                            let room = ui.available_width() - 16.0;
-                            let shown =
-                                activity_header_detail(ui.painter(), &usage, &self.status.sync_dir, &font, room);
-                            if !shown.is_empty() {
-                                let resp = ui.label(RichText::new(&shown).size(12.0).color(TEXT_MUTED()));
-                                if shown != full {
-                                    resp.on_hover_text(&full);
-                                }
-                            }
-                        });
-                    }
-                }
-            });
-            ui.add_space(12.0);
 
             // Full-width Column Header Bar for Recent Sync Activity
             let (hdr_rect, _) =
@@ -2055,27 +1819,18 @@ impl ProtonDriveNativeApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    if self.activities.is_empty() {
+                    let shown: Vec<&ActivityRecord> =
+                        self.activities.iter().filter(|a| activity_matches(a, &query)).take(50).collect();
+                    if self.activities.is_empty() || shown.is_empty() {
+                        let text = if self.activities.is_empty() {
+                            "No synchronization activity recorded yet.".to_string()
+                        } else {
+                            format!("No activity matches \"{}\".", query.trim())
+                        };
                         ui.add_space(16.0);
-                        ui.label(
-                            RichText::new("No synchronization activity recorded yet.")
-                                .size(13.0)
-                                .color(TEXT_MUTED()),
-                        );
+                        ui.label(RichText::new(text).size(13.0).color(TEXT_MUTED()));
                     } else {
-                        for act in self
-                            .activities
-                            .iter()
-                            .filter(|a| {
-                                query_lower.is_empty()
-                                    || a.local_rel_path
-                                        .to_lowercase()
-                                        .contains(&query_lower)
-                                    || a.details.to_lowercase().contains(&query_lower)
-                                    || a.action.to_lowercase().contains(&query_lower)
-                            })
-                            .take(50)
-                        {
+                        for act in shown {
                             let (row_rect, row_resp) = ui.allocate_exact_size(
                                 Vec2::new(ui.available_width(), 38.0),
                                 Sense::hover(),
@@ -2259,7 +2014,8 @@ impl ProtonDriveNativeApp {
             screen_rect.center().y - modal_h * 0.5,
         );
 
-        let ConfirmCopy { title, body, detail, button, cancel, rel_path: action_path, action } = confirm_copy(&confirm);
+        let ConfirmCopy { title, body, detail, button, cancel, rel_path: action_path, action } =
+            confirm_copy(&confirm, self.status.vfs.as_ref().is_some_and(|v| v.mode == "virtual"));
 
         let area_resp = egui::Area::new(egui::Id::new("confirm_dialog"))
             .order(egui::Order::Tooltip)
@@ -2462,12 +2218,11 @@ impl ProtonDriveNativeApp {
                 }
                 match self.tab {
                     NavTab::Home => self.render_home(ui),
-                    NavTab::Activity => self.render_overview_tab(ui),
+                    NavTab::Activity => self.render_activity(ui),
                     NavTab::Settings => self.render_settings_tab(ui),
                 }
             });
 
-        self.render_account_popover(ctx);
         self.render_confirm_modal(ctx);
     }
 
@@ -2478,6 +2233,8 @@ impl ProtonDriveNativeApp {
             .show(ui, |ui| {
                 // A gutter for the scroll bar, so that it never draws over the cards' edges
                 Frame::NONE.inner_margin(Margin { left: 0, right: 12, top: 0, bottom: 0 }).show(ui, |ui| {
+                    self.render_account_card(ui);
+                    ui.add_space(14.0);
                     // A daemon before Stage 2 has no virtual drive to show
                     if let Some(vfs) = self.status.vfs.clone() {
                         self.render_drive_card(ui, &vfs);
@@ -2485,79 +2242,28 @@ impl ProtonDriveNativeApp {
                         self.render_blocked_apps_card(ui);
                         ui.add_space(14.0);
                     }
+                    self.render_hidden_card(ui);
+                    ui.add_space(14.0);
                     self.render_sync_settings_card(ui);
                 });
             });
     }
 
-    /// The virtual drive: its state, Mount again, a move that stopped, and the switch.
+    /// The drive: where it is, and the virtual drive switch. Its state, Mount again and a move that stopped are Home's.
     fn render_drive_card(&mut self, ui: &mut egui::Ui, vfs: &VfsStatus) {
         let moving = vfs.reason.as_deref() == Some("moving");
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.label(RichText::new("Virtual Drive").size(16.0).strong().color(TEXT_PRIMARY()));
+            ui.label(RichText::new("Drive").size(16.0).strong().color(TEXT_PRIMARY()));
             ui.add_space(12.0);
 
-            ui.horizontal(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if offers_mount_again(vfs) {
-                        let clicked = ui
-                            .add_enabled_ui(!self.drive_working, |ui| {
-                                proton_button(
-                                    ui,
-                                    Vec2::new(button_width(ui, "Mount again"), 32.0),
-                                    "Mount again",
-                                    PROTON_PURPLE,
-                                    PROTON_PURPLE_HOVER,
-                                    None,
-                                    Color32::WHITE,
-                                    13.0,
-                                )
-                                .clicked()
-                            })
-                            .inner;
-                        if clicked {
-                            self.send_drive_command(WorkerCommand::MountAgain);
-                        }
-                        ui.add_space(8.0);
-                    }
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.add_space(DRIVE_DOT_INDENT);
-                        let line = ui.add(
-                            egui::Label::new(
-                                RichText::new(drive_status_line(vfs, &self.status.sync_dir))
-                                    .size(14.0)
-                                    .strong()
-                                    .color(TEXT_PRIMARY()),
-                            )
-                            .wrap(),
-                        );
-                        // Level with the first line when a long one wraps
-                        let first_line_h = ui.fonts(|f| f.row_height(&FontId::proportional(14.0)));
-                        let dot = egui::pos2(line.rect.left() - DRIVE_DOT_INDENT + 5.0, line.rect.top() + first_line_h / 2.0);
-                        ui.painter().circle_filled(dot, 4.5, drive_state_color(vfs));
-                    });
-                });
-            });
-            if let Some(hint) = files_safe_hint(vfs) {
-                ui.add_space(4.0);
-                ui.add(egui::Label::new(RichText::new(hint).size(12.5).color(TEXT_MUTED())).wrap());
-            }
-            if let Some(mv) = &vfs.drive_move {
-                ui.add_space(12.0);
-                self.render_stopped_move(ui, vfs, mv);
-            }
-            if self.drive_working {
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new("↻ Working… moving files can take a while.").size(12.5).color(PROTON_PURPLE_TEXT()),
-                );
-            }
-            if let Some(error) = &self.drive_error {
-                ui.add_space(10.0);
-                ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
-            }
-
+            ui.label(RichText::new("Location").size(13.0).color(TEXT_MUTED()));
+            ui.add_space(4.0);
+            let sync_dir = &self.status.sync_dir;
+            let shown = if sync_dir.is_empty() { "Not set up yet".to_string() } else { shown_folder(sync_dir) };
+            ui.add(egui::Label::new(RichText::new(&shown).size(14.0).strong().color(TEXT_PRIMARY())).truncate())
+                .on_hover_text(sync_dir);
+            ui.label(RichText::new(home::drive_kind(Some(vfs))).size(12.5).color(TEXT_MUTED()));
             ui.add_space(14.0);
             ui.separator();
             ui.add_space(12.0);
@@ -2596,6 +2302,26 @@ impl ProtonDriveNativeApp {
                 )
                 .wrap(),
             );
+            // Why the drive is a plain folder although the switch is on (switched off is the user's own choice)
+            if on && matches!(vfs.reason.as_deref(), Some("fuse-unavailable" | "different-disk")) {
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(drive_status_line(vfs, &self.status.sync_dir)).size(12.5).color(STATUS_WARNING),
+                    )
+                    .wrap(),
+                );
+            }
+            if self.drive_working {
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new("↻ Working… moving files can take a while.").size(12.5).color(PROTON_PURPLE_TEXT()),
+                );
+            }
+            if let Some(error) = &self.drive_error {
+                ui.add_space(10.0);
+                ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
+            }
             if clicked {
                 if on {
                     self.pending_confirm = Some(PendingConfirm::VirtualDriveOff);
@@ -3179,9 +2905,6 @@ fn proton_button(
     resp
 }
 
-/// Room left of the drive's status line for its dot.
-const DRIVE_DOT_INDENT: f32 = 18.0;
-
 /// A button just wide enough for its label at 13 pt.
 fn button_width(ui: &egui::Ui, label: &str) -> f32 {
     text_width(ui.painter(), label, &FontId::proportional(13.0)) + 32.0
@@ -3206,67 +2929,8 @@ fn toggle_switch(ui: &mut egui::Ui, on: bool) -> egui::Response {
     resp
 }
 
-/// The dot before the drive's status line: green when mounted, red when it needs the user, grey otherwise.
-fn drive_state_color(v: &VfsStatus) -> Color32 {
-    if v.mounted {
-        return STATUS_SUCCESS;
-    }
-    match v.reason.as_deref() {
-        Some("crashed" | "mount-point-busy" | "move-failed") => STATUS_DANGER,
-        Some("ejected" | "different-disk" | "fuse-unavailable") => STATUS_WARNING,
-        Some("starting" | "moving") => PROTON_PURPLE_HOVER,
-        _ => TEXT_MUTED(),
-    }
-}
-
 /// Room for about five 38px activity rows.
 const ACTIVITY_TABLE_MIN_HEIGHT: f32 = 200.0;
-
-const STAT_LABEL_SIZE: f32 = 12.5;
-const STAT_VALUE_SIZE: f32 = 24.0;
-const STAT_VALUE_MIN_SIZE: f32 = 14.0;
-/// Smallest value size accepted with four cards per row before switching to a 2×2 grid.
-const STAT_VALUE_COMFORT_SIZE: f32 = 18.0;
-
-/// Width left for a stat card's text when `per_row` cards share `available_width` (mirrors `ui.columns`).
-fn stat_card_content_width(available_width: f32, spacing: f32, per_row: usize) -> f32 {
-    let n = per_row as f32;
-    (available_width - spacing * (n - 1.0)) / n - card_frame().total_margin().sum().x
-}
-
-/// All cards in one row when every label and value fits on one line at a comfortable size,
-/// otherwise two rows (a 2×2 grid for four cards) so narrow windows neither wrap labels nor
-/// shrink values to nothing.
-fn stat_cards_per_row(painter: &egui::Painter, cards: &[(&str, String)], available_width: f32, spacing: f32) -> usize {
-    let content_width = stat_card_content_width(available_width, spacing, cards.len());
-    let fits = cards.iter().all(|(label, value)| {
-        text_width(painter, label, &FontId::proportional(STAT_LABEL_SIZE)) <= content_width
-            && text_width(painter, value, &FontId::proportional(STAT_VALUE_COMFORT_SIZE)) <= content_width
-    });
-    if fits {
-        cards.len()
-    } else {
-        cards.len().div_ceil(2)
-    }
-}
-
-fn render_stat_card(ui: &mut egui::Ui, label: &str, value: &str, value_size: f32) {
-    card_frame().show(ui, |ui| {
-        ui.set_min_width(ui.available_width());
-        ui.label(RichText::new(label).size(STAT_LABEL_SIZE).color(TEXT_MUTED()));
-        ui.add_space(6.0);
-        // Never wrap the value; if even the minimum size can't fit, elide instead
-        ui.add(
-            egui::Label::new(
-                RichText::new(value)
-                    .size(value_size)
-                    .strong()
-                    .color(TEXT_PRIMARY()),
-            )
-            .truncate(),
-        );
-    });
-}
 
 fn configure_proton_theme(ctx: &egui::Context) {
     // Embed Inter & JetBrains Mono fonts (matching Proton Carbon Design System & WordCraft)
@@ -3370,24 +3034,6 @@ fn format_bytes(bytes: u64) -> String {
         idx += 1;
     }
     format!("{val:.1} {}", units[idx])
-}
-
-fn format_bytes_precise(bytes: u64) -> String {
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let units = ["KB", "MB", "GB", "TB"];
-    let mut val = bytes as f64 / 1024.0;
-    let mut idx = 0;
-    while val >= 1024.0 && idx < units.len() - 1 {
-        val /= 1024.0;
-        idx += 1;
-    }
-    if idx >= 2 {
-        format!("{val:.2} {}", units[idx])
-    } else {
-        format!("{val:.1} {}", units[idx])
-    }
 }
 
 fn draw_nav_icon(painter: &egui::Painter, rect: egui::Rect, tab: NavTab, color: Color32) {
@@ -3633,35 +3279,6 @@ fn truncate_middle_to_width(painter: &egui::Painter, s: &str, font: &FontId, max
     best
 }
 
-/// Largest font size in `min_size..=base_size` at which `text` fits within `max_width` on one line,
-/// or `min_size` if it doesn't fit even then.
-fn fit_font_size(painter: &egui::Painter, text: &str, base_size: f32, min_size: f32, max_width: f32) -> f32 {
-    let mut size = base_size;
-    while size > min_size && text_width(painter, text, &FontId::proportional(size)) > max_width {
-        size -= 0.5;
-    }
-    size.max(min_size)
-}
-
-/// The Recent Sync Activity header detail, "<usage>  •  Syncing <dir>", fitted to `max_width`: the
-/// folder path is middle-truncated first, then dropped, then the whole text.
-fn activity_header_detail(painter: &egui::Painter, usage: &str, sync_dir: &str, font: &FontId, max_width: f32) -> String {
-    let prefix = format!("{usage}  •  Syncing ");
-    let full = format!("{prefix}{sync_dir}");
-    if text_width(painter, &full, font) <= max_width {
-        return full;
-    }
-    let path = truncate_middle_to_width(painter, sync_dir, font, max_width - text_width(painter, &prefix, font));
-    // Only keep the path while enough of it survives to be recognisable
-    if path.chars().count() >= 12 {
-        return format!("{prefix}{path}");
-    }
-    if text_width(painter, usage, font) <= max_width {
-        return usage.to_string();
-    }
-    String::new()
-}
-
 /// One active-transfer line: direction badge, the path (middle-truncated to the room left, full path on
 /// hover) and the right-aligned "transferred / total". Returns the path and byte-count label rects.
 fn render_transfer_line(ui: &mut egui::Ui, t: &ActiveTransfer) -> (egui::Rect, egui::Rect) {
@@ -3817,6 +3434,9 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                     ctx_clone.request_repaint();
                 });
             }
+            WorkerCommand::LoadHidden => {
+                off_thread(&tx, &ctx, || WorkerEvent::HiddenLoaded(hidden_items_at(&control_socket_path())))
+            }
             WorkerCommand::LoadConflicts => {
                 if let Ok(resp) = ureq::get(&format!("{}/api/conflicts", daemon_url())).call() {
                     if let Ok(list) = resp.into_json::<Vec<ConflictRecord>>() {
@@ -3916,6 +3536,7 @@ OPTIONS:
   --files-missing       with --screenshot: show the daemon holding with the files missing from the folder
   --confirm-files-missing  with --screenshot: also show the confirmation for deleting them from Proton Drive too
   --login-error <TEXT>  with --screenshot: show TEXT as a failed sign-in
+  --hidden-items        with --screenshot: list two items as hidden from this computer in Settings
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --version             print the version
   -h, --help            print this help
@@ -3932,7 +3553,6 @@ fn parse_window_size(s: &str) -> Option<[f32; 2]> {
 fn main() -> eframe::Result {
     let mut screenshot_target: Option<String> = None;
     let mut initial_tab = NavTab::Home;
-    let mut initial_account_menu = false;
     let mut cli_theme_override: Option<String> = None;
     let mut cli_search: Option<String> = None;
     let mut cli_size: Option<[f32; 2]> = None;
@@ -3944,14 +3564,12 @@ fn main() -> eframe::Result {
     let mut cli_files_missing = false;
     let mut cli_confirm_files_missing = false;
     let mut cli_login_error: Option<String> = None;
+    let mut cli_hidden_items = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--screenshot" => {
                 screenshot_target = args.next();
-            }
-            "--account-menu" => {
-                initial_account_menu = true;
             }
             "--confirm-free-all" => {
                 cli_confirm_free_all = true;
@@ -3974,6 +3592,9 @@ fn main() -> eframe::Result {
             "--confirm-files-missing" => {
                 cli_files_missing = true;
                 cli_confirm_files_missing = true;
+            }
+            "--hidden-items" => {
+                cli_hidden_items = true;
             }
             "--login-error" => {
                 cli_login_error = args.next();
@@ -4107,7 +3728,6 @@ fn main() -> eframe::Result {
                 cc,
                 screenshot_target,
                 initial_tab,
-                initial_account_menu,
                 saved_geom,
             );
             if let Some(q) = cli_search {
@@ -4135,6 +3755,10 @@ fn main() -> eframe::Result {
                     }
                 }
                 app.drive_error = cli_drive_error;
+                if cli_hidden_items {
+                    let item = |path: &str, state: &str| HiddenItem { path: path.into(), state: state.into() };
+                    app.hidden = Some(Ok(vec![item("Archive/2019 taxes", "hidden"), item("Docs/Private", "hiding")]));
+                }
                 if let Some(error) = cli_login_error {
                     app.show_account_error(format!("Couldn't start signing in: {error}"));
                 }
@@ -4235,67 +3859,6 @@ mod tests {
     }
 
     #[test]
-    fn stat_card_content_width_matches_what_egui_gives_the_card() {
-        // Odd widths too, so egui's pixel rounding of column positions is exercised
-        for screen_width in [1440.0, 1133.7, 841.3, 1001.0] {
-            let ctx = egui::Context::default();
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(screen_width, 900.0))),
-                ..Default::default()
-            };
-            let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let available = ui.available_width();
-                    let spacing = ui.spacing().item_spacing.x;
-                    for per_row in [2, 4] {
-                        let mut actual = 0.0;
-                        ui.columns(per_row, |cols| {
-                            card_frame().show(&mut cols[0], |ui| actual = ui.available_width());
-                        });
-                        let predicted = stat_card_content_width(available, spacing, per_row);
-                        // egui snaps layout positions to multiples of GUI_ROUNDING (1/32 pt)
-                        assert!(
-                            (predicted - actual).abs() <= egui::emath::GUI_ROUNDING,
-                            "{screen_width}px, {per_row} per row: {predicted} vs {actual}"
-                        );
-                    }
-                });
-            });
-        }
-    }
-
-    #[test]
-    fn stat_cards_switch_to_two_rows_exactly_when_one_row_stops_fitting() {
-        with_painter(|p| {
-            let spacing = 8.0;
-            let margin = card_frame().total_margin().sum().x;
-            let long_quota = [
-                ("Proton Cloud Storage", "13.22 GB / 510.00 GB".to_string()),
-                ("Local Synced Size", "5.29 GB".to_string()),
-                ("Synced Files", "372".to_string()),
-                ("Synced Folders", "60".to_string()),
-            ];
-            let short_values = long_quota.clone().map(|(label, _)| (label, "1".to_string()));
-            let mut switch_points = vec![];
-            for cards in [&long_quota, &short_values] {
-                let needed = cards
-                    .iter()
-                    .map(|(label, value)| {
-                        text_width(p, label, &FontId::proportional(STAT_LABEL_SIZE))
-                            .max(text_width(p, value, &FontId::proportional(STAT_VALUE_COMFORT_SIZE)))
-                    })
-                    .fold(0.0, f32::max);
-                let switch_at = 4.0 * (needed + margin) + 3.0 * spacing;
-                assert_eq!(stat_cards_per_row(p, cards, switch_at + 0.5, spacing), 4);
-                assert_eq!(stat_cards_per_row(p, cards, switch_at - 0.5, spacing), 2);
-                switch_points.push(switch_at);
-            }
-            // The decision follows the measured text: a long quota needs a wider window
-            assert!(switch_points[0] > switch_points[1]);
-        });
-    }
-
-    #[test]
     fn transfer_line_keeps_the_path_clear_of_the_byte_counts() {
         let transfer = ActiveTransfer {
             id: "t1".into(),
@@ -4319,28 +3882,6 @@ mod tests {
                 });
             });
         }
-    }
-
-    #[test]
-    fn activity_header_detail_shortens_path_then_drops_it_then_everything() {
-        with_painter(|p| {
-            let font = FontId::proportional(12.0);
-            let usage = "Drive Cloud Usage: 13.13 GB";
-            let dir = "/home/gautam-chauhan/ProtonDrive";
-            let full = format!("{usage}  •  Syncing {dir}");
-            let full_w = text_width(p, &full, &font);
-
-            assert_eq!(activity_header_detail(p, usage, dir, &font, full_w + 10.0), full);
-
-            let shortened = activity_header_detail(p, usage, dir, &font, full_w - 60.0);
-            assert!(shortened.starts_with(&format!("{usage}  •  Syncing /")), "{shortened:?}");
-            assert!(shortened.contains('…') && shortened.ends_with("ProtonDrive"));
-            assert!(text_width(p, &shortened, &font) <= full_w - 60.0);
-
-            let usage_w = text_width(p, usage, &font);
-            assert_eq!(activity_header_detail(p, usage, dir, &font, usage_w + 20.0), usage);
-            assert_eq!(activity_header_detail(p, usage, dir, &font, usage_w - 1.0), "");
-        });
     }
 
     #[test]
@@ -4374,24 +3915,6 @@ mod tests {
         for bad in ["", "1280", "x800", "abcxdef", "NaNx700", "infx700"] {
             assert_eq!(parse_window_size(bad), None, "{bad:?}");
         }
-    }
-
-    #[test]
-    fn fit_font_size_keeps_base_size_when_text_fits() {
-        with_painter(|p| {
-            assert_eq!(fit_font_size(p, "372", 24.0, 14.0, 300.0), 24.0);
-        });
-    }
-
-    #[test]
-    fn fit_font_size_shrinks_wide_text_to_fit_without_going_below_min() {
-        with_painter(|p| {
-            let quota = "13.22 GB / 510.00 GB";
-            let size = fit_font_size(p, quota, 24.0, 14.0, 200.0);
-            assert!((14.0..24.0).contains(&size));
-            assert!(text_width(p, quota, &FontId::proportional(size)) <= 200.0);
-            assert_eq!(fit_font_size(p, quota, 24.0, 14.0, 20.0), 14.0);
-        });
     }
 
     #[test]
@@ -4666,8 +4189,11 @@ mod tests {
                 login_url: None,
                 account_error: None,
                 search_query: String::new(),
-                show_account_menu: false,
-                account_footer_rect: None,
+                jump_to_account: false,
+                hidden: None,
+                hidden_loading: false,
+                unhiding: None,
+                unhide_notice: None,
                 working: Vec::new(),
                 pending_confirm: None,
                 notice: None,
@@ -4770,6 +4296,22 @@ mod tests {
             self.last.as_ref()?.shapes.iter().find_map(|c| find(&c.shape, text))
         }
 
+        /// Everywhere the last frame painted exactly this text, in the order painted.
+        fn text_at_all(&self, text: &str) -> Vec<egui::Pos2> {
+            fn find(shape: &egui::Shape, text: &str, out: &mut Vec<egui::Pos2>) {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == text => out.push(t.visual_bounding_rect().center()),
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, text, out)),
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for clipped in self.last.iter().flat_map(|o| o.shapes.iter()) {
+                find(&clipped.shape, text, &mut out);
+            }
+            out
+        }
+
         /// The fill of the topmost rectangle the last frame painted under a point (a button's background).
         fn fill_under(&self, pos: egui::Pos2) -> Option<Color32> {
             fn rects(shape: &egui::Shape, out: &mut Vec<(egui::Rect, Color32)>) {
@@ -4803,6 +4345,8 @@ mod tests {
                     WorkerCommand::TriggerSync => Some("sync now".to_string()),
                     WorkerCommand::SetPaused(paused) => Some(format!("paused {paused}")),
                     WorkerCommand::ResolveConflict { id, choice } => Some(format!("resolve {id} {choice}")),
+                    WorkerCommand::StartLogin => Some("sign in".to_string()),
+                    WorkerCommand::Logout => Some("sign out".to_string()),
                     _ => None,
                 })
                 .collect()
@@ -4891,24 +4435,162 @@ mod tests {
     }
 
     #[test]
-    fn the_sidebar_footer_shows_the_account_and_toggles_its_popover() {
+    fn the_sidebar_footer_shows_the_account_and_opens_settings_at_the_account() {
+        const GB: u64 = 1024 * 1024 * 1024;
         let mut h = Harness::new();
-        h.app.status.account = Some(AccountInfo { display_name: "Gautam C".into(), initials: "GC".into(), ..Default::default() });
+        h.app.status.account = Some(AccountInfo {
+            display_name: "Gautam C".into(),
+            email: "gc@proton.me".into(),
+            initials: "GC".into(),
+            used_space: 51 * GB,
+            max_space: 510 * GB,
+            ..Default::default()
+        });
         h.frames(2);
         assert!(h.text_at("GC").is_some());
         assert!(h.text_at(&format!("Version {}", env!("CARGO_PKG_VERSION"))).is_some());
         let name = h.text_at("Gautam C").expect("the footer names the account");
         h.click(name);
-        assert!(h.app.show_account_menu);
-        assert!(h.text_at("Sign out").is_some());
-        h.click(name);
-        assert!(!h.app.show_account_menu);
-        // Nothing of the old sidebar or top bar is left (Home has its own Pause and Sync now)
-        h.app.tab = NavTab::Settings;
-        h.frames(2);
-        for gone in ["Sync now", "My files", "Sync Activity", "Conflicts", "Pause"] {
+        assert_eq!(h.app.tab, NavTab::Settings);
+        // Settings starts with the account: name, email, plan, storage and Sign out
+        assert!(h.text_at("Account").is_some());
+        assert!(h.text_at("gc@proton.me").is_some());
+        assert!(h.text_at("Proton Unlimited").is_some());
+        assert!(h.text_at("51.0 GB of 510.0 GB").is_some());
+        h.click(h.text_at("Sign out").expect("Sign out is offered"));
+        assert_eq!(h.sent(), vec!["sign out".to_string()]);
+        // Nothing of the old sidebar, top bar or popover is left (Home has its own Pause and Sync now)
+        for gone in ["Sync now", "My files", "Sync Activity", "Conflicts", "Pause", "Open local sync folder"] {
             assert!(h.text_at(gone).is_none(), "{gone}");
         }
+    }
+
+    #[test]
+    fn signed_out_the_account_card_offers_sign_in_and_shows_how_it_went() {
+        let mut h = Harness::new();
+        h.app.status.logged_in = false;
+        h.app.status.account = None;
+        h.app.tab = NavTab::Settings;
+        h.frames(2);
+        assert!(h.text_at("Sign out").is_none());
+        h.click(h.text_at("Sign in").expect("Sign in is offered while signed out"));
+        assert_eq!(h.sent(), vec!["sign in".to_string()]);
+        h.event(WorkerEvent::LoginStarted(Err("Proton is unreachable".into())));
+        assert!(h.text_at("Couldn't start signing in: Proton is unreachable").is_some());
+    }
+
+    #[test]
+    fn activity_has_its_own_search_and_no_stat_cards() {
+        let mut h = Harness::new();
+        h.app.tab = NavTab::Activity;
+        h.app.status.account = Some(AccountInfo { used_space: 5, max_space: 10, used_drive_space: 5, ..Default::default() });
+        let record = |path: &str, details: &str| ActivityRecord {
+            timestamp: 0,
+            action: "upload".into(),
+            local_rel_path: path.into(),
+            details: details.into(),
+        };
+        h.app.activities = vec![record("Docs/Report.pdf", "Uploaded 2 MB"), record("Music/song.mp3", "Uploaded in Q3 report run")];
+        h.frames(2);
+        assert!(h.text_at("Activity").is_some());
+        assert!(h.text_at("Search activity").is_some(), "the search field is at the top");
+        for gone in ["Proton Cloud Storage", "Local Synced Size", "Synced Files", "Synced Folders", "Recent Sync Activity"] {
+            assert!(h.text_at(gone).is_none(), "{gone}");
+        }
+        assert!(h.text_at("Docs/Report.pdf").is_some());
+        assert!(h.text_at("Music/song.mp3").is_some());
+
+        // Case-insensitive, on the path or the details
+        h.app.search_query = "REPORT".into();
+        h.frames(2);
+        assert!(h.text_at("Docs/Report.pdf").is_some());
+        assert!(h.text_at("Music/song.mp3").is_some());
+        h.app.search_query = "docs/".into();
+        h.frames(2);
+        assert!(h.text_at("Docs/Report.pdf").is_some());
+        assert!(h.text_at("Music/song.mp3").is_none());
+        h.app.search_query = "nothing like it".into();
+        h.frames(2);
+        assert!(h.text_at("Docs/Report.pdf").is_none());
+        assert!(h.text_at("No activity matches \"nothing like it\".").is_some());
+    }
+
+    #[test]
+    fn activity_search_matches_the_path_or_the_details_whatever_the_case() {
+        let act: ActivityRecord =
+            serde_json::from_str(r#"{"timestamp":0,"action":"download","localRelPath":"Docs/Plan.txt","details":"From Laptop"}"#)
+                .unwrap();
+        assert!(activity_matches(&act, ""));
+        assert!(activity_matches(&act, "plan"));
+        assert!(activity_matches(&act, "LAPTOP"));
+        assert!(activity_matches(&act, "  docs/plan "));
+        assert!(!activity_matches(&act, "music"));
+    }
+
+    fn hidden(path: &str, state: &str) -> HiddenItem {
+        HiddenItem { path: path.into(), state: state.into() }
+    }
+
+    #[test]
+    fn hidden_items_are_read_over_the_control_socket() {
+        let reply: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"items\":[{\"path\":\"Docs/Private\",\"state\":\"hiding\"},{\"path\":\"Music\",\"state\":\"hidden\"}]}";
+        let (sock, server) = serve_once(reply);
+        assert_eq!(hidden_items_at(&sock).unwrap(), vec![hidden("Docs/Private", "hiding"), hidden("Music", "hidden")]);
+        assert!(server.join().unwrap().starts_with("GET /availability/hidden HTTP/1.1\r\n"));
+
+        // A daemon from before the list answers 404
+        let (sock, server) = serve_once(b"HTTP/1.1 404 Not Found\r\n\r\n{\"error\":\"Not found\"}");
+        assert_eq!(hidden_items_at(&sock).unwrap_err(), "Not found");
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn settings_lists_what_is_hidden_and_unhide_sends_it() {
+        let mut h = Harness::settings(Some(vfs("virtual", true, None)), Some(true));
+        assert!(h.text_at("Hidden from this computer").is_some());
+        // Shown, it asks for the list on every status
+        let status = h.app.status.clone();
+        h.event(WorkerEvent::StatusAndActivity { status: Box::new(Ok(status)), activity: Vec::new() });
+        assert!(h.commands.try_iter().any(|c| matches!(c, WorkerCommand::LoadHidden)));
+
+        h.event(WorkerEvent::HiddenLoaded(Ok(Vec::new())));
+        assert!(h.text_at("Nothing is hidden.").is_some());
+
+        h.event(WorkerEvent::HiddenLoaded(Ok(vec![hidden("Docs/Private", "hiding"), hidden("Music", "hidden")])));
+        assert!(h.text_at("Nothing is hidden.").is_none());
+        assert!(h.text_at("Docs/Private").is_some());
+        assert!(h.text_at("Music").is_some());
+        assert!(h.text_at("Hiding…").is_some());
+        let music = h.text_at("Music").unwrap();
+        let unhide = h.text_at_all("Unhide").into_iter().find(|p| (p.y - music.y).abs() < 12.0).expect("Music has Unhide");
+        h.click(unhide);
+        assert_eq!(h.sent(), vec![r#"unhide "Music""#.to_string()]);
+        assert_eq!(h.app.working, vec!["Music".to_string()]);
+        // One at a time
+        h.click(unhide);
+        assert_eq!(h.sent(), Vec::<String>::new());
+
+        // When it is done the list is read again, and a refusal is shown in the card
+        let refused = AvailabilityResult { state: "hidden".into(), kept: Vec::new(), refused: Some("Can't unhide Music: busy".into()) };
+        h.event(WorkerEvent::AvailabilityDone { path: "Music".into(), result: Ok(refused) });
+        assert!(h.app.working.is_empty());
+        assert!(h.commands.try_iter().any(|c| matches!(c, WorkerCommand::LoadHidden)));
+        assert!(h.text_at("Can't unhide Music: busy").is_some());
+
+        // A list that can't be read says so
+        h.event(WorkerEvent::HiddenLoaded(Err("Not found".into())));
+        assert!(h.text_at("Couldn't load the list: Not found").is_some());
+    }
+
+    #[test]
+    fn unhide_waits_for_the_daemon() {
+        let mut h = Harness::settings(None, None);
+        h.event(WorkerEvent::HiddenLoaded(Ok(vec![hidden("Music", "hidden")])));
+        h.app.daemon_online = false;
+        h.frames(2);
+        h.click(h.text_at("Unhide").expect("Unhide is painted"));
+        assert_eq!(h.sent(), Vec::<String>::new());
     }
 
     /// Home with the status changed by `change`, and what Needs attention lists recomputed, as a status event would.
@@ -4969,6 +4651,17 @@ mod tests {
         assert_eq!(h.sent(), vec!["resolve 7 keep-both".to_string()]);
         h.click(h.text_at("Keep Local").unwrap());
         assert_eq!(h.sent(), vec!["resolve 7 keep-local".to_string()]);
+        h.click(h.text_at("Keep Remote").unwrap());
+        assert_eq!(h.sent(), vec!["resolve 7 keep-remote".to_string()]);
+        // They wait for the daemon, as Pause and Sync now do
+        h.app.daemon_online = false;
+        h.frames(2);
+        for label in ["Keep Both", "Keep Local", "Keep Remote"] {
+            h.click(h.text_at(label).unwrap());
+        }
+        assert_eq!(h.sent(), Vec::<String>::new());
+        h.app.daemon_online = true;
+        h.frames(2);
         // A refused resolve is shown in the card
         h.event(WorkerEvent::ConflictResolved(Err("The file changed again".into())));
         assert!(h.text_at("The file changed again").is_some());
@@ -5072,14 +4765,22 @@ mod tests {
 
     #[test]
     fn freeing_up_the_whole_drive_asks_in_plain_words() {
-        let copy = confirm_copy(&PendingConfirm::FreeAll { rel_path: String::new() });
+        let copy = confirm_copy(&PendingConfirm::FreeAll { rel_path: String::new() }, true);
         assert_eq!(copy.title, "Free up space on this computer?");
         assert!(copy.body.contains("stay in Proton Drive"), "{}", copy.body);
-        assert!(copy.body.contains("online-only"), "{}", copy.body);
+        assert!(copy.body.contains("in Files as online-only"), "{}", copy.body);
         for text in [&copy.title, &copy.body, &copy.detail.to_string()] {
             assert!(!text.contains("My files"), "{text}");
         }
         assert_eq!((copy.rel_path.as_str(), copy.action), ("", "free"));
+        // A plain folder doesn't show online-only files in Files: the dialog never says it does
+        let plain = confirm_copy(&PendingConfirm::FreeAll { rel_path: String::new() }, false);
+        assert_eq!(plain.title, copy.title);
+        assert!(plain.body.contains("stay in Proton Drive"), "{}", plain.body);
+        assert!(!plain.body.contains("in Files as online-only"), "{}", plain.body);
+        assert!(!plain.body.contains("download again when you open them"), "{}", plain.body);
+        assert!(plain.body.contains("don't show in Files"), "{}", plain.body);
+        assert_eq!((plain.rel_path.as_str(), plain.action), ("", "free"));
     }
 
     fn vfs(mode: &str, mounted: bool, reason: Option<&str>) -> VfsStatus {
@@ -5401,6 +5102,9 @@ mod tests {
             WorkerCommand::DriveMove { action: "finish".into(), from: "a".into(), to: "b".into() },
             WorkerCommand::ResolveConflict { id: 1, choice: "keep-both".into() },
             WorkerCommand::SetAvailability { path: "x".into(), action: "pin".into() },
+            WorkerCommand::SetAvailability { path: "Music".into(), action: "unhide".into() },
+            // A read, but over the control socket, which a screenshot never calls
+            WorkerCommand::LoadHidden,
             WorkerCommand::ResolveFilesMissing { choice: MissingChoice::DeleteInCloud, root: "/r".into(), names: vec!["Docs".into()] },
             WorkerCommand::ResolveFilesMissing { choice: MissingChoice::KeepOnlineOnly, root: "/r".into(), names: vec!["Docs".into()] },
         ];
@@ -5618,7 +5322,7 @@ mod tests {
             root: "/mnt/disk/ProtonDrive".into(),
             names: vec!["Photos/p2.jpg".into()],
             items: 1,
-        });
+        }, true);
         assert_eq!(
             one.body,
             "The missing item (Photos/p2.jpg) will move to the Proton Drive trash. You can restore it from the trash on the Proton Drive website."
@@ -5686,8 +5390,11 @@ mod tests {
     #[test]
     fn the_settings_tab_shows_the_drive_and_its_switch() {
         let h = Harness::settings(Some(vfs("virtual", true, None)), Some(true));
-        assert!(h.text_at("Virtual drive: mounted at /home/u/ProtonDrive").is_some());
+        assert!(h.text_at("Location").is_some());
+        assert!(h.text_at("/home/u/ProtonDrive").is_some());
         assert!(h.text_at(SWITCH).is_some());
+        // The mount state is Home's
+        assert!(h.text_at("Virtual drive: mounted at /home/u/ProtonDrive").is_none());
         assert!(h.text_at("Mount again").is_none());
         // A daemon before Stage 2 has no drive to show
         let h = Harness::settings(None, None);
@@ -5776,40 +5483,39 @@ mod tests {
     #[test]
     fn switching_the_virtual_drive_on_goes_at_once() {
         let mut h = Harness::settings(Some(vfs("plain", false, Some("switched-off"))), Some(false));
-        assert!(h.text_at("Plain folder: virtual drive switched off").is_some());
         h.click(h.text_at(SWITCH).unwrap());
         assert_eq!(h.app.pending_confirm, None);
         assert_eq!(h.sent(), vec!["virtual drive true".to_string()]);
     }
 
     #[test]
-    fn mount_again_and_the_move_actions_send_their_requests() {
-        let mut h = Harness::settings(Some(vfs("virtual", false, Some("ejected"))), Some(true));
-        h.click(h.text_at("Mount again").expect("Mount again is offered"));
-        assert_eq!(h.sent(), vec!["mount again".to_string()]);
-        // Nothing else is sent while it runs
-        h.click(h.text_at("Mount again").unwrap());
-        assert_eq!(h.sent(), Vec::<String>::new());
-
+    fn mount_again_and_a_stopped_move_are_on_home_not_in_settings() {
+        let h = Harness::settings(Some(vfs("virtual", false, Some("ejected"))), Some(true));
+        assert!(h.text_at("Mount again").is_none());
+        assert!(h.text_at("Virtual drive: ejected").is_none());
         let stopped = VfsStatus {
             error: Some("Disk full".into()),
             drive_move: Some(drive_move("relocation", None, &["move-back", "retry"])),
             ..vfs("plain", false, Some("move-failed"))
         };
-        let mut h = Harness::settings(Some(stopped.clone()), Some(true));
-        assert!(h.text_at("Moving files stopped: Disk full").is_some());
-        assert!(h.text_at("Finish moving files").is_none());
-        h.click(h.text_at("Move files back").expect("the move's actions are offered"));
-        assert_eq!(h.sent(), vec!["move-back /home/u/ProtonDrive -> /mnt/b/ProtonDrive".to_string()]);
-        let mut h = Harness::settings(Some(stopped), Some(true));
-        h.click(h.text_at("Try again").unwrap());
-        assert_eq!(h.sent(), vec!["retry /home/u/ProtonDrive -> /mnt/b/ProtonDrive".to_string()]);
+        let h = Harness::settings(Some(stopped), Some(true));
+        assert!(h.text_at("Moving files stopped: Disk full").is_none());
+        assert!(h.text_at("Move files back").is_none());
+        assert!(h.text_at("Try again").is_none());
+    }
+
+    #[test]
+    fn why_the_drive_is_a_plain_folder_despite_the_switch_is_said_under_it() {
+        let h = Harness::settings(Some(vfs("plain", false, Some("fuse-unavailable"))), Some(true));
+        assert!(h.text_at("Plain folder: FUSE isn't available on this system").is_some());
+        // Switched off is the user's own choice: nothing to explain
+        let h = Harness::settings(Some(vfs("plain", false, Some("switched-off"))), Some(false));
+        assert!(h.text_at("Plain folder: virtual drive switched off").is_none());
     }
 
     #[test]
     fn a_refused_drive_request_is_shown() {
-        let mut h = Harness::settings(Some(vfs("virtual", false, Some("ejected"))), Some(true));
-        h.click(h.text_at("Mount again").unwrap());
+        let mut h = Harness::settings(Some(vfs("virtual", true, None)), Some(true));
         h.event(WorkerEvent::DriveDone(Err("The drive is stopping".into())));
         assert!(!h.app.drive_working);
         assert!(h.text_at("The drive is stopping").is_some());
@@ -5824,7 +5530,7 @@ mod tests {
         let mut h = Harness::settings(None, None);
         h.click(h.text_at("Save Preferences").unwrap());
         assert_eq!(h.sent(), Vec::<String>::new());
-        assert!(h.text_at("No changes to save.").is_some());
+        assert_eq!(h.app.settings_notice, Some(Notice::info("No changes to save.")));
 
         h.app.edit_conflict_strategy = "keep-local".into();
         h.app.settings_dirty = true;
