@@ -32,7 +32,11 @@ except (ValueError, ImportError):
 DAEMON_URL = os.environ.get("PROTON_DRIVE_DAEMON_URL", "http://127.0.0.1:49152")
 
 MOUNT_LABEL = "Mount Proton Drive"
-OPEN_FOLDER_LABEL = "Open Proton Drive Folder"
+# #98: the drive itself is what people open most; the app is where they check on sync and change how it behaves
+OPEN_DRIVE_LABEL = "Open Proton Drive"
+VIEW_ONLINE_LABEL = "View Online"
+ONLINE_URL = "https://drive.proton.me"
+APP_LABEL = "Status & Settings…"
 # A delete through the drive goes to the Proton Drive trash, on the web (#201)
 OPEN_TRASH_LABEL = "Open Proton Drive Trash"
 TRASH_URL = "https://drive.proton.me/trash"
@@ -177,6 +181,107 @@ def offers_mount(status: dict) -> bool:
     return vfs.get("mode") == "virtual" and not vfs.get("mounted") and vfs.get("reason") in MOUNT_REASONS
 
 
+# A GTK menu grows with its longest label: a file name longer than this is shortened in the middle
+NAME_LIMIT = 40
+
+
+def _short(name: str) -> str:
+    if len(name) <= NAME_LIMIT:
+        return name
+    keep = NAME_LIMIT - 1
+    return name[: keep - keep // 2] + "…" + name[-(keep // 2):]
+
+
+def signed_out(status: dict) -> bool:
+    return not status.get("loggedIn", False) or status.get("state") == "unauthenticated"
+
+
+def _transfers_line(transfers) -> str:
+    """What moves, as the app's Home says it."""
+    uploads = sum(1 for t in transfers if t.get("direction") == "upload")
+    downloads = sum(1 for t in transfers if t.get("direction") == "download")
+    if uploads == 0 and downloads == 0:
+        return "Checking for changes…"
+    if uploads and downloads:
+        return f"Syncing {uploads + downloads} files"
+    count, verb = (uploads, "Uploading") if uploads else (downloads, "Downloading")
+    if count == 1:
+        name = next(t for t in transfers if t.get("direction") in ("upload", "download")).get("relPath") or ""
+        name = name.rstrip("/").rsplit("/", 1)[-1]
+        return f"{verb} {_short(name)}" if name else f"{verb} 1 file"
+    return f"{verb} {count} files"
+
+
+def problem_count(status: dict) -> int:
+    """How many things need the user, counted as the app's Needs attention lists them: another account's records,
+    files missing, a stopped move, the drive not mounted, each unresolved conflict, failed files (one line), and the
+    last error when neither another account nor missing files explains it."""
+    count = 0
+    if status.get("accountMismatch"):
+        count += 1
+    if status.get("filesMissing"):
+        count += 1
+    vfs = status.get("vfs")
+    if isinstance(vfs, dict):
+        reason = vfs.get("reason")
+        move = vfs.get("move")
+        move_to_act_on = isinstance(move, dict) and (move.get("actions") or str(move.get("error") or "").strip())
+        if move_to_act_on or reason == "move-failed":
+            count += 1
+        if vfs.get("mode") == "virtual" and not vfs.get("mounted") and reason not in ("move-failed", "starting", "moving"):
+            count += 1
+    stats = status.get("stats") or {}
+    count += int(stats.get("unresolvedConflicts") or 0)
+    if int(stats.get("errorItems") or 0) > 0:
+        count += 1
+    if not status.get("filesMissing") and not status.get("accountMismatch") and str(status.get("lastError") or "").strip():
+        count += 1
+    return count
+
+
+def status_line(status: dict):
+    """The tray's status line and icon, in the app's words (native-gui/src/home.rs status_summary): signed out, paused,
+    moving files, what moves, problems, sync stopped, up to date. Never the engine's own action text."""
+    if signed_out(status):
+        return "Signed out", "protondrive-tray-error"
+    if status.get("state") == "paused" or (status.get("settings") or {}).get("paused"):
+        return "Paused", "protondrive-tray-paused"
+    vfs = status.get("vfs")
+    if isinstance(vfs, dict) and vfs.get("reason") == "moving":
+        return "Moving files…", "protondrive-tray-syncing"
+    if status.get("state") == "syncing":
+        return _transfers_line(status.get("activeTransfers") or []), "protondrive-tray-syncing"
+    if problem_count(status):
+        # The count is on the clickable item just below (problems_label), so this line doesn't repeat it
+        return "Needs attention", "protondrive-tray-error"
+    if status.get("state") == "error":
+        return "Sync stopped", "protondrive-tray-error"
+    return "Up to date", "protondrive-tray-idle"
+
+
+def problems_label(count: int) -> str:
+    """The menu item that opens the app on Home, where the problems are listed."""
+    return "⚠ 1 problem needs you" if count == 1 else f"⚠ {count} problems need you"
+
+
+def _one_decimal(b: int) -> str:
+    """Bytes with one decimal, in 1024s, as the app shows storage."""
+    val = float(b)
+    for unit in ("B", "KB", "MB", "GB"):
+        if val < 1024.0:
+            return f"{int(val)} B" if unit == "B" else f"{val:.1f} {unit}"
+        val /= 1024.0
+    return f"{val:.1f} TB"
+
+
+def storage_line(account: dict):
+    """'13.6 GB of 510.0 GB used', or None while the account's storage isn't known."""
+    used, total = int(account.get("usedSpace") or 0), int(account.get("maxSpace") or 0)
+    if total <= 0:
+        return None
+    return f"{_one_decimal(used)} of {_one_decimal(total)} used"
+
+
 def notify(title: str, body: str) -> None:
     """A desktop notification; nothing happens if notify-send is missing."""
     try:
@@ -221,17 +326,6 @@ def find_icon_dir() -> str:
     return candidates[0]
 
 
-def format_bytes(b: int) -> str:
-    if b < 1024:
-        return f"{b} B"
-    val = float(b) / 1024.0
-    for unit in ["KB", "MB", "GB", "TB"]:
-        if val < 1024.0 or unit == "TB":
-            return f"{val:.2f} {unit}" if unit in ("GB", "TB") else f"{val:.1f} {unit}"
-        val /= 1024.0
-    return f"{val:.2f} TB"
-
-
 class ProtonDriveTrayIndicator:
     def __init__(self):
         icon_dir = find_icon_dir()
@@ -250,33 +344,31 @@ class ProtonDriveTrayIndicator:
 
         self.menu = Gtk.Menu()
 
-        self.account_item = Gtk.MenuItem(label="Proton Drive")
-        self.account_item.set_sensitive(False)
-        self.menu.append(self.account_item)
-
-        self.storage_item = Gtk.MenuItem(label="Storage: Calculating...")
-        self.storage_item.set_sensitive(False)
-        self.menu.append(self.storage_item)
-
-        self.menu.append(Gtk.SeparatorMenuItem())
-
-        self.status_item = Gtk.MenuItem(label="Status: Starting...")
+        # What is going on, greyed: the same status line as the app's Home, and the storage
+        self.status_item = Gtk.MenuItem(label="Starting…")
         self.status_item.set_sensitive(False)
         self.menu.append(self.status_item)
 
-        self.stats_item = Gtk.MenuItem(label="Checking local sync folder...")
-        self.stats_item.set_sensitive(False)
-        self.menu.append(self.stats_item)
+        self.storage_item = Gtk.MenuItem(label="")
+        self.storage_item.set_sensitive(False)
+        self.storage_item.set_no_show_all(True)
+        self.menu.append(self.storage_item)
+
+        # Only while something needs the user: opens the app, whose Home lists it
+        self.problems_item = Gtk.MenuItem(label="")
+        self.problems_item.connect("activate", self.on_open_app)
+        self.problems_item.set_no_show_all(True)
+        self.menu.append(self.problems_item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
-        open_app_item = Gtk.MenuItem(label="Open Proton Drive")
-        open_app_item.connect("activate", self.on_open_app)
-        self.menu.append(open_app_item)
+        open_drive_item = Gtk.MenuItem(label=OPEN_DRIVE_LABEL)
+        open_drive_item.connect("activate", self.on_open_drive)
+        self.menu.append(open_drive_item)
 
-        open_folder_item = Gtk.MenuItem(label=OPEN_FOLDER_LABEL)
-        open_folder_item.connect("activate", self.on_open_folder)
-        self.menu.append(open_folder_item)
+        view_online_item = Gtk.MenuItem(label=VIEW_ONLINE_LABEL)
+        view_online_item.connect("activate", self.on_view_online)
+        self.menu.append(view_online_item)
 
         self.open_trash_item = Gtk.MenuItem(label=OPEN_TRASH_LABEL)
         self.open_trash_item.set_tooltip_text(trash_tooltip(self.sync_dir))
@@ -289,6 +381,12 @@ class ProtonDriveTrayIndicator:
         self.mount_item.connect("activate", self.on_mount)
         self.mount_item.set_no_show_all(True)
         self.menu.append(self.mount_item)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        app_item = Gtk.MenuItem(label=APP_LABEL)
+        app_item.connect("activate", self.on_open_app)
+        self.menu.append(app_item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
@@ -318,67 +416,33 @@ class ProtonDriveTrayIndicator:
             with urllib.request.urlopen(req, timeout=1.2) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
 
-            state = data.get("state", "idle")
-            logged_in = data.get("loggedIn", False)
-            settings = data.get("settings", {})
-            stats = data.get("stats", {})
-            account = data.get("account") or {}
-            self.paused = bool(settings.get("paused", False))
+            settings = data.get("settings") or {}
+            self.paused = bool(settings.get("paused", False)) or data.get("state") == "paused"
             sync_dir = data.get("syncDir") or os.path.expanduser("~/ProtonDrive")
             if sync_dir != self.sync_dir:
                 self.sync_dir = sync_dir
                 self.open_trash_item.set_tooltip_text(trash_tooltip(sync_dir))
 
-            display_name = account.get("displayName") or ""
-            email = account.get("email") or ""
-            used_space = int(account.get("usedSpace") or 0)
-            max_space = int(account.get("maxSpace") or 0)
+            text, icon = status_line(data)
+            self.status_item.set_label(text)
+            self.indicator.set_icon_full(icon, text)
 
-            if display_name and email:
-                self.account_item.set_label(f"{display_name} ({email})")
-            elif email:
-                self.account_item.set_label(email)
-            elif logged_in:
-                self.account_item.set_label("Proton Account Connected")
-            else:
-                self.account_item.set_label("Proton Drive (Not Signed In)")
+            storage = storage_line(data.get("account") or {})
+            self.storage_item.set_label(storage or "")
+            self.storage_item.set_visible(storage is not None)
 
-            if max_space > 0:
-                pct = (used_space / max_space) * 100.0
-                self.storage_item.set_label(
-                    f"Storage: {format_bytes(used_space)} / {format_bytes(max_space)} ({pct:.1f}%)"
-                )
-            else:
-                self.storage_item.set_label("Storage: —")
-
-            total_files = int(stats.get("totalFiles", 0))
-            total_bytes = int(stats.get("totalBytes", 0))
-            self.stats_item.set_label(f"Local Sync: {format_bytes(total_bytes)}  •  {total_files} files")
-
-            if not logged_in:
-                self.indicator.set_icon_full("protondrive-tray-error", "Sign in required")
-                self.status_item.set_label("Status: Sign in required")
-            elif self.paused or state == "paused":
-                self.indicator.set_icon_full("protondrive-tray-paused", "Paused")
-                self.status_item.set_label("Status: Sync Paused")
-            elif state == "syncing":
-                action = data.get("currentAction") or "Syncing..."
-                if len(action) > 42:
-                    action = action[:20] + "…" + action[-18:]
-                self.indicator.set_icon_full("protondrive-tray-syncing", "Syncing")
-                self.status_item.set_label(f"Syncing: {action}")
-            elif state == "error":
-                self.indicator.set_icon_full("protondrive-tray-error", "Sync Error")
-                self.status_item.set_label("Status: Sync Error")
-            else:
-                self.indicator.set_icon_full("protondrive-tray-idle", "Up to date")
-                self.status_item.set_label("Status: Up to date")
+            problems = 0 if signed_out(data) else problem_count(data)
+            self.problems_item.set_label(problems_label(problems))
+            self.problems_item.set_visible(problems > 0)
 
             self.pause_item.set_label("Resume Sync" if self.paused else "Pause Sync")
             self.mount_item.set_visible(offers_mount(data))
         except Exception:
-            self.indicator.set_icon_full("protondrive-tray-error", "Daemon Offline")
-            self.status_item.set_label("Status: Daemon Offline")
+            offline = "Can't reach Proton Drive's background service"
+            self.indicator.set_icon_full("protondrive-tray-error", offline)
+            self.status_item.set_label(offline)
+            self.storage_item.set_visible(False)
+            self.problems_item.set_visible(False)
             self.mount_item.set_visible(False)
         return True
 
@@ -391,13 +455,18 @@ class ProtonDriveTrayIndicator:
         ]
         for bin_path in candidates:
             try:
-                spawn_detached([bin_path])
+                # On Home, where what needs the user is listed; a running app just comes to the front
+                spawn_detached([bin_path, "--tab", "home"])
                 return
             except OSError:
                 continue
 
-    def on_open_folder(self, _widget):
+    def on_open_drive(self, _widget):
+        """The drive itself, in Files (#98)."""
         spawn_detached(["xdg-open", self.sync_dir])
+
+    def on_view_online(self, _widget):
+        spawn_detached(["xdg-open", ONLINE_URL])
 
     def on_open_trash(self, _widget):
         spawn_detached(["xdg-open", TRASH_URL])
