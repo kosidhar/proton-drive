@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test } from 'bun:test';
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { chmod, cp, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -9263,6 +9263,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await engine.reconcileNow();
             await Bun.sleep(20);
             await chmod(path.join(engine.localRoot(), 'a.txt'), 0o600);
+            await Bun.sleep(30); // a hash this close to the chmod counts it as a write after, and is made again (#109)
             const hashes = spyOn(fileOpsModule, 'computeLocalFileSha1');
             try {
                 await engine.reconcileNow();
@@ -9288,6 +9289,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await engine.reconcileNow();
             await Bun.sleep(20);
             await chmod(path.join(engine.localRoot(), 'legacy.txt'), 0o600);
+            await Bun.sleep(30); // a hash this close to the chmod counts it as a write after, and is made again (#109)
             const hashes = spyOn(fileOpsModule, 'computeLocalFileSha1');
             try {
                 for (let i = 0; i < 3; i++) await engine.reconcileNow();
@@ -11122,6 +11124,143 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await expect(d.engine.startFreshForThisAccount()).rejects.toThrow(/busy moving/);
             expect(stateDb.getMeta('accountRoot')).toBe('other~root');
             d.engine.releaseHold();
+        });
+    });
+
+    describe('a record says when its file was read, so a write while it synced is never missed (#109)', () => {
+        const synced = async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('vault.bin', 'AAAAAAAA');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            d.calls.uploads.length = 0;
+            return { ...d, engine, file: path.join(engine.localRoot(), 'vault.bin') };
+        };
+        // As a VeraCrypt container, cp -p or touch -r would: the same size, and the old time put back
+        const rewriteKeepingTime = async (file: string, content: string) => {
+            const before = await stat(file);
+            await writeFile(file, content);
+            await utimes(file, before.atime, before.mtime);
+        };
+
+        // An upload of vault.bin held once it has read the file, written to meanwhile as a container is
+        const writtenDuringUpload = async (d: Awaited<ReturnType<typeof synced>>) => {
+            await Bun.sleep(20);
+            await writeFile(d.file, 'BBBBBBBB');
+            // Holds the upload once it has read the file, until written to again
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            const uploader = (d.sdk as any).getFileRevisionUploader.bind(d.sdk);
+            (d.sdk as any).getFileRevisionUploader = async (...args: unknown[]) => {
+                (d.sdk as any).getFileRevisionUploader = uploader;
+                entered();
+                await gate;
+                return uploader(...args);
+            };
+            const pass = d.engine.reconcileNow();
+            await inside;
+            await Bun.sleep(20);
+            await rewriteKeepingTime(d.file, 'CCCCCCCC');
+            await Bun.sleep(20); // the record is written well after the write
+            release();
+            await pass;
+        };
+
+        test('written during its upload, as it was: the next pass looks at it, and uploads what it holds now', async () => {
+            const d = await synced();
+            await writtenDuringUpload(d);
+            d.calls.uploads.length = 0;
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toEqual(['vault.bin']);
+            expect(stateDb.getItemByPath('vault.bin')?.localSha1).toBe(await computeLocalFileSha1(d.file));
+        });
+
+        test('written during its upload, then deleted in the cloud: the write is never removed as an unchanged copy', async () => {
+            const d = await synced();
+            await writtenDuringUpload(d);
+            d.nodes.delete(d.uid('vault.bin'));
+            await d.engine.reconcileNow();
+            // Kept: here, or in the desktop Trash (which the test's trash refuses, so here)
+            expect(await readFile(d.file, 'utf8')).toBe('CCCCCCCC');
+        });
+
+        test('written the instant its download is placed: the next pass looks at it', async () => {
+            const d = await synced();
+            const node = d.nodes.get(d.uid('vault.bin'))!;
+            d.nodes.set(d.uid('vault.bin'), { ...node, content: 'GGGGGGGG' } as any);
+            (d.nodes.get(d.uid('vault.bin')) as any).activeRevision = {
+                ...node.activeRevision!,
+                claimedDigests: { sha1: undefined },
+                claimedModificationTime: new Date(Date.now() + 60_000),
+            };
+            // Written straight after the download's stat of the placed file, well within a millisecond
+            const download = fileOpsModule.downloadDriveNodeToLocal;
+            const spy = spyOn(fileOpsModule, 'downloadDriveNodeToLocal').mockImplementation(async (options: any) => {
+                const result = await download(options);
+                const st = await stat(options.localPath);
+                writeFileSync(options.localPath, 'HHHHHHHH');
+                utimesSync(options.localPath, st.atime, st.mtime);
+                return result;
+            });
+            try {
+                await d.engine.reconcileNow();
+            } finally {
+                spy.mockRestore();
+            }
+            d.calls.uploads.length = 0;
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toEqual(['vault.bin']);
+        });
+
+        test('written a moment after its download is placed: the next pass looks at it', async () => {
+            const d = await synced();
+            const node = d.nodes.get(d.uid('vault.bin'))!;
+            d.nodes.set(d.uid('vault.bin'), { ...node, content: 'DDDDDDDD' } as any);
+            (d.nodes.get(d.uid('vault.bin')) as any).activeRevision = {
+                ...node.activeRevision!,
+                claimedDigests: { sha1: undefined },
+                claimedModificationTime: new Date(Date.now() + 60_000),
+            };
+            await d.engine.reconcileNow();
+            expect(await readFile(d.file, 'utf8')).toBe('DDDDDDDD');
+            await Bun.sleep(15); // past the clock tick of its placing: one within it is the gap placedReadAt leaves
+            await rewriteKeepingTime(d.file, 'EEEEEEEE');
+            d.calls.uploads.length = 0;
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toEqual(['vault.bin']);
+        });
+
+        test('a record with no read time is hashed, not taken as unwritten', async () => {
+            const d = await synced();
+            const { updatedAt: _, ...record } = stateDb.getItemByPath('vault.bin')!;
+            await Bun.sleep(20);
+            await rewriteKeepingTime(d.file, 'FFFFFFFF');
+            await Bun.sleep(20);
+            stateDb.upsertItem({ ...record, contentReadAt: null }); // written after the write: its updatedAt is newer
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toEqual(['vault.bin']);
+        });
+
+        test('an unchanged file is hashed at most once after it syncs, and not again', async () => {
+            const d = await synced();
+            await Bun.sleep(30);
+            const hashes = spyOn(fileOpsModule, 'computeLocalFileSha1');
+            try {
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+                expect(hashes.mock.calls.filter(([p]) => String(p).endsWith('vault.bin')).length).toBe(0); // its download's read time holds
+                expect(d.calls.uploads).toEqual([]);
+            } finally {
+                hashes.mockRestore();
+            }
         });
     });
 });
