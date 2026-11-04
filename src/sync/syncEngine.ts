@@ -1482,9 +1482,10 @@ export class ProtonDriveSyncEngine {
         if (this.manualResolvingPaths.has(relPath)) {
             return; // The user is resolving it by hand right now: their choice is what happens to it (#77)
         }
-        if (this.driveDestination(relPath, since) !== undefined) {
-            // Renamed or deleted through the drive since this work read it: what was read is no longer at this path, even
-            // with no record to say so (a file the drive made local has only an edit baseline). The next pass decides (#139)
+        if (this.driveTouched(relPath, since)) {
+            // Renamed, deleted or replaced through the drive since this work read it: what was read is no longer what is
+            // at this path, even with no record to say so (a file the drive made local has only an edit baseline; one a
+            // rename put here, replacing it). The next pass decides, from what is there then (#139)
             return;
         }
         if (strategy === 'keep-both' && this.stillChangingWhenLetThrough(relPath)) {
@@ -2446,6 +2447,18 @@ export class ProtonDriveSyncEngine {
         this.keepBothCopies.delete(relPath);
         this.forgetFailure(relPath);
         return true;
+    }
+
+    // Whether a rename or delete through the drive since `since` took the item at this path away, or put another there
+    // (renamed onto it, or into a folder above it)
+    private driveTouched(relPath: string, since: number): boolean {
+        const changes = [
+            ...this.removalBatches.filter((batch) => batch.n > since).map((batch) => batch.takenAway),
+            ...this.runningRemovals,
+        ];
+        return changes.some(
+            ({ drive }) => drive !== undefined && (isWithin(relPath, drive.from) || (drive.to !== null && isWithin(relPath, drive.to))),
+        );
     }
 
     // Where a rename or delete through the drive took an item that work begun when `since` removals had finished was
