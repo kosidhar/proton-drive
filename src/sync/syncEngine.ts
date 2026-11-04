@@ -1558,10 +1558,11 @@ export class ProtonDriveSyncEngine {
             }
 
             // Default: keep-both
-            const conflictCopyRelPath = await this.keepBoth(relPath, localFullPath, localSha1, remoteNode, remoteMap, since);
-            if (conflictCopyRelPath === null) {
+            const kept = await this.keepBoth(relPath, localFullPath, localSha1, remoteNode, remoteMap, since);
+            if (kept === null) {
                 return; // Changed meanwhile: the next pass keeps both again, and a conflict waiting there keeps waiting
             }
+            const conflictCopyRelPath = kept.copyPath;
 
             this.stateDb.settleConflict({
                 localRelPath: relPath,
@@ -1576,7 +1577,10 @@ export class ProtonDriveSyncEngine {
             this.stateDb.logActivity({
                 action: 'conflict',
                 localRelPath: relPath,
-                details: `Resolved conflict with keep-both: saved ${conflictCopyRelPath}`,
+                details:
+                    conflictCopyRelPath === null
+                        ? 'Resolved conflict with keep-both: the conflict copy was moved or deleted before it uploaded'
+                        : `Resolved conflict with keep-both: saved ${conflictCopyRelPath}`,
             });
         } finally {
             this.strategyResolvingPaths.delete(relPath);
@@ -1588,6 +1592,8 @@ export class ProtonDriveSyncEngine {
     // download failed goes on from the copy the earlier try made (see earlierKeepBothCopy), and nothing else is ever
     // taken for it. A copy nothing tracks yet is uploaded as made; refused (its name taken in Proton Drive), it stays as
     // it is and a new copy is made, so no file anything tracks is ever renamed.
+    // copyPath is null when the user moved or deleted the copy before it uploaded (#122, #127): both were kept as asked,
+    // but no copy is where it was made.
     // Returns null, with the local file left as it is, when it changed after its copy was taken (still being written,
     // say: #67): what was written since would be lost under the cloud's version. The next pass keeps both again, from
     // what it holds then; the copy made here stays, a new local file to that pass.
@@ -1598,7 +1604,7 @@ export class ProtonDriveSyncEngine {
         remoteNode: NodeEntity,
         remoteMap: Map<string, NodeEntity>,
         since: number,
-    ): Promise<string | null> {
+    ): Promise<{ copyPath: string | null } | null> {
         // The local file as it was when copied: checked again just before the cloud's version replaces it
         const snapshot = async (sha1: string) => {
             const st = await stat(localFullPath).catch(() => null);
@@ -1641,7 +1647,7 @@ export class ProtonDriveSyncEngine {
                 return changedMeanwhile(); // Uploaded already: that copy stays
             }
             this.keepBothCopies.delete(relPath);
-            return copyRelPath;
+            return { copyPath: copyRelPath };
         }
         const madeAs = path.relative(this.localRoot(), await createLocalConflictCopy(localFullPath)).split(path.sep).join('/');
         // What the copy holds, which may be newer than localSha1 (read before): the local file must still be that
@@ -1656,7 +1662,7 @@ export class ProtonDriveSyncEngine {
         // Past the download no retry comes (the file now holds the cloud's version): a copy whose upload fails here is
         // a new local file to the next pass
         this.keepBothCopies.delete(relPath);
-        return await this.uploadConflictCopy(madeAs, remoteMap, since);
+        return { copyPath: await this.uploadConflictCopy(madeAs, remoteMap, since) };
     }
 
     // Removes a conflict copy just made, while nothing tracks it (no record, no index entry) and it still holds what it
@@ -1705,7 +1711,7 @@ export class ProtonDriveSyncEngine {
         copyRelPath: string,
         remoteMap: Map<string, NodeEntity>,
         since: number,
-    ): Promise<string> {
+    ): Promise<string | null> {
         const root = this.localRoot();
         const name = path.posix.basename(copyRelPath);
         const dot = name.lastIndexOf('.');
@@ -1723,20 +1729,30 @@ export class ProtonDriveSyncEngine {
                 );
             // The user deleted or moved the copy meanwhile (through Files, say): theirs to do, and both were kept as asked.
             // A copy moved is a new local file wherever it went, which a later look uploads (#122)
-            if (await gone()) {
+            const leftByTheUser = () => {
                 this.logger.info(`The conflict copy ${relPath} was moved or deleted before it uploaded; left as the user left it`);
-                return relPath;
+                this.stateDb.logActivity({
+                    action: 'conflict',
+                    localRelPath: relPath,
+                    details: `The conflict copy ${relPath} was moved or deleted before it uploaded; left as it is`,
+                });
+                return null;
+            };
+            if (await gone()) {
+                return leftByTheUser();
             }
-            const result = await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, undefined, 'skip').catch(
+            const result = await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, undefined, 'skip', gone).catch(
                 async (error: unknown) => {
                     if ((error as NodeJS.ErrnoException).code === 'ENOENT' && (await gone())) {
-                        this.logger.info(`The conflict copy ${relPath} was moved or deleted as it uploaded; left as the user left it`);
-                        return null;
+                        return 'gone' as const;
                     }
                     throw error;
                 },
             );
-            if (result === null || result.status !== 'skipped') {
+            if (result === 'gone') {
+                return leftByTheUser();
+            }
+            if (result.status !== 'skipped') {
                 return relPath;
             }
             let next: string;
@@ -1865,11 +1881,11 @@ export class ProtonDriveSyncEngine {
                 this.stateDb.markConflictResolved(conflictId, 'keep-remote');
             } else {
                 const localSha1 = await computeLocalFileSha1(localFullPath);
-                const conflictCopyRelPath = await this.keepBoth(conflict.localRelPath, localFullPath, localSha1, remoteNode, remoteMap, since);
-                if (conflictCopyRelPath === null) {
+                const kept = await this.keepBoth(conflict.localRelPath, localFullPath, localSha1, remoteNode, remoteMap, since);
+                if (kept === null) {
                     throw new ConflictRefusedError(409, `${conflict.localRelPath} changed while both were being kept; try again`);
                 }
-                this.stateDb.markConflictResolved(conflictId, 'keep-both', conflictCopyRelPath);
+                this.stateDb.markConflictResolved(conflictId, 'keep-both', kept.copyPath);
             }
             // Resolved, whichever way: a keep-both of it left unfinished before is over too (see keepBoth)
             this.keepBothCopies.delete(conflict.localRelPath);
@@ -1962,6 +1978,8 @@ export class ProtonDriveSyncEngine {
         since: number,
         existingNodeUid?: string,
         collisionMode: 'new-revision' | 'skip' = 'new-revision',
+        // Says whether a file that failed to upload is gone by the user's doing: the caller reports that, not a failure
+        leftByTheUser?: () => Promise<boolean>,
     ): Promise<UploadResult> {
         const transferId = `ul:${relPath}`;
         const st = await stat(localFullPath);
@@ -2025,6 +2043,9 @@ export class ProtonDriveSyncEngine {
             }
             return result;
         } catch (error: unknown) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT' && leftByTheUser && (await leftByTheUser())) {
+                throw error;
+            }
             const msg = error instanceof Error ? error.message : String(error);
             this.stateDb.setItemStatus(relPath, 'error', msg);
             this.stateDb.logActivity({
