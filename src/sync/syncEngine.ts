@@ -1274,10 +1274,11 @@ export class ProtonDriveSyncEngine {
             // New local item -> upload/create on Proton Drive
             const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
             if (localInfo.isDirectory) {
-                if (await this.inProtonTrash(parentNode)) {
+                const held = await this.trashHold(parentNode);
+                if (held) {
                     // Its folder is in the Proton Drive trash: made there, it would be recorded as synced, and the folder's
                     // removal here would take it for an unchanged copy. Left here unrecorded, which that removal keeps (#160)
-                    this.logger.warn(`Not making ${relPath} in Proton Drive: its folder is in the Proton Drive trash`);
+                    this.logger.warn(`Not making ${relPath} in Proton Drive: ${held}`);
                     return;
                 }
                 const { node: createdFolder, created } = await createRemoteFolder(this.sdk, parentNode, path.basename(relPath));
@@ -1665,7 +1666,7 @@ export class ProtonDriveSyncEngine {
                     () => false,
                     (error: NodeJS.ErrnoException) => error.code === 'ENOENT',
                 );
-            if (await this.inProtonTrash(parentNode)) {
+            if (await this.trashHold(parentNode)) {
                 // In a folder in the Proton Drive trash: the copy stays here unrecorded, as uploadConflictCopy leaves one
                 // (#160), and the folder's removal here keeps it
                 copyRelPath = earlier.relPath;
@@ -1783,12 +1784,13 @@ export class ProtonDriveSyncEngine {
             if (await gone()) {
                 return leftByTheUser();
             }
-            if (await this.inProtonTrash(parentNode)) {
+            const held = await this.trashHold(parentNode);
+            if (held) {
                 // Its folder is in the Proton Drive trash (trashed elsewhere meanwhile), or that couldn't be checked: put
                 // there, the copy would be recorded as synced, and the folder's removal here would take the only copy of
                 // the user's version as an unchanged one. Left here unrecorded instead: a file only on this computer,
                 // which that removal keeps (#150)
-                this.logger.warn(`The conflict copy ${relPath} stays on this computer: its folder is in the Proton Drive trash`);
+                this.logger.warn(`The conflict copy ${relPath} stays on this computer: ${held}`);
                 return relPath;
             }
             const result = await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, undefined, 'skip', gone).catch(
@@ -2119,12 +2121,13 @@ export class ProtonDriveSyncEngine {
         parentNode: NodeEntity,
         since: number,
     ): Promise<NodeEntity | null> {
-        if (await this.inProtonTrash(parentNode)) {
+        const held = await this.trashHold(parentNode);
+        if (held) {
             // Its folder is in the Proton Drive trash (trashed elsewhere, not yet removed here), or that couldn't be told:
             // put there, the file would be recorded as synced and the folder's removal here would take it for an
             // unchanged copy, leaving it only in the trash. Left here unrecorded: a file only on this computer, which
             // that removal keeps (#160)
-            this.logger.warn(`Not uploading ${relPath}: its folder is in the Proton Drive trash`);
+            this.logger.warn(`Not uploading ${relPath}: ${held}`);
             return null;
         }
         for (let attempt = 1; ; attempt++) {
@@ -2263,13 +2266,26 @@ export class ProtonDriveSyncEngine {
         }
     }
 
-    // Whether a folder node is in the Proton Drive trash, itself or by a folder above it; true when that can't be told.
-    // The root never is
-    private async inProtonTrash(folder: NodeEntity): Promise<boolean> {
+    // Why nothing is to be put in a folder, or null when it may (the root always may): it is in the Proton Drive trash
+    // (itself or by a folder above it), or whether it is couldn't be told (offline, say), which holds it all the same
+    // until a later look (#166)
+    private async trashHold(folder: NodeEntity): Promise<string | null> {
+        const unchecked = "its folder couldn't be checked in Proton Drive just now; it is tried again later";
+        const trashed = 'its folder is in the Proton Drive trash';
         const root = await this.getRootFolder().catch(() => null);
-        if (!root) return true;
-        if (folder.uid === root.uid) return false;
-        return Boolean(folder.trashTime) || (await this.inTrashedFolder(folder));
+        if (!root) return unchecked;
+        if (folder.uid === root.uid) return null;
+        if (folder.trashTime) return trashed;
+        const seen = new Set<string>();
+        for (let uid = folder.parentUid; uid && uid !== root.uid; ) {
+            if (seen.has(uid)) return unchecked;
+            seen.add(uid);
+            const above = await this.sdk.getNode(uid).catch(() => null);
+            if (!above) return unchecked;
+            if (above.trashTime) return trashed;
+            uid = above.parentUid;
+        }
+        return null;
     }
 
     // Whether a conflict at the path is being resolved right now, by hand or by the conflict setting
@@ -2782,10 +2798,11 @@ export class ProtonDriveSyncEngine {
             const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
 
             if (st.isDirectory()) {
-                if (await this.inProtonTrash(parentNode)) {
+                const held = await this.trashHold(parentNode);
+                if (held) {
                     // Its folder is in the Proton Drive trash: made there, it would be recorded as synced, and the folder's
                     // removal here would take it for an unchanged copy. Left here unrecorded, which that removal keeps (#160)
-                    this.logger.warn(`Not making ${relPath} in Proton Drive: its folder is in the Proton Drive trash`);
+                    this.logger.warn(`Not making ${relPath} in Proton Drive: ${held}`);
                     return;
                 }
                 const { node: folder, created } = await createRemoteFolder(this.sdk, parentNode, path.basename(relPath));
