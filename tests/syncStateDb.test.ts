@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
+import { Database } from 'bun:sqlite';
 
 describe('SyncStateDatabase paths', () => {
     let tempDir: string;
@@ -223,6 +224,62 @@ describe('SyncStateDatabase activity hook', () => {
             stateDb.onActivity = (entry) => told.push(entry);
             stateDb.logActivity({ action: 'delete-local', localRelPath: 'Docs/a.txt', details: 'Deleted on this computer' });
             expect(told).toEqual([{ action: 'delete-local', localRelPath: 'Docs/a.txt', details: 'Deleted on this computer' }]);
+            stateDb.close();
+        } finally {
+            await rm(tempDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('SyncStateDatabase conflict strategy (#91)', () => {
+    test('keep-local or keep-remote, stored by an older version, reads as keep-both, and is stored as keep-both at the next open', async () => {
+        const tempDir = await mkdtemp(path.join(tmpdir(), 'proton-drive-statedb-test-'));
+        try {
+            const dbPath = path.join(tempDir, 'state.sqlite');
+            for (const retired of ['keep-local', 'keep-remote']) {
+                const stateDb = new SyncStateDatabase(dbPath);
+                const raw = new Database(dbPath);
+                const stored = () => (raw.query("SELECT value FROM settings WHERE key = 'conflictStrategy'").get() as { value: string }).value;
+                raw.run("INSERT OR REPLACE INTO settings (key, value) VALUES ('conflictStrategy', ?)", [retired]);
+                expect([retired, stateDb.getSettings().conflictStrategy]).toEqual([retired, 'keep-both']);
+                stateDb.close();
+                expect(stored()).toBe(retired);
+                const reopened = new SyncStateDatabase(dbPath);
+                expect(stored()).toBe('keep-both'); // an older version run next never overwrites by it
+                expect(reopened.getSettings().conflictStrategy).toBe('keep-both');
+                reopened.updateSettings({ conflictStrategy: 'prompt' });
+                reopened.close();
+                expect(stored()).toBe('prompt'); // the other strategies are left as they are
+                expect(new SyncStateDatabase(dbPath).getSettings().conflictStrategy).toBe('prompt');
+                raw.close();
+            }
+        } finally {
+            await rm(tempDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('SyncStateDatabase content read time (#109)', () => {
+    test('records from before it was kept have no read time, so their files are hashed once', async () => {
+        const tempDir = await mkdtemp(path.join(tmpdir(), 'proton-drive-statedb-test-'));
+        try {
+            const dbPath = path.join(tempDir, 'state.sqlite');
+            const old = new Database(dbPath);
+            old.run(`CREATE TABLE synced_items (
+                localRelPath TEXT PRIMARY KEY, nodeUid TEXT NOT NULL, parentNodeUid TEXT, type TEXT NOT NULL,
+                localSha1 TEXT, remoteSha1 TEXT, localMtimeMs INTEGER NOT NULL DEFAULT 0, remoteMtimeMs INTEGER NOT NULL DEFAULT 0,
+                size INTEGER NOT NULL DEFAULT 0, syncStatus TEXT NOT NULL DEFAULT 'synced', lastError TEXT, updatedAt INTEGER NOT NULL)`);
+            old.run("INSERT INTO synced_items (localRelPath, nodeUid, type, updatedAt) VALUES ('a.txt', 'n1', 'file', 1234)");
+            old.close();
+            const stateDb = new SyncStateDatabase(dbPath);
+            expect(stateDb.getItemByPath('a.txt')?.contentReadAt).toBeNull();
+            expect(stateDb.getItemByPath('a.txt')?.updatedAt).toBe(1234);
+            stateDb.upsertItem({ ...stateDb.getItemByPath('a.txt')!, localRelPath: 'b.txt', contentReadAt: undefined });
+            expect(stateDb.getItemByPath('b.txt')?.contentReadAt).toBeNull(); // written without one: not known
+            stateDb.touchItem('b.txt', 5000);
+            expect(stateDb.getItemByPath('b.txt')?.contentReadAt).toBe(5000);
+            stateDb.upsertItem({ ...stateDb.getItemByPath('a.txt')!, contentReadAt: 1730000000123.457 });
+            expect(stateDb.getItemByPath('a.txt')?.contentReadAt).toBe(1730000000123.457); // kept to the fraction
             stateDb.close();
         } finally {
             await rm(tempDir, { recursive: true, force: true });

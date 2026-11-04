@@ -231,6 +231,13 @@ struct SyncSettings {
     ignore_patterns: Vec<String>,
     /// Apps (by process name) the virtual drive won't download online-only files for; absent from an older daemon
     blocked_apps: Vec<String>,
+    /// Proton Drive starts at login (#92); on unless the daemon says otherwise (an older daemon doesn't say)
+    #[serde(default = "on")]
+    start_at_login: bool,
+}
+
+fn on() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -268,6 +275,9 @@ struct DaemonStatus {
     /// While the daemon holds because the files are missing from the folder: what is missing
     #[serde(default)]
     files_missing: Option<FilesMissing>,
+    /// While the daemon holds because the records are of another account than the one signed in to (#35)
+    #[serde(default)]
+    account_mismatch: Option<AccountMismatch>,
     logged_in: bool,
     sync_dir: String,
     active_transfers: Vec<ActiveTransfer>,
@@ -298,6 +308,14 @@ struct FilesMissing {
     root: String,
     names: Vec<String>,
     items: u64,
+    message: String,
+}
+
+/// Signed in to another Proton account than the files on this computer were synced with (`accountMismatch` in
+/// /api/status): nothing syncs until the user signs back in to that account, or starts fresh with this one (#35).
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+struct AccountMismatch {
     message: String,
 }
 
@@ -713,6 +731,7 @@ fn settings_changes(
     sync_dir: &str,
     conflict_strategy: &str,
     notifications_enabled: bool,
+    start_at_login: bool,
     ignore_patterns_text: &str,
 ) -> serde_json::Map<String, serde_json::Value> {
     use serde_json::Value;
@@ -725,6 +744,9 @@ fn settings_changes(
     }
     if notifications_enabled != loaded.notifications_enabled {
         changes.insert("notificationsEnabled".into(), Value::from(notifications_enabled));
+    }
+    if start_at_login != loaded.start_at_login {
+        changes.insert("startAtLogin".into(), Value::from(start_at_login));
     }
     let patterns = parse_ignore_patterns(ignore_patterns_text);
     if patterns != parse_ignore_patterns(&loaded.ignore_patterns.join("\n")) {
@@ -796,6 +818,11 @@ fn files_missing_resolve_at(socket: &std::path::Path, choice: MissingChoice, roo
     control_request_at(socket, "POST", "/sync/files-missing", Some(&body), DRIVE_READ_TIMEOUT).map(|_| ())
 }
 
+/// POST /account/start-fresh: the files on this computer sync to the account signed in to as new files (#35).
+fn start_fresh_at(socket: &std::path::Path) -> Result<(), String> {
+    control_request_at(socket, "POST", "/account/start-fresh", Some(&serde_json::json!({})), DRIVE_READ_TIMEOUT).map(|_| ())
+}
+
 /// An action that waits for the user's confirmation.
 #[derive(Clone, Debug, PartialEq)]
 enum PendingConfirm {
@@ -807,6 +834,8 @@ enum PendingConfirm {
     /// The files missing from the folder were deleted on purpose: they go to the Proton Drive trash too. What the dialog
     /// was opened for (the status's `filesMissing`) is what it confirms.
     DeleteMissing { root: String, names: Vec<String>, items: u64 },
+    /// Start fresh with the account signed in to: the files on this computer sync to it as new files (#35)
+    StartFresh,
 }
 
 /// What a confirmation dialog says, and what its button asks the daemon to do to which path.
@@ -878,6 +907,16 @@ fn confirm_copy(confirm: &PendingConfirm, virtual_drive: bool) -> ConfirmCopy {
             // Not an availability action: render_confirm_modal sends the confirmation instead
             action: "files-missing-delete",
         },
+        PendingConfirm::StartFresh => ConfirmCopy {
+            title: "Start fresh with this account?".to_string(),
+            body: "The files on this computer stay, and sync to the Proton account you are signed in to as new files: they upload to it.".to_string(),
+            detail: "Nothing is deleted, on this computer or in either account. To sync with the other account instead, sign out and sign in to it.",
+            button: "Start fresh",
+            cancel: "Cancel",
+            rel_path: String::new(),
+            // Not an availability action: render_confirm_modal sends the start-fresh instead
+            action: "start-fresh",
+        },
     }
 }
 
@@ -915,6 +954,8 @@ enum WorkerCommand {
     LoadHidden,
     /// What to do about the files missing from the folder, as shown (POST /sync/files-missing)
     ResolveFilesMissing { choice: MissingChoice, root: String, names: Vec<String> },
+    /// Start fresh with the account signed in to (POST /account/start-fresh, #35)
+    StartFresh,
 }
 
 /// Set once in `main` when the app only renders a screenshot: nothing that changes anything is ever sent then, and
@@ -1014,6 +1055,7 @@ enum WorkerEvent {
     DriveDone(Result<(), String>),
     /// What was asked about the missing files (deleted on purpose, or kept online-only) went through, or why not
     FilesMissingDone(Result<(), String>),
+    StartFreshDone(Result<(), String>),
 }
 
 /// A line telling how something went: done, or why not.
@@ -1201,6 +1243,8 @@ struct ProtonDriveNativeApp {
     /// The confirmation that the missing files were deleted on purpose is still running, and why the last one failed
     files_missing_working: bool,
     files_missing_error: Option<String>,
+    start_fresh_working: bool,
+    start_fresh_error: Option<String>,
 
     // Conflicts state
     conflicts: Vec<ConflictRecord>,
@@ -1213,6 +1257,7 @@ struct ProtonDriveNativeApp {
     edit_sync_dir: String,
     edit_conflict_strategy: String,
     edit_notifications: bool,
+    edit_start_at_login: bool,
 
     /// Screenshot-only: `--drive-status` and `--drive-move`, laid over every status from the daemon
     fake_drive: Option<(String, Option<String>)>,
@@ -1224,6 +1269,8 @@ struct ProtonDriveNativeApp {
     fake_transfers: Option<usize>,
     /// Screenshot-only: `--signed-out`, the daemon without an account, laid over every status
     fake_signed_out: bool,
+    /// Screenshot-only: `--account-mismatch`, the daemon holding another account's records, laid over every status
+    fake_account_mismatch: bool,
 
     // Window geometry state
     window_geometry: WindowGeometry,
@@ -1283,6 +1330,7 @@ impl ProtonDriveNativeApp {
             initial_status.settings.conflict_strategy.clone()
         };
         let edit_notifications = initial_status.settings.notifications_enabled;
+        let edit_start_at_login = initial_status.settings.start_at_login;
         let ignore_patterns_text = initial_status.settings.ignore_patterns.join("\n");
         let loaded_settings = initial_status.settings.clone();
         let attention = home::attention_items(&initial_status, &[]);
@@ -1319,17 +1367,21 @@ impl ProtonDriveNativeApp {
             blocklist_error: None,
             files_missing_working: false,
             files_missing_error: None,
+            start_fresh_working: false,
+            start_fresh_error: None,
             conflicts: Vec::new(),
             attention,
             conflict_error: None,
             edit_sync_dir,
             edit_conflict_strategy,
             edit_notifications,
+            edit_start_at_login,
             fake_drive: None,
             fake_files_missing: false,
             fake_attention: None,
             fake_transfers: None,
             fake_signed_out: false,
+            fake_account_mismatch: false,
             window_geometry,
             maximize_applied_on_open: false,
             applied_light_mode: initial_light,
@@ -1354,6 +1406,19 @@ impl ProtonDriveNativeApp {
             status.state = "unauthenticated".into();
             status.account = None;
         }
+    }
+
+    /// Screenshot-only: lays `--account-mismatch` over a status from the daemon, in the daemon's words (#35).
+    fn apply_fake_account_mismatch(&self, status: &mut DaemonStatus) {
+        if !self.fake_account_mismatch {
+            return;
+        }
+        let message = "You signed in to a different Proton account than the files on this computer were synced with. \
+            Nothing is synced, deleted or uploaded until you choose: sign back in to that account, or start fresh, keeping \
+            the files on this computer and syncing them to this account as new files.";
+        status.state = "error".into();
+        status.last_error = Some(message.to_string());
+        status.account_mismatch = Some(AccountMismatch { message: message.to_string() });
     }
 
     /// Screenshot-only: lays `--files-missing` over a status from the daemon.
@@ -1428,6 +1493,7 @@ impl ProtonDriveNativeApp {
         self.edit_sync_dir = settings.sync_dir.clone();
         self.edit_conflict_strategy = settings.conflict_strategy.clone();
         self.edit_notifications = settings.notifications_enabled;
+        self.edit_start_at_login = settings.start_at_login;
         self.ignore_patterns_text = settings.ignore_patterns.join("\n");
         self.loaded_settings = settings.clone();
     }
@@ -1455,6 +1521,7 @@ impl ProtonDriveNativeApp {
                         self.apply_fake_files_missing(&mut s);
                         self.apply_fake_transfers(&mut s);
                         self.apply_fake_signed_out(&mut s);
+                        self.apply_fake_account_mismatch(&mut s);
                         // Edits being made or saved stay as they are; Save compares them with what they were loaded from
                         if !self.settings_dirty && !self.settings_saving {
                             self.load_settings_form(&s.settings);
@@ -1555,6 +1622,11 @@ impl ProtonDriveNativeApp {
                 WorkerEvent::HiddenLoaded(result) => {
                     self.hidden_loading = false;
                     self.hidden = Some(result);
+                }
+                WorkerEvent::StartFreshDone(result) => {
+                    self.start_fresh_working = false;
+                    self.start_fresh_error = result.err();
+                    let _ = self.tx.send(WorkerCommand::RefreshAll);
                 }
                 WorkerEvent::ConflictsLoaded(conflicts) => {
                     self.conflicts = conflicts;
@@ -2149,6 +2221,10 @@ impl ProtonDriveNativeApp {
                                     self.send_drive_command(WorkerCommand::SetVirtualDrive(false));
                                 } else if let PendingConfirm::DeleteMissing { root, names, .. } = &confirm {
                                     self.resolve_files_missing(MissingChoice::DeleteInCloud, root.clone(), names.clone());
+                                } else if confirm == PendingConfirm::StartFresh {
+                                    self.start_fresh_working = true;
+                                    self.start_fresh_error = None;
+                                    let _ = self.tx.send(WorkerCommand::StartFresh);
                                 } else {
                                     self.send_availability(action_path.clone(), action);
                                 }
@@ -2274,6 +2350,69 @@ impl ProtonDriveNativeApp {
                             Some(PendingConfirm::DeleteMissing { root: fm.root.clone(), names: fm.names.clone(), items: fm.items });
                     }
                     None => {}
+                }
+            });
+    }
+
+    /// In Home's Needs attention, first, while the daemon holds because the records are of another Proton account than
+    /// the one signed in to: what the daemon says, and the two ways on. Starting fresh asks first; signing out (to sign
+    /// in to the account the files were synced with) asks nothing, as it changes no file.
+    fn render_account_mismatch(&mut self, ui: &mut egui::Ui) {
+        let Some(mismatch) = self.status.account_mismatch.clone() else {
+            return;
+        };
+        Frame::NONE
+            .fill(Color32::from_rgba_unmultiplied(239, 68, 68, 26))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(239, 68, 68, 110)))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::symmetric(16, 12))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.add(
+                    egui::Label::new(RichText::new("Signed in to a different Proton account").size(13.5).strong().color(TEXT_PRIMARY()))
+                        .wrap(),
+                );
+                ui.add_space(2.0);
+                ui.add(egui::Label::new(RichText::new(&mismatch.message).size(12.5).color(TEXT_MUTED())).wrap());
+                if let Some(error) = &self.start_fresh_error {
+                    ui.add_space(2.0);
+                    ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
+                }
+                ui.add_space(8.0);
+                let working = self.start_fresh_working;
+                let mut start_fresh = false;
+                let mut sign_out = false;
+                ui.horizontal(|ui| {
+                    let text = if working { TEXT_MUTED() } else { Color32::WHITE };
+                    if proton_button(ui, Vec2::new(210.0, 32.0), "Start fresh with this account", PROTON_PURPLE, PROTON_PURPLE_HOVER, None, text, 12.5)
+                        .on_hover_text("Asks first. The files on this computer stay, and upload to this account.")
+                        .clicked()
+                    {
+                        start_fresh = true;
+                    }
+                    ui.add_space(4.0);
+                    if proton_button(
+                        ui,
+                        Vec2::new(110.0, 32.0),
+                        "Sign out",
+                        BG_CARD_ALT(),
+                        btn_secondary_hover_bg(),
+                        Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                        if working { TEXT_MUTED() } else { TEXT_PRIMARY() },
+                        12.5,
+                    )
+                    .on_hover_text("Then sign in to the account the files were synced with")
+                    .clicked()
+                    {
+                        sign_out = true;
+                    }
+                });
+                if !working && start_fresh {
+                    self.pending_confirm = Some(PendingConfirm::StartFresh);
+                }
+                if !working && sign_out {
+                    // As Settings › Account signs out
+                    self.send_account_command(WorkerCommand::Logout);
                 }
             });
     }
@@ -2570,6 +2709,7 @@ impl ProtonDriveNativeApp {
             &self.edit_sync_dir,
             &self.edit_conflict_strategy,
             self.edit_notifications,
+            self.edit_start_at_login,
             &self.ignore_patterns_text,
         );
         if changes.is_empty() {
@@ -2695,19 +2835,16 @@ impl ProtonDriveNativeApp {
             );
             ui.add_space(6.0);
             egui::ComboBox::from_id_salt("conflict_strategy_combo")
+                // Both versions are always kept (#91): at once, or once the user chose in Home's Needs attention
                 .selected_text(match self.edit_conflict_strategy.as_str() {
-                    "keep-local" => "Keep Local (Overwrite remote revision)",
-                    "keep-remote" => "Keep Remote (Overwrite local file)",
-                    "prompt" => "Ask manually in Conflicts tab",
+                    "prompt" => "Ask me each time (in Home's Needs attention)",
                     _ => "Keep Both (Save conflict copy with timestamp)",
                 })
                 .width(360.0)
                 .show_ui(ui, |ui| {
                     for (val, text) in [
                         ("keep-both", "Keep Both (Save conflict copy with timestamp)"),
-                        ("keep-local", "Keep Local (Overwrite remote revision)"),
-                        ("keep-remote", "Keep Remote (Overwrite local file)"),
-                        ("prompt", "Ask manually in Conflicts tab"),
+                        ("prompt", "Ask me each time (in Home's Needs attention)"),
                     ] {
                         if ui
                             .selectable_value(
@@ -2730,6 +2867,20 @@ impl ProtonDriveNativeApp {
                         .size(13.5)
                         .color(TEXT_PRIMARY()),
                 )
+                .changed()
+            {
+                self.mark_settings_edited();
+            }
+
+            ui.add_space(10.0);
+            if ui
+                .checkbox(
+                    &mut self.edit_start_at_login,
+                    RichText::new("Start Proton Drive when I log in")
+                        .size(13.5)
+                        .color(TEXT_PRIMARY()),
+                )
+                .on_hover_text("Syncs and mounts the drive at login, with the tray icon, without opening this window")
                 .changed()
             {
                 self.mark_settings_edited();
@@ -3537,6 +3688,9 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
             WorkerCommand::ResolveFilesMissing { choice, root, names } => off_thread(&tx, &ctx, move || {
                 WorkerEvent::FilesMissingDone(files_missing_resolve_at(&control_socket_path(), choice, &root, &names))
             }),
+            WorkerCommand::StartFresh => {
+                off_thread(&tx, &ctx, move || WorkerEvent::StartFreshDone(start_fresh_at(&control_socket_path())))
+            }
         }
     }
 }
@@ -3626,6 +3780,7 @@ OPTIONS:
   --fake-attention <N>  with --screenshot: list N conflicts (and two failed items) under Needs attention on Home
   --fake-transfers <N>  with --screenshot: show N uploads in progress on Home
   --signed-out          with --screenshot: show the daemon without an account
+  --account-mismatch    with --screenshot: show the daemon holding the records of another Proton account
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --version             print the version
   -h, --help            print this help
@@ -3657,6 +3812,7 @@ fn main() -> eframe::Result {
     let mut cli_fake_attention: Option<usize> = None;
     let mut cli_fake_transfers: Option<usize> = None;
     let mut cli_signed_out = false;
+    let mut cli_account_mismatch = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -3693,6 +3849,9 @@ fn main() -> eframe::Result {
             }
             "--signed-out" => {
                 cli_signed_out = true;
+            }
+            "--account-mismatch" => {
+                cli_account_mismatch = true;
             }
             "--hidden-items" => {
                 cli_hidden_items = true;
@@ -3733,8 +3892,12 @@ fn main() -> eframe::Result {
     // Before any thread starts: a screenshot only reads (see allowed_in_screenshot_mode and control_request_at)
     SCREENSHOT_MODE.store(screenshot_target.is_some(), AtomicOrdering::SeqCst);
 
-    if screenshot_target.is_none() && (cli_fake_attention.is_some() || cli_fake_transfers.is_some() || cli_signed_out) {
-        eprintln!("protondrive-gui: --fake-attention, --fake-transfers and --signed-out only apply together with --screenshot; ignoring them");
+    if screenshot_target.is_none()
+        && (cli_fake_attention.is_some() || cli_fake_transfers.is_some() || cli_signed_out || cli_account_mismatch)
+    {
+        eprintln!(
+            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out and --account-mismatch only apply together with --screenshot; ignoring them"
+        );
     }
     let fake_drive = if cli_drive_status.is_some() || cli_drive_move.is_some() {
         // A move alone is shown as the move that failed
@@ -3850,11 +4013,13 @@ fn main() -> eframe::Result {
                 app.fake_attention = cli_fake_attention;
                 app.fake_transfers = cli_fake_transfers;
                 app.fake_signed_out = cli_signed_out;
+                app.fake_account_mismatch = cli_account_mismatch;
                 let mut status = std::mem::take(&mut app.status);
                 app.apply_fake_drive(&mut status);
                 app.apply_fake_files_missing(&mut status);
                 app.apply_fake_transfers(&mut status);
                 app.apply_fake_signed_out(&mut status);
+                app.apply_fake_account_mismatch(&mut status);
                 app.status = status;
                 app.refresh_attention();
                 if cli_confirm_files_missing {
@@ -4321,17 +4486,21 @@ mod tests {
                 blocklist_error: None,
                 files_missing_working: false,
                 files_missing_error: None,
+                start_fresh_working: false,
+                start_fresh_error: None,
                 conflicts: Vec::new(),
                 attention: Vec::new(),
                 conflict_error: None,
                 edit_sync_dir: String::new(),
                 edit_conflict_strategy: "keep-both".into(),
                 edit_notifications: false,
+                edit_start_at_login: true,
                 fake_drive: None,
                 fake_files_missing: false,
                 fake_attention: None,
                 fake_transfers: None,
                 fake_signed_out: false,
+            fake_account_mismatch: false,
                 window_geometry: WindowGeometry::default(),
                 maximize_applied_on_open: true,
                 applied_light_mode: false,
@@ -4399,6 +4568,19 @@ mod tests {
             self.frames(2);
         }
 
+        /// The mouse wheel turned over `pos`, moving the content under it up by `dy` points, then time for the scroll
+        /// to settle.
+        fn scroll(&mut self, pos: egui::Pos2, dy: f32) {
+            self.frame(vec![egui::Event::PointerMoved(pos)]);
+            let wheel = egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: Vec2::new(0.0, -dy),
+                modifiers: egui::Modifiers::NONE,
+            };
+            self.frame(vec![wheel]);
+            self.frames(30);
+        }
+
         /// Where the last frame painted exactly this text.
         fn text_at(&self, text: &str) -> Option<egui::Pos2> {
             fn find(shape: &egui::Shape, text: &str) -> Option<egui::Pos2> {
@@ -4461,6 +4643,7 @@ mod tests {
                     WorkerCommand::SetPaused(paused) => Some(format!("paused {paused}")),
                     WorkerCommand::ResolveConflict { id, choice } => Some(format!("resolve {id} {choice}")),
                     WorkerCommand::StartLogin => Some("sign in".to_string()),
+                    WorkerCommand::StartFresh => Some("start fresh".to_string()),
                     WorkerCommand::Logout => Some("sign out".to_string()),
                     _ => None,
                 })
@@ -4898,6 +5081,18 @@ mod tests {
     }
 
     #[test]
+    fn the_account_mismatch_screenshot_flag_lays_it_over_every_status() {
+        let mut h = Harness::new();
+        h.app.fake_account_mismatch = true;
+        let status = h.app.status.clone();
+        h.event(WorkerEvent::StatusAndActivity { status: Box::new(Ok(status)), activity: Vec::new() });
+        assert!(h.app.status.account_mismatch.is_some());
+        assert_eq!(h.app.status.state, "error");
+        assert_eq!(h.app.attention.first(), Some(&home::Attention::AccountMismatch));
+        assert!(h.text_at("Start fresh with this account").is_some());
+    }
+
+    #[test]
     fn signed_out_home_offers_sign_in_and_not_pause() {
         let mut h = home_with(|s| {
             s.logged_in = false;
@@ -5138,6 +5333,7 @@ mod tests {
             paused: false,
             ignore_patterns: vec![".git".into(), "*.part".into()],
             blocked_apps: Vec::new(),
+            start_at_login: true,
         }
     }
 
@@ -5145,13 +5341,13 @@ mod tests {
     fn settings_save_sends_only_the_fields_that_changed() {
         let loaded = loaded_settings();
         let changes = |dir: &str, strategy: &str, notify: bool, ignore: &str| {
-            serde_json::Value::Object(settings_changes(&loaded, dir, strategy, notify, ignore))
+            serde_json::Value::Object(settings_changes(&loaded, dir, strategy, notify, loaded.start_at_login, ignore))
         };
         let same = ".git\n*.part";
         assert_eq!(changes("/home/u/ProtonDrive", "keep-both", true, same), serde_json::json!({}));
         assert_eq!(
-            changes("/home/u/ProtonDrive", "keep-local", true, same),
-            serde_json::json!({ "conflictStrategy": "keep-local" })
+            changes("/home/u/ProtonDrive", "prompt", true, same),
+            serde_json::json!({ "conflictStrategy": "prompt" })
         );
         assert_eq!(changes("/home/u/ProtonDrive", "keep-both", false, same), serde_json::json!({ "notificationsEnabled": false }));
         assert_eq!(changes(" /mnt/b/ProtonDrive ", "keep-both", true, same), serde_json::json!({ "syncDir": "/mnt/b/ProtonDrive" }));
@@ -5166,6 +5362,23 @@ mod tests {
             changes("/mnt/x", "prompt", false, ""),
             serde_json::json!({ "syncDir": "/mnt/x", "conflictStrategy": "prompt", "notificationsEnabled": false, "ignorePatterns": [] })
         );
+    }
+
+    // #92: the Start at login switch is saved like the others, and reads as on from a daemon that doesn't send it
+    #[test]
+    fn start_at_login_is_sent_only_when_changed_and_on_unless_said_otherwise() {
+        let loaded = loaded_settings();
+        let same = ".git\n*.part";
+        let changes = |start: bool| {
+            serde_json::Value::Object(settings_changes(&loaded, "/home/u/ProtonDrive", "keep-both", true, start, same))
+        };
+        assert!(loaded.start_at_login);
+        assert_eq!(changes(true), serde_json::json!({}));
+        assert_eq!(changes(false), serde_json::json!({ "startAtLogin": false }));
+        let older: SyncSettings = serde_json::from_value(serde_json::json!({ "syncDir": "/home/u/ProtonDrive" })).unwrap();
+        assert!(older.start_at_login);
+        let off: SyncSettings = serde_json::from_value(serde_json::json!({ "startAtLogin": false })).unwrap();
+        assert!(!off.start_at_login);
     }
 
     #[test]
@@ -5236,15 +5449,15 @@ mod tests {
 
     #[test]
     fn settings_are_saved_over_the_control_socket_and_a_400_is_shown() {
-        let reply: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"ok\":true,\"settings\":{\"syncDir\":\"/home/u/ProtonDrive\",\"conflictStrategy\":\"keep-local\",\"notificationsEnabled\":true,\"reconcileIntervalSec\":120,\"paused\":false,\"ignorePatterns\":[]},\"virtualDriveWanted\":true,\"vfs\":{\"mode\":\"virtual\",\"mounted\":true,\"reason\":null},\"folderError\":null,\"switchError\":null}";
+        let reply: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"ok\":true,\"settings\":{\"syncDir\":\"/home/u/ProtonDrive\",\"conflictStrategy\":\"prompt\",\"notificationsEnabled\":true,\"reconcileIntervalSec\":120,\"paused\":false,\"ignorePatterns\":[]},\"virtualDriveWanted\":true,\"vfs\":{\"mode\":\"virtual\",\"mounted\":true,\"reason\":null},\"folderError\":null,\"switchError\":null}";
         let (sock, server) = serve_once(reply);
-        let body = serde_json::json!({ "conflictStrategy": "keep-local" });
+        let body = serde_json::json!({ "conflictStrategy": "prompt" });
         let got = save_settings_at(&sock, &body).unwrap();
         assert_eq!(got.problem(), None);
-        assert_eq!(got.settings.unwrap().conflict_strategy, "keep-local");
+        assert_eq!(got.settings.unwrap().conflict_strategy, "prompt");
         let request = server.join().unwrap();
         assert!(request.starts_with("POST /drive/settings HTTP/1.1\r\n"), "{request}");
-        assert_eq!(request_body(&request), serde_json::json!({ "conflictStrategy": "keep-local" }));
+        assert_eq!(request_body(&request), serde_json::json!({ "conflictStrategy": "prompt" }));
 
         let (sock, server) = serve_once(b"HTTP/1.1 400 Bad Request\r\n\r\n{\"error\":\"Unknown setting: x\",\"code\":\"EINVAL\"}");
         assert_eq!(save_settings_at(&sock, &serde_json::json!({ "x": 1 })).unwrap_err(), "Unknown setting: x");
@@ -5318,6 +5531,7 @@ mod tests {
             WorkerCommand::LoadHidden,
             WorkerCommand::ResolveFilesMissing { choice: MissingChoice::DeleteInCloud, root: "/r".into(), names: vec!["Docs".into()] },
             WorkerCommand::ResolveFilesMissing { choice: MissingChoice::KeepOnlineOnly, root: "/r".into(), names: vec!["Docs".into()] },
+            WorkerCommand::StartFresh,
         ];
         for cmd in &writes {
             assert!(!allowed_in_screenshot_mode(cmd));
@@ -5362,6 +5576,61 @@ mod tests {
             assert!(h.text_at(DELETE_TOO).is_none(), "{tab:?}");
             assert!(h.text_at("1").is_some(), "{tab:?}: Home's badge");
         }
+    }
+
+    // #35: signed in to another account than the files were synced with, Home's Needs attention says so first, and
+    // offers both ways on
+    #[test]
+    fn another_account_shows_first_in_homes_needs_attention_and_starting_fresh_asks_first() {
+        let mut sent = serde_json::to_value(DaemonStatus::default()).unwrap();
+        sent["accountMismatch"] = serde_json::json!({ "message": "You signed in to a different Proton account." });
+        let status: DaemonStatus = serde_json::from_value(sent).unwrap();
+        assert_eq!(status.account_mismatch, Some(AccountMismatch { message: "You signed in to a different Proton account.".into() }));
+
+        let mut h = Harness::new();
+        assert!(h.text_at("Start fresh with this account").is_none());
+        h.app.status.state = "error".into();
+        h.app.status.last_error = Some("You signed in to a different Proton account.".into());
+        h.app.status.account_mismatch = Some(AccountMismatch { message: "You signed in to a different Proton account.".into() });
+        h.app.status.files_missing =
+            Some(FilesMissing { root: "/home/u/ProtonDrive".into(), names: vec!["Docs".into()], items: 1, ..Default::default() });
+        h.app.refresh_attention();
+        h.frames(3);
+        assert_eq!(h.app.attention.first(), Some(&home::Attention::AccountMismatch));
+        assert!(h.text_at("Needs attention").is_some());
+        assert!(h.text_at("2 problems need you").is_some(), "the mismatch counts in the status");
+        let title = h.text_at("Signed in to a different Proton account").expect("the mismatch is listed");
+        assert!(title.y < h.text_at(DELETE_TOO).expect("files missing is listed too").y, "the mismatch comes first");
+        // Said once: the error the daemon sets for it isn't listed again
+        assert_eq!(h.text_at_all("You signed in to a different Proton account.").len(), 1);
+        // Home only, as the files missing are: the other sections don't repeat it
+        for tab in [NavTab::Activity, NavTab::Settings] {
+            h.app.tab = tab;
+            h.frames(3);
+            assert!(h.text_at("Start fresh with this account").is_none(), "{tab:?}");
+        }
+        h.app.tab = NavTab::Home;
+        h.frames(3);
+
+        h.click(h.text_at("Start fresh with this account").unwrap());
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::StartFresh));
+        assert_eq!(h.sent(), Vec::<String>::new());
+        h.click(h.text_at("Cancel").expect("the dialog is painted"));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+        h.click(h.text_at("Start fresh with this account").unwrap());
+        h.click(h.text_at("Start fresh").expect("the dialog's button"));
+        assert_eq!(h.sent(), vec!["start fresh".to_string()]);
+        assert!(h.app.start_fresh_working);
+        // Nothing more is sent while it runs
+        h.click(h.text_at("Start fresh with this account").unwrap());
+        assert_eq!(h.app.pending_confirm, None);
+        h.event(WorkerEvent::StartFreshDone(Err("Nothing to start fresh from".into())));
+        assert!(!h.app.start_fresh_working);
+        h.frames(2);
+        assert!(h.text_at("Nothing to start fresh from").is_some());
+        h.click(h.text_at("Sign out").unwrap());
+        assert_eq!(h.sent(), vec!["sign out".to_string()]);
     }
 
     #[test]
@@ -5775,26 +6044,46 @@ mod tests {
     #[test]
     fn save_preferences_sends_only_what_changed() {
         let mut h = Harness::settings(None, None);
+        // Below the fold at 1440x900 since Settings gained the Account card and Start at login
+        h.scroll(h.text_at("Save Preferences").unwrap() - Vec2::new(0.0, 200.0), 400.0);
         h.click(h.text_at("Save Preferences").unwrap());
         assert_eq!(h.sent(), Vec::<String>::new());
         assert_eq!(h.app.settings_notice, Some(Notice::info("No changes to save.")));
 
-        h.app.edit_conflict_strategy = "keep-local".into();
+        h.app.edit_conflict_strategy = "prompt".into();
         h.app.settings_dirty = true;
         h.frames(2);
         h.click(h.text_at("Save Preferences").unwrap());
-        assert_eq!(h.sent(), vec![r#"save {"conflictStrategy":"keep-local"}"#.to_string()]);
+        assert_eq!(h.sent(), vec![r#"save {"conflictStrategy":"prompt"}"#.to_string()]);
         assert!(h.app.settings_saving);
+    }
+
+    // #92 and #91 merged into Stage 1's Settings: the login switch is there and saves, and the conflict strategy offers
+    // only the two the daemon still takes
+    #[test]
+    fn settings_has_start_at_login_and_no_strategy_that_replaces_a_version() {
+        let mut h = Harness::settings(None, None);
+        h.scroll(h.text_at("Save Preferences").unwrap() - Vec2::new(0.0, 200.0), 400.0);
+        h.click(h.text_at("Start Proton Drive when I log in").expect("the login switch is in Settings"));
+        assert!(!h.app.edit_start_at_login);
+        h.click(h.text_at("Save Preferences").unwrap());
+        assert_eq!(h.sent(), vec![r#"save {"startAtLogin":false}"#.to_string()]);
+
+        h.click(h.text_at("Keep Both (Save conflict copy with timestamp)").expect("the strategy's dropdown"));
+        assert!(h.text_at("Ask me each time (in Home's Needs attention)").is_some(), "the dropdown is open");
+        for gone in ["Keep Local (Overwrite remote revision)", "Keep Remote (Overwrite local file)", "Ask manually in Conflicts tab"] {
+            assert!(h.text_at(gone).is_none(), "{gone}");
+        }
     }
 
     #[test]
     fn a_save_refreshes_the_form_from_the_reply_and_shows_what_was_refused() {
         let mut h = Harness::settings(None, None);
         h.app.edit_sync_dir = "/mnt/b/ProtonDrive".into();
-        h.app.edit_conflict_strategy = "keep-local".into();
+        h.app.edit_conflict_strategy = "prompt".into();
         h.app.settings_dirty = true;
         h.app.settings_saving = true;
-        let stored = SyncSettings { conflict_strategy: "keep-local".into(), ..loaded_settings() };
+        let stored = SyncSettings { conflict_strategy: "prompt".into(), ..loaded_settings() };
         let reply = SettingsReply {
             settings: Some(stored.clone()),
             folder_error: Some("The new folder must be empty".into()),

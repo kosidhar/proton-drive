@@ -89,6 +89,9 @@ Home, and the gear and account block to Settings.
 2. **Pause and Sync now.** Pause/Resume is the main button. Stage 4 turns it into a dropdown: for 1 hour, until
    tomorrow, until I resume. "Sync now" is secondary.
 3. **Needs attention:** a list shown only when non-empty. It replaces the Conflicts tab and the scattered notices:
+   - **Signed in to another Proton account** than the files on this computer were synced with (#35, `accountMismatch`):
+     listed first, as nothing syncs until it is settled. The daemon's words, "Start fresh with this account" (with its
+     confirmation) and "Sign out" (to sign in to the other account). The `lastError` it sets isn't listed again.
    - **Unresolved conflicts:** say what happened ("Changed here and in Proton Drive: report.pdf", the full path on
      hover), with "Show in Files" and the existing resolve actions. Unresolved conflicts only exist under the "ask me"
      strategy, where the daemon queued the file and kept nothing twice. Keep Both is the main choice; each button's hover
@@ -125,10 +128,12 @@ In Stage 1 the list moves here as it is.
 ### Settings
 
 Grouped into sections (Stage 3), with the same controls and routes as today:
-- **General:** notifications, theme. Stage 4 adds start at login (#92).
+- **General:** notifications, theme, and "Start Proton Drive when I log in" (#92, which landed before Stage 1 and sits
+  in the preferences card until Stage 3 groups them).
 - **Drive:** the sync folder's location (and the move flow), "Show online-only files in Files" (the virtual drive
   switch, with its confirmation), apps blocked from downloading.
-- **Sync:** ignore patterns. The conflict strategy control is removed once #91 lands; until then it stays here unchanged.
+- **Sync:** ignore patterns, and the conflict strategy. #91 (#194) removed the strategies that replaced one version with
+  the other; the control stays with the two left, keep both at once or ask me each time (in Needs attention).
 - **Account:** name, email, plan, storage, Sign out. These move here from the account popover.
 - **About & help** (#96): app, daemon and helper versions (with a warning when they differ), "Open logs folder",
   "Copy diagnostics" (no file names or email), "Report a problem" (the project's issues page).
@@ -152,7 +157,6 @@ In Stage 1 the existing settings cards move here as they are, plus an Account se
   itself at that time, and the time survives a daemon restart (stored in settings or meta). The status carries `pausedUntil`.
 - **Files that couldn't sync:** a read route listing items whose record is in error, with their message, for Needs attention.
 - **Retry:** a control-socket route that clears an item's backoff (#18's per-item failure) and asks for a pass.
-- **Start at login:** as #92 describes.
 - **The tray (#98):** its Pause gets the same choices, and it gets a "N problems need you" item that opens the app on
   Home.
 
