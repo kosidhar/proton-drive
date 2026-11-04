@@ -10,6 +10,8 @@ export interface SettingsRouteDeps {
     stateDb: SyncStateDatabase;
     drive: Pick<DriveController, 'relocate' | 'setVirtualDriveWanted' | 'status'>;
     engine: Pick<ProtonDriveSyncEngine, 'reconcileNow'>;
+    // Puts the login entry in place or removes it, as startAtLogin asks (#92)
+    applyStartAtLogin?: (on: boolean) => void;
 }
 
 // What changing the folder and the switch answers: the folder refused or its move
@@ -74,6 +76,15 @@ export async function driveSettings(change: SettingsChange, deps: SettingsRouteD
     try {
         const prev = stateDb.getSettings();
         stateDb.updateSettings(change.settings);
+        if (change.settings.startAtLogin !== undefined && change.settings.startAtLogin !== prev.startAtLogin) {
+            try {
+                deps.applyStartAtLogin?.(change.settings.startAtLogin);
+            } catch (error: unknown) {
+                // The entry couldn't be written or removed: the setting says what is true, not what was asked
+                stateDb.updateSettings({ startAtLogin: prev.startAtLogin });
+                throw new Error(`Couldn't change starting at login: ${messageOf(error)}`, { cause: error });
+            }
+        }
         if (JSON.stringify(prev.ignorePatterns) !== JSON.stringify(stateDb.getSettings().ignorePatterns)) {
             void engine.reconcileNow();
         }

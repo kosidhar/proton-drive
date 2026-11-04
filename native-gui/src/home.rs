@@ -115,6 +115,8 @@ pub fn ago(ms: i64) -> String {
 /// One thing that needs the user, in the order the home screen lists them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Attention {
+    /// Signed in to another Proton account than the records are of: nothing syncs until the user chooses (#35)
+    AccountMismatch,
     Conflict { id: u64, rel_path: String },
     FilesMissing,
     DriveNotMounted { message: String, can_mount: bool },
@@ -123,14 +125,18 @@ pub enum Attention {
     LastError(String),
 }
 
-/// Every problem the user can act on, each once: files missing, stopped move, drive not mounted, unresolved
-/// conflicts by id, failed items, last error (only when no files are missing, which explains it).
+/// Every problem the user can act on, each once: another account's records (first, as nothing syncs until it is
+/// settled), files missing, stopped move, drive not mounted, unresolved conflicts by id, failed items, last error (only
+/// when neither another account nor missing files explains it: the daemon sets it to say so).
 ///
 /// A stopped move is listed whenever the daemon reports one with something to do or say about it, whatever the drive
 /// is doing now: it attaches the move to a drive mounted (or ejected) again since the move failed. An unmounted virtual
 /// drive is listed too unless the move explains it or it is still starting or moving files.
 pub fn attention_items(status: &DaemonStatus, conflicts: &[ConflictRecord]) -> Vec<Attention> {
     let mut items = Vec::new();
+    if status.account_mismatch.is_some() {
+        items.push(Attention::AccountMismatch);
+    }
     if status.files_missing.is_some() {
         items.push(Attention::FilesMissing);
     }
@@ -155,7 +161,7 @@ pub fn attention_items(status: &DaemonStatus, conflicts: &[ConflictRecord]) -> V
     if status.stats.error_items > 0 {
         items.push(Attention::FailedItems(status.stats.error_items));
     }
-    if status.files_missing.is_none() {
+    if status.files_missing.is_none() && status.account_mismatch.is_none() {
         if let Some(e) = status.last_error.as_deref().filter(|e| !e.trim().is_empty()) {
             items.push(Attention::LastError(e.to_string()));
         }
@@ -416,6 +422,7 @@ impl ProtonDriveNativeApp {
 
     fn render_attention_item(&mut self, ui: &mut egui::Ui, item: Attention) {
         match item {
+            Attention::AccountMismatch => self.render_account_mismatch(ui),
             Attention::FilesMissing => self.render_files_missing(ui),
             Attention::Conflict { id, rel_path } => {
                 attention_row(ui, |ui| {
@@ -905,6 +912,43 @@ mod tests {
         assert_eq!(attention_items(&s, &[]), vec![Attention::LastError("boom".into())]);
         s.files_missing = Some(missing());
         assert_eq!(attention_items(&s, &[]), vec![Attention::FilesMissing]);
+    }
+
+    fn mismatch() -> crate::AccountMismatch {
+        crate::AccountMismatch { message: "You signed in to a different Proton account.".into() }
+    }
+
+    // #35: another account's records block every sync, so the mismatch comes first, and the error it sets isn't repeated
+    #[test]
+    fn another_accounts_records_come_first_and_explain_the_last_error() {
+        let mut s = status("error", vec![], false);
+        s.account_mismatch = Some(mismatch());
+        s.last_error = Some("You signed in to a different Proton account.".into());
+        assert_eq!(attention_items(&s, &[]), vec![Attention::AccountMismatch]);
+
+        s.files_missing = Some(missing());
+        s.vfs = Some(vfs("virtual", false, Some("ejected")));
+        s.stats.error_items = 1;
+        assert_eq!(
+            attention_items(&s, &[conflict(4, "a", 0)]),
+            vec![
+                Attention::AccountMismatch,
+                Attention::FilesMissing,
+                Attention::DriveNotMounted { message: "Virtual drive: ejected".into(), can_mount: true },
+                Attention::Conflict { id: 4, rel_path: "a".into() },
+                Attention::FailedItems(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn another_accounts_records_count_as_a_problem_in_the_status() {
+        let mut s = status("error", vec![], false);
+        s.account_mismatch = Some(mismatch());
+        let n = attention_items(&s, &[]).len();
+        let r = status_summary(&s, true, false, n, 0);
+        assert_eq!(r.headline, "1 problem needs you");
+        assert_eq!(r.tone, Tone::Attention);
     }
 
     #[test]

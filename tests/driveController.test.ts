@@ -957,13 +957,13 @@ describe('Explicit actions for a move that stopped (S31)', () => {
         const { s, api, to } = await stoppedRelocation();
         const old = snapshot(s.syncDir);
         const moved = snapshot(to);
-        const res = await api.driveSettings({ syncDir: s.syncDir, notificationsEnabled: true, conflictStrategy: 'keep-local' });
+        const res = await api.driveSettings({ syncDir: s.syncDir, notificationsEnabled: true, conflictStrategy: 'prompt' });
         expect(res.status).toBe(200);
         expect(res.json).toMatchObject({ ok: true, folderError: null });
         expect(snapshot(s.syncDir)).toEqual(old);
         expect(snapshot(to)).toEqual(moved);
         expect(s.stateDb.getMeta(SYNC_DIR_MOVING)).not.toBeNull();
-        expect(s.stateDb.getSettings()).toMatchObject({ notificationsEnabled: true, conflictStrategy: 'keep-local', syncDir: s.syncDir });
+        expect(s.stateDb.getSettings()).toMatchObject({ notificationsEnabled: true, conflictStrategy: 'prompt', syncDir: s.syncDir });
         expect(s.controller.status().move).toEqual({
             kind: 'relocation',
             from: s.syncDir,
@@ -1038,9 +1038,9 @@ describe('The drive folder and the virtual drive change only over the control so
         await s.boot();
         const api = over(s);
         await api.start();
-        const res = await api.socket({ syncDir: `${s.syncDir}/`, virtualDriveWanted: false, conflictStrategy: 'keep-local' });
+        const res = await api.socket({ syncDir: `${s.syncDir}/`, virtualDriveWanted: false, conflictStrategy: 'prompt' });
         expect(res.json).toMatchObject({ ok: true, folderError: null, switchError: null });
-        expect(s.stateDb.getSettings()).toMatchObject({ syncDir: s.syncDir, conflictStrategy: 'keep-local' });
+        expect(s.stateDb.getSettings()).toMatchObject({ syncDir: s.syncDir, conflictStrategy: 'prompt' });
     });
 
     test('the socket saves the plain settings beside a folder it refuses, and moves nothing', async () => {

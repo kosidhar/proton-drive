@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test } from 'bun:test';
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { chmod, cp, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -1106,8 +1106,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
         test('a file edited just as free drops its record stays, keeps its record and uploads as an edit', async () => {
             const { engine, nodes, calls, files } = await downloaded({ 'Docs/a.txt': 'a', 'Docs/b.txt': 'b' }, 'vol~Docs');
-            // keep-remote settles a conflict by overwriting the local file, so a lost record would lose the edit
-            stateDb.updateSettings({ conflictStrategy: 'keep-remote' });
+            // A lost record would make the edit a conflict, and no conflict is recorded
             let edited = '';
             files.onRemoval(1, (rel) => {
                 edited = rel;
@@ -1677,10 +1676,10 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             let removalStarted!: () => void;
             const removing = new Promise<void>((resolve) => (removalStarted = resolve));
             files.onRemoval(1, () => removalStarted());
-            let uploading!: () => void;
-            const uploaded = new Promise<void>((resolve) => (uploading = resolve));
+            let downloading!: () => void;
+            const uploaded = new Promise<void>((resolve) => (downloading = resolve));
             duringUpload(sdk, 'Docs/n.txt', async () => {
-                uploading();
+                downloading();
                 await removing;
             });
             const handler = (engine as any).handleLocalFileChange('Docs/n.txt');
@@ -8626,6 +8625,12 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
     });
     describe('waiting prompt conflicts after the strategy changes or the sides agree (#68)', () => {
+        // As an older version stored it, past the checks a save makes now
+        const storeRawSetting = (key: string, value: string) =>
+            (stateDb as unknown as { db: { run: (sql: string, params: string[]) => void } }).db.run(
+                'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+                [key, value],
+            );
         // Docs/a.txt downloaded and pinned, then edited here and in the cloud while the strategy is prompt: one waits
         const queued = async (layout: 'plain' | 'virtual' = 'plain') => {
             if (layout === 'virtual') stateDb.setMeta('driveLayout', 'virtual');
@@ -8677,15 +8682,22 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.calls.trashed).toEqual([]);
         });
 
-        test('switched to keep-local: the local edit becomes a new revision, and the waiting conflict is closed as keep-local', async () => {
-            const d = await queued();
-            stateDb.updateSettings({ conflictStrategy: 'keep-local' });
-            await d.engine.reconcileNow();
-            expect(d.waiting()).toEqual([]);
-            expect(d.first()).toMatchObject({ resolved: 1, resolution: 'keep-local' });
-            expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('local edit');
-            expect(d.calls.trashed).toEqual([]);
-        });
+        for (const retired of ['keep-local', 'keep-remote']) {
+            test(`${retired} stored by an older version: the next pass keeps both, and neither side replaces the other (#91)`, async () => {
+                const d = await queued();
+                storeRawSetting('conflictStrategy', retired);
+                expect(stateDb.getSettings().conflictStrategy).toBe('keep-both');
+                await d.engine.reconcileNow();
+                expect(d.waiting()).toEqual([]);
+                expect(d.first()).toMatchObject({ resolved: 1, resolution: 'keep-both' });
+                expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('remote edit');
+                expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('remote edit');
+                const copies = (await readdir(d.local('Docs'))).filter((n) => n !== 'a.txt');
+                expect(copies.length).toBe(1);
+                expect(await readFile(d.local(`Docs/${copies[0]}`), 'utf8')).toBe('local edit');
+                expect(d.calls.trashed).toEqual([]);
+            });
+        }
 
         test('both sides come to hold the same content: the conflict is closed as in-sync, and the file is synced', async () => {
             const d = await queued();
@@ -8998,9 +9010,9 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             return { release, inside };
         };
 
-        test('a pass under keep-remote leaves alone the conflict the user is keeping local by hand', async () => {
+        test('a pass under keep-both leaves alone the conflict the user is keeping local by hand', async () => {
             const d = await queued();
-            stateDb.updateSettings({ conflictStrategy: 'keep-remote' });
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
             const held = holdGetNode(d, d.uid('a.txt'));
             const manual = d.engine.resolveConflictManually(d.conflict.id, 'keep-local');
             await held.inside;
@@ -9015,7 +9027,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
         test('a pass that read the file before the user resolved it by hand, and reaches it after, leaves it alone', async () => {
             const d = await queued();
-            stateDb.updateSettings({ conflictStrategy: 'keep-remote' });
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
             d.add('0.txt', 'new from another device'); // sorts first: the pass is busy with it while the user resolves
             let release!: () => void;
             const gate = new Promise<void>((resolve) => (release = resolve));
@@ -9269,6 +9281,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await engine.reconcileNow();
             await Bun.sleep(20);
             await chmod(path.join(engine.localRoot(), 'a.txt'), 0o600);
+            await Bun.sleep(30); // a hash this close to the chmod counts it as a write after, and is made again (#109)
             const hashes = spyOn(fileOpsModule, 'computeLocalFileSha1');
             try {
                 await engine.reconcileNow();
@@ -9294,6 +9307,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await engine.reconcileNow();
             await Bun.sleep(20);
             await chmod(path.join(engine.localRoot(), 'legacy.txt'), 0o600);
+            await Bun.sleep(30); // a hash this close to the chmod counts it as a write after, and is made again (#109)
             const hashes = spyOn(fileOpsModule, 'computeLocalFileSha1');
             try {
                 for (let i = 0; i < 3; i++) await engine.reconcileNow();
@@ -9846,22 +9860,23 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const local = (rel: string) => path.join(engine.localRoot(), rel);
             await writeFile(local('a.txt'), 'local edit');
             d.nodes.set(d.uid('a.txt'), makeMockNode({ uid: d.uid('a.txt'), parentUid: d.root.uid, nameStr: 'a.txt', type: NodeType.File, content: 'cloud edit' }));
-            stateDb.updateSettings({ conflictStrategy: 'keep-local' });
-            return { ...d, engine, local };
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+            const copies = async () => (await readdir(engine.localRoot())).filter((n) => n.includes('(conflict'));
+            return { ...d, engine, local, copies };
         };
 
-        test('a delete through the drive waits for a keep-local by the setting, then deletes what it left', async () => {
+        test('a delete through the drive waits for a keep-both by the setting, then deletes what it left', async () => {
             const d = await conflicted();
-            // Holds the keep-local's upload of a.txt until released
+            // Holds the keep-both's download of the cloud's a.txt until released: its conflict copy is made already
             let release!: () => void;
             const gate = new Promise<void>((resolve) => (release = resolve));
             let entered!: () => void;
             const inside = new Promise<void>((resolve) => (entered = resolve));
-            (d.sdk as any).getFileRevisionUploader = ((orig) => async (...args: unknown[]) => {
+            (d.sdk as any).getFileRevisionDownloader = ((orig) => async (...args: unknown[]) => {
                 entered();
                 await gate;
                 return orig(...args);
-            })((d.sdk as any).getFileRevisionUploader.bind(d.sdk));
+            })((d.sdk as any).getFileRevisionDownloader.bind(d.sdk));
             const pass = d.engine.reconcileNow();
             await inside;
             let deleted = false;
@@ -9873,10 +9888,13 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await pass;
             await del;
             await d.engine.replayRemoteOps();
-            // The keep-local landed first, then the user's delete took the file: what the delete said is what happened
-            expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-local']);
+            // The keep-both landed first, then the user's delete took the file: what the delete said is what happened,
+            // and the local edit stays, in its conflict copy
+            expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-both']);
             expect(await stat(d.local('a.txt')).catch(() => null)).toBeNull();
             expect(d.calls.trashed.flat()).toContain(d.uid('a.txt'));
+            const [copy] = await d.copies();
+            expect(await readFile(d.local(copy), 'utf8')).toBe('local edit');
         });
 
         test('a delete queued behind another drive change is refused if a resolution by the setting starts meanwhile', async () => {
@@ -9899,30 +9917,34 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 (error: unknown) => error,
             );
             await Bun.sleep(10); // past its wait for resolutions: queued for its turn
-            // A resolution by the setting starts on a.txt, its upload held
-            let releaseUpload!: () => void;
-            const uploadGate = new Promise<void>((resolve) => (releaseUpload = resolve));
-            let uploading!: () => void;
-            const uploadInside = new Promise<void>((resolve) => (uploading = resolve));
-            (d.sdk as any).getFileRevisionUploader = ((orig) => async (...args: unknown[]) => {
-                uploading();
-                await uploadGate;
+            // A resolution by the setting starts on a.txt, its download held
+            let releaseDownload!: () => void;
+            const downloadGate = new Promise<void>((resolve) => (releaseDownload = resolve));
+            let downloading!: () => void;
+            const downloadInside = new Promise<void>((resolve) => (downloading = resolve));
+            (d.sdk as any).getFileRevisionDownloader = ((orig) => async (...args: unknown[]) => {
+                downloading();
+                await downloadGate;
                 return orig(...args);
-            })((d.sdk as any).getFileRevisionUploader.bind(d.sdk));
+            })((d.sdk as any).getFileRevisionDownloader.bind(d.sdk));
             const record = stateDb.getItemByPath('a.txt')!;
             const resolving = (d.engine as any).handleFileConflict(
                 'a.txt', d.local('a.txt'), d.nodes.get(d.uid('a.txt')), 'local-sha1', null, 0, 0, new Map(),
                 stateDb.getSettings(), 0, record,
             );
-            await uploadInside;
+            await downloadInside;
             releaseRename();
             await rename;
             expect(await del).toMatchObject({ code: 'EIO' });
             expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
-            releaseUpload();
+            releaseDownload();
             await resolving;
-            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('local edit');
-            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
+            // Both kept: the cloud's version in place, the local edit in its conflict copy, here and in the cloud
+            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('cloud edit');
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('cloud edit');
+            const [copy] = await d.copies();
+            expect(await readFile(d.local(copy), 'utf8')).toBe('local edit');
+            expect([...d.nodes.values()].some((n) => n.content === 'local edit')).toBe(true);
         });
 
         test('a pass reaching the conflict while a drive rename of the file runs leaves it to the next pass', async () => {
@@ -9952,7 +9974,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 0,
                 stateDb.getItemByPath('a.txt') ?? undefined,
             );
-            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('cloud edit'); // nothing uploaded under the rename
+            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('cloud edit'); // nothing done under the rename
+            expect(await d.copies()).toEqual([]);
             release();
             await rename;
             expect(await readFile(d.local('b.txt'), 'utf8')).toBe('local edit');
@@ -10046,31 +10069,34 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const file = path.join(engine.localRoot(), 'a.txt');
             await writeFile(file, 'local edit');
             d.nodes.set(d.uid('a.txt'), makeMockNode({ uid: d.uid('a.txt'), parentUid: d.root.uid, nameStr: 'a.txt', type: NodeType.File, content: 'cloud edit' }));
-            stateDb.updateSettings({ conflictStrategy: 'keep-local' });
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
             let release!: () => void;
             const gate = new Promise<void>((resolve) => (release = resolve));
             let entered!: () => void;
             const inside = new Promise<void>((resolve) => (entered = resolve));
-            let uploads = 0;
-            (d.sdk as any).getFileRevisionUploader = ((orig) => async (...args: unknown[]) => {
-                uploads++;
-                if (uploads === 1) {
+            let downloads = 0;
+            (d.sdk as any).getFileRevisionDownloader = ((orig) => async (...args: unknown[]) => {
+                downloads++;
+                if (downloads === 1) {
                     entered();
                     await gate;
                 }
                 return orig(...args);
-            })((d.sdk as any).getFileRevisionUploader.bind(d.sdk));
+            })((d.sdk as any).getFileRevisionDownloader.bind(d.sdk));
             const record = stateDb.getItemByPath('a.txt')!;
             const resolve = () =>
                 (engine as any).handleFileConflict('a.txt', file, d.nodes.get(d.uid('a.txt')), 'local-sha1', null, 0, 0, new Map(), stateDb.getSettings(), 0, record);
             const first = resolve();
             await inside;
             await resolve(); // a watcher look reaching the same conflict
-            expect(uploads).toBe(1);
+            expect(downloads).toBe(1);
             expect((engine as any).strategyResolvingPaths.has('a.txt')).toBe(true); // the first still holds its claim
             release();
             await first;
-            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('local edit');
+            expect(await readFile(file, 'utf8')).toBe('cloud edit');
+            const copies = (await readdir(engine.localRoot())).filter((n) => n.includes('(conflict'));
+            expect(copies.length).toBe(1); // one copy: the second never made its own
+            expect(await readFile(path.join(engine.localRoot(), copies[0]), 'utf8')).toBe('local edit');
         });
 
         test('a local delete is not taken to the cloud meanwhile', async () => {
@@ -10101,7 +10127,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
     });
 
     describe('the conflict setting never acts on a file a drive change took since the pass read it (#139)', () => {
-        test('virtual: keep-remote after a drive rename of a file with no record does not bring the cloud version back', async () => {
+        test('virtual: keep-both after a drive rename of a file with no record does not bring the cloud version back', async () => {
             stateDb.setMeta('driveLayout', 'virtual');
             const d = makeMockDrive();
             const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
@@ -10115,7 +10141,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const local = (rel: string) => path.join(engine.localRoot(), rel);
             await writeFile(local('a.txt'), 'mine'); // made local through the drive, say
             expect(stateDb.getItemByPath('a.txt')).toBeNull();
-            stateDb.updateSettings({ conflictStrategy: 'keep-remote' });
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
             // The pass read the file (since = the removals finished then); the user renames it through the drive meanwhile
             await (engine as any).observingLocal(async (since: number) => {
                 await engine.renameItem('a.txt', 'b.txt');
@@ -10126,9 +10152,10 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
             expect(await stat(local('a.txt')).catch(() => null)).toBeNull(); // not brought back
             expect(await readFile(local('b.txt'), 'utf8')).toBe('mine');
+            expect((await readdir(engine.localRoot())).filter((n) => n.includes('(conflict'))).toEqual([]);
         });
 
-        test('virtual: keep-remote after a drive rename onto the file never replaces what the rename put there', async () => {
+        test('virtual: keep-both after a drive rename onto the file never replaces what the rename put there', async () => {
             stateDb.setMeta('driveLayout', 'virtual');
             const d = makeMockDrive();
             const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
@@ -10142,7 +10169,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const local = (rel: string) => path.join(engine.localRoot(), rel);
             await writeFile(local('a.txt'), 'mine');
             await writeFile(local('x.txt'), 'precious'); // only on this computer
-            stateDb.updateSettings({ conflictStrategy: 'keep-remote' });
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
             await (engine as any).observingLocal(async (since: number) => {
                 await engine.renameItem('x.txt', 'a.txt'); // the user saves x.txt over a.txt, as an editor does
                 await (engine as any).handleFileConflict(
@@ -10151,6 +10178,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 );
             });
             expect(await readFile(local('a.txt'), 'utf8')).toBe('precious');
+            expect((await readdir(engine.localRoot())).filter((n) => n.includes('(conflict'))).toEqual([]);
         });
     });
 
@@ -10796,6 +10824,461 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 (d.engine as any).reconcileSinglePath('Big/b.bin', node, st, undefined, new Map(), stateDb.getSettings(), since),
             );
             expect(await stat(d.local('Big/b.bin')).catch(() => null)).toBeNull();
+        });
+    });
+
+    describe('signing in to a different Proton account never reuses the last one\'s records (#35)', () => {
+        const synced = async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('Docs/a.txt', 'a');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            return { ...d, engine, local: (rel: string) => path.join(engine.localRoot(), rel) };
+        };
+
+        test('the account the records belong to is remembered, and the same account syncs on as before', async () => {
+            const d = await synced();
+            expect(stateDb.getMeta('accountRoot')).toBe(d.root.uid);
+            await writeFile(d.local('Docs/new.txt'), 'new');
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toContain('Docs/new.txt');
+            expect(d.engine.getStatus().accountMismatch).toBeNull();
+        });
+
+        test('records of another account: nothing is synced, deleted, trashed or uploaded, and the status says why', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountRoot', 'other~root'); // the records are another account's
+            await writeFile(d.local('Docs/new.txt'), 'new');
+            await rm(d.local('Kept.txt'));
+            d.calls.uploads.length = 0;
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toEqual([]);
+            expect(d.calls.trashed).toEqual([]);
+            expect(stateDb.getItemByPath('Docs/a.txt')).not.toBeNull();
+            expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('a');
+            const status = d.engine.getStatus();
+            expect(status.accountMismatch?.message).toMatch(/different Proton account/);
+            expect(status.state).toBe('error');
+            await expect(d.engine.setAvailability('Docs', 'free')).rejects.toThrow(/different Proton account/);
+            await expect(d.engine.deleteItem('Docs/a.txt')).rejects.toThrow(/different Proton account/);
+            await expect(d.engine.resolveConflictManually(1, 'keep-both')).rejects.toThrow(/different Proton account/);
+            await d.engine.replayRemoteOps();
+            expect(d.calls.trashed).toEqual([]);
+        });
+
+        test('starting fresh keeps every file here and syncs them as new to this account, trashing nothing', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountRoot', 'other~root');
+            await d.engine.reconcileNow();
+            d.calls.uploads.length = 0;
+            await d.engine.startFreshForThisAccount();
+            expect(stateDb.getMeta('accountRoot')).toBe(d.root.uid);
+            expect(d.engine.getStatus().accountMismatch).toBeNull();
+            await d.engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([]);
+            expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('a');
+            expect(await readFile(d.local('Kept.txt'), 'utf8')).toBe('kept');
+            expect(stateDb.getItemByPath('Docs/a.txt')).not.toBeNull();
+        });
+
+        test('passes asked for together never run together (the account check sits inside the guard)', async () => {
+            const d = await synced();
+            let running = 0;
+            let most = 0;
+            const walk = (d.engine as any).reconcileDirectoryIncremental.bind(d.engine);
+            (d.engine as any).reconcileDirectoryIncremental = async (...args: unknown[]) => {
+                if (args[1] === '') {
+                    running++;
+                    most = Math.max(most, running);
+                    try {
+                        return await walk(...args);
+                    } finally {
+                        running--;
+                    }
+                }
+                return walk(...args);
+            };
+            await Promise.all([d.engine.reconcileNow(), d.engine.reconcileNow(), d.engine.reconcileNow()]);
+            for (let i = 0; i < 20 && (d.engine as any).reconcileRunning; i++) await Bun.sleep(5);
+            expect(most).toBe(1);
+        });
+
+        const otherAccount = (d: Awaited<ReturnType<typeof synced>>) => {
+            stateDb.setMeta('accountRoot', 'other~root');
+            // Restarted, signed in to the other account: a new engine on the same records
+            return new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+        };
+
+        test('after a restart the account is checked at start, and local changes act on nothing', async () => {
+            const d = await synced();
+            const engine = otherAccount(d);
+            await engine.start();
+            expect(engine.getStatus().accountMismatch).not.toBeNull();
+            await writeFile(d.local('Docs/new.txt'), 'new');
+            await rm(d.local('Kept.txt'));
+            d.calls.uploads.length = 0;
+            await (engine as any).handleLocalFileChange('Docs/new.txt');
+            await (engine as any).handleLocalFileChange('Kept.txt');
+            expect(d.calls.uploads).toEqual([]);
+            expect(d.calls.trashed).toEqual([]);
+            expect(stateDb.getItemByPath('Kept.txt')).not.toBeNull();
+            await engine.stop();
+        });
+
+        test('a local change before any check looks the account up first, and acts on nothing for another', async () => {
+            const d = await synced();
+            const engine = otherAccount(d);
+            await writeFile(d.local('Docs/new.txt'), 'new');
+            d.calls.uploads.length = 0;
+            await (engine as any).handleLocalFileChange('Docs/new.txt');
+            expect(d.calls.uploads).toEqual([]);
+            expect(engine.getStatus().accountMismatch).not.toBeNull();
+        });
+
+        test('a pass whose root lookup fails acts on nothing, and checks the account before it does', async () => {
+            const d = await synced();
+            const engine = otherAccount(d);
+            const root = d.sdk.getMyFilesRootFolder.bind(d.sdk);
+            let first = true;
+            (d.sdk as any).getMyFilesRootFolder = async () => {
+                if (first) {
+                    first = false;
+                    throw new Error('timeout');
+                }
+                return root();
+            };
+            await writeFile(d.local('Docs/new.txt'), 'new');
+            d.calls.uploads.length = 0;
+            await engine.reconcileNow();
+            await engine.reconcileNow();
+            expect(d.calls.uploads).toEqual([]);
+            expect(engine.getStatus().accountMismatch).not.toBeNull();
+        });
+
+        test('records from before the account was remembered are adopted only if they are of the account signed in to', async () => {
+            const d = await synced();
+            stateDb.deleteMeta('accountRoot');
+            const same = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+            });
+            await same.reconcileNow();
+            expect(stateDb.getMeta('accountRoot')).toBe(d.root.uid);
+            // Another account's, from before an upgrade: their top items name another root
+            stateDb.deleteMeta('accountRoot');
+            for (const item of stateDb.getAllItems().filter((i) => !i.localRelPath.includes('/'))) {
+                stateDb.upsertItem({ ...item, parentNodeUid: 'other~root' });
+            }
+            const other = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+            });
+            await other.reconcileNow();
+            expect(other.getStatus().accountMismatch).not.toBeNull();
+            expect(stateDb.getMeta('accountRoot')).toBeNull();
+        });
+
+        test('starting fresh is refused when there is no other account to start fresh from', async () => {
+            const d = await synced();
+            await expect(d.engine.startFreshForThisAccount()).rejects.toThrow(/same Proton account/);
+        });
+
+        const fresh = (d: Awaited<ReturnType<typeof synced>>) =>
+            new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+        const signInAs = (d: Awaited<ReturnType<typeof synced>>, uid: string) => {
+            (d.sdk as any).getMyFilesRootFolder = async () => ({ ...d.root, uid });
+        };
+
+        test('a check made between sign-out and the next sign-in never stands for the account signed in to next', async () => {
+            const d = await synced();
+            const engine = fresh(d);
+            await engine.start();
+            await engine.stop(); // signing out: still signed in to this account for a moment
+            expect(await (engine as any).verifyAccount()).toBe(true); // as a drive change journalled meanwhile does, with this one's root
+            signInAs(d, 'other~root'); // the next sign-in is to another account
+            await engine.start();
+            expect(engine.getStatus().accountMismatch).not.toBeNull();
+            await engine.stop();
+        });
+
+        test('a root lookup begun before a sign-out never fills in the account after the next sign-in', async () => {
+            const d = await synced();
+            const engine = fresh(d);
+            const lookUp = d.sdk.getMyFilesRootFolder.bind(d.sdk);
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            (d.sdk as any).getMyFilesRootFolder = async () => {
+                const root = await lookUp();
+                await gate;
+                return root;
+            };
+            const held = (engine as any).verifyAccount();
+            await Bun.sleep(5);
+            await engine.stop();
+            signInAs(d, 'other~root');
+            await engine.start();
+            release();
+            expect(await held).toBe(false);
+            expect(engine.getStatus().accountMismatch).not.toBeNull();
+            expect((engine as any).accountVerified).toBe(false);
+            expect((engine as any).rootNode?.uid).toBe('other~root');
+            await engine.stop();
+        });
+
+        test('a mismatch found before still holds after a restart offline, and refuses what would act on the records', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountRoot', 'other~root');
+            await d.engine.reconcileNow();
+            expect(d.engine.getStatus().accountMismatch).not.toBeNull();
+            (d.sdk as any).getMyFilesRootFolder = async () => {
+                throw new Error('offline');
+            };
+            const engine = fresh(d);
+            await engine.start();
+            expect(engine.getStatus().accountMismatch?.message).toMatch(/different Proton account/);
+            await expect(engine.setAvailability('Kept.txt', 'free')).rejects.toThrow(/different Proton account/);
+            await expect(engine.deleteItem('Kept.txt')).rejects.toThrow(/different Proton account/);
+            expect(await readFile(d.local('Kept.txt'), 'utf8')).toBe('kept');
+            expect(stateDb.getItemByPath('Kept.txt')).not.toBeNull();
+            await engine.stop();
+        });
+
+        test('before the account can be checked (offline), availability and conflict choices are refused, and nothing is freed', async () => {
+            const d = await synced();
+            (d.sdk as any).getMyFilesRootFolder = async () => {
+                throw new Error('offline');
+            };
+            const engine = fresh(d);
+            await engine.start();
+            await expect(engine.setAvailability('Kept.txt', 'free')).rejects.toThrow(/try again once online/);
+            await expect(engine.resolveConflictManually(1, 'keep-local')).rejects.toThrow(/try again once online/);
+            expect(await readFile(d.local('Kept.txt'), 'utf8')).toBe('kept');
+            expect(stateDb.getItemByPath('Kept.txt')).not.toBeNull();
+            await engine.stop();
+        });
+
+        test('once online, the same account clears a mismatch remembered from before', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountMismatch', '1');
+            const engine = fresh(d);
+            await engine.start();
+            expect(engine.getStatus().accountMismatch).toBeNull();
+            expect(stateDb.getMeta('accountMismatch')).toBeNull();
+            await engine.stop();
+        });
+
+        test('after starting fresh, local and cloud changes are watched at once, with no restart', async () => {
+            const d = await synced();
+            const engine = otherAccount(d);
+            await engine.start();
+            expect(engine.getStatus().accountMismatch).not.toBeNull();
+            await engine.startFreshForThisAccount();
+            expect(stateDb.getMeta('accountMismatch')).toBeNull();
+            await engine.reconcileNow();
+            expect((engine as any).watcher.running).toBe(true);
+            expect((engine as any).unsubscribeDriveEvents).not.toBeNull();
+            d.calls.uploads.length = 0;
+            await writeFile(d.local('Docs/new.txt'), 'new');
+            await (engine as any).handleLocalFileChange('Docs/new.txt');
+            expect(d.calls.uploads).toContain('Docs/new.txt');
+            await engine.stop();
+        });
+
+        test('starting fresh is refused when a mismatch remembered from before is over: the records and journal stay', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountMismatch', '1'); // from a sign-in to another account, since signed back out of
+            (d.engine as any).accountMismatch = { message: 'remembered' }; // as a start that couldn't check restores it
+            // A drive delete still to be sent
+            stateDb.connection.run("INSERT INTO remote_ops (kind, nodeUid, path, createdAt) VALUES ('trash', 'vol~Kept.txt', 'Kept.txt', 0)");
+            const journalled = () => (stateDb.connection.query('SELECT COUNT(*) AS n FROM remote_ops').get() as { n: number }).n;
+            const records = stateDb.getAllItems().length;
+            await expect(d.engine.startFreshForThisAccount()).rejects.toThrow(/same Proton account/);
+            expect(stateDb.getAllItems().length).toBe(records);
+            expect(journalled()).toBe(1);
+            expect(stateDb.getMeta('accountMismatch')).toBeNull();
+            expect(d.engine.getStatus().accountMismatch).toBeNull();
+        });
+
+        test('starting fresh that waited for its turn across a sign-out changes nothing', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountRoot', 'other~root');
+            await d.engine.reconcileNow();
+            const records = stateDb.getAllItems().length;
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            const held = (d.engine as any).inAvailabilityRun(() => gate); // another availability change holds the turn
+            const fresh = d.engine.startFreshForThisAccount();
+            await Bun.sleep(10);
+            await d.engine.stop();
+            release();
+            await held;
+            await expect(fresh).rejects.toThrow(/nothing was changed/);
+            expect(stateDb.getAllItems().length).toBe(records);
+            expect(stateDb.getMeta('accountRoot')).toBe('other~root');
+        });
+
+        test('a mismatch found by a local change is what the status says', async () => {
+            const d = await synced();
+            const engine = otherAccount(d);
+            await writeFile(d.local('Docs/new.txt'), 'new');
+            await (engine as any).handleLocalFileChange('Docs/new.txt');
+            expect(engine.getStatus()).toMatchObject({ state: 'error', lastError: expect.stringMatching(/different Proton account/) });
+        });
+
+        test('starting fresh is refused while the files move', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountRoot', 'other~root');
+            await d.engine.reconcileNow();
+            await d.engine.holdForMove();
+            await expect(d.engine.startFreshForThisAccount()).rejects.toThrow(/busy moving/);
+            expect(stateDb.getMeta('accountRoot')).toBe('other~root');
+            d.engine.releaseHold();
+        });
+    });
+
+    describe('a record says when its file was read, so a write while it synced is never missed (#109)', () => {
+        const synced = async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('vault.bin', 'AAAAAAAA');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            d.calls.uploads.length = 0;
+            return { ...d, engine, file: path.join(engine.localRoot(), 'vault.bin') };
+        };
+        // As a VeraCrypt container, cp -p or touch -r would: the same size, and the old time put back
+        const rewriteKeepingTime = async (file: string, content: string) => {
+            const before = await stat(file);
+            await writeFile(file, content);
+            await utimes(file, before.atime, before.mtime);
+        };
+
+        // An upload of vault.bin held once it has read the file, written to meanwhile as a container is
+        const writtenDuringUpload = async (d: Awaited<ReturnType<typeof synced>>) => {
+            await Bun.sleep(20);
+            await writeFile(d.file, 'BBBBBBBB');
+            // Holds the upload once it has read the file, until written to again
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            const uploader = (d.sdk as any).getFileRevisionUploader.bind(d.sdk);
+            (d.sdk as any).getFileRevisionUploader = async (...args: unknown[]) => {
+                (d.sdk as any).getFileRevisionUploader = uploader;
+                entered();
+                await gate;
+                return uploader(...args);
+            };
+            const pass = d.engine.reconcileNow();
+            await inside;
+            await Bun.sleep(20);
+            await rewriteKeepingTime(d.file, 'CCCCCCCC');
+            await Bun.sleep(20); // the record is written well after the write
+            release();
+            await pass;
+        };
+
+        test('written during its upload, as it was: the next pass looks at it, and uploads what it holds now', async () => {
+            const d = await synced();
+            await writtenDuringUpload(d);
+            d.calls.uploads.length = 0;
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toEqual(['vault.bin']);
+            expect(stateDb.getItemByPath('vault.bin')?.localSha1).toBe(await computeLocalFileSha1(d.file));
+        });
+
+        test('written during its upload, then deleted in the cloud: the write is never removed as an unchanged copy', async () => {
+            const d = await synced();
+            await writtenDuringUpload(d);
+            d.nodes.delete(d.uid('vault.bin'));
+            await d.engine.reconcileNow();
+            // Kept: here, or in the desktop Trash (which the test's trash refuses, so here)
+            expect(await readFile(d.file, 'utf8')).toBe('CCCCCCCC');
+        });
+
+        test('written the instant its download is placed: the next pass looks at it', async () => {
+            const d = await synced();
+            const node = d.nodes.get(d.uid('vault.bin'))!;
+            d.nodes.set(d.uid('vault.bin'), { ...node, content: 'GGGGGGGG' } as any);
+            (d.nodes.get(d.uid('vault.bin')) as any).activeRevision = {
+                ...node.activeRevision!,
+                claimedDigests: { sha1: undefined },
+                claimedModificationTime: new Date(Date.now() + 60_000),
+            };
+            // Written straight after the download's stat of the placed file, well within a millisecond
+            const download = fileOpsModule.downloadDriveNodeToLocal;
+            const spy = spyOn(fileOpsModule, 'downloadDriveNodeToLocal').mockImplementation(async (options: any) => {
+                const result = await download(options);
+                const st = await stat(options.localPath);
+                writeFileSync(options.localPath, 'HHHHHHHH');
+                utimesSync(options.localPath, st.atime, st.mtime);
+                return result;
+            });
+            try {
+                await d.engine.reconcileNow();
+            } finally {
+                spy.mockRestore();
+            }
+            d.calls.uploads.length = 0;
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toEqual(['vault.bin']);
+        });
+
+        test('written a moment after its download is placed: the next pass looks at it', async () => {
+            const d = await synced();
+            const node = d.nodes.get(d.uid('vault.bin'))!;
+            d.nodes.set(d.uid('vault.bin'), { ...node, content: 'DDDDDDDD' } as any);
+            (d.nodes.get(d.uid('vault.bin')) as any).activeRevision = {
+                ...node.activeRevision!,
+                claimedDigests: { sha1: undefined },
+                claimedModificationTime: new Date(Date.now() + 60_000),
+            };
+            await d.engine.reconcileNow();
+            expect(await readFile(d.file, 'utf8')).toBe('DDDDDDDD');
+            await Bun.sleep(15); // past the clock tick of its placing: one within it is the gap placedReadAt leaves
+            await rewriteKeepingTime(d.file, 'EEEEEEEE');
+            d.calls.uploads.length = 0;
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toEqual(['vault.bin']);
+        });
+
+        test('a record with no read time is hashed, not taken as unwritten', async () => {
+            const d = await synced();
+            const { updatedAt: _, ...record } = stateDb.getItemByPath('vault.bin')!;
+            await Bun.sleep(20);
+            await rewriteKeepingTime(d.file, 'FFFFFFFF');
+            await Bun.sleep(20);
+            stateDb.upsertItem({ ...record, contentReadAt: null }); // written after the write: its updatedAt is newer
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toEqual(['vault.bin']);
+        });
+
+        test('an unchanged file is hashed at most once after it syncs, and not again', async () => {
+            const d = await synced();
+            await Bun.sleep(30);
+            const hashes = spyOn(fileOpsModule, 'computeLocalFileSha1');
+            try {
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+                expect(hashes.mock.calls.filter(([p]) => String(p).endsWith('vault.bin')).length).toBe(0); // its download's read time holds
+                expect(d.calls.uploads).toEqual([]);
+            } finally {
+                hashes.mockRestore();
+            }
         });
     });
 });
