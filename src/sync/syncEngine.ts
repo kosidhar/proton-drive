@@ -4237,6 +4237,10 @@ export class ProtonDriveSyncEngine {
                 if (source) {
                     this.moveLocalOrUndo(fromRel, toRel, replacing, snapshot);
                 }
+                // Work still under way anywhere in the old subtree (an upload, say) must not record its old path once
+                // done; a node it makes follows the item (see adoptStrayNode). Noted as soon as the item has moved, so that
+                // the rename is seen by such work even if a step after this fails (#145)
+                records.dropSubtree(fromRel);
                 // An edit baseline follows its file, unless the file now stands for the target (its record) or leaves
                 // what is synced
                 // A colliding file goes on as a new one: what it was an edit of stays where it is (#65). A colliding target
@@ -4246,9 +4250,6 @@ export class ProtonDriveSyncEngine {
                 } else {
                     this.stateDb.moveEditBaselines(fromRel, toRel);
                 }
-                // Work still under way anywhere in the old subtree (an upload, say) must not record its old path once
-                // done; a node it makes follows the item (see adoptStrayNode)
-                records.dropSubtree(fromRel);
             },
             { from: fromRel, to: keepsTarget ? null : toRel },
         );
