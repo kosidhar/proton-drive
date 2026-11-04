@@ -10266,6 +10266,25 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(stateDb.getMeta('localMoveInProgress')).toBeNull();
         });
 
+        test('virtual: an identity that matches nothing (renumbered by a remount, say) leaves recovery as it was', async () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            await writeFile(local('x.txt'), 'saved');
+            await writeFile(local('a.txt'), 'old');
+            stateDb.setMeta('localMoveInProgress', JSON.stringify({ from: 'x.txt', to: 'a.txt', replace: true, ino: '1', born: '1' }));
+            engine.recoverLocalMove();
+            expect(await readFile(local('a.txt'), 'utf8')).toBe('saved'); // finished, as a move not done must be
+            expect(await stat(local('x.txt')).catch(() => null)).toBeNull();
+        });
+
         test('virtual: a move interrupted before it happened is still finished, its item being the one at the source', async () => {
             stateDb.setMeta('driveLayout', 'virtual');
             const d = makeMockDrive();
