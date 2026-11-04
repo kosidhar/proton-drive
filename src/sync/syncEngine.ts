@@ -1276,6 +1276,12 @@ export class ProtonDriveSyncEngine {
             // New local item -> upload/create on Proton Drive
             const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
             if (localInfo.isDirectory) {
+                if (await this.inProtonTrash(parentNode)) {
+                    // Its folder is in the Proton Drive trash: made there, it would be recorded as synced, and the folder's
+                    // removal here would take it for an unchanged copy. Left here unrecorded, which that removal keeps (#160)
+                    this.logger.warn(`Not making ${relPath} in Proton Drive: its folder is in the Proton Drive trash`);
+                    return;
+                }
                 const { node: createdFolder, created } = await createRemoteFolder(this.sdk, parentNode, path.basename(relPath));
                 remoteMap.set(relPath, createdFolder);
                 this.indexCreatedFolder(createdFolder, relPath);
@@ -1661,16 +1667,22 @@ export class ProtonDriveSyncEngine {
                     () => false,
                     (error: NodeJS.ErrnoException) => error.code === 'ENOENT',
                 );
-            const result = await this.uploadLocalToRemote(earlier.relPath, fullPath, parentNode, since, undefined, 'skip', gone).catch(
-                async (error: unknown) => {
-                    if ((error as NodeJS.ErrnoException).code === 'ENOENT' && (await gone())) {
-                        this.keepBothCopies.delete(relPath);
-                        return null;
-                    }
-                    throw error;
-                },
-            );
-            copyRelPath = result === null || result.status === 'skipped' ? null : earlier.relPath;
+            if (await this.inProtonTrash(parentNode)) {
+                // In a folder in the Proton Drive trash: the copy stays here unrecorded, as uploadConflictCopy leaves one
+                // (#160), and the folder's removal here keeps it
+                copyRelPath = earlier.relPath;
+            } else {
+                const result = await this.uploadLocalToRemote(earlier.relPath, fullPath, parentNode, since, undefined, 'skip', gone).catch(
+                    async (error: unknown) => {
+                        if ((error as NodeJS.ErrnoException).code === 'ENOENT' && (await gone())) {
+                            this.keepBothCopies.delete(relPath);
+                            return null;
+                        }
+                        throw error;
+                    },
+                );
+                copyRelPath = result === null || result.status === 'skipped' ? null : earlier.relPath;
+            }
         }
         if (copyRelPath !== null) {
             // The earlier copy holds localSha1: the local file must still be that
@@ -2772,6 +2784,12 @@ export class ProtonDriveSyncEngine {
             const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
 
             if (st.isDirectory()) {
+                if (await this.inProtonTrash(parentNode)) {
+                    // Its folder is in the Proton Drive trash: made there, it would be recorded as synced, and the folder's
+                    // removal here would take it for an unchanged copy. Left here unrecorded, which that removal keeps (#160)
+                    this.logger.warn(`Not making ${relPath} in Proton Drive: its folder is in the Proton Drive trash`);
+                    return;
+                }
                 const { node: folder, created } = await createRemoteFolder(this.sdk, parentNode, path.basename(relPath));
                 this.indexCreatedFolder(folder, relPath);
                 const item: Omit<SyncedItemRecord, 'updatedAt'> = {
