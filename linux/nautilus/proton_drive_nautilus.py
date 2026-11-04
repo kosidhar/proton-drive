@@ -43,6 +43,7 @@ TRACK_LIMIT = 20000
 EMBLEMS = {
     "pinned": "emblem-protondrive-pinned",
     "downloaded": "emblem-protondrive-local",
+    "partial": "emblem-protondrive-partial",  # a folder with some files here and some not (#183)
     "online-only": "emblem-protondrive-cloud",
 }
 SYNCING_EMBLEM = "emblem-synchronizing"
@@ -580,7 +581,8 @@ class ProtonDriveFiles:
         actions = []
         if not all(known(s) and s.get("availability") == "pinned" for s in acting):
             actions.append("pin")
-        if any(not known(s) or s.get("availability") in ("pinned", "downloaded") for s in acting):
+        # Whatever has something here can be freed, a folder partly here included (#183, #176)
+        if any(not known(s) or s.get("availability") in ("pinned", "downloaded", "partial") for s in acting):
             actions.append("free")
         actions.append("hide")
         return actions

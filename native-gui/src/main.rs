@@ -441,6 +441,8 @@ struct RemoteItem {
 enum Availability {
     Pinned,
     Downloaded,
+    /// A folder with some files here and some online only (#183)
+    Partial,
     OnlineOnly,
     Hidden,
     Hiding,
@@ -458,6 +460,7 @@ fn parse_availability(s: Option<&str>) -> Availability {
     match s {
         Some("pinned") => Availability::Pinned,
         Some("downloaded") => Availability::Downloaded,
+        Some("partial") => Availability::Partial,
         Some("hidden") => Availability::Hidden,
         Some("hiding") => Availability::Hiding,
         _ => Availability::OnlineOnly,
@@ -468,6 +471,7 @@ fn availability_pill(a: Availability) -> (&'static str, PillStyle) {
     match a {
         Availability::Pinned => ("Always keep", PillStyle::SolidGreen),
         Availability::Downloaded => ("Downloaded", PillStyle::OutlineGreen),
+        Availability::Partial => ("Partly here", PillStyle::OutlineGreen),
         Availability::OnlineOnly => ("Online only", PillStyle::Muted),
         Availability::Hidden => ("Hidden", PillStyle::Muted),
         Availability::Hiding => ("Hiding…", PillStyle::Muted),
@@ -482,7 +486,7 @@ fn menu_actions(a: Availability, is_root: bool) -> Vec<(&'static str, &'static s
     if a != Availability::Pinned && !hidden {
         out.push(("Always keep on this device", "pin"));
     }
-    if matches!(a, Availability::Pinned | Availability::Downloaded) {
+    if matches!(a, Availability::Pinned | Availability::Downloaded | Availability::Partial) {
         out.push(("Free up space", "free"));
     }
     if !hidden && !is_root {
@@ -842,7 +846,8 @@ fn make_folder_at(socket: &std::path::Path, parent_path: &str, name: &str) -> Re
 fn file_opens_on_click(availability: Availability, vfs: Option<&VfsStatus>) -> bool {
     match availability {
         Availability::Pinned | Availability::Downloaded => true,
-        Availability::OnlineOnly => vfs.is_some_and(|v| v.mode == "virtual" && v.mounted),
+        // Only folders are partly here; a file never reads so
+        Availability::OnlineOnly | Availability::Partial => vfs.is_some_and(|v| v.mode == "virtual" && v.mounted),
         Availability::Hidden | Availability::Hiding => false,
     }
 }
@@ -3510,7 +3515,7 @@ impl ProtonDriveNativeApp {
                             let is_hidden = availability == Availability::Hidden;
                             let has_local_copy = matches!(
                                 availability,
-                                Availability::Pinned | Availability::Downloaded
+                                Availability::Pinned | Availability::Downloaded | Availability::Partial
                             );
                             let opens_file = !is_folder && file_opens_on_click(availability, self.status.vfs.as_ref());
                             let item_rel = item_rel_path(&self.remote_path, &item.name);
@@ -6102,6 +6107,7 @@ mod tests {
         assert_eq!(parse_availability(Some("online-only")), Availability::OnlineOnly);
         assert_eq!(parse_availability(Some("hidden")), Availability::Hidden);
         assert_eq!(parse_availability(Some("hiding")), Availability::Hiding);
+        assert_eq!(parse_availability(Some("partial")), Availability::Partial);
     }
 
     #[test]
@@ -6117,6 +6123,7 @@ mod tests {
         assert_eq!(availability_pill(Availability::Pinned), ("Always keep", PillStyle::SolidGreen));
         assert_eq!(availability_pill(Availability::Downloaded), ("Downloaded", PillStyle::OutlineGreen));
         assert_eq!(availability_pill(Availability::OnlineOnly), ("Online only", PillStyle::Muted));
+        assert_eq!(availability_pill(Availability::Partial), ("Partly here", PillStyle::OutlineGreen));
         assert_eq!(availability_pill(Availability::Hidden), ("Hidden", PillStyle::Muted));
         assert_eq!(availability_pill(Availability::Hiding), ("Hiding…", PillStyle::Muted));
     }
@@ -6131,6 +6138,8 @@ mod tests {
         assert_eq!(menu_actions(Pinned, false), vec![free, hide]);
         assert_eq!(menu_actions(Downloaded, false), vec![keep, free, hide]);
         assert_eq!(menu_actions(OnlineOnly, false), vec![keep, hide]);
+        // A folder partly here can be kept or freed (#183, #176)
+        assert_eq!(menu_actions(Partial, false), vec![keep, free, hide]);
         // Unhide first, then keep (ruling R18)
         assert_eq!(menu_actions(Hidden, false), vec![unhide]);
         assert_eq!(menu_actions(Hiding, false), vec![unhide]);
@@ -6139,7 +6148,7 @@ mod tests {
     #[test]
     fn menu_actions_never_offer_hide_on_the_root() {
         use Availability::*;
-        for a in [Pinned, Downloaded, OnlineOnly, Hidden, Hiding] {
+        for a in [Pinned, Downloaded, Partial, OnlineOnly, Hidden, Hiding] {
             assert!(menu_actions(a, true).iter().all(|(_, action)| *action != "hide"), "{a:?}");
         }
     }
