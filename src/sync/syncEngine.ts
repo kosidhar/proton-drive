@@ -1210,8 +1210,8 @@ export class ProtonDriveSyncEngine {
             if (recorded?.localRelPath === relPath) {
                 return; // Moved here earlier in this pass, after the listing was read: the next look at it syncs it
             }
-            if (recorded && this.manualResolvingPaths.has(recorded.localRelPath)) {
-                return; // Moved in Proton Drive while the user resolves its conflict by hand: the next pass follows it (#104)
+            if (recorded && this.isResolving(recorded.localRelPath)) {
+                return; // Moved in Proton Drive while its conflict is being resolved: the next pass follows it (#104, #140)
             }
             if (
                 recorded &&
@@ -1479,8 +1479,16 @@ export class ProtonDriveSyncEngine {
         if ((this.stateDb.getItemByPath(relPath)?.updatedAt ?? null) !== (recordSeen?.updatedAt ?? null)) {
             return; // The next pass decides, from what the file and its record are then
         }
-        if (this.manualResolvingPaths.has(relPath)) {
-            return; // The user is resolving it by hand right now: their choice is what happens to it (#77)
+        if (this.isResolving(relPath)) {
+            // Being resolved right now: by the user by hand, whose choice is what happens to it (#77), or by the setting
+            // in another look (a pass and a watcher look can reach one conflict at once), which holds the claim (#140)
+            return;
+        }
+        if (this.driveTouched(relPath, since)) {
+            // Renamed, deleted or replaced through the drive since this work read it: what was read is no longer what is
+            // at this path, even with no record to say so (a file the drive made local has only an edit baseline; one a
+            // rename put here, replacing it). The next pass decides, from what is there then (#139)
+            return;
         }
         if (strategy === 'keep-both' && this.stillChangingWhenLetThrough(relPath)) {
             // Still being written: the cloud version would be downloaded only to be thrown away once the file changes
@@ -2229,13 +2237,19 @@ export class ProtonDriveSyncEngine {
         }
     }
 
+    // Whether a conflict at the path is being resolved right now, by hand or by the conflict setting
+    private isResolving(relPath: string): boolean {
+        return this.manualResolvingPaths.has(relPath) || this.strategyResolvingPaths.has(relPath);
+    }
+
     // The user deleted a synced item locally, so its cloud copy goes to the Proton Drive trash. A folder can also hold
     // things that never were on this computer: online-only, ignored or hidden items, Proton Docs and Sheets, or a node
     // that replaced the one synced here. Those stay in the cloud: only the items that had local copies are trashed, and
     // the folder is left online-only.
     private async trashForDeletedLocal(relPath: string, remoteNode: NodeEntity): Promise<void> {
-        if (this.manualResolvingPaths.has(relPath)) {
-            // The user is resolving its conflict by hand: their choice decides, and the next look after it sees the delete
+        if (this.isResolving(relPath)) {
+            // Its conflict is being resolved (by hand or by the setting, #140): that decides, and the next look after it
+            // sees the delete
             this.logger.info(`Not acting on ${relPath} gone here yet: its conflict is being resolved`);
             return;
         }
@@ -2441,6 +2455,18 @@ export class ProtonDriveSyncEngine {
         this.keepBothCopies.delete(relPath);
         this.forgetFailure(relPath);
         return true;
+    }
+
+    // Whether a rename or delete through the drive since `since` took the item at this path away, or put another there
+    // (renamed onto it, or into a folder above it)
+    private driveTouched(relPath: string, since: number): boolean {
+        const changes = [
+            ...this.removalBatches.filter((batch) => batch.n > since).map((batch) => batch.takenAway),
+            ...this.runningRemovals,
+        ];
+        return changes.some(
+            ({ drive }) => drive !== undefined && (isWithin(relPath, drive.from) || (drive.to !== null && isWithin(relPath, drive.to))),
+        );
     }
 
     // Where a rename or delete through the drive took an item that work begun when `since` removals had finished was
@@ -3146,8 +3172,8 @@ export class ProtonDriveSyncEngine {
         if (!record) {
             return;
         }
-        if (this.manualResolvingPaths.has(relPath)) {
-            return; // Its conflict is being resolved by hand: the next pass decides where it went, or that it went (#104)
+        if (this.isResolving(relPath)) {
+            return; // Its conflict is being resolved: the next pass decides where it went, or that it went (#104, #140)
         }
         const now = await this.currentRemotePath(record.nodeUid, relPath);
         if (now === undefined || now === relPath) {
