@@ -106,6 +106,8 @@ export class SyncStateDatabase {
     onChange: ((relPath: string, subtree: boolean) => void) | null = null;
     // Told when every state may have changed at once: the sync folder moved, the ignore patterns or the layout changed
     onReset: (() => void) | null = null;
+    // Told of each activity entry as it is logged: the daemon writes them to its log file too (#180)
+    onActivity: ((entry: { action: ActivityRecord['action']; localRelPath: string; details: string }) => void) | null = null;
 
     // For modules that keep their own tables in this database file, such as RemoteIndex.
     get connection(): Database {
@@ -745,6 +747,8 @@ export class SyncStateDatabase {
                 $details: entry.details,
                 $bytesTransferred: entry.bytesTransferred ?? 0,
             });
+
+        this.onActivity?.({ action: entry.action, localRelPath: entry.localRelPath, details: entry.details });
 
         // Keep last 500 activity log entries
         this.db.run(`

@@ -80,6 +80,8 @@ export async function init(configOptions: InitConfig) {
     return {
         config,
         logger: logger as Logger,
+        // A logger of its own for a part of the app, tagged with its name in the log file ([sync], say)
+        getLogger: (name: string) => telemetry.getLogger(name) as Logger,
         auth,
         addresses,
         apiClient,

@@ -63,6 +63,11 @@ function prettifyName(rawName: string, email: string): string {
         .join(' ');
 }
 
+// An activity log entry as a line of the daemon's log file
+export function activityLogLine(entry: { action: string; localRelPath: string; details: string }): string {
+    return `${entry.action} ${entry.localRelPath}: ${entry.details}`;
+}
+
 export async function startSyncDaemon(options: {
     port?: number;
     host?: string;
@@ -83,12 +88,16 @@ export async function startSyncDaemon(options: {
     const stateDbPath = path.join(runtime.config.appDir, 'ubuntu-sync-state.sqlite');
     const stateDb = new SyncStateDatabase(stateDbPath);
 
+    // The engine logs as [sync], and every decision it records in the activity log goes to the log file too: started
+    // detached by the app, the daemon has no other record of why it did what it did (#180)
+    const syncLogger = runtime.getLogger('sync');
+    stateDb.onActivity = (entry) => syncLogger.info(activityLogLine(entry));
     const engine = new ProtonDriveSyncEngine(
         runtime.sdk,
         runtime.eventsManager,
         runtime.auth,
         stateDb,
-        runtime.logger,
+        syncLogger,
         { backingDir: backingDirFor(runtime.config.appDir) },
     );
 
