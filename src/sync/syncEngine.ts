@@ -1269,7 +1269,10 @@ export class ProtonDriveSyncEngine {
                 if (!live) {
                     return;
                 }
-                await this.downloadRemoteToLocal(relPath, live, localFullPath, since);
+                // And again once its bytes are in, before it is put in place: deleted while it downloaded, it stays gone
+                const stillWanted = async () =>
+                    !this.driveTouched(relPath, since) && (await this.liveNode(live.uid).catch(() => live)) !== null;
+                await this.downloadRemoteToLocal(relPath, live, localFullPath, since, stillWanted);
             }
             return;
         }
