@@ -4317,7 +4317,7 @@ export class ProtonDriveSyncEngine {
                 // are gone leaves them unrecorded, to upload again as new items (nothing lost), never recorded without
                 // their files
                 this.stateDb.connection.transaction(() => {
-                    records.dropSubtree(relPath);
+                    this.stateDb.removeItemByPath(relPath);
                     this.stateDb.dropEditBaselines(relPath);
                     if (collision) {
                         // Nothing is left of this computer's side: what stays is the cloud's version
@@ -4333,6 +4333,9 @@ export class ProtonDriveSyncEngine {
                     }
                     this.applyPendingOpsToIndex();
                 })();
+                // Noted for work under way once it has happened: a transaction that threw rolled everything back, and no
+                // delete is there to see (#154). Nothing runs between the commit and this
+                records.dropSubtree(relPath);
                 if (local && onlyIfEmpty) {
                     // Never what was put in it since the look above: that stays, and syncs as new, folder and all
                     await rmdir(path.join(root, relPath)).catch((error: NodeJS.ErrnoException) => {
