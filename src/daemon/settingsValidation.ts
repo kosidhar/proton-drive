@@ -1,4 +1,4 @@
-import { isConflictStrategy, CONFLICT_STRATEGIES, problemWithBlockedApps, problemWithIgnorePatterns } from '../sync/settingsRules';
+import { isConflictStrategy, CONFLICT_STRATEGIES, RETIRED_CONFLICT_STRATEGIES, problemWithBlockedApps, problemWithIgnorePatterns } from '../sync/settingsRules';
 import type { SyncSettings } from '../sync/syncStateDb';
 
 export { MAX_IGNORE_PATTERN_LENGTH, MAX_IGNORE_PATTERNS } from '../sync/settingsRules';
@@ -10,13 +10,19 @@ export type ParsedSettings = { ok: true; value: Partial<SyncSettings> } | { ok: 
 // are left out of the value (parseSettingsRequest refuses them).
 export function parseSettings(body: Record<string, unknown>): ParsedSettings {
     const value: Partial<SyncSettings> = {};
-    const { ignorePatterns, conflictStrategy, notificationsEnabled, blockedApps } = body;
+    const { ignorePatterns, conflictStrategy, notificationsEnabled, blockedApps, startAtLogin } = body;
     if (ignorePatterns !== undefined) {
         const problem = problemWithIgnorePatterns(ignorePatterns);
         if (problem) return { ok: false, error: problem };
         value.ignorePatterns = ignorePatterns as string[];
     }
     if (conflictStrategy !== undefined) {
+        if (typeof conflictStrategy === 'string' && RETIRED_CONFLICT_STRATEGIES.includes(conflictStrategy)) {
+            return {
+                ok: false,
+                error: `conflictStrategy ${conflictStrategy} is no longer offered: a conflict always keeps both versions (keep-both, or prompt to choose each time)`,
+            };
+        }
         if (!isConflictStrategy(conflictStrategy)) {
             return { ok: false, error: `conflictStrategy must be one of ${CONFLICT_STRATEGIES.join(', ')}` };
         }
@@ -25,6 +31,10 @@ export function parseSettings(body: Record<string, unknown>): ParsedSettings {
     if (notificationsEnabled !== undefined) {
         if (typeof notificationsEnabled !== 'boolean') return { ok: false, error: 'notificationsEnabled must be true or false' };
         value.notificationsEnabled = notificationsEnabled;
+    }
+    if (startAtLogin !== undefined) {
+        if (typeof startAtLogin !== 'boolean') return { ok: false, error: 'startAtLogin must be true or false' };
+        value.startAtLogin = startAtLogin;
     }
     if (blockedApps !== undefined) {
         const problem = problemWithBlockedApps(blockedApps);
@@ -46,6 +56,7 @@ const SETTING_KEYS: readonly string[] = [
     'ignorePatterns',
     'conflictStrategy',
     'notificationsEnabled',
+    'startAtLogin',
     'blockedApps',
     'syncDir',
     'virtualDriveWanted',

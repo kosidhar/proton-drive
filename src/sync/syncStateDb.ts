@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 
 import { selfOrDescendant, selfOrDescendantWhere } from './pathRange';
-import { type ConflictStrategy, isConflictStrategy, problemWithBlockedApps, usableIgnorePatterns } from './settingsRules';
+import { type ConflictStrategy, isConflictStrategy, problemWithBlockedApps, RETIRED_CONFLICT_STRATEGIES, usableIgnorePatterns } from './settingsRules';
 
 export type ItemSyncStatus = 'synced' | 'uploading' | 'downloading' | 'conflict' | 'error' | 'ignored';
 export { CONFLICT_STRATEGIES, type ConflictStrategy } from './settingsRules';
@@ -75,6 +75,8 @@ export interface SyncSettings {
     syncDir: string;
     conflictStrategy: ConflictStrategy;
     notificationsEnabled: boolean;
+    // Proton Drive starts at login (see linux/autostart.ts), on unless turned off (#92)
+    startAtLogin: boolean;
     reconcileIntervalSec: number;
     paused: boolean;
     ignorePatterns: string[];
@@ -120,6 +122,27 @@ export class SyncStateDatabase {
         this.db.run('PRAGMA synchronous = NORMAL');
         this.db.run('PRAGMA busy_timeout = 5000');
         this.initSchema();
+        this.retireOverwritingStrategies();
+    }
+
+    // keep-local or keep-remote, stored before #91, is rewritten as keep-both once: read as keep-both already (see
+    // getSettings), it would turn overwriting back on for an older version run after this one. A write, so tried once:
+    // while the daemon holds the write lock (a CLI's own open), it is left for the daemon's open
+    private retireOverwritingStrategies(): void {
+        const stored = this.db.query("SELECT value FROM settings WHERE key = 'conflictStrategy'").get() as { value: string } | null;
+        if (!stored || !RETIRED_CONFLICT_STRATEGIES.includes(stored.value)) {
+            return; // Nothing to write: an open never waits on the write lock for it
+        }
+        try {
+            const changed = this.db
+                .query(`UPDATE settings SET value = 'keep-both' WHERE key = 'conflictStrategy' AND value IN ('keep-local', 'keep-remote')`)
+                .run().changes;
+            if (changed > 0) {
+                console.warn('The stored conflict strategy, which replaced one version with the other, is now keep-both (#91)');
+            }
+        } catch {
+            // Read as keep-both meanwhile
+        }
     }
 
     private initSchema(): void {
@@ -264,6 +287,9 @@ export class SyncStateDatabase {
         let conflictStrategy: ConflictStrategy = 'keep-both';
         if (isConflictStrategy(storedStrategy)) {
             conflictStrategy = storedStrategy;
+        } else if (storedStrategy && RETIRED_CONFLICT_STRATEGIES.includes(storedStrategy)) {
+            // Saved before #91: it replaced one side with the other. Read as keep-both, never acted on
+            this.warnBadSetting('conflictStrategy', storedStrategy, 'as keep-both (keep-local and keep-remote are no longer offered)');
         } else if (storedStrategy) {
             this.warnBadSetting('conflictStrategy', storedStrategy);
         }
@@ -272,6 +298,7 @@ export class SyncStateDatabase {
             syncDir: map.get('syncDir') || defaultSyncDir,
             conflictStrategy,
             notificationsEnabled: map.has('notificationsEnabled') ? map.get('notificationsEnabled') === 'true' : true,
+            startAtLogin: map.has('startAtLogin') ? map.get('startAtLogin') === 'true' : true,
             reconcileIntervalSec: Number(map.get('reconcileIntervalSec') || 120),
             paused: map.get('paused') === 'true',
             ignorePatterns,
@@ -292,6 +319,7 @@ export class SyncStateDatabase {
         store('syncDir', next.syncDir);
         store('conflictStrategy', next.conflictStrategy);
         store('notificationsEnabled', String(next.notificationsEnabled));
+        store('startAtLogin', String(next.startAtLogin));
         store('reconcileIntervalSec', String(next.reconcileIntervalSec));
         store('paused', String(next.paused));
         store('ignorePatterns', JSON.stringify(next.ignorePatterns));

@@ -1628,38 +1628,7 @@ export class ProtonDriveSyncEngine {
         let ended!: () => void;
         this.resolutionEnds.set(relPath, new Promise<void>((resolve) => (ended = resolve)));
         try {
-            if (strategy === 'keep-local') {
-                const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
-                await this.uploadLocalToRemote(relPath, localFullPath, parentNode, since, remoteNode.uid);
-                this.stateDb.settleConflict({
-                    localRelPath: relPath,
-                    nodeUid: remoteNode.uid,
-                    localSha1,
-                    remoteSha1,
-                    localMtimeMs,
-                    remoteMtimeMs,
-                    resolution: 'keep-local',
-                });
-                this.keepBothCopies.delete(relPath);
-                return;
-            }
-
-            if (strategy === 'keep-remote') {
-                await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
-                this.stateDb.settleConflict({
-                    localRelPath: relPath,
-                    nodeUid: remoteNode.uid,
-                    localSha1,
-                    remoteSha1,
-                    localMtimeMs,
-                    remoteMtimeMs,
-                    resolution: 'keep-remote',
-                });
-                this.keepBothCopies.delete(relPath);
-                return;
-            }
-
-            // Default: keep-both
+            // keep-both: the only strategy that settles a conflict on its own, and it never replaces either side (#91)
             const kept = await this.keepBoth(relPath, localFullPath, localSha1, remoteNode, remoteMap, since);
             if (kept === null) {
                 return; // Changed meanwhile: the next pass keeps both again, and a conflict waiting there keeps waiting
@@ -5830,7 +5799,7 @@ export class ProtonDriveSyncEngine {
 
     // Drops records for a removal of local copies (each just before its file goes). The records are kept aside so
     // that one whose file stayed after all, because it changed at the very last moment, can be put back: without it an
-    // edit would read as a conflict on the next sync, which the keep-remote strategy settles by overwriting it.
+    // edit would read as a conflict on the next sync, kept as a conflict copy beside the cloud version.
     private recordDropper(takenAway: TakenAway) {
         const dropped = new Map<string, SyncedItemRecord>();
         return {

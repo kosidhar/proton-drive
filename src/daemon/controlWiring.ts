@@ -1,3 +1,4 @@
+import { syncLoginEntry } from '../linux/autostart';
 import type { ProtonDriveSyncEngine } from '../sync/syncEngine';
 import type { SyncStateDatabase } from '../sync/syncStateDb';
 import type { ControlServerOptions } from './controlServer';
@@ -33,7 +34,20 @@ export function controlServerOptions(deps: {
         mountAgain: () => drive.mountAgain(),
         space: deps.space,
         driveMove: (action, from, to) => drive.resolveMove(action, from, to),
-        driveSettings: (change) => driveSettings(change, { stateDb, drive, engine }),
+        driveSettings: (change) =>
+            driveSettings(change, {
+                stateDb,
+                drive,
+                engine,
+                // The setting as just saved, which wins over what the entry says (#92)
+                applyStartAtLogin: () => {
+                    const result = syncLoginEntry(stateDb, { explicit: true });
+                    if (result === 'unsupported') throw new Error('Proton Drive can not start itself at login from inside Flatpak');
+                    if (result === 'not-ours') {
+                        throw new Error('~/.config/autostart/proton-drive.desktop is your own entry: Proton Drive leaves it alone');
+                    }
+                },
+            }),
         login: deps.signIn,
         logout: deps.signOut,
         resolveConflict: (id, choice) => engine.resolveConflictManually(id, choice),

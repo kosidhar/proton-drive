@@ -1088,8 +1088,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
         test('a file edited just as free drops its record stays, keeps its record and uploads as an edit', async () => {
             const { engine, nodes, calls, files } = await downloaded({ 'Docs/a.txt': 'a', 'Docs/b.txt': 'b' }, 'vol~Docs');
-            // keep-remote settles a conflict by overwriting the local file, so a lost record would lose the edit
-            stateDb.updateSettings({ conflictStrategy: 'keep-remote' });
+            // A lost record would make the edit a conflict, and no conflict is recorded
             let edited = '';
             files.onRemoval(1, (rel) => {
                 edited = rel;
@@ -1659,10 +1658,10 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             let removalStarted!: () => void;
             const removing = new Promise<void>((resolve) => (removalStarted = resolve));
             files.onRemoval(1, () => removalStarted());
-            let uploading!: () => void;
-            const uploaded = new Promise<void>((resolve) => (uploading = resolve));
+            let downloading!: () => void;
+            const uploaded = new Promise<void>((resolve) => (downloading = resolve));
             duringUpload(sdk, 'Docs/n.txt', async () => {
-                uploading();
+                downloading();
                 await removing;
             });
             const handler = (engine as any).handleLocalFileChange('Docs/n.txt');
@@ -8608,6 +8607,12 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
     });
     describe('waiting prompt conflicts after the strategy changes or the sides agree (#68)', () => {
+        // As an older version stored it, past the checks a save makes now
+        const storeRawSetting = (key: string, value: string) =>
+            (stateDb as unknown as { db: { run: (sql: string, params: string[]) => void } }).db.run(
+                'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+                [key, value],
+            );
         // Docs/a.txt downloaded and pinned, then edited here and in the cloud while the strategy is prompt: one waits
         const queued = async (layout: 'plain' | 'virtual' = 'plain') => {
             if (layout === 'virtual') stateDb.setMeta('driveLayout', 'virtual');
@@ -8659,15 +8664,22 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.calls.trashed).toEqual([]);
         });
 
-        test('switched to keep-local: the local edit becomes a new revision, and the waiting conflict is closed as keep-local', async () => {
-            const d = await queued();
-            stateDb.updateSettings({ conflictStrategy: 'keep-local' });
-            await d.engine.reconcileNow();
-            expect(d.waiting()).toEqual([]);
-            expect(d.first()).toMatchObject({ resolved: 1, resolution: 'keep-local' });
-            expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('local edit');
-            expect(d.calls.trashed).toEqual([]);
-        });
+        for (const retired of ['keep-local', 'keep-remote']) {
+            test(`${retired} stored by an older version: the next pass keeps both, and neither side replaces the other (#91)`, async () => {
+                const d = await queued();
+                storeRawSetting('conflictStrategy', retired);
+                expect(stateDb.getSettings().conflictStrategy).toBe('keep-both');
+                await d.engine.reconcileNow();
+                expect(d.waiting()).toEqual([]);
+                expect(d.first()).toMatchObject({ resolved: 1, resolution: 'keep-both' });
+                expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('remote edit');
+                expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('remote edit');
+                const copies = (await readdir(d.local('Docs'))).filter((n) => n !== 'a.txt');
+                expect(copies.length).toBe(1);
+                expect(await readFile(d.local(`Docs/${copies[0]}`), 'utf8')).toBe('local edit');
+                expect(d.calls.trashed).toEqual([]);
+            });
+        }
 
         test('both sides come to hold the same content: the conflict is closed as in-sync, and the file is synced', async () => {
             const d = await queued();
@@ -8980,9 +8992,9 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             return { release, inside };
         };
 
-        test('a pass under keep-remote leaves alone the conflict the user is keeping local by hand', async () => {
+        test('a pass under keep-both leaves alone the conflict the user is keeping local by hand', async () => {
             const d = await queued();
-            stateDb.updateSettings({ conflictStrategy: 'keep-remote' });
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
             const held = holdGetNode(d, d.uid('a.txt'));
             const manual = d.engine.resolveConflictManually(d.conflict.id, 'keep-local');
             await held.inside;
@@ -8997,7 +9009,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
         test('a pass that read the file before the user resolved it by hand, and reaches it after, leaves it alone', async () => {
             const d = await queued();
-            stateDb.updateSettings({ conflictStrategy: 'keep-remote' });
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
             d.add('0.txt', 'new from another device'); // sorts first: the pass is busy with it while the user resolves
             let release!: () => void;
             const gate = new Promise<void>((resolve) => (release = resolve));
@@ -9828,22 +9840,23 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const local = (rel: string) => path.join(engine.localRoot(), rel);
             await writeFile(local('a.txt'), 'local edit');
             d.nodes.set(d.uid('a.txt'), makeMockNode({ uid: d.uid('a.txt'), parentUid: d.root.uid, nameStr: 'a.txt', type: NodeType.File, content: 'cloud edit' }));
-            stateDb.updateSettings({ conflictStrategy: 'keep-local' });
-            return { ...d, engine, local };
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
+            const copies = async () => (await readdir(engine.localRoot())).filter((n) => n.includes('(conflict'));
+            return { ...d, engine, local, copies };
         };
 
-        test('a delete through the drive waits for a keep-local by the setting, then deletes what it left', async () => {
+        test('a delete through the drive waits for a keep-both by the setting, then deletes what it left', async () => {
             const d = await conflicted();
-            // Holds the keep-local's upload of a.txt until released
+            // Holds the keep-both's download of the cloud's a.txt until released: its conflict copy is made already
             let release!: () => void;
             const gate = new Promise<void>((resolve) => (release = resolve));
             let entered!: () => void;
             const inside = new Promise<void>((resolve) => (entered = resolve));
-            (d.sdk as any).getFileRevisionUploader = ((orig) => async (...args: unknown[]) => {
+            (d.sdk as any).getFileRevisionDownloader = ((orig) => async (...args: unknown[]) => {
                 entered();
                 await gate;
                 return orig(...args);
-            })((d.sdk as any).getFileRevisionUploader.bind(d.sdk));
+            })((d.sdk as any).getFileRevisionDownloader.bind(d.sdk));
             const pass = d.engine.reconcileNow();
             await inside;
             let deleted = false;
@@ -9855,10 +9868,13 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await pass;
             await del;
             await d.engine.replayRemoteOps();
-            // The keep-local landed first, then the user's delete took the file: what the delete said is what happened
-            expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-local']);
+            // The keep-both landed first, then the user's delete took the file: what the delete said is what happened,
+            // and the local edit stays, in its conflict copy
+            expect(stateDb.listConflicts(true).map((c) => c.resolution)).toEqual(['keep-both']);
             expect(await stat(d.local('a.txt')).catch(() => null)).toBeNull();
             expect(d.calls.trashed.flat()).toContain(d.uid('a.txt'));
+            const [copy] = await d.copies();
+            expect(await readFile(d.local(copy), 'utf8')).toBe('local edit');
         });
 
         test('a delete queued behind another drive change is refused if a resolution by the setting starts meanwhile', async () => {
@@ -9881,30 +9897,34 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 (error: unknown) => error,
             );
             await Bun.sleep(10); // past its wait for resolutions: queued for its turn
-            // A resolution by the setting starts on a.txt, its upload held
-            let releaseUpload!: () => void;
-            const uploadGate = new Promise<void>((resolve) => (releaseUpload = resolve));
-            let uploading!: () => void;
-            const uploadInside = new Promise<void>((resolve) => (uploading = resolve));
-            (d.sdk as any).getFileRevisionUploader = ((orig) => async (...args: unknown[]) => {
-                uploading();
-                await uploadGate;
+            // A resolution by the setting starts on a.txt, its download held
+            let releaseDownload!: () => void;
+            const downloadGate = new Promise<void>((resolve) => (releaseDownload = resolve));
+            let downloading!: () => void;
+            const downloadInside = new Promise<void>((resolve) => (downloading = resolve));
+            (d.sdk as any).getFileRevisionDownloader = ((orig) => async (...args: unknown[]) => {
+                downloading();
+                await downloadGate;
                 return orig(...args);
-            })((d.sdk as any).getFileRevisionUploader.bind(d.sdk));
+            })((d.sdk as any).getFileRevisionDownloader.bind(d.sdk));
             const record = stateDb.getItemByPath('a.txt')!;
             const resolving = (d.engine as any).handleFileConflict(
                 'a.txt', d.local('a.txt'), d.nodes.get(d.uid('a.txt')), 'local-sha1', null, 0, 0, new Map(),
                 stateDb.getSettings(), 0, record,
             );
-            await uploadInside;
+            await downloadInside;
             releaseRename();
             await rename;
             expect(await del).toMatchObject({ code: 'EIO' });
             expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
-            releaseUpload();
+            releaseDownload();
             await resolving;
-            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('local edit');
-            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
+            // Both kept: the cloud's version in place, the local edit in its conflict copy, here and in the cloud
+            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('cloud edit');
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('cloud edit');
+            const [copy] = await d.copies();
+            expect(await readFile(d.local(copy), 'utf8')).toBe('local edit');
+            expect([...d.nodes.values()].some((n) => n.content === 'local edit')).toBe(true);
         });
 
         test('a pass reaching the conflict while a drive rename of the file runs leaves it to the next pass', async () => {
@@ -9934,7 +9954,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 0,
                 stateDb.getItemByPath('a.txt') ?? undefined,
             );
-            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('cloud edit'); // nothing uploaded under the rename
+            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('cloud edit'); // nothing done under the rename
+            expect(await d.copies()).toEqual([]);
             release();
             await rename;
             expect(await readFile(d.local('b.txt'), 'utf8')).toBe('local edit');
@@ -10028,31 +10049,34 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const file = path.join(engine.localRoot(), 'a.txt');
             await writeFile(file, 'local edit');
             d.nodes.set(d.uid('a.txt'), makeMockNode({ uid: d.uid('a.txt'), parentUid: d.root.uid, nameStr: 'a.txt', type: NodeType.File, content: 'cloud edit' }));
-            stateDb.updateSettings({ conflictStrategy: 'keep-local' });
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
             let release!: () => void;
             const gate = new Promise<void>((resolve) => (release = resolve));
             let entered!: () => void;
             const inside = new Promise<void>((resolve) => (entered = resolve));
-            let uploads = 0;
-            (d.sdk as any).getFileRevisionUploader = ((orig) => async (...args: unknown[]) => {
-                uploads++;
-                if (uploads === 1) {
+            let downloads = 0;
+            (d.sdk as any).getFileRevisionDownloader = ((orig) => async (...args: unknown[]) => {
+                downloads++;
+                if (downloads === 1) {
                     entered();
                     await gate;
                 }
                 return orig(...args);
-            })((d.sdk as any).getFileRevisionUploader.bind(d.sdk));
+            })((d.sdk as any).getFileRevisionDownloader.bind(d.sdk));
             const record = stateDb.getItemByPath('a.txt')!;
             const resolve = () =>
                 (engine as any).handleFileConflict('a.txt', file, d.nodes.get(d.uid('a.txt')), 'local-sha1', null, 0, 0, new Map(), stateDb.getSettings(), 0, record);
             const first = resolve();
             await inside;
             await resolve(); // a watcher look reaching the same conflict
-            expect(uploads).toBe(1);
+            expect(downloads).toBe(1);
             expect((engine as any).strategyResolvingPaths.has('a.txt')).toBe(true); // the first still holds its claim
             release();
             await first;
-            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('local edit');
+            expect(await readFile(file, 'utf8')).toBe('cloud edit');
+            const copies = (await readdir(engine.localRoot())).filter((n) => n.includes('(conflict'));
+            expect(copies.length).toBe(1); // one copy: the second never made its own
+            expect(await readFile(path.join(engine.localRoot(), copies[0]), 'utf8')).toBe('local edit');
         });
 
         test('a local delete is not taken to the cloud meanwhile', async () => {
@@ -10083,7 +10107,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
     });
 
     describe('the conflict setting never acts on a file a drive change took since the pass read it (#139)', () => {
-        test('virtual: keep-remote after a drive rename of a file with no record does not bring the cloud version back', async () => {
+        test('virtual: keep-both after a drive rename of a file with no record does not bring the cloud version back', async () => {
             stateDb.setMeta('driveLayout', 'virtual');
             const d = makeMockDrive();
             const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
@@ -10097,7 +10121,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const local = (rel: string) => path.join(engine.localRoot(), rel);
             await writeFile(local('a.txt'), 'mine'); // made local through the drive, say
             expect(stateDb.getItemByPath('a.txt')).toBeNull();
-            stateDb.updateSettings({ conflictStrategy: 'keep-remote' });
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
             // The pass read the file (since = the removals finished then); the user renames it through the drive meanwhile
             await (engine as any).observingLocal(async (since: number) => {
                 await engine.renameItem('a.txt', 'b.txt');
@@ -10108,9 +10132,10 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
             expect(await stat(local('a.txt')).catch(() => null)).toBeNull(); // not brought back
             expect(await readFile(local('b.txt'), 'utf8')).toBe('mine');
+            expect((await readdir(engine.localRoot())).filter((n) => n.includes('(conflict'))).toEqual([]);
         });
 
-        test('virtual: keep-remote after a drive rename onto the file never replaces what the rename put there', async () => {
+        test('virtual: keep-both after a drive rename onto the file never replaces what the rename put there', async () => {
             stateDb.setMeta('driveLayout', 'virtual');
             const d = makeMockDrive();
             const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
@@ -10124,7 +10149,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const local = (rel: string) => path.join(engine.localRoot(), rel);
             await writeFile(local('a.txt'), 'mine');
             await writeFile(local('x.txt'), 'precious'); // only on this computer
-            stateDb.updateSettings({ conflictStrategy: 'keep-remote' });
+            stateDb.updateSettings({ conflictStrategy: 'keep-both' });
             await (engine as any).observingLocal(async (since: number) => {
                 await engine.renameItem('x.txt', 'a.txt'); // the user saves x.txt over a.txt, as an editor does
                 await (engine as any).handleFileConflict(
@@ -10133,6 +10158,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 );
             });
             expect(await readFile(local('a.txt'), 'utf8')).toBe('precious');
+            expect((await readdir(engine.localRoot())).filter((n) => n.includes('(conflict'))).toEqual([]);
         });
     });
 
