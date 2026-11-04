@@ -175,6 +175,57 @@ describe("AvailabilityPolicy", () => {
     expect(policy.stateOf("Docs/a.txt")).toBe("pinned");
   });
 
+  // #175: "Always keep" means it and everything inside it stay here; a folder with something freed inside it no longer is
+  test("a pinned folder with something freed inside it reads by its contents, while the pin still applies", () => {
+    policy.setPin("docs", "pinned", false);
+    addLocalRecord("Docs/a.txt");
+    addLocalRecord("Docs/b.txt");
+    policy.setPin("deep", "unpinned", true); // Free up space on Docs/Deep
+    expect(policy.stateOf("Docs")).toBe("online-only"); // Deep/c.txt isn't here
+    expect(policy.childStates("").get("Docs")).toBe("online-only");
+    expect(policy.stateOf("Docs/Deep")).toBe("online-only");
+    // The rest of the folder is still kept, and new arrivals in it still download: only what is shown changes
+    expect(policy.stateOf("Docs/a.txt")).toBe("pinned");
+    expect(policy.childStates("Docs").get("a.txt")).toBe("pinned");
+    expect(policy.isPinned("Docs/a.txt")).toBe(true);
+    expect(policy.isPinned("Docs")).toBe(true);
+    // Downloaded again by hand, the folder is all here
+    addLocalRecord("Docs/Deep/c.txt");
+    expect(policy.stateOf("Docs")).toBe("downloaded");
+    // Always keep on the folder again clears what is below it, so it reads as kept
+    policy.setPin("docs", "pinned", true);
+    expect(policy.stateOf("Docs")).toBe("pinned");
+    expect(policy.childStates("").get("Docs")).toBe("pinned");
+  });
+
+  test("something freed deep inside counts for every pinned folder above it, and only for those", () => {
+    policy.setPin("root", "pinned", false);
+    policy.setPin("c", "unpinned", true); // a file two folders down
+    expect(policy.stateOf("Docs")).not.toBe("pinned");
+    expect(policy.stateOf("Docs/Deep")).not.toBe("pinned");
+    expect(policy.childStates("").get("Docs")).not.toBe("pinned");
+    expect(policy.childStates("Docs").get("Deep")).not.toBe("pinned");
+    // Siblings with nothing freed inside them are still kept
+    expect(policy.stateOf("Music")).toBe("pinned");
+    expect(policy.childStates("").get("Music")).toBe("pinned");
+    expect(policy.stateOf("Docs/a.txt")).toBe("pinned");
+  });
+
+  test("something hidden inside a pinned folder doesn't change how the folder reads: it isn't shown at all", () => {
+    policy.setPin("docs", "pinned", false);
+    policy.setHide("deep", "hidden");
+    expect(policy.stateOf("Docs")).toBe("pinned");
+    expect(policy.childStates("").get("Docs")).toBe("pinned");
+  });
+
+  test("a pin deeper inside a freed folder doesn't make the folder above read as kept", () => {
+    policy.setPin("docs", "pinned", false);
+    policy.setPin("deep", "unpinned", false);
+    policy.setPin("c", "pinned", false);
+    expect(policy.stateOf("Docs")).not.toBe("pinned");
+    expect(policy.stateOf("Docs/Deep/c.txt")).toBe("pinned");
+  });
+
   test("hide wins over pin and is inherited", () => {
     policy.setPin("deep", "pinned", false);
     policy.setHide("docs", "pending");

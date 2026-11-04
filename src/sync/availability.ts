@@ -105,7 +105,10 @@ export class AvailabilityPolicy {
     if (hidden) {
       return hidden.hide === "pending" ? "hiding" : "hidden";
     }
-    if (this.isPinned(relPath)) {
+    // Always keep means it and everything inside it stay here, new arrivals included: a pinned folder with something
+    // freed inside it isn't that any more, and reads by its contents like any other folder (#175). Its pin still
+    // applies to the rest of it (isPinned).
+    if (this.isPinned(relPath) && !this.unpinnedBelow(relPath)) {
       return "pinned";
     }
     if (this.index.getByPath(relPath)?.type === "folder") {
@@ -146,19 +149,54 @@ export class AvailabilityPolicy {
     const pinnedAbove = this.isPinned(folderRel);
     const missing = this.childrenMissingFiles(folderRel);
     const here = this.childrenWithAnythingHere(folderRel);
+    const freedInside = this.childrenWithUnpinnedBelow(folderRel);
     for (const child of children) {
       // The nearest hide flag wins, the child's own first, as stateOf has it
       if (child.hide) {
         out.set(child.name, child.hide === "pending" ? "hiding" : "hidden");
       } else if (hiddenAbove) {
         out.set(child.name, hiddenAbove.hide === "pending" ? "hiding" : "hidden");
-      } else if (child.pin ? child.pin === "pinned" : pinnedAbove) {
+      } else if ((child.pin ? child.pin === "pinned" : pinnedAbove) && !freedInside.has(child.name)) {
         out.set(child.name, "pinned");
       } else {
         out.set(child.name, !missing.has(child.name) && here.has(child.name) ? "downloaded" : "online-only");
       }
     }
     return out;
+  }
+
+  // Whether any indexed descendant (not the item itself) is explicitly unpinned: freed inside a pinned folder
+  private unpinnedBelow(relPath: string): boolean {
+    const row = this.db
+      .query(
+        `SELECT 1 FROM remote_nodes n JOIN availability a ON a.nodeUid = n.uid
+                 WHERE a.pin = 'unpinned' AND n.relPath != $path AND ${this.range("n.relPath", relPath)} LIMIT 1`,
+      )
+      .get(this.rangeParams(relPath));
+    return row !== null;
+  }
+
+  // The names of a folder's children with an explicitly unpinned descendant (below the child, not the child itself)
+  private childrenWithUnpinnedBelow(folderRel: string): Set<string> {
+    const prefix = folderRel === "" ? "" : `${folderRel}/`;
+    const below =
+      folderRel === ""
+        ? "n.relPath != ''"
+        : "(n.relPath >= $lo AND n.relPath < $hi)";
+    const rows = this.db
+      .query(
+        `SELECT DISTINCT substr(rest, 1, instr(rest, '/') - 1) AS name
+                 FROM (SELECT substr(n.relPath, length($prefix) + 1) AS rest FROM remote_nodes n
+                       JOIN availability a ON a.nodeUid = n.uid
+                       WHERE a.pin = 'unpinned' AND ${below})
+                 WHERE instr(rest, '/') > 0`,
+      )
+      .all({
+        // SQLite measures the prefix in characters, as substr counts them (a JS length counts UTF-16 units)
+        $prefix: prefix,
+        ...(folderRel === "" ? {} : { $lo: prefix, $hi: `${folderRel}0` }),
+      }) as { name: string }[];
+    return new Set(rows.map((row) => row.name));
   }
 
   // Whether anything at or below a path is recorded as being on this computer
