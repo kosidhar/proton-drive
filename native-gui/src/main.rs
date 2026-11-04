@@ -1,3 +1,5 @@
+#[cfg_attr(not(test), allow(dead_code))]
+mod home;
 mod single_instance;
 
 use std::process::Command;
@@ -273,6 +275,9 @@ struct DaemonStatus {
     /// The Settings switch as stored (the drive may still be a plain folder, e.g. without FUSE)
     #[serde(default)]
     virtual_drive_wanted: Option<bool>,
+    /// When the last sync pass finished, epoch milliseconds; absent before the first one
+    #[serde(default)]
+    last_sync_at: Option<i64>,
 }
 
 /// What is missing while the daemon holds because the files are missing from the folder (`filesMissing` in
