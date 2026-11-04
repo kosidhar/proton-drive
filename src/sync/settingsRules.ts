@@ -3,8 +3,12 @@ import { matchesIgnorePatterns } from './localWatcher';
 // What the settings may hold. The control socket checks a request against these before it stores anything, and
 // getSettings checks what is stored (values saved before the checks existed), so a bad value never reaches the engine.
 
-export const CONFLICT_STRATEGIES = ['keep-both', 'keep-local', 'keep-remote', 'prompt'] as const;
+// A conflict always keeps both versions, at once (keep-both) or once the user chose (prompt, which waits): neither side
+// is ever replaced by the other on its own (#91). keep-local and keep-remote did, and are no longer offered; one stored
+// before is read as keep-both (see SyncStateDatabase)
+export const CONFLICT_STRATEGIES = ['keep-both', 'prompt'] as const;
 export type ConflictStrategy = (typeof CONFLICT_STRATEGIES)[number];
+export const RETIRED_CONFLICT_STRATEGIES: readonly string[] = ['keep-local', 'keep-remote'];
 
 export const MAX_IGNORE_PATTERNS = 500;
 export const MAX_IGNORE_PATTERN_LENGTH = 1024;
