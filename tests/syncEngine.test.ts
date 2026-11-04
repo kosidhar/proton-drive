@@ -9759,6 +9759,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 };
                 const resolved = await engine.resolveConflictManually(conflict.id, 'keep-both');
                 expect(resolved.resolution).toBe('keep-both');
+                // #127: it names no copy that isn't there
+                expect(resolved.conflictCopyPath).toBeNull();
                 expect(await readFile(local('a.txt'), 'utf8')).toBe('cloud edit');
                 expect(stateDb.getItemByPath(copy)).toBeNull();
                 if (what === 'moved') expect(await readFile(local('elsewhere.txt'), 'utf8')).toBe('local edit');
@@ -9796,6 +9798,11 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await engine.reconcileNow();
             expect(await readFile(local('a.txt'), 'utf8')).toBe('cloud edit');
             expect(stateDb.listConflicts()).toEqual([]);
+            // #127: no copy is named, the log says what happened, and no upload is said to have failed
+            expect(stateDb.listConflicts(true).map((c) => [c.resolution, c.conflictCopyPath])).toEqual([['keep-both', null]]);
+            const activity = stateDb.listActivity().map((a) => a.details ?? '');
+            expect(activity.filter((t) => t.startsWith('Upload failed'))).toEqual([]);
+            expect(activity.some((t) => t.includes('was moved or deleted before it uploaded'))).toBe(true);
             expect([...d.nodes.values()].filter((n) => d.nameOf(n).includes('(conflict'))).toEqual([]);
             expect(stateDb.getAllItems().filter((i) => i.localRelPath.includes('(conflict'))).toEqual([]);
         });
