@@ -106,6 +106,11 @@ if [ "$UNINSTALL" -eq 1 ]; then
   rm -f "$PREFIX/share/applications/ch.proton.drive.desktop" "$PREFIX/share/applications/proton-drive.desktop"
   rm -f "$PREFIX/share/metainfo/ch.proton.drive.metainfo.xml"
   rm -f "$SYSTEMD_USER_DIR/protondrive.service"
+  # The login entry the daemon wrote (#92), only if it is ours: a user's own entry of that name stays
+  autostart_entry="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/proton-drive.desktop"
+  if [ "$(id -u)" -ne 0 ] && grep -qx 'X-ProtonDrive-Autostart=true' "$autostart_entry" 2>/dev/null; then
+    rm -f "$autostart_entry"
+  fi
   rm -f "$PREFIX/share/icons/hicolor/scalable/emblems/emblem-protondrive-"*.svg
   # The file manager integrations and the tray, so Files, Nemo and Dolphin stop offering Proton Drive (#54)
   rm -f "$PREFIX/share/nautilus-python/extensions/ch_proton_drive_nautilus.py" \

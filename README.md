@@ -25,6 +25,7 @@ Built to work out-of-the-box across all major Linux distributions and desktop en
   - Built with `eframe`/`egui` in Rust using Proton's **Carbon Dark** design palette and embedded `Inter` + `JetBrains Mono` typography.
   - Proper Freedesktop reverse-DNS App ID (`ch.proton.drive`), `StartupWMClass=ch.proton.drive`, AppStream metainfo, and complete `hicolor` icon theme (`16x16` through `512x512` + `scalable` SVG) so docks and taskbars display the official Proton Drive icon across X11 and Wayland.
   - **Self-Starting Companion Daemon**: Launching the GUI automatically spawns `protondrive daemon` in the background if it is not already running.
+  - **Starts at login**: Proton Drive starts when you log in (the daemon, so syncing and the drive, and the tray icon), without opening the window. Turn it off in Settings with **Start Proton Drive when I log in**. It is an XDG autostart entry, `~/.config/autostart/proton-drive.desktop`, which runs `protondrive autostart`; `install.sh --uninstall` removes it.
 - **Event-Driven Two-Way Folder Synchronization (`~/ProtonDrive`)**:
   - Real-time remote changes via Proton Drive SDK event subscriptions (`subscribeToDriveEvents` & `subscribeToTreeEvents`) with persisted cursors.
   - Real-time local filesystem watching via Linux `inotify` (`fs.watch`) with debouncing and atomic writes.
@@ -114,6 +115,7 @@ protondrive free <path>                    # Free up space: make downloaded file
 protondrive hide <path>                    # Hide a file or folder from this computer
 protondrive unhide <path>                  # Unhide it (it becomes online only)
 protondrive sync                           # Trigger immediate two-way sync pass
+protondrive autostart                      # Start the daemon and the tray, detached (what runs at login)
 protondrive pause / resume                 # Pause or resume background sync
 protondrive auth login / logout / status   # Manage Proton account session
 protondrive conflicts                      # List or resolve file conflicts
