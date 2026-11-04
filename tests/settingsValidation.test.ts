@@ -483,13 +483,30 @@ describe('leading classes are judged by how much they cover (#155)', () => {
 
     test('rewritten, joined or escaped, such a class is refused all the same', () => {
         for (const pattern of [
-            '[!ryzRYZ]*?', '[!ryzRYZ]*[!q]', '[!ryzRYZ][!.]*', '**/[!ryzRYZ]*', '{[!ryzRYZ]*,x}', '[!ryzRYZ]*[a-z]*',
+            '[!ryzRYZ]*?', '[!ryzRYZ][!.]*', '**/[!ryzRYZ]*', '{[!ryzRYZ]*,x}',
             '[!]ryzRYZ]*', '[!\\]ryzRYZ]*', '[!r\\-zRYZ]*', '[!M]*/**', '[!Z9a.]*/**',
         ]) {
             expect(problemWithIgnorePatterns([pattern])).not.toBeNull();
         }
         expect(problemWithIgnorePatterns(['[a-q]*', '[s-x]*', '[A-Q]*', '[S-X]*', '[0-9]*'])).not.toBeNull();
         expect(problemWithIgnorePatterns(['[!ryzRYZ]*.*', '[!ryzRYZ]*[!.]'])).not.toBeNull();
+    });
+
+    test('lists of extensions, separators and digits, which hide few real files, are allowed', () => {
+        for (const list of [
+            ['* *', '*.txt', '*.md'],
+            ['*.pdf', '*.txt', '*.md', '* *'],
+            ['*.txt', '*.md', '*.pdf', '*.docx', '*.xlsx', '*.jpg', '*.png', '*.zip', '* *'],
+            ['* *', '*.??', '*.txt'],
+            ['*.pdf', '*.txt', '*.md', '*-*'],
+            ['*.txt', '*.md', '*[0-9]*', '* *'],
+            ['*_*', '*[0-9]*', '*-*'],
+            ['* *', '*_*', '*[0-9]*'],
+            ['*q*', '*w*'],
+            ['*_*', '*j*', '*k'],
+        ]) {
+            expect(problemWithIgnorePatterns(list)).toBeNull();
+        }
     });
 
     test('a class that leaves out a fair share is allowed', () => {
