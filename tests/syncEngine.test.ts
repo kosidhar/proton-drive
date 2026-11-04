@@ -10129,4 +10129,29 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(await readFile(local('a.txt'), 'utf8')).toBe('precious');
         });
     });
+
+    describe('a local folder delete holds off while a file in it is being resolved (#143)', () => {
+        for (const how of ['by hand', 'by the setting'] as const) {
+            test(`nothing in the folder is trashed in the cloud while a file in it is resolved ${how}`, async () => {
+                const d = makeMockDrive();
+                const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                    moveToDesktopTrash: async () => false,
+                    settle: { quietMs: 0 },
+                });
+                d.add('Kept.txt', 'kept');
+                d.add('Folder/a.txt', 'a');
+                d.add('Folder/b.txt', 'b');
+                engine.availability.setPin(d.root.uid, 'pinned', false);
+                await engine.reconcileNow();
+                (engine as any)[how === 'by hand' ? 'manualResolvingPaths' : 'strategyResolvingPaths'].add('Folder/a.txt');
+                await rm(path.join(engine.localRoot(), 'Folder'), { recursive: true });
+                await (engine as any).trashForDeletedLocal('Folder', d.nodes.get(d.uid('Folder')));
+                expect(d.calls.trashed).toEqual([]);
+                // Once it is resolved, the next look takes the delete to the cloud
+                (engine as any)[how === 'by hand' ? 'manualResolvingPaths' : 'strategyResolvingPaths'].delete('Folder/a.txt');
+                await engine.reconcileNow();
+                expect(d.calls.trashed.flat().length).toBeGreaterThan(0);
+            });
+        }
+    });
 });
