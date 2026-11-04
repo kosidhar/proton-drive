@@ -9809,7 +9809,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
     });
 
     describe('keep-both again after an unfinished one, when the earlier copy goes as it uploads (#137)', () => {
-        test('a retry by hand makes a new copy from the file as it is, and no upload is said to have failed', async () => {
+        for (const what of ['deleted', 'moved'] as const) test(`a retry by hand after the earlier copy is ${what} makes a new copy from the file as it is, and no upload is said to have failed`, async () => {
             const d = makeMockDrive();
             const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
                 moveToDesktopTrash: async () => false,
@@ -9840,7 +9840,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             (d.sdk as any).getFileUploader = async (parent: NodeEntity, name: string, metadata: any) => {
                 if (name === earlier) {
                     (d.sdk as any).getFileUploader = getFileUploader;
-                    await rm(local(name), { force: true });
+                    if (what === 'deleted') await rm(local(name), { force: true });
+                    else await rename(local(name), local('kept elsewhere.txt'));
                 }
                 return getFileUploader(parent, name, metadata);
             };
@@ -9853,6 +9854,13 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const inCloud = [...d.nodes.values()].filter((n) => d.nameOf(n).includes('(conflict'));
             expect(inCloud.map((n) => n.content)).toEqual(['local edit']);
             expect(stateDb.listActivity().filter((a) => (a.details ?? '').startsWith('Upload failed'))).toEqual([]);
+            if (what === 'moved') {
+                // Kept where the user put it: a new local file, uploaded by a later pass. Two copies, nothing lost
+                expect(await readFile(local('kept elsewhere.txt'), 'utf8')).toBe('local edit');
+                await engine.reconcileNow();
+                const elsewhere = [...d.nodes.values()].filter((n) => d.nameOf(n) === 'kept elsewhere.txt');
+                expect(elsewhere.map((n) => n.content)).toEqual(['local edit']);
+            }
         });
     });
 });
