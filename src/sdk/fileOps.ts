@@ -227,6 +227,8 @@ export interface DownloadResult {
     sha1?: string;
     size: number;
     mtimeMs: number;
+    // The placed file's ctime, as seen just after it was placed (and its time set): downloaded only
+    ctimeMs?: number;
 }
 
 export async function downloadDriveNodeToLocal(options: {
@@ -297,6 +299,7 @@ export async function downloadDriveNodeToLocal(options: {
         sha1: downloaded.sha1,
         size: finalStat.size,
         mtimeMs: finalStat.mtimeMs,
+        ctimeMs: finalStat.ctimeMs,
     };
 }
 

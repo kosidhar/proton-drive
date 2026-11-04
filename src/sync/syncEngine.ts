@@ -1490,6 +1490,7 @@ export class ProtonDriveSyncEngine {
                         size: localInfo.size,
                         syncStatus: 'synced',
                         lastError: null,
+                        contentReadAt: hashedFrom, // what the hash read: a write during it is newer (#109)
                     }, since);
                     // Both sides were just compared and hold the same content: a conflict waiting for the user here is
                     // over (#68). Only here: a record written as synced elsewhere (an upload by the watcher, say) says
@@ -2021,6 +2022,8 @@ export class ProtonDriveSyncEngine {
         });
 
         try {
+            // Before anything is placed or hashed here: a write from then on is newer than what the record says (#109)
+            const readFrom = Date.now();
             const result = await downloadDriveNodeToLocal({
                 sdk: this.sdk,
                 logger: this.logger,
@@ -2056,6 +2059,7 @@ export class ProtonDriveSyncEngine {
                     size: result.size,
                     syncStatus: 'synced',
                     lastError: null,
+                    contentReadAt: result.status === 'downloaded' ? placedReadAt(result.ctimeMs, readFrom) : readFrom,
                 }, since);
 
                 if (result.status === 'downloaded') {
@@ -2090,6 +2094,9 @@ export class ProtonDriveSyncEngine {
         leftByTheUser?: () => Promise<boolean>,
     ): Promise<UploadResult> {
         const transferId = `ul:${relPath}`;
+        // Before the upload reads the file: a write from then on (as it uploads, which can take minutes) is newer than
+        // what the record says it holds, so the next look hashes the file (#109)
+        const readFrom = Date.now();
         const st = await stat(localFullPath);
         this.activeTransfers.set(transferId, {
             id: transferId,
@@ -2135,6 +2142,7 @@ export class ProtonDriveSyncEngine {
                     size: result.size,
                     syncStatus: 'synced',
                     lastError: null,
+                    contentReadAt: readFrom,
                 };
                 if (!this.recordSynced(item, since) && result.status === 'uploaded') {
                     this.adoptStrayNode(relPath, item, since); // A new node, for a file renamed or deleted meanwhile
@@ -4171,6 +4179,7 @@ export class ProtonDriveSyncEngine {
             if (madeFrom !== null) {
                 await mkdir(path.dirname(target), { recursive: true });
             }
+            const readFrom = Date.now(); // before it is placed (see placedReadAt)
             if (!this.localItemExists(rel)) {
                 stillThere();
                 placed = moveWithoutReplacing(staging, target);
@@ -4197,6 +4206,7 @@ export class ProtonDriveSyncEngine {
                         size: st.size,
                         syncStatus: 'synced',
                         lastError: null,
+                        contentReadAt: placedReadAt(st.ctimeMs, readFrom),
                     },
                     since,
                 );
@@ -4453,6 +4463,7 @@ export class ProtonDriveSyncEngine {
                                 syncStatus: 'synced',
                                 lastError: null,
                                 updatedAt: undefined,
+                                contentReadAt: null, // what is here now was never read (#109)
                             });
                         }
                         if (sourceUid !== null && sourceUid !== targetUid) {
@@ -6553,12 +6564,28 @@ function driveOpErrorOf(failure: unknown, toRel: string): unknown {
     return failure;
 }
 
-// Whether nothing has written to a file since its record was made, by its ctime, which the system sets on every write
-// (unlike the mtime, which cp -p, touch -r or an encrypted container can put back). Without a ctime it can't be told,
-// which counts as written: the caller then compares contents (#105).
+// Whether nothing has written to a file since the content its record holds was read, by its ctime, which the system
+// sets on every write (unlike the mtime, which cp -p, touch -r or an encrypted container can put back). Measured from
+// when the content was read, not when the record was written, as a write in between (during an upload, say) is one the
+// record knows nothing of (#109). The system's ctime may run up to a clock tick behind (CTIME_TICK_MS): a write that
+// close to the read counts as one after it. Without a ctime or a read time it can't be told, which counts as written:
+// the caller then compares contents (#105).
 function notWrittenSince(local: { ctimeMs?: number }, record: SyncedItemRecord): boolean {
-    return local.ctimeMs !== undefined && local.ctimeMs <= record.updatedAt + 1;
+    const readAt = record.contentReadAt;
+    return local.ctimeMs !== undefined && readAt !== null && readAt !== undefined && local.ctimeMs + CTIME_TICK_MS < readAt;
 }
+const CTIME_TICK_MS = 20;
+
+// The read time for a file just placed by a download: the ctime its placing gave it, as seen at once after, so that
+// what placed it isn't taken for a write after (which would have the watcher upload the download back). Just above it
+// (notWrittenSince then holds for a ctime no newer than the one seen, and not for any later one, however close): only
+// a write within the same clock tick as that stat, keeping the size and the old mtime, is left unseen. Without that
+// ctime, the time before placing, which has the next look hash the file once
+function placedReadAt(placedCtimeMs: number | undefined, readFrom: number): number {
+    return placedCtimeMs === undefined ? readFrom : Math.max(readFrom, placedCtimeMs + CTIME_TICK_MS + PLACED_CTIME_EPSILON_MS);
+}
+// Above the rounding of a ctime in ms at today's dates (about 0.0002 ms), below any later ctime the system gives
+const PLACED_CTIME_EPSILON_MS = 0.001;
 
 // Whether a local file differs from its record by size or time (as a pass's fast path tells), or has none: an upload
 // is what it would come to

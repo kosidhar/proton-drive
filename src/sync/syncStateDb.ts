@@ -21,6 +21,10 @@ export interface SyncedItemRecord {
     syncStatus: ItemSyncStatus;
     lastError: string | null;
     updatedAt: number;
+    // When the content the record says it holds was read (just before the stat and hash of an upload or a comparison,
+    // or before a download was placed): a file whose ctime is older was not written since (see notWrittenSince). Null
+    // when not known, which counts as written. Unlike updatedAt, which says when the record was written (#109)
+    contentReadAt?: number | null;
 }
 
 // What the virtual drive showed of an online-only file when it turned it into a local one (POST /vfs/truncate): the
@@ -163,6 +167,13 @@ export class SyncStateDatabase {
             )
         `);
         this.db.run('CREATE INDEX IF NOT EXISTS idx_synced_items_node_uid ON synced_items(nodeUid)');
+        // Records from before #109 have no read time: their updatedAt may hide a write made while they synced, so each
+        // file is hashed once (the next pass, or the watcher, which then finds it identical and uploads nothing), and is
+        // given one then. Only when missing, as an open that writes needs the write lock, which the daemon may hold
+        const columns = this.db.query('PRAGMA table_info(synced_items)').all() as Array<{ name: string }>;
+        if (!columns.some((c) => c.name === 'contentReadAt')) {
+            this.db.run('ALTER TABLE synced_items ADD COLUMN contentReadAt REAL');
+        }
 
         this.db.run(`
             CREATE TABLE IF NOT EXISTS conflicts (
@@ -372,11 +383,11 @@ export class SyncStateDatabase {
                 INSERT OR REPLACE INTO synced_items (
                     localRelPath, nodeUid, parentNodeUid, type,
                     localSha1, remoteSha1, localMtimeMs, remoteMtimeMs,
-                    size, syncStatus, lastError, updatedAt
+                    size, syncStatus, lastError, updatedAt, contentReadAt
                 ) VALUES (
                     $localRelPath, $nodeUid, $parentNodeUid, $type,
                     $localSha1, $remoteSha1, $localMtimeMs, $remoteMtimeMs,
-                    $size, $syncStatus, $lastError, $updatedAt
+                    $size, $syncStatus, $lastError, $updatedAt, $contentReadAt
                 )
             `)
             .run({
@@ -392,6 +403,7 @@ export class SyncStateDatabase {
                 $syncStatus: item.syncStatus,
                 $lastError: item.lastError,
                 $updatedAt: updatedAt,
+                $contentReadAt: item.contentReadAt ?? null,
             });
         this.onChange?.(item.localRelPath, false);
     }
@@ -676,7 +688,10 @@ export class SyncStateDatabase {
     // Marks a record as current as of `at` (when its file was last read whole), without changing what it says
     touchItem(localRelPath: string, at: number): void {
         this.db
-            .query('UPDATE synced_items SET updatedAt = MAX(updatedAt, $at) WHERE localRelPath = $localRelPath')
+            .query(
+                `UPDATE synced_items SET updatedAt = MAX(updatedAt, $at), contentReadAt = MAX(COALESCE(contentReadAt, 0), $at)
+                 WHERE localRelPath = $localRelPath`,
+            )
             .run({ $at: at, $localRelPath: localRelPath });
     }
 
