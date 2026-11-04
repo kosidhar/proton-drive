@@ -167,14 +167,12 @@ export class SyncStateDatabase {
             )
         `);
         this.db.run('CREATE INDEX IF NOT EXISTS idx_synced_items_node_uid ON synced_items(nodeUid)');
-        // Records from before #109 take their updatedAt, which is what they were judged by then. Only when missing, as
-        // an open that writes needs the write lock, which the daemon may hold
+        // Records from before #109 have no read time: their updatedAt may hide a write made while they synced, so each
+        // file is hashed once (the next pass, or the watcher, which then finds it identical and uploads nothing), and is
+        // given one then. Only when missing, as an open that writes needs the write lock, which the daemon may hold
         const columns = this.db.query('PRAGMA table_info(synced_items)').all() as Array<{ name: string }>;
         if (!columns.some((c) => c.name === 'contentReadAt')) {
-            this.db.transaction(() => {
-                this.db.run('ALTER TABLE synced_items ADD COLUMN contentReadAt INTEGER');
-                this.db.run('UPDATE synced_items SET contentReadAt = updatedAt');
-            })();
+            this.db.run('ALTER TABLE synced_items ADD COLUMN contentReadAt REAL');
         }
 
         this.db.run(`

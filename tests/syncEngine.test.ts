@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test } from 'bun:test';
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { chmod, cp, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -10830,8 +10830,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await utimes(file, before.atime, before.mtime);
         };
 
-        test('written during its upload, as it was: the next pass looks at it, and uploads what it holds now', async () => {
-            const d = await synced();
+        // An upload of vault.bin held once it has read the file, written to meanwhile as a container is
+        const writtenDuringUpload = async (d: Awaited<ReturnType<typeof synced>>) => {
             await Bun.sleep(20);
             await writeFile(d.file, 'BBBBBBBB');
             // Holds the upload once it has read the file, until written to again
@@ -10853,10 +10853,52 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await Bun.sleep(20); // the record is written well after the write
             release();
             await pass;
+        };
+
+        test('written during its upload, as it was: the next pass looks at it, and uploads what it holds now', async () => {
+            const d = await synced();
+            await writtenDuringUpload(d);
             d.calls.uploads.length = 0;
             await d.engine.reconcileNow();
             expect(d.calls.uploads).toEqual(['vault.bin']);
             expect(stateDb.getItemByPath('vault.bin')?.localSha1).toBe(await computeLocalFileSha1(d.file));
+        });
+
+        test('written during its upload, then deleted in the cloud: the write is never removed as an unchanged copy', async () => {
+            const d = await synced();
+            await writtenDuringUpload(d);
+            d.nodes.delete(d.uid('vault.bin'));
+            await d.engine.reconcileNow();
+            // Kept: here, or in the desktop Trash (which the test's trash refuses, so here)
+            expect(await readFile(d.file, 'utf8')).toBe('CCCCCCCC');
+        });
+
+        test('written the instant its download is placed: the next pass looks at it', async () => {
+            const d = await synced();
+            const node = d.nodes.get(d.uid('vault.bin'))!;
+            d.nodes.set(d.uid('vault.bin'), { ...node, content: 'GGGGGGGG' } as any);
+            (d.nodes.get(d.uid('vault.bin')) as any).activeRevision = {
+                ...node.activeRevision!,
+                claimedDigests: { sha1: undefined },
+                claimedModificationTime: new Date(Date.now() + 60_000),
+            };
+            // Written straight after the download's stat of the placed file, well within a millisecond
+            const download = fileOpsModule.downloadDriveNodeToLocal;
+            const spy = spyOn(fileOpsModule, 'downloadDriveNodeToLocal').mockImplementation(async (options: any) => {
+                const result = await download(options);
+                const st = await stat(options.localPath);
+                writeFileSync(options.localPath, 'HHHHHHHH');
+                utimesSync(options.localPath, st.atime, st.mtime);
+                return result;
+            });
+            try {
+                await d.engine.reconcileNow();
+            } finally {
+                spy.mockRestore();
+            }
+            d.calls.uploads.length = 0;
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toEqual(['vault.bin']);
         });
 
         test('written a moment after its download is placed: the next pass looks at it', async () => {
@@ -10896,7 +10938,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.engine.reconcileNow();
                 await d.engine.reconcileNow();
                 await d.engine.reconcileNow();
-                expect(hashes.mock.calls.filter(([p]) => String(p).endsWith('vault.bin')).length).toBeLessThanOrEqual(1);
+                expect(hashes.mock.calls.filter(([p]) => String(p).endsWith('vault.bin')).length).toBe(0); // its download's read time holds
                 expect(d.calls.uploads).toEqual([]);
             } finally {
                 hashes.mockRestore();

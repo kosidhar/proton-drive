@@ -260,7 +260,7 @@ describe('SyncStateDatabase conflict strategy (#91)', () => {
 });
 
 describe('SyncStateDatabase content read time (#109)', () => {
-    test('records from before it was kept take their updatedAt as when their content was read', async () => {
+    test('records from before it was kept have no read time, so their files are hashed once', async () => {
         const tempDir = await mkdtemp(path.join(tmpdir(), 'proton-drive-statedb-test-'));
         try {
             const dbPath = path.join(tempDir, 'state.sqlite');
@@ -272,11 +272,14 @@ describe('SyncStateDatabase content read time (#109)', () => {
             old.run("INSERT INTO synced_items (localRelPath, nodeUid, type, updatedAt) VALUES ('a.txt', 'n1', 'file', 1234)");
             old.close();
             const stateDb = new SyncStateDatabase(dbPath);
-            expect(stateDb.getItemByPath('a.txt')?.contentReadAt).toBe(1234);
+            expect(stateDb.getItemByPath('a.txt')?.contentReadAt).toBeNull();
+            expect(stateDb.getItemByPath('a.txt')?.updatedAt).toBe(1234);
             stateDb.upsertItem({ ...stateDb.getItemByPath('a.txt')!, localRelPath: 'b.txt', contentReadAt: undefined });
             expect(stateDb.getItemByPath('b.txt')?.contentReadAt).toBeNull(); // written without one: not known
             stateDb.touchItem('b.txt', 5000);
             expect(stateDb.getItemByPath('b.txt')?.contentReadAt).toBe(5000);
+            stateDb.upsertItem({ ...stateDb.getItemByPath('a.txt')!, contentReadAt: 1730000000123.457 });
+            expect(stateDb.getItemByPath('a.txt')?.contentReadAt).toBe(1730000000123.457); // kept to the fraction
             stateDb.close();
         } finally {
             await rm(tempDir, { recursive: true, force: true });

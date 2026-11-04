@@ -4256,6 +4256,7 @@ export class ProtonDriveSyncEngine {
                                 syncStatus: 'synced',
                                 lastError: null,
                                 updatedAt: undefined,
+                                contentReadAt: null, // what is here now was never read (#109)
                             });
                         }
                         if (sourceUid !== null && sourceUid !== targetUid) {
@@ -6360,12 +6361,15 @@ function notWrittenSince(local: { ctimeMs?: number }, record: SyncedItemRecord):
 const CTIME_TICK_MS = 20;
 
 // The read time for a file just placed by a download: the ctime its placing gave it, as seen at once after, so that
-// what placed it isn't taken for a write after (which would have the watcher upload the download back). A write within
-// the same clock tick as that stat, keeping the size and the old mtime, is the one left unseen. Without that ctime,
-// the time before placing, which has the next look hash the file once
+// what placed it isn't taken for a write after (which would have the watcher upload the download back). Just above it
+// (notWrittenSince then holds for a ctime no newer than the one seen, and not for any later one, however close): only
+// a write within the same clock tick as that stat, keeping the size and the old mtime, is left unseen. Without that
+// ctime, the time before placing, which has the next look hash the file once
 function placedReadAt(placedCtimeMs: number | undefined, readFrom: number): number {
-    return placedCtimeMs === undefined ? readFrom : Math.max(readFrom, placedCtimeMs + CTIME_TICK_MS + 1);
+    return placedCtimeMs === undefined ? readFrom : Math.max(readFrom, placedCtimeMs + CTIME_TICK_MS + PLACED_CTIME_EPSILON_MS);
 }
+// Above the rounding of a ctime in ms at today's dates (about 0.0002 ms), below any later ctime the system gives
+const PLACED_CTIME_EPSILON_MS = 0.001;
 
 // Whether a local file differs from its record by size or time (as a pass's fast path tells), or has none: an upload
 // is what it would come to
