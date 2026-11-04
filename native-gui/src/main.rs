@@ -3259,7 +3259,6 @@ impl ProtonDriveNativeApp {
         ui.add_space(14.0);
     }
 
-    /// Asks the daemon to do what the user chose about the missing files, as they were shown.
     /// Above every tab while the daemon holds because the records are of another Proton account than the one signed in
     /// to: what the daemon says, and the two ways on. Starting fresh asks first; signing out (to sign in to the account
     /// the files were synced with) asks nothing, as it changes no file.
@@ -3323,6 +3322,7 @@ impl ProtonDriveNativeApp {
         ui.add_space(14.0);
     }
 
+    /// Asks the daemon to do what the user chose about the missing files, as they were shown.
     fn resolve_files_missing(&mut self, choice: MissingChoice, root: String, names: Vec<String>) {
         self.files_missing_working = true;
         self.files_missing_error = None;

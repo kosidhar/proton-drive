@@ -305,9 +305,12 @@ export class ProtonDriveSyncEngine {
     // FILES_HOLD too; a hold saved by an earlier run is looked at once (filesHoldResumed).
     private filesHold: { root: string; names: string[] } | null = null;
     private filesHoldResumed = false;
-    private filesGoneSaid: string | null = null;
+    private filesGoneSaid: string | null = null; // where the hold was last told about, so it is said once
     // Signed in to another account than the records are of (see recordsAreOf): nothing is synced until the user chooses
-    private accountMismatch: { message: string } | null = null; // where the hold was last told about, so it is said once
+    private accountMismatch: { message: string } | null = null;
+    // Whether the account signed in to was checked to be the records' since the engine started: until then, local and
+    // cloud changes and the journal wait for a pass, which checks it first (#35)
+    private accountVerified = false;
     private filesGoneError: string | null = null; // the lastError the hold set, which ending it clears
     private missingKnown: { hold: object; at: number; missing: MissingItems } | null = null; // see stillMissing
     // Missing items the user said were deleted on purpose, for the next sync pass to take for deletes
@@ -497,6 +500,18 @@ export class ProtonDriveSyncEngine {
             return;
         }
 
+        // The account checked before anything watches or acts (#35): another account's records are never acted on. Not
+        // told (offline), nothing acts until a pass has checked it (see accountVerified)
+        const root = await this.getRootFolder().catch(() => null);
+        if (root !== null) {
+            if (!this.recordsAreOf(root.uid)) {
+                this.state = 'error';
+                this.lastError = this.accountMismatch!.message;
+                return;
+            }
+            this.accountVerified = true;
+        }
+
         if (!this.unsubscribeDriveEvents) {
             this.unsubscribeDriveEvents = this.eventsManager.addEventListener(async (context, event) => {
                 if (context === 'drive') {
@@ -524,6 +539,11 @@ export class ProtonDriveSyncEngine {
     async stop(): Promise<void> {
         this.stopped = true;
         this.rootNode = null; // signed out, maybe to sign in to another account: looked up again (#35)
+        this.accountVerified = false;
+        if (this.accountMismatch) {
+            this.lastError = null; // said again, if it still holds, at the next start
+            this.accountMismatch = null;
+        }
         this.watcher.stop();
         for (const settling of this.settlingFiles.values()) {
             settling.cancel(); // The pass at the next start looks at them again
@@ -836,6 +856,7 @@ export class ProtonDriveSyncEngine {
     // the user agreed to. Answers what was confirmed. Throws FilesMissingRefused (409) when nothing is held, for a
     // mismatch, or while the files move between the sync folder and the backing store.
     async confirmFilesMissingDeleted(expected: { root: string; names: string[] }): Promise<FilesMissingStatus> {
+        this.refuseForAnotherAccount(); // about the records of the account they are of (#35)
         const { root, missing } = this.shownMissing(expected, 'nothing was deleted');
         this.missingConfirmed = { root, names: new Set(missing.names) };
         this.endFilesHold();
@@ -854,6 +875,7 @@ export class ProtonDriveSyncEngine {
     // checked as for confirmFilesMissingDeleted. Answers what was kept. Throws FilesMissingRefused (409) when nothing is
     // held, for a mismatch, or while the files move between the sync folder and the backing store.
     async keepFilesMissingOnlineOnly(expected: { root: string; names: string[] }): Promise<FilesMissingStatus> {
+        this.refuseForAnotherAccount(); // about the records of the account they are of (#35)
         const { missing } = this.shownMissing(expected, 'nothing was changed');
         this.stateDb.connection.transaction(() => {
             for (const name of missing.names) {
@@ -1058,14 +1080,6 @@ export class ProtonDriveSyncEngine {
         if (this.filesGone(true)) {
             return; // Looked at again at the next pass
         }
-        // Signed in to another account than the records are of: nothing of them is acted on (#35). Not told here (offline,
-        // say), the pass goes on as before: it can't reach the cloud either
-        const root = await this.getRootFolder().catch(() => null);
-        if (root && !this.recordsAreOf(root.uid)) {
-            this.state = 'error';
-            this.lastError = this.accountMismatch!.message;
-            return;
-        }
         // This pass takes the items the user confirmed as deleted for deletes, and uses the confirmation up (unless an
         // item it touches failed: then the next pass does)
         const confirmation = this.missingConfirmed;
@@ -1084,6 +1098,15 @@ export class ProtonDriveSyncEngine {
             this.recoverLocalMove();
             await mkdir(this.localRoot(), { recursive: true });
             const root = await this.getRootFolder();
+            // Signed in to another account than the records are of: nothing of them is acted on (#35). The root the pass
+            // works with is the one checked; one that can't be had (offline) fails the pass, as before, and checks nothing
+            if (!this.recordsAreOf(root.uid)) {
+                this.state = 'error';
+                this.lastError = this.accountMismatch!.message;
+                this.currentAction = null;
+                return;
+            }
+            this.accountVerified = true;
             await this.eventsManager.subscribeDriveScope(root.treeEventScopeId);
             this.index.setRoot(root.uid);
             if (this.stateDb.getMeta(PIN_ROOT_ON_FIRST_SYNC) === '1') {
@@ -2732,8 +2755,8 @@ export class ProtonDriveSyncEngine {
                 if (this.localWaiting.get(relPath) === look) {
                     this.localWaiting.delete(relPath); // Started: a report from now on is for a later look
                 }
-                if (this.stopped || this.holding() || !this.auth.isLoggedIn()) {
-                    return;
+                if (this.stopped || this.holding() || !this.auth.isLoggedIn() || !(await this.verifyAccount())) {
+                    return; // Not unless the account is checked to be the records' (#35): the pass after catches up
                 }
                 if (this.filesGone()) {
                     return; // Not a change to sync: the files are missing from the folder (see filesGone); the pass after catches up
@@ -3055,6 +3078,9 @@ export class ProtonDriveSyncEngine {
     private async handleRemoteDriveEvent(event: DriveEvent): Promise<void> {
         if (this.holding()) {
             return; // The pass after the move, at start(), catches up
+        }
+        if (!(await this.verifyAccount())) {
+            return; // The account not checked to be the records' (#35): the pass, which checks it, catches up
         }
         if (this.filesGone()) {
             return; // The pass once the files are back catches up
@@ -3576,11 +3602,14 @@ export class ProtonDriveSyncEngine {
     private recordsAreOf(rootUid: string): boolean {
         const recorded = this.stateDb.getMeta(ACCOUNT_ROOT);
         if (recorded === null) {
-            this.stateDb.setMeta(ACCOUNT_ROOT, rootUid); // records from before this was remembered: this account's
-            this.accountMismatch = null;
-            return true;
-        }
-        if (recorded === rootUid) {
+            // Records from before this was remembered: this account's only if what they say is at the top is in its root
+            const top = this.stateDb.getAllItems().filter((item) => !item.localRelPath.includes('/') && item.parentNodeUid !== null);
+            if (top.length === 0 || top.some((item) => item.parentNodeUid === rootUid)) {
+                this.stateDb.setMeta(ACCOUNT_ROOT, rootUid);
+                this.accountMismatch = null;
+                return true;
+            }
+        } else if (recorded === rootUid) {
             this.accountMismatch = null;
             return true;
         }
@@ -3594,6 +3623,17 @@ export class ProtonDriveSyncEngine {
                 'this computer and syncing them to this account as new files.',
         };
         return false;
+    }
+
+    // Whether the account signed in to is checked to be the records': at once when it was since the engine started, or
+    // by looking up its root now; false when that can't be told (offline), so nothing acts on unchecked records (#35)
+    private async verifyAccount(): Promise<boolean> {
+        if (this.accountMismatch) return false;
+        if (this.accountVerified) return true;
+        const root = await this.getRootFolder().catch(() => null);
+        if (root === null || !this.recordsAreOf(root.uid)) return false;
+        this.accountVerified = true;
+        return true;
     }
 
     private refuseForAnotherAccount(): void {
@@ -4202,6 +4242,9 @@ export class ProtonDriveSyncEngine {
         }
         const run = (async () => {
             try {
+                if (!(await this.verifyAccount())) {
+                    return; // Never sent before the account is checked to be the records' (#35): the next pass sends it
+                }
                 do {
                     this.replayAgain = false;
                     await this.replayPending();
