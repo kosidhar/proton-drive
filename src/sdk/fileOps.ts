@@ -280,17 +280,24 @@ export async function downloadDriveNodeToLocal(options: {
 
     const tempPath = path.join(parentDir, `.proton-drive-tmp-${process.pid}-${Date.now()}-${path.basename(localPath)}`);
     const downloaded = await downloadRevisionToFile({ sdk, logger, remoteNode, revision, filePath: tempPath, onProgress });
-    if (options.beforePlacing && !(await options.beforePlacing().catch(() => false))) {
-        await unlink(tempPath).catch(() => {});
-        return { status: 'skipped-changed', localPath, size: 0, mtimeMs: 0 };
-    }
     // Its time is set, and it is looked at, before it is placed: what it is then is what was downloaded. Set after, a
-    // write between the placing and the setting would get the cloud's time and pass for the download (#199)
+    // write between the placing and the setting would get the cloud's time and pass for the download (#199). Before
+    // beforePlacing too: between its check that the file here is unchanged and the placing, nothing may wait, or a
+    // save there would be overwritten
     let placing: Awaited<ReturnType<typeof stat>>;
     try {
         const mtimeDate = new Date(downloaded.mtimeMs);
         await utimes(tempPath, mtimeDate, mtimeDate).catch(() => {});
         placing = await stat(tempPath);
+    } catch (error) {
+        await unlink(tempPath).catch(() => {});
+        throw error;
+    }
+    if (options.beforePlacing && !(await options.beforePlacing().catch(() => false))) {
+        await unlink(tempPath).catch(() => {});
+        return { status: 'skipped-changed', localPath, size: 0, mtimeMs: 0 };
+    }
+    try {
         await rename(tempPath, localPath);
     } catch (error) {
         logger.error(`Failed downloading ${getName(remoteNode)} to ${localPath}`, error);

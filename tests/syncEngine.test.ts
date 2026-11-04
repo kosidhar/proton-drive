@@ -9385,6 +9385,23 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(stateDb.getConflictById(d.conflict.id)?.resolved).toBe(0);
         });
 
+        // #199 put setting the download's time, and looking at it, before placing: never between the check that the file
+        // here is unchanged (beforePlacing) and the placing, where a save would be overwritten
+        test('keep-remote by hand never replaces a save made as the download is readied to be placed (#199)', async () => {
+            const d = await queued();
+            const real = fsPromises.utimes;
+            const spy = spyOn(fsPromises, 'utimes').mockImplementation(async (p: any, a: any, m: any) => {
+                await writeFile(d.local('a.txt'), 'saved meanwhile');
+                return real(p, a, m);
+            });
+            try {
+                await d.engine.resolveConflictManually(d.conflict.id, 'keep-remote').catch(() => {});
+            } finally {
+                spy.mockRestore();
+            }
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('saved meanwhile');
+        });
+
         test('a delete here seen while the user resolves by hand ends nothing and records nothing', async () => {
             const d = await queued();
             const held = hold(d, 'getNode');
