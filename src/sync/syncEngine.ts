@@ -877,7 +877,8 @@ export class ProtonDriveSyncEngine {
     // after it is held again. `expected` is what the user was shown (filesMissing's root and names): it must still be
     // exactly what is missing, in any order, or the confirmation is refused, as what would be deleted is no longer what
     // the user agreed to. Answers what was confirmed. Throws FilesMissingRefused (409) when nothing is held, for a
-    // mismatch, or while the files move between the sync folder and the backing store.
+    // mismatch, or while the files move between the sync folder and the backing store; DriveOpError (EIO) while the
+    // account signed in to can't be checked to be the records' (offline), or is another's (#35).
     async confirmFilesMissingDeleted(expected: { root: string; names: string[] }): Promise<FilesMissingStatus> {
         await this.refuseUntilAccountChecked(); // about the records of the account they are of (#35)
         const { root, missing } = this.shownMissing(expected, 'nothing was deleted');
@@ -896,7 +897,8 @@ export class ProtonDriveSyncEngine {
     // later; and what of them was kept on this device stops being kept (an explicit unpin, as Free up space gives), so
     // nothing comes down again. They show as online-only, in the drive and in My files, and the hold ends. `expected` is
     // checked as for confirmFilesMissingDeleted. Answers what was kept. Throws FilesMissingRefused (409) when nothing is
-    // held, for a mismatch, or while the files move between the sync folder and the backing store.
+    // held, for a mismatch, or while the files move between the sync folder and the backing store; DriveOpError (EIO)
+    // while the account can't be checked to be the records', or is another's (#35).
     async keepFilesMissingOnlineOnly(expected: { root: string; names: string[] }): Promise<FilesMissingStatus> {
         await this.refuseUntilAccountChecked(); // about the records of the account they are of (#35)
         const { missing } = this.shownMissing(expected, 'nothing was changed');
@@ -1192,7 +1194,8 @@ export class ProtonDriveSyncEngine {
                 this.onlineOnlyCrawlDue = true; // The next pass crawls instead
             }
             const msg = error instanceof Error ? error.message : String(error);
-            this.lastError = msg;
+            // A mismatch known is what the user needs to hear of, not that the pass couldn't reach Proton Drive (#35)
+            this.lastError = this.accountMismatch?.message ?? msg;
             this.currentAction = null;
             this.state = 'error';
             this.logger.error('Reconcile failed', error);
@@ -3650,6 +3653,8 @@ export class ProtonDriveSyncEngine {
         }
         this.accountMismatch = { message: ACCOUNT_MISMATCH_MESSAGE };
         this.stateDb.setMeta(ACCOUNT_MISMATCH, '1');
+        this.state = 'error'; // however it was found (a pass, a change, the journal): the status says so
+        this.lastError = ACCOUNT_MISMATCH_MESSAGE;
         return false;
     }
 
@@ -3713,10 +3718,21 @@ export class ProtonDriveSyncEngine {
         }
         const generation = this.accountGeneration;
         const root = await this.getRootFolder();
-        if (generation !== this.accountGeneration || !this.accountMismatch || this.holding()) {
+        const changedMeanwhile = () => generation !== this.accountGeneration || !this.accountMismatch || this.holding();
+        if (changedMeanwhile()) {
             throw new Error('Signed out, or the files began to move, meanwhile: nothing was changed');
         }
+        // Checked against the account signed in to now, never only by what is remembered: a mismatch kept from before
+        // (see ACCOUNT_MISMATCH) may be over, signed back in to the records' account, and starting fresh then would
+        // drop their records and the drive changes still to be sent
+        if (this.recordsAreOf(root.uid)) {
+            this.accountVerified = true;
+            throw new Error('The files on this computer are synced with the same Proton account: there is nothing to start fresh from');
+        }
         await this.inAvailabilityRun(async () => {
+            if (changedMeanwhile()) {
+                throw new Error('Signed out, or the files began to move, meanwhile: nothing was changed');
+            }
             this.stateDb.connection.transaction(() => {
                 for (const table of ['synced_items', 'conflicts', 'drive_edit_baselines', 'remote_nodes', 'remote_ops', 'availability']) {
                     this.stateDb.connection.run(`DELETE FROM ${table}`);

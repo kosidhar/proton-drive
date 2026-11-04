@@ -10955,11 +10955,11 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         test('a check made between sign-out and the next sign-in never stands for the account signed in to next', async () => {
             const d = await synced();
             const engine = fresh(d);
-            await engine.start({ backgroundInitialReconcile: true });
+            await engine.start();
             await engine.stop(); // signing out: still signed in to this account for a moment
             expect(await (engine as any).verifyAccount()).toBe(true); // as a drive change journalled meanwhile does, with this one's root
             signInAs(d, 'other~root'); // the next sign-in is to another account
-            await engine.start({ backgroundInitialReconcile: true });
+            await engine.start();
             expect(engine.getStatus().accountMismatch).not.toBeNull();
             await engine.stop();
         });
@@ -10979,7 +10979,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await Bun.sleep(5);
             await engine.stop();
             signInAs(d, 'other~root');
-            await engine.start({ backgroundInitialReconcile: true });
+            await engine.start();
             release();
             expect(await held).toBe(false);
             expect(engine.getStatus().accountMismatch).not.toBeNull();
@@ -10997,7 +10997,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 throw new Error('offline');
             };
             const engine = fresh(d);
-            await engine.start({ backgroundInitialReconcile: true });
+            await engine.start();
             expect(engine.getStatus().accountMismatch?.message).toMatch(/different Proton account/);
             await expect(engine.setAvailability('Kept.txt', 'free')).rejects.toThrow(/different Proton account/);
             await expect(engine.deleteItem('Kept.txt')).rejects.toThrow(/different Proton account/);
@@ -11012,7 +11012,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 throw new Error('offline');
             };
             const engine = fresh(d);
-            await engine.start({ backgroundInitialReconcile: true });
+            await engine.start();
             await expect(engine.setAvailability('Kept.txt', 'free')).rejects.toThrow(/try again once online/);
             await expect(engine.resolveConflictManually(1, 'keep-local')).rejects.toThrow(/try again once online/);
             expect(await readFile(d.local('Kept.txt'), 'utf8')).toBe('kept');
@@ -11045,6 +11045,47 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await (engine as any).handleLocalFileChange('Docs/new.txt');
             expect(d.calls.uploads).toContain('Docs/new.txt');
             await engine.stop();
+        });
+
+        test('starting fresh is refused when a mismatch remembered from before is over: the records and journal stay', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountMismatch', '1'); // from a sign-in to another account, since signed back out of
+            (d.engine as any).accountMismatch = { message: 'remembered' }; // as a start that couldn't check restores it
+            // A drive delete still to be sent
+            stateDb.connection.run("INSERT INTO remote_ops (kind, nodeUid, path, createdAt) VALUES ('trash', 'vol~Kept.txt', 'Kept.txt', 0)");
+            const journalled = () => (stateDb.connection.query('SELECT COUNT(*) AS n FROM remote_ops').get() as { n: number }).n;
+            const records = stateDb.getAllItems().length;
+            await expect(d.engine.startFreshForThisAccount()).rejects.toThrow(/same Proton account/);
+            expect(stateDb.getAllItems().length).toBe(records);
+            expect(journalled()).toBe(1);
+            expect(stateDb.getMeta('accountMismatch')).toBeNull();
+            expect(d.engine.getStatus().accountMismatch).toBeNull();
+        });
+
+        test('starting fresh that waited for its turn across a sign-out changes nothing', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountRoot', 'other~root');
+            await d.engine.reconcileNow();
+            const records = stateDb.getAllItems().length;
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            const held = (d.engine as any).inAvailabilityRun(() => gate); // another availability change holds the turn
+            const fresh = d.engine.startFreshForThisAccount();
+            await Bun.sleep(10);
+            await d.engine.stop();
+            release();
+            await held;
+            await expect(fresh).rejects.toThrow(/nothing was changed/);
+            expect(stateDb.getAllItems().length).toBe(records);
+            expect(stateDb.getMeta('accountRoot')).toBe('other~root');
+        });
+
+        test('a mismatch found by a local change is what the status says', async () => {
+            const d = await synced();
+            const engine = otherAccount(d);
+            await writeFile(d.local('Docs/new.txt'), 'new');
+            await (engine as any).handleLocalFileChange('Docs/new.txt');
+            expect(engine.getStatus()).toMatchObject({ state: 'error', lastError: expect.stringMatching(/different Proton account/) });
         });
 
         test('starting fresh is refused while the files move', async () => {
