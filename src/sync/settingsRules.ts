@@ -54,20 +54,27 @@ const ORDINARY_PATHS = [
 ];
 const NEARLY_ALL = 0.9;
 
-function hidesAll(patterns: string[]): boolean {
-    // Hidden as the engine hides it: the path itself, or any folder above it, ignored
-    const ignored = (sample: string) => {
+// Hidden as the engine hides it: the path itself, or any folder above it, ignored
+function hiddenBy(patterns: string[]) {
+    return (sample: string) => {
         const names = sample.split('/');
         return names.some((_, i) => matchesIgnorePatterns(names.slice(0, i + 1).join('/'), patterns));
     };
-    // Every file, every file inside folders, or every file not hidden by its name (a pattern like [!.]* leaves only
-    // dotfiles: the whole drive as the user sees it), or nearly every ordinary name
-    return (
-        SAMPLE_PATHS.every(ignored) ||
-        NESTED_SAMPLE_PATHS.every(ignored) ||
-        VISIBLE_SAMPLE_PATHS.every(ignored) ||
-        ORDINARY_PATHS.filter(ignored).length >= NEARLY_ALL * ORDINARY_PATHS.length
-    );
+}
+
+// Every file, every file inside folders, or every file not hidden by its name (a pattern like [!.]* leaves only
+// dotfiles: the whole drive as the user sees it)
+function hidesAll(patterns: string[]): boolean {
+    const ignored = hiddenBy(patterns);
+    return SAMPLE_PATHS.every(ignored) || NESTED_SAMPLE_PATHS.every(ignored) || VISIBLE_SAMPLE_PATHS.every(ignored);
+}
+
+// Nearly every ordinary name, by the wildcard patterns alone: a pattern naming a file or folder hides only that, however
+// many of the ordinary names it happens to be (#151)
+function hidesNearlyAll(patterns: string[]): boolean {
+    const wildcards = patterns.filter((pattern) => /[*?[{]/.test(pattern));
+    if (wildcards.length === 0) return false;
+    return ORDINARY_PATHS.filter(hiddenBy(wildcards)).length >= NEARLY_ALL * ORDINARY_PATHS.length;
 }
 
 function problemWithPattern(pattern: unknown, index: number): string | null {
@@ -91,8 +98,10 @@ export function problemWithIgnorePatterns(patterns: unknown): string | null {
     try {
         for (const [index, pattern] of list.entries()) {
             if (hidesAll([pattern])) return `ignorePatterns[${index}] (${JSON.stringify(pattern)}) matches every file and would hide the whole drive`;
+            if (hidesNearlyAll([pattern])) return `ignorePatterns[${index}] (${JSON.stringify(pattern)}) matches nearly every file and would hide most of the drive`;
         }
         if (list.length > 1 && hidesAll(list)) return 'ignorePatterns together match every file and would hide the whole drive';
+        if (list.length > 1 && hidesNearlyAll(list)) return 'ignorePatterns together match nearly every file and would hide most of the drive';
     } catch {
         return 'ignorePatterns holds a pattern that is not valid';
     }
@@ -102,7 +111,8 @@ export function problemWithIgnorePatterns(patterns: unknown): string | null {
 // What of a stored list can be used (it may have been saved before the checks existed): the entries that are valid,
 // none of which hides everything alone, or null when nothing usable is left (or the rest together hide everything), and
 // the default list stands in. A stored list that is empty is a usable list that ignores nothing. `dropped` counts the
-// entries left out.
+// entries left out. Judged by hidesAll only: a list saved before the check for nearly every file (#151) stays as the
+// user saved it, rather than letting files they kept out start syncing after an update.
 export function usableIgnorePatterns(stored: unknown): { patterns: string[]; dropped: number } | null {
     if (!Array.isArray(stored)) return null;
     const usable: string[] = [];
