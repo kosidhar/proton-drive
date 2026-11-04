@@ -17,6 +17,7 @@ import { migrateExcludedFolders } from '../sync/availabilityMigration';
 import { backingDirFor, virtualDriveWanted } from '../sync/driveMode';
 import { ProtonDriveSyncEngine } from '../sync/syncEngine';
 import { SyncStateDatabase } from '../sync/syncStateDb';
+import type { Logger } from '@protontech/drive-sdk';
 import { defaultControlSocketPath, startControlServer } from './controlServer';
 import { controlServerOptions } from './controlWiring';
 import { DriveController } from './driveController';
@@ -63,6 +64,14 @@ function prettifyName(rawName: string, email: string): string {
         .join(' ');
 }
 
+// The engine logs as [sync], and every decision it records in the activity log goes to the log file too: started
+// detached by the app, the daemon has no other record of why it did what it did (#180). Returns the engine's logger
+export function wireSyncLogging(runtime: { getLogger(name: string): Logger }, stateDb: SyncStateDatabase): Logger {
+    const syncLogger = runtime.getLogger('sync');
+    stateDb.onActivity = (entry) => syncLogger.info(activityLogLine(entry));
+    return syncLogger;
+}
+
 // An activity log entry as a line of the daemon's log file
 export function activityLogLine(entry: { action: string; localRelPath: string; details: string }): string {
     return `${entry.action} ${entry.localRelPath}: ${entry.details}`;
@@ -88,10 +97,7 @@ export async function startSyncDaemon(options: {
     const stateDbPath = path.join(runtime.config.appDir, 'ubuntu-sync-state.sqlite');
     const stateDb = new SyncStateDatabase(stateDbPath);
 
-    // The engine logs as [sync], and every decision it records in the activity log goes to the log file too: started
-    // detached by the app, the daemon has no other record of why it did what it did (#180)
-    const syncLogger = runtime.getLogger('sync');
-    stateDb.onActivity = (entry) => syncLogger.info(activityLogLine(entry));
+    const syncLogger = wireSyncLogging(runtime, stateDb);
     const engine = new ProtonDriveSyncEngine(
         runtime.sdk,
         runtime.eventsManager,
