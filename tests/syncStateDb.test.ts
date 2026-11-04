@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { SyncStateDatabase } from '../src/sync/syncStateDb';
+import { Database } from 'bun:sqlite';
 
 describe('SyncStateDatabase paths', () => {
     let tempDir: string;
@@ -224,6 +225,27 @@ describe('SyncStateDatabase activity hook', () => {
             stateDb.logActivity({ action: 'delete-local', localRelPath: 'Docs/a.txt', details: 'Deleted on this computer' });
             expect(told).toEqual([{ action: 'delete-local', localRelPath: 'Docs/a.txt', details: 'Deleted on this computer' }]);
             stateDb.close();
+        } finally {
+            await rm(tempDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('SyncStateDatabase conflict strategy (#91)', () => {
+    test('keep-local or keep-remote, stored by an older version, reads as keep-both; the stored value is left as it is', async () => {
+        const tempDir = await mkdtemp(path.join(tmpdir(), 'proton-drive-statedb-test-'));
+        try {
+            const dbPath = path.join(tempDir, 'state.sqlite');
+            for (const retired of ['keep-local', 'keep-remote']) {
+                const stateDb = new SyncStateDatabase(dbPath);
+                const raw = new Database(dbPath);
+                raw.run("INSERT OR REPLACE INTO settings (key, value) VALUES ('conflictStrategy', ?)", [retired]);
+                expect([retired, stateDb.getSettings().conflictStrategy]).toEqual([retired, 'keep-both']);
+                const stored = raw.query("SELECT value FROM settings WHERE key = 'conflictStrategy'").get() as { value: string };
+                expect(stored.value).toBe(retired);
+                raw.close();
+                stateDb.close();
+            }
         } finally {
             await rm(tempDir, { recursive: true, force: true });
         }

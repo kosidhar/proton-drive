@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 
 import { selfOrDescendant, selfOrDescendantWhere } from './pathRange';
-import { type ConflictStrategy, isConflictStrategy, problemWithBlockedApps, usableIgnorePatterns } from './settingsRules';
+import { type ConflictStrategy, isConflictStrategy, problemWithBlockedApps, RETIRED_CONFLICT_STRATEGIES, usableIgnorePatterns } from './settingsRules';
 
 export type ItemSyncStatus = 'synced' | 'uploading' | 'downloading' | 'conflict' | 'error' | 'ignored';
 export { CONFLICT_STRATEGIES, type ConflictStrategy } from './settingsRules';
@@ -266,6 +266,9 @@ export class SyncStateDatabase {
         let conflictStrategy: ConflictStrategy = 'keep-both';
         if (isConflictStrategy(storedStrategy)) {
             conflictStrategy = storedStrategy;
+        } else if (storedStrategy && RETIRED_CONFLICT_STRATEGIES.includes(storedStrategy)) {
+            // Saved before #91: it replaced one side with the other. Read as keep-both, never acted on
+            this.warnBadSetting('conflictStrategy', storedStrategy, 'as keep-both (keep-local and keep-remote are no longer offered)');
         } else if (storedStrategy) {
             this.warnBadSetting('conflictStrategy', storedStrategy);
         }

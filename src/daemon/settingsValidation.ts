@@ -1,4 +1,4 @@
-import { isConflictStrategy, CONFLICT_STRATEGIES, problemWithBlockedApps, problemWithIgnorePatterns } from '../sync/settingsRules';
+import { isConflictStrategy, CONFLICT_STRATEGIES, RETIRED_CONFLICT_STRATEGIES, problemWithBlockedApps, problemWithIgnorePatterns } from '../sync/settingsRules';
 import type { SyncSettings } from '../sync/syncStateDb';
 
 export { MAX_IGNORE_PATTERN_LENGTH, MAX_IGNORE_PATTERNS } from '../sync/settingsRules';
@@ -17,6 +17,12 @@ export function parseSettings(body: Record<string, unknown>): ParsedSettings {
         value.ignorePatterns = ignorePatterns as string[];
     }
     if (conflictStrategy !== undefined) {
+        if (typeof conflictStrategy === 'string' && RETIRED_CONFLICT_STRATEGIES.includes(conflictStrategy)) {
+            return {
+                ok: false,
+                error: `conflictStrategy ${conflictStrategy} is no longer offered: a conflict always keeps both versions (keep-both, or prompt to choose each time)`,
+            };
+        }
         if (!isConflictStrategy(conflictStrategy)) {
             return { ok: false, error: `conflictStrategy must be one of ${CONFLICT_STRATEGIES.join(', ')}` };
         }

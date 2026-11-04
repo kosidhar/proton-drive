@@ -69,10 +69,20 @@ describe('settings are validated, every field, before any is stored (#34, #36)',
 
     test('every strategy the engine knows is accepted', async () => {
         const s = setup();
-        for (const conflictStrategy of ['keep-both', 'keep-local', 'keep-remote', 'prompt'] as const) {
+        for (const conflictStrategy of ['keep-both', 'prompt'] as const) {
             expect((await s.save({ conflictStrategy })).status).toBe(200);
             expect(s.stateDb.getSettings().conflictStrategy).toBe(conflictStrategy);
         }
+    });
+
+    test('keep-local and keep-remote are refused, saying conflicts always keep both versions now (#91)', async () => {
+        const s = setup();
+        for (const conflictStrategy of ['keep-local', 'keep-remote']) {
+            const res = await s.save({ conflictStrategy });
+            expect([conflictStrategy, res.status]).toEqual([conflictStrategy, 400]);
+            expect(res.json.error).toContain('no longer offered');
+        }
+        expect(s.stateDb.getSettings()).toEqual(s.before);
     });
 
     const bad: Array<[string, Record<string, unknown>]> = [
@@ -89,6 +99,8 @@ describe('settings are validated, every field, before any is stored (#34, #36)',
         ['conflictStrategy unknown', { conflictStrategy: 'delete-everything' }],
         ['conflictStrategy a number', { conflictStrategy: 1 }],
         ['conflictStrategy null', { conflictStrategy: null }],
+        ['conflictStrategy keep-local, which is no longer offered (#91)', { conflictStrategy: 'keep-local' }],
+        ['conflictStrategy keep-remote, which is no longer offered (#91)', { conflictStrategy: 'keep-remote' }],
         ['notificationsEnabled a string', { notificationsEnabled: 'false' }],
         ['notificationsEnabled a number', { notificationsEnabled: 0 }],
         ['notificationsEnabled null', { notificationsEnabled: null }],
@@ -98,7 +110,7 @@ describe('settings are validated, every field, before any is stored (#34, #36)',
     for (const [name, field] of bad) {
         test(`${name}: 400 EINVAL, and the good fields beside it are not stored either`, async () => {
             const s = setup();
-            const res = await s.save({ ...field, conflictStrategy: field.conflictStrategy === undefined ? 'keep-local' : field.conflictStrategy, notificationsEnabled: field.notificationsEnabled === undefined ? false : field.notificationsEnabled });
+            const res = await s.save({ ...field, conflictStrategy: field.conflictStrategy === undefined ? 'prompt' : field.conflictStrategy, notificationsEnabled: field.notificationsEnabled === undefined ? false : field.notificationsEnabled });
             expect([name, res.status, res.json.code]).toEqual([name, 400, 'EINVAL']);
             expect(typeof res.json.error).toBe('string');
             expect(s.stateDb.getSettings()).toEqual(s.before);
@@ -108,7 +120,7 @@ describe('settings are validated, every field, before any is stored (#34, #36)',
 
     test('a good field is not stored when another is bad', async () => {
         const s = setup();
-        const res = await s.save({ conflictStrategy: 'keep-remote', notificationsEnabled: false, ignorePatterns: ['*'] });
+        const res = await s.save({ conflictStrategy: 'prompt', notificationsEnabled: false, ignorePatterns: ['*'] });
         expect(res.status).toBe(400);
         expect(s.stateDb.getSettings()).toEqual(s.before);
     });
@@ -136,9 +148,9 @@ describe('settings are validated, every field, before any is stored (#34, #36)',
         const bad = await s.save({ syncDir: to, virtualDriveWanted: true, notificationsEnabled: false, ignorePatterns: ['*'] });
         expect(bad.status).toBe(400);
         expect(s.stateDb.getSettings()).toEqual(s.before);
-        const good = await s.save({ syncDir: to, notificationsEnabled: false, conflictStrategy: 'keep-remote', ignorePatterns: ['*.bak'] });
+        const good = await s.save({ syncDir: to, notificationsEnabled: false, conflictStrategy: 'prompt', ignorePatterns: ['*.bak'] });
         expect(good.json).toMatchObject({ ok: true, folderError: null, switchError: null });
-        expect(s.stateDb.getSettings()).toMatchObject({ syncDir: to, notificationsEnabled: false, conflictStrategy: 'keep-remote', ignorePatterns: ['*.bak'] });
+        expect(s.stateDb.getSettings()).toMatchObject({ syncDir: to, notificationsEnabled: false, conflictStrategy: 'prompt', ignorePatterns: ['*.bak'] });
     });
 
     test('limits are inclusive: 500 patterns of 1024 characters are fine, and an empty list clears them', async () => {
