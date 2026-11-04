@@ -53,6 +53,8 @@ export interface Config {
     enableMetrics: boolean;
     /** Level of logging to both console and log file. */
     logLevel: LogLevel;
+    /** The level for the SDK's own loggers (api, download, upload, nodes…), which log a line per block at INFO. */
+    sdkLogLevel: LogLevel;
 
     /** Where to persist the authenticated session. */
     credentialsStore: CredentialsStoreType;
@@ -61,8 +63,14 @@ export interface Config {
 }
 
 export function getConfig(options: InitConfig): Config {
-    const logLevelOption = process.env.PROTON_DRIVE_LOG_LEVEL?.toUpperCase() ?? 'DEBUG';
-    const logLevel = LogLevel[logLevelOption as keyof typeof LogLevel] ?? LogLevel.DEBUG;
+    // The app's own lines at INFO and the SDK's at WARNING by default: the SDK's DEBUG and INFO lines (each API call,
+    // several per file and per block) filled the rotating log files within hours, taking what the sync engine logged
+    // with them (#180). PROTON_DRIVE_LOG_LEVEL sets both; without it, -v (the console log) asks for DEBUG
+    const fromEnv = process.env.PROTON_DRIVE_LOG_LEVEL
+        ? LogLevel[process.env.PROTON_DRIVE_LOG_LEVEL.toUpperCase() as keyof typeof LogLevel]
+        : undefined;
+    const logLevel = fromEnv ?? (options.enableConsoleLog ? LogLevel.DEBUG : LogLevel.INFO);
+    const sdkLogLevel = fromEnv ?? (options.enableConsoleLog ? LogLevel.DEBUG : LogLevel.WARNING);
 
     const { cacheDir, appDir, logDir } = defaultDataDirs();
 
@@ -82,6 +90,7 @@ export function getConfig(options: InitConfig): Config {
         enableConsoleLog: options.enableConsoleLog || false,
         enableMetrics: options.enableMetrics || false,
         logLevel,
+        sdkLogLevel,
         credentialsStore: parseCredentialsStore(process.env.PROTON_DRIVE_CREDENTIALS_STORE),
         unsafeCache: parseBooleanEnv(process.env.PROTON_DRIVE_UNSAFE_CACHE),
     };

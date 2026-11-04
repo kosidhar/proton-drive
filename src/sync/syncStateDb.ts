@@ -106,6 +106,8 @@ export class SyncStateDatabase {
     onChange: ((relPath: string, subtree: boolean) => void) | null = null;
     // Told when every state may have changed at once: the sync folder moved, the ignore patterns or the layout changed
     onReset: (() => void) | null = null;
+    // Told of each activity entry as it is logged: the daemon writes them to its log file too (#180)
+    onActivity: ((entry: { action: ActivityRecord['action']; localRelPath: string; details: string }) => void) | null = null;
 
     // For modules that keep their own tables in this database file, such as RemoteIndex.
     get connection(): Database {
@@ -751,6 +753,13 @@ export class SyncStateDatabase {
             DELETE FROM activity_log
             WHERE id NOT IN (SELECT id FROM activity_log ORDER BY id DESC LIMIT 500)
         `);
+
+        // Best effort: a log handler failing never fails what logged the entry
+        try {
+            this.onActivity?.({ action: entry.action, localRelPath: entry.localRelPath, details: entry.details });
+        } catch {
+            // the entry is in the activity log all the same
+        }
     }
 
     listActivity(limit = 50): ActivityRecord[] {
