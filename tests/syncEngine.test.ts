@@ -10780,4 +10780,69 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(await stat(d.local('Big/b.bin')).catch(() => null)).toBeNull();
         });
     });
+
+    describe('signing in to a different Proton account never reuses the last one\'s records (#35)', () => {
+        const synced = async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('Docs/a.txt', 'a');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            return { ...d, engine, local: (rel: string) => path.join(engine.localRoot(), rel) };
+        };
+
+        test('the account the records belong to is remembered, and the same account syncs on as before', async () => {
+            const d = await synced();
+            expect(stateDb.getMeta('accountRoot')).toBe(d.root.uid);
+            await writeFile(d.local('Docs/new.txt'), 'new');
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toContain('Docs/new.txt');
+            expect(d.engine.getStatus().accountMismatch).toBeNull();
+        });
+
+        test('records of another account: nothing is synced, deleted, trashed or uploaded, and the status says why', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountRoot', 'other~root'); // the records are another account's
+            await writeFile(d.local('Docs/new.txt'), 'new');
+            await rm(d.local('Kept.txt'));
+            d.calls.uploads.length = 0;
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toEqual([]);
+            expect(d.calls.trashed).toEqual([]);
+            expect(stateDb.getItemByPath('Docs/a.txt')).not.toBeNull();
+            expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('a');
+            const status = d.engine.getStatus();
+            expect(status.accountMismatch?.message).toMatch(/different Proton account/);
+            expect(status.state).toBe('error');
+            await expect(d.engine.setAvailability('Docs', 'free')).rejects.toThrow(/different Proton account/);
+            await expect(d.engine.deleteItem('Docs/a.txt')).rejects.toThrow(/different Proton account/);
+            await expect(d.engine.resolveConflictManually(1, 'keep-both')).rejects.toThrow(/different Proton account/);
+            await d.engine.replayRemoteOps();
+            expect(d.calls.trashed).toEqual([]);
+        });
+
+        test('starting fresh keeps every file here and syncs them as new to this account, trashing nothing', async () => {
+            const d = await synced();
+            stateDb.setMeta('accountRoot', 'other~root');
+            await d.engine.reconcileNow();
+            d.calls.uploads.length = 0;
+            await d.engine.startFreshForThisAccount();
+            expect(stateDb.getMeta('accountRoot')).toBe(d.root.uid);
+            expect(d.engine.getStatus().accountMismatch).toBeNull();
+            await d.engine.reconcileNow();
+            expect(d.calls.trashed).toEqual([]);
+            expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('a');
+            expect(await readFile(d.local('Kept.txt'), 'utf8')).toBe('kept');
+            expect(stateDb.getItemByPath('Docs/a.txt')).not.toBeNull();
+        });
+
+        test('starting fresh is refused when there is no other account to start fresh from', async () => {
+            const d = await synced();
+            await expect(d.engine.startFreshForThisAccount()).rejects.toThrow(/same Proton account/);
+        });
+    });
 });

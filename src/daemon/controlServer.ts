@@ -69,6 +69,9 @@ export interface ControlServerOptions {
         action: FilesMissingAction,
         expected: { root: string; names: string[] },
     ) => Promise<{ root: string; names: string[]; items: number }>;
+    // Signed in to another account than the records are of: start fresh with this one (see
+    // ProtonDriveSyncEngine.startFreshForThisAccount, #35); throws when there is nothing to start fresh from
+    startFresh?: () => Promise<void>;
 }
 
 // 'live' when something accepts connections on the socket, 'stale' when it refuses or is gone
@@ -392,6 +395,16 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
             }
             if (url.pathname === '/conflicts/resolve') {
                 return resolveConflictRoute(req, opts.resolveConflict);
+            }
+            if (url.pathname === '/account/start-fresh') {
+                if (req.method !== 'POST') return jsonError('Method not allowed', 405);
+                if (!opts.startFresh) return jsonError('Not found', 404);
+                try {
+                    await opts.startFresh();
+                    return Response.json({ ok: true });
+                } catch (err) {
+                    return Response.json({ error: messageOf(err), code: 'EEXIST' }, { status: 409 });
+                }
             }
             if (url.pathname === '/sync/files-missing') {
                 return filesMissingRoute(req, opts.resolveFilesMissing);

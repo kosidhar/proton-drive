@@ -73,6 +73,8 @@ export interface ActiveTransfer {
 // have happened yet: { from, to, replace }. Set and cleared around that step; found set only after a crash, and then
 // finished (see recoverLocalMove).
 export const LOCAL_MOVE_IN_PROGRESS = 'localMoveInProgress';
+// Meta key for the account the records are of: its My files root's uid (see recordsAreOf, #35)
+export const ACCOUNT_ROOT = 'accountRoot';
 // How many times a journalled change may fail for a reason other than the network or the server before it is given up
 // on, so that it can't hold up everything after it for ever
 const MAX_UNEXPECTED_FAILURES = 10;
@@ -303,7 +305,9 @@ export class ProtonDriveSyncEngine {
     // FILES_HOLD too; a hold saved by an earlier run is looked at once (filesHoldResumed).
     private filesHold: { root: string; names: string[] } | null = null;
     private filesHoldResumed = false;
-    private filesGoneSaid: string | null = null; // where the hold was last told about, so it is said once
+    private filesGoneSaid: string | null = null;
+    // Signed in to another account than the records are of (see recordsAreOf): nothing is synced until the user chooses
+    private accountMismatch: { message: string } | null = null; // where the hold was last told about, so it is said once
     private filesGoneError: string | null = null; // the lastError the hold set, which ending it clears
     private missingKnown: { hold: object; at: number; missing: MissingItems } | null = null; // see stillMissing
     // Missing items the user said were deleted on purpose, for the next sync pass to take for deletes
@@ -465,6 +469,7 @@ export class ProtonDriveSyncEngine {
             stats,
             settings,
             filesMissing,
+            accountMismatch: this.accountMismatch,
         };
     }
 
@@ -518,6 +523,7 @@ export class ProtonDriveSyncEngine {
 
     async stop(): Promise<void> {
         this.stopped = true;
+        this.rootNode = null; // signed out, maybe to sign in to another account: looked up again (#35)
         this.watcher.stop();
         for (const settling of this.settlingFiles.values()) {
             settling.cancel(); // The pass at the next start looks at them again
@@ -1051,6 +1057,14 @@ export class ProtonDriveSyncEngine {
         }
         if (this.filesGone(true)) {
             return; // Looked at again at the next pass
+        }
+        // Signed in to another account than the records are of: nothing of them is acted on (#35). Not told here (offline,
+        // say), the pass goes on as before: it can't reach the cloud either
+        const root = await this.getRootFolder().catch(() => null);
+        if (root && !this.recordsAreOf(root.uid)) {
+            this.state = 'error';
+            this.lastError = this.accountMismatch!.message;
+            return;
         }
         // This pass takes the items the user confirmed as deleted for deletes, and uses the confirmation up (unless an
         // item it touches failed: then the next pass does)
@@ -1842,6 +1856,7 @@ export class ProtonDriveSyncEngine {
             throw new Error(BUSY_MOVING);
         }
         this.refuseWhileFilesGone();
+        this.refuseForAnotherAccount();
         return this.tracked(() => this.resolveConflictNow(conflictId, choice));
     }
 
@@ -3551,6 +3566,68 @@ export class ProtonDriveSyncEngine {
         if (this.holding()) {
             throw new DriveOpError('EIO', BUSY_MOVING);
         }
+        this.refuseForAnotherAccount();
+    }
+
+    // Whether the records are of the account signed in to (its My files root): remembered on the first pass, and checked
+    // at every pass after. Records of another (signed out of, and another signed in to) are never acted on: their nodes
+    // aren't in this account, which would read as cloud deletes of the files here, or upload them under the old
+    // structure (#35). The user chooses (startFreshForThisAccount, or signing back in to that account)
+    private recordsAreOf(rootUid: string): boolean {
+        const recorded = this.stateDb.getMeta(ACCOUNT_ROOT);
+        if (recorded === null) {
+            this.stateDb.setMeta(ACCOUNT_ROOT, rootUid); // records from before this was remembered: this account's
+            this.accountMismatch = null;
+            return true;
+        }
+        if (recorded === rootUid) {
+            this.accountMismatch = null;
+            return true;
+        }
+        if (!this.accountMismatch) {
+            this.logger.warn('Signed in to a different Proton account than this computer synced with: not syncing until the user chooses');
+        }
+        this.accountMismatch = {
+            message:
+                'You signed in to a different Proton account than the files on this computer were synced with. Nothing is synced, ' +
+                'deleted or uploaded until you choose: sign back in to that account, or start fresh, keeping the files on ' +
+                'this computer and syncing them to this account as new files.',
+        };
+        return false;
+    }
+
+    private refuseForAnotherAccount(): void {
+        if (this.accountMismatch) {
+            throw new DriveOpError('EIO', this.accountMismatch.message);
+        }
+    }
+
+    // Start fresh with the account signed in to: the records, index, availability, journal, conflicts and edit baselines
+    // of the other account go, and the files on this computer stay, to be synced to this account as new files (a fresh
+    // install's first sync). Nothing is deleted or trashed, here or in either account (#35)
+    async startFreshForThisAccount(): Promise<void> {
+        if (!this.accountMismatch) {
+            throw new Error('The files on this computer are synced with the same Proton account: there is nothing to start fresh from');
+        }
+        const root = await this.getRootFolder();
+        await this.inAvailabilityRun(async () => {
+            this.stateDb.connection.transaction(() => {
+                for (const table of ['synced_items', 'conflicts', 'drive_edit_baselines', 'remote_nodes', 'remote_ops', 'availability']) {
+                    this.stateDb.connection.run(`DELETE FROM ${table}`);
+                }
+                this.stateDb.setMeta(PIN_ROOT_ON_FIRST_SYNC, '1'); // syncs everything, as a fresh install does
+                this.stateDb.setMeta(ACCOUNT_ROOT, root.uid);
+            })();
+            this.keepBothCopies.clear(); // the index, journal and policy are read from their tables: nothing else to drop
+        });
+        this.accountMismatch = null;
+        this.lastError = null;
+        this.state = 'idle';
+        this.stateDb.logActivity({
+            action: 'auth',
+            localRelPath: '/',
+            details: 'Started fresh with this Proton account: the files on this computer sync to it as new files',
+        });
     }
 
     // A drive change carries the time the helper stops waiting for it (it has told the app EIO by then): one whose turn
@@ -4115,6 +4192,9 @@ export class ProtonDriveSyncEngine {
     private runReplay(): Promise<void> {
         if (this.holding()) {
             return Promise.resolve(); // Sent after the move, by the pass at start()
+        }
+        if (this.accountMismatch) {
+            return Promise.resolve(); // Its changes are for the other account's nodes: never sent to this one (#35)
         }
         if (this.replayRun) {
             this.replayAgain = true; // What was journalled meanwhile goes too
@@ -5522,6 +5602,7 @@ export class ProtonDriveSyncEngine {
         if (this.holding()) {
             throw new Error(BUSY_MOVING);
         }
+        this.refuseForAnotherAccount();
         this.refuseWhileFilesGone();
         return this.tracked(() => this.setAvailabilityNow(relPath, action));
     }
