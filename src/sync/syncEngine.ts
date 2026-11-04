@@ -6290,7 +6290,7 @@ async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boo
 // it can't climb out of it.
 export type Transfer = 'syncing' | 'error' | 'conflict' | null;
 export interface ItemState {
-    availability: 'pinned' | 'downloaded' | 'online-only';
+    availability: 'pinned' | 'downloaded' | 'partial' | 'online-only';
     transfer: Transfer;
 }
 export interface FolderStates {
