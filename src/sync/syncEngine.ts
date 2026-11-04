@@ -5918,20 +5918,18 @@ export class ProtonDriveSyncEngine {
 
         const dbItem = this.stateDb.getItemByPath(dirRel);
         if (dbItem && dbItem.type === 'folder') {
-            try {
-                const existing = await this.sdk.getNode(dbItem.nodeUid);
+            const existing = await this.sdk.getNode(dbItem.nodeUid).catch(() => null);
+            if (existing) {
                 remoteMap.set(dirRel, existing);
                 return existing;
-            } catch (error: unknown) {
-                if (error instanceof ValidationError) {
-                    // The folder this computer synced is gone from Proton Drive (deleted for good elsewhere), and its
-                    // removal here hasn't happened yet: made again by name, it would come back. Refused: what was to go
-                    // in it stays here unrecorded, which that removal keeps (#161)
-                    throw new Error(`${dirRel} is gone from Proton Drive: nothing is put there`, { cause: error });
-                }
             }
         }
 
+        // Down from the root, each folder: as the listing had it, as its record names it, or made by name. A recorded
+        // folder whose node is gone from Proton Drive (deleted for good elsewhere, not yet removed here) is never made
+        // again by name, at any depth, or the folder the other device deleted would come back: refused, and what was to
+        // go in it stays here unrecorded, which that folder's removal keeps (#161). One of that name made since in the
+        // cloud stands in for it, so a stale record never holds anything up for good
         const segments = dirRel.split('/').filter(Boolean);
         let currentParent = root;
         let currentRel = '';
@@ -5941,6 +5939,37 @@ export class ProtonDriveSyncEngine {
             const foundInMap = remoteMap.get(currentRel);
             if (foundInMap) {
                 currentParent = foundInMap;
+                continue;
+            }
+            const recorded = this.stateDb.getItemByPath(currentRel);
+            if (recorded?.type === 'folder') {
+                const node = await this.sdk.getNode(recorded.nodeUid).then(
+                    (found) => found,
+                    (error: unknown) => {
+                        if (error instanceof ValidationError) return null;
+                        throw error;
+                    },
+                );
+                if (node && !node.trashTime) {
+                    remoteMap.set(currentRel, node);
+                    currentParent = node;
+                    continue;
+                }
+                if (!node) {
+                    const parentUid = currentParent.uid;
+                    const madeSince = (await listFolderChildren(this.sdk, currentParent)).find(
+                        (child) => child.type === NodeType.Folder && getName(child) === seg && child.parentUid === parentUid,
+                    );
+                    if (!madeSince) {
+                        throw new Error(`${currentRel} is gone from Proton Drive: nothing is put there`);
+                    }
+                    remoteMap.set(currentRel, madeSince);
+                    currentParent = madeSince;
+                    continue;
+                }
+                // In the Proton Drive trash: as it is (the callers that put things in it check that, #160)
+                remoteMap.set(currentRel, node);
+                currentParent = node;
                 continue;
             }
             const { node: ensured, created } = await createRemoteFolder(this.sdk, currentParent, seg);
