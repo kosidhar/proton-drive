@@ -53,7 +53,7 @@ pub fn status_summary(status: &DaemonStatus, daemon_online: bool, connecting: bo
         return summary("Signed out", Some("Sign in to sync your files".to_string()), Tone::Attention);
     }
     if status.state == "paused" || status.settings.paused {
-        return summary("Paused", None, Tone::Paused);
+        return summary(paused_headline(status.settings.paused_until, now_ms, local_offset_secs), None, Tone::Paused);
     }
     if status.vfs.as_ref().is_some_and(|v| v.reason.as_deref() == Some("moving")) {
         return summary("Moving files…", None, Tone::Busy);
@@ -174,6 +174,81 @@ pub fn attention_items(status: &DaemonStatus, conflicts: &[ConflictRecord]) -> V
 /// two polls (the same count) is not missed.
 pub fn should_reload_conflicts(was_offline: bool, old_unresolved: u64, new_unresolved: u64, listed_open: usize) -> bool {
     was_offline || old_unresolved != new_unresolved || new_unresolved > 0 || listed_open > 0
+}
+
+const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// The local day (days since 1970-01-01 by the local calendar) and the seconds into it, of a time in epoch ms, local
+/// time being `offset` seconds east of UTC.
+fn local_day_and_secs(ms: i64, offset: i64) -> (i64, i64) {
+    let secs = ms.div_euclid(1000) + offset;
+    (secs.div_euclid(86_400), secs.rem_euclid(86_400))
+}
+
+/// How many seconds east of UTC local time is at a time in epoch ms (the machine's time zone, summer time included).
+pub fn local_offset_secs(ms: i64) -> i64 {
+    let t = ms.div_euclid(1000) as libc::time_t;
+    // SAFETY: localtime_r only writes the tm it is given, and reads t
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return 0;
+    }
+    tm.tm_gmtoff
+}
+
+/// The Home headline while paused (#205), as the tray says it (linux/tray paused_line): "Paused until 15:00" when the
+/// pause ends today, "Paused until tomorrow 08:00", "Paused until Mon 08:00" on a later day; "Paused" with no end.
+/// `offset_at` gives local time's offset from UTC (seconds east) at a time in epoch ms (local_offset_secs).
+pub fn paused_headline(until: Option<i64>, now_ms: i64, offset_at: impl Fn(i64) -> i64) -> String {
+    let Some(until) = until else {
+        return "Paused".to_string();
+    };
+    let (day, secs) = local_day_and_secs(until, offset_at(until));
+    let (today, _) = local_day_and_secs(now_ms, offset_at(now_ms));
+    let clock = format!("{:02}:{:02}", secs / 3600, secs % 3600 / 60);
+    match day - today {
+        ..=0 => format!("Paused until {clock}"),
+        1 => format!("Paused until tomorrow {clock}"),
+        // 1970-01-01 was a Thursday
+        _ => format!("Paused until {} {clock}", WEEKDAYS[(day + 4).rem_euclid(7) as usize]),
+    }
+}
+
+/// Tomorrow at 08:00 local time, in epoch ms: by the offset that holds then (a clock change overnight is allowed for).
+pub fn tomorrow_at_eight(now_ms: i64, offset_at: impl Fn(i64) -> i64) -> i64 {
+    let (today, _) = local_day_and_secs(now_ms, offset_at(now_ms));
+    let local_secs = (today + 1) * 86_400 + 8 * 3600;
+    let guess = (local_secs - offset_at(now_ms)) * 1000;
+    (local_secs - offset_at(guess)) * 1000
+}
+
+/// What Home's Pause offers (#205).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseChoice {
+    Hour,
+    Tomorrow,
+    UntilResumed,
+}
+
+impl PauseChoice {
+    pub const ALL: [PauseChoice; 3] = [PauseChoice::Hour, PauseChoice::Tomorrow, PauseChoice::UntilResumed];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PauseChoice::Hour => "For 1 hour",
+            PauseChoice::Tomorrow => "Until tomorrow",
+            PauseChoice::UntilResumed => "Until I resume",
+        }
+    }
+
+    /// When the pause ends (epoch ms), None until resumed.
+    pub fn until(self, now_ms: i64, offset_at: impl Fn(i64) -> i64) -> Option<i64> {
+        match self {
+            PauseChoice::Hour => Some(now_ms + 3_600_000),
+            PauseChoice::Tomorrow => Some(tomorrow_at_eight(now_ms, offset_at)),
+            PauseChoice::UntilResumed => None,
+        }
+    }
 }
 
 /// The main button's label, and the `paused` it asks for: Resume when paused by the setting or the state.
@@ -351,6 +426,62 @@ pub(crate) fn primary_button(ui: &mut egui::Ui, label: &str, height: f32) -> egu
     proton_button(ui, size, label, PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE, 13.0)
 }
 
+const PAUSE_CHOICES_ID: &str = "pause_choices";
+
+/// Home's Pause choices (#205), in a small card under the Pause button (its right edges lined up), over an invisible
+/// shield so that a click outside only closes them. The choice clicked, if one was.
+fn pause_choices(ctx: &egui::Context, anchor: egui::Rect) -> Option<PauseChoice> {
+    crate::click_shield(ctx, "pause_choices_shield", egui::Order::Foreground, None);
+    let mut picked = None;
+    egui::Area::new(egui::Id::new(PAUSE_CHOICES_ID))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(anchor.right_bottom() + Vec2::new(0.0, 6.0))
+        .pivot(egui::Align2::RIGHT_TOP)
+        .show(ctx, |ui| {
+            Frame::NONE
+                .fill(crate::BG_CARD())
+                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
+                .corner_radius(CornerRadius::same(10))
+                .shadow(egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_rgba_unmultiplied(0, 0, 0, 90) })
+                .inner_margin(Margin::same(6))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for choice in PauseChoice::ALL {
+                        if menu_item(ui, choice.label(), 168.0).clicked() {
+                            picked = Some(choice);
+                        }
+                    }
+                });
+        });
+    picked
+}
+
+/// Whether a click landed on the Pause choices (as last drawn).
+fn pause_choices_hit(ctx: &egui::Context, input: &egui::InputState) -> bool {
+    let rect = ctx.memory(|m| m.area_rect(egui::Id::new(PAUSE_CHOICES_ID)));
+    match (rect, input.pointer.interact_pos()) {
+        (Some(rect), Some(pos)) => rect.contains(pos),
+        _ => false,
+    }
+}
+
+/// A row of a small menu: its label on the left, highlighted on hover.
+fn menu_item(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 30.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        ui.painter().rect_filled(rect, CornerRadius::same(6), btn_secondary_hover_bg());
+    }
+    ui.painter().text(
+        rect.left_center() + Vec2::new(10.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        TEXT_PRIMARY(),
+    );
+    resp
+}
+
 fn card_title(ui: &mut egui::Ui, title: &str) {
     ui.label(RichText::new(title).size(15.5).strong().color(TEXT_PRIMARY()));
 }
@@ -360,7 +491,7 @@ pub(crate) fn elided(ui: &mut egui::Ui, text: RichText, full: &str) -> egui::Res
     ui.add(egui::Label::new(text).truncate()).on_hover_text(full)
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
@@ -407,8 +538,27 @@ impl ProtonDriveNativeApp {
                         sign_in = primary_button(ui, "Sign in", 34.0).clicked();
                     } else {
                         ui.add_enabled_ui(self.daemon_online, |ui| {
-                            if primary_button(ui, pause_label, 34.0).clicked() {
-                                command = Some(WorkerCommand::SetPaused(pause_to));
+                            let button = primary_button(ui, pause_label, 34.0);
+                            if !pause_to {
+                                if button.clicked() {
+                                    command = Some(WorkerCommand::SetPaused { paused: false, until: None });
+                                }
+                            } else if self.pause_choices_open {
+                                // Over a shield that takes the click on Pause too: any click outside closes them
+                                if let Some(choice) = pause_choices(ui.ctx(), button.rect) {
+                                    command = Some(WorkerCommand::SetPaused {
+                                        paused: true,
+                                        until: choice.until(now_ms(), local_offset_secs),
+                                    });
+                                }
+                                let outside = ui.input(|i| {
+                                    i.key_pressed(egui::Key::Escape) || (i.pointer.primary_clicked() && !pause_choices_hit(ui.ctx(), i))
+                                });
+                                if command.is_some() || outside {
+                                    self.pause_choices_open = false;
+                                }
+                            } else if button.clicked() {
+                                self.pause_choices_open = true; // #205: For 1 hour, Until tomorrow, Until I resume
                             }
                             ui.add_space(4.0);
                             if secondary_button(ui, "Sync now", 34.0).clicked() {
@@ -434,6 +584,10 @@ impl ProtonDriveNativeApp {
                 });
             });
         });
+        // Only while Pause is offered and can be used
+        if !self.daemon_online || show_sign_in || !pause_to {
+            self.pause_choices_open = false;
+        }
         if let Some(command) = command {
             let _ = self.tx.send(command);
         }
@@ -1026,6 +1180,74 @@ mod tests {
         assert!(should_reload_conflicts(false, 0, 0, 1));
         // The daemon came back
         assert!(should_reload_conflicts(true, 0, 0, 0));
+    }
+
+    // #205: times by a fixed offset from UTC, so the tests don't depend on the machine's time zone
+    const CET: i64 = 3600;
+    /// 2026-11-04 (a Wednesday) at 00:00 UTC, in epoch ms
+    const NOV_4_UTC: i64 = 1_793_750_400_000;
+
+    /// Epoch ms of `days` after 2026-11-04 at hh:mm, local time `offset` seconds east of UTC.
+    fn local(days: i64, hh: i64, mm: i64, offset: i64) -> i64 {
+        NOV_4_UTC + days * 86_400_000 + (hh * 3600 + mm * 60 - offset) * 1000
+    }
+
+    #[test]
+    fn paused_headline_says_until_when() {
+        let off = |_| CET;
+        let now = local(0, 10, 30, CET);
+        assert_eq!(paused_headline(None, now, off), "Paused");
+        assert_eq!(paused_headline(Some(local(0, 15, 0, CET)), now, off), "Paused until 15:00");
+        assert_eq!(paused_headline(Some(local(0, 23, 59, CET)), now, off), "Paused until 23:59");
+        assert_eq!(paused_headline(Some(local(1, 8, 0, CET)), now, off), "Paused until tomorrow 08:00");
+        assert_eq!(paused_headline(Some(local(5, 8, 0, CET)), now, off), "Paused until Mon 08:00");
+        assert_eq!(paused_headline(Some(local(2, 7, 5, CET)), now, off), "Paused until Fri 07:05");
+        // Just after local midnight, by the local day, not UTC's
+        let late = local(0, 0, 30, CET);
+        assert_eq!(paused_headline(Some(local(0, 8, 0, CET)), late, off), "Paused until 08:00");
+        // West of UTC too
+        let west = |_| -5 * 3600;
+        assert_eq!(paused_headline(Some(local(1, 8, 0, -5 * 3600)), local(0, 22, 0, -5 * 3600), west), "Paused until tomorrow 08:00");
+        // A time already past (the daemon is about to resume) reads as a time today
+        assert_eq!(paused_headline(Some(local(0, 9, 0, CET)), now, off), "Paused until 09:00");
+    }
+
+    #[test]
+    fn tomorrow_at_eight_is_the_next_local_day_at_eight() {
+        let off = |_| CET;
+        assert_eq!(tomorrow_at_eight(local(0, 10, 30, CET), off), local(1, 8, 0, CET));
+        assert_eq!(tomorrow_at_eight(local(0, 0, 10, CET), off), local(1, 8, 0, CET));
+        assert_eq!(tomorrow_at_eight(local(0, 23, 59, CET), off), local(1, 8, 0, CET));
+        // Across a clock change: +2 h until tomorrow 03:00 local, +1 h from then on, so 08:00 is by the new offset
+        let change = local(1, 3, 0, CET);
+        let dst = move |ms: i64| if ms < change { 2 * 3600 } else { CET };
+        assert_eq!(tomorrow_at_eight(local(0, 10, 30, 2 * 3600), dst), local(1, 8, 0, CET));
+    }
+
+    #[test]
+    fn the_pause_choices_and_their_times() {
+        let off = |_| CET;
+        let now = local(0, 10, 30, CET);
+        let labels: Vec<&str> = PauseChoice::ALL.iter().map(|c| c.label()).collect();
+        assert_eq!(labels, ["For 1 hour", "Until tomorrow", "Until I resume"]);
+        assert_eq!(PauseChoice::Hour.until(now, off), Some(now + 3_600_000));
+        assert_eq!(PauseChoice::Tomorrow.until(now, off), Some(local(1, 8, 0, CET)));
+        assert_eq!(PauseChoice::UntilResumed.until(now, off), None);
+    }
+
+    #[test]
+    fn the_local_offset_is_one_the_machine_could_have() {
+        let off = local_offset_secs(NOW);
+        assert!((-14 * 3600..=14 * 3600).contains(&off), "{off}");
+    }
+
+    #[test]
+    fn summary_says_until_when_paused_with_a_time() {
+        let mut s = status("paused", vec![], true);
+        s.settings.paused_until = Some(NOW + 30 * 60_000);
+        let r = status_summary(&s, true, false, 0, NOW);
+        assert!(r.headline.starts_with("Paused until "), "{}", r.headline);
+        assert_eq!(r.tone, Tone::Paused);
     }
 
     #[test]

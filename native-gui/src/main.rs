@@ -228,6 +228,8 @@ struct SyncSettings {
     notifications_enabled: bool,
     reconcile_interval_sec: u64,
     paused: bool,
+    /// When a timed pause ends (epoch ms); None when it lasts until resumed, or from an older daemon (#205)
+    paused_until: Option<i64>,
     ignore_patterns: Vec<String>,
     /// Apps (by process name) the virtual drive won't download online-only files for; absent from an older daemon
     blocked_apps: Vec<String>,
@@ -934,8 +936,8 @@ enum WorkerCommand {
     RefreshAll,
     /// Home's Sync now
     TriggerSync,
-    /// Home's Pause and Resume
-    SetPaused(bool),
+    /// Home's Pause choices and Resume: until, when the pause ends (epoch ms), None until resumed (#205)
+    SetPaused { paused: bool, until: Option<i64> },
     StartLogin,
     Logout,
     /// Only the settings that changed (see `settings_changes`)
@@ -969,6 +971,14 @@ static SECTION_REQUESTED: std::sync::Mutex<Option<NavTab>> = std::sync::Mutex::n
 static APP_CONTEXT: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
 
 /// What screenshot mode may ask the worker for: reads only.
+/// The POST /api/pause body: until (epoch ms) only when the pause has an end (#205).
+fn pause_request(paused: bool, until: Option<i64>) -> serde_json::Value {
+    match until {
+        Some(until) => serde_json::json!({ "paused": paused, "until": until }),
+        None => serde_json::json!({ "paused": paused }),
+    }
+}
+
 fn allowed_in_screenshot_mode(cmd: &WorkerCommand) -> bool {
     matches!(cmd, WorkerCommand::RefreshAll | WorkerCommand::LoadConflicts)
 }
@@ -1273,6 +1283,10 @@ struct ProtonDriveNativeApp {
     fake_signed_out: bool,
     /// Screenshot-only: `--account-mismatch`, the daemon holding another account's records, laid over every status
     fake_account_mismatch: bool,
+    /// Screenshot-only: `--paused-until-min N`, paused until N minutes from the start (0: until resumed)
+    fake_paused_until: Option<i64>,
+    /// Home's Pause choices are open (#205)
+    pause_choices_open: bool,
 
     // Window geometry state
     window_geometry: WindowGeometry,
@@ -1384,6 +1398,8 @@ impl ProtonDriveNativeApp {
             fake_transfers: None,
             fake_signed_out: false,
             fake_account_mismatch: false,
+            fake_paused_until: None,
+            pause_choices_open: false,
             window_geometry,
             maximize_applied_on_open: false,
             applied_light_mode: initial_light,
@@ -1407,6 +1423,15 @@ impl ProtonDriveNativeApp {
             status.logged_in = false;
             status.state = "unauthenticated".into();
             status.account = None;
+        }
+    }
+
+    /// Screenshot-only: lays `--paused-until-min` over a status from the daemon: paused, until that time if one (#205).
+    fn apply_fake_paused(&self, status: &mut DaemonStatus) {
+        if let Some(until) = self.fake_paused_until {
+            status.state = "paused".into();
+            status.settings.paused = true;
+            status.settings.paused_until = (until > 0).then_some(until);
         }
     }
 
@@ -1524,6 +1549,7 @@ impl ProtonDriveNativeApp {
                         self.apply_fake_transfers(&mut s);
                         self.apply_fake_signed_out(&mut s);
                         self.apply_fake_account_mismatch(&mut s);
+                        self.apply_fake_paused(&mut s);
                         // Edits being made or saved stay as they are; Save compares them with what they were loaded from
                         if !self.settings_dirty && !self.settings_saving {
                             self.load_settings_form(&s.settings);
@@ -3647,9 +3673,8 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                 });
                 ctx.request_repaint();
             }
-            WorkerCommand::SetPaused(paused) => {
-                let _ = ureq::post(&format!("{}/api/pause", daemon_url()))
-                    .send_json(serde_json::json!({ "paused": paused }));
+            WorkerCommand::SetPaused { paused, until } => {
+                let _ = ureq::post(&format!("{}/api/pause", daemon_url())).send_json(pause_request(paused, until));
                 let _ = tx.send(WorkerEvent::StatusAndActivity {
                     status: Box::new(fetch_status()),
                     activity: fetch_activity(),
@@ -3794,6 +3819,8 @@ OPTIONS:
   --fake-transfers <N>  with --screenshot: show N uploads in progress on Home
   --signed-out          with --screenshot: show the daemon without an account
   --account-mismatch    with --screenshot: show the daemon holding the records of another Proton account
+  --paused-until-min <N>  with --screenshot: show sync paused until N minutes from now (0: until resumed)
+  --pause-choices       with --screenshot: show Home's Pause choices open
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --version             print the version
   -h, --help            print this help
@@ -3827,6 +3854,8 @@ fn main() -> eframe::Result {
     let mut cli_fake_transfers: Option<usize> = None;
     let mut cli_signed_out = false;
     let mut cli_account_mismatch = false;
+    let mut cli_paused_until_min: Option<i64> = None;
+    let mut cli_pause_choices = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -3866,6 +3895,12 @@ fn main() -> eframe::Result {
             }
             "--account-mismatch" => {
                 cli_account_mismatch = true;
+            }
+            "--paused-until-min" => {
+                cli_paused_until_min = args.next().and_then(|v| v.parse().ok()).filter(|m: &i64| *m >= 0);
+            }
+            "--pause-choices" => {
+                cli_pause_choices = true;
             }
             "--hidden-items" => {
                 cli_hidden_items = true;
@@ -3908,10 +3943,15 @@ fn main() -> eframe::Result {
     SCREENSHOT_MODE.store(screenshot_target.is_some(), AtomicOrdering::SeqCst);
 
     if screenshot_target.is_none()
-        && (cli_fake_attention.is_some() || cli_fake_transfers.is_some() || cli_signed_out || cli_account_mismatch)
+        && (cli_fake_attention.is_some()
+            || cli_fake_transfers.is_some()
+            || cli_signed_out
+            || cli_account_mismatch
+            || cli_paused_until_min.is_some()
+            || cli_pause_choices)
     {
         eprintln!(
-            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out and --account-mismatch only apply together with --screenshot; ignoring them"
+            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min and --pause-choices only apply together with --screenshot; ignoring them"
         );
     }
     let fake_drive = if cli_drive_status.is_some() || cli_drive_move.is_some() {
@@ -4032,12 +4072,16 @@ fn main() -> eframe::Result {
                 app.fake_transfers = cli_fake_transfers;
                 app.fake_signed_out = cli_signed_out;
                 app.fake_account_mismatch = cli_account_mismatch;
+                // Epoch ms from the minutes asked for (0: paused until resumed)
+                app.fake_paused_until = cli_paused_until_min.map(|min| if min > 0 { home::now_ms() + min * 60_000 } else { 0 });
+                app.pause_choices_open = cli_pause_choices;
                 let mut status = std::mem::take(&mut app.status);
                 app.apply_fake_drive(&mut status);
                 app.apply_fake_files_missing(&mut status);
                 app.apply_fake_transfers(&mut status);
                 app.apply_fake_signed_out(&mut status);
                 app.apply_fake_account_mismatch(&mut status);
+                app.apply_fake_paused(&mut status);
                 app.status = status;
                 app.refresh_attention();
                 if cli_confirm_files_missing {
@@ -4519,6 +4563,8 @@ mod tests {
                 fake_transfers: None,
                 fake_signed_out: false,
             fake_account_mismatch: false,
+            fake_paused_until: None,
+            pause_choices_open: false,
                 window_geometry: WindowGeometry::default(),
                 maximize_applied_on_open: true,
                 applied_light_mode: false,
@@ -4658,7 +4704,8 @@ mod tests {
                         Some(format!("files missing: {} {root} {}", choice.action(), names.join(", ")))
                     }
                     WorkerCommand::TriggerSync => Some("sync now".to_string()),
-                    WorkerCommand::SetPaused(paused) => Some(format!("paused {paused}")),
+                    WorkerCommand::SetPaused { paused, until: None } => Some(format!("paused {paused}")),
+                    WorkerCommand::SetPaused { paused, until: Some(until) } => Some(format!("paused {paused} until {until}")),
                     WorkerCommand::ResolveConflict { id, choice } => Some(format!("resolve {id} {choice}")),
                     WorkerCommand::StartLogin => Some("sign in".to_string()),
                     WorkerCommand::StartFresh => Some("start fresh".to_string()),
@@ -4972,10 +5019,43 @@ mod tests {
         let mut h = home_with(|_| {});
         assert!(h.text_at("Up to date").is_some());
         assert!(h.text_at("Resume").is_none());
-        h.click(h.text_at("Pause").expect("Pause is the main button"));
+        // #205: Pause opens its three choices and sends nothing yet; each choice sends the pause with its time
+        let pause = h.text_at("Pause").expect("Pause is the main button");
+        assert!(h.text_at("For 1 hour").is_none());
+        h.click(pause);
+        assert_eq!(h.sent(), Vec::<String>::new());
+        for choice in ["For 1 hour", "Until tomorrow", "Until I resume"] {
+            assert!(h.text_at(choice).is_some(), "{choice} is offered");
+        }
+        let before = home::now_ms();
+        h.click(h.text_at("For 1 hour").unwrap());
+        let after = home::now_ms();
+        let sent = h.sent();
+        let until: i64 = sent[0].strip_prefix("paused true until ").expect("a pause with a time").parse().unwrap();
+        assert!((before + 3_600_000..=after + 3_600_000).contains(&until), "{sent:?}");
+        assert!(h.text_at("For 1 hour").is_none(), "a choice closes the choices");
+
+        h.click(pause);
+        h.click(h.text_at("Until tomorrow").unwrap());
+        let tomorrow = home::tomorrow_at_eight(home::now_ms(), home::local_offset_secs);
+        assert_eq!(h.sent(), vec![format!("paused true until {tomorrow}")]);
+
+        h.click(pause);
+        h.click(h.text_at("Until I resume").unwrap());
         assert_eq!(h.sent(), vec!["paused true".to_string()]);
+
         h.click(h.text_at("Sync now").expect("Sync now is offered"));
         assert_eq!(h.sent(), vec!["sync now".to_string()]);
+
+        // A click elsewhere closes the choices and sends nothing, Sync now's place included (the shield takes it)
+        h.click(pause);
+        h.click(h.text_at("Sync now").unwrap());
+        assert!(h.text_at("For 1 hour").is_none());
+        assert_eq!(h.sent(), Vec::<String>::new());
+        h.click(pause);
+        h.click(h.text_at("Up to date").unwrap());
+        assert!(h.text_at("For 1 hour").is_none());
+        assert_eq!(h.sent(), Vec::<String>::new());
 
         // Paused, by the setting or by the state, offers Resume
         for paused in [home_with(|s| s.settings.paused = true), home_with(|s| s.state = "paused".into())] {
@@ -4984,7 +5064,36 @@ mod tests {
             assert!(h.text_at("Pause").is_none());
             h.click(h.text_at("Resume").expect("Resume is the main button"));
             assert_eq!(h.sent(), vec!["paused false".to_string()]);
+            assert!(h.text_at("For 1 hour").is_none(), "Resume is one button");
         }
+    }
+
+    #[test]
+    fn home_says_until_when_a_pause_ends() {
+        let until = home::now_ms() + 30 * 60_000;
+        let h = home_with(|s| {
+            s.settings.paused = true;
+            s.state = "paused".into();
+            s.settings.paused_until = Some(until);
+        });
+        let headline = home::paused_headline(Some(until), home::now_ms(), home::local_offset_secs);
+        assert!(headline.starts_with("Paused until "), "{headline}");
+        assert!(h.text_at(&headline).is_some(), "{headline}");
+    }
+
+    #[test]
+    fn the_settings_carry_when_a_pause_ends() {
+        let read = |json: &str| serde_json::from_str::<SyncSettings>(json).unwrap().paused_until;
+        assert_eq!(read(r#"{"paused":true,"pausedUntil":1800000000000}"#), Some(1_800_000_000_000));
+        assert_eq!(read(r#"{"paused":true,"pausedUntil":null}"#), None);
+        assert_eq!(read(r#"{"paused":true}"#), None); // an older daemon
+    }
+
+    #[test]
+    fn a_pause_request_carries_its_time_only_when_it_has_one() {
+        assert_eq!(pause_request(true, Some(1_800_000_000_000)), serde_json::json!({ "paused": true, "until": 1_800_000_000_000_i64 }));
+        assert_eq!(pause_request(true, None), serde_json::json!({ "paused": true }));
+        assert_eq!(pause_request(false, None), serde_json::json!({ "paused": false }));
     }
 
     #[test]
@@ -5415,6 +5524,7 @@ mod tests {
             notifications_enabled: true,
             reconcile_interval_sec: 120,
             paused: false,
+            paused_until: None,
             ignore_patterns: vec![".git".into(), "*.part".into()],
             blocked_apps: Vec::new(),
             start_at_login: true,
@@ -5601,7 +5711,9 @@ mod tests {
         }
         let writes = [
             WorkerCommand::TriggerSync,
-            WorkerCommand::SetPaused(true),
+            WorkerCommand::SetPaused { paused: true, until: None },
+            WorkerCommand::SetPaused { paused: true, until: Some(1_800_000_000_000) },
+            WorkerCommand::SetPaused { paused: false, until: None },
             WorkerCommand::StartLogin,
             WorkerCommand::Logout,
             WorkerCommand::SaveSettings(serde_json::json!({})),
