@@ -7,6 +7,7 @@ import { startControlServer } from '../src/daemon/controlServer';
 import { driveSettings } from '../src/daemon/settingsRoute';
 import { parseSettings } from '../src/daemon/settingsValidation';
 import { matchesIgnorePatterns } from '../src/sync/localWatcher';
+import { MAX_IGNORE_PATTERNS, problemWithIgnorePatterns, usableIgnorePatterns } from '../src/sync/settingsRules';
 import { ProtonDriveSyncEngine } from '../src/sync/syncEngine';
 import { DEFAULT_IGNORE_PATTERNS, SyncStateDatabase } from '../src/sync/syncStateDb';
 import { makeMockDrive } from './helpers/mockDrive';
@@ -164,7 +165,7 @@ describe('settings are validated, every field, before any is stored (#34, #36)',
     });
 
     // Each of these hides every file; the first three are what the first review found
-    for (const set of [['?', '??*'], ['*[!b]', '*b'], ['[a-m]*', '[!a-m]*'], ['*7*', '*5*'], ['*', 'a'], ['*/**', 'a/**']]) {
+    for (const set of [['?', '??*'], ['*[!b]', '*b'], ['[a-m]*', '[!a-m]*'], ['[A-Z]*', '[!A-Z]*'], ['*', 'a'], ['*/**', 'a/**']]) {
         test(`${JSON.stringify(set)} match every file: 400, nothing stored`, async () => {
             const s = setup();
             const res = await s.save({ ignorePatterns: set, notificationsEnabled: false });
@@ -174,9 +175,9 @@ describe('settings are validated, every field, before any is stored (#34, #36)',
     }
 
     test('two patterns that together hide everything are refused as a set, though each is fine alone', async () => {
-        expect(parseSettings({ ignorePatterns: ['*7*'] }).ok).toBe(true);
-        expect(parseSettings({ ignorePatterns: ['*5*'] }).ok).toBe(true);
-        const res = await setup().save({ ignorePatterns: ['*7*', '*5*'] });
+        expect(parseSettings({ ignorePatterns: ['[A-Z]*'] }).ok).toBe(true);
+        expect(parseSettings({ ignorePatterns: ['[!A-Z]*'] }).ok).toBe(true);
+        const res = await setup().save({ ignorePatterns: ['[A-Z]*', '[!A-Z]*'] });
         expect(String(res.json.error)).toMatch(/together/);
     });
 
@@ -203,7 +204,7 @@ describe('a bad stored setting is not used, and not overwritten (#34)', () => {
         ['not JSON', '{oops', DEFAULT_IGNORE_PATTERNS],
         ['a list of nothing usable', '[1,null,""]', DEFAULT_IGNORE_PATTERNS],
         ['everything', '["*"]', DEFAULT_IGNORE_PATTERNS],
-        ['everything together', '["*7*","*5*"]', DEFAULT_IGNORE_PATTERNS],
+        ['everything together', '["[A-Z]*","[!A-Z]*"]', DEFAULT_IGNORE_PATTERNS],
         ['a number among good patterns', '["*.bak",1,"build/**"]', ['*.bak', 'build/**']],
         ['everything among good patterns', '["*.bak","*","build/**"]', ['*.bak', 'build/**']],
         ['an empty pattern among good ones', '["","*.bak"]', ['*.bak']],
@@ -336,5 +337,50 @@ describe('blockedApps', () => {
         t.stateDb.connection.run(`INSERT OR REPLACE INTO settings (key, value) VALUES ('blockedApps', '["/bin/sh"]')`);
         expect(t.stateDb.getSettings().blockedApps).toEqual([]);
         expect(t.stateDb.getMeta('blockedApps')).toBe('["/bin/sh"]');
+    });
+});
+
+// #43: the check that a pattern hides everything keys on names unlike real files in every feature, so a broad but
+// legitimate pattern that keys on one feature (a hyphen, a digit, a first letter, its case) is never taken for it
+describe('ignore patterns that are broad but leave files out are allowed (#43)', () => {
+
+    for (const pattern of ['*-*', '*[0-9]*', '[n-z]*', '[a-z]*', '[!A-Z]*', '[A-Z]*', '*_*', '* *', '*.*', '[!0-9]*']) {
+        test(`${pattern} is allowed, alone and as stored`, () => {
+            expect(problemWithIgnorePatterns([pattern])).toBeNull();
+            expect(usableIgnorePatterns([pattern])).toEqual({ patterns: [pattern], dropped: 0 });
+        });
+    }
+
+    for (const pair of [['[A-Z]*', '[!A-Z]*'], ['[0-9]*', '[!0-9]*']] as const) {
+        test(`${pair.join(' with ')} together are refused, as they hide everything`, () => {
+            expect(problemWithIgnorePatterns([...pair])).toMatch(/together match every file/);
+            expect(usableIgnorePatterns([...pair])).toBeNull();
+        });
+    }
+
+    test('patterns that leave only dotfiles, the whole drive as it is seen, are refused', () => {
+        for (const pattern of ['[!.]*', '[a-zA-Z0-9]*']) {
+            expect(problemWithIgnorePatterns([pattern])).toMatch(/matches every file/);
+        }
+        expect(problemWithIgnorePatterns(['[a-z]*', '[A-Z]*', '[0-9]*'])).toMatch(/together match every file/);
+    });
+
+    test('lists keyed on what real files do not all share are allowed', () => {
+        for (const list of [['*7*', '*5*'], ['.*'], ['.*/**'], ['*.tmp', '*.log', 'build/**', '__pycache__', '.cache/**', '.*.swp']]) {
+            expect(problemWithIgnorePatterns(list)).toBeNull();
+        }
+    });
+
+    test('patterns that match everything are still refused', () => {
+        for (const pattern of everything) {
+            expect(problemWithIgnorePatterns([pattern])).toMatch(/matches every file/);
+        }
+    });
+
+    test('a stored list longer than the cap keeps the first 500 usable patterns', () => {
+        const stored = Array.from({ length: MAX_IGNORE_PATTERNS + 20 }, (_, i) => `file-${i}.tmp`);
+        const usable = usableIgnorePatterns(stored)!;
+        expect(usable.patterns).toEqual(stored.slice(0, MAX_IGNORE_PATTERNS));
+        expect(usable.dropped).toBe(20);
     });
 });
