@@ -21,7 +21,7 @@ use fuser::{
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 
-use crate::daemon::{DaemonClient, DaemonError, Removal};
+use crate::daemon::{DaemonClient, DaemonError, Removal, Space};
 use crate::inodes::{Inodes, ROOT_INO};
 use crate::listing::{self, Entry, Kind, VOLUME_INFO_CONTENT, VOLUME_INFO_NAME};
 use crate::readers::{classify_open, opener_interrupted, process_comm, Reader};
@@ -31,6 +31,9 @@ use crate::trash::{TrashArea, TrashNode};
 const TTL: Duration = Duration::from_secs(1);
 /// How long a folder's merged listing serves lookups, getattrs and readdirs.
 const LISTING_TTL: Duration = Duration::from_secs(1);
+/// How often the drive asks the daemon for the account's storage, and how soon again while it can't say (#181).
+const SPACE_REFRESH: Duration = Duration::from_secs(120);
+const SPACE_RETRY: Duration = Duration::from_secs(10);
 /// How often a use of a deferred open that waits for another asks whether its own app gave up.
 const SETTLE_CHECK: Duration = Duration::from_millis(500);
 
@@ -59,8 +62,28 @@ impl DriveFs {
                 uid,
                 gid: unsafe { libc::getgid() },
                 started: SystemTime::now(),
+                space: Mutex::new(None),
             }),
         }
+    }
+
+    /// Keeps the account's storage up to date for statfs, on a thread of its own: statfs never waits on the daemon,
+    /// let alone the network (#181).
+    pub fn start_space_refresh(&self) {
+        let state = Arc::downgrade(&self.state);
+        std::thread::spawn(move || loop {
+            let Some(state) = state.upgrade() else { return };
+            let wait = match state.daemon.space() {
+                Ok(space) => {
+                    *lock(&state.space) = space;
+                    if space.is_some() { SPACE_REFRESH } else { SPACE_RETRY }
+                }
+                // Not reachable for now: what it said last stays
+                Err(_) => SPACE_RETRY,
+            };
+            drop(state);
+            std::thread::sleep(wait);
+        });
     }
 
     /// Where main puts the session's notifier, once the session exists, before it runs.
@@ -90,6 +113,8 @@ struct State {
     uid: u32,
     gid: u32,
     started: SystemTime,
+    /// The account's storage, as the daemon said last; None until it has (statfs then reports the local disk)
+    space: Mutex<Option<Space>>,
 }
 
 struct CachedListing {
@@ -1423,10 +1448,12 @@ impl Filesystem for DriveFs {
         if unsafe { libc::statvfs(path.as_ptr(), &mut st) } != 0 {
             return reply.error(std::io::Error::last_os_error().into());
         }
+        let local = DiskSize { blocks: st.f_blocks, free: st.f_bfree, available: st.f_bavail, block: st.f_frsize };
+        let size = drive_size(local, *lock(&self.state.space));
         reply.statfs(
-            st.f_blocks,
-            st.f_bfree,
-            st.f_bavail,
+            size.blocks,
+            size.free,
+            size.available,
             st.f_files,
             st.f_ffree,
             st.f_bsize as u32,
@@ -1436,10 +1463,60 @@ impl Filesystem for DriveFs {
     }
 }
 
+/// A file system's size in blocks of `block` bytes, as statvfs gives it: free is what root may use, available what
+/// anyone may.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DiskSize {
+    blocks: u64,
+    free: u64,
+    available: u64,
+    block: u64,
+}
+
+/// What the drive reports as its size (#181): the Proton account's storage, so that Disk Usage and df show it rather
+/// than the local disk the backing store is on. Anything written through the drive lands in the backing store first
+/// and uploads later, so what is available for writing is never more than the local disk has: a copy Files lets
+/// through on the drive's word must fit. Until the storage is known, the local disk's own numbers.
+fn drive_size(local: DiskSize, space: Option<Space>) -> DiskSize {
+    let Some(space) = space else { return local };
+    let block = local.block.max(1);
+    let cloud_free = space.max.saturating_sub(space.used) / block;
+    DiskSize {
+        blocks: space.max / block,
+        // Used (blocks - free) is what the account uses
+        free: cloud_free,
+        available: cloud_free.min(local.available),
+        block,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn the_drive_reports_the_accounts_storage_with_no_more_room_than_the_local_disk() {
+        const GB: u64 = 1_000_000_000;
+        let block = 4096;
+        // The user's machine: 118.6 GB free of a 1 TB disk, 13.57 GB used of 510 GB in Proton Drive
+        let local = DiskSize { blocks: 1000 * GB / block, free: 130 * GB / block, available: 1186 * GB / 10 / block, block };
+        let space = Space { used: 1357 * GB / 100, max: 510 * GB };
+        let size = drive_size(local, Some(space));
+        let near = |bytes: u64, want: u64| bytes.abs_diff(want) < block; // to the block, rounded down
+        assert!(near(size.blocks * block, 510 * GB));
+        assert!(near((size.blocks - size.free) * block, space.used)); // used: the account's
+        assert_eq!(size.available, local.available); // the local disk has less room than the cloud
+        // Plenty of room here, little left in the cloud: the cloud's
+        let roomy = DiskSize { available: 900 * GB / block, ..local };
+        let nearly_full = Space { used: 509 * GB, max: 510 * GB };
+        assert!(near(drive_size(roomy, Some(nearly_full)).available * block, GB));
+        // Over quota: nothing free, never a wrap-around
+        let over = drive_size(local, Some(Space { used: 600 * GB, max: 510 * GB }));
+        assert_eq!((over.free, over.available), (0, 0));
+        // Not known yet: the local disk's numbers as they are
+        assert_eq!(drive_size(local, None), local);
+    }
     use std::sync::atomic::AtomicUsize;
 
     #[test]
