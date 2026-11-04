@@ -55,7 +55,7 @@ export async function scanLocalCopies(opts: {
             return false; // Deleted since the listing, or never here
         }
         if (relPath !== '') {
-            if (st.isFile() && path.posix.basename(relPath).startsWith(HYDRATE_STAGING_PREFIX)) {
+            if (st.isFile() && !relPath.includes('/') && relPath.startsWith(HYDRATE_STAGING_PREFIX)) {
                 // Never removed under the app waiting on it, however long it stalls: the open would fail (#41). The
                 // download finishes or cleans it up
                 return false;
