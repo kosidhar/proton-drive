@@ -98,16 +98,34 @@ export class EventFeed {
     }
 
     private onChange(change: StateChange | 'reset'): void {
-        const { syncDir, mode } = this.source.root();
-        if (change === 'reset') {
-            this.send({ type: 'reset', syncDir, mode });
+        let event: Record<string, unknown>;
+        try {
+            const { syncDir, mode } = this.source.root();
+            event =
+                change === 'reset'
+                    ? { type: 'reset', syncDir, mode }
+                    : {
+                          type: 'changed',
+                          paths: change.paths.map((p) => absolute(syncDir, p)),
+                          subtrees: change.subtrees.map((p) => absolute(syncDir, p)),
+                      };
+        } catch {
+            // This feed can't say what changed: it ends (the reader reconnects and starts over), and the failure stays
+            // here, never reaching whoever made the change or the other feeds (#128)
+            this.end();
             return;
         }
-        this.send({
-            type: 'changed',
-            paths: change.paths.map((p) => absolute(syncDir, p)),
-            subtrees: change.subtrees.map((p) => absolute(syncDir, p)),
-        });
+        this.send(event);
+    }
+
+    // Stops, and closes the stream, which lets go of its slot
+    private end(): void {
+        this.stop();
+        try {
+            this.sink.close();
+        } catch {
+            // closed already
+        }
     }
 
     private send(event: Record<string, unknown>): void {
@@ -118,13 +136,12 @@ export class EventFeed {
             if ((this.sink.desiredSize ?? 0) <= 0) {
                 const { syncDir, mode } = this.source.root();
                 this.sink.enqueue(`${JSON.stringify({ type: 'reset', syncDir, mode })}\n`);
-                this.stop();
-                this.sink.close();
+                this.end();
                 return;
             }
             this.sink.enqueue(`${JSON.stringify(event)}\n`);
         } catch {
-            this.stop(); // the reader went away
+            this.end(); // the reader went away: closed, so that its stream isn't left counted (#128)
         }
     }
 }
@@ -184,8 +201,11 @@ function eventStream(req: Request, source: FileManagerSource): Response {
                     const sink: LineSink = {
                         enqueue: (line) => controller.enqueue(encoder.encode(line)),
                         close: () => {
-                            controller.close();
-                            done();
+                            try {
+                                controller.close();
+                            } finally {
+                                done(); // let go of even when the stream had errored already
+                            }
                         },
                         get desiredSize() {
                             return controller.desiredSize;

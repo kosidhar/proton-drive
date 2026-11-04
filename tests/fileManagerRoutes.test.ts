@@ -96,6 +96,39 @@ describe('driveRelPath', () => {
 });
 
 describe('EventFeed', () => {
+    // #128: a send that fails ends the stream (so its slot is let go of), and a failure in one feed is that feed's only
+    test('a send that fails closes the stream and lets go of the events', () => {
+        const { events, flush } = manualEvents();
+        const out = fakeSink();
+        new EventFeed(out.sink, makeSource(events), { pingMs: 0 });
+        (out.sink as any).enqueue = () => {
+            throw new Error('reader gone');
+        };
+        events.touch('Docs/a.txt');
+        flush();
+        expect(out.closed).toBe(true);
+        expect(events.listenerCount).toBe(0);
+    });
+
+    test('the root failing as a change is sent ends that feed only, and never reaches who made the change', () => {
+        const { events, flush } = manualEvents();
+        let rootFails = false;
+        const failing = { ...makeSource(events), root: () => {
+            if (rootFails) throw new Error('settings gone');
+            return { syncDir: SYNC_DIR, mode: 'virtual' as const, mounted: true };
+        } } as FileManagerSource;
+        const broken = fakeSink();
+        const fine = fakeSink();
+        new EventFeed(broken.sink, failing, { pingMs: 0 });
+        new EventFeed(fine.sink, makeSource(events), { pingMs: 0 });
+        rootFails = true;
+        events.touch('Docs/a.txt');
+        expect(() => flush()).not.toThrow();
+        expect(broken.closed).toBe(true);
+        expect(events.listenerCount).toBe(1);
+        expect(fine.lines.at(-1)).toMatchObject({ type: 'changed' });
+    });
+
     test('says hello, then sends changes with absolute paths, and resets', () => {
         const { events, flush } = manualEvents();
         const out = fakeSink();
