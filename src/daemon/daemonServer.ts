@@ -22,6 +22,7 @@ import type { Logger } from '@protontech/drive-sdk';
 import { defaultControlSocketPath, startControlServer } from './controlServer';
 import { controlServerOptions } from './controlWiring';
 import { DriveController } from './driveController';
+import { pauseRoute } from './pauseRoute';
 import { withAvailability } from './remoteListing';
 import { isTrustedLocalRequest } from './requestGuard';
 import { refuseOnTcp } from './tcpRefusals';
@@ -429,9 +430,7 @@ export async function startSyncDaemon(options: {
                 }
 
                 if (req.method === 'POST' && pathname === '/api/pause') {
-                    const body = (await req.json().catch(() => ({}))) as { paused?: boolean };
-                    await engine.setPaused(Boolean(body.paused));
-                    return Response.json({ ok: true, status: engine.getStatus() });
+                    return pauseRoute(await req.json().catch(() => ({})), engine, Date.now());
                 }
 
                 if (req.method === 'GET' && pathname === '/api/conflicts') {
