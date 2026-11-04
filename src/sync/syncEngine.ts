@@ -1773,6 +1773,14 @@ export class ProtonDriveSyncEngine {
             if (await gone()) {
                 return leftByTheUser();
             }
+            if (await this.inProtonTrash(parentNode)) {
+                // Its folder is in the Proton Drive trash (trashed elsewhere meanwhile), or that couldn't be checked: put
+                // there, the copy would be recorded as synced, and the folder's removal here would take the only copy of
+                // the user's version as an unchanged one. Left here unrecorded instead: a file only on this computer,
+                // which that removal keeps (#150)
+                this.logger.warn(`The conflict copy ${relPath} stays on this computer: its folder is in the Proton Drive trash`);
+                return relPath;
+            }
             const result = await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, undefined, 'skip', gone).catch(
                 async (error: unknown) => {
                     if ((error as NodeJS.ErrnoException).code === 'ENOENT' && (await gone())) {
@@ -2235,6 +2243,15 @@ export class ProtonDriveSyncEngine {
         } catch (error: unknown) {
             this.logger.warn(`Failed to trash remote node for ${relPath}: ${error}`);
         }
+    }
+
+    // Whether a folder node is in the Proton Drive trash, itself or by a folder above it; true when that can't be told.
+    // The root never is
+    private async inProtonTrash(folder: NodeEntity): Promise<boolean> {
+        const root = await this.getRootFolder().catch(() => null);
+        if (!root) return true;
+        if (folder.uid === root.uid) return false;
+        return Boolean(folder.trashTime) || (await this.inTrashedFolder(folder));
     }
 
     // Whether a conflict at the path is being resolved right now, by hand or by the conflict setting
@@ -3029,6 +3046,12 @@ export class ProtonDriveSyncEngine {
             return; // Never the whole sync folder
         }
         await this.inAvailabilityRun(async () => {
+            if (this.isResolvingWithin(relPath)) {
+                // A conflict of it, or of something in it, is being resolved: removing it now would pull the files and
+                // records out from under that. The next pass finds it gone and removes it then (#150)
+                this.logger.info(`Not removing ${relPath} here yet: a conflict in it is being resolved`);
+                return;
+            }
             if (this.stateDb.getItemByPath(relPath)) {
                 await this.removeLocalCopyAfterCloudDelete(relPath, reason);
             }
@@ -3177,8 +3200,10 @@ export class ProtonDriveSyncEngine {
         if (!record) {
             return;
         }
-        if (this.isResolving(relPath)) {
-            return; // Its conflict is being resolved: the next pass decides where it went, or that it went (#104, #140)
+        if (this.isResolvingWithin(relPath)) {
+            // A conflict of it, or of something in it, is being resolved: the next pass decides where it went, or that it
+            // went (#104, #140, #150)
+            return;
         }
         const now = await this.currentRemotePath(record.nodeUid, relPath);
         if (now === undefined || now === relPath) {
