@@ -970,7 +970,6 @@ static SECTION_REQUESTED: std::sync::Mutex<Option<NavTab>> = std::sync::Mutex::n
 /// The running app's context, so the single-instance listener can wake it
 static APP_CONTEXT: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
 
-/// What screenshot mode may ask the worker for: reads only.
 /// The POST /api/pause body: until (epoch ms) only when the pause has an end (#205).
 fn pause_request(paused: bool, until: Option<i64>) -> serde_json::Value {
     match until {
@@ -979,6 +978,7 @@ fn pause_request(paused: bool, until: Option<i64>) -> serde_json::Value {
     }
 }
 
+/// What screenshot mode may ask the worker for: reads only.
 fn allowed_in_screenshot_mode(cmd: &WorkerCommand) -> bool {
     matches!(cmd, WorkerCommand::RefreshAll | WorkerCommand::LoadConflicts)
 }
