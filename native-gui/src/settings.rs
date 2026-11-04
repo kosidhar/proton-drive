@@ -3,7 +3,10 @@
 
 use eframe::egui::{self, Align, Color32, CornerRadius, FontFamily, FontId, Frame, Layout, Margin, RichText, Sense, Vec2};
 
-use crate::home::{elided, primary_button, secondary_button, storage};
+use crate::home::{
+    elided, open_in_browser, primary_button, secondary_button, storage, trash_hover, OPEN_TRASH, PROTON_DRIVE_TRASH_URL,
+    PROTON_DRIVE_WEB_URL,
+};
 use crate::{
     card_frame, is_light_mode, ProtonDriveNativeApp, WorkerCommand, BG_CARD_ALT, HIDDEN_NEEDS_RESTART, PROTON_PURPLE_TEXT,
     STATUS_DANGER, TEXT_MUTED, TEXT_PRIMARY,
@@ -84,6 +87,17 @@ impl ProtonDriveNativeApp {
                     });
                 });
             }
+            // Proton Drive on the web, and its trash, where a delete through the drive puts what was deleted (#201)
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if secondary_button(ui, "Open Proton Drive on the web", 30.0).clicked() {
+                    open_in_browser(PROTON_DRIVE_WEB_URL);
+                }
+                ui.add_space(8.0);
+                if secondary_button(ui, OPEN_TRASH, 30.0).on_hover_text(trash_hover(&self.status.sync_dir)).clicked() {
+                    open_in_browser(PROTON_DRIVE_TRASH_URL);
+                }
+            });
             // How signing in or out went (the sign-in page opening, or why it failed)
             if let Some(error) = &self.account_error {
                 ui.add_space(8.0);

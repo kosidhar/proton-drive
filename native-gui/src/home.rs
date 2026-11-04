@@ -285,10 +285,46 @@ fn tone_color(tone: Tone) -> Color32 {
 
 /// Opens a folder in the file manager; a screenshot opens nothing.
 fn open_in_files(folder: &std::path::Path) {
-    if SCREENSHOT_MODE.load(Ordering::SeqCst) {
+    open_externally(folder.as_os_str(), SCREENSHOT_MODE.load(Ordering::SeqCst));
+}
+
+/// Proton Drive on the web, and its trash: where a delete through the drive puts what was deleted (#201)
+pub(crate) const PROTON_DRIVE_WEB_URL: &str = "https://drive.proton.me";
+pub(crate) const PROTON_DRIVE_TRASH_URL: &str = "https://drive.proton.me/trash";
+pub(crate) const OPEN_TRASH: &str = "Open Proton Drive Trash";
+
+/// What the trash button says on hover: deleted files wait there, and come back to the sync folder when restored
+pub(crate) fn trash_hover(sync_dir: &str) -> String {
+    let folder = if sync_dir.is_empty() { "~/ProtonDrive".to_string() } else { shown_folder(sync_dir) };
+    format!("Deleted files stay here until you empty the trash or restore them. Restoring brings them back to {folder}.")
+}
+
+/// Opens a page in the default browser; a screenshot opens nothing.
+pub(crate) fn open_in_browser(url: &str) {
+    open_externally(std::ffi::OsStr::new(url), SCREENSHOT_MODE.load(Ordering::SeqCst));
+}
+
+/// The one way the app opens a folder or a page, with the desktop's own handler (xdg-open), except in a screenshot.
+/// Tests see what would have been opened (LAUNCHED) instead of opening it.
+pub(crate) fn open_externally(target: &std::ffi::OsStr, screenshot: bool) {
+    if screenshot {
         return;
     }
-    let _ = spawn_reaped(Command::new("xdg-open").arg(folder));
+    #[cfg(test)]
+    LAUNCHED.with(|launched| launched.borrow_mut().push(target.to_string_lossy().into_owned()));
+    #[cfg(not(test))]
+    spawn_opener(target);
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn spawn_opener(target: &std::ffi::OsStr) {
+    let _ = spawn_reaped(Command::new("xdg-open").arg(target));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What open_externally would have opened, on this test's thread
+    pub(crate) static LAUNCHED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// A secondary (outlined) button, as wide as its label.
@@ -544,8 +580,15 @@ impl ProtonDriveNativeApp {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if !sync_dir.is_empty() && secondary_button(ui, "Open in Files", 32.0).clicked() {
-                        open_in_files(std::path::Path::new(&sync_dir));
+                    // Laid out from the right: Open in Files, then the trash beside it
+                    if !sync_dir.is_empty() {
+                        if secondary_button(ui, "Open in Files", 32.0).clicked() {
+                            open_in_files(std::path::Path::new(&sync_dir));
+                        }
+                        ui.add_space(8.0);
+                    }
+                    if secondary_button(ui, OPEN_TRASH, 32.0).on_hover_text(trash_hover(&sync_dir)).clicked() {
+                        open_in_browser(PROTON_DRIVE_TRASH_URL);
                     }
                     ui.add_space(8.0);
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {

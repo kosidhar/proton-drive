@@ -5142,6 +5142,38 @@ mod tests {
         assert!(h.text_at("2 more").is_some());
     }
 
+    // #201: a delete through the drive goes to the Proton Drive trash, which the app opens in the browser, from Home
+    // and from Settings' account card; a screenshot opens nothing
+    #[test]
+    fn the_proton_drive_trash_opens_in_the_browser_from_home_and_settings() {
+        let launched = || home::LAUNCHED.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        launched();
+        let mut h = home_with(|s| s.sync_dir = "/srv/u/ProtonDrive".into());
+        h.click(h.text_at("Open Proton Drive Trash").expect("the trash is offered on Home"));
+        assert_eq!(launched(), vec!["https://drive.proton.me/trash".to_string()]);
+        h.click(h.text_at("Open in Files").unwrap());
+        assert_eq!(launched(), vec!["/srv/u/ProtonDrive".to_string()]);
+        assert_eq!(h.sent(), Vec::<String>::new()); // nothing goes to the daemon
+
+        let mut h = Harness::settings(None, None);
+        h.click(h.text_at("Open Proton Drive Trash").expect("the trash is offered in Settings"));
+        assert_eq!(launched(), vec!["https://drive.proton.me/trash".to_string()]);
+        h.click(h.text_at("Open Proton Drive on the web").expect("Proton Drive on the web is offered"));
+        assert_eq!(launched(), vec!["https://drive.proton.me".to_string()]);
+
+        home::open_externally(std::ffi::OsStr::new("https://drive.proton.me/trash"), true);
+        assert_eq!(launched(), Vec::<String>::new(), "a screenshot opens nothing");
+    }
+
+    #[test]
+    fn the_trash_hover_says_where_restored_files_come_back() {
+        assert_eq!(
+            home::trash_hover(""),
+            "Deleted files stay here until you empty the trash or restore them. Restoring brings them back to ~/ProtonDrive."
+        );
+        assert!(home::trash_hover("/srv/u/Elsewhere").ends_with("Restoring brings them back to /srv/u/Elsewhere."));
+    }
+
     #[test]
     fn your_drive_shows_where_it_is_the_storage_and_frees_up_space_after_asking() {
         const GB: u64 = 1024 * 1024 * 1024;

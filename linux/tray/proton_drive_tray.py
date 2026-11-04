@@ -33,6 +33,9 @@ DAEMON_URL = os.environ.get("PROTON_DRIVE_DAEMON_URL", "http://127.0.0.1:49152")
 
 MOUNT_LABEL = "Mount Proton Drive"
 OPEN_FOLDER_LABEL = "Open Proton Drive Folder"
+# A delete through the drive goes to the Proton Drive trash, on the web (#201)
+OPEN_TRASH_LABEL = "Open Proton Drive Trash"
+TRASH_URL = "https://drive.proton.me/trash"
 # Why a virtual drive can be mounted again (the daemon's vfs.reason); POST /vfs/mount refuses the rest
 MOUNT_REASONS = ("ejected", "crashed", "mount-point-busy")
 CONTROL_CONNECT_TIMEOUT = 2.0
@@ -265,6 +268,14 @@ class ProtonDriveTrayIndicator:
         open_folder_item.connect("activate", self.on_open_folder)
         self.menu.append(open_folder_item)
 
+        open_trash_item = Gtk.MenuItem(label=OPEN_TRASH_LABEL)
+        open_trash_item.set_tooltip_text(
+            "Deleted files stay here until you empty the trash or restore them. "
+            "Restoring brings them back to your Proton Drive folder."
+        )
+        open_trash_item.connect("activate", self.on_open_trash)
+        self.menu.append(open_trash_item)
+
         # Shown only while the virtual drive can be mounted again (see offers_mount)
         self.mounting = False
         self.mount_item = Gtk.MenuItem(label=MOUNT_LABEL)
@@ -377,6 +388,9 @@ class ProtonDriveTrayIndicator:
 
     def on_open_folder(self, _widget):
         spawn_detached(["xdg-open", self.sync_dir])
+
+    def on_open_trash(self, _widget):
+        spawn_detached(["xdg-open", TRASH_URL])
 
     def on_mount(self, _widget):
         """POST /vfs/mount on the control socket, off the GTK thread; a failure is a notification, never a crash."""

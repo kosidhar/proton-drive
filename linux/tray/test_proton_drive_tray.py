@@ -183,6 +183,15 @@ class MountItemTest(unittest.TestCase):
     def test_labels_follow_the_copy(self):
         self.assertEqual(tray.MOUNT_LABEL, "Mount Proton Drive")
         self.assertEqual(tray.OPEN_FOLDER_LABEL, "Open Proton Drive Folder")
+        self.assertEqual(tray.OPEN_TRASH_LABEL, "Open Proton Drive Trash")
+
+
+class OpenTrashTest(unittest.TestCase):
+    # #201: a delete through the drive goes to the Proton Drive trash, which the tray opens in the browser
+    def test_open_trash_opens_the_proton_drive_trash_in_the_browser(self):
+        with mock.patch.object(tray, "spawn_detached") as spawn:
+            tray.ProtonDriveTrayIndicator.on_open_trash(object(), None)
+        spawn.assert_called_once_with(["xdg-open", "https://drive.proton.me/trash"])
 
 
 if __name__ == "__main__":
