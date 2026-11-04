@@ -19,8 +19,8 @@ const SAMPLE_PATHS = [
     '4vxq.Wz',
     '.zq7-e',
     'q x_j',
-    // A pattern matches a nested path by any of its names: each of these starts all its names alike, so that a pattern
-    // keyed on how a name starts doesn't hide them all
+    // A file in folders is hidden when it or any folder above it is (the scan doesn't go into an ignored folder): each
+    // of these starts all its names alike, so that a pattern keyed on how a name starts doesn't hide them all
     'Zq7 c/Yk3-d.zq7',
     '9vu_f/4y k',
     'aqj/ykg.w',
@@ -28,9 +28,18 @@ const SAMPLE_PATHS = [
 ];
 const NESTED_SAMPLE_PATHS = SAMPLE_PATHS.filter((sample) => sample.includes('/'));
 
+// Samples no name of which starts with a dot: what the file manager shows
+const VISIBLE_SAMPLE_PATHS = SAMPLE_PATHS.filter((sample) => sample.split('/').every((name) => !name.startsWith('.')));
+
 function hidesAll(patterns: string[]): boolean {
-    const ignored = (sample: string) => matchesIgnorePatterns(sample, patterns);
-    return SAMPLE_PATHS.every(ignored) || NESTED_SAMPLE_PATHS.every(ignored);
+    // Hidden as the engine hides it: the path itself, or any folder above it, ignored
+    const ignored = (sample: string) => {
+        const names = sample.split('/');
+        return names.some((_, i) => matchesIgnorePatterns(names.slice(0, i + 1).join('/'), patterns));
+    };
+    // Every file, every file inside folders, or every file not hidden by its name (a pattern like [!.]* leaves only
+    // dotfiles: the whole drive as the user sees it)
+    return SAMPLE_PATHS.every(ignored) || NESTED_SAMPLE_PATHS.every(ignored) || VISIBLE_SAMPLE_PATHS.every(ignored);
 }
 
 function problemWithPattern(pattern: unknown, index: number): string | null {
