@@ -43,6 +43,8 @@ struct Fake {
     /// Renames from these refused with EXDEV while they have no local copy, as the daemon refuses an online-only file
     /// replacing another
     exdev_while_online: Vec<String>,
+    /// What GET /vfs/space answers: the account's storage, or nothing known (#181)
+    space: Value,
 }
 
 impl Fake {
@@ -53,7 +55,13 @@ impl Fake {
             refusals: HashMap::new(),
             rename_refusals: HashMap::new(),
             exdev_while_online: Vec::new(),
+            space: Value::Null,
         }
+    }
+
+    fn with_space(mut self, used: u64, max: u64) -> Fake {
+        self.space = json!({ "usedSpace": used, "maxSpace": max });
+        self
     }
 
     fn slow(mut self, delay: Duration) -> Fake {
@@ -191,6 +199,7 @@ fn serve(mut stream: UnixStream, backing: &Path, fake: &Fake, calls: &Calls) {
             let path = query.strip_prefix("path=").map(query_decode).unwrap_or_default();
             (200, json!({ "entries": fake.children.lock().unwrap().get(&path).cloned().unwrap_or_default() }))
         }
+        ("GET", None) if target == "/vfs/space" => (200, json!({ "space": fake.space })),
         ("POST", None) if target == "/vfs/rename" => {
             let body = without_deadline(&body);
             calls.renames.lock().unwrap().push(body.clone());
@@ -657,6 +666,38 @@ fn mounts_as_protondrive_with_the_drives_options() {
     // Free space is the backing store's
     let (drive, backing) = (statvfs(&h.mountpoint), statvfs(&h.backing));
     assert_eq!((drive.f_blocks, drive.f_bsize, drive.f_frsize), (backing.f_blocks, backing.f_bsize, backing.f_frsize));
+}
+
+// #181: Disk Usage and df show the account's storage, never more room for writing than the local disk has
+#[test]
+fn the_drive_reports_the_accounts_storage() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    let backing = statvfs(&h.backing);
+    let block = backing.f_frsize;
+    let local_free = backing.f_bavail * block;
+    // A quota bigger than the local disk's room, nearly all of it free: the local room is what is available
+    let max = local_free * 4 + 1_000_000_000;
+    let used = 2_000_000_000;
+    h.start_fake(Fake::new(HashMap::new()).with_space(used, max));
+    h.mount();
+    // The helper asks for it on its own thread as it starts: wait for it to be in
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let drive = loop {
+        let drive = statvfs(&h.mountpoint);
+        if drive.f_blocks != backing.f_blocks || Instant::now() > deadline {
+            break drive;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    let near = |bytes: u64, want: u64| bytes.abs_diff(want) < block * 2;
+    assert!(near(drive.f_blocks * block, max), "total {}", drive.f_blocks * block);
+    assert!(near((drive.f_blocks - drive.f_bfree) * block, used), "used {}", (drive.f_blocks - drive.f_bfree) * block);
+    // The local disk's room, give or take what changed on it meanwhile
+    let available = drive.f_bavail * block;
+    assert!(available <= max - used && available.abs_diff(local_free) < 1_000_000_000, "available {available}");
 }
 
 fn statvfs(path: &Path) -> libc::statvfs {

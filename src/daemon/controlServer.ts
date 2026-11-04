@@ -45,6 +45,8 @@ export interface ControlServerOptions {
     fileManager?: FileManagerSource;
     // Mount again (the tray and the app): absent while Proton Drive is a plain folder
     mountAgain?: () => Promise<void>;
+    // The account's storage in bytes, or null while it isn't known: what the drive reports as its size (#181)
+    space?: () => Promise<{ usedSpace: number; maxSpace: number } | null>;
     // Finish, move back or retry a move that stopped (see DriveController.resolveMove); its errors may carry an HTTP
     // status and the move waiting now
     driveMove?: (action: DriveMoveAction, from?: string, to?: string) => Promise<void>;
@@ -198,6 +200,18 @@ async function driveRoute(req: Request, route: string, engine: DriveEngine): Pro
 }
 
 const DRIVE_ROUTES: readonly string[] = ['/vfs/children', '/vfs/hydrate', '/vfs/rename', '/vfs/delete', '/vfs/truncate'];
+
+// GET /vfs/space: the account's storage for the drive helper's statfs (#181), { space: { usedSpace, maxSpace } }, or
+// { space: null } while it isn't known; the helper then reports the local disk
+async function spaceRoute(req: Request, space: ControlServerOptions['space']): Promise<Response> {
+    if (req.method !== 'GET') return driveError(new Error('Method not allowed'), 405);
+    try {
+        const known = space ? await space() : null;
+        return Response.json({ space: known ? { usedSpace: known.usedSpace, maxSpace: known.maxSpace } : null });
+    } catch {
+        return Response.json({ space: null });
+    }
+}
 
 // POST /vfs/mount: mounts the drive again after an eject, a crash streak or a busy mount point; { ok: true }, or 400
 // { error, code } when the mount point can't be readied
@@ -366,6 +380,9 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
             }
             if (url.pathname === '/vfs/mount') {
                 return mountRoute(req, opts.mountAgain);
+            }
+            if (url.pathname === '/vfs/space') {
+                return spaceRoute(req, opts.space);
             }
             if (url.pathname === '/drive/move') {
                 return driveMoveRoute(req, opts.driveMove);

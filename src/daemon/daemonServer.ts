@@ -508,6 +508,12 @@ export async function startSyncDaemon(options: {
                 signIn,
                 signOut,
                 makeRemoteFolder,
+                // The drive's size (#181): what the account uses of its storage, from what the app shows (asked of the
+                // API at most once a minute)
+                space: async () => {
+                    const account = await refreshAccountInfo();
+                    return account && account.maxSpace > 0 ? { usedSpace: account.usedSpace, maxSpace: account.maxSpace } : null;
+                },
             }),
         );
     } catch (err) {
