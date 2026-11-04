@@ -1,3 +1,4 @@
+import { applyStartAtLogin } from '../linux/autostart';
 import type { ProtonDriveSyncEngine } from '../sync/syncEngine';
 import type { SyncStateDatabase } from '../sync/syncStateDb';
 import type { ControlServerOptions } from './controlServer';
@@ -32,7 +33,7 @@ export function controlServerOptions(deps: {
         mountAgain: () => drive.mountAgain(),
         space: deps.space,
         driveMove: (action, from, to) => drive.resolveMove(action, from, to),
-        driveSettings: (change) => driveSettings(change, { stateDb, drive, engine }),
+        driveSettings: (change) => driveSettings(change, { stateDb, drive, engine, applyStartAtLogin: (on) => applyStartAtLogin(on) }),
         login: deps.signIn,
         logout: deps.signOut,
         resolveConflict: (id, choice) => engine.resolveConflictManually(id, choice),

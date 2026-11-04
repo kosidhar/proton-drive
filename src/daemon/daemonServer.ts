@@ -1,5 +1,6 @@
 import path from 'node:path';
 
+import { applyStartAtLogin } from '../linux/autostart';
 import { ensureSystemTrayIndicator, getSystemdServiceStatus, sendDesktopNotification } from '../linux/notifications';
 import {
     DEFAULT_APP_VERSION,
@@ -98,6 +99,12 @@ export async function startSyncDaemon(options: {
     const stateDb = new SyncStateDatabase(stateDbPath);
 
     const syncLogger = wireSyncLogging(runtime, stateDb);
+    // The login entry as the setting asks, from this binary (it may have moved since): on for a new install (#92)
+    try {
+        applyStartAtLogin(stateDb.getSettings().startAtLogin);
+    } catch (error: unknown) {
+        syncLogger.warn(`Could not set Proton Drive to start at login: ${String(error)}`);
+    }
     const engine = new ProtonDriveSyncEngine(
         runtime.sdk,
         runtime.eventsManager,
