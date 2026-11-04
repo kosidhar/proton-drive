@@ -465,3 +465,23 @@ describe('ignore patterns that hide nearly every ordinary name are refused (#151
         }
     });
 });
+
+// #155: a leading class that leaves out only a few letters hides nearly every file, whatever the sample names start with;
+// and a list that leaves files in folders visible is not taken for hiding everything
+describe('leading classes are judged by how much they cover (#155)', () => {
+    for (const pattern of ['[!ryzRYZ]*', '[!dyzDYZ]*', '[!akyAKY]*', '[!anyANY]*', '[!ayDd]*', '[^ryzRYZ]*']) {
+        test(`${pattern} is refused`, () => {
+            expect(problemWithIgnorePatterns([pattern])).toMatch(/matches nearly every file/);
+        });
+    }
+
+    test('classes covering part of the alphabet are still allowed', () => {
+        for (const pattern of ['[A-Z]*', '[a-z]*', '[0-9]*', '[a-m]*', '[A-Za-f]*', '[!xyz]*.tmp']) {
+            expect(problemWithIgnorePatterns([pattern])).toBeNull();
+        }
+    });
+
+    test('*[0-9]* with *.* leaves files in folders visible, and is allowed', () => {
+        expect(problemWithIgnorePatterns(['*[0-9]*', '*.*'])).toBeNull();
+    });
+});
