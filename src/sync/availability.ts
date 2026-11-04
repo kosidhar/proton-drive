@@ -5,8 +5,9 @@ import { selfOrDescendant, selfOrDescendantWhere } from "./pathRange";
 
 export type PinFlag = "pinned" | "unpinned";
 export type HideFlag = "pending" | "hidden";
+// partial: a folder with some of its files on this computer and some not (#183); never a file
 export type ItemAvailability =
-  "pinned" | "downloaded" | "online-only" | "hidden" | "hiding";
+  "pinned" | "downloaded" | "partial" | "online-only" | "hidden" | "hiding";
 
 // Pin and hide flags per remote node uid, so they follow a node when it moves. A flag applies to everything below its
 // node until a nearer flag overrides it; hide wins over pin. Paths that are not indexed yet (local items waiting for
@@ -121,7 +122,12 @@ export class AvailabilityPolicy {
         .get(this.rangeParams(relPath));
       // Downloaded: nothing below it is missing here, and it is here at all (it, or something in it, is recorded). A
       // folder whose contents aren't indexed yet has nothing below it to be missing, and may have nothing here (#17)
-      return missing === null && this.anythingHere(relPath) ? "downloaded" : "online-only";
+      if (missing === null) {
+        return this.anythingHere(relPath) ? "downloaded" : "online-only";
+      }
+      // Partly here: something is missing, and some file below it is on this computer (#183). A folder of its own
+      // doesn't count: an online-only folder can still have its folders here
+      return this.filesHereBelow(relPath) ? "partial" : "online-only";
     }
     return this.hasLocalCopy(relPath) ? "downloaded" : "online-only";
   }
@@ -150,6 +156,7 @@ export class AvailabilityPolicy {
     const missing = this.childrenMissingFiles(folderRel);
     const here = this.childrenWithAnythingHere(folderRel);
     const freedInside = this.childrenWithUnpinnedBelow(folderRel);
+    const filesBelow = this.childrenWithFilesBelow(folderRel);
     for (const child of children) {
       // The nearest hide flag wins, the child's own first, as stateOf has it
       if (child.hide) {
@@ -159,10 +166,53 @@ export class AvailabilityPolicy {
       } else if ((child.pin ? child.pin === "pinned" : pinnedAbove) && !freedInside.has(child.name)) {
         out.set(child.name, "pinned");
       } else {
-        out.set(child.name, !missing.has(child.name) && here.has(child.name) ? "downloaded" : "online-only");
+        out.set(child.name, this.contentsState(child.type, missing.has(child.name), here.has(child.name), filesBelow.has(child.name)));
       }
     }
     return out;
+  }
+
+  // An unpinned item's state from what of it is here, as stateOf has it: a folder with something missing is partial
+  // when some file below it is here
+  private contentsState(type: string, missing: boolean, here: boolean, filesBelow: boolean): ItemAvailability {
+    if (!missing) {
+      return here ? "downloaded" : "online-only";
+    }
+    return type === "folder" && filesBelow ? "partial" : "online-only";
+  }
+
+  // Whether a file below a path (not the path itself) is recorded as being on this computer
+  private filesHereBelow(relPath: string): boolean {
+    return (
+      this.db
+        .query(
+          `SELECT 1 FROM synced_items s WHERE s.type = 'file' AND s.localRelPath != $path
+                     AND ${this.range("s.localRelPath", relPath)} LIMIT 1`,
+        )
+        .get(this.rangeParams(relPath)) !== null
+    );
+  }
+
+  // The names of a folder's children with a file below them (not the child itself) recorded as being here
+  private childrenWithFilesBelow(folderRel: string): Set<string> {
+    const prefix = folderRel === "" ? "" : `${folderRel}/`;
+    const below =
+      folderRel === ""
+        ? "s.localRelPath != ''"
+        : "(s.localRelPath >= $lo AND s.localRelPath < $hi)";
+    const rows = this.db
+      .query(
+        `SELECT DISTINCT substr(rest, 1, instr(rest, '/') - 1) AS name
+                 FROM (SELECT substr(s.localRelPath, length($prefix) + 1) AS rest FROM synced_items s
+                       WHERE s.type = 'file' AND ${below})
+                 WHERE instr(rest, '/') > 0`,
+      )
+      .all({
+        // SQLite measures the prefix in characters, as substr counts them (a JS length counts UTF-16 units)
+        $prefix: prefix,
+        ...(folderRel === "" ? {} : { $lo: prefix, $hi: `${folderRel}0` }),
+      }) as { name: string }[];
+    return new Set(rows.map((row) => row.name));
   }
 
   // Whether any indexed descendant (not the item itself) is explicitly unpinned: freed inside a pinned folder

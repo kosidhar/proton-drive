@@ -135,6 +135,7 @@ DOCS_STATES = {
         "d.txt": {"availability": "online-only", "transfer": "syncing"},
         "e.txt": {"availability": "downloaded", "transfer": "error"},
         "f.txt": {"availability": "downloaded", "transfer": "conflict"},
+        "Part": {"availability": "partial", "transfer": None},  # a folder partly here (#183)
         ".git": None,
     },
 }
@@ -159,6 +160,11 @@ class EmblemTest(unittest.TestCase):
         self.assertEqual(ext.EMBLEMS["pinned"], "emblem-protondrive-pinned")
         self.assertEqual(ext.EMBLEMS["downloaded"], "emblem-protondrive-local")
         self.assertEqual(ext.EMBLEMS["online-only"], "emblem-protondrive-cloud")
+        self.assertEqual(ext.EMBLEMS["partial"], "emblem-protondrive-partial")
+        # Every emblem the extension names is one the app installs
+        icons = os.path.join(HERE, "..", "icons", "emblems")
+        for emblem in ext.EMBLEMS.values():
+            self.assertTrue(os.path.isfile(os.path.join(icons, emblem + ".svg")), emblem)
 
     def test_paths_inside_the_drive(self):
         self.assertEqual(ext.rel_to_root(ROOT, ROOT), "")
@@ -186,6 +192,7 @@ class EmblemTest(unittest.TestCase):
         self.assertEqual(files["d.txt"].emblems, ["emblem-synchronizing"])
         self.assertEqual(files["e.txt"].emblems, ["emblem-important"])
         self.assertEqual(files["f.txt"].emblems, ["emblem-important"])
+        self.assertEqual(files["Part"].emblems, ["emblem-protondrive-partial"])
         self.assertEqual(files[".git"].emblems, [])
         # Cached: the next file of that folder gets its emblem at once, with no request
         again = FakeFile(f"{ROOT}/Docs/a.txt")
@@ -436,6 +443,7 @@ class MenuTest(unittest.TestCase):
         self.assertEqual(self.actions("a.txt", "c.txt"), ["pin", "free", "hide"])  # mixed
         self.assertEqual(self.actions("c.txt"), ["pin", "hide"])  # online-only
         self.assertEqual(self.actions("b.txt"), ["pin", "free", "hide"])  # downloaded
+        self.assertEqual(self.actions("Part"), ["pin", "free", "hide"])  # partly here: both ways (#183, #176)
         self.assertEqual(self.actions("unseen.txt"), ["pin", "free", "hide"])  # not known yet
         self.assertEqual(self.h.files.actions_for([f"{ROOT}/Elsewhere/x"]), ["pin", "free", "hide"])
         self.assertEqual(self.actions(".git"), [])  # local only: Sync Now and Open only

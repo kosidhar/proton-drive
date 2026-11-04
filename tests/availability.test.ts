@@ -117,11 +117,42 @@ describe("AvailabilityPolicy", () => {
   test("folder state follows its contents", () => {
     addLocalRecord("Docs/a.txt");
     addLocalRecord("Docs/b.txt");
-    expect(policy.stateOf("Docs")).toBe("online-only");
+    expect(policy.stateOf("Docs")).toBe("partial"); // #183: some of it here, Deep/c.txt not
     addLocalRecord("Docs/Deep/c.txt");
     expect(policy.stateOf("Docs")).toBe("downloaded");
     expect(policy.stateOf("Docs/a.txt")).toBe("downloaded");
     expect(policy.stateOf("Music/s.mp3")).toBe("online-only");
+  });
+
+  // #183: a folder with some of its files here and some not reads as partly here; a file never does
+  test("a folder with some files here and some not is partial, at any depth, in childStates as in stateOf", () => {
+    addLocalRecord("Docs/Deep/c.txt");
+    expect(policy.stateOf("Docs")).toBe("partial");
+    expect(policy.childStates("").get("Docs")).toBe("partial");
+    expect(policy.stateOf("Docs/Deep")).toBe("downloaded");
+    expect(policy.childStates("Docs").get("Deep")).toBe("downloaded");
+    expect(policy.stateOf("Docs/a.txt")).toBe("online-only");
+    expect(policy.childStates("Docs").get("a.txt")).toBe("online-only");
+    // The top of the drive has no emblem of its own, but reads the same way
+    expect(policy.stateOf("")).toBe("partial");
+  });
+
+  test("an empty local folder inside an online-only folder doesn't make it partial: only files count", () => {
+    stateDb.upsertItem({
+      localRelPath: "Docs/Deep",
+      nodeUid: "deep",
+      parentNodeUid: "docs",
+      type: "folder",
+      localSha1: null,
+      remoteSha1: null,
+      localMtimeMs: 0,
+      remoteMtimeMs: 0,
+      size: 0,
+      syncStatus: "synced",
+      lastError: null,
+    });
+    expect(policy.stateOf("Docs")).toBe("online-only");
+    expect(policy.childStates("").get("Docs")).toBe("online-only");
   });
 
   // #17: a cloud folder indexed one level deep (its contents not crawled yet) has no indexed file below it that lacks a
@@ -181,8 +212,8 @@ describe("AvailabilityPolicy", () => {
     addLocalRecord("Docs/a.txt");
     addLocalRecord("Docs/b.txt");
     policy.setPin("deep", "unpinned", true); // Free up space on Docs/Deep
-    expect(policy.stateOf("Docs")).toBe("online-only"); // Deep/c.txt isn't here
-    expect(policy.childStates("").get("Docs")).toBe("online-only");
+    expect(policy.stateOf("Docs")).toBe("partial"); // a.txt and b.txt are here, Deep/c.txt isn't (#183)
+    expect(policy.childStates("").get("Docs")).toBe("partial");
     expect(policy.stateOf("Docs/Deep")).toBe("online-only");
     // The rest of the folder is still kept, and new arrivals in it still download: only what is shown changes
     expect(policy.stateOf("Docs/a.txt")).toBe("pinned");
@@ -305,12 +336,12 @@ describe("AvailabilityPolicy.childStates", () => {
     };
   }
 
-  function record(relPath: string): void {
+  function record(relPath: string, type: "file" | "folder" = "file"): void {
     stateDb.upsertItem({
       localRelPath: relPath,
       nodeUid: `uid-${relPath}`,
       parentNodeUid: null,
-      type: "file",
+      type,
       localSha1: null,
       remoteSha1: null,
       localMtimeMs: 0,
@@ -347,7 +378,7 @@ describe("AvailabilityPolicy.childStates", () => {
           // Some folders' contents are never crawled (indexed one level deep, #17); some folders are recorded
           // themselves; some hold a local item the index doesn't know
           if (next() < 0.75) grow(child.uid, child.relPath, depth + 1);
-          if (next() < 0.3) record(child.relPath);
+          if (next() < 0.3) record(child.relPath, next() < 0.5 ? "folder" : "file");
           if (next() < 0.2) record(`${child.relPath}/local-only.txt`);
         } else if (next() < 0.5) {
           record(child.relPath);

@@ -449,7 +449,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(await files.exists('A/sibling.txt')).toBe(false);
             expect(await files.exists('A/B/cousin.txt')).toBe(false);
             expect(calls.downloads).toEqual(['A/B/C/f.txt']);
-            expect(engine.availability.stateOf('A')).toBe('online-only');
+            expect(engine.availability.stateOf('A')).toBe('partial'); // A/B/C/f.txt is here, the rest isn't (#183)
             expect(engine.availability.stateOf('A/B/C')).toBe('pinned');
         });
 
@@ -949,7 +949,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(await stateOf('Docs')).toBe('pinned');
             expect(await stateOf('Other/b.txt')).toBe('online-only');
             expect(await stateOf('Docs/new.txt')).toBe('pinned');
-            expect(await stateOf('')).toBe('online-only');
+            expect(await stateOf('')).toBe('partial'); // Docs is here, Other isn't (#183)
             expect(await stateOf('typo.txt')).toBe('Not in Proton Drive: typo.txt');
             expect(await stateOf('Docs/typo.txt')).toBe('Not in Proton Drive: Docs/typo.txt');
             // The state database sits next to the sync folder: a path climbing out of it is not in Proton Drive
@@ -1032,7 +1032,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(result.state).toBe('pinned');
             expect(calls.downloads).toEqual(['Docs/a.txt']);
             expect(await readFile(local('Docs/a.txt'), 'utf8')).toBe('a');
-            expect(engine.availability.stateOf('Docs')).toBe('online-only');
+            expect(engine.availability.stateOf('Docs')).toBe('partial'); // a.txt here, b.txt not (#183)
         });
 
         test('free keeps ignored and edited files and drops only unchanged copies', async () => {
@@ -1338,8 +1338,9 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const left = (await readdir(local('Docs'))).sort();
             expect(left).toHaveLength(3); // two went before the unhide, then it stopped
             await files.expectNoRecordWithoutFile('Docs');
-            expect(shown.state).toBe('online-only');
-            expect(engine.availability.stateOf('Docs')).toBe('online-only');
+            // Three files stayed: the folder is partly here (#183)
+            expect(shown.state).toBe('partial');
+            expect(engine.availability.stateOf('Docs')).toBe('partial');
             // Online-only now: the next sync trashes nothing and brings nothing back
             await engine.reconcileNow();
             expect(calls.trashed).toEqual([]);
@@ -1379,7 +1380,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(calls.trashed).toEqual([]);
         });
 
-        test('unhide drops records whose files are gone, re-reads the cloud folder and leaves it online-only', async () => {
+        test('unhide drops records whose files are gone, re-reads the cloud folder and leaves the rest as it is', async () => {
             const { engine, add, nodes, calls } = await downloaded({ 'Docs/a.txt': 'a', 'Docs/b.txt': 'b' }, 'vol~root');
             // Hidden by a run that stopped before removing anything (a crash, say): local copies and records are still here
             engine.availability.setHide('vol~Docs', 'hidden');
@@ -1390,7 +1391,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
             const result = await engine.setAvailability('Docs', 'unhide');
 
-            expect(result).toEqual({ state: 'online-only', kept: [], refused: null });
+            // b.txt is still here, a.txt went and c.txt never came: partly here (#183)
+            expect(result).toEqual({ state: 'partial', kept: [], refused: null });
             expect(stateDb.getItemByPath('Docs/a.txt')).toBeNull();
             expect(stateDb.getItemByPath('Docs/b.txt')).not.toBeNull();
             expect(engine.remoteIndex.getByPath('Docs/c.txt')).not.toBeNull();
@@ -1399,7 +1401,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(calls.trashed).toEqual([]);
             expect(nodes.has('vol~Docs/a.txt')).toBe(true);
             expect(calls.downloads.sort()).toEqual(['Docs/a.txt', 'Docs/b.txt']);
-            expect(engine.availability.stateOf('Docs')).toBe('online-only');
+            expect(engine.availability.stateOf('Docs')).toBe('partial'); // nothing more downloads; b.txt stays (#183)
         });
 
         test('an explicit choice for the root wins over the fresh-install root pin', async () => {
@@ -8550,7 +8552,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             // A file waiting to upload shows on itself; its folders sum up only what is recorded, the same from any view.
             // b.txt was freed inside it, so Docs isn't all kept here any more and reads by its contents (#175); a hidden
             // item inside doesn't count, it isn't shown at all
-            expect(docsStates.self).toEqual({ availability: 'online-only', transfer: null });
+            expect(docsStates.self).toEqual({ availability: 'partial', transfer: null }); // a.txt here, b.txt not (#183)
             expect(docsStates.children).toEqual({
                 'a.txt': { availability: 'pinned', transfer: null },
                 'b.txt': { availability: 'online-only', transfer: null },
