@@ -481,6 +481,23 @@ describe('leading classes are judged by how much they cover (#155)', () => {
         }
     });
 
+    test('rewritten, joined or escaped, such a class is refused all the same', () => {
+        for (const pattern of [
+            '[!ryzRYZ]*?', '[!ryzRYZ]*[!q]', '[!ryzRYZ][!.]*', '**/[!ryzRYZ]*', '{[!ryzRYZ]*,x}', '[!ryzRYZ]*[a-z]*',
+            '[!]ryzRYZ]*', '[!\\]ryzRYZ]*', '[!r\\-zRYZ]*', '[!M]*/**', '[!Z9a.]*/**',
+        ]) {
+            expect(problemWithIgnorePatterns([pattern])).not.toBeNull();
+        }
+        expect(problemWithIgnorePatterns(['[a-q]*', '[s-x]*', '[A-Q]*', '[S-X]*', '[0-9]*'])).not.toBeNull();
+        expect(problemWithIgnorePatterns(['[!ryzRYZ]*.*', '[!ryzRYZ]*[!.]'])).not.toBeNull();
+    });
+
+    test('a class that leaves out a fair share is allowed', () => {
+        for (const pattern of ['[!\\-a-z]*', '[!qryzRYZ]*', '[A-Za-m]*']) {
+            expect(problemWithIgnorePatterns([pattern])).toBeNull();
+        }
+    });
+
     test('*[0-9]* with *.* leaves files in folders visible, and is allowed', () => {
         expect(problemWithIgnorePatterns(['*[0-9]*', '*.*'])).toBeNull();
     });

@@ -71,38 +71,22 @@ function hidesAll(patterns: string[]): boolean {
     return SAMPLE_PATHS.every(ignored) || NESTED_SAMPLE_PATHS.every(ignored) || VISIBLE_SAMPLE_PATHS.every(ignored);
 }
 
-// Nearly every ordinary name, by the wildcard patterns alone: a pattern naming a file or folder hides only that, however
-// many of the ordinary names it happens to be (#151). Or a pattern that is just a leading class followed by * (or ?*),
-// covering nearly every letter and digit: it hides nearly every name whatever the names below start with (#155)
+// Names starting with each letter and digit, their endings varied (an extension or none, a digit, a space, a hyphen, an
+// underscore), and the same inside folders: a pattern or list that hides nearly all of these hides nearly every name,
+// whatever its shape ([!ryzRYZ]*, [!ryzRYZ]*?, **/[!ryzRYZ]*, [!M]*/**, a union of partial classes) (#155)
+const ALNUM = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+const ENDINGS = ['vq', 'k8 w.pdf', 'q_z.txt', 'wx-j', 'j9.md', 'p k'];
+const SYNTH_PATHS = [...ALNUM].map((c, i) => `${c}${ENDINGS[i % ENDINGS.length]}`);
+const SYNTH_NESTED_PATHS = [...ALNUM].map((c, i) => `${c}${ENDINGS[(i + 3) % ENDINGS.length]}/${c}${ENDINGS[(i + 1) % ENDINGS.length]}`);
+
+// Nearly every name, by the wildcard patterns alone: a pattern naming a file or folder hides only that, however many
+// of the ordinary names it happens to be (#151)
 function hidesNearlyAll(patterns: string[]): boolean {
     const wildcards = patterns.filter((pattern) => /[*?[{]/.test(pattern));
     if (wildcards.length === 0) return false;
-    if (wildcards.some(leadingClassCoversNearlyAll)) return true;
-    return ORDINARY_PATHS.filter(hiddenBy(wildcards)).length >= NEARLY_ALL * ORDINARY_PATHS.length;
-}
-
-const ALNUM = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-
-// [class]* (or [class]?*, [class]**): whether the class takes in at least NEARLY_ALL of the letters and digits
-function leadingClassCoversNearlyAll(pattern: string): boolean {
-    const match = /^\[([^\]]+)\](\?*)\*+$/.exec(pattern.trim());
-    if (!match) return false;
-    let body = match[1]!;
-    const negated = body.startsWith('!') || body.startsWith('^');
-    if (negated) body = body.slice(1);
-    const inClass = new Set<string>();
-    for (let i = 0; i < body.length; i++) {
-        const from = body[i]!;
-        if (body[i + 1] === '-' && i + 2 < body.length) {
-            const to = body[i + 2]!;
-            for (let c = from.charCodeAt(0); c <= to.charCodeAt(0); c++) inClass.add(String.fromCharCode(c));
-            i += 2;
-        } else {
-            inClass.add(from);
-        }
-    }
-    const covered = [...ALNUM].filter((c) => inClass.has(c) !== negated).length;
-    return covered >= NEARLY_ALL * ALNUM.length;
+    const ignored = hiddenBy(wildcards);
+    const nearlyAll = (paths: string[]) => paths.filter(ignored).length >= NEARLY_ALL * paths.length;
+    return nearlyAll(ORDINARY_PATHS) || nearlyAll(SYNTH_PATHS) || nearlyAll(SYNTH_NESTED_PATHS);
 }
 
 function problemWithPattern(pattern: unknown, index: number): string | null {
