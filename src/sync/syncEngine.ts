@@ -1773,6 +1773,14 @@ export class ProtonDriveSyncEngine {
             if (await gone()) {
                 return leftByTheUser();
             }
+            if (await this.inProtonTrash(parentNode)) {
+                // Its folder is in the Proton Drive trash (trashed elsewhere meanwhile), or that couldn't be checked: put
+                // there, the copy would be recorded as synced, and the folder's removal here would take the only copy of
+                // the user's version as an unchanged one. Left here unrecorded instead: a file only on this computer,
+                // which that removal keeps (#150)
+                this.logger.warn(`The conflict copy ${relPath} stays on this computer: its folder is in the Proton Drive trash`);
+                return relPath;
+            }
             const result = await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, undefined, 'skip', gone).catch(
                 async (error: unknown) => {
                     if ((error as NodeJS.ErrnoException).code === 'ENOENT' && (await gone())) {
@@ -2235,6 +2243,15 @@ export class ProtonDriveSyncEngine {
         } catch (error: unknown) {
             this.logger.warn(`Failed to trash remote node for ${relPath}: ${error}`);
         }
+    }
+
+    // Whether a folder node is in the Proton Drive trash, itself or by a folder above it; true when that can't be told.
+    // The root never is
+    private async inProtonTrash(folder: NodeEntity): Promise<boolean> {
+        const root = await this.getRootFolder().catch(() => null);
+        if (!root) return true;
+        if (folder.uid === root.uid) return false;
+        return Boolean(folder.trashTime) || (await this.inTrashedFolder(folder));
     }
 
     // Whether a conflict at the path is being resolved right now, by hand or by the conflict setting
