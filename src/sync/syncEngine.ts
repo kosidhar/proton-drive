@@ -316,9 +316,10 @@ export class ProtonDriveSyncEngine {
     // or the strategy would act against the user's choice and the row would say what didn't happen (#77)
     private readonly manualResolvingPaths = new Set<string>();
     private readonly strategyResolvingPaths = new Set<string>();
-    // When each resolution by hand ends (by its path), for a drive rename or delete of it to wait for; and the paths a
-    // drive rename or delete is working on right now, which a resolution by hand is refused for (#112)
-    private readonly manualResolutionEnds = new Map<string, Promise<void>>();
+    // When each resolution ends (by its path), by hand or by the conflict setting, for a drive rename or delete of it to
+    // wait for; and the paths a drive rename or delete is working on right now, which a resolution doesn't start on
+    // (#112, #121)
+    private readonly resolutionEnds = new Map<string, Promise<void>>();
     private readonly drivingPaths = new Map<string, number>();
     // The conflict copy a keep-both made of a file (by its path), and of what content, until that keep-both finishes or
     // the file's conflict is over some other way (resolved by hand, or the file synced): a retry after its download failed
@@ -1521,10 +1522,16 @@ export class ProtonDriveSyncEngine {
             }
             return;
         }
+        if ([...this.drivingPaths.keys()].some((p) => isSameOrUnder(relPath, p))) {
+            return; // Being renamed or deleted through the drive right now: the next pass decides, from what it leaves (#121)
+        }
         notify();
 
-        // Claimed until it is done: a manual resolution of it meanwhile is refused (#77)
+        // Claimed until it is done: a manual resolution of it meanwhile is refused (#77), and a drive rename or delete of
+        // it waits (#121)
         this.strategyResolvingPaths.add(relPath);
+        let ended!: () => void;
+        this.resolutionEnds.set(relPath, new Promise<void>((resolve) => (ended = resolve)));
         try {
             if (strategy === 'keep-local') {
                 const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
@@ -1580,6 +1587,8 @@ export class ProtonDriveSyncEngine {
             });
         } finally {
             this.strategyResolvingPaths.delete(relPath);
+            this.resolutionEnds.delete(relPath);
+            ended();
         }
     }
 
@@ -1793,13 +1802,13 @@ export class ProtonDriveSyncEngine {
         this.resolvingConflicts.add(conflictId);
         this.manualResolvingPaths.add(conflict.localRelPath);
         let ended!: () => void;
-        this.manualResolutionEnds.set(conflict.localRelPath, new Promise<void>((resolve) => (ended = resolve)));
+        this.resolutionEnds.set(conflict.localRelPath, new Promise<void>((resolve) => (ended = resolve)));
         try {
             await this.resolveUnresolvedConflict(conflict, choice);
         } finally {
             this.resolvingConflicts.delete(conflictId);
             this.manualResolvingPaths.delete(conflict.localRelPath);
-            this.manualResolutionEnds.delete(conflict.localRelPath);
+            this.resolutionEnds.delete(conflict.localRelPath);
             ended();
         }
         return this.stateDb.getConflictById(conflictId)!;
@@ -3290,7 +3299,7 @@ export class ProtonDriveSyncEngine {
         if (to.startsWith(`${from}/`)) {
             throw new Error(`Can't move ${from} into itself`);
         }
-        await this.afterManualResolutions([from, to], opts.deadlineMs);
+        await this.afterResolutions([from, to], opts.deadlineMs);
         await this.inAvailabilityRun(() => {
             this.refuseWhileHeld(); // again: a move of the files may have begun while it waited
             this.inTime(opts.deadlineMs, from);
@@ -3316,7 +3325,7 @@ export class ProtonDriveSyncEngine {
         if (rel === '') {
             throw new Error("The whole of Proton Drive can't be deleted");
         }
-        await this.afterManualResolutions([rel], opts.deadlineMs);
+        await this.afterResolutions([rel], opts.deadlineMs);
         await this.inAvailabilityRun(() => {
             this.refuseWhileHeld(); // again: a move of the files may have begun while it waited
             this.inTime(opts.deadlineMs, rel);
@@ -3325,12 +3334,12 @@ export class ProtonDriveSyncEngine {
         void this.replayRemoteOps();
     }
 
-    // A drive rename or delete of a file being resolved by hand (or of a folder holding one) waits for that to finish:
-    // done meanwhile, it would end the conflict and drop the record under the resolution, whose upload could still land
-    // (#112). Waits no longer than the drive op's deadline, which then refuses it
-    private async afterManualResolutions(paths: string[], deadlineMs?: number): Promise<void> {
+    // A drive rename or delete of a file being resolved, by hand or by the conflict setting (or of a folder holding one),
+    // waits for that to finish: done meanwhile, it would end the conflict and drop the record under the resolution, whose
+    // upload could still land (#112, #121). Waits no longer than the drive op's deadline, which then refuses it
+    private async afterResolutions(paths: string[], deadlineMs?: number): Promise<void> {
         for (;;) {
-            const ends = [...this.manualResolutionEnds].filter(([r]) => paths.some((p) => isSameOrUnder(r, p))).map(([, end]) => end);
+            const ends = [...this.resolutionEnds].filter(([r]) => paths.some((p) => isSameOrUnder(r, p))).map(([, end]) => end);
             if (ends.length === 0) {
                 return;
             }
@@ -3345,7 +3354,9 @@ export class ProtonDriveSyncEngine {
     // Runs a drive rename or delete with its paths marked, so that a resolution by hand doesn't start on them meanwhile;
     // one that started since the wait above (its turn came while this one queued) refuses this one instead (#112)
     private async drivingAt<T>(paths: string[], work: () => Promise<T>): Promise<T> {
-        const resolving = [...this.manualResolvingPaths].find((r) => paths.some((p) => isSameOrUnder(r, p)));
+        const resolving = [...this.manualResolvingPaths, ...this.strategyResolvingPaths].find((r) =>
+            paths.some((p) => isSameOrUnder(r, p)),
+        );
         if (resolving !== undefined) {
             throw new DriveOpError('EIO', `Busy resolving a conflict: ${resolving}`);
         }
