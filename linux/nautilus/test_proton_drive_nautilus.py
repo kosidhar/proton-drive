@@ -516,23 +516,47 @@ class MenuTest(unittest.TestCase):
         self.assertEqual(h.notes, [("Proton Drive couldn't change a.txt, b.txt, c.txt and 2 more", "Not in Proton Drive: x")])
 
 
-class AppItemTest(unittest.TestCase):
-    """#212: inside the drive, the item that opens the app says so; 'Open Proton Drive' is the drive itself (tray, #98)."""
+class FileMenuTest(unittest.TestCase):
+    """#214: the right-click menu holds only actions on what was clicked, with no "Proton Drive:" prefix; syncing and
+    the app are in the tray."""
 
-    def test_it_is_named_for_the_app_and_opens_it_on_home(self):
-        self.assertEqual(ext.APP_LABEL, "Proton Drive: Status & Settings…")
-        with mock.patch.object(ext, "_spawn_detached") as spawn:
-            ext._launch_native_gui()
-        argv = spawn.call_args_list[0].args[0]
-        self.assertTrue(argv[0].endswith("protondrive-gui"))
-        self.assertEqual(argv[1:], ["--tab", "home"])
+    def setUp(self):
+        self.h = Harness({states_query(ROOT + "/Docs"): DOCS_STATES})
+        for name in DOCS_STATES["children"]:
+            self.h.files.file_info(FakeFile(f"{ROOT}/Docs/{name}"))
+        self.h.release()
+        self.menu = types.SimpleNamespace(files=self.h.files)
+        ext.Nautilus.MenuItem.reset_mock()
 
-    def test_every_file_manager_uses_the_new_name(self):
-        linux = os.path.join(HERE, "..")
+    def labels(self):
+        return [c.kwargs["label"] for c in ext.Nautilus.MenuItem.call_args_list]
+
+    def test_the_items_menu_offers_only_actions_on_the_selection(self):
+        ext.ProtonDriveNautilusExtension.get_file_items(self.menu, [FakeFile(f"{ROOT}/Docs/b.txt")])
+        self.assertEqual(self.labels(), ["Always keep on this device", "Free up space", "Hide from this computer"])
+        for label in self.labels():
+            self.assertFalse(label.startswith("Proton Drive"), label)
+
+    def test_a_file_the_drive_keeps_for_itself_gets_nothing(self):
+        items = ext.ProtonDriveNautilusExtension.get_file_items(self.menu, [FakeFile(f"{ROOT}/Docs/.git")])
+        self.assertEqual(items, [])
+
+    def test_the_empty_space_menu_offers_nothing_of_ours(self):
+        folder = FakeFile(f"{ROOT}/Docs")
+        self.assertEqual(ext.ProtonDriveNautilusExtension.get_background_items(self.menu, folder), [])
+
+    def test_nothing_says_sync_now_or_status_and_settings(self):
         with open(os.path.join(HERE, "proton_drive_nautilus.py")) as f:
-            nautilus = f.read()
-        self.assertNotIn('label="Open Proton Drive"', nautilus)
-        self.assertEqual(nautilus.count("label=APP_LABEL"), 2)  # the items' menu and the folder background's
+            source = f.read()
+        for gone in ("Sync Now", "Status & Settings", "Proton Drive: "):
+            self.assertNotIn(gone, source.split("class ProtonDriveNautilusExtension(")[1], gone)
+
+
+class OtherFileManagersTest(unittest.TestCase):
+    """#212: Nemo and Dolphin, which have no file actions yet, keep their app item, named for what it opens."""
+
+    def test_their_app_item_says_status_and_settings(self):
+        linux = os.path.join(HERE, "..")
         with open(os.path.join(linux, "nemo", "proton_drive_nemo.py")) as f:
             nemo = f.read()
         self.assertIn('label="Proton Drive: Status & Settings…"', nemo)
