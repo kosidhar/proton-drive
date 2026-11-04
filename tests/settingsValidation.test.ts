@@ -344,14 +344,14 @@ describe('blockedApps', () => {
 // legitimate pattern that keys on one feature (a hyphen, a digit, a first letter, its case) is never taken for it
 describe('ignore patterns that are broad but leave files out are allowed (#43)', () => {
 
-    for (const pattern of ['*-*', '*[0-9]*', '[n-z]*', '[a-z]*', '[!A-Z]*', '[A-Z]*', '*_*', '* *', '*.*', '[!0-9]*']) {
+    for (const pattern of ['*-*', '*[0-9]*', '[n-z]*', '[a-z]*', '[!A-Z]*', '[A-Z]*', '*_*', '* *', '*.*', '[0-9]*']) {
         test(`${pattern} is allowed, alone and as stored`, () => {
             expect(problemWithIgnorePatterns([pattern])).toBeNull();
             expect(usableIgnorePatterns([pattern])).toEqual({ patterns: [pattern], dropped: 0 });
         });
     }
 
-    for (const pair of [['[A-Z]*', '[!A-Z]*'], ['[0-9]*', '[!0-9]*']] as const) {
+    for (const pair of [['[A-Z]*', '[!A-Z]*'], ['[a-z]*', '[!a-z]*']] as const) {
         test(`${pair.join(' with ')} together are refused, as they hide everything`, () => {
             expect(problemWithIgnorePatterns([...pair])).toMatch(/together match every file/);
             expect(usableIgnorePatterns([...pair])).toBeNull();
@@ -423,5 +423,45 @@ describe('ignore patterns are matched as plain globs, never extglobs or negation
         expect(matchesIgnorePatterns('a', ['[!a]*'])).toBe(false);
         expect(matchesIgnorePatterns('x.tmp', ['*.{tmp,log}'])).toBe(true);
         expect(matchesIgnorePatterns('build/out/x', ['build/**'])).toBe(true);
+    });
+});
+
+// #151: a class or range that leaves out only what the samples start with hides nearly every real file, past them
+describe('ignore patterns that hide nearly every ordinary name are refused (#151)', () => {
+    // [!0-9]* too: every name not starting with a digit is nearly every real file
+    for (const pattern of ['[0-x]*', '[!yz.]*', '[!z.]*', '[A-Za-y]*', '[\\x00-\\x7f]*', '[!q]*', '[!0-9]*']) {
+        test(`${pattern} is refused when saved`, () => {
+            expect(problemWithIgnorePatterns([pattern])).toMatch(/matches (every|nearly every) file/);
+        });
+    }
+
+    test('stored before the check, such a list is kept as saved: nothing kept out starts syncing after an update', () => {
+        expect(usableIgnorePatterns(['[0-x]*'])).toEqual({ patterns: ['[0-x]*'], dropped: 0 });
+        expect(usableIgnorePatterns(['*[aeiou]*', '*[AEIOU]*'])).toEqual({ patterns: ['*[aeiou]*', '*[AEIOU]*'], dropped: 0 });
+        expect(usableIgnorePatterns(['*'])).toBeNull(); // everything, as before
+    });
+
+    test('the message says nearly every file, and lists cross the line together too', () => {
+        expect(problemWithIgnorePatterns(['[0-x]*'])).toMatch(/matches nearly every file/);
+        expect(problemWithIgnorePatterns(['[a-m]*', '[n-z]*', '[A-Z]*'])).toMatch(/together match nearly every file/);
+    });
+
+    test('names of files or folders never count toward nearly every file', () => {
+        expect(problemWithIgnorePatterns(['*.*', 'Documents', 'Desktop', 'todo', 'keys'])).toBeNull();
+        expect(problemWithIgnorePatterns(['Documents', 'Desktop', 'Music', 'todo', 'keys', 'notes.txt', 'README.md'])).toBeNull();
+    });
+
+    test('realistic and broad-but-partial lists still pass', () => {
+        for (const list of [
+            DEFAULT_IGNORE_PATTERNS,
+            ['*.tmp', '*.log', 'build/**', '__pycache__', '.cache/**', '.*.swp', 'node_modules'],
+            ['[A-Z]*'],
+            ['[a-z]*'],
+            ['*.*'],
+            ['*.jpg', '*.png', '*.mp4'],
+            ['Documents', 'Photos', 'Music'],
+        ]) {
+            expect(problemWithIgnorePatterns(list)).toBeNull();
+        }
     });
 });
