@@ -52,8 +52,8 @@ class ProtonDriveNemoExtension(GObject.GObject, Nemo.MenuProvider, Nemo.InfoProv
 
         gui_item = Nemo.MenuItem(
             name="ProtonDriveNemo::OpenGui",
-            label="Open Proton Drive",
-            tip="Open the Proton Drive desktop window",
+            label="Proton Drive: Status & Settings…",
+            tip="Open the Proton Drive app: how sync is going, what needs you, and its settings",
         )
         gui_item.connect("activate", self._on_open_gui)
         return [sync_item, gui_item]
@@ -66,4 +66,4 @@ class ProtonDriveNemoExtension(GObject.GObject, Nemo.MenuProvider, Nemo.InfoProv
             _spawn_detached(["protondrive", "sync"])
 
     def _on_open_gui(self, _menu):
-        _spawn_detached(["protondrive-gui"])
+        _spawn_detached(["protondrive-gui", "--tab", "home"])
