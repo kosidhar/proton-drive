@@ -181,6 +181,21 @@ def offers_mount(status: dict) -> bool:
     return vfs.get("mode") == "virtual" and not vfs.get("mounted") and vfs.get("reason") in MOUNT_REASONS
 
 
+# A GTK menu grows with its longest label: a file name longer than this is shortened in the middle
+NAME_LIMIT = 40
+
+
+def _short(name: str) -> str:
+    if len(name) <= NAME_LIMIT:
+        return name
+    keep = NAME_LIMIT - 1
+    return name[: keep - keep // 2] + "…" + name[-(keep // 2):]
+
+
+def signed_out(status: dict) -> bool:
+    return not status.get("loggedIn", False) or status.get("state") == "unauthenticated"
+
+
 def _transfers_line(transfers) -> str:
     """What moves, as the app's Home says it."""
     uploads = sum(1 for t in transfers if t.get("direction") == "upload")
@@ -193,7 +208,7 @@ def _transfers_line(transfers) -> str:
     if count == 1:
         name = next(t for t in transfers if t.get("direction") in ("upload", "download")).get("relPath") or ""
         name = name.rstrip("/").rsplit("/", 1)[-1]
-        return f"{verb} {name}" if name else f"{verb} 1 file"
+        return f"{verb} {_short(name)}" if name else f"{verb} 1 file"
     return f"{verb} {count} files"
 
 
@@ -227,7 +242,7 @@ def problem_count(status: dict) -> int:
 def status_line(status: dict):
     """The tray's status line and icon, in the app's words (native-gui/src/home.rs status_summary): signed out, paused,
     moving files, what moves, problems, sync stopped, up to date. Never the engine's own action text."""
-    if not status.get("loggedIn", False) or status.get("state") == "unauthenticated":
+    if signed_out(status):
         return "Signed out", "protondrive-tray-error"
     if status.get("state") == "paused" or (status.get("settings") or {}).get("paused"):
         return "Paused", "protondrive-tray-paused"
@@ -401,7 +416,7 @@ class ProtonDriveTrayIndicator:
             with urllib.request.urlopen(req, timeout=1.2) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
 
-            settings = data.get("settings", {})
+            settings = data.get("settings") or {}
             self.paused = bool(settings.get("paused", False)) or data.get("state") == "paused"
             sync_dir = data.get("syncDir") or os.path.expanduser("~/ProtonDrive")
             if sync_dir != self.sync_dir:
@@ -416,7 +431,7 @@ class ProtonDriveTrayIndicator:
             self.storage_item.set_label(storage or "")
             self.storage_item.set_visible(storage is not None)
 
-            problems = problem_count(data) if data.get("loggedIn", False) else 0
+            problems = 0 if signed_out(data) else problem_count(data)
             self.problems_item.set_label(problems_label(problems))
             self.problems_item.set_visible(problems > 0)
 
