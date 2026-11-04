@@ -332,9 +332,9 @@ export async function startSyncDaemon(options: {
     const reconcileTimer = setInterval(() => {
         const s = stateDb.getSettings();
         if (s.paused && s.pausedUntil !== null) {
-            // A timed pause ends here too, so a machine asleep past its time picks up syncing within one check (#205)
+            // A timed pause ends here too, so a machine asleep past its time picks up syncing within one check (#205);
+            // endPauseIfDue syncs when it ends one
             void engine.endPauseIfDue();
-            return;
         }
         if (runtime.auth.isLoggedIn()) {
             void refreshAccountInfo();
