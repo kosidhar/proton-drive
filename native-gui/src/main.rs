@@ -456,6 +456,9 @@ fn move_action_label(action: &str) -> Option<&'static str> {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ActivityRecord {
+    /// The daemon's id for the entry: what an opened row is known by (none from a cache written before it was kept)
+    #[serde(default)]
+    id: Option<u64>,
     #[allow(dead_code)]
     timestamp: u64,
     action: String,
@@ -1221,8 +1224,9 @@ struct ProtonDriveNativeApp {
     search_query: String,
     /// Activity's filter: all, uploads, downloads, or problems (#94)
     activity_filter: activity::ActivityFilter,
-    /// The Activity row opened to show its full details and actions (see activity_key)
-    expanded_activity: Option<String>,
+    /// The Activity row opened to show its full details and actions (see activity_key), with where Show in Files and
+    /// Open go, looked up once when it was opened: never on every frame, as the drive may be slow to answer
+    expanded_activity: Option<ExpandedActivity>,
     /// The sidebar's account footer was clicked: Settings brings its Account card into view once
     jump_to_account: bool,
 
@@ -1916,7 +1920,8 @@ impl ProtonDriveNativeApp {
                     self.send_account_command(WorkerCommand::StartLogin);
                 }
                 ui.add_space(8.0);
-                let width = ui.available_width().clamp(120.0, 280.0);
+                // Room kept for the filter beside it, so a narrow window never runs it over the title
+                let width = (ui.available_width() - ACTIVITY_FILTER_WIDTH).clamp(120.0, 280.0);
                 ui.add_sized(
                     [width, 32.0],
                     egui::TextEdit::singleline(&mut self.search_query)
@@ -2024,7 +2029,7 @@ impl ProtonDriveNativeApp {
                         .iter()
                         .filter(|a| activity_matches(a, &query))
                         .filter(|a| activity::in_filter(activity::activity_kind(&a.action, &a.details), filter))
-                        .take(50)
+                        .take(ACTIVITY_SHOWN)
                         .cloned()
                         .collect();
                     if self.activities.is_empty() || shown.is_empty() {
@@ -2046,7 +2051,7 @@ impl ProtonDriveNativeApp {
                         for act in &shown {
                             let kind = activity::activity_kind(&act.action, &act.details);
                             let key = activity_key(act);
-                            let expanded = self.expanded_activity.as_deref() == Some(key.as_str());
+                            let expanded = self.expanded_activity.as_ref().is_some_and(|e| e.key == key);
                             let (row_rect, row_resp) = ui.allocate_exact_size(
                                 Vec2::new(ui.available_width(), 38.0),
                                 Sense::click(),
@@ -2096,14 +2101,18 @@ impl ProtonDriveNativeApp {
                             );
 
                             // File / Folder icon + name
-                            let is_folder_act = act.action == "mkdir"
-                                || matches!(kind, activity::ActivityKind::RemovedLocally) && !act.local_rel_path.contains('.');
+                            // Taken away here (removed, freed up, hidden): grey, and a folder when the path looks like one
+                            let taken_away = matches!(
+                                kind,
+                                activity::ActivityKind::RemovedLocally | activity::ActivityKind::FreedUp | activity::ActivityKind::Hidden
+                            );
+                            let is_folder_act = act.action == "mkdir" || taken_away && !act.local_rel_path.contains('.');
                             let ic_rect = egui::Rect::from_center_size(
                                 egui::pos2(r_file_x + 9.0, cy),
                                 Vec2::new(17.0, 14.5),
                             );
                             if is_folder_act {
-                                draw_folder_icon(ui.painter(), ic_rect, act.action != "delete-local");
+                                draw_folder_icon(ui.painter(), ic_rect, !taken_away);
                             } else {
                                 draw_file_icon(ui.painter(), ic_rect, &act.local_rel_path);
                             }
@@ -2124,6 +2133,7 @@ impl ProtonDriveNativeApp {
                                 truncate_middle_to_width(ui.painter(), &act.local_rel_path, &name_font, name_max_w);
                             let details_text =
                                 truncate_middle_to_width(ui.painter(), &act.details, &details_font, details_max_w);
+                            let truncated = name_text != act.local_rel_path || details_text != act.details;
 
                             ui.painter().text(
                                 egui::pos2(name_x, cy),
@@ -2146,12 +2156,24 @@ impl ProtonDriveNativeApp {
                                 time_font,
                                 TEXT_MUTED(),
                             );
-                            // The whole text shows on hover, and in the row opened by a click
-                            let row_resp = row_resp
-                                .on_hover_text(format!("{}\n{}", act.local_rel_path, act.details))
-                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            // Cut short: the whole text shows on hover; it shows in the row a click opens, too
+                            let row_resp = if truncated {
+                                row_resp.on_hover_text(format!("{}\n{}", act.local_rel_path, act.details))
+                            } else {
+                                row_resp
+                            }
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
                             if row_resp.clicked() {
-                                self.expanded_activity = if expanded { None } else { Some(key.clone()) };
+                                self.expanded_activity = if expanded {
+                                    None
+                                } else {
+                                    let sync_dir = &self.status.sync_dir;
+                                    Some(ExpandedActivity {
+                                        key: key.clone(),
+                                        show: activity::show_target(sync_dir, &act.local_rel_path),
+                                        open: activity::open_target(sync_dir, &act.local_rel_path),
+                                    })
+                                };
                             }
                             if expanded {
                                 self.render_activity_details(ui, act);
@@ -2164,7 +2186,6 @@ impl ProtonDriveNativeApp {
 
     /// An opened Activity row: its whole path and details, and Show in Files and, for a file there now, Open (#94)
     fn render_activity_details(&mut self, ui: &mut egui::Ui, act: &ActivityRecord) {
-        let sync_dir = self.status.sync_dir.clone();
         Frame::NONE
             .fill(BG_CARD_ALT())
             .corner_radius(CornerRadius::same(8))
@@ -2174,8 +2195,7 @@ impl ProtonDriveNativeApp {
                 ui.add(egui::Label::new(RichText::new(&act.local_rel_path).size(13.0).strong().color(TEXT_PRIMARY())).wrap());
                 ui.add_space(2.0);
                 ui.add(egui::Label::new(RichText::new(&act.details).size(12.5).color(TEXT_MUTED())).wrap());
-                let show = activity::show_target(&sync_dir, &act.local_rel_path);
-                let open = activity::open_target(&sync_dir, &act.local_rel_path);
+                let (show, open) = self.expanded_activity.as_ref().map(|e| (e.show.clone(), e.open.clone())).unwrap_or_default();
                 if show.is_some() || open.is_some() {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -3288,6 +3308,12 @@ fn toggle_switch(ui: &mut egui::Ui, on: bool) -> egui::Response {
 
 /// Room for about five 38px activity rows.
 const ACTIVITY_TABLE_MIN_HEIGHT: f32 = 200.0;
+/// How many activity entries the app asks for (the daemon keeps 500), and lists: enough that the filter finds older
+/// problems too, not only among the latest few (#94)
+const ACTIVITY_FETCHED: usize = 200;
+const ACTIVITY_SHOWN: usize = 200;
+/// About the width of the Activity filter (All, Uploads, Downloads, Problems), kept free beside the search
+const ACTIVITY_FILTER_WIDTH: f32 = 290.0;
 
 fn configure_proton_theme(ctx: &egui::Context) {
     // Embed Inter & JetBrains Mono fonts (matching Proton Carbon Design System & WordCraft)
@@ -3526,9 +3552,20 @@ fn draw_file_icon(painter: &egui::Painter, rect: egui::Rect, filename: &str) {
     );
 }
 
-/// An Activity row's identity, to keep it open across refreshes
+/// An Activity row's identity, to keep it open across refreshes: the daemon's id, or without one what it says
 fn activity_key(act: &ActivityRecord) -> String {
-    format!("{}\u{0}{}\u{0}{}", act.timestamp, act.action, act.local_rel_path)
+    match act.id {
+        Some(id) => format!("#{id}"),
+        None => format!("{}\u{0}{}\u{0}{}\u{0}{}", act.timestamp, act.action, act.local_rel_path, act.details),
+    }
+}
+
+/// The opened Activity row
+#[derive(Clone, Debug, PartialEq)]
+struct ExpandedActivity {
+    key: String,
+    show: Option<std::path::PathBuf>,
+    open: Option<std::path::PathBuf>,
 }
 
 /// An Activity pill's fill and text colours, by what the entry is
@@ -3822,7 +3859,7 @@ fn fetch_status() -> Result<DaemonStatus, String> {
 }
 
 fn fetch_activity() -> Vec<ActivityRecord> {
-    ureq::get(&format!("{}/api/activity?limit=40", daemon_url()))
+    ureq::get(&format!("{}/api/activity?limit={ACTIVITY_FETCHED}", daemon_url()))
         .timeout(Duration::from_millis(1200))
         .call()
         .ok()
@@ -4948,6 +4985,7 @@ mod tests {
         h.app.tab = NavTab::Activity;
         h.app.status.sync_dir = dir.to_string_lossy().into_owned();
         let record = |ts: u64, action: &str, path: &str, details: &str| ActivityRecord {
+            id: Some(ts),
             timestamp: ts,
             action: action.into(),
             local_rel_path: path.into(),
@@ -4986,6 +5024,9 @@ mod tests {
         assert_eq!(launched(), vec![dir.join("Docs/report.pdf").to_string_lossy().into_owned()]);
         assert_eq!(h.sent(), Vec::<String>::new());
 
+        // Looked up once, as the row opened: a file gone since still offers what was found then, until opened again
+        assert!(h.app.expanded_activity.as_ref().is_some_and(|e| e.open.is_some()));
+
         // An item that is gone: no Open, and Show in Files shows the sync folder it was in, quietly
         h.click(h.text_at("Gone/away.txt").unwrap());
         h.frames(2);
@@ -5001,6 +5042,7 @@ mod tests {
         h.app.tab = NavTab::Activity;
         h.app.status.account = Some(AccountInfo { used_space: 5, max_space: 10, used_drive_space: 5, ..Default::default() });
         let record = |path: &str, details: &str| ActivityRecord {
+            id: None,
             timestamp: 0,
             action: "upload".into(),
             local_rel_path: path.into(),

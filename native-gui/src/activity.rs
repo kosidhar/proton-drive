@@ -119,10 +119,15 @@ pub(crate) fn show_target(sync_dir: &str, rel_path: &str) -> Option<PathBuf> {
 }
 
 /// What Open opens: the item, when it is a file there now (opening an online-only one in the virtual drive downloads
-/// it, as opening it in Files does). None otherwise, so a path that is gone offers no Open.
+/// it, as opening it in Files does). None otherwise, so a path that is gone offers no Open; and none for a link, or a
+/// path through a linked folder, that leads out of the sync folder: Open never launches anything from elsewhere.
 pub(crate) fn open_target(sync_dir: &str, rel_path: &str) -> Option<PathBuf> {
     let path = local_path(sync_dir, rel_path)?;
-    path.metadata().ok().filter(|m| m.is_file()).map(|_| path)
+    if !path.symlink_metadata().ok()?.file_type().is_file() {
+        return None;
+    }
+    let root = Path::new(sync_dir).canonicalize().ok()?;
+    path.canonicalize().ok().filter(|real| real.starts_with(&root)).map(|_| path)
 }
 
 /// A file:// URI for a path, as the file manager's ShowItems takes it
@@ -199,6 +204,15 @@ mod tests {
         // A folder is shown, not opened as a file; the whole drive is the folder itself
         assert_eq!(open_target(root, "Docs"), None);
         assert_eq!(show_target(root, "/"), Some(dir.clone()));
+        // No Open for a link, nor for a file reached through a linked folder that leads out of the sync folder
+        let outside = std::env::temp_dir().join(format!("pd-activity-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.sh"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.sh"), dir.join("Docs/link.sh")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("Elsewhere")).unwrap();
+        assert_eq!(open_target(root, "Docs/link.sh"), None);
+        assert_eq!(open_target(root, "Elsewhere/secret.sh"), None);
+        std::fs::remove_dir_all(&outside).unwrap();
         // Never outside the sync folder, and nothing without one
         assert_eq!(show_target(root, "../etc/passwd"), None);
         assert_eq!(show_target("", "Docs/a.txt"), None);
