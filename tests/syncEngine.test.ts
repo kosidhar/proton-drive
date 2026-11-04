@@ -10499,5 +10499,36 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await engine.reconcileNow();
             expect(await readFile(local('Folder/new.txt'), 'utf8')).toBe('new'); // only on this computer: kept
         });
+
+        for (const via of ['the watcher', 'a pass']) {
+            test(`nor is a new local folder made in it, seen by ${via}`, async () => {
+                const d = makeMockDrive();
+                const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                    moveToDesktopTrash: async () => false,
+                    settle: { quietMs: 0 },
+                });
+                d.add('Kept.txt', 'kept');
+                d.add('Folder/a.txt', 'a');
+                engine.availability.setPin(d.root.uid, 'pinned', false);
+                await engine.reconcileNow();
+                const local = (rel: string) => path.join(engine.localRoot(), rel);
+                const folder = d.nodes.get(d.uid('Folder'))!;
+                d.nodes.set(d.uid('Folder'), { ...folder, trashTime: new Date() });
+                await mkdir(local('Folder/Empty'));
+                if (via === 'the watcher') {
+                    await (engine as any).handleLocalFileChange('Folder/Empty');
+                } else {
+                    const st = await stat(local('Folder/Empty'));
+                    const info = { isDirectory: true, size: 0, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs };
+                    await (engine as any).reconcileSinglePath('Folder/Empty', undefined, info, undefined, new Map(), stateDb.getSettings(), 0);
+                }
+                expect([...d.nodes.values()].filter((n) => n.parentUid === folder.uid && d.nameOf(n) === 'Empty')).toEqual([]);
+                expect(stateDb.getItemByPath('Folder/Empty')).toBeNull();
+                // The folder's removal here then takes the empty folder with it: it holds nothing, and nothing of it
+                // was ever put in the Proton Drive trash
+                await engine.reconcileNow();
+                expect([...d.nodes.values()].filter((n) => d.nameOf(n) === 'Empty')).toEqual([]);
+            });
+        }
     });
 });
