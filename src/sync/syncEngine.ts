@@ -1479,8 +1479,10 @@ export class ProtonDriveSyncEngine {
         if ((this.stateDb.getItemByPath(relPath)?.updatedAt ?? null) !== (recordSeen?.updatedAt ?? null)) {
             return; // The next pass decides, from what the file and its record are then
         }
-        if (this.manualResolvingPaths.has(relPath)) {
-            return; // The user is resolving it by hand right now: their choice is what happens to it (#77)
+        if (this.isResolving(relPath)) {
+            // Being resolved right now: by the user by hand, whose choice is what happens to it (#77), or by the setting
+            // in another look (a pass and a watcher look can reach one conflict at once), which holds the claim (#140)
+            return;
         }
         if (strategy === 'keep-both' && this.stillChangingWhenLetThrough(relPath)) {
             // Still being written: the cloud version would be downloaded only to be thrown away once the file changes
