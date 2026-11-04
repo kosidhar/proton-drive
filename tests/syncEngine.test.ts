@@ -10141,16 +10141,25 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 d.add('Kept.txt', 'kept');
                 d.add('Folder/a.txt', 'a');
                 d.add('Folder/b.txt', 'b');
+                d.add('Folder/Sub/x.txt', 'x');
+                d.add('Folder2/a.txt', 'other'); // named alike, outside it
                 engine.availability.setPin(d.root.uid, 'pinned', false);
                 await engine.reconcileNow();
-                (engine as any)[how === 'by hand' ? 'manualResolvingPaths' : 'strategyResolvingPaths'].add('Folder/a.txt');
+                const resolving = (engine as any)[how === 'by hand' ? 'manualResolvingPaths' : 'strategyResolvingPaths'];
+                resolving.add('Folder/Sub/x.txt');
                 await rm(path.join(engine.localRoot(), 'Folder'), { recursive: true });
                 await (engine as any).trashForDeletedLocal('Folder', d.nodes.get(d.uid('Folder')));
+                await engine.reconcileNow(); // a whole pass, too, while the resolution runs
                 expect(d.calls.trashed).toEqual([]);
-                // Once it is resolved, the next look takes the delete to the cloud
-                (engine as any)[how === 'by hand' ? 'manualResolvingPaths' : 'strategyResolvingPaths'].delete('Folder/a.txt');
+                expect(stateDb.getItemByPath('Folder/Sub/x.txt')).not.toBeNull();
+                // A file being resolved in a folder only named alike holds nothing off
+                resolving.delete('Folder/Sub/x.txt');
+                resolving.add('Folder2/a.txt');
+                await (engine as any).trashForDeletedLocal('Folder', d.nodes.get(d.uid('Folder')));
+                expect(d.calls.trashed).toEqual([[d.uid('Folder')]]);
+                resolving.delete('Folder2/a.txt');
                 await engine.reconcileNow();
-                expect(d.calls.trashed.flat().length).toBeGreaterThan(0);
+                expect(stateDb.getAllItems().filter((i) => i.localRelPath.startsWith('Folder/'))).toEqual([]);
             });
         }
     });
