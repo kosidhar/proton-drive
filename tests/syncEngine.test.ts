@@ -10570,4 +10570,25 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.warnings.filter((w) => w.includes('new.txt'))).toEqual([expect.stringContaining('is in the Proton Drive trash')]);
         });
     });
+
+    describe('a new local folder never takes a cloud file holding its name (#165)', () => {
+        test('nothing is recorded for it, and deleting it here never trashes the cloud file', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('X', 'a file in the cloud'); // online-only here
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            await mkdir(local('X'));
+            await (engine as any).handleLocalFileChange('X').catch(() => {});
+            expect(stateDb.getItemByPath('X')).toBeNull();
+            await rm(local('X'), { recursive: true });
+            await (engine as any).handleLocalFileChange('X').catch(() => {});
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.nodes.get(d.uid('X'))?.trashTime).toBeFalsy();
+        });
+    });
 });
