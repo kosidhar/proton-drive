@@ -3766,10 +3766,12 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                         return folder;
                     };
                 }
-                goneFromCloud(d, 'Projects');
                 await d.files.writeLocal(what === 'file' ? made : `${made}/a.txt`, 'only here');
                 const localChange: Promise<void> = (d.engine as any).handleLocalFileChange(made);
                 await uploading;
+                // Deleted in the cloud while the upload's answer is on its way (deleted before it starts, the folder isn't
+                // made again for it: #161)
+                goneFromCloud(d, 'Projects');
 
                 await event(d, {
                     type: DriveEventType.NodeDeleted,
@@ -10589,6 +10591,68 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await (engine as any).handleLocalFileChange('X').catch(() => {});
             expect(d.calls.trashed).toEqual([]);
             expect(d.nodes.get(d.uid('X'))?.trashTime).toBeFalsy();
+        });
+    });
+
+    describe('a new local file in a folder deleted for good in the cloud never brings the folder back (#161)', () => {
+        test('it stays on this computer, unrecorded, and the folder removal keeps it', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('Folder/a.txt', 'a');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            // Another device deletes the folder for good; before this computer removes it, the user saves a file in it
+            d.nodes.delete(d.uid('Folder/a.txt'));
+            d.nodes.delete(d.uid('Folder'));
+            await writeFile(local('Folder/new.txt'), 'new');
+            await (engine as any).handleLocalFileChange('Folder/new.txt').catch(() => {});
+            expect([...d.nodes.values()].filter((n) => d.nameOf(n) === 'Folder' || d.nameOf(n) === 'new.txt')).toEqual([]);
+            expect(stateDb.getItemByPath('Folder/new.txt')).toBeNull();
+            await engine.reconcileNow();
+            expect(await readFile(local('Folder/new.txt'), 'utf8')).toBe('new');
+        });
+
+        const synced = async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('Folder/a.txt', 'a');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            return { ...d, engine, local: (rel: string) => path.join(engine.localRoot(), rel) };
+        };
+
+        test('nor does a file in a new subfolder of it', async () => {
+            const d = await synced();
+            d.nodes.delete(d.uid('Folder/a.txt'));
+            d.nodes.delete(d.uid('Folder'));
+            await mkdir(d.local('Folder/Sub'));
+            await writeFile(d.local('Folder/Sub/new.txt'), 'new');
+            await (d.engine as any).handleLocalFileChange('Folder/Sub').catch(() => {});
+            await expect((d.engine as any).handleLocalFileChange('Folder/Sub/new.txt')).rejects.toThrow(/gone from Proton Drive/);
+            expect([...d.nodes.values()].filter((n) => ['Folder', 'Sub', 'new.txt'].includes(d.nameOf(n)))).toEqual([]);
+        });
+
+        test('a folder of that name made again in the cloud since takes the file, so nothing is held up for good', async () => {
+            const d = await synced();
+            d.nodes.delete(d.uid('Folder/a.txt'));
+            d.nodes.delete(d.uid('Folder'));
+            // Another folder, made since where the old one was: a node of its own
+            const again = makeMockNode({ uid: 'vol~Folder-again', parentUid: d.root.uid, nameStr: 'Folder', type: NodeType.Folder });
+            d.nodes.set(again.uid, again);
+            await writeFile(d.local('Folder/new.txt'), 'new');
+            await (d.engine as any).handleLocalFileChange('Folder/new.txt');
+            const uploaded = [...d.nodes.values()].filter((n) => d.nameOf(n) === 'new.txt');
+            expect(uploaded.map((n) => n.parentUid)).toEqual([again.uid]);
+            expect([...d.nodes.values()].filter((n) => d.nameOf(n) === 'Folder').length).toBe(1);
         });
     });
 });
