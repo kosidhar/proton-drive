@@ -16,6 +16,8 @@ use crate::listing::{Entry, Kind};
 
 /// A listing answers fast; a lookup waits no longer than this when the daemon is stuck.
 pub const CHILDREN_TIMEOUT: Duration = Duration::from_secs(3);
+/// The account's storage is a small read the daemon answers from what it knows (#181).
+pub const SPACE_TIMEOUT: Duration = Duration::from_secs(5);
 /// A download for an open completes or fails within 30 minutes.
 pub const HYDRATE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// A rename, delete or truncate waits its turn in the daemon's queue, but changes only this computer: no network. Each
@@ -34,6 +36,13 @@ const INTERRUPT_CHECK: Duration = Duration::from_millis(500);
 const LISTING_BACKOFF: Duration = Duration::from_secs(5);
 /// Listing problems go to stderr at most this often.
 const LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// The Proton account's storage, in bytes: what the drive reports as its size (#181).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Space {
+    pub used: u64,
+    pub max: u64,
+}
 
 /// What a delete through the drive is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +171,11 @@ impl DaemonClient {
     /// of it as what its new content is an edit of. EEXIST when it is on this computer already.
     pub fn truncate(&self, rel: &str) -> Result<(), DaemonError> {
         self.change("/vfs/truncate", serde_json::json!({ "path": rel }))
+    }
+
+    /// The account's storage, or None when the daemon doesn't know it (signed out, or not asked yet).
+    pub fn space(&self) -> Result<Option<Space>, DaemonError> {
+        parse_space(self.request("GET", "/vfs/space", None, SPACE_TIMEOUT, &|| false)?)
     }
 
     fn request(
@@ -295,6 +309,24 @@ fn parse_children(body: serde_json::Value) -> Result<Vec<Entry>, DaemonError> {
         .collect())
 }
 
+/// `{ "space": { "usedSpace", "maxSpace" } }`, or `{ "space": null }`. A quota of 0 or less is no quota.
+fn parse_space(body: serde_json::Value) -> Result<Option<Space>, DaemonError> {
+    let unreadable = || DaemonError::eio("unreadable storage from the daemon");
+    let space = body.get("space").ok_or_else(unreadable)?;
+    if space.is_null() {
+        return Ok(None);
+    }
+    let number = |key: &str| space.get(key).and_then(serde_json::Value::as_f64).filter(|n| n.is_finite());
+    let (Some(used), Some(max)) = (number("usedSpace"), number("maxSpace")) else {
+        return Err(unreadable());
+    };
+    if max <= 0.0 {
+        return Ok(None);
+    }
+    // `as` saturates: a negative used is 0
+    Ok(Some(Space { used: used as u64, max: max as u64 }))
+}
+
 /// A connection to the Unix socket, or an error once `timeout` passes: a connect to a full backlog (a daemon that is
 /// alive but not accepting) otherwise waits for SO_SNDTIMEO, which std leaves unlimited. A timeout is WouldBlock.
 fn connect_within(path: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
@@ -401,6 +433,25 @@ mod tests {
         assert_eq!(url_search_params_decode(&encoded), original);
         assert_eq!(encode_query_value("AZaz09-._~"), "AZaz09-._~");
         assert_eq!(encode_query_value(""), "");
+    }
+
+    #[test]
+    fn storage_json_is_read_and_anything_else_is_refused() {
+        let read = |v: serde_json::Value| parse_space(v);
+        assert_eq!(
+            read(serde_json::json!({ "space": { "usedSpace": 13_570_000_000u64, "maxSpace": 510_000_000_000u64 } })),
+            Ok(Some(Space { used: 13_570_000_000, max: 510_000_000_000 }))
+        );
+        assert_eq!(read(serde_json::json!({ "space": null })), Ok(None));
+        assert_eq!(read(serde_json::json!({ "space": { "usedSpace": 5, "maxSpace": 0 } })), Ok(None));
+        assert_eq!(read(serde_json::json!({ "space": { "usedSpace": -5, "maxSpace": 10 } })), Ok(Some(Space { used: 0, max: 10 })));
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({ "space": { "usedSpace": 1 } }),
+            serde_json::json!({ "space": { "usedSpace": "1", "maxSpace": 2 } }),
+        ] {
+            assert!(read(bad.clone()).is_err(), "{bad}");
+        }
     }
 
     #[test]

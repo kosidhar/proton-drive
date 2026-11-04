@@ -23,12 +23,14 @@ export function controlServerOptions(deps: {
     signIn: NonNullable<ControlServerOptions['login']>;
     signOut: NonNullable<ControlServerOptions['logout']>;
     makeRemoteFolder: NonNullable<ControlServerOptions['remoteMkdir']>;
+    space?: ControlServerOptions['space'];
 }): ControlServerOptions {
     const { socketPath, engine, drive, stateDb } = deps;
     return {
         socketPath,
         engine,
         mountAgain: () => drive.mountAgain(),
+        space: deps.space,
         driveMove: (action, from, to) => drive.resolveMove(action, from, to),
         driveSettings: (change) => driveSettings(change, { stateDb, drive, engine }),
         login: deps.signIn,
