@@ -51,7 +51,8 @@ Home, and the gear and account block to Settings.
 │              │  Last synced 2 min ago        [Sync now]     │
 │ ◉ Home       │──────────────────────────────────────────────│
 │ ○ Activity   │  NEEDS ATTENTION  (only when needed)         │
-│ ○ Settings   │  ⚠ report.pdf: kept both copies  [Show]      │
+│ ○ Settings   │  ⚠ Changed here and in Proton Drive:         │
+│              │    report.pdf  [Show] [Keep Both]…           │
 │              │  ⚠ notes.txt couldn't upload     [Retry]     │
 │              │──────────────────────────────────────────────│
 │              │  IN PROGRESS                                 │
@@ -70,7 +71,8 @@ Home, and the gear and account block to Settings.
   storage is on Home.
 - **Default window size:** about 900×640. Keep the minimum at 840×540.
 - **The sidebar shows a badge** on Home when something needs attention.
-- **Signed out:** the sign-in screen stays exactly as it is today.
+- **Signed out:** Home says "Signed out" and offers Sign in (the same action as Settings › Account) in place of Pause
+  and Sync now.
 
 ### Home (the default section)
 
@@ -79,14 +81,20 @@ Home, and the gear and account block to Settings.
    - "Up to date", with "Last synced 2 min ago" under it;
    - "Uploading 3 files", "Downloading report.pdf", "Checking for changes…";
    - "Paused" (Stage 4: "Paused until 15:00");
-   - "Offline: can't reach Proton Drive", "1 problem needs you".
+   - "Offline: can't reach Proton Drive" ("Connecting…" while the app's first try is still out), "1 problem needs you";
+   - "Signed out", with a Sign in button in place of Pause and Sync now; "Moving files…" while the drive moves them;
+     "Sync stopped" for an error the daemon gave no message for.
 
    The mapping is a pure function with unit tests. `currentAction` text is never shown raw.
 2. **Pause and Sync now.** Pause/Resume is the main button. Stage 4 turns it into a dropdown: for 1 hour, until
    tomorrow, until I resume. "Sync now" is secondary.
 3. **Needs attention:** a list shown only when non-empty. It replaces the Conflicts tab and the scattered notices:
-   - **Unresolved conflicts:** say what happened ("Both copies kept: report.pdf"), with "Show in Files" and the
-     existing resolve actions. Resolving goes through the same control-socket route as today.
+   - **Unresolved conflicts:** say what happened ("Changed here and in Proton Drive: report.pdf", the full path on
+     hover), with "Show in Files" and the existing resolve actions. Unresolved conflicts only exist under the "ask me"
+     strategy, where the daemon queued the file and kept nothing twice. Keep Both is the main choice; each button's hover
+     text says what it replaces (Keep Local: "Use this computer's version: replaces the one in Proton Drive"; Keep
+     Remote: "Use the Proton Drive version: replaces the one on this computer"). Resolving goes through the same
+     control-socket route as today.
    - **Files missing from the folder:** the existing flow and dialog, moved here.
    - **The drive not mounted:** the reason, with "Mount again" when the daemon offers it. The existing drive-card logic moves
      here.
