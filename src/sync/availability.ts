@@ -311,6 +311,17 @@ export class AvailabilityPolicy {
     return rows.map((row) => row.relPath);
   }
 
+  // Every item hidden or being hidden, by its own flag (a hide supersedes the flags below it, so none is listed twice),
+  // sorted by path.
+  hiddenItems(): { relPath: string; hide: HideFlag }[] {
+    return this.db
+      .query(
+        `SELECT n.relPath AS relPath, a.hide AS hide FROM availability a JOIN remote_nodes n ON n.uid = a.nodeUid
+                 WHERE a.hide IS NOT NULL ORDER BY n.relPath ASC`,
+      )
+      .all() as { relPath: string; hide: HideFlag }[];
+  }
+
   pendingHides(): string[] {
     const rows = this.db
       .query(
