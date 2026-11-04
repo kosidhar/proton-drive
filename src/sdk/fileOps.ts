@@ -227,7 +227,9 @@ export interface DownloadResult {
     sha1?: string;
     size: number;
     mtimeMs: number;
-    // The placed file's ctime, as seen just after it was placed (and its time set): downloaded only
+    // Downloaded only: the placed file's ctime, as seen just after it was placed, when it was still what was downloaded
+    // (the same file, size and mtime as just before placing). Unset when something wrote it in between (#199): its
+    // content is then not what the sha1 says, and the caller has it looked at again
     ctimeMs?: number;
 }
 
@@ -278,6 +280,19 @@ export async function downloadDriveNodeToLocal(options: {
 
     const tempPath = path.join(parentDir, `.proton-drive-tmp-${process.pid}-${Date.now()}-${path.basename(localPath)}`);
     const downloaded = await downloadRevisionToFile({ sdk, logger, remoteNode, revision, filePath: tempPath, onProgress });
+    // Its time is set, and it is looked at, before it is placed: what it is then is what was downloaded. Set after, a
+    // write between the placing and the setting would get the cloud's time and pass for the download (#199). Before
+    // beforePlacing too: between its check that the file here is unchanged and the placing, nothing may wait, or a
+    // save there would be overwritten
+    let placing: Awaited<ReturnType<typeof stat>>;
+    try {
+        const mtimeDate = new Date(downloaded.mtimeMs);
+        await utimes(tempPath, mtimeDate, mtimeDate).catch(() => {});
+        placing = await stat(tempPath);
+    } catch (error) {
+        await unlink(tempPath).catch(() => {});
+        throw error;
+    }
     if (options.beforePlacing && !(await options.beforePlacing().catch(() => false))) {
         await unlink(tempPath).catch(() => {});
         return { status: 'skipped-changed', localPath, size: 0, mtimeMs: 0 };
@@ -289,18 +304,25 @@ export async function downloadDriveNodeToLocal(options: {
         await unlink(tempPath).catch(() => {});
         throw error;
     }
-    const mtimeDate = new Date(downloaded.mtimeMs);
-    await utimes(localPath, mtimeDate, mtimeDate).catch(() => {});
 
     const finalStat = await stat(localPath);
     return {
         status: 'downloaded',
         localPath,
         sha1: downloaded.sha1,
-        size: finalStat.size,
-        mtimeMs: finalStat.mtimeMs,
-        ctimeMs: finalStat.ctimeMs,
+        size: placing.size,
+        mtimeMs: placing.mtimeMs,
+        ctimeMs: isSameFileAs(finalStat, placing) ? finalStat.ctimeMs : undefined,
     };
+}
+
+// Whether a file looked at again is still the one looked at before, unwritten as far as its size and mtime tell (a
+// write that keeps both, and puts the old mtime back, can't be told from here)
+export function isSameFileAs(
+    now: { dev: number; ino: number; size: number; mtimeMs: number },
+    before: { dev: number; ino: number; size: number; mtimeMs: number },
+): boolean {
+    return now.dev === before.dev && now.ino === before.ino && now.size === before.size && now.mtimeMs === before.mtimeMs;
 }
 
 // Downloads a revision of a file into exactly `filePath`, a new file it creates, and checks it against the SHA1 the
