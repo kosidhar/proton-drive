@@ -24,6 +24,7 @@ import {
     createRemoteFolder,
     downloadDriveNodeToLocal,
     downloadRevisionToFile,
+    isSameFileAs,
     isUnsupportedRemoteNode,
     listFolderChildren,
     type UploadResult,
@@ -2147,7 +2148,9 @@ export class ProtonDriveSyncEngine {
                     size: result.size,
                     syncStatus: 'synced',
                     lastError: null,
-                    contentReadAt: result.status === 'downloaded' ? placedReadAt(result.ctimeMs, readFrom) : readFrom,
+                    // A download written as it was placed has no ctime: not what was downloaded, so looked at again (#199)
+                    contentReadAt:
+                        result.status !== 'downloaded' ? readFrom : result.ctimeMs === undefined ? null : placedReadAt(result.ctimeMs, readFrom),
                 }, since);
 
                 if (result.status === 'downloaded') {
@@ -4268,19 +4271,22 @@ export class ProtonDriveSyncEngine {
                 await mkdir(path.dirname(target), { recursive: true });
             }
             const readFrom = Date.now(); // before it is placed (see placedReadAt)
+            // Its time set, and looked at, before it is placed: set after, a write between the placing and the setting
+            // (by the app that opened it) would get the cloud's time and pass for the download (#199)
+            const mtime = new Date(downloaded.mtimeMs);
+            try {
+                utimesSync(staging, mtime, mtime);
+            } catch {
+                // Keeps the time it was written at
+            }
+            const placing = statSync(staging);
             if (!this.localItemExists(rel)) {
                 stillThere();
                 placed = moveWithoutReplacing(staging, target);
             }
             if (placed) {
-                const mtime = new Date(downloaded.mtimeMs);
-                try {
-                    utimesSync(target, mtime, mtime);
-                } catch {
-                    // Keeps the time it was written at
-                }
                 const st = statSync(target);
-                size = st.size;
+                size = placing.size;
                 this.recordSynced(
                     {
                         localRelPath: rel,
@@ -4289,12 +4295,13 @@ export class ProtonDriveSyncEngine {
                         type: 'file',
                         localSha1: downloaded.sha1,
                         remoteSha1: node.activeRevision?.claimedDigests?.sha1 ?? null, // as the cloud claims it
-                        localMtimeMs: st.mtimeMs,
+                        localMtimeMs: placing.mtimeMs,
                         remoteMtimeMs: (node.activeRevision?.claimedModificationTime ?? node.modificationTime).getTime(),
-                        size: st.size,
+                        size: placing.size,
                         syncStatus: 'synced',
                         lastError: null,
-                        contentReadAt: placedReadAt(st.ctimeMs, readFrom),
+                        // Written meanwhile: not what was downloaded, so looked at again
+                        contentReadAt: isSameFileAs(st, placing) ? placedReadAt(st.ctimeMs, readFrom) : null,
                     },
                     since,
                 );
@@ -6675,10 +6682,10 @@ const CTIME_TICK_MS = 20;
 // The read time for a file just placed by a download: the ctime its placing gave it, as seen at once after, so that
 // what placed it isn't taken for a write after (which would have the watcher upload the download back). Just above it
 // (notWrittenSince then holds for a ctime no newer than the one seen, and not for any later one, however close): only
-// a write within the same clock tick as that stat, keeping the size and the old mtime, is left unseen. Without that
-// ctime, the time before placing, which has the next look hash the file once
-function placedReadAt(placedCtimeMs: number | undefined, readFrom: number): number {
-    return placedCtimeMs === undefined ? readFrom : Math.max(readFrom, placedCtimeMs + CTIME_TICK_MS + PLACED_CTIME_EPSILON_MS);
+// a write within the same clock tick as that stat, keeping the size and the old mtime, is left unseen. A file written
+// between its placing and that stat (#199) gets no read time instead, and is looked at again
+function placedReadAt(placedCtimeMs: number, readFrom: number): number {
+    return Math.max(readFrom, placedCtimeMs + CTIME_TICK_MS + PLACED_CTIME_EPSILON_MS);
 }
 // Above the rounding of a ctime in ms at today's dates (about 0.0002 ms), below any later ctime the system gives
 const PLACED_CTIME_EPSILON_MS = 0.001;
