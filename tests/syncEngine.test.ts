@@ -10018,5 +10018,30 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(await stat(local('a.txt')).catch(() => null)).toBeNull(); // not brought back
             expect(await readFile(local('b.txt'), 'utf8')).toBe('mine');
         });
+
+        test('virtual: keep-remote after a drive rename onto the file never replaces what the rename put there', async () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'cloud');
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            await writeFile(local('a.txt'), 'mine');
+            await writeFile(local('x.txt'), 'precious'); // only on this computer
+            stateDb.updateSettings({ conflictStrategy: 'keep-remote' });
+            await (engine as any).observingLocal(async (since: number) => {
+                await engine.renameItem('x.txt', 'a.txt'); // the user saves x.txt over a.txt, as an editor does
+                await (engine as any).handleFileConflict(
+                    'a.txt', local('a.txt'), d.nodes.get(d.uid('a.txt')), 'mine-sha1', null, 0, 0, new Map(),
+                    stateDb.getSettings(), since, undefined,
+                );
+            });
+            expect(await readFile(local('a.txt'), 'utf8')).toBe('precious');
+        });
     });
 });
