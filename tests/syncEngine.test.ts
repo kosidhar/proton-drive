@@ -10700,6 +10700,42 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await d.engine.reconcileNow();
             expect(await stat(d.local('Big/b.bin')).catch(() => null)).toBeNull();
             expect(await readFile(d.local('Big/a.bin'), 'utf8')).toBe('a');
+            expect(d.calls.downloads).toEqual(['Big/a.bin']); // b.bin was never even asked for
+        });
+
+        test('deleted through the drive while its own download runs, it is never put in place nor recorded', async () => {
+            const d = await pinning();
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            const download = (d.sdk as any).getFileRevisionDownloader.bind(d.sdk);
+            (d.sdk as any).getFileRevisionDownloader = async (...args: unknown[]) => {
+                const downloader = await download(...args);
+                if (!String(args[0]).includes('b.bin')) return downloader;
+                return {
+                    ...downloader,
+                    downloadToStream: (...dl: unknown[]) => {
+                        const running = downloader.downloadToStream(...dl);
+                        return {
+                            ...running,
+                            completion: async () => {
+                                await running.completion();
+                                entered();
+                                await gate; // the bytes are in; placing them waits
+                            },
+                        };
+                    },
+                };
+            };
+            const pin = d.engine.setAvailability('Big', 'pin');
+            await inside;
+            await d.engine.deleteItem('Big/b.bin');
+            await d.engine.replayRemoteOps();
+            release();
+            await pin;
+            expect(await stat(d.local('Big/b.bin')).catch(() => null)).toBeNull();
+            expect(stateDb.getItemByPath('Big/b.bin')).toBeNull();
         });
 
         test('nor when what Proton Drive says of it still looks live (a cache behind), after a drive delete since', async () => {
