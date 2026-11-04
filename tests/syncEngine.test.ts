@@ -9934,4 +9934,49 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(await readFile(d.local('b.txt'), 'utf8')).toBe('local edit');
         });
     });
+
+    describe('other sync work holds off a file being resolved by the conflict setting, as for one resolved by hand (#140)', () => {
+        const synced = async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'a');
+            const folder = d.add('Folder');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            // A resolution by the setting is working on a.txt
+            (engine as any).strategyResolvingPaths.add('a.txt');
+            return { ...d, engine, local, folder };
+        };
+
+        test('a local delete is not taken to the cloud meanwhile', async () => {
+            const d = await synced();
+            await rm(d.local('a.txt'));
+            await (d.engine as any).trashForDeletedLocal('a.txt', d.nodes.get(d.uid('a.txt')));
+            expect(d.calls.trashed).toEqual([]);
+        });
+
+        test('a cloud move is not followed meanwhile', async () => {
+            const d = await synced();
+            const node = d.nodes.get(d.uid('a.txt'))!;
+            d.nodes.set(d.uid('a.txt'), { ...node, parentUid: d.folder.uid });
+            await (d.engine as any).afterGoneFromCloudPath('a.txt');
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('a');
+            expect(stateDb.getItemByPath('a.txt')?.nodeUid).toBe(d.uid('a.txt'));
+        });
+
+        test('a cloud move found from its new path is not followed meanwhile', async () => {
+            const d = await synced();
+            const node = d.nodes.get(d.uid('a.txt'))!;
+            const moved = { ...node, parentUid: d.folder.uid };
+            d.nodes.set(d.uid('a.txt'), moved);
+            await (d.engine as any).reconcileSinglePath('Folder/a.txt', moved, undefined, undefined, new Map(), stateDb.getSettings(), 0);
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('a');
+            expect(stateDb.getItemByPath('a.txt')?.nodeUid).toBe(d.uid('a.txt'));
+        });
+    });
 });
