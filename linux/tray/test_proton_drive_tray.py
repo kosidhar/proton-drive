@@ -182,8 +182,10 @@ class MountItemTest(unittest.TestCase):
 
     def test_labels_follow_the_copy(self):
         self.assertEqual(tray.MOUNT_LABEL, "Mount Proton Drive")
-        self.assertEqual(tray.OPEN_FOLDER_LABEL, "Open Proton Drive Folder")
+        self.assertEqual(tray.OPEN_DRIVE_LABEL, "Open Proton Drive")
+        self.assertEqual(tray.VIEW_ONLINE_LABEL, "View Online")
         self.assertEqual(tray.OPEN_TRASH_LABEL, "Open Proton Drive Trash")
+        self.assertEqual(tray.APP_LABEL, "Status & Settings…")
 
 
 class OpenTrashTest(unittest.TestCase):
@@ -209,6 +211,231 @@ class OpenTrashTest(unittest.TestCase):
             "Deleted files stay here until you empty the trash or restore them. Restoring brings them back to ~/ProtonDrive.",
         )
         self.assertTrue(tray.trash_tooltip("/srv/u/Drive").endswith("back to /srv/u/Drive."))
+
+
+def status(**over):
+    """A daemon status as /api/status sends it: signed in, idle, nothing wrong."""
+    base = {
+        "state": "idle",
+        "loggedIn": True,
+        "settings": {"paused": False},
+        "stats": {"unresolvedConflicts": 0, "errorItems": 0},
+        "activeTransfers": [],
+        "vfs": {"mode": "virtual", "mounted": True, "reason": None},
+    }
+    base.update(over)
+    return base
+
+
+def transfer(direction, rel_path="a.txt"):
+    return {"direction": direction, "relPath": rel_path, "bytesTransferred": 1, "totalBytes": 2}
+
+
+class MenuTest(unittest.TestCase):
+    """#98: the menu as agreed — Open Proton Drive opens the drive, Status & Settings… opens the app."""
+
+    def build(self):
+        tray.Gtk.MenuItem.reset_mock()
+        with mock.patch.object(tray.ProtonDriveTrayIndicator, "poll_status"):
+            return tray.ProtonDriveTrayIndicator()
+
+    def labels(self):
+        return [c.kwargs.get("label") for c in tray.Gtk.MenuItem.call_args_list]
+
+    def test_the_menu_items_in_order(self):
+        self.build()
+        labels = [l for l in self.labels() if l is not None]
+        expected = [
+            tray.OPEN_DRIVE_LABEL,
+            tray.VIEW_ONLINE_LABEL,
+            tray.OPEN_TRASH_LABEL,
+            tray.MOUNT_LABEL,
+            tray.APP_LABEL,
+            "Sync Now",
+            "Pause Sync",
+            "Quit Proton Drive",
+        ]
+        self.assertEqual([l for l in labels if l in expected], expected)
+        # Gone: the account line, the local-sync line and the separate folder item
+        for gone in ("Open Proton Drive Folder", "Proton Drive"):
+            self.assertNotIn(gone, labels)
+        self.assertFalse(any(l.startswith("Local Sync") or l.startswith("Checking local") for l in labels))
+
+    def test_open_proton_drive_opens_the_drive_in_files(self):
+        indicator = types.SimpleNamespace(sync_dir="/home/u/ProtonDrive")
+        with mock.patch.object(tray, "spawn_detached") as spawn:
+            tray.ProtonDriveTrayIndicator.on_open_drive(indicator, None)
+        spawn.assert_called_once_with(["xdg-open", "/home/u/ProtonDrive"])
+
+    def test_view_online_opens_proton_drive_on_the_web(self):
+        with mock.patch.object(tray, "spawn_detached") as spawn:
+            tray.ProtonDriveTrayIndicator.on_view_online(object(), None)
+        spawn.assert_called_once_with(["xdg-open", "https://drive.proton.me"])
+
+    def test_status_and_settings_opens_the_app_on_home(self):
+        with mock.patch.object(tray, "spawn_detached") as spawn:
+            tray.ProtonDriveTrayIndicator.on_open_app(object(), None)
+        argv = spawn.call_args_list[0].args[0]
+        self.assertTrue(argv[0].endswith("protondrive-gui"))
+        self.assertEqual(argv[1:], ["--tab", "home"])
+
+    def test_the_problems_item_is_hidden_until_there_are_problems(self):
+        indicator = self.build()
+        item = indicator.problems_item
+        item.set_no_show_all.assert_called_with(True)
+        item.connect.assert_any_call("activate", indicator.on_open_app)
+
+
+class StatusLineTest(unittest.TestCase):
+    """The tray says what the app's Home says, in the same words (#98, #191)."""
+
+    def test_up_to_date(self):
+        self.assertEqual(tray.status_line(status()), ("Up to date", "protondrive-tray-idle"))
+
+    def test_signed_out_either_way(self):
+        self.assertEqual(tray.status_line(status(loggedIn=False))[0], "Signed out")
+        self.assertEqual(tray.status_line(status(state="unauthenticated"))[0], "Signed out")
+        self.assertEqual(tray.status_line(status(loggedIn=False))[1], "protondrive-tray-error")
+
+    def test_paused_from_either_field(self):
+        self.assertEqual(tray.status_line(status(state="paused")), ("Paused", "protondrive-tray-paused"))
+        self.assertEqual(tray.status_line(status(settings={"paused": True}))[0], "Paused")
+
+    def test_what_moves(self):
+        syncing = lambda transfers: tray.status_line(status(state="syncing", activeTransfers=transfers))  # noqa: E731
+        self.assertEqual(syncing([]), ("Checking for changes…", "protondrive-tray-syncing"))
+        self.assertEqual(syncing([transfer("upload")] * 3)[0], "Uploading 3 files")
+        self.assertEqual(syncing([transfer("download", "docs/report.pdf")])[0], "Downloading report.pdf")
+        self.assertEqual(syncing([transfer("upload")] * 2 + [transfer("download")])[0], "Syncing 3 files")
+
+    def test_never_shows_engine_text(self):
+        text, _icon = tray.status_line(status(state="syncing", currentAction="Listing /my-files/deployment"))
+        self.assertNotIn("/my-files", text)
+        self.assertNotIn("Listing", text)
+
+    def test_moving_files(self):
+        moving = status(vfs={"mode": "virtual", "mounted": False, "reason": "moving"})
+        self.assertEqual(tray.status_line(moving)[0], "Moving files…")
+
+    def test_problems(self):
+        # The count is on the clickable item just below (problems_label); the greyed line doesn't repeat it
+        self.assertEqual(tray.status_line(status(stats={"unresolvedConflicts": 1, "errorItems": 0})),
+                         ("Needs attention", "protondrive-tray-error"))
+        self.assertEqual(tray.problems_label(1), "⚠ 1 problem needs you")
+        self.assertEqual(tray.problems_label(3), "⚠ 3 problems need you")
+
+    def test_an_error_with_no_message_is_not_up_to_date(self):
+        self.assertEqual(tray.status_line(status(state="error"))[0], "Sync stopped")
+
+    def test_storage_line(self):
+        gb = 1024 ** 3
+        self.assertEqual(tray.storage_line({"usedSpace": int(13.57 * gb), "maxSpace": 510 * gb}),
+                         "13.6 GB of 510.0 GB used")
+        self.assertIsNone(tray.storage_line({}))
+        self.assertIsNone(tray.storage_line({"usedSpace": 5, "maxSpace": 0}))
+
+
+class LongNamesTest(unittest.TestCase):
+    def test_a_long_file_name_is_shortened_in_the_middle(self):
+        name = "a-very-long-file-name-" * 6 + "end.docx"
+        text, _ = tray.status_line(status(state="syncing", activeTransfers=[transfer("upload", "Docs/" + name)]))
+        self.assertLessEqual(len(text), len("Uploading ") + tray.NAME_LIMIT)
+        self.assertTrue(text.startswith("Uploading a-very-long"))
+        self.assertTrue(text.endswith("end.docx"))
+        self.assertIn("…", text)
+        # A short name is left alone
+        self.assertEqual(tray.status_line(status(state="syncing", activeTransfers=[transfer("upload", "a.txt")]))[0],
+                         "Uploading a.txt")
+
+
+class PollTest(unittest.TestCase):
+    """poll_status against a fake daemon answer: what the menu shows."""
+
+    def poll(self, answer):
+        tray.Gtk.MenuItem.reset_mock()
+        with mock.patch.object(tray.ProtonDriveTrayIndicator, "poll_status"):
+            indicator = tray.ProtonDriveTrayIndicator()
+        for name in ("status_item", "storage_item", "problems_item", "pause_item", "mount_item"):
+            setattr(indicator, name, mock.MagicMock())
+        indicator.indicator = mock.MagicMock()
+
+        def urlopen(_req, timeout=None):
+            if isinstance(answer, Exception):
+                raise answer
+            reply = mock.MagicMock()
+            reply.__enter__.return_value.read.return_value = json.dumps(answer).encode()
+            return reply
+
+        with mock.patch.object(tray.urllib.request, "urlopen", urlopen):
+            tray.ProtonDriveTrayIndicator.poll_status(indicator)
+        return indicator
+
+    def test_up_to_date_with_storage_and_no_problems(self):
+        gb = 1024 ** 3
+        ind = self.poll(status(account={"usedSpace": 2 * gb, "maxSpace": 10 * gb}))
+        ind.status_item.set_label.assert_called_with("Up to date")
+        ind.storage_item.set_label.assert_called_with("2.0 GB of 10.0 GB used")
+        ind.storage_item.set_visible.assert_called_with(True)
+        ind.problems_item.set_visible.assert_called_with(False)
+        ind.pause_item.set_label.assert_called_with("Pause Sync")
+        ind.indicator.set_icon_full.assert_called_with("protondrive-tray-idle", "Up to date")
+
+    def test_problems_show_the_item_with_the_count(self):
+        ind = self.poll(status(stats={"unresolvedConflicts": 2, "errorItems": 0}))
+        ind.status_item.set_label.assert_called_with("Needs attention")
+        ind.problems_item.set_label.assert_called_with("⚠ 2 problems need you")
+        ind.problems_item.set_visible.assert_called_with(True)
+
+    def test_signed_out_by_either_field_shows_no_problems_item(self):
+        for answer in (status(loggedIn=False, lastError="x"), status(state="unauthenticated", lastError="x")):
+            ind = self.poll(answer)
+            ind.status_item.set_label.assert_called_with("Signed out")
+            ind.problems_item.set_visible.assert_called_with(False)
+
+    def test_paused_offers_resume(self):
+        self.poll(status(state="paused")).pause_item.set_label.assert_called_with("Resume Sync")
+
+    def test_null_fields_are_not_mistaken_for_an_offline_daemon(self):
+        ind = self.poll(status(settings=None, stats=None, account=None, activeTransfers=None))
+        ind.status_item.set_label.assert_called_with("Up to date")
+
+    def test_unreachable_daemon(self):
+        ind = self.poll(OSError("connection refused"))
+        ind.status_item.set_label.assert_called_with("Can't reach Proton Drive's background service")
+        ind.storage_item.set_visible.assert_called_with(False)
+        ind.problems_item.set_visible.assert_called_with(False)
+
+
+class ProblemCountTest(unittest.TestCase):
+    """Counted as the app's Needs attention lists them: one per conflict, one for failed files, one each for the rest."""
+
+    def test_nothing_wrong(self):
+        self.assertEqual(tray.problem_count(status()), 0)
+
+    def test_each_kind_counts(self):
+        self.assertEqual(tray.problem_count(status(accountMismatch={"message": "x"})), 1)
+        self.assertEqual(tray.problem_count(status(filesMissing={"root": "/x"})), 1)
+        self.assertEqual(tray.problem_count(status(stats={"unresolvedConflicts": 2, "errorItems": 0})), 2)
+        self.assertEqual(tray.problem_count(status(stats={"unresolvedConflicts": 0, "errorItems": 7})), 1)
+        self.assertEqual(tray.problem_count(status(lastError="Disk full")), 1)
+
+    def test_last_error_is_not_counted_when_missing_files_or_another_account_explain_it(self):
+        self.assertEqual(tray.problem_count(status(filesMissing={"root": "/x"}, lastError="missing")), 1)
+        self.assertEqual(tray.problem_count(status(accountMismatch={"message": "m"}, lastError="m")), 1)
+        self.assertEqual(tray.problem_count(status(lastError="   ")), 0)
+
+    def test_the_drive(self):
+        unmounted = lambda reason: status(vfs={"mode": "virtual", "mounted": False, "reason": reason})  # noqa: E731
+        self.assertEqual(tray.problem_count(unmounted("ejected")), 1)
+        self.assertEqual(tray.problem_count(unmounted(None)), 1)
+        for transient in ("starting", "moving"):
+            self.assertEqual(tray.problem_count(unmounted(transient)), 0, transient)
+        self.assertEqual(tray.problem_count(unmounted("move-failed")), 1)  # the stopped move, not also "not mounted"
+        mounted_with_move = status(vfs={"mode": "virtual", "mounted": True, "reason": None,
+                                        "move": {"actions": ["retry"]}})
+        self.assertEqual(tray.problem_count(mounted_with_move), 1)
+        self.assertEqual(tray.problem_count(status(vfs={"mode": "plain", "mounted": False, "reason": "switched-off"})), 0)
+        self.assertEqual(tray.problem_count(status(vfs=None)), 0)
 
 
 if __name__ == "__main__":
