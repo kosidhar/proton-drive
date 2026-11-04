@@ -5922,7 +5922,14 @@ export class ProtonDriveSyncEngine {
                 const existing = await this.sdk.getNode(dbItem.nodeUid);
                 remoteMap.set(dirRel, existing);
                 return existing;
-            } catch {}
+            } catch (error: unknown) {
+                if (error instanceof ValidationError) {
+                    // The folder this computer synced is gone from Proton Drive (deleted for good elsewhere), and its
+                    // removal here hasn't happened yet: made again by name, it would come back. Refused: what was to go
+                    // in it stays here unrecorded, which that removal keeps (#161)
+                    throw new Error(`${dirRel} is gone from Proton Drive: nothing is put there`, { cause: error });
+                }
+            }
         }
 
         const segments = dirRel.split('/').filter(Boolean);
