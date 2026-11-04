@@ -10399,4 +10399,81 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(stateDb.getItemByPath('Docs/a.txt')).toBeNull();
         });
     });
+
+    describe('a stale move marker never moves a new file over another on the next start (#153)', () => {
+        test('virtual: a replacing rename whose marker outlived it leaves a new file at its source alone', async () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'old');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            await writeFile(local('x.txt'), 'saved'); // an editor's temp file, saved over a.txt
+            // Clearing the marker fails after the move: it outlives it
+            const deleteMeta = stateDb.deleteMeta.bind(stateDb);
+            let failing = true;
+            (stateDb as any).deleteMeta = (key: string) => {
+                if (failing && key === 'localMoveInProgress') throw new Error('database is locked');
+                return deleteMeta(key);
+            };
+            try {
+                await expect(engine.renameItem('x.txt', 'a.txt')).rejects.toThrow('database is locked');
+            } finally {
+                failing = false;
+            }
+            expect(stateDb.getMeta('localMoveInProgress')).not.toBeNull();
+            expect(await readFile(local('a.txt'), 'utf8')).toBe('saved');
+            // The editor's next temp file, before the daemon starts again
+            await writeFile(local('x.txt'), 'next draft');
+            engine.recoverLocalMove();
+            expect(await readFile(local('a.txt'), 'utf8')).toBe('saved');
+            expect(await readFile(local('x.txt'), 'utf8')).toBe('next draft');
+            expect(stateDb.getMeta('localMoveInProgress')).toBeNull();
+        });
+
+        test('virtual: an identity that matches nothing (renumbered by a remount, say) leaves recovery as it was', async () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            await writeFile(local('x.txt'), 'saved');
+            await writeFile(local('a.txt'), 'old');
+            stateDb.setMeta('localMoveInProgress', JSON.stringify({ from: 'x.txt', to: 'a.txt', replace: true, ino: '1', born: '1' }));
+            engine.recoverLocalMove();
+            expect(await readFile(local('a.txt'), 'utf8')).toBe('saved'); // finished, as a move not done must be
+            expect(await stat(local('x.txt')).catch(() => null)).toBeNull();
+        });
+
+        test('virtual: a move interrupted before it happened is still finished, its item being the one at the source', async () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                backingDir: path.join(tempDir, 'files'),
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            await writeFile(local('x.txt'), 'saved');
+            await writeFile(local('a.txt'), 'old');
+            // The marker as written just before the move, then a crash
+            stateDb.setMeta('localMoveInProgress', (engine as any).moveIntent('x.txt', 'a.txt', true));
+            engine.recoverLocalMove();
+            expect(await readFile(local('a.txt'), 'utf8')).toBe('saved');
+            expect(await stat(local('x.txt')).catch(() => null)).toBeNull();
+        });
+    });
 });
