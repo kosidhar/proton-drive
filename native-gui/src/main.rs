@@ -775,10 +775,20 @@ struct ConfirmCopy {
 fn confirm_copy(confirm: &PendingConfirm) -> ConfirmCopy {
     match confirm {
         PendingConfirm::FreeAll { rel_path } => {
-            let place = if rel_path.is_empty() { "My files".to_string() } else { format!("\"{rel_path}\"") };
+            let (title, body) = if rel_path.is_empty() {
+                (
+                    "Free up space on this computer?".to_string(),
+                    "This removes the copies on this computer of everything that is safely in Proton Drive. Your files stay in Proton Drive, and in Files as online-only: they download again when you open them. Nothing is deleted online.".to_string(),
+                )
+            } else {
+                (
+                    format!("Free up space in \"{rel_path}\"?"),
+                    format!("This removes the copies on this computer of everything in \"{rel_path}\" that is safely in Proton Drive. Nothing is deleted online. Use Always keep to download them again."),
+                )
+            };
             ConfirmCopy {
-                title: format!("Free up space in {place}?"),
-                body: format!("This removes the local copies of everything in {place} that is safely in Proton Drive. Nothing is deleted online. Use Always keep to download them again."),
+                title,
+                body,
                 detail: "Anything marked Always keep here stops being kept. Files that aren't fully synced, or that you've told Proton Drive to ignore, stay on this computer.",
                 button: "Free up space",
                 cancel: "Cancel",
@@ -824,14 +834,13 @@ struct ConflictRecord {
     #[allow(dead_code)]
     detected_at: u64,
     resolved: u8,
-    resolution: Option<String>,
 }
 
 enum WorkerCommand {
     RefreshAll,
-    #[cfg_attr(not(test), allow(dead_code))] // used by Home in Task 4 (Sync now)
+    /// Home's Sync now
     TriggerSync,
-    #[cfg_attr(not(test), allow(dead_code))] // used by Home in Task 4 (Pause and Resume)
+    /// Home's Pause and Resume
     SetPaused(bool),
     StartLogin,
     Logout,
@@ -1330,9 +1339,15 @@ impl ProtonDriveNativeApp {
                         if s.logged_in {
                             self.login_url = None;
                         }
-                        // A change in the count of unresolved conflicts, or the daemon coming back, means the list
-                        // Needs attention shows may have changed
-                        if was_offline || s.stats.unresolved_conflicts != self.status.stats.unresolved_conflicts {
+                        // The list Needs attention shows may have changed: reload it while any is open (see
+                        // should_reload_conflicts)
+                        let listed_open = self.conflicts.iter().filter(|c| c.resolved == 0).count();
+                        if home::should_reload_conflicts(
+                            was_offline,
+                            self.status.stats.unresolved_conflicts,
+                            s.stats.unresolved_conflicts,
+                            listed_open,
+                        ) {
                             let _ = self.tx.send(WorkerCommand::LoadConflicts);
                         }
                         self.status = s;
@@ -2331,7 +2346,7 @@ impl ProtonDriveNativeApp {
         }
     }
 
-    /// Above every tab while the daemon holds because the files are missing from the folder: what is missing, that
+    /// In Home's Needs attention while the daemon holds because the files are missing from the folder: what is missing, that
     /// nothing was deleted, and what can be done besides waiting, which is the default and needs nothing. Keeping them
     /// online-only deletes nothing, so it asks nothing: the banner says what it does. Deleting them from Proton Drive too
     /// asks first. In the virtual layout (the files were in the drive's hidden storage) keeping them online-only is the
@@ -2366,7 +2381,7 @@ impl ProtonDriveNativeApp {
                 let keep_says = if virtual_layout {
                     "Keep them online-only to stop waiting: they stay in Proton Drive, and the drive shows them as online-only. Nothing is deleted."
                 } else {
-                    "Keep them online-only to stop waiting: they stay in Proton Drive, shown as online-only in My files, and aren't downloaded again. Nothing is deleted."
+                    "Keep them online-only to stop waiting: they stay in Proton Drive as online-only files, and aren't downloaded again. Nothing is deleted."
                 };
                 ui.add(egui::Label::new(RichText::new(keep_says).size(12.5).color(TEXT_MUTED())).wrap());
                 if let Some(error) = &self.files_missing_error {
@@ -2422,7 +2437,6 @@ impl ProtonDriveNativeApp {
                     None => {}
                 }
             });
-        ui.add_space(14.0);
     }
 
     /// Asks the daemon to do what the user chose about the missing files, as they were shown.
@@ -2446,9 +2460,8 @@ impl ProtonDriveNativeApp {
                 if self.pending_confirm.is_some() {
                     ui.disable(); // Nothing under the confirmation dialog takes clicks or keys while it is open
                 }
-                self.render_files_missing(ui);
                 match self.tab {
-                    NavTab::Home => self.render_home_placeholder(ui),
+                    NavTab::Home => self.render_home(ui),
                     NavTab::Activity => self.render_overview_tab(ui),
                     NavTab::Settings => self.render_settings_tab(ui),
                 }
@@ -2456,87 +2469,6 @@ impl ProtonDriveNativeApp {
 
         self.render_account_popover(ctx);
         self.render_confirm_modal(ctx);
-    }
-
-    /// Home until it gets its status, Needs attention, In progress and drive cards: how the last availability action
-    /// went, and an empty card.
-    fn render_home_placeholder(&mut self, ui: &mut egui::Ui) {
-        self.render_notice(ui);
-        ui.add_space(10.0);
-        card_frame().show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-        });
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))] // used by Home in Task 4: its resolve buttons move into Needs attention
-    fn render_conflicts_tab(&mut self, ui: &mut egui::Ui) {
-        card_frame().show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.label(
-                RichText::new("File Conflicts")
-                    .size(15.5)
-                    .strong()
-                    .color(TEXT_PRIMARY()),
-            );
-            ui.add_space(8.0);
-            if let Some(error) = &self.conflict_error {
-                ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
-                ui.add_space(8.0);
-            }
-            if self.conflicts.is_empty() {
-                ui.label(
-                    RichText::new("No file conflicts detected.")
-                        .size(13.0)
-                        .color(TEXT_MUTED()),
-                );
-            } else {
-                for c in self.conflicts.clone() {
-                    Frame::NONE
-                        .fill(BG_CARD_ALT())
-                        .corner_radius(CornerRadius::same(8))
-                        .inner_margin(Margin::symmetric(12, 10))
-                        .show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(&c.local_rel_path)
-                                        .size(13.5)
-                                        .strong()
-                                        .color(TEXT_PRIMARY()),
-                                );
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if c.resolved != 0 {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "Resolved ({})",
-                                                c.resolution.unwrap_or_default()
-                                            ))
-                                            .size(12.5)
-                                            .color(STATUS_SUCCESS),
-                                        );
-                                    } else {
-                                        for (choice, label) in [
-                                            ("keep-remote", "Keep Remote"),
-                                            ("keep-local", "Keep Local"),
-                                            ("keep-both", "Keep Both"),
-                                        ] {
-                                            if ui.button(label).clicked() {
-                                                let _ = self.tx.send(
-                                                    WorkerCommand::ResolveConflict {
-                                                        id: c.id,
-                                                        choice: choice.to_string(),
-                                                    },
-                                                );
-                                            }
-                                        }
-                                    }
-                                });
-                            });
-                        });
-                    ui.add_space(6.0);
-                }
-            }
-        });
     }
 
     fn render_settings_tab(&mut self, ui: &mut egui::Ui) {
@@ -4854,7 +4786,7 @@ mod tests {
             all.into_iter().rev().find(|(rect, fill)| rect.contains(pos) && *fill != Color32::TRANSPARENT).map(|(_, fill)| fill)
         }
 
-        /// Availability actions and folder changes asked of the worker since the last call.
+        /// The actions asked of the worker since the last call (reads, such as refreshes, are left out).
         fn sent(&self) -> Vec<String> {
             self.commands
                 .try_iter()
@@ -4868,6 +4800,9 @@ mod tests {
                     WorkerCommand::ResolveFilesMissing { choice, root, names } => {
                         Some(format!("files missing: {} {root} {}", choice.action(), names.join(", ")))
                     }
+                    WorkerCommand::TriggerSync => Some("sync now".to_string()),
+                    WorkerCommand::SetPaused(paused) => Some(format!("paused {paused}")),
+                    WorkerCommand::ResolveConflict { id, choice } => Some(format!("resolve {id} {choice}")),
                     _ => None,
                 })
                 .collect()
@@ -4968,49 +4903,183 @@ mod tests {
         assert!(h.text_at("Sign out").is_some());
         h.click(name);
         assert!(!h.app.show_account_menu);
-        // Nothing of the old sidebar or top bar is left
+        // Nothing of the old sidebar or top bar is left (Home has its own Pause and Sync now)
+        h.app.tab = NavTab::Settings;
+        h.frames(2);
         for gone in ["Sync now", "My files", "Sync Activity", "Conflicts", "Pause"] {
             assert!(h.text_at(gone).is_none(), "{gone}");
         }
     }
 
-    #[test]
-    fn a_conflicts_resolve_buttons_send_the_choice() {
-        // Home's Needs attention takes these buttons over in Task 4; until then they still send what they did
+    /// Home with the status changed by `change`, and what Needs attention lists recomputed, as a status event would.
+    fn home_with(change: impl FnOnce(&mut DaemonStatus)) -> Harness {
         let mut h = Harness::new();
-        h.app.conflicts = vec![ConflictRecord { id: 7, local_rel_path: "docs/report.pdf".into(), ..Default::default() }];
-        let draw = |h: &mut Harness, events: Vec<egui::Event>| {
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1440.0, 900.0))),
-                events,
-                ..Default::default()
-            };
-            let app = &mut h.app;
-            h.last = Some(h.ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| app.render_conflicts_tab(ui));
-            }));
+        h.app.status.sync_dir = "/home/u/ProtonDrive".into();
+        change(&mut h.app.status);
+        h.app.refresh_attention();
+        h.frames(3);
+        h
+    }
+
+    #[test]
+    fn home_says_how_the_sync_is_and_pause_resume_and_sync_now_send_their_commands() {
+        let mut h = home_with(|_| {});
+        assert!(h.text_at("Up to date").is_some());
+        assert!(h.text_at("Resume").is_none());
+        h.click(h.text_at("Pause").expect("Pause is the main button"));
+        assert_eq!(h.sent(), vec!["paused true".to_string()]);
+        h.click(h.text_at("Sync now").expect("Sync now is offered"));
+        assert_eq!(h.sent(), vec!["sync now".to_string()]);
+
+        // Paused, by the setting or by the state, offers Resume
+        for paused in [home_with(|s| s.settings.paused = true), home_with(|s| s.state = "paused".into())] {
+            let mut h = paused;
+            assert!(h.text_at("Paused").is_some());
+            assert!(h.text_at("Pause").is_none());
+            h.click(h.text_at("Resume").expect("Resume is the main button"));
+            assert_eq!(h.sent(), vec!["paused false".to_string()]);
+        }
+    }
+
+    #[test]
+    fn needs_attention_shows_only_when_something_does() {
+        let h = home_with(|_| {});
+        assert!(h.text_at("Needs attention").is_none());
+        let h = home_with(|s| {
+            s.stats.error_items = 3;
+            s.last_error = Some("Proton Drive couldn't be reached".into());
+        });
+        assert!(h.text_at("Needs attention").is_some());
+        assert!(h.text_at("2 problems need you").is_some());
+        assert!(h.text_at("3 files couldn't sync").is_some());
+        assert!(h.text_at("Proton Drive couldn't be reached").is_some());
+    }
+
+    #[test]
+    fn a_conflict_says_both_copies_were_kept_and_its_resolve_buttons_send_the_choice() {
+        let mut h = home_with(|_| {});
+        h.event(WorkerEvent::ConflictsLoaded(vec![
+            ConflictRecord { id: 7, local_rel_path: "docs/report.pdf".into(), ..Default::default() },
+            ConflictRecord { id: 8, local_rel_path: "old.txt".into(), resolved: 1, ..Default::default() },
+        ]));
+        assert!(h.text_at("Both copies kept: report.pdf").is_some());
+        assert!(h.text_at("Both copies kept: old.txt").is_none(), "a resolved conflict is not listed");
+        assert!(h.text_at("Show in Files").is_some());
+        h.click(h.text_at("Keep Both").expect("the conflict's resolve buttons are painted"));
+        assert_eq!(h.sent(), vec!["resolve 7 keep-both".to_string()]);
+        h.click(h.text_at("Keep Local").unwrap());
+        assert_eq!(h.sent(), vec!["resolve 7 keep-local".to_string()]);
+        // A refused resolve is shown in the card
+        h.event(WorkerEvent::ConflictResolved(Err("The file changed again".into())));
+        assert!(h.text_at("The file changed again").is_some());
+    }
+
+    #[test]
+    fn conflicts_reload_on_every_status_while_one_is_open() {
+        let mut h = Harness::new();
+        let mut status = h.app.status.clone();
+        status.stats.unresolved_conflicts = 1;
+        for _ in 0..2 {
+            h.event(WorkerEvent::StatusAndActivity { status: Box::new(Ok(status.clone())), activity: Vec::new() });
+            assert!(h.commands.try_iter().any(|c| matches!(c, WorkerCommand::LoadConflicts)));
+        }
+        status.stats.unresolved_conflicts = 0;
+        h.event(WorkerEvent::StatusAndActivity { status: Box::new(Ok(status.clone())), activity: Vec::new() });
+        assert!(h.commands.try_iter().any(|c| matches!(c, WorkerCommand::LoadConflicts)), "the count changed");
+        h.event(WorkerEvent::StatusAndActivity { status: Box::new(Ok(status)), activity: Vec::new() });
+        assert!(!h.commands.try_iter().any(|c| matches!(c, WorkerCommand::LoadConflicts)), "nothing open, nothing new");
+    }
+
+    #[test]
+    fn the_drive_not_mounted_is_on_home_with_mount_again() {
+        let mut h = home_with(|s| s.vfs = Some(vfs("virtual", false, Some("ejected"))));
+        assert!(h.text_at("Virtual drive: ejected").is_some());
+        h.click(h.text_at("Mount again").expect("Mount again is offered"));
+        assert_eq!(h.sent(), vec!["mount again".to_string()]);
+        // Nothing else is sent while it runs
+        h.click(h.text_at("Mount again").unwrap());
+        assert_eq!(h.sent(), Vec::<String>::new());
+        h.event(WorkerEvent::DriveDone(Err("The drive is stopping".into())));
+        assert!(h.text_at("The drive is stopping").is_some());
+
+        // Not offered when the daemon can't mount it again
+        let h = home_with(|s| s.vfs = Some(vfs("virtual", false, Some("different-disk"))));
+        assert!(h.text_at("Mount again").is_none());
+    }
+
+    #[test]
+    fn a_stopped_move_is_on_home_with_its_actions() {
+        let stopped = VfsStatus {
+            error: Some("Disk full".into()),
+            drive_move: Some(drive_move("relocation", None, &["move-back", "retry"])),
+            ..vfs("plain", false, Some("move-failed"))
         };
-        draw(&mut h, Vec::new());
-        draw(&mut h, Vec::new());
-        let pos = h.text_at("Keep Both").expect("the conflict's buttons are painted");
-        let button = |pressed| egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed,
-            modifiers: egui::Modifiers::NONE,
-        };
-        draw(&mut h, vec![egui::Event::PointerMoved(pos)]);
-        draw(&mut h, vec![button(true)]);
-        draw(&mut h, vec![button(false)]);
-        let sent: Vec<(u64, String)> = h
-            .commands
-            .try_iter()
-            .filter_map(|c| match c {
-                WorkerCommand::ResolveConflict { id, choice } => Some((id, choice)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(sent, vec![(7, "keep-both".to_string())]);
+        let mut h = home_with(|s| s.vfs = Some(stopped));
+        assert!(h.text_at("Moving files stopped: Disk full").is_some());
+        assert!(h.text_at("Moving the Proton Drive folder didn't finish").is_some());
+        h.click(h.text_at("Move files back").expect("the move's actions are offered"));
+        assert_eq!(h.sent(), vec!["move-back /home/u/ProtonDrive -> /mnt/b/ProtonDrive".to_string()]);
+    }
+
+    #[test]
+    fn in_progress_shows_the_first_five_transfers_then_how_many_more() {
+        let h = home_with(|_| {});
+        assert!(h.text_at("In progress").is_none());
+        let h = home_with(|s| {
+            s.state = "syncing".into();
+            s.active_transfers = (0..7)
+                .map(|i| ActiveTransfer {
+                    id: i.to_string(),
+                    direction: "upload".into(),
+                    rel_path: format!("a{i}.txt"),
+                    bytes_transferred: 1,
+                    total_bytes: 2,
+                })
+                .collect();
+        });
+        assert!(h.text_at("In progress").is_some());
+        assert!(h.text_at("a4.txt").is_some());
+        assert!(h.text_at("a5.txt").is_none());
+        assert!(h.text_at("2 more").is_some());
+    }
+
+    #[test]
+    fn your_drive_shows_where_it_is_the_storage_and_frees_up_space_after_asking() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        let mut h = home_with(|s| {
+            s.sync_dir = "/srv/u/ProtonDrive".into();
+            s.vfs = Some(vfs("virtual", true, None));
+            s.stats.total_bytes = 169 * 1024 * 1024;
+            s.account = Some(AccountInfo { used_space: 51 * GB, max_space: 510 * GB, used_drive_space: GB, ..Default::default() });
+        });
+        assert!(h.text_at("Your drive").is_some());
+        assert!(h.text_at("/srv/u/ProtonDrive").is_some());
+        assert!(h.text_at("Virtual drive · mounted").is_some());
+        assert!(h.text_at("Open in Files").is_some());
+        assert!(h.text_at("Proton storage").is_some());
+        assert!(h.text_at("51.0 GB of 510.0 GB").is_some());
+        assert!(h.text_at("On this computer").is_some());
+        assert!(h.text_at("169.0 MB").is_some());
+        h.click(h.text_at("Free up space…").expect("Free up space is offered"));
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::FreeAll { rel_path: String::new() }));
+        assert_eq!(h.sent(), Vec::<String>::new());
+
+        // Without the account's usage there is no storage row
+        let h = home_with(|s| s.account = None);
+        assert!(h.text_at("Proton storage").is_none());
+        assert!(h.text_at("Plain folder").is_some());
+    }
+
+    #[test]
+    fn freeing_up_the_whole_drive_asks_in_plain_words() {
+        let copy = confirm_copy(&PendingConfirm::FreeAll { rel_path: String::new() });
+        assert_eq!(copy.title, "Free up space on this computer?");
+        assert!(copy.body.contains("stay in Proton Drive"), "{}", copy.body);
+        assert!(copy.body.contains("online-only"), "{}", copy.body);
+        for text in [&copy.title, &copy.body, &copy.detail.to_string()] {
+            assert!(!text.contains("My files"), "{text}");
+        }
+        assert_eq!((copy.rel_path.as_str(), copy.action), ("", "free"));
     }
 
     fn vfs(mode: &str, mounted: bool, reason: Option<&str>) -> VfsStatus {
@@ -5349,7 +5418,7 @@ mod tests {
     // #50: or keep them in Proton Drive, online-only, which deletes nothing; the default in the virtual layout
     const KEEP: &str = "Keep them online-only";
     const KEEP_SAYS_PLAIN: &str =
-        "Keep them online-only to stop waiting: they stay in Proton Drive, shown as online-only in My files, and aren't downloaded again. Nothing is deleted.";
+        "Keep them online-only to stop waiting: they stay in Proton Drive as online-only files, and aren't downloaded again. Nothing is deleted.";
     const KEEP_SAYS_VIRTUAL: &str =
         "Keep them online-only to stop waiting: they stay in Proton Drive, and the drive shows them as online-only. Nothing is deleted.";
 
@@ -5358,20 +5427,25 @@ mod tests {
         h.app.status.last_error = Some(MISSING.into());
         h.app.status.files_missing =
             Some(FilesMissing { root: "/home/u/ProtonDrive".into(), names: vec!["Docs".into(), "Photos".into()], items: 12, ..Default::default() });
+        h.app.refresh_attention();
         h.frames(3);
     }
 
     #[test]
-    fn the_files_missing_hold_shows_on_every_tab() {
+    fn the_files_missing_hold_shows_in_homes_needs_attention() {
         let mut h = Harness::new();
         assert!(h.text_at(DELETE_TOO).is_none());
         held(&mut h);
-        for tab in [NavTab::Home, NavTab::Activity, NavTab::Settings] {
+        assert!(h.text_at("Needs attention").is_some());
+        assert!(h.text_at(DELETE_TOO).is_some());
+        assert!(h.text_at(KEEP).is_some());
+        assert!(h.text_at("Docs and Photos are missing. Proton Drive waits for them to come back and syncs nothing meanwhile.").is_some());
+        // Elsewhere, Home's badge says something needs the user
+        for tab in [NavTab::Activity, NavTab::Settings] {
             h.app.tab = tab;
             h.frames(3);
-            assert!(h.text_at(DELETE_TOO).is_some(), "{tab:?}");
-            assert!(h.text_at(KEEP).is_some(), "{tab:?}");
-            assert!(h.text_at("Docs and Photos are missing. Proton Drive waits for them to come back and syncs nothing meanwhile.").is_some(), "{tab:?}");
+            assert!(h.text_at(DELETE_TOO).is_none(), "{tab:?}");
+            assert!(h.text_at("1").is_some(), "{tab:?}: Home's badge");
         }
     }
 
