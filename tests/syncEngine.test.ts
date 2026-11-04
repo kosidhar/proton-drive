@@ -10476,4 +10476,28 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(await stat(local('x.txt')).catch(() => null)).toBeNull();
         });
     });
+
+    describe('a new local file is never uploaded into a folder in the Proton Drive trash (#160)', () => {
+        test('it stays on this computer, unrecorded, and the folder removal keeps it', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('Folder/a.txt', 'a');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            // Another device trashes the folder; before this computer removes it, the user saves a new file in it
+            const folder = d.nodes.get(d.uid('Folder'))!;
+            d.nodes.set(d.uid('Folder'), { ...folder, trashTime: new Date() });
+            await writeFile(local('Folder/new.txt'), 'new');
+            await (engine as any).handleLocalFileChange('Folder/new.txt');
+            expect([...d.nodes.values()].filter((n) => n.parentUid === folder.uid && d.nameOf(n) === 'new.txt')).toEqual([]);
+            expect(stateDb.getItemByPath('Folder/new.txt')).toBeNull();
+            await engine.reconcileNow();
+            expect(await readFile(local('Folder/new.txt'), 'utf8')).toBe('new'); // only on this computer: kept
+        });
+    });
 });
