@@ -25,6 +25,8 @@ const SAMPLE_PATHS = [
     '9vu_f/4y k',
     'aqj/ykg.w',
     '.vq/.k8',
+    // No digit and no dot anywhere: a list keyed on those ('*[0-9]*' with '*.*') leaves files like it visible (#155)
+    'Mxq/Vkj b',
 ];
 const NESTED_SAMPLE_PATHS = SAMPLE_PATHS.filter((sample) => sample.includes('/'));
 
@@ -70,11 +72,37 @@ function hidesAll(patterns: string[]): boolean {
 }
 
 // Nearly every ordinary name, by the wildcard patterns alone: a pattern naming a file or folder hides only that, however
-// many of the ordinary names it happens to be (#151)
+// many of the ordinary names it happens to be (#151). Or a pattern that is just a leading class followed by * (or ?*),
+// covering nearly every letter and digit: it hides nearly every name whatever the names below start with (#155)
 function hidesNearlyAll(patterns: string[]): boolean {
     const wildcards = patterns.filter((pattern) => /[*?[{]/.test(pattern));
     if (wildcards.length === 0) return false;
+    if (wildcards.some(leadingClassCoversNearlyAll)) return true;
     return ORDINARY_PATHS.filter(hiddenBy(wildcards)).length >= NEARLY_ALL * ORDINARY_PATHS.length;
+}
+
+const ALNUM = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+
+// [class]* (or [class]?*, [class]**): whether the class takes in at least NEARLY_ALL of the letters and digits
+function leadingClassCoversNearlyAll(pattern: string): boolean {
+    const match = /^\[([^\]]+)\](\?*)\*+$/.exec(pattern.trim());
+    if (!match) return false;
+    let body = match[1]!;
+    const negated = body.startsWith('!') || body.startsWith('^');
+    if (negated) body = body.slice(1);
+    const inClass = new Set<string>();
+    for (let i = 0; i < body.length; i++) {
+        const from = body[i]!;
+        if (body[i + 1] === '-' && i + 2 < body.length) {
+            const to = body[i + 2]!;
+            for (let c = from.charCodeAt(0); c <= to.charCodeAt(0); c++) inClass.add(String.fromCharCode(c));
+            i += 2;
+        } else {
+            inClass.add(from);
+        }
+    }
+    const covered = [...ALNUM].filter((c) => inClass.has(c) !== negated).length;
+    return covered >= NEARLY_ALL * ALNUM.length;
 }
 
 function problemWithPattern(pattern: unknown, index: number): string | null {
