@@ -1482,6 +1482,11 @@ export class ProtonDriveSyncEngine {
         if (this.manualResolvingPaths.has(relPath)) {
             return; // The user is resolving it by hand right now: their choice is what happens to it (#77)
         }
+        if (this.driveDestination(relPath, since) !== undefined) {
+            // Renamed or deleted through the drive since this work read it: what was read is no longer at this path, even
+            // with no record to say so (a file the drive made local has only an edit baseline). The next pass decides (#139)
+            return;
+        }
         if (strategy === 'keep-both' && this.stillChangingWhenLetThrough(relPath)) {
             // Still being written: the cloud version would be downloaded only to be thrown away once the file changes
             // again (#67 keeps the newer local writes), every time it is let through. Nothing is touched; a pass once
