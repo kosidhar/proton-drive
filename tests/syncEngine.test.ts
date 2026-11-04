@@ -9991,6 +9991,91 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
     });
 
+    describe('other sync work holds off a file being resolved by the conflict setting, as for one resolved by hand (#140)', () => {
+        const synced = async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'a');
+            const folder = d.add('Folder');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            // A resolution by the setting is working on a.txt
+            (engine as any).strategyResolvingPaths.add('a.txt');
+            return { ...d, engine, local, folder };
+        };
+
+        test('a second resolution by the setting never starts on a file one is resolving, nor ends its claim', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'original');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const file = path.join(engine.localRoot(), 'a.txt');
+            await writeFile(file, 'local edit');
+            d.nodes.set(d.uid('a.txt'), makeMockNode({ uid: d.uid('a.txt'), parentUid: d.root.uid, nameStr: 'a.txt', type: NodeType.File, content: 'cloud edit' }));
+            stateDb.updateSettings({ conflictStrategy: 'keep-local' });
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            let uploads = 0;
+            (d.sdk as any).getFileRevisionUploader = ((orig) => async (...args: unknown[]) => {
+                uploads++;
+                if (uploads === 1) {
+                    entered();
+                    await gate;
+                }
+                return orig(...args);
+            })((d.sdk as any).getFileRevisionUploader.bind(d.sdk));
+            const record = stateDb.getItemByPath('a.txt')!;
+            const resolve = () =>
+                (engine as any).handleFileConflict('a.txt', file, d.nodes.get(d.uid('a.txt')), 'local-sha1', null, 0, 0, new Map(), stateDb.getSettings(), 0, record);
+            const first = resolve();
+            await inside;
+            await resolve(); // a watcher look reaching the same conflict
+            expect(uploads).toBe(1);
+            expect((engine as any).strategyResolvingPaths.has('a.txt')).toBe(true); // the first still holds its claim
+            release();
+            await first;
+            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('local edit');
+        });
+
+        test('a local delete is not taken to the cloud meanwhile', async () => {
+            const d = await synced();
+            await rm(d.local('a.txt'));
+            await (d.engine as any).trashForDeletedLocal('a.txt', d.nodes.get(d.uid('a.txt')));
+            expect(d.calls.trashed).toEqual([]);
+        });
+
+        test('a cloud move is not followed meanwhile', async () => {
+            const d = await synced();
+            const node = d.nodes.get(d.uid('a.txt'))!;
+            d.nodes.set(d.uid('a.txt'), { ...node, parentUid: d.folder.uid });
+            await (d.engine as any).afterGoneFromCloudPath('a.txt');
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('a');
+            expect(stateDb.getItemByPath('a.txt')?.nodeUid).toBe(d.uid('a.txt'));
+        });
+
+        test('a cloud move found from its new path is not followed meanwhile', async () => {
+            const d = await synced();
+            const node = d.nodes.get(d.uid('a.txt'))!;
+            const moved = { ...node, parentUid: d.folder.uid };
+            d.nodes.set(d.uid('a.txt'), moved);
+            await (d.engine as any).reconcileSinglePath('Folder/a.txt', moved, undefined, undefined, new Map(), stateDb.getSettings(), 0);
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('a');
+            expect(stateDb.getItemByPath('a.txt')?.nodeUid).toBe(d.uid('a.txt'));
+        });
+    });
+
     describe('the conflict setting never acts on a file a drive change took since the pass read it (#139)', () => {
         test('virtual: keep-remote after a drive rename of a file with no record does not bring the cloud version back', async () => {
             stateDb.setMeta('driveLayout', 'virtual');

@@ -1210,8 +1210,8 @@ export class ProtonDriveSyncEngine {
             if (recorded?.localRelPath === relPath) {
                 return; // Moved here earlier in this pass, after the listing was read: the next look at it syncs it
             }
-            if (recorded && this.manualResolvingPaths.has(recorded.localRelPath)) {
-                return; // Moved in Proton Drive while the user resolves its conflict by hand: the next pass follows it (#104)
+            if (recorded && this.isResolving(recorded.localRelPath)) {
+                return; // Moved in Proton Drive while its conflict is being resolved: the next pass follows it (#104, #140)
             }
             if (
                 recorded &&
@@ -1479,8 +1479,10 @@ export class ProtonDriveSyncEngine {
         if ((this.stateDb.getItemByPath(relPath)?.updatedAt ?? null) !== (recordSeen?.updatedAt ?? null)) {
             return; // The next pass decides, from what the file and its record are then
         }
-        if (this.manualResolvingPaths.has(relPath)) {
-            return; // The user is resolving it by hand right now: their choice is what happens to it (#77)
+        if (this.isResolving(relPath)) {
+            // Being resolved right now: by the user by hand, whose choice is what happens to it (#77), or by the setting
+            // in another look (a pass and a watcher look can reach one conflict at once), which holds the claim (#140)
+            return;
         }
         if (this.driveTouched(relPath, since)) {
             // Renamed, deleted or replaced through the drive since this work read it: what was read is no longer what is
@@ -2235,13 +2237,19 @@ export class ProtonDriveSyncEngine {
         }
     }
 
+    // Whether a conflict at the path is being resolved right now, by hand or by the conflict setting
+    private isResolving(relPath: string): boolean {
+        return this.manualResolvingPaths.has(relPath) || this.strategyResolvingPaths.has(relPath);
+    }
+
     // The user deleted a synced item locally, so its cloud copy goes to the Proton Drive trash. A folder can also hold
     // things that never were on this computer: online-only, ignored or hidden items, Proton Docs and Sheets, or a node
     // that replaced the one synced here. Those stay in the cloud: only the items that had local copies are trashed, and
     // the folder is left online-only.
     private async trashForDeletedLocal(relPath: string, remoteNode: NodeEntity): Promise<void> {
-        if (this.manualResolvingPaths.has(relPath)) {
-            // The user is resolving its conflict by hand: their choice decides, and the next look after it sees the delete
+        if (this.isResolving(relPath)) {
+            // Its conflict is being resolved (by hand or by the setting, #140): that decides, and the next look after it
+            // sees the delete
             this.logger.info(`Not acting on ${relPath} gone here yet: its conflict is being resolved`);
             return;
         }
@@ -3164,8 +3172,8 @@ export class ProtonDriveSyncEngine {
         if (!record) {
             return;
         }
-        if (this.manualResolvingPaths.has(relPath)) {
-            return; // Its conflict is being resolved by hand: the next pass decides where it went, or that it went (#104)
+        if (this.isResolving(relPath)) {
+            return; // Its conflict is being resolved: the next pass decides where it went, or that it went (#104, #140)
         }
         const now = await this.currentRemotePath(record.nodeUid, relPath);
         if (now === undefined || now === relPath) {
