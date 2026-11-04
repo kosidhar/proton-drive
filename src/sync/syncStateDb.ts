@@ -69,7 +69,20 @@ export interface NewConflict {
 export interface ActivityRecord {
     id: number;
     timestamp: number;
-    action: 'upload' | 'download' | 'delete-local' | 'trash-remote' | 'mkdir' | 'conflict' | 'error' | 'auth' | 'sync';
+    // free-up and hide take local copies away and keep the items in Proton Drive: never a delete-local, which reads
+    // as one (#94)
+    action:
+        | 'upload'
+        | 'download'
+        | 'delete-local'
+        | 'free-up'
+        | 'hide'
+        | 'trash-remote'
+        | 'mkdir'
+        | 'conflict'
+        | 'error'
+        | 'auth'
+        | 'sync';
     localRelPath: string;
     details: string;
     bytesTransferred: number;

@@ -6053,7 +6053,7 @@ export class ProtonDriveSyncEngine {
         });
         if (scan.entries.length > kept.length) {
             this.stateDb.logActivity({
-                action: 'delete-local',
+                action: 'free-up',
                 localRelPath: relPath || '/',
                 details: 'Freed up space (removed the local copies; kept in Proton Drive)',
             });
@@ -6149,7 +6149,7 @@ export class ProtonDriveSyncEngine {
         // Its local copy is gone, so no record under it may be left (say, for a file deleted while it was hiding)
         await this.dropRecordsWithoutFiles(relPath);
         this.stateDb.logActivity({
-            action: 'delete-local',
+            action: 'hide',
             localRelPath: relPath,
             details: 'Hidden from this computer (removed the local copy; kept in Proton Drive)',
         });
