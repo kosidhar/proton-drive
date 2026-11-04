@@ -2266,10 +2266,9 @@ export class ProtonDriveSyncEngine {
         }
     }
 
-    // Whether a folder node is in the Proton Drive trash, itself or by a folder above it; true when that can't be told.
-    // The root never is
-    // Why nothing is to be put in a folder, or null when it may: it is in the Proton Drive trash (itself or by a folder
-    // above it), or whether it is couldn't be told (offline, say), which holds it all the same until a later look (#166)
+    // Why nothing is to be put in a folder, or null when it may (the root always may): it is in the Proton Drive trash
+    // (itself or by a folder above it), or whether it is couldn't be told (offline, say), which holds it all the same
+    // until a later look (#166)
     private async trashHold(folder: NodeEntity): Promise<string | null> {
         const unchecked = "its folder couldn't be checked in Proton Drive just now; it is tried again later";
         const trashed = 'its folder is in the Proton Drive trash';
