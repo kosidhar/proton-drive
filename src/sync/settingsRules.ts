@@ -71,13 +71,14 @@ function hidesAll(patterns: string[]): boolean {
     return SAMPLE_PATHS.every(ignored) || NESTED_SAMPLE_PATHS.every(ignored) || VISIBLE_SAMPLE_PATHS.every(ignored);
 }
 
-// Names starting with each letter and digit, their endings varied (an extension or none, a digit, a space, a hyphen, an
-// underscore), and the same inside folders: a pattern or list that hides nearly all of these hides nearly every name,
-// whatever its shape ([!ryzRYZ]*, [!ryzRYZ]*?, **/[!ryzRYZ]*, [!M]*/**, a union of partial classes) (#155)
+// Names made of each letter and digit alone, repeated two to five times, and the same inside folders. A pattern or list
+// that hides nearly all of these hides nearly every name by which characters names start with or hold, whatever its
+// shape ([!ryzRYZ]*, [!ryzRYZ]*?, **/[!ryzRYZ]*, [!M]*/**, a union of partial classes) (#155). Having no extension,
+// separator, digit or other letter beside their one character, they are hidden by no list keyed on those (*.pdf, * *,
+// *-*, *q*), which hide few real files
 const ALNUM = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-const ENDINGS = ['vq', 'k8 w.pdf', 'q_z.txt', 'wx-j', 'j9.md', 'p k'];
-const SYNTH_PATHS = [...ALNUM].map((c, i) => `${c}${ENDINGS[i % ENDINGS.length]}`);
-const SYNTH_NESTED_PATHS = [...ALNUM].map((c, i) => `${c}${ENDINGS[(i + 3) % ENDINGS.length]}/${c}${ENDINGS[(i + 1) % ENDINGS.length]}`);
+const SYNTH_PATHS = [...ALNUM].map((c, i) => c.repeat(2 + (i % 4)));
+const SYNTH_NESTED_PATHS = [...ALNUM].map((c, i) => `${c.repeat(2 + ((i + 1) % 4))}/${c.repeat(2 + ((i + 2) % 4))}`);
 
 // Nearly every name, by the wildcard patterns alone: a pattern naming a file or folder hides only that, however many
 // of the ordinary names it happens to be (#151)
