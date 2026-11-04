@@ -9848,6 +9848,52 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.calls.trashed.flat()).toContain(d.uid('a.txt'));
         });
 
+        test('a delete queued behind another drive change is refused if a resolution by the setting starts meanwhile', async () => {
+            const d = await conflicted();
+            // Another drive change holds the turn
+            let releaseRename!: () => void;
+            const renameGate = new Promise<void>((resolve) => (releaseRename = resolve));
+            let renaming!: () => void;
+            const renameInside = new Promise<void>((resolve) => (renaming = resolve));
+            const renameLocally = (d.engine as any).renameLocally.bind(d.engine);
+            (d.engine as any).renameLocally = async (...args: unknown[]) => {
+                renaming();
+                await renameGate;
+                return renameLocally(...args);
+            };
+            const rename = d.engine.renameItem('Kept.txt', 'Kept2.txt');
+            await renameInside;
+            const del = d.engine.deleteItem('a.txt').then(
+                () => null,
+                (error: unknown) => error,
+            );
+            await Bun.sleep(10); // past its wait for resolutions: queued for its turn
+            // A resolution by the setting starts on a.txt, its upload held
+            let releaseUpload!: () => void;
+            const uploadGate = new Promise<void>((resolve) => (releaseUpload = resolve));
+            let uploading!: () => void;
+            const uploadInside = new Promise<void>((resolve) => (uploading = resolve));
+            (d.sdk as any).getFileRevisionUploader = ((orig) => async (...args: unknown[]) => {
+                uploading();
+                await uploadGate;
+                return orig(...args);
+            })((d.sdk as any).getFileRevisionUploader.bind(d.sdk));
+            const record = stateDb.getItemByPath('a.txt')!;
+            const resolving = (d.engine as any).handleFileConflict(
+                'a.txt', d.local('a.txt'), d.nodes.get(d.uid('a.txt')), 'local-sha1', null, 0, 0, new Map(),
+                stateDb.getSettings(), 0, record,
+            );
+            await uploadInside;
+            releaseRename();
+            await rename;
+            expect(await del).toMatchObject({ code: 'EIO' });
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
+            releaseUpload();
+            await resolving;
+            expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('local edit');
+            expect(await readFile(d.local('a.txt'), 'utf8')).toBe('local edit');
+        });
+
         test('a pass reaching the conflict while a drive rename of the file runs leaves it to the next pass', async () => {
             const d = await conflicted();
             let release!: () => void;
