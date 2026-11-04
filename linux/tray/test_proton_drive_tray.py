@@ -335,6 +335,77 @@ class StatusLineTest(unittest.TestCase):
         self.assertIsNone(tray.storage_line({"usedSpace": 5, "maxSpace": 0}))
 
 
+class LongNamesTest(unittest.TestCase):
+    def test_a_long_file_name_is_shortened_in_the_middle(self):
+        name = "a-very-long-file-name-" * 6 + "end.docx"
+        text, _ = tray.status_line(status(state="syncing", activeTransfers=[transfer("upload", "Docs/" + name)]))
+        self.assertLessEqual(len(text), len("Uploading ") + tray.NAME_LIMIT)
+        self.assertTrue(text.startswith("Uploading a-very-long"))
+        self.assertTrue(text.endswith("end.docx"))
+        self.assertIn("…", text)
+        # A short name is left alone
+        self.assertEqual(tray.status_line(status(state="syncing", activeTransfers=[transfer("upload", "a.txt")]))[0],
+                         "Uploading a.txt")
+
+
+class PollTest(unittest.TestCase):
+    """poll_status against a fake daemon answer: what the menu shows."""
+
+    def poll(self, answer):
+        tray.Gtk.MenuItem.reset_mock()
+        with mock.patch.object(tray.ProtonDriveTrayIndicator, "poll_status"):
+            indicator = tray.ProtonDriveTrayIndicator()
+        for name in ("status_item", "storage_item", "problems_item", "pause_item", "mount_item"):
+            setattr(indicator, name, mock.MagicMock())
+        indicator.indicator = mock.MagicMock()
+
+        def urlopen(_req, timeout=None):
+            if isinstance(answer, Exception):
+                raise answer
+            reply = mock.MagicMock()
+            reply.__enter__.return_value.read.return_value = json.dumps(answer).encode()
+            return reply
+
+        with mock.patch.object(tray.urllib.request, "urlopen", urlopen):
+            tray.ProtonDriveTrayIndicator.poll_status(indicator)
+        return indicator
+
+    def test_up_to_date_with_storage_and_no_problems(self):
+        gb = 1024 ** 3
+        ind = self.poll(status(account={"usedSpace": 2 * gb, "maxSpace": 10 * gb}))
+        ind.status_item.set_label.assert_called_with("Up to date")
+        ind.storage_item.set_label.assert_called_with("2.0 GB of 10.0 GB used")
+        ind.storage_item.set_visible.assert_called_with(True)
+        ind.problems_item.set_visible.assert_called_with(False)
+        ind.pause_item.set_label.assert_called_with("Pause Sync")
+        ind.indicator.set_icon_full.assert_called_with("protondrive-tray-idle", "Up to date")
+
+    def test_problems_show_the_item_with_the_count(self):
+        ind = self.poll(status(stats={"unresolvedConflicts": 2, "errorItems": 0}))
+        ind.status_item.set_label.assert_called_with("Needs attention")
+        ind.problems_item.set_label.assert_called_with("⚠ 2 problems need you")
+        ind.problems_item.set_visible.assert_called_with(True)
+
+    def test_signed_out_by_either_field_shows_no_problems_item(self):
+        for answer in (status(loggedIn=False, lastError="x"), status(state="unauthenticated", lastError="x")):
+            ind = self.poll(answer)
+            ind.status_item.set_label.assert_called_with("Signed out")
+            ind.problems_item.set_visible.assert_called_with(False)
+
+    def test_paused_offers_resume(self):
+        self.poll(status(state="paused")).pause_item.set_label.assert_called_with("Resume Sync")
+
+    def test_null_fields_are_not_mistaken_for_an_offline_daemon(self):
+        ind = self.poll(status(settings=None, stats=None, account=None, activeTransfers=None))
+        ind.status_item.set_label.assert_called_with("Up to date")
+
+    def test_unreachable_daemon(self):
+        ind = self.poll(OSError("connection refused"))
+        ind.status_item.set_label.assert_called_with("Can't reach Proton Drive's background service")
+        ind.storage_item.set_visible.assert_called_with(False)
+        ind.problems_item.set_visible.assert_called_with(False)
+
+
 class ProblemCountTest(unittest.TestCase):
     """Counted as the app's Needs attention lists them: one per conflict, one for failed files, one each for the rest."""
 
