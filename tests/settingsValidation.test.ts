@@ -7,6 +7,7 @@ import { startControlServer } from '../src/daemon/controlServer';
 import { driveSettings } from '../src/daemon/settingsRoute';
 import { parseSettings } from '../src/daemon/settingsValidation';
 import { matchesIgnorePatterns } from '../src/sync/localWatcher';
+import { MAX_IGNORE_PATTERNS, problemWithIgnorePatterns, usableIgnorePatterns } from '../src/sync/settingsRules';
 import { ProtonDriveSyncEngine } from '../src/sync/syncEngine';
 import { DEFAULT_IGNORE_PATTERNS, SyncStateDatabase } from '../src/sync/syncStateDb';
 import { makeMockDrive } from './helpers/mockDrive';
@@ -342,7 +343,6 @@ describe('blockedApps', () => {
 // #43: the check that a pattern hides everything keys on names unlike real files in every feature, so a broad but
 // legitimate pattern that keys on one feature (a hyphen, a digit, a first letter, its case) is never taken for it
 describe('ignore patterns that are broad but leave files out are allowed (#43)', () => {
-    const { problemWithIgnorePatterns, usableIgnorePatterns, MAX_IGNORE_PATTERNS } = require('../src/sync/settingsRules');
 
     for (const pattern of ['*-*', '*[0-9]*', '[n-z]*', '[a-z]*', '[!A-Z]*', '[A-Z]*', '*_*', '* *', '*.*', '[!0-9]*']) {
         test(`${pattern} is allowed, alone and as stored`, () => {
@@ -357,6 +357,19 @@ describe('ignore patterns that are broad but leave files out are allowed (#43)',
             expect(usableIgnorePatterns([...pair])).toBeNull();
         });
     }
+
+    test('patterns that leave only dotfiles, the whole drive as it is seen, are refused', () => {
+        for (const pattern of ['[!.]*', '[a-zA-Z0-9]*']) {
+            expect(problemWithIgnorePatterns([pattern])).toMatch(/matches every file/);
+        }
+        expect(problemWithIgnorePatterns(['[a-z]*', '[A-Z]*', '[0-9]*'])).toMatch(/together match every file/);
+    });
+
+    test('lists keyed on what real files do not all share are allowed', () => {
+        for (const list of [['*7*', '*5*'], ['.*'], ['.*/**'], ['*.tmp', '*.log', 'build/**', '__pycache__', '.cache/**', '.*.swp']]) {
+            expect(problemWithIgnorePatterns(list)).toBeNull();
+        }
+    });
 
     test('patterns that match everything are still refused', () => {
         for (const pattern of everything) {
