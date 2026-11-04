@@ -10228,4 +10228,62 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             }
         });
     });
+
+    describe('a cloud delete of a folder holds off while a file in it is being resolved (#150)', () => {
+        for (const how of ['by hand', 'by the setting'] as const) {
+            for (const via of ['its event', 'a pass']) {
+                test(`nothing in the folder is removed here while a file in it is resolved ${how}, found by ${via}`, async () => {
+                    const d = makeMockDrive();
+                    const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                        moveToDesktopTrash: async () => false,
+                        settle: { quietMs: 0 },
+                    });
+                    d.add('Kept.txt', 'kept');
+                    d.add('Folder/Sub/a.txt', 'a');
+                    d.add('Folder/b.txt', 'b');
+                    engine.availability.setPin(d.root.uid, 'pinned', false);
+                    await engine.reconcileNow();
+                    const local = (rel: string) => path.join(engine.localRoot(), rel);
+                    const resolving = (engine as any)[how === 'by hand' ? 'manualResolvingPaths' : 'strategyResolvingPaths'];
+                    resolving.add('Folder/Sub/a.txt');
+                    // Another device trashes the folder
+                    const folder = d.nodes.get(d.uid('Folder'))!;
+                    d.nodes.set(d.uid('Folder'), { ...folder, trashTime: new Date(), parentUid: 'vol~trash' });
+                    if (via === 'its event') await (engine as any).removeAfterCloudDelete('Folder', 'trashed');
+                    else await engine.reconcileNow();
+                    expect(await readFile(local('Folder/Sub/a.txt'), 'utf8')).toBe('a');
+                    expect(await readFile(local('Folder/b.txt'), 'utf8')).toBe('b');
+                    expect(stateDb.getItemByPath('Folder/Sub/a.txt')).not.toBeNull();
+                    // Once it is resolved, the next pass takes the delete here
+                    resolving.delete('Folder/Sub/a.txt');
+                    await engine.reconcileNow();
+                    expect(await stat(local('Folder')).catch(() => null)).toBeNull();
+                    expect(stateDb.getAllItems().filter((i) => i.localRelPath.startsWith('Folder'))).toEqual([]);
+                });
+            }
+        }
+
+        test('nor is a cloud move of the folder followed here meanwhile', async () => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('Folder/Sub/a.txt', 'a');
+            const other = d.add('Other');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            (engine as any).strategyResolvingPaths.add('Folder/Sub/a.txt');
+            const folder = d.nodes.get(d.uid('Folder'))!;
+            d.nodes.set(d.uid('Folder'), { ...folder, parentUid: other.uid });
+            await (engine as any).afterGoneFromCloudPath('Folder');
+            expect(await readFile(local('Folder/Sub/a.txt'), 'utf8')).toBe('a');
+            expect(stateDb.getItemByPath('Folder/Sub/a.txt')).not.toBeNull();
+            (engine as any).strategyResolvingPaths.delete('Folder/Sub/a.txt');
+            await engine.reconcileNow();
+            expect(await readFile(local('Other/Folder/Sub/a.txt'), 'utf8')).toBe('a');
+        });
+    });
 });

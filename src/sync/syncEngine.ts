@@ -3029,6 +3029,12 @@ export class ProtonDriveSyncEngine {
             return; // Never the whole sync folder
         }
         await this.inAvailabilityRun(async () => {
+            if (this.isResolvingWithin(relPath)) {
+                // A conflict of it, or of something in it, is being resolved: removing it now would pull the files and
+                // records out from under that. The next pass finds it gone and removes it then (#150)
+                this.logger.info(`Not removing ${relPath} here yet: a conflict in it is being resolved`);
+                return;
+            }
             if (this.stateDb.getItemByPath(relPath)) {
                 await this.removeLocalCopyAfterCloudDelete(relPath, reason);
             }
@@ -3177,8 +3183,10 @@ export class ProtonDriveSyncEngine {
         if (!record) {
             return;
         }
-        if (this.isResolving(relPath)) {
-            return; // Its conflict is being resolved: the next pass decides where it went, or that it went (#104, #140)
+        if (this.isResolvingWithin(relPath)) {
+            // A conflict of it, or of something in it, is being resolved: the next pass decides where it went, or that it
+            // went (#104, #140, #150)
+            return;
         }
         const now = await this.currentRemotePath(record.nodeUid, relPath);
         if (now === undefined || now === relPath) {
