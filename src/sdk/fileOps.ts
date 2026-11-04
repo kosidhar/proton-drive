@@ -395,8 +395,10 @@ export async function createRemoteFolder(
         if (error instanceof NodeWithSameNameExistsValidationError && error.existingNodeUid) {
             const existing = await sdk.getNode(error.existingNodeUid);
             // Never one in the Proton Drive trash (it holds its name there, say): syncing against it would bring its
-            // contents back from the trash, and the next pass remove them again (#165). Nor a file. Refused instead:
-            // what was to go in it stays where it is, unrecorded, and a later look tries again
+            // contents back from the trash, and the next pass remove them again (#165). Nor a file: recorded as the
+            // folder, a local delete of the folder would trash that file. Refused instead: what was to go in it stays
+            // where it is, unrecorded. A pass or the watcher tries again later; a journalled move into it is given up on
+            // after its tries, and the move is undone here (see #170)
             if (existing.trashTime) {
                 throw new Error(`${folderName} can't be made in Proton Drive yet: an item in its trash still holds the name`, {
                     cause: error,
