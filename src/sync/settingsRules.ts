@@ -25,6 +25,8 @@ const SAMPLE_PATHS = [
     '9vu_f/4y k',
     'aqj/ykg.w',
     '.vq/.k8',
+    // No digit and no dot anywhere: a list keyed on those ('*[0-9]*' with '*.*') leaves files like it visible (#155)
+    'Mxq/Vkj b',
 ];
 const NESTED_SAMPLE_PATHS = SAMPLE_PATHS.filter((sample) => sample.includes('/'));
 
@@ -69,12 +71,23 @@ function hidesAll(patterns: string[]): boolean {
     return SAMPLE_PATHS.every(ignored) || NESTED_SAMPLE_PATHS.every(ignored) || VISIBLE_SAMPLE_PATHS.every(ignored);
 }
 
-// Nearly every ordinary name, by the wildcard patterns alone: a pattern naming a file or folder hides only that, however
-// many of the ordinary names it happens to be (#151)
+// Names made of each letter and digit alone, repeated two to five times, and the same inside folders. A pattern or list
+// that hides nearly all of these hides nearly every name by which characters names start with or hold, whatever its
+// shape ([!ryzRYZ]*, [!ryzRYZ]*?, **/[!ryzRYZ]*, [!M]*/**, a union of partial classes) (#155). Having no extension,
+// separator, digit or other letter beside their one character, they are hidden by no list keyed on those (*.pdf, * *,
+// *-*, *q*), which hide few real files
+const ALNUM = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+const SYNTH_PATHS = [...ALNUM].map((c, i) => c.repeat(2 + (i % 4)));
+const SYNTH_NESTED_PATHS = [...ALNUM].map((c, i) => `${c.repeat(2 + ((i + 1) % 4))}/${c.repeat(2 + ((i + 2) % 4))}`);
+
+// Nearly every name, by the wildcard patterns alone: a pattern naming a file or folder hides only that, however many
+// of the ordinary names it happens to be (#151)
 function hidesNearlyAll(patterns: string[]): boolean {
     const wildcards = patterns.filter((pattern) => /[*?[{]/.test(pattern));
     if (wildcards.length === 0) return false;
-    return ORDINARY_PATHS.filter(hiddenBy(wildcards)).length >= NEARLY_ALL * ORDINARY_PATHS.length;
+    const ignored = hiddenBy(wildcards);
+    const nearlyAll = (paths: string[]) => paths.filter(ignored).length >= NEARLY_ALL * paths.length;
+    return nearlyAll(ORDINARY_PATHS) || nearlyAll(SYNTH_PATHS) || nearlyAll(SYNTH_NESTED_PATHS);
 }
 
 function problemWithPattern(pattern: unknown, index: number): string | null {

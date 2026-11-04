@@ -68,6 +68,26 @@ describe('local copies', () => {
             shouldContinue: () => true,
         });
 
+    // #41: a stalled download for the drive (an app waiting on it) is never removed under it; another temp file still is
+    test('Free up space of the whole drive leaves a download for the drive in progress alone', async () => {
+        await files.writeSynced('Docs/a.txt', 'a');
+        // Staged at the root, beside the files
+        await writeFile(path.join(files.syncDir(), '.proton-drive-tmp-hydrate-3f2a9c1e-7b4d-4e8a-9c0f-1a2b3c4d5e6f'), 'partial');
+        await writeFile(path.join(files.syncDir(), 'Docs/.proton-drive-tmp-999-c.txt'), 'stale');
+        const scanned = await scan('', false);
+        expect(scanned.entries.map((e) => e.relPath)).not.toContain('.proton-drive-tmp-hydrate-3f2a9c1e-7b4d-4e8a-9c0f-1a2b3c4d5e6f');
+        await removeKeepingChanged(scanned);
+        expect(await readFile(path.join(files.syncDir(), '.proton-drive-tmp-hydrate-3f2a9c1e-7b4d-4e8a-9c0f-1a2b3c4d5e6f'), 'utf8')).toBe('partial');
+        expect(await readdir(path.join(files.syncDir(), 'Docs')).catch(() => null)).toBeNull(); // removed, its temp file too
+    });
+
+    test('a file named like a staged download inside a folder is not taken for one', async () => {
+        await files.writeSynced('Docs/a.txt', 'a');
+        await writeFile(path.join(files.syncDir(), 'Docs/.proton-drive-tmp-hydrate-x'), 'not ours');
+        const scanned = await scan('Docs', false);
+        expect(scanned.entries.map((e) => e.relPath)).toContain('Docs/.proton-drive-tmp-hydrate-x');
+    });
+
     test('removes a folder whose every file is an unchanged synced copy', async () => {
         await files.writeSynced('Archive/2025/tax.pdf', 'tax');
         await files.writeSynced('Archive/touched.txt', 'same content');

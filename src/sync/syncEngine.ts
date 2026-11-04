@@ -42,7 +42,7 @@ import { homeTrash, type MoveToDesktopTrash } from './desktopTrash';
 import { readDriveLayout } from './driveMode';
 import { LAYOUT_MOVING, type MoveSeams, relocateFiles, SYNC_DIR_MOVING } from './layoutMigration';
 import { DriveOpError, type VfsEntry } from './driveOps';
-import { isEngineTempName, removeScannedEntries, type ScanEntry, scanLocalCopies } from './localCopies';
+import { HYDRATE_STAGING_PREFIX, isEngineTempName, removeScannedEntries, type ScanEntry, scanLocalCopies } from './localCopies';
 import { moveWithoutReplacing } from './localMove';
 import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
 import { pathsOverlap } from './mountPoint';
@@ -103,10 +103,8 @@ const SETTLED_KEPT_MS = 60_000;
 // what a pending move puts in them (see applyPendingOpsToIndex). Never a node: never resolved, moved or trashed.
 const PROVISIONAL = 'provisional:';
 // How long a download for the virtual drive (an app opening an online-only file) may take before the user is told
+// (those downloads are staged at the root of the backing store: see HYDRATE_STAGING_PREFIX in localCopies)
 const SLOW_DOWNLOAD_NOTICE_MS = 2000;
-// Name prefix of the files those downloads go to before they are put in place, at the root of the backing store (the
-// virtual drive hides every .proton-drive-tmp-* name, and the sync ignores them)
-const HYDRATE_STAGING_PREFIX = '.proton-drive-tmp-hydrate-';
 // What everything that would touch the files answers while they move between the sync folder and the backing store
 const BUSY_MOVING = 'Proton Drive is busy moving files';
 // Whether a relative path is base itself or inside it
