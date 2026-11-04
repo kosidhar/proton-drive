@@ -212,3 +212,20 @@ describe('SyncStateDatabase opening', () => {
         }
     }, 15_000);
 });
+
+// #180: what the engine decides (the activity log) also reaches the daemon's log file, through this hook
+describe('SyncStateDatabase activity hook', () => {
+    test('each activity entry is told to onActivity as it is logged', async () => {
+        const tempDir = await mkdtemp(path.join(tmpdir(), 'proton-drive-statedb-test-'));
+        try {
+            const stateDb = new SyncStateDatabase(path.join(tempDir, 'state.sqlite'));
+            const told: unknown[] = [];
+            stateDb.onActivity = (entry) => told.push(entry);
+            stateDb.logActivity({ action: 'delete-local', localRelPath: 'Docs/a.txt', details: 'Deleted on this computer' });
+            expect(told).toEqual([{ action: 'delete-local', localRelPath: 'Docs/a.txt', details: 'Deleted on this computer' }]);
+            stateDb.close();
+        } finally {
+            await rm(tempDir, { recursive: true, force: true });
+        }
+    });
+});

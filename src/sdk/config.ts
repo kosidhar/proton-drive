@@ -61,8 +61,10 @@ export interface Config {
 }
 
 export function getConfig(options: InitConfig): Config {
-    const logLevelOption = process.env.PROTON_DRIVE_LOG_LEVEL?.toUpperCase() ?? 'DEBUG';
-    const logLevel = LogLevel[logLevelOption as keyof typeof LogLevel] ?? LogLevel.DEBUG;
+    // INFO by default: the SDK's DEBUG lines (each API call) filled the rotating log files within hours, taking what the
+    // sync engine logged with them (#180). PROTON_DRIVE_LOG_LEVEL=DEBUG still asks for them
+    const logLevelOption = process.env.PROTON_DRIVE_LOG_LEVEL?.toUpperCase() ?? 'INFO';
+    const logLevel = LogLevel[logLevelOption as keyof typeof LogLevel] ?? LogLevel.INFO;
 
     const { cacheDir, appDir, logDir } = defaultDataDirs();
 
