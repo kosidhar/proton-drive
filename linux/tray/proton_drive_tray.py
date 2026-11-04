@@ -3,6 +3,7 @@
 Proton Drive Top-Bar / System Tray Status Indicator for Linux.
 Supports AyatanaAppIndicator3 and AppIndicator3 across GNOME, KDE, XFCE, Cinnamon, MATE.
 """
+import datetime
 import fcntl
 import json
 import os
@@ -40,6 +41,48 @@ APP_LABEL = "Status & Settings…"
 # A delete through the drive goes to the Proton Drive trash, on the web (#201)
 OPEN_TRASH_LABEL = "Open Proton Drive Trash"
 TRASH_URL = "https://drive.proton.me/trash"
+
+# #205: what Pause Sync offers, and the request each sends (pause_body)
+PAUSE_CHOICES = (("For 1 hour", "hour"), ("Until tomorrow", "tomorrow"), ("Until I resume", "resume"))
+RESUME_LABEL = "Resume Sync"
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def _ms(moment: datetime.datetime) -> int:
+    return int(moment.timestamp() * 1000)
+
+
+def tomorrow_at_eight(now: datetime.datetime) -> int:
+    """Tomorrow at 08:00 local time (now is local), in epoch ms."""
+    day = now.date() + datetime.timedelta(days=1)
+    return _ms(datetime.datetime(day.year, day.month, day.day, 8, 0))
+
+
+def pause_body(choice: str, now: datetime.datetime) -> dict:
+    """The POST /api/pause body for a choice: an hour from now, tomorrow at 08:00, or until resumed (no time)."""
+    if choice == "hour":
+        return {"paused": True, "until": _ms(now) + 3_600_000}
+    if choice == "tomorrow":
+        return {"paused": True, "until": tomorrow_at_eight(now)}
+    return {"paused": True}
+
+
+def paused_line(until_ms, now: datetime.datetime) -> str:
+    """How long a pause lasts, as the app's Home says it (native-gui/src/home.rs paused_headline): Paused until 15:00
+    (today), Paused until tomorrow 08:00, Paused until Mon 08:00 (a later day); Paused with no time."""
+    if not isinstance(until_ms, (int, float)) or isinstance(until_ms, bool) or until_ms <= 0:
+        return "Paused"
+    try:
+        until = datetime.datetime.fromtimestamp(until_ms / 1000)
+    except (OverflowError, OSError, ValueError):
+        return "Paused"  # a time no clock can show: only a corrupt stored value gets here
+    clock = until.strftime("%H:%M")
+    days = (until.date() - now.date()).days
+    if days <= 0:
+        return f"Paused until {clock}"
+    if days == 1:
+        return f"Paused until tomorrow {clock}"
+    return f"Paused until {_WEEKDAYS[until.weekday()]} {clock}"
 
 
 def trash_tooltip(sync_dir: str) -> str:
@@ -239,13 +282,14 @@ def problem_count(status: dict) -> int:
     return count
 
 
-def status_line(status: dict):
+def status_line(status: dict, now=None):
     """The tray's status line and icon, in the app's words (native-gui/src/home.rs status_summary): signed out, paused,
     moving files, what moves, problems, sync stopped, up to date. Never the engine's own action text."""
     if signed_out(status):
         return "Signed out", "protondrive-tray-error"
-    if status.get("state") == "paused" or (status.get("settings") or {}).get("paused"):
-        return "Paused", "protondrive-tray-paused"
+    settings = status.get("settings") or {}
+    if status.get("state") == "paused" or settings.get("paused"):
+        return paused_line(settings.get("pausedUntil"), now or datetime.datetime.now()), "protondrive-tray-paused"
     vfs = status.get("vfs")
     if isinstance(vfs, dict) and vfs.get("reason") == "moving":
         return "Moving files…", "protondrive-tray-syncing"
@@ -394,9 +438,20 @@ class ProtonDriveTrayIndicator:
         sync_now_item.connect("activate", self.on_sync_now)
         self.menu.append(sync_now_item)
 
+        # #205: while not paused, Pause Sync opens its choices; while paused, Resume Sync shows in its place
         self.pause_item = Gtk.MenuItem(label="Pause Sync")
-        self.pause_item.connect("activate", self.on_toggle_pause)
+        pause_menu = Gtk.Menu()
+        for label, choice in PAUSE_CHOICES:
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", self.on_pause_choice, choice)
+            pause_menu.append(item)
+        self.pause_item.set_submenu(pause_menu)
         self.menu.append(self.pause_item)
+
+        self.resume_item = Gtk.MenuItem(label=RESUME_LABEL)
+        self.resume_item.connect("activate", self.on_resume)
+        self.resume_item.set_no_show_all(True)
+        self.menu.append(self.resume_item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
@@ -435,7 +490,8 @@ class ProtonDriveTrayIndicator:
             self.problems_item.set_label(problems_label(problems))
             self.problems_item.set_visible(problems > 0)
 
-            self.pause_item.set_label("Resume Sync" if self.paused else "Pause Sync")
+            self.pause_item.set_visible(not self.paused)
+            self.resume_item.set_visible(self.paused)
             self.mount_item.set_visible(offers_mount(data))
         except Exception:
             offline = "Can't reach Proton Drive's background service"
@@ -503,9 +559,15 @@ class ProtonDriveTrayIndicator:
             pass
         self.poll_status()
 
-    def on_toggle_pause(self, _widget):
+    def on_pause_choice(self, _widget, choice):
+        self._post_pause(pause_body(choice, datetime.datetime.now()))
+
+    def on_resume(self, _widget):
+        self._post_pause({"paused": False})
+
+    def _post_pause(self, body):
         try:
-            payload = json.dumps({"paused": not self.paused}).encode("utf-8")
+            payload = json.dumps(body).encode("utf-8")
             req = urllib.request.Request(
                 f"{DAEMON_URL}/api/pause",
                 data=payload,

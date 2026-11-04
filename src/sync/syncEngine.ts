@@ -369,6 +369,8 @@ export class ProtonDriveSyncEngine {
     >();
     // Looks again at settling files that are running now (stop() waits for them)
     private readonly runningLooks = new Set<Promise<void>>();
+    // Cancels the timer that ends a timed pause (see setPaused), while one is set
+    private cancelPauseTimer: (() => void) | null = null;
 
     constructor(
         private readonly sdk: ProtonDriveClient,
@@ -396,6 +398,11 @@ export class ProtonDriveSyncEngine {
                 quietMs?: number;
                 maxQuietMs?: number;
                 maxWaitMs?: number;
+                now?: () => number;
+                schedule?: (run: () => Promise<void>, delayMs: number) => () => void;
+            };
+            // For tests: the clock a timed pause is timed by, and how its end is scheduled (see setPaused)
+            pauseClock?: {
                 now?: () => number;
                 schedule?: (run: () => Promise<void>, delayMs: number) => () => void;
             };
@@ -498,6 +505,7 @@ export class ProtonDriveSyncEngine {
     }
 
     private async startNow(options: { backgroundInitialReconcile?: boolean }): Promise<void> {
+        this.resumeIfPauseEnded();
         const settings = this.stateDb.getSettings();
         // Made only on a fresh install (no records): a missing folder with records is the files missing (see filesGone)
         if (!this.filesGone(true)) {
@@ -572,6 +580,7 @@ export class ProtonDriveSyncEngine {
             settling.cancel(); // The pass at the next start looks at them again
         }
         this.settlingFiles.clear();
+        this.clearPauseTimer(); // Set again at the next start, from the stored time
         // A look already running isn't waited for here: holdForMove waits for it (see idleForMove), as long as it
         // allows, and a caller about to close the database waits with waitForRunningLooks
         if (this.unsubscribeDriveEvents) {
@@ -976,15 +985,23 @@ export class ProtonDriveSyncEngine {
         }
     }
 
-    async setPaused(paused: boolean): Promise<void> {
-        this.stateDb.updateSettings({ paused });
+    // Pauses (until resumed, or with until, until then: the engine resumes by itself at that time) or resumes. The time
+    // is stored with the settings (pausedUntil), so that a start after a restart resumes or sets the timer again
+    // (resumeIfPauseEnded). Any earlier timer is cancelled.
+    async setPaused(paused: boolean, until: number | null = null): Promise<void> {
+        this.clearPauseTimer();
+        const pausedUntil = paused ? until : null;
+        this.stateDb.updateSettings({ paused, pausedUntil });
         if (paused) {
             this.state = 'paused';
             this.stateDb.logActivity({
                 action: 'sync',
                 localRelPath: '/',
-                details: 'Synchronization paused by user',
+                details: pausedUntil === null ? 'Synchronization paused by user' : `Synchronization paused until ${new Date(pausedUntil).toISOString()}`,
             });
+            if (pausedUntil !== null) {
+                this.schedulePauseEnd(pausedUntil);
+            }
         } else {
             this.state = 'idle';
             this.stateDb.logActivity({
@@ -994,6 +1011,77 @@ export class ProtonDriveSyncEngine {
             });
             await this.reconcileNow();
         }
+    }
+
+    private pauseNow(): number {
+        return this.options.pauseClock?.now?.() ?? Date.now();
+    }
+
+    private clearPauseTimer(): void {
+        this.cancelPauseTimer?.();
+        this.cancelPauseTimer = null;
+    }
+
+    // Sets the timer that ends a pause at until (replacing any earlier one)
+    private schedulePauseEnd(until: number): void {
+        this.clearPauseTimer();
+        const schedule =
+            this.options.pauseClock?.schedule ??
+            ((run: () => Promise<void>, delayMs: number) => {
+                const timer = setTimeout(() => void run(), delayMs);
+                timer.unref?.(); // Never what keeps a one-off run (the CLI's sync) going
+                return () => clearTimeout(timer);
+            });
+        let cancelled = false;
+        const cancel = schedule(async () => {
+            if (cancelled) {
+                return;
+            }
+            this.cancelPauseTimer = null;
+            if (this.resumeIfPauseEnded()) {
+                await this.reconcileNow();
+            }
+        }, Math.max(0, until - this.pauseNow()));
+        this.cancelPauseTimer = () => {
+            cancelled = true;
+            cancel();
+        };
+    }
+
+    // For the daemon's periodic check: a timer doesn't count time the machine spent asleep (nor a clock set forward), so a
+    // timed pause whose time has come is also ended here, and syncing picks up again (true). Nothing else changes.
+    async endPauseIfDue(): Promise<boolean> {
+        if (!this.resumeIfPauseEnded()) {
+            return false;
+        }
+        await this.reconcileNow();
+        return true;
+    }
+
+    // A timed pause whose time has come is ended (true); one still to come gets its timer, if it has none. Only the
+    // stored pause counts: a timer from a pause since changed or resumed finds nothing to end.
+    private resumeIfPauseEnded(): boolean {
+        const { paused, pausedUntil } = this.stateDb.getSettings();
+        if (!paused || pausedUntil === null) {
+            return false;
+        }
+        if (pausedUntil > this.pauseNow()) {
+            if (this.cancelPauseTimer === null) {
+                this.schedulePauseEnd(pausedUntil);
+            }
+            return false;
+        }
+        this.clearPauseTimer();
+        this.stateDb.updateSettings({ paused: false, pausedUntil: null });
+        if (this.state === 'paused') {
+            this.state = 'idle';
+        }
+        this.stateDb.logActivity({
+            action: 'sync',
+            localRelPath: '/',
+            details: 'Synchronization resumed (pause ended)',
+        });
+        return true;
     }
 
     async relocateSyncFolder(oldSyncDir: string, newSyncDirRaw: string): Promise<string> {

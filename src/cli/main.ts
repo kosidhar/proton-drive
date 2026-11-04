@@ -295,7 +295,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
         const runtime = await createStandaloneRuntime(verboseFlag);
         try {
             const stateDb = new SyncStateDatabase(path.join(runtime.config.appDir, 'ubuntu-sync-state.sqlite'));
-            stateDb.updateSettings({ paused });
+            stateDb.updateSettings({ paused, pausedUntil: null });
             stateDb.close();
             console.log(`Synchronization ${paused ? 'paused' : 'resumed'}.`);
         } finally {

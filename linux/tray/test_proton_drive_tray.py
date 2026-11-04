@@ -3,6 +3,7 @@
 
 Run: python3 linux/tray/test_proton_drive_tray.py
 """
+import datetime
 import importlib.util
 import json
 import os
@@ -253,6 +254,10 @@ class MenuTest(unittest.TestCase):
             tray.APP_LABEL,
             "Sync Now",
             "Pause Sync",
+            "For 1 hour",
+            "Until tomorrow",
+            "Until I resume",
+            "Resume Sync",
             "Quit Proton Drive",
         ]
         self.assertEqual([l for l in labels if l in expected], expected)
@@ -355,7 +360,7 @@ class PollTest(unittest.TestCase):
         tray.Gtk.MenuItem.reset_mock()
         with mock.patch.object(tray.ProtonDriveTrayIndicator, "poll_status"):
             indicator = tray.ProtonDriveTrayIndicator()
-        for name in ("status_item", "storage_item", "problems_item", "pause_item", "mount_item"):
+        for name in ("status_item", "storage_item", "problems_item", "pause_item", "resume_item", "mount_item"):
             setattr(indicator, name, mock.MagicMock())
         indicator.indicator = mock.MagicMock()
 
@@ -377,7 +382,7 @@ class PollTest(unittest.TestCase):
         ind.storage_item.set_label.assert_called_with("2.0 GB of 10.0 GB used")
         ind.storage_item.set_visible.assert_called_with(True)
         ind.problems_item.set_visible.assert_called_with(False)
-        ind.pause_item.set_label.assert_called_with("Pause Sync")
+        ind.pause_item.set_visible.assert_called_with(True)
         ind.indicator.set_icon_full.assert_called_with("protondrive-tray-idle", "Up to date")
 
     def test_problems_show_the_item_with_the_count(self):
@@ -393,7 +398,20 @@ class PollTest(unittest.TestCase):
             ind.problems_item.set_visible.assert_called_with(False)
 
     def test_paused_offers_resume(self):
-        self.poll(status(state="paused")).pause_item.set_label.assert_called_with("Resume Sync")
+        ind = self.poll(status(state="paused"))
+        ind.pause_item.set_visible.assert_called_with(False)
+        ind.resume_item.set_visible.assert_called_with(True)
+
+    def test_not_paused_offers_the_pause_choices(self):
+        ind = self.poll(status())
+        ind.pause_item.set_visible.assert_called_with(True)
+        ind.resume_item.set_visible.assert_called_with(False)
+
+    def test_paused_until_a_time_says_so(self):
+        until = int((datetime.datetime.now() + datetime.timedelta(minutes=30)).timestamp() * 1000)
+        ind = self.poll(status(state="paused", settings={"paused": True, "pausedUntil": until}))
+        label = ind.status_item.set_label.call_args.args[0]
+        self.assertTrue(label.startswith("Paused until "), label)
 
     def test_null_fields_are_not_mistaken_for_an_offline_daemon(self):
         ind = self.poll(status(settings=None, stats=None, account=None, activeTransfers=None))
@@ -404,6 +422,100 @@ class PollTest(unittest.TestCase):
         ind.status_item.set_label.assert_called_with("Can't reach Proton Drive's background service")
         ind.storage_item.set_visible.assert_called_with(False)
         ind.problems_item.set_visible.assert_called_with(False)
+
+
+NOW = datetime.datetime(2026, 11, 4, 10, 30)  # a Wednesday, local time
+
+
+def ms(dt):
+    return int(dt.timestamp() * 1000)
+
+
+class PausedLineTest(unittest.TestCase):
+    """#205: how long a pause lasts, in local time: a time today, tomorrow, or on a later day; no time is just Paused."""
+
+    def test_no_time(self):
+        self.assertEqual(tray.paused_line(None, NOW), "Paused")
+        # A time no clock can show (a corrupt stored value) is just "Paused", never an error that reads as offline
+        self.assertEqual(tray.paused_line(10 ** 18, NOW), "Paused")
+
+    def test_today(self):
+        self.assertEqual(tray.paused_line(ms(datetime.datetime(2026, 11, 4, 15, 0)), NOW), "Paused until 15:00")
+        self.assertEqual(tray.paused_line(ms(datetime.datetime(2026, 11, 4, 23, 59)), NOW), "Paused until 23:59")
+
+    def test_tomorrow(self):
+        self.assertEqual(tray.paused_line(ms(datetime.datetime(2026, 11, 5, 8, 0)), NOW), "Paused until tomorrow 08:00")
+
+    def test_a_later_day_by_its_weekday(self):
+        self.assertEqual(tray.paused_line(ms(datetime.datetime(2026, 11, 9, 8, 0)), NOW), "Paused until Mon 08:00")
+        self.assertEqual(tray.paused_line(ms(datetime.datetime(2026, 11, 6, 7, 5)), NOW), "Paused until Fri 07:05")
+
+    def test_the_status_line_uses_it(self):
+        until = ms(datetime.datetime(2026, 11, 4, 15, 0))
+        self.assertEqual(
+            tray.status_line(status(state="paused", settings={"paused": True, "pausedUntil": until}), now=NOW),
+            ("Paused until 15:00", "protondrive-tray-paused"),
+        )
+        self.assertEqual(tray.status_line(status(settings={"paused": True, "pausedUntil": None}), now=NOW)[0], "Paused")
+        # A time that is not a number is no time
+        self.assertEqual(tray.status_line(status(settings={"paused": True, "pausedUntil": "soon"}), now=NOW)[0], "Paused")
+
+
+class PauseChoicesTest(unittest.TestCase):
+    """#205: Pause Sync is a submenu of three choices while not paused; each posts /api/pause with its time."""
+
+    def test_tomorrow_at_eight(self):
+        self.assertEqual(tray.tomorrow_at_eight(NOW), ms(datetime.datetime(2026, 11, 5, 8, 0)))
+        # Just after midnight it is still the next day's morning, not the same day's
+        self.assertEqual(tray.tomorrow_at_eight(datetime.datetime(2026, 11, 4, 0, 10)), ms(datetime.datetime(2026, 11, 5, 8, 0)))
+        # The last day of a month
+        self.assertEqual(tray.tomorrow_at_eight(datetime.datetime(2026, 11, 30, 22, 0)), ms(datetime.datetime(2026, 12, 1, 8, 0)))
+
+    def test_bodies(self):
+        self.assertEqual(tray.pause_body("hour", NOW), {"paused": True, "until": ms(NOW) + 3_600_000})
+        self.assertEqual(tray.pause_body("tomorrow", NOW), {"paused": True, "until": ms(datetime.datetime(2026, 11, 5, 8, 0))})
+        self.assertEqual(tray.pause_body("resume", NOW), {"paused": True})
+
+    def test_the_menu_has_the_choices_under_pause_and_a_hidden_resume(self):
+        tray.Gtk.MenuItem.reset_mock()
+        with mock.patch.object(tray.ProtonDriveTrayIndicator, "poll_status"):
+            indicator = tray.ProtonDriveTrayIndicator()
+        self.assertEqual([label for label, _ in tray.PAUSE_CHOICES], ["For 1 hour", "Until tomorrow", "Until I resume"])
+        indicator.pause_item.set_submenu.assert_called()
+        indicator.resume_item.set_no_show_all.assert_called_with(True)
+        indicator.resume_item.connect.assert_any_call("activate", indicator.on_resume)
+
+    def posted(self, action):
+        sent = []
+
+        def urlopen(req, timeout=None):
+            sent.append((req.full_url, req.get_method(), json.loads(req.data.decode())))
+            return mock.MagicMock()
+
+        indicator = mock.MagicMock()
+        indicator._post_pause = lambda body: tray.ProtonDriveTrayIndicator._post_pause(indicator, body)
+        with mock.patch.object(tray.urllib.request, "urlopen", urlopen):
+            action(indicator)
+        indicator.poll_status.assert_called()
+        return sent
+
+    def test_each_choice_posts_its_body(self):
+        for choice in ("hour", "tomorrow", "resume"):
+            with mock.patch.object(tray, "pause_body", return_value={"paused": True, "choice": choice}) as body:
+                sent = self.posted(lambda ind: tray.ProtonDriveTrayIndicator.on_pause_choice(ind, None, choice))
+            self.assertEqual(body.call_args.args[0], choice)
+            self.assertEqual(sent, [(f"{tray.DAEMON_URL}/api/pause", "POST", {"paused": True, "choice": choice})])
+
+    def test_a_choice_uses_the_time_now(self):
+        fixed = mock.MagicMock(wraps=datetime.datetime)
+        fixed.now.return_value = NOW
+        with mock.patch.object(tray.datetime, "datetime", fixed):
+            sent = self.posted(lambda ind: tray.ProtonDriveTrayIndicator.on_pause_choice(ind, None, "hour"))
+        self.assertEqual(sent[0][2], {"paused": True, "until": ms(NOW) + 3_600_000})
+
+    def test_resume_posts_paused_false(self):
+        sent = self.posted(lambda ind: tray.ProtonDriveTrayIndicator.on_resume(ind, None))
+        self.assertEqual(sent, [(f"{tray.DAEMON_URL}/api/pause", "POST", {"paused": False})])
 
 
 class ProblemCountTest(unittest.TestCase):

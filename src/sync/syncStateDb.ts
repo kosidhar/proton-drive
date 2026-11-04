@@ -83,6 +83,8 @@ export interface SyncSettings {
     startAtLogin: boolean;
     reconcileIntervalSec: number;
     paused: boolean;
+    // When a timed pause ends (epoch ms), the engine resuming by itself then; null when it lasts until resumed (#205)
+    pausedUntil: number | null;
     ignorePatterns: string[];
     // Apps (by process name) that may not download online-only files from the virtual drive
     blockedApps: string[];
@@ -103,6 +105,12 @@ export const DEFAULT_IGNORE_PATTERNS = [
 
 // Meta keys whose change changes where the files are, so every emblem may be stale
 const RESET_META_KEYS: readonly string[] = ['driveLayout', 'virtualDriveWanted'];
+
+// A stored time (epoch ms), or null when there is none or it is not one
+function storedTime(raw: string | undefined): number | null {
+    const value = raw === undefined || raw.trim() === '' ? Number.NaN : Number(raw);
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
 
 export class SyncStateDatabase {
     private db: Database;
@@ -312,6 +320,7 @@ export class SyncStateDatabase {
             startAtLogin: map.has('startAtLogin') ? map.get('startAtLogin') === 'true' : true,
             reconcileIntervalSec: Number(map.get('reconcileIntervalSec') || 120),
             paused: map.get('paused') === 'true',
+            pausedUntil: storedTime(map.get('pausedUntil')),
             ignorePatterns,
             blockedApps: this.storedBlockedApps(map.get('blockedApps')),
         };
@@ -333,6 +342,11 @@ export class SyncStateDatabase {
         store('startAtLogin', String(next.startAtLogin));
         store('reconcileIntervalSec', String(next.reconcileIntervalSec));
         store('paused', String(next.paused));
+        if (partial.pausedUntil === null) {
+            this.db.query("DELETE FROM settings WHERE key = 'pausedUntil'").run();
+        } else if (partial.pausedUntil !== undefined) {
+            store('pausedUntil', String(partial.pausedUntil));
+        }
         store('ignorePatterns', JSON.stringify(next.ignorePatterns));
         store('blockedApps', JSON.stringify(next.blockedApps));
 
