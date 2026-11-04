@@ -456,13 +456,10 @@ fn pause_choices(ctx: &egui::Context, anchor: egui::Rect) -> Option<PauseChoice>
     picked
 }
 
-/// Whether a click landed on the Pause choices (as last drawn).
-fn pause_choices_hit(ctx: &egui::Context, input: &egui::InputState) -> bool {
-    let rect = ctx.memory(|m| m.area_rect(egui::Id::new(PAUSE_CHOICES_ID)));
-    match (rect, input.pointer.interact_pos()) {
-        (Some(rect), Some(pos)) => rect.contains(pos),
-        _ => false,
-    }
+/// Whether a click landed on the Pause choices, as last drawn. Takes their place rather than the context: it is read
+/// inside `ui.input`, which holds egui's lock, and asking the context's memory there deadlocks.
+fn pause_choices_hit(choices: Option<egui::Rect>, pointer: Option<egui::Pos2>) -> bool {
+    matches!((choices, pointer), (Some(rect), Some(pos)) if rect.contains(pos))
 }
 
 /// A row of a small menu: its label on the left, highlighted on hover.
@@ -551,8 +548,11 @@ impl ProtonDriveNativeApp {
                                         until: choice.until(now_ms(), local_offset_secs),
                                     });
                                 }
+                                // Read before ui.input: egui's context lock isn't re-entrant
+                                let choices = ui.ctx().memory(|m| m.area_rect(egui::Id::new(PAUSE_CHOICES_ID)));
                                 let outside = ui.input(|i| {
-                                    i.key_pressed(egui::Key::Escape) || (i.pointer.primary_clicked() && !pause_choices_hit(ui.ctx(), i))
+                                    i.key_pressed(egui::Key::Escape)
+                                        || (i.pointer.primary_clicked() && !pause_choices_hit(choices, i.pointer.interact_pos()))
                                 });
                                 if command.is_some() || outside {
                                     self.pause_choices_open = false;
@@ -1190,6 +1190,15 @@ mod tests {
     /// Epoch ms of `days` after 2026-11-04 at hh:mm, local time `offset` seconds east of UTC.
     fn local(days: i64, hh: i64, mm: i64, offset: i64) -> i64 {
         NOV_4_UTC + days * 86_400_000 + (hh * 3600 + mm * 60 - offset) * 1000
+    }
+
+    #[test]
+    fn a_click_hits_the_pause_choices_only_inside_them_as_last_drawn() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(180.0, 96.0));
+        assert!(pause_choices_hit(Some(rect), Some(egui::pos2(150.0, 120.0))));
+        assert!(!pause_choices_hit(Some(rect), Some(egui::pos2(50.0, 120.0))));
+        assert!(!pause_choices_hit(None, Some(egui::pos2(150.0, 120.0)))); // not drawn yet
+        assert!(!pause_choices_hit(Some(rect), None)); // no pointer
     }
 
     #[test]

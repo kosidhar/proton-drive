@@ -436,6 +436,8 @@ class PausedLineTest(unittest.TestCase):
 
     def test_no_time(self):
         self.assertEqual(tray.paused_line(None, NOW), "Paused")
+        # A time no clock can show (a corrupt stored value) is just "Paused", never an error that reads as offline
+        self.assertEqual(tray.paused_line(10 ** 18, NOW), "Paused")
 
     def test_today(self):
         self.assertEqual(tray.paused_line(ms(datetime.datetime(2026, 11, 4, 15, 0)), NOW), "Paused until 15:00")

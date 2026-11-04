@@ -91,6 +91,12 @@ describe('POST /api/pause with an end time (#205)', () => {
             { paused: true, until: Number.POSITIVE_INFINITY },
             { paused: true, until: T0 + 0.5 + HOUR },
             { paused: false, until: T0 + HOUR },
+            // paused must be true or false: a string, a missing one or no body at all neither pauses nor resumes
+            { paused: 'false', until: T0 + HOUR },
+            { paused: 'true' },
+            { paused: 1 },
+            {},
+            null,
         ];
         for (const body of bad) {
             const r = await call(body);
@@ -176,6 +182,30 @@ describe('The engine resumes by itself when a timed pause ends (#205)', () => {
 });
 
 describe('A timed pause survives a restart (#205)', () => {
+    // A timer doesn't count time asleep: a laptop closed overnight would otherwise stay paused for hours after the time
+    // has come. The daemon's periodic check ends it (endPauseIfDue), within one check of waking.
+    test('a pause whose time passed while the timer was held up ends on the next periodic check', async () => {
+        const t = setup();
+        await t.engine.setPaused(true, T0 + HOUR);
+        t.clock.advance(14 * HOUR); // asleep: the timer never ran
+        expect(await t.engine.endPauseIfDue()).toBe(true);
+        expect(t.stateDb.getSettings()).toMatchObject({ paused: false, pausedUntil: null });
+        expect(t.activity()[0]).toBe('Synchronization resumed (pause ended)');
+        expect(t.clock.live()).toEqual([]); // the held-up timer is cancelled
+    });
+
+    test('the periodic check leaves a pause alone before its time, and one with no time', async () => {
+        const t = setup();
+        await t.engine.setPaused(true, T0 + HOUR);
+        t.clock.advance(HOUR / 2);
+        expect(await t.engine.endPauseIfDue()).toBe(false);
+        expect(t.stateDb.getSettings()).toMatchObject({ paused: true, pausedUntil: T0 + HOUR });
+        await t.engine.setPaused(true);
+        t.clock.advance(30 * HOUR);
+        expect(await t.engine.endPauseIfDue()).toBe(false);
+        expect(t.stateDb.getSettings().paused).toBe(true);
+    });
+
     test('a start after the time has passed resumes at once', async () => {
         const t = setup();
         t.stateDb.updateSettings({ paused: true, pausedUntil: T0 - 1 });

@@ -72,7 +72,10 @@ def paused_line(until_ms, now: datetime.datetime) -> str:
     (today), Paused until tomorrow 08:00, Paused until Mon 08:00 (a later day); Paused with no time."""
     if not isinstance(until_ms, (int, float)) or isinstance(until_ms, bool) or until_ms <= 0:
         return "Paused"
-    until = datetime.datetime.fromtimestamp(until_ms / 1000)
+    try:
+        until = datetime.datetime.fromtimestamp(until_ms / 1000)
+    except (OverflowError, OSError, ValueError):
+        return "Paused"  # a time no clock can show: only a corrupt stored value gets here
     clock = until.strftime("%H:%M")
     days = (until.date() - now.date()).days
     if days <= 0:

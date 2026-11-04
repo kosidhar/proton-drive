@@ -1048,6 +1048,16 @@ export class ProtonDriveSyncEngine {
         };
     }
 
+    // For the daemon's periodic check: a timer doesn't count time the machine spent asleep (nor a clock set forward), so a
+    // timed pause whose time has come is also ended here, and syncing picks up again (true). Nothing else changes.
+    async endPauseIfDue(): Promise<boolean> {
+        if (!this.resumeIfPauseEnded()) {
+            return false;
+        }
+        await this.reconcileNow();
+        return true;
+    }
+
     // A timed pause whose time has come is ended (true); one still to come gets its timer, if it has none. Only the
     // stored pause counts: a timer from a pause since changed or resumed finds nothing to end.
     private resumeIfPauseEnded(): boolean {
