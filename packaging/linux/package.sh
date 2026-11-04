@@ -76,7 +76,7 @@ cp -R "$ROOT/assets/app-icon/hicolor" "$STAGE/usr/share/icons/"
 cp -R "$ROOT/assets/app-icon/tray/"*.png "$STAGE/usr/share/protondrive/tray/"
 cp -R "$ROOT/assets/app-icon/tray/"*.png "$STAGE/usr/share/icons/hicolor/64x64/apps/"
 install -Dm755 "$ROOT/linux/tray/proton_drive_tray.py" "$STAGE/usr/share/protondrive/proton_drive_tray.py"
-# The Files emblems: Always keep, Downloaded, Online only
+# The Files emblems: Always keep, Downloaded, Partly here, Online only
 for emblem in "$ROOT"/linux/icons/emblems/emblem-protondrive-*.svg; do
   install -Dm644 "$emblem" "$STAGE/usr/share/icons/hicolor/scalable/emblems/$(basename "$emblem")"
 done
