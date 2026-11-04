@@ -2242,14 +2242,19 @@ export class ProtonDriveSyncEngine {
         return this.manualResolvingPaths.has(relPath) || this.strategyResolvingPaths.has(relPath);
     }
 
+    // The same, at the path or anywhere under it
+    private isResolvingWithin(relPath: string): boolean {
+        return [...this.manualResolvingPaths, ...this.strategyResolvingPaths].some((r) => isWithin(r, relPath));
+    }
+
     // The user deleted a synced item locally, so its cloud copy goes to the Proton Drive trash. A folder can also hold
     // things that never were on this computer: online-only, ignored or hidden items, Proton Docs and Sheets, or a node
     // that replaced the one synced here. Those stay in the cloud: only the items that had local copies are trashed, and
     // the folder is left online-only.
     private async trashForDeletedLocal(relPath: string, remoteNode: NodeEntity): Promise<void> {
-        if (this.isResolving(relPath)) {
-            // Its conflict is being resolved (by hand or by the setting, #140): that decides, and the next look after it
-            // sees the delete
+        if (this.isResolvingWithin(relPath)) {
+            // A conflict of it, or of something in it, is being resolved (by hand or by the setting, #140, #143): that
+            // decides, and the next look after it sees the delete
             this.logger.info(`Not acting on ${relPath} gone here yet: its conflict is being resolved`);
             return;
         }
