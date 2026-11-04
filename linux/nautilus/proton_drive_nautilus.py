@@ -2,7 +2,7 @@
 GNOME Files (Nautilus) extension for Proton Drive on Linux.
 
 - Emblems: what is on this computer (Always keep, Downloaded, Online only), and what is syncing or needs attention.
-- Right-click: Always keep on this device, Free up space, Hide from this computer; Sync Now and Status & Settings….
+- Right-click: Always keep on this device, Free up space, Hide from this computer (only actions on what was clicked).
 - Emblems follow changes by themselves, from the daemon's change stream.
 
 Everything goes through the daemon's user-only control socket (never the TCP API), off the GTK thread: Files never
@@ -20,13 +20,11 @@ import threading
 import time
 import types
 import urllib.parse
-import urllib.request
 import weakref
 from collections import OrderedDict
 
 from gi.repository import GLib, GObject, Nautilus
 
-DAEMON_URL = os.environ.get("PROTON_DRIVE_DAEMON_URL", "http://127.0.0.1:49152")
 
 # The client functions below are the tray's (linux/tray/proton_drive_tray.py), unchanged: a test keeps them identical
 CONTROL_CONNECT_TIMEOUT = 0.5
@@ -689,15 +687,6 @@ class ProtonDriveFiles:
 # --- Nautilus ----------------------------------------------------------------------------------------------------
 
 
-def _query_daemon(endpoint: str, method: str = "GET"):
-    try:
-        req = urllib.request.Request(f"{DAEMON_URL}{endpoint}", method=method)
-        with urllib.request.urlopen(req, timeout=0.35) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return None
-
-
 def _spawn_detached(argv) -> None:
     # Like Popen(start_new_session=True): own session, stdio on /dev/null, none of Nautilus's
     # fds and default SIGPIPE/SIGXFSZ. The GLib child watch reaps it so it never lingers as a
@@ -721,26 +710,6 @@ def _notify(title: str, body: str) -> None:
         _spawn_detached(["notify-send", "--app-name=Proton Drive", "--icon=ch.proton.drive", title, body])
     except OSError:
         pass
-
-
-# #212: the item that opens the app; inside the drive, "Open Proton Drive" would read as opening the drive itself, which
-# is what the tray's item of that name does (#98)
-APP_LABEL = "Proton Drive: Status & Settings…"
-
-
-def _launch_native_gui():
-    candidates = [
-        os.path.expanduser("~/.local/bin/protondrive-gui"),
-        "/usr/bin/protondrive-gui",
-        "protondrive-gui",
-    ]
-    for bin_path in candidates:
-        try:
-            # On Home, like the tray; a running app just comes to the front there (#203)
-            _spawn_detached([bin_path, "--tab", "home"])
-            return
-        except OSError:
-            continue
 
 
 def _transient(error):
@@ -882,7 +851,7 @@ class ProtonDriveNautilusExtension(
         labels = {
             "pin": (PIN_LABEL, "Download and keep these on this computer, including what is added later"),
             "free": (FREE_LABEL, "Remove the copies on this computer; they stay in Proton Drive"),
-            "hide": (HIDE_LABEL, "Remove these from this computer and from Files; unhide them in the Proton Drive app"),
+            "hide": (HIDE_LABEL, "Remove these from this computer and from Files; unhide them in the Proton Drive app's Settings"),
         }
         for action in self.files.actions_for(paths) if kind == "items" else []:
             label, tip = labels[action]
@@ -890,48 +859,10 @@ class ProtonDriveNautilusExtension(
             item.connect("activate", lambda _menu, a=action: self.files.act(a, paths))
             items.append(item)
 
-        sync_item = Nautilus.MenuItem(
-            name="ProtonDrive::SyncNow",
-            label="Proton Drive: Sync Now",
-            tip="Trigger immediate two-way synchronization with Proton Drive",
-        )
-        sync_item.connect("activate", self._on_sync_now)
-
-        open_app_item = Nautilus.MenuItem(
-            name="ProtonDrive::OpenApp",
-            label=APP_LABEL,
-            tip="Open the Proton Drive app: how sync is going, what needs you, and its settings",
-        )
-        open_app_item.connect("activate", self._on_open_app)
-
-        return items + [sync_item, open_app_item]
+        # Only actions on what was clicked (#214): syncing and the app are in the tray
+        return items
 
     def get_background_items(self, *args):
-        _neutralize_legacy_extension()
-        folder = args[-1] if args else None
-        if folder is not None and hasattr(folder, "get_location"):
-            folder_path = folder.get_location().get_path()
-            if rel_to_root(self.files.menu_root(), folder_path) is None:
-                return []
+        # Nothing of ours in the empty-space menu (#214): it isn't about any file, and syncing and the app are in the tray
+        return []
 
-        sync_item = Nautilus.MenuItem(
-            name="ProtonDrive::BgSyncNow",
-            label="Proton Drive: Sync Folder Now",
-            tip="Trigger immediate two-way synchronization with Proton Drive",
-        )
-        sync_item.connect("activate", self._on_sync_now)
-
-        open_app_item = Nautilus.MenuItem(
-            name="ProtonDrive::BgOpenApp",
-            label=APP_LABEL,
-            tip="Open the Proton Drive app: how sync is going, what needs you, and its settings",
-        )
-        open_app_item.connect("activate", self._on_open_app)
-
-        return [sync_item, open_app_item]
-
-    def _on_sync_now(self, _menu):
-        threading.Thread(target=_query_daemon, args=("/api/sync", "POST"), daemon=True).start()
-
-    def _on_open_app(self, _menu):
-        _launch_native_gui()
