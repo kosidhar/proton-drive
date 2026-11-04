@@ -2109,6 +2109,14 @@ export class ProtonDriveSyncEngine {
         parentNode: NodeEntity,
         since: number,
     ): Promise<NodeEntity | null> {
+        if (await this.inProtonTrash(parentNode)) {
+            // Its folder is in the Proton Drive trash (trashed elsewhere, not yet removed here), or that couldn't be told:
+            // put there, the file would be recorded as synced and the folder's removal here would take it for an
+            // unchanged copy, leaving it only in the trash. Left here unrecorded: a file only on this computer, which
+            // that removal keeps (#160)
+            this.logger.warn(`Not uploading ${relPath}: its folder is in the Proton Drive trash`);
+            return null;
+        }
         for (let attempt = 1; ; attempt++) {
             const result = await this.uploadLocalToRemote(relPath, localFullPath, parentNode, since, undefined, 'skip');
             if (result.status !== 'skipped' || !result.nodeUid) {
