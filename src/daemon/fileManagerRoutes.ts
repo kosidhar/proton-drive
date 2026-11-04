@@ -73,6 +73,9 @@ export class EventFeed {
     ) {
         const { syncDir, mode } = source.root();
         this.send({ type: 'hello', syncDir, mode });
+        if (this.closed) {
+            return; // the hello couldn't be sent: nothing to subscribe for, and nothing left for stop() to undo
+        }
         this.unsubscribe = source.events.subscribe((change) => this.onChange(change));
         const pingMs = opts.pingMs ?? PING_MS;
         if (pingMs > 0) {
