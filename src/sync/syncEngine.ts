@@ -1773,6 +1773,14 @@ export class ProtonDriveSyncEngine {
             if (await gone()) {
                 return leftByTheUser();
             }
+            if (await this.inProtonTrash(parentNode)) {
+                // Its folder is in the Proton Drive trash (trashed elsewhere meanwhile), or that couldn't be checked: put
+                // there, the copy would be recorded as synced, and the folder's removal here would take the only copy of
+                // the user's version as an unchanged one. Left here unrecorded instead: a file only on this computer,
+                // which that removal keeps (#150)
+                this.logger.warn(`The conflict copy ${relPath} stays on this computer: its folder is in the Proton Drive trash`);
+                return relPath;
+            }
             const result = await this.uploadLocalToRemote(relPath, fullPath, parentNode, since, undefined, 'skip', gone).catch(
                 async (error: unknown) => {
                     if ((error as NodeJS.ErrnoException).code === 'ENOENT' && (await gone())) {
@@ -2237,6 +2245,15 @@ export class ProtonDriveSyncEngine {
         }
     }
 
+    // Whether a folder node is in the Proton Drive trash, itself or by a folder above it; true when that can't be told.
+    // The root never is
+    private async inProtonTrash(folder: NodeEntity): Promise<boolean> {
+        const root = await this.getRootFolder().catch(() => null);
+        if (!root) return true;
+        if (folder.uid === root.uid) return false;
+        return Boolean(folder.trashTime) || (await this.inTrashedFolder(folder));
+    }
+
     // Whether a conflict at the path is being resolved right now, by hand or by the conflict setting
     private isResolving(relPath: string): boolean {
         return this.manualResolvingPaths.has(relPath) || this.strategyResolvingPaths.has(relPath);
@@ -2604,6 +2621,7 @@ export class ProtonDriveSyncEngine {
         removal: (records: {
             drop(relPath: string): void;
             dropSubtree(relPath: string): void;
+            noteSubtree(relPath: string): void;
             putBack(stayed: string[]): Promise<void>;
         }) => Promise<T>,
         drive?: DriveChange,
@@ -3029,6 +3047,12 @@ export class ProtonDriveSyncEngine {
             return; // Never the whole sync folder
         }
         await this.inAvailabilityRun(async () => {
+            if (this.isResolvingWithin(relPath)) {
+                // A conflict of it, or of something in it, is being resolved: removing it now would pull the files and
+                // records out from under that. The next pass finds it gone and removes it then (#150)
+                this.logger.info(`Not removing ${relPath} here yet: a conflict in it is being resolved`);
+                return;
+            }
             if (this.stateDb.getItemByPath(relPath)) {
                 await this.removeLocalCopyAfterCloudDelete(relPath, reason);
             }
@@ -3177,8 +3201,10 @@ export class ProtonDriveSyncEngine {
         if (!record) {
             return;
         }
-        if (this.isResolving(relPath)) {
-            return; // Its conflict is being resolved: the next pass decides where it went, or that it went (#104, #140)
+        if (this.isResolvingWithin(relPath)) {
+            // A conflict of it, or of something in it, is being resolved: the next pass decides where it went, or that it
+            // went (#104, #140, #150)
+            return;
         }
         const now = await this.currentRemotePath(record.nodeUid, relPath);
         if (now === undefined || now === relPath) {
@@ -4317,7 +4343,7 @@ export class ProtonDriveSyncEngine {
                 // are gone leaves them unrecorded, to upload again as new items (nothing lost), never recorded without
                 // their files
                 this.stateDb.connection.transaction(() => {
-                    records.dropSubtree(relPath);
+                    this.stateDb.removeItemByPath(relPath);
                     this.stateDb.dropEditBaselines(relPath);
                     if (collision) {
                         // Nothing is left of this computer's side: what stays is the cloud's version
@@ -4333,6 +4359,10 @@ export class ProtonDriveSyncEngine {
                     }
                     this.applyPendingOpsToIndex();
                 })();
+                // Noted for work under way once it has happened: a transaction that threw rolled everything back, and no
+                // delete is there to see (#154). Nothing runs between the commit and this, which writes nothing (the
+                // records went in the transaction), so it can't fail after the delete committed
+                records.noteSubtree(relPath);
                 if (local && onlyIfEmpty) {
                     // Never what was put in it since the look above: that stays, and syncs as new, folder and all
                     await rmdir(path.join(root, relPath)).catch((error: NodeJS.ErrnoException) => {
@@ -5511,6 +5541,10 @@ export class ProtonDriveSyncEngine {
             dropSubtree: (relPath: string) => {
                 takenAway.subtrees.add(relPath);
                 this.stateDb.removeItemByPath(relPath);
+            },
+            // Only notes a subtree whose records are gone already
+            noteSubtree: (relPath: string) => {
+                takenAway.subtrees.add(relPath);
             },
             putBack: async (stayed: string[]) => {
                 for (const relPath of stayed) {
