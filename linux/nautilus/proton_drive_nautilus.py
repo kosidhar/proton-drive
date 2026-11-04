@@ -2,7 +2,7 @@
 GNOME Files (Nautilus) extension for Proton Drive on Linux.
 
 - Emblems: what is on this computer (Always keep, Downloaded, Online only), and what is syncing or needs attention.
-- Right-click: Always keep on this device, Free up space, Hide from this computer; Sync Now and Open Proton Drive.
+- Right-click: Always keep on this device, Free up space, Hide from this computer; Sync Now and Status & Settings….
 - Emblems follow changes by themselves, from the daemon's change stream.
 
 Everything goes through the daemon's user-only control socket (never the TCP API), off the GTK thread: Files never
@@ -723,6 +723,11 @@ def _notify(title: str, body: str) -> None:
         pass
 
 
+# #212: the item that opens the app; inside the drive, "Open Proton Drive" would read as opening the drive itself, which
+# is what the tray's item of that name does (#98)
+APP_LABEL = "Proton Drive: Status & Settings…"
+
+
 def _launch_native_gui():
     candidates = [
         os.path.expanduser("~/.local/bin/protondrive-gui"),
@@ -731,7 +736,8 @@ def _launch_native_gui():
     ]
     for bin_path in candidates:
         try:
-            _spawn_detached([bin_path])
+            # On Home, like the tray; a running app just comes to the front there (#203)
+            _spawn_detached([bin_path, "--tab", "home"])
             return
         except OSError:
             continue
@@ -893,8 +899,8 @@ class ProtonDriveNautilusExtension(
 
         open_app_item = Nautilus.MenuItem(
             name="ProtonDrive::OpenApp",
-            label="Open Proton Drive",
-            tip="Open the native Proton Drive desktop application",
+            label=APP_LABEL,
+            tip="Open the Proton Drive app: how sync is going, what needs you, and its settings",
         )
         open_app_item.connect("activate", self._on_open_app)
 
@@ -917,8 +923,8 @@ class ProtonDriveNautilusExtension(
 
         open_app_item = Nautilus.MenuItem(
             name="ProtonDrive::BgOpenApp",
-            label="Open Proton Drive",
-            tip="Open the native Proton Drive desktop application",
+            label=APP_LABEL,
+            tip="Open the Proton Drive app: how sync is going, what needs you, and its settings",
         )
         open_app_item.connect("activate", self._on_open_app)
 
