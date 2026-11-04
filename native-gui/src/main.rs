@@ -221,6 +221,13 @@ struct SyncSettings {
     ignore_patterns: Vec<String>,
     /// Apps (by process name) the virtual drive won't download online-only files for; absent from an older daemon
     blocked_apps: Vec<String>,
+    /// Proton Drive starts at login (#92); on unless the daemon says otherwise (an older daemon doesn't say)
+    #[serde(default = "on")]
+    start_at_login: bool,
+}
+
+fn on() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -752,6 +759,7 @@ fn settings_changes(
     sync_dir: &str,
     conflict_strategy: &str,
     notifications_enabled: bool,
+    start_at_login: bool,
     ignore_patterns_text: &str,
 ) -> serde_json::Map<String, serde_json::Value> {
     use serde_json::Value;
@@ -764,6 +772,9 @@ fn settings_changes(
     }
     if notifications_enabled != loaded.notifications_enabled {
         changes.insert("notificationsEnabled".into(), Value::from(notifications_enabled));
+    }
+    if start_at_login != loaded.start_at_login {
+        changes.insert("startAtLogin".into(), Value::from(start_at_login));
     }
     let patterns = parse_ignore_patterns(ignore_patterns_text);
     if patterns != parse_ignore_patterns(&loaded.ignore_patterns.join("\n")) {
@@ -1284,6 +1295,7 @@ struct ProtonDriveNativeApp {
     edit_sync_dir: String,
     edit_conflict_strategy: String,
     edit_notifications: bool,
+    edit_start_at_login: bool,
 
     /// Screenshot-only: `--drive-status` and `--drive-move`, laid over every status from the daemon
     fake_drive: Option<(String, Option<String>)>,
@@ -1357,6 +1369,7 @@ impl ProtonDriveNativeApp {
             initial_status.settings.conflict_strategy.clone()
         };
         let edit_notifications = initial_status.settings.notifications_enabled;
+        let edit_start_at_login = initial_status.settings.start_at_login;
         let ignore_patterns_text = initial_status.settings.ignore_patterns.join("\n");
         let loaded_settings = initial_status.settings.clone();
 
@@ -1403,6 +1416,7 @@ impl ProtonDriveNativeApp {
             edit_sync_dir,
             edit_conflict_strategy,
             edit_notifications,
+            edit_start_at_login,
             fake_drive: None,
             fake_files_missing: false,
             window_geometry,
@@ -1487,6 +1501,7 @@ impl ProtonDriveNativeApp {
         self.edit_sync_dir = settings.sync_dir.clone();
         self.edit_conflict_strategy = settings.conflict_strategy.clone();
         self.edit_notifications = settings.notifications_enabled;
+        self.edit_start_at_login = settings.start_at_login;
         self.ignore_patterns_text = settings.ignore_patterns.join("\n");
         self.loaded_settings = settings.clone();
     }
@@ -4096,6 +4111,7 @@ impl ProtonDriveNativeApp {
             &self.edit_sync_dir,
             &self.edit_conflict_strategy,
             self.edit_notifications,
+            self.edit_start_at_login,
             &self.ignore_patterns_text,
         );
         if changes.is_empty() {
@@ -4256,6 +4272,20 @@ impl ProtonDriveNativeApp {
                         .size(13.5)
                         .color(TEXT_PRIMARY()),
                 )
+                .changed()
+            {
+                self.mark_settings_edited();
+            }
+
+            ui.add_space(10.0);
+            if ui
+                .checkbox(
+                    &mut self.edit_start_at_login,
+                    RichText::new("Start Proton Drive when I log in")
+                        .size(13.5)
+                        .color(TEXT_PRIMARY()),
+                )
+                .on_hover_text("Syncs and mounts the drive at login, with the tray icon, without opening this window")
                 .changed()
             {
                 self.mark_settings_edited();
@@ -6472,6 +6502,7 @@ mod tests {
                 edit_sync_dir: String::new(),
                 edit_conflict_strategy: "keep-both".into(),
                 edit_notifications: false,
+                edit_start_at_login: true,
                 fake_drive: None,
                 fake_files_missing: false,
                 window_geometry: WindowGeometry::default(),
@@ -6910,6 +6941,7 @@ mod tests {
             paused: false,
             ignore_patterns: vec![".git".into(), "*.part".into()],
             blocked_apps: Vec::new(),
+            start_at_login: true,
         }
     }
 
@@ -6917,7 +6949,7 @@ mod tests {
     fn settings_save_sends_only_the_fields_that_changed() {
         let loaded = loaded_settings();
         let changes = |dir: &str, strategy: &str, notify: bool, ignore: &str| {
-            serde_json::Value::Object(settings_changes(&loaded, dir, strategy, notify, ignore))
+            serde_json::Value::Object(settings_changes(&loaded, dir, strategy, notify, loaded.start_at_login, ignore))
         };
         let same = ".git\n*.part";
         assert_eq!(changes("/home/u/ProtonDrive", "keep-both", true, same), serde_json::json!({}));
@@ -6938,6 +6970,23 @@ mod tests {
             changes("/mnt/x", "prompt", false, ""),
             serde_json::json!({ "syncDir": "/mnt/x", "conflictStrategy": "prompt", "notificationsEnabled": false, "ignorePatterns": [] })
         );
+    }
+
+    // #92: the Start at login switch is saved like the others, and reads as on from a daemon that doesn't send it
+    #[test]
+    fn start_at_login_is_sent_only_when_changed_and_on_unless_said_otherwise() {
+        let loaded = loaded_settings();
+        let same = ".git\n*.part";
+        let changes = |start: bool| {
+            serde_json::Value::Object(settings_changes(&loaded, "/home/u/ProtonDrive", "keep-both", true, start, same))
+        };
+        assert!(loaded.start_at_login);
+        assert_eq!(changes(true), serde_json::json!({}));
+        assert_eq!(changes(false), serde_json::json!({ "startAtLogin": false }));
+        let older: SyncSettings = serde_json::from_value(serde_json::json!({ "syncDir": "/home/u/ProtonDrive" })).unwrap();
+        assert!(older.start_at_login);
+        let off: SyncSettings = serde_json::from_value(serde_json::json!({ "startAtLogin": false })).unwrap();
+        assert!(!off.start_at_login);
     }
 
     #[test]

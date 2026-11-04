@@ -1,5 +1,6 @@
 import path from 'node:path';
 
+import { syncLoginEntry } from '../linux/autostart';
 import { ensureSystemTrayIndicator, getSystemdServiceStatus, sendDesktopNotification } from '../linux/notifications';
 import {
     DEFAULT_APP_VERSION,
@@ -533,6 +534,18 @@ export async function startSyncDaemon(options: {
         );
     } catch (err) {
         runtime.logger.error(`Control socket unavailable, so the app can't pin or free files, change settings, sign in or out, resolve conflicts or make folders: ${String(err)}`);
+    }
+    // The login entry as the setting asks, from this binary (it may have moved since): on for a new install (#92). Only
+    // by the daemon that has the control socket: a second one, about to stop, never points it elsewhere
+    if (controlServer !== null) {
+        try {
+            const result = syncLoginEntry(stateDb);
+            if (result === 'turned-off-by-user') {
+                syncLogger.info('Start at login was turned off outside the app (the login entry was disabled or deleted): left off');
+            }
+        } catch (error: unknown) {
+            syncLogger.warn(`Could not set Proton Drive to start at login: ${String(error)}`);
+        }
     }
     await drive.startDrive(controlServer !== null);
 

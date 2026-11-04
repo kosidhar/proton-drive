@@ -75,6 +75,8 @@ export interface SyncSettings {
     syncDir: string;
     conflictStrategy: ConflictStrategy;
     notificationsEnabled: boolean;
+    // Proton Drive starts at login (see linux/autostart.ts), on unless turned off (#92)
+    startAtLogin: boolean;
     reconcileIntervalSec: number;
     paused: boolean;
     ignorePatterns: string[];
@@ -272,6 +274,7 @@ export class SyncStateDatabase {
             syncDir: map.get('syncDir') || defaultSyncDir,
             conflictStrategy,
             notificationsEnabled: map.has('notificationsEnabled') ? map.get('notificationsEnabled') === 'true' : true,
+            startAtLogin: map.has('startAtLogin') ? map.get('startAtLogin') === 'true' : true,
             reconcileIntervalSec: Number(map.get('reconcileIntervalSec') || 120),
             paused: map.get('paused') === 'true',
             ignorePatterns,
@@ -292,6 +295,7 @@ export class SyncStateDatabase {
         store('syncDir', next.syncDir);
         store('conflictStrategy', next.conflictStrategy);
         store('notificationsEnabled', String(next.notificationsEnabled));
+        store('startAtLogin', String(next.startAtLogin));
         store('reconcileIntervalSec', String(next.reconcileIntervalSec));
         store('paused', String(next.paused));
         store('ignorePatterns', JSON.stringify(next.ignorePatterns));
