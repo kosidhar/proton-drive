@@ -10531,4 +10531,43 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
         }
     });
+
+    describe('an upload held back says whether its folder is in the trash or could not be checked (#166)', () => {
+        const setup = async () => {
+            const d = makeMockDrive();
+            const warnings: string[] = [];
+            const logger = { ...d.logger, warn: (m: string) => warnings.push(m) };
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+            });
+            d.add('Kept.txt', 'kept');
+            d.add('Outer/Folder/a.txt', 'a');
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow();
+            await writeFile(path.join(engine.localRoot(), 'Outer/Folder/new.txt'), 'new');
+            return { ...d, engine, warnings };
+        };
+
+        test('a folder above that could not be looked at is said to be unchecked, not in the trash', async () => {
+            const d = await setup();
+            const getNode = d.sdk.getNode.bind(d.sdk);
+            (d.sdk as any).getNode = async (uid: string) => {
+                if (uid === d.uid('Outer')) throw new Error('network down');
+                return getNode(uid);
+            };
+            await (d.engine as any).handleLocalFileChange('Outer/Folder/new.txt');
+            const held = d.warnings.filter((w) => w.includes('new.txt'));
+            expect(held).toEqual([expect.stringContaining("couldn't be checked")]);
+            expect(held[0]).not.toContain('is in the Proton Drive trash');
+        });
+
+        test('a folder above in the trash is said to be in the trash', async () => {
+            const d = await setup();
+            const outer = d.nodes.get(d.uid('Outer'))!;
+            d.nodes.set(d.uid('Outer'), { ...outer, trashTime: new Date() });
+            await (d.engine as any).handleLocalFileChange('Outer/Folder/new.txt');
+            expect(d.warnings.filter((w) => w.includes('new.txt'))).toEqual([expect.stringContaining('is in the Proton Drive trash')]);
+        });
+    });
 });
