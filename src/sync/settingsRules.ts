@@ -10,8 +10,22 @@ export const MAX_IGNORE_PATTERNS = 500;
 export const MAX_IGNORE_PATTERN_LENGTH = 1024;
 
 // Names no real file has, so only a wildcard can match them: a pattern or a list that ignores all of these hides every
-// file (or, for the nested ones, everything inside folders), whatever the files are called
-const SAMPLE_PATHS = ['zq7-a', 'zq7-b.zq7', 'zq7-c/yk3-d.zq7', '.zq7-e', 'vu9-f/yk3-g/xw5-h'];
+// file (or, for the nested ones, everything inside folders), whatever the files are called. Between them they differ in
+// every feature a broad pattern may key on (#43): first character (lower and upper case, early and late letters, a
+// digit, a dot), a hyphen or none, a digit or none, an extension or none, a space, an underscore
+const SAMPLE_PATHS = [
+    'zq7-a',
+    'Bqk',
+    '4vxq.Wz',
+    '.zq7-e',
+    'q x_j',
+    // A pattern matches a nested path by any of its names: each of these starts all its names alike, so that a pattern
+    // keyed on how a name starts doesn't hide them all
+    'Zq7 c/Yk3-d.zq7',
+    '9vu_f/4y k',
+    'aqj/ykg.w',
+    '.vq/.k8',
+];
 const NESTED_SAMPLE_PATHS = SAMPLE_PATHS.filter((sample) => sample.includes('/'));
 
 function hidesAll(patterns: string[]): boolean {
