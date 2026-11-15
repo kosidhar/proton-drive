@@ -19,6 +19,7 @@ mod inodes;
 mod listing;
 mod readers;
 mod trash;
+mod unlinker;
 
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
@@ -101,6 +102,11 @@ fn main() {
 }
 
 fn run() -> i32 {
+    // The helper's own child, which unlinks what the trash drops (see unlinker.rs)
+    let mut given = std::env::args_os().skip(1);
+    if given.next().is_some_and(|first| first == unlinker::SUBCOMMAND) {
+        return unlinker::serve(given.next().as_deref());
+    }
     let args = match parse_args(std::env::args_os().skip(1)) {
         Ok(args) => args,
         Err(msg) => {
@@ -137,6 +143,11 @@ fn run() -> i32 {
     config.n_threads = Some(4);
     let drive = fs::DriveFs::new(args.backing, daemon::DaemonClient::new(args.socket));
     drive.start_space_refresh();
+    // Started before the session opens /dev/fuse, so that the child never holds it
+    match unlinker::Unlinker::start() {
+        Ok(unlinker) => drive.use_unlinker(unlinker),
+        Err(err) => log!("protondrive-vfs: couldn't start the trash's unlinker ({err}): Files may count trashed items"),
+    }
     let (notifier, mount) = (drive.notifier_slot(), drive.mount_slot());
     let session = match Session::new(drive, &mountpoint, &config) {
         Ok(session) => session,
@@ -150,8 +161,11 @@ fn run() -> i32 {
     let _ = notifier.set(session.notifier());
     // And so can what the trash drops be unlinked through this mount, and only this one (#236)
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-    if let Some(dev) = mount_device(&mountinfo, &mountpoint) {
-        let _ = mount.set(fs::Mount { path: mountpoint.clone(), dev });
+    match mount_device(&mountinfo, &mountpoint) {
+        Some(dev) => {
+            let _ = mount.set(fs::Mount { path: mountpoint.clone(), dev });
+        }
+        None => log!("protondrive-vfs: the drive's mount isn't in mountinfo: Files may count trashed items"),
     }
     // Returns once the kernel ends the session, which an unmount does
     match session.run() {

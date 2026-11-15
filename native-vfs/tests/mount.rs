@@ -1464,6 +1464,156 @@ fn watchers_of_the_trash_hear_an_item_go_after_a_slow_delete() {
     assert_eq!(ls(&files), Vec::<String>::new());
 }
 
+// Without its unlinker, the drive still trashes as it did before #236: the names go, the kernel's entries with them,
+// and the log says so once, naming nothing
+#[test]
+fn the_drive_still_trashes_once_its_unlinker_is_gone() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    for name in ["secret-one.txt", "secret-two.txt"] {
+        std::fs::write(h.backing.join(name), b"x").unwrap();
+    }
+    h.start_daemon(HashMap::new());
+    h.mount();
+    let pid = h.helper.as_ref().unwrap().id();
+    let children = children_of(pid);
+    assert_eq!(children.len(), 1, "the helper's children: {children:?}");
+    let comm = std::fs::read_to_string(format!("/proc/{}/comm", children[0])).unwrap();
+    assert_eq!(comm.trim_end(), "trash-unlinker");
+    unsafe { libc::kill(children[0] as i32, libc::SIGKILL) };
+    let files = h.path(&trash_name()).join("files");
+
+    for name in ["secret-one.txt", "secret-two.txt"] {
+        assert_eq!(renameat2(&h.path(name), &files.join(name), 0), None, "{name}");
+    }
+    let trashed = ["secret-one.txt", "secret-two.txt"].map(|path| json!({ "path": path, "trash": true }));
+    assert_eq!(h.daemon().deletes(), trashed);
+    assert_eq!(ls(&files), Vec::<String>::new());
+    let started = Instant::now();
+    while !h.stderr().contains("unlinker stopped") && started.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let log = h.stderr();
+    assert_eq!(log.matches("unlinker stopped").count(), 1, "{log}");
+    assert!(!log.contains("secret"), "{log}");
+    // Reaped, not left a zombie
+    let started = Instant::now();
+    while std::fs::metadata(format!("/proc/{}", children[0])).is_ok() && started.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(std::fs::metadata(format!("/proc/{}", children[0])).is_err(), "the unlinker wasn't reaped");
+}
+
+/// The FUSE connection of a test mount: its number in /sys/fs/fuse/connections.
+fn connection_of(mountpoint: &Path) -> u32 {
+    let wanted = mountpoint.to_str().unwrap();
+    assert!(wanted.starts_with("/tmp/protondrive-vfs-test-"), "only ever a test mount: {wanted}");
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    let line = mountinfo.lines().find(|l| l.split(' ').nth(4) == Some(wanted)).expect("the test mount in mountinfo");
+    let (major, minor) = line.split(' ').nth(2).unwrap().split_once(':').unwrap();
+    assert_eq!(major, "0");
+    minor.parse().unwrap()
+}
+
+/// The processes `pid` started that are still running.
+fn children_of(pid: u32) -> Vec<u32> {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { return Vec::new() };
+    let lists = tasks.flatten().map(|t| std::fs::read_to_string(t.path().join("children")).unwrap_or_default());
+    lists.flat_map(|l| l.split_whitespace().filter_map(|p| p.parse().ok()).collect::<Vec<u32>>()).collect()
+}
+
+/// The threads of `pid` in uninterruptible sleep (D), by name.
+fn waiting_threads(pid: u32) -> Vec<String> {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { return Vec::new() };
+    let stats = tasks.flatten().map(|t| std::fs::read_to_string(t.path().join("stat")).unwrap_or_default());
+    // pid (comm) state ...: comm may hold spaces and parentheses
+    let waiting = stats.filter_map(|s| {
+        let (open, close) = (s.find('(')?, s.rfind(')')?);
+        (s.get(close + 2..close + 3) == Some("D")).then(|| s[open + 1..close].to_string())
+    });
+    waiting.collect()
+}
+
+/// Waits up to `limit` for the helper to be reaped: its exit status, if it was.
+fn reaped(helper: &mut Child, limit: Duration) -> Option<ExitStatus> {
+    let started = Instant::now();
+    while started.elapsed() < limit {
+        if let Some(status) = helper.try_wait().unwrap() {
+            return Some(status);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+// An unlink in the trash waits on the kernel's lock of files/ for as long as the next rename into it holds it, which
+// is as long as the daemon takes to delete. A helper killed meanwhile (a systemd stop, a logout) must still go, and its
+// connection with it, so that the app's renames return: nothing in the helper may be stuck on that lock (#236)
+#[test]
+fn a_helper_killed_while_trashes_queue_up_goes_and_the_renames_return() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    let n = 8;
+    for k in 0..n {
+        std::fs::write(h.backing.join(format!("i{k}.txt")), b"x").unwrap();
+    }
+    h.start_fake(Fake::new(HashMap::new()).slow_deletes(Duration::from_millis(1000)));
+    h.mount();
+    let connection = connection_of(&h.mountpoint);
+    let pid = h.helper.as_ref().unwrap().id();
+    let files = h.path(&trash_name()).join("files");
+    assert!(files.is_dir());
+    let started_with = children_of(pid);
+    let (tx, renamed) = std::sync::mpsc::channel();
+    for k in 0..n {
+        let (from, to, tx) = (h.path(&format!("i{k}.txt")), files.join(format!("i{k}.txt")), tx.clone());
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100 * k as u64));
+            let _ = tx.send((k, renameat2(&from, &to, 0)));
+        });
+    }
+    // Each rename holds files/ through its delete. An unlink there that comes after the next rename took the lock
+    // waits, uninterruptibly, behind it: that is when the helper is killed
+    let (started, mut since) = (Instant::now(), None::<Instant>);
+    let waiting = loop {
+        let mut waiting = waiting_threads(pid);
+        waiting.extend(children_of(pid).into_iter().flat_map(waiting_threads));
+        since = if waiting.is_empty() { None } else { since.or(Some(Instant::now())) };
+        if since.is_some_and(|at| at.elapsed() >= Duration::from_millis(300)) {
+            break Some(waiting);
+        }
+        if started.elapsed() > Duration::from_secs(n as u64 + 2) {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    // Killed whatever was seen, so that the test always ends the same way
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let status = reaped(h.helper.as_mut().unwrap(), Duration::from_secs(5));
+    if status.is_none() {
+        // Ends the connection, which frees whatever is stuck, so the test leaves nothing behind
+        let _ = std::fs::write(format!("/sys/fs/fuse/connections/{connection}/abort"), b"1");
+        assert!(reaped(h.helper.as_mut().unwrap(), LIMIT).is_some(), "the helper outlived its connection");
+    }
+    h.helper = None;
+    let returned: Vec<usize> =
+        (1..n).filter_map(|_| renamed.recv_timeout(Duration::from_secs(5)).ok()).map(|(k, _)| k).collect();
+    let left = |pid: &u32| std::fs::metadata(format!("/proc/{pid}")).is_ok();
+    let started = Instant::now();
+    while started_with.iter().any(left) && started.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(waiting.is_some(), "no unlink ever waited on files/");
+    assert!(status.is_some(), "the helper outlived SIGKILL until its connection was aborted: {waiting:?} waited");
+    assert_eq!(returned.len(), n - 1, "renames still waiting after the helper went: only {returned:?} returned");
+    let stayed: Vec<&u32> = started_with.iter().filter(|p| left(p)).collect();
+    assert!(stayed.is_empty(), "the helper's children outlived it: {stayed:?}");
+}
+
 #[test]
 fn a_read_write_open_of_an_online_only_file_downloads_it_whole_at_open() {
     if !enabled() {
