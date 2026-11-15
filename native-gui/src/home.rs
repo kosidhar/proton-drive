@@ -480,22 +480,26 @@ fn pause_choices(ctx: &egui::Context, anchor: egui::Rect) -> Option<PauseChoice>
         .fixed_pos(anchor.right_bottom() + Vec2::new(0.0, 6.0))
         .pivot(egui::Align2::RIGHT_TOP)
         .show(ctx, |ui| {
-            Frame::NONE
-                .fill(crate::BG_CARD())
-                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
-                .corner_radius(CornerRadius::same(10))
-                .shadow(egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_rgba_unmultiplied(0, 0, 0, 90) })
-                .inner_margin(Margin::same(6))
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    for choice in PauseChoice::ALL {
-                        if menu_item(ui, choice.label(), 168.0).clicked() {
-                            picked = Some(choice);
-                        }
+            menu_frame().show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for choice in PauseChoice::ALL {
+                    if menu_item(ui, None, choice.label(), 168.0).clicked() {
+                        picked = Some(choice);
                     }
-                });
+                }
+            });
         });
     picked
+}
+
+/// A small menu's card, floating over the window: Pause's choices, the account menu.
+pub(crate) fn menu_frame() -> Frame {
+    Frame::NONE
+        .fill(crate::BG_CARD())
+        .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
+        .corner_radius(CornerRadius::same(10))
+        .shadow(egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_rgba_unmultiplied(0, 0, 0, 90) })
+        .inner_margin(Margin::same(6))
 }
 
 /// Whether a click landed on the Pause choices, as last drawn. Takes their place rather than the context: it is read
@@ -504,15 +508,23 @@ fn pause_choices_hit(choices: Option<egui::Rect>, pointer: Option<egui::Pos2>) -
     matches!((choices, pointer), (Some(rect), Some(pos)) if rect.contains(pos))
 }
 
-/// A row of a small menu: its label on the left, highlighted on hover.
-fn menu_item(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
+/// A row of a small menu: its icon (one of `icons::*`), if any, and its label on the left, highlighted on hover.
+pub(crate) fn menu_item(ui: &mut egui::Ui, icon: Option<&str>, label: &str, width: f32) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 30.0), egui::Sense::click());
+    let enabled = ui.is_enabled();
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         ui.painter().rect_filled(rect, CornerRadius::same(6), btn_secondary_hover_bg());
     }
+    let mut x = rect.left() + 10.0;
+    if let Some(icon) = icon {
+        let at = egui::pos2(x, rect.center().y);
+        ui.painter().text(at, egui::Align2::LEFT_CENTER, icon, crate::icons::font(16.0), TEXT_MUTED());
+        x += 16.0 + 10.0;
+    }
     ui.painter().text(
-        rect.left_center() + Vec2::new(10.0, 0.0),
+        egui::pos2(x, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
         egui::FontId::proportional(13.0),

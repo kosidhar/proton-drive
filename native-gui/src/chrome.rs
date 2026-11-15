@@ -1,13 +1,17 @@
-//! The window's frame around the sections: the sidebar, as Proton's apps have it (#276). From the top: the logo, Open
-//! in Files, the sections, and at its foot the storage meter and the version.
+//! The window's frame around the sections, as Proton's apps have it (#276):
+//! - the sidebar: from the top, the logo, Open in Files, the sections, and at its foot the storage meter and the version;
+//! - the top bar over the section: its title, the gear for Settings, and the account, which opens the account menu
+//!   (#274).
 
 use std::path::Path;
 
-use eframe::egui::{self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Vec2};
+use eframe::egui::{self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, Vec2};
 
 use crate::{
-    action_button_sized, bold, format_bytes, home, icons, AccountInfo, ButtonKind, NavTab, ProtonDriveNativeApp,
-    BG_SIDEBAR, SIDEBAR_HOVER, SIDEBAR_SELECTED, SIDEBAR_TEXT, SIDEBAR_WEAK, STATUS_DANGER, STORAGE_FILL, STORAGE_TRACK,
+    action_button_sized, bold, format_bytes, home, icon_button_pressed, icons, settings, truncate_middle_to_width,
+    AccountInfo, ButtonKind, NavTab, ProtonDriveNativeApp, WorkerCommand, BG_CANVAS, BG_CARD_ALT, BG_SIDEBAR,
+    BORDER_NORM, BORDER_SUBTLE, PROTON_PURPLE, PROTON_PURPLE_SOFT, SIDEBAR_HOVER, SIDEBAR_SELECTED, SIDEBAR_TEXT,
+    SIDEBAR_WEAK, STATUS_DANGER, STORAGE_FILL, STORAGE_TRACK, TEXT_MUTED, TEXT_PRIMARY,
 };
 
 /// The sidebar's one button: the drive's folder in the file manager
@@ -16,6 +20,27 @@ pub(crate) const OPEN_IN_FILES: &str = "Open in Files";
 pub(crate) const OPEN_IN_FILES_WAITS: &str = "Set up a folder in Settings first";
 
 const SIDEBAR_WIDTH: f32 = 252.0;
+/// The top bar's height, over the section
+pub(crate) const TOP_BAR_HEIGHT: f32 = 56.0;
+/// The top bar's room on the left, as the section's, so that the title starts where the cards do
+const TOP_BAR_MARGIN_LEFT: i8 = 26;
+/// And on the right: the initials end where Home's and Settings' cards do (the section's margin and its scroll bar's
+/// gutter, less the account's padding)
+const TOP_BAR_MARGIN_RIGHT: i8 = 32;
+/// The account's initials, in a bordered square on the top bar's right
+const INITIALS_SIZE: f32 = 28.0;
+/// The room around the account's lines and initials (its hover fill), and between them
+const ACCOUNT_PADDING: f32 = 6.0;
+const ACCOUNT_GAP: f32 = 10.0;
+/// The most the account's name and email take on the top bar: longer ones are shortened in the middle
+const ACCOUNT_TEXT_WIDTH: f32 = 220.0;
+/// The gear's side, as `icon_button`'s
+const GEAR_SIZE: f32 = 28.0;
+const ACCOUNT_MENU_ID: &str = "account_menu";
+/// The account menu's rows' width
+const ACCOUNT_MENU_WIDTH: f32 = 280.0;
+const OPEN_WEB: &str = "Open Proton Drive on the web";
+const SIGN_OUT: &str = "Sign out";
 /// The mark's side, beside "Proton Drive"
 const LOGO_SIZE: f32 = 28.0;
 /// A section's row: with the spacing between rows, 38 pt apart, as on drive.proton.me
@@ -30,6 +55,16 @@ const SECTION_ICON_GAP: f32 = 10.0;
 pub(crate) fn storage_meter_text(account: Option<&AccountInfo>) -> Option<String> {
     let a = account.filter(|a| a.max_space > 0)?;
     Some(format!("{} / {}", format_bytes(a.used_space), format_bytes(a.max_space)))
+}
+
+/// A section's title, as the top bar shows it.
+pub(crate) fn tab_title(tab: NavTab) -> &'static str {
+    match tab {
+        NavTab::Home => "Home",
+        NavTab::Shared => "Shared",
+        NavTab::Activity => "Activity",
+        NavTab::Settings => "Settings",
+    }
 }
 
 impl ProtonDriveNativeApp {
@@ -174,4 +209,248 @@ fn storage_bar(ui: &mut egui::Ui, fraction: f32) -> egui::Response {
         ui.painter().rect_filled(used, CornerRadius::same(2), STORAGE_FILL());
     }
     resp
+}
+
+/// Who the top bar says is signed in.
+struct AccountShown {
+    name: String,
+    /// Empty when not known
+    email: String,
+    initials: String,
+    /// Whether the account menu opens: signed in, even without the account's details (an older daemon)
+    signed_in: bool,
+}
+
+/// What the account menu was asked to do
+#[derive(Clone, Copy)]
+enum AccountAction {
+    OpenWeb,
+    SignOut,
+}
+
+impl ProtonDriveNativeApp {
+    /// The top bar over the section: its title on the left; on the right, the gear (Settings), then the account, which
+    /// opens the account menu.
+    pub(crate) fn render_top_bar(&mut self, ctx: &egui::Context) {
+        // Nothing under the confirmation dialog or the Share window takes clicks, and the menu doesn't stay over them
+        let dialog = self.pending_confirm.is_some() || self.share.is_some();
+        if dialog {
+            self.account_menu_open = false;
+        }
+        let (gear, account) = egui::TopBottomPanel::top("top_bar")
+            .exact_height(TOP_BAR_HEIGHT)
+            // The bottom edge is egui's separator line, in BORDER_SUBTLE as the sidebar's
+            .show_separator_line(true)
+            .frame(Frame::NONE.fill(BG_CANVAS()).inner_margin(Margin {
+                left: TOP_BAR_MARGIN_LEFT,
+                right: TOP_BAR_MARGIN_RIGHT,
+                top: 0,
+                bottom: 0,
+            }))
+            .show(ctx, |ui| {
+                if dialog {
+                    ui.disable();
+                }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.label(RichText::new(tab_title(self.tab)).font(bold(17.0)).color(TEXT_PRIMARY()));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // The name and email take what the title, the gear and the initials leave, up to 220 pt
+                        let spacing = ui.spacing().item_spacing.x; // after the account, before the gap to the gear
+                        let fixed = INITIALS_SIZE + 2.0 * ACCOUNT_PADDING + 2.0 * ACCOUNT_GAP + GEAR_SIZE + spacing;
+                        let room = (ui.available_width() - fixed).clamp(0.0, ACCOUNT_TEXT_WIDTH);
+                        let account = self.account_block(ui, room).clicked();
+                        ui.add_space(ACCOUNT_GAP);
+                        let gear = icon_button_pressed(ui, icons::SETTINGS, "Settings", self.tab == NavTab::Settings);
+                        (gear.clicked(), account)
+                    })
+                    .inner
+                })
+                .inner
+            })
+            .inner;
+        if gear {
+            self.open_tab(NavTab::Settings);
+        }
+        self.render_account_menu(ctx);
+        // Shown from the next frame: in this one, the click that opened it would count as a click outside it
+        if account {
+            self.account_menu_open = !self.account_menu_open;
+            ctx.request_repaint();
+        }
+    }
+
+    /// Who the top bar shows: the account, or that it isn't known yet, or that no one is signed in.
+    fn account_shown(&self) -> AccountShown {
+        let unknown = |name: &str, signed_in| AccountShown {
+            name: name.to_string(),
+            email: String::new(),
+            initials: "PD".to_string(),
+            signed_in,
+        };
+        match &self.status.account {
+            Some(a) => AccountShown {
+                name: if a.display_name.is_empty() { "Proton Account".to_string() } else { a.display_name.clone() },
+                email: a.email.clone(),
+                initials: if a.initials.is_empty() { "PD".to_string() } else { a.initials.clone() },
+                signed_in: true,
+            },
+            None if self.status.logged_in => unknown("Proton Account", true),
+            None if self.initial_connecting => unknown("Connecting…", false),
+            None => unknown("Not signed in", false),
+        }
+    }
+
+    /// The account on the top bar's right: the name over the email, each shortened to `room`, then the initials in a
+    /// bordered square, as Proton's top bar has it. Signed in, it is one button, named Account, for the account menu;
+    /// otherwise it only says who isn't signed in.
+    fn account_block(&self, ui: &mut egui::Ui, room: f32) -> egui::Response {
+        let shown = self.account_shown();
+        let painter = ui.painter().clone();
+        let line = |text: &str, size: f32, color| {
+            let font = FontId::proportional(size);
+            painter.layout_no_wrap(truncate_middle_to_width(&painter, text, &font, room), font, color)
+        };
+        let name = line(&shown.name, 13.0, TEXT_PRIMARY());
+        let email = (!shown.email.is_empty()).then(|| line(&shown.email, 11.5, TEXT_MUTED()));
+        let text_width = name.size().x.max(email.as_ref().map_or(0.0, |e| e.size().x));
+        let size = Vec2::new(text_width + ACCOUNT_GAP + INITIALS_SIZE, INITIALS_SIZE) + Vec2::splat(2.0 * ACCOUNT_PADDING);
+        let (rect, resp) = ui.allocate_exact_size(size, if shown.signed_in { Sense::click() } else { Sense::hover() });
+        let enabled = ui.is_enabled();
+        if shown.signed_in {
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, "Account"));
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            // Under the pointer, and while its menu is open
+            if resp.hovered() || self.account_menu_open {
+                painter.rect_filled(rect, CornerRadius::same(8), BG_CARD_ALT());
+            }
+        } else {
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, enabled, &shown.name));
+        }
+        let initials = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - ACCOUNT_PADDING - INITIALS_SIZE / 2.0, rect.center().y),
+            Vec2::splat(INITIALS_SIZE),
+        );
+        painter.rect_stroke(initials, CornerRadius::same(6), Stroke::new(1.0_f32, BORDER_NORM()), egui::StrokeKind::Inside);
+        let initials_font = FontId::proportional(11.5);
+        painter.text(initials.center(), egui::Align2::CENTER_CENTER, &shown.initials, initials_font, TEXT_PRIMARY());
+        // Both lines end at the initials, as in Proton's top bar
+        let right = initials.left() - ACCOUNT_GAP;
+        let height = name.size().y + email.as_ref().map_or(0.0, |e| e.size().y);
+        let top = rect.center().y - height / 2.0;
+        let below = top + name.size().y;
+        painter.galley(egui::pos2(right - name.size().x, top), name, TEXT_PRIMARY());
+        if let Some(email) = email {
+            painter.galley(egui::pos2(right - email.size().x, below), email, TEXT_MUTED());
+        }
+        resp
+    }
+
+    /// The account menu, under the account on the right, over an invisible shield so that a click outside only closes
+    /// it (as Home's Pause choices). It shows who is signed in, with the plan and the storage used, and offers Proton
+    /// Drive on the web and Sign out. Either one, Escape or a click outside closes it.
+    fn render_account_menu(&mut self, ctx: &egui::Context) {
+        let shown = self.account_shown();
+        // Only while signed in (a status saying no one is closes it, see process_worker_events); `--account-menu` opens
+        // it before the first status
+        if !self.account_menu_open || !shown.signed_in {
+            return;
+        }
+        crate::click_shield(ctx, "account_menu_shield", egui::Order::Foreground, None);
+        let screen = ctx.screen_rect();
+        // The menu's right edge lines up with the account's, which ends at the top bar's margin
+        let anchor = egui::pos2(screen.right() - f32::from(TOP_BAR_MARGIN_RIGHT), screen.top() + TOP_BAR_HEIGHT + 4.0);
+        let account = self.status.account.clone();
+        let mut picked = None;
+        // Above its shield, in the order above it, as Pause's choices are: the shield moves to the top of its own order
+        // when pressed, which would bury a menu in that order under it
+        egui::Area::new(egui::Id::new(ACCOUNT_MENU_ID))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(anchor)
+            .pivot(egui::Align2::RIGHT_TOP)
+            .show(ctx, |ui| {
+                home::menu_frame().show(ui, |ui| {
+                    ui.set_width(ACCOUNT_MENU_WIDTH);
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    Frame::NONE.inner_margin(Margin::symmetric(10, 8)).show(ui, |ui| {
+                        account_menu_header(ui, &shown, account.as_ref());
+                        if let Some(storage) = home::storage(account.as_ref()) {
+                            ui.add_space(12.0);
+                            account_menu_storage(ui, &storage);
+                        }
+                    });
+                    ui.separator();
+                    if home::menu_item(ui, Some(icons::WEB), OPEN_WEB, ACCOUNT_MENU_WIDTH).clicked() {
+                        picked = Some(AccountAction::OpenWeb);
+                    }
+                    if home::menu_item(ui, Some(icons::SIGN_OUT), SIGN_OUT, ACCOUNT_MENU_WIDTH).clicked() {
+                        picked = Some(AccountAction::SignOut);
+                    }
+                });
+            });
+        // Read before ctx.input: egui's context lock isn't re-entrant
+        let menu = ctx.memory(|m| m.area_rect(egui::Id::new(ACCOUNT_MENU_ID)));
+        let outside = ctx.input(|i| {
+            let on_menu = matches!((menu, i.pointer.interact_pos()), (Some(menu), Some(at)) if menu.contains(at));
+            i.key_pressed(egui::Key::Escape) || (i.pointer.primary_clicked() && !on_menu)
+        });
+        match picked {
+            Some(AccountAction::OpenWeb) => home::open_in_browser(home::PROTON_DRIVE_WEB_URL),
+            // At once, as Settings' Sign out
+            Some(AccountAction::SignOut) => self.send_account_command(WorkerCommand::Logout),
+            None => {}
+        }
+        if picked.is_some() || outside {
+            self.account_menu_open = false;
+        }
+    }
+}
+
+/// The account menu's top: the initials, then the name over the email, and the plan, as Settings' Account card shows
+/// them. The plan has a line of its own, so that the name keeps the menu's width.
+fn account_menu_header(ui: &mut egui::Ui, shown: &AccountShown, account: Option<&AccountInfo>) {
+    ui.horizontal(|ui| {
+        let (avatar, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
+        ui.painter().rect_filled(avatar, CornerRadius::same(8), PROTON_PURPLE_SOFT());
+        let font = FontId::proportional(13.5);
+        ui.painter().text(avatar.center(), egui::Align2::CENTER_CENTER, &shown.initials, font, TEXT_PRIMARY());
+        ui.add_space(4.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            let room = ui.available_width();
+            let name = truncate_middle_to_width(ui.painter(), &shown.name, &bold(13.5), room);
+            ui.label(RichText::new(name).font(bold(13.5)).color(TEXT_PRIMARY())).on_hover_text(&shown.name);
+            if !shown.email.is_empty() {
+                let font = FontId::proportional(12.0);
+                let email = truncate_middle_to_width(ui.painter(), &shown.email, &font, room);
+                ui.label(RichText::new(email).font(font).color(TEXT_MUTED())).on_hover_text(&shown.email);
+            }
+            if let Some(a) = account.filter(|a| a.max_space > 0) {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| settings::plan_pill(ui, settings::plan_name(a.max_space)));
+            }
+        });
+    });
+}
+
+/// The account menu's storage: "Proton storage", what is used of the quota, and a bar of it.
+fn account_menu_storage(ui: &mut egui::Ui, storage: &home::Storage) {
+    let row = ui
+        .horizontal(|ui| {
+            ui.label(RichText::new("Proton storage").size(12.5).color(TEXT_PRIMARY()));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(&storage.text).size(12.5).color(TEXT_MUTED()));
+            });
+        })
+        .response;
+    ui.add_space(6.0);
+    let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 4.0), Sense::hover());
+    ui.painter().rect_filled(bar, CornerRadius::same(2), BORDER_SUBTLE());
+    if storage.fraction > 0.0 {
+        let used = egui::Rect::from_min_size(bar.min, Vec2::new((bar.width() * storage.fraction).max(bar.height()), bar.height()));
+        ui.painter().rect_filled(used, CornerRadius::same(2), PROTON_PURPLE);
+    }
+    // How much of it is Drive's
+    row.union(ui.interact(bar, ui.id().with("account_menu_storage_bar"), Sense::hover())).on_hover_text(&storage.tooltip);
 }
