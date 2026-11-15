@@ -967,7 +967,7 @@ enum WorkerCommand {
     /// Start fresh with the account signed in to (POST /account/start-fresh, #35)
     StartFresh,
     /// What is shared, for the Shared section (a read, over the control socket)
-    SharedLoad,
+    SharedLoad { seq: u64 },
     /// The Share window (#216), each over the control socket for the item at `rel_path` (inside My files), and
     /// answered to the `window` that asked: how it is shared (a read)
     ShareLoad { window: share::WindowId, rel_path: String },
@@ -1099,7 +1099,7 @@ enum WorkerEvent {
     FilesMissingDone(Result<(), String>),
     StartFreshDone(Result<(), String>),
     /// What the Shared section lists, or why that couldn't be read (#253)
-    SharedLoaded(Result<Vec<shared::SharedItem>, String>),
+    SharedLoaded(u64, Result<Vec<shared::SharedItem>, String>),
     /// How the item of the Share window that asked is shared, or why that couldn't be read (#216)
     ShareLoaded(share::WindowId, Result<share::ShareInfo, String>),
     /// A change made in that Share window went through, or why not
@@ -1391,8 +1391,8 @@ impl ProtonDriveNativeApp {
         // Opened on Shared (--tab shared): the list is asked for as the window opens
         let mut shared = shared::SharedPage::default();
         if initial_tab == NavTab::Shared {
-            shared.begin_load();
-            let _ = cmd_tx.send(WorkerCommand::SharedLoad);
+            let seq = shared.begin_load();
+            let _ = cmd_tx.send(WorkerCommand::SharedLoad { seq });
         }
 
         let edit_sync_dir = initial_status.settings.sync_dir.clone();
@@ -1723,7 +1723,7 @@ impl ProtonDriveNativeApp {
                 WorkerEvent::ConflictsLoaded(conflicts) => {
                     self.conflicts = conflicts;
                 }
-                WorkerEvent::SharedLoaded(result) => self.shared.loaded(result),
+                WorkerEvent::SharedLoaded(seq, result) => self.shared.loaded(seq, result),
                 WorkerEvent::ShareLoaded(window, result) => self.share_loaded(window, result),
                 WorkerEvent::ShareDone(window, result) => self.share_done(window, result),
                 WorkerEvent::SharePassword(window, result) => self.share_password(window, result),
@@ -1941,10 +1941,11 @@ impl ProtonDriveNativeApp {
         self.tab = tab;
     }
 
-    /// Asks for what is shared. Each entry, Refresh and Retry asks again; the newest answer is the one shown.
+    /// Asks for what is shared. Each entry, Refresh and Retry asks again; only the newest read's answer is shown (older ones, which can
+    /// arrive later, are ignored).
     fn load_shared(&mut self) {
-        self.shared.begin_load();
-        let _ = self.tx.send(WorkerCommand::SharedLoad);
+        let seq = self.shared.begin_load();
+        let _ = self.tx.send(WorkerCommand::SharedLoad { seq });
     }
 
     /// Shared: what you've shared, with where it is and what it exposes.
@@ -1954,8 +1955,10 @@ impl ProtonDriveNativeApp {
                 ui.set_min_height(34.0);
                 ui.label(RichText::new("Shared").size(20.0).strong().color(TEXT_PRIMARY()));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if self.shared.error.is_none()
-                        && proton_button(
+                    let loading = self.shared.loading;
+                    let refresh = ui
+                        .add_enabled_ui(!loading, |ui| {
+                            proton_button(
                             ui,
                             Vec2::new(button_width(ui, "Refresh"), 34.0),
                             "Refresh",
@@ -1964,9 +1967,10 @@ impl ProtonDriveNativeApp {
                             Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
                             TEXT_PRIMARY(),
                             13.0,
-                        )
-                        .clicked()
-                    {
+                            )
+                        })
+                        .inner;
+                    if self.shared.error.is_none() && !loading && refresh.clicked() {
                         self.load_shared();
                     }
                 });
@@ -2013,14 +2017,23 @@ impl ProtonDriveNativeApp {
                         if i > 0 {
                             ui.separator();
                         }
-                        let name_font = FontId::new(14.0, FontFamily::Proportional);
-                        let name = truncate_middle_to_width(ui.painter(), &item.name, &name_font, ui.available_width());
-                        ui.label(RichText::new(name).size(14.0).strong().color(TEXT_PRIMARY()));
+                        // First line: the name, then the folder after it; second line: what it exposes
                         let small = FontId::new(12.5, FontFamily::Proportional);
-                        for text in [shared::folder_text(item), shared::exposure_text(item, now, home::local_offset_secs)] {
-                            let shown = truncate_middle_to_width(ui.painter(), &text, &small, ui.available_width());
-                            ui.label(RichText::new(shown).size(12.5).color(TEXT_MUTED()));
-                        }
+                        let name_font = FontId::new(14.0, FontFamily::Proportional);
+                        let folder = shared::folder_text(item);
+                        let room = ui.available_width();
+                        // The name keeps at most two thirds of the line, so a long one never pushes the folder out
+                        let name_w = text_width(ui.painter(), &item.name, &name_font).min(room * 0.66);
+                        let name = truncate_middle_to_width(ui.painter(), &item.name, &name_font, name_w);
+                        let folder_room = room - text_width(ui.painter(), &name, &name_font) - 10.0;
+                        let folder = truncate_middle_to_width(ui.painter(), &folder, &small, folder_room);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(name).size(14.0).strong().color(TEXT_PRIMARY()));
+                            ui.label(RichText::new(folder).size(12.5).color(TEXT_MUTED()));
+                        });
+                        let exposure = shared::exposure_text(item, now, home::local_offset_secs);
+                        let shown = truncate_middle_to_width(ui.painter(), &exposure, &small, ui.available_width());
+                        ui.label(RichText::new(shown).size(12.5).color(TEXT_MUTED()));
                     }
                 });
             });
@@ -4029,8 +4042,8 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                 off_thread(&tx, &ctx, move || WorkerEvent::StartFreshDone(start_fresh_at(&control_socket_path())))
             }
             // The Share window's requests reach Proton's servers through the daemon: each runs on its own thread
-            WorkerCommand::SharedLoad => {
-                off_thread(&tx, &ctx, move || WorkerEvent::SharedLoaded(share::list_at(&control_socket_path())))
+            WorkerCommand::SharedLoad { seq } => {
+                off_thread(&tx, &ctx, move || WorkerEvent::SharedLoaded(seq, share::list_at(&control_socket_path())))
             }
             WorkerCommand::ShareLoad { window, rel_path } => off_thread(&tx, &ctx, move || {
                 WorkerEvent::ShareLoaded(window, share::info_at(&control_socket_path(), &rel_path))
@@ -4490,7 +4503,8 @@ fn main() -> eframe::Result {
                 if app.tab == NavTab::Shared {
                     // The worker doesn't read the list in a screenshot: show the fake one, or an empty one, rather than
                     // loading forever
-                    app.shared.loaded(fake_shared.unwrap_or_else(|| Ok(Vec::new())));
+                    let seq = app.shared.seq;
+                    app.shared.loaded(seq, fake_shared.unwrap_or_else(|| Ok(Vec::new())));
                 }
                 if let Some(info) = fake_share {
                     // The item --share names, or one in the drive (as the startup cache knows it)
@@ -5124,7 +5138,7 @@ mod tests {
                     WorkerCommand::ResolveConflict { id, choice } => Some(format!("resolve {id} {choice}")),
                     WorkerCommand::StartLogin => Some("sign in".to_string()),
                     WorkerCommand::StartFresh => Some("start fresh".to_string()),
-                    WorkerCommand::SharedLoad => Some("shared list".to_string()),
+                    WorkerCommand::SharedLoad { .. } => Some("shared list".to_string()),
                     WorkerCommand::Logout => Some("sign out".to_string()),
                     WorkerCommand::ShareLoad { rel_path, .. } => Some(format!("share info {rel_path}")),
                     WorkerCommand::SharePassword { rel_path, .. } => Some(format!("share password {rel_path}")),
@@ -6408,7 +6422,7 @@ mod tests {
         h.sent();
         assert!(h.text_at(shared::LOADING).is_some());
         let rows = shared_rows();
-        h.event(WorkerEvent::SharedLoaded(Ok(rows.clone())));
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(rows.clone())));
         h.frames(3);
         assert!(h.text_at(shared::LOADING).is_none());
         for item in &rows {
@@ -6417,11 +6431,11 @@ mod tests {
             let exposure = shared::exposure_text(item, home::now_ms(), home::local_offset_secs);
             assert!(h.text_at(&exposure).is_some(), "{exposure}");
         }
-        h.event(WorkerEvent::SharedLoaded(Ok(vec![])));
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(vec![])));
         h.frames(3);
         assert!(h.text_at(shared::EMPTY).is_some());
         let offline = "Proton Drive is offline: try again when you are connected";
-        h.event(WorkerEvent::SharedLoaded(Err(offline.into())));
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Err(offline.into())));
         h.frames(3);
         assert!(h.text_at(shared::EMPTY).is_none());
         assert!(h.text_at(offline).is_some());
@@ -6434,7 +6448,7 @@ mod tests {
         let mut h = Harness::new();
         h.click(h.text_at("Shared").unwrap());
         let rows = shared_rows();
-        h.event(WorkerEvent::SharedLoaded(Ok(rows.clone())));
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(rows.clone())));
         h.frames(3);
         h.sent();
         h.click(h.text_at("Refresh").unwrap());
@@ -6442,9 +6456,68 @@ mod tests {
         h.frames(3);
         assert!(h.text_at(shared::LOADING).is_some());
         assert!(h.text_at(&rows[0].name).is_some());
-        h.event(WorkerEvent::SharedLoaded(Ok(rows.clone())));
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(rows.clone())));
         h.frames(3);
         assert!(h.text_at(shared::LOADING).is_none());
+    }
+
+    #[test]
+    fn only_the_newest_read_is_shown() {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared").unwrap());
+        let old = h.app.shared.seq;
+        // Leaving and entering again while that read is out: a second read
+        h.click(h.text_at("Home").unwrap());
+        h.click(h.text_at("Shared").unwrap());
+        let new = h.app.shared.seq;
+        assert_ne!(old, new);
+        let rows = shared_rows();
+        h.event(WorkerEvent::SharedLoaded(new, Ok(rows.clone())));
+        h.frames(3);
+        // The older read answers last: with a list, with an error; neither changes what is shown
+        h.event(WorkerEvent::SharedLoaded(old, Ok(vec![])));
+        h.event(WorkerEvent::SharedLoaded(old, Err("Proton Drive took too long to answer".into())));
+        h.frames(3);
+        assert!(h.text_at(&rows[0].name).is_some());
+        assert!(h.text_at(shared::EMPTY).is_none());
+        assert!(h.text_at("Proton Drive took too long to answer").is_none());
+        assert!(!h.app.shared.loading);
+        // An older answer doesn't end a newer read's loading either
+        h.click(h.text_at("Home").unwrap());
+        h.click(h.text_at("Shared").unwrap());
+        let older = new;
+        h.event(WorkerEvent::SharedLoaded(older, Ok(vec![])));
+        assert!(h.app.shared.loading);
+        assert!(h.text_at(shared::LOADING).is_some());
+    }
+
+    #[test]
+    fn refresh_does_nothing_while_a_read_is_out() {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared").unwrap());
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(shared_rows())));
+        h.sent();
+        h.click(h.text_at("Refresh").unwrap());
+        assert_eq!(h.sent(), ["shared list"]);
+        h.frames(3);
+        h.click(h.text_at("Refresh").unwrap());
+        assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_row_has_its_name_and_folder_on_one_line_and_what_it_exposes_below() {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared").unwrap());
+        let rows = shared_rows();
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(rows.clone())));
+        h.frames(3);
+        let item = &rows[0];
+        let name = h.text_at(&item.name).unwrap();
+        let folder = h.text_at(&shared::folder_text(item)).unwrap();
+        let exposure = h.text_at(&shared::exposure_text(item, home::now_ms(), home::local_offset_secs)).unwrap();
+        assert!((name.y - folder.y).abs() < 4.0, "{name:?} {folder:?}");
+        assert!(folder.x > name.x);
+        assert!(exposure.y > name.y + 8.0);
     }
 
     // #35: signed in to another account than the files were synced with, Home's Needs attention says so first, and
