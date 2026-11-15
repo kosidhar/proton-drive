@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'bun:test';
 
-import { ValidationError } from '@protontech/drive-sdk/errors';
+import { ConnectionError, ServerError, ValidationError } from '@protontech/drive-sdk/errors';
 import { ErrorCode } from '@protontech/drive-sdk/internal/apiService/errorCodes';
 import { SharingManagement } from '@protontech/drive-sdk/internal/sharing/sharingManagement';
 
@@ -38,9 +38,20 @@ function makeFake(initial: any) {
             state = next;
             return state;
         },
+        // As the SDK: removes what it is given, and answers nothing once the share is empty (it deletes it)
         async unshareNode(...args: any[]) {
             calls.push({ fn: 'unshareNode', args });
             if (failWith) throw failWith;
+            const s = args[1];
+            if (!state) return undefined;
+            if (s.urlAccess === 'remove') state.urlAccess = undefined;
+            const gone = (m: any) => (s.users ?? []).includes(m.inviteeEmail);
+            state.members = state.members.filter((m: any) => !gone(m));
+            state.protonInvitations = state.protonInvitations.filter((m: any) => !gone(m));
+            state.nonProtonInvitations = state.nonProtonInvitations.filter((m: any) => !gone(m));
+            if (!state.urlAccess && !state.members.length && !state.protonInvitations.length && !state.nonProtonInvitations.length) {
+                state = undefined;
+            }
             return state;
         },
     };
@@ -274,6 +285,93 @@ describe('ShareService', () => {
             expect(l.details).not.toContain('@');
             expect(l.details).not.toContain('s3cret');
         }
+    });
+});
+
+describe('ShareService, after the PR 1 review', () => {
+    test('invite refuses someone already on the list, whatever the case, and sends nothing', async () => {
+        for (const listed of ['MEM@x.co', 'inv@X.CO', 'Ext@x.co']) {
+            const { svc, fake, logs } = setup(shared());
+            const e = await rejects(svc.invite('a.txt', ['new@x.co', listed], 'editor'));
+            expect(e).toBeInstanceOf(ShareError);
+            expect(e.message).toBe('Already has access: change their role instead');
+            expect(fake.calls.some((c) => c.fn === 'shareNode')).toBe(false);
+            expect(logs).toEqual([]);
+        }
+        const { svc, fake } = setup(undefined); // not shared yet: nobody is listed
+        await svc.invite('a.txt', ['new@x.co'], 'viewer');
+        expect(fake.calls.find((c) => c.fn === 'shareNode')!.args[1]).toEqual({ users: [{ email: 'new@x.co', role: 'viewer' }] });
+    });
+
+    test('an invalid address is refused before the item is looked up', async () => {
+        const looked: string[] = [];
+        const { svc, fake } = setup(shared(), (p: string) => {
+            looked.push(p);
+            return { uid: 'node1', name: 'a.txt' };
+        });
+        expect((await rejects(svc.invite('a.txt', ['nope'], 'viewer'))).message).toBe('Not a valid email address: nope');
+        expect(looked).toEqual([]);
+        expect(fake.calls).toEqual([]);
+    });
+
+    test('offline reads as offline for every kind of call, and a refusal by the server never does', async () => {
+        const timeout = Object.assign(new Error('Request timed out: GET https://drive-api.proton.me/x'), { name: 'TimeoutError' });
+        const noNetwork = Object.assign(new Error('Offline'), { name: 'OfflineError' });
+        const offline = [new TypeError('fetch failed'), new ConnectionError('Connection lost'), timeout, noNetwork];
+        for (const err of offline) {
+            const calls: Array<[string, (s: ShareService) => Promise<unknown>]> = [
+                ['info', (s) => s.info('a.txt')],
+                ['password', (s) => s.password('a.txt')],
+                ['ensureLink', (s) => s.ensureLink('a.txt')],
+                ['setLinkSettings', (s) => s.setLinkSettings('a.txt', { password: 'x' })],
+                ['removeLink', (s) => s.removeLink('a.txt')],
+                ['invite', (s) => s.invite('a.txt', ['new@x.co'], 'viewer')],
+                ['setRole', (s) => s.setRole('a.txt', 'mem@x.co', 'viewer')],
+                ['removePerson', (s) => s.removePerson('a.txt', 'mem@x.co')],
+            ];
+            for (const [name, call] of calls) {
+                const { svc, fake, logs } = setup(shared());
+                fake.fail(err);
+                const e = await rejects(call(svc));
+                expect([err.name, name, e.message]).toEqual([err.name, name, 'Proton Drive is offline: try again when you are connected']);
+                expect(logs).toEqual([]);
+            }
+        }
+        const { svc, fake } = setup(shared());
+        fake.fail(new ServerError('Too many server errors, please try again later'));
+        expect((await rejects(svc.info('a.txt'))).message).toBe('Proton Drive refused: Too many server errors, please try again later');
+    });
+
+    test('a history entry that fails to be written never fails a change already made', async () => {
+        const fake = makeFake(shared({ urlAccess: undefined }));
+        const svc = createShareService({
+            sdk: fake.sdk,
+            nodeFor: () => ({ uid: 'node1', name: 'a.txt' }),
+            logActivity: () => {
+                throw new Error('disk full');
+            },
+            now: () => 1000,
+        });
+        expect(await svc.ensureLink('a.txt')).toEqual({ url: LINK_URL, created: true });
+        expect((await svc.setLinkSettings('a.txt', { password: 'pw' })).link?.hasPassword).toBe(true);
+        expect((await svc.invite('a.txt', ['new@x.co'], 'viewer')).people.length).toBeGreaterThan(0);
+        expect((await svc.setRole('a.txt', 'mem@x.co', 'viewer')).people.length).toBeGreaterThan(0);
+        expect((await svc.removePerson('a.txt', 'mem@x.co')).people.some((p) => p.email === 'mem@x.co')).toBe(false);
+        expect((await svc.removeLink('a.txt')).link).toBeNull();
+    });
+
+    test('removing answers what the removal left, without asking again', async () => {
+        const { svc, fake } = setup(shared());
+        const afterLink = await svc.removeLink('a.txt');
+        expect(afterLink.link).toBeNull();
+        expect(afterLink.people.map((p) => p.email)).toEqual(['mem@x.co', 'inv@x.co', 'ext@x.co']);
+        const afterPerson = await svc.removePerson('a.txt', 'inv@x.co');
+        expect(afterPerson.people.map((p) => p.email)).toEqual(['mem@x.co', 'ext@x.co']);
+        // removePerson asks once, to find the address as listed; nothing is asked after a removal
+        expect(fake.calls.map((c) => c.fn)).toEqual(['unshareNode', 'getSharingInfo', 'unshareNode']);
+        // The last one out: the SDK deletes the share and answers nothing
+        await svc.removePerson('a.txt', 'mem@x.co');
+        expect(await svc.removePerson('a.txt', 'ext@x.co')).toEqual({ link: null, people: [] });
     });
 });
 

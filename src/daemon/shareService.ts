@@ -1,4 +1,4 @@
-import { MemberRole, type ProtonDriveClient, type URLAccess } from '@protontech/drive-sdk';
+import { ConnectionError, MemberRole, type ProtonDriveClient, type ShareResult, type URLAccess } from '@protontech/drive-sdk';
 
 export type ShareRole = 'viewer' | 'editor';
 
@@ -48,8 +48,13 @@ function isOlderLink(url: string): boolean {
 // The URL as it may be shown: an older link's without the password after its '#'
 const shownUrl = (url: string) => (isOlderLink(url) ? url.split('#')[0] : url);
 
+// The network, not Proton Drive: the SDK's ConnectionError, a request that timed out (ky's TimeoutError, once the SDK's
+// retries are spent) or found no network (OfflineError), or a fetch that couldn't connect. Not remoteErrors.isTransient,
+// which counts every ServerError, refusals answered with an API code among them: those read as refused, not offline.
+const OFFLINE_ERRORS = new Set(['ConnectionError', 'TimeoutError', 'OfflineError', 'NetworkError']);
 function isOffline(e: unknown): boolean {
     const err = e as { name?: string; message?: string; code?: string } | null;
+    if (e instanceof ConnectionError || OFFLINE_ERRORS.has(err?.name ?? '')) return true;
     const text = `${err?.name ?? ''} ${err?.code ?? ''} ${err?.message ?? ''}`;
     return (
         (e instanceof TypeError && /fetch failed|network/i.test(text)) ||
@@ -103,18 +108,26 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
         });
     }
 
+    // Everyone on the item's list: its members, and the people invited
+    const everyone = (r: ShareResult | undefined) => (r ? [...r.members, ...r.protonInvitations, ...r.nonProtonInvitations] : []);
+
     // The address as the item's list has it: acting on someone not on it would send a new invitation (or do nothing)
     async function listed(uid: string, email: string): Promise<string> {
-        const r = await sdk.getSharingInfo(uid);
-        const all = r ? [...r.members, ...r.protonInvitations, ...r.nonProtonInvitations] : [];
-        const found = all.find((m) => m.inviteeEmail.toLowerCase() === email.toLowerCase());
+        const found = everyone(await sdk.getSharingInfo(uid)).find((m) => m.inviteeEmail.toLowerCase() === email.toLowerCase());
         if (!found) throw new ShareError("That person doesn't have access to this item");
         return found.inviteeEmail;
     }
 
-    const log = (path: string, details: string) => deps.logActivity({ action: 'share', localRelPath: path, details });
+    // Best effort: the change is made by then, and a history entry that can't be written must not report it as failed
+    const log = (path: string, details: string) => {
+        try {
+            deps.logActivity({ action: 'share', localRelPath: path, details });
+        } catch {
+            // The entry is lost; the change stands
+        }
+    };
 
-    function toInfo(result: Awaited<ReturnType<typeof sdk.getSharingInfo>>): ShareInfo {
+    function toInfo(result: ShareResult | undefined): ShareInfo {
         if (!result) return { link: null, people: [] };
         const u = result.urlAccess;
         return {
@@ -148,10 +161,8 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
         }
     }
 
-    const infoOf = (uid: string) => sdk.getSharingInfo(uid).then(toInfo);
-
     return {
-        info: (path) => run(path, (n) => infoOf(n.uid)),
+        info: (path) => run(path, async (n) => toInfo(await sdk.getSharingInfo(n.uid))),
 
         password: (path) =>
             run(path, async (n) => {
@@ -201,9 +212,10 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
 
         async removeLink(path) {
             return run(path, async (n) => {
-                await sdk.unshareNode(n.uid, { urlAccess: 'remove' });
+                // What is left, or nothing once the SDK has deleted the emptied share
+                const result = await sdk.unshareNode(n.uid, { urlAccess: 'remove' });
                 log(path, `Stopped sharing the link to ${n.name}`);
-                return infoOf(n.uid);
+                return toInfo(result);
             });
         },
 
@@ -211,6 +223,12 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
             const bad = emails.find((e) => !EMAIL.test(e));
             if (bad !== undefined) throw new ShareError(`Not a valid email address: ${bad}`);
             return run(path, async (n) => {
+                // The SDK matches an address already on the list exactly as written, and changes that person's role
+                // instead of inviting them: a role changes only through setRole
+                const listedNow = new Set(everyone(await sdk.getSharingInfo(n.uid)).map((m) => m.inviteeEmail.toLowerCase()));
+                if (emails.some((e) => listedNow.has(e.toLowerCase()))) {
+                    throw new ShareError('Already has access: change their role instead');
+                }
                 const result = await sdk.shareNode(n.uid, { users: emails.map((email) => ({ email, role: sdkRole(role) })) });
                 log(path, `Invited ${emails.length} ${emails.length === 1 ? 'person' : 'people'} to ${n.name}`);
                 return toInfo(result);
@@ -228,9 +246,9 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
 
         async removePerson(path, email) {
             return run(path, async (n) => {
-                await sdk.unshareNode(n.uid, { users: [await listed(n.uid, email)] });
+                const result = await sdk.unshareNode(n.uid, { users: [await listed(n.uid, email)] });
                 log(path, `Removed someone's access to ${n.name}`);
-                return infoOf(n.uid);
+                return toInfo(result);
             });
         },
     };
