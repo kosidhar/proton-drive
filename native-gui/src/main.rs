@@ -2070,6 +2070,8 @@ impl ProtonDriveNativeApp {
             if items.is_empty() {
                 if !loading {
                     ui.add(egui::Label::new(RichText::new(shared::EMPTY).size(13.0).color(TEXT_MUTED())).wrap());
+                    ui.add_space(8.0);
+                    Self::shared_photos_note(ui, self.screenshot_target.is_some());
                 }
                 return;
             }
@@ -2165,8 +2167,21 @@ impl ProtonDriveNativeApp {
                     }
                 });
             });
+            ui.add_space(10.0);
+            Self::shared_photos_note(ui, self.screenshot_target.is_some());
             if let Some((action, i)) = act {
                 self.act_on_shared_row(ui.ctx(), action, i);
+            }
+        });
+    }
+
+    /// The daemon never lists Photos shares, so the page says where to find them (#256).
+    fn shared_photos_note(ui: &mut egui::Ui, screenshot: bool) {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.label(RichText::new(shared::PHOTOS_NOTE).size(12.5).color(TEXT_MUTED()));
+            if ui.add(egui::Link::new(RichText::new(shared::PHOTOS_LINK).size(12.5))).clicked() {
+                home::open_externally(std::ffi::OsStr::new(shared::WEB_SHARED_URL), screenshot);
             }
         });
     }
@@ -6873,6 +6888,40 @@ mod tests {
     fn manage_on_the_web_opens_the_shared_page_there() {
         let mut h = shared_with_rows();
         h.click(on_row(&h, "holiday.jpg", "Manage on the web"));
+        assert!(home::LAUNCHED.with(|l| l.borrow().iter().any(|t| t == shared::WEB_SHARED_URL)));
+        assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn shared_notes_that_photos_may_be_missing_under_rows_and_under_the_empty_text() {
+        let mut h = shared_with_rows();
+        assert!(h.text_at(shared::PHOTOS_NOTE).is_some(), "under the list");
+        assert!(h.text_at(shared::PHOTOS_LINK).is_some());
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(vec![])));
+        h.frames(3);
+        assert!(h.text_at(shared::EMPTY).is_some());
+        assert!(h.text_at(shared::PHOTOS_NOTE).is_some(), "under the empty text");
+        assert!(h.text_at(shared::PHOTOS_LINK).is_some());
+    }
+
+    #[test]
+    fn shared_does_not_note_photos_while_first_loading_or_on_an_error() {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared").unwrap());
+        h.frames(3);
+        assert!(h.text_at(shared::LOADING).is_some());
+        assert!(h.text_at(shared::PHOTOS_NOTE).is_none(), "first load");
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Err("Proton Drive is offline".into())));
+        h.frames(3);
+        assert!(h.text_at("Retry").is_some());
+        assert!(h.text_at(shared::PHOTOS_NOTE).is_none(), "error");
+        assert!(h.text_at(shared::PHOTOS_LINK).is_none());
+    }
+
+    #[test]
+    fn see_them_on_drive_proton_me_opens_the_shared_page_there() {
+        let mut h = shared_with_rows();
+        h.click(h.text_at(shared::PHOTOS_LINK).expect("the link"));
         assert!(home::LAUNCHED.with(|l| l.borrow().iter().any(|t| t == shared::WEB_SHARED_URL)));
         assert_eq!(h.sent(), Vec::<String>::new());
     }
