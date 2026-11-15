@@ -363,7 +363,7 @@ fn tone_color(tone: Tone) -> Color32 {
 }
 
 /// Opens a folder in the file manager; a screenshot opens nothing.
-fn open_in_files(folder: &std::path::Path) {
+pub(crate) fn open_in_files(folder: &std::path::Path) {
     open_externally(folder.as_os_str(), screenshot());
 }
 
@@ -784,7 +784,8 @@ impl ProtonDriveNativeApp {
         });
     }
 
-    /// Your drive: where it is and how it is shown, the account's storage, and what is on this computer.
+    /// Your drive: where it is and how it is shown, its trash, and what is on this computer. Open in Files is the
+    /// sidebar's, and the account's storage is at the sidebar's foot.
     fn render_your_drive(&mut self, ui: &mut egui::Ui) {
         let sync_dir = self.status.sync_dir.clone();
         card_frame().show(ui, |ui| {
@@ -793,12 +794,8 @@ impl ProtonDriveNativeApp {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // Laid out from the right: Open in Files, then the trash beside it. Neither before a folder is set up
+                    // The trash, on the right. Not before a folder is set up
                     if !sync_dir.is_empty() {
-                        if secondary_button(ui, "Open in Files", 32.0).clicked() {
-                            open_in_files(std::path::Path::new(&sync_dir));
-                        }
-                        ui.add_space(8.0);
                         if secondary_button(ui, OPEN_TRASH, 32.0).on_hover_text(trash_hover(&sync_dir)).clicked() {
                             open_in_browser(PROTON_DRIVE_TRASH_URL);
                         }
@@ -811,23 +808,6 @@ impl ProtonDriveNativeApp {
                     });
                 });
             });
-
-            if let Some(s) = storage(self.status.account.as_ref()) {
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(10.0);
-                let row = ui
-                    .horizontal(|ui| {
-                        ui.label(RichText::new("Proton storage").size(13.0).color(TEXT_PRIMARY()));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new(&s.text).size(13.0).strong().color(TEXT_PRIMARY()));
-                        });
-                    })
-                    .response;
-                ui.add_space(6.0);
-                let bar = usage_bar(ui, s.fraction);
-                row.union(bar).on_hover_text(&s.tooltip);
-            }
 
             ui.add_space(12.0);
             ui.separator();
@@ -850,19 +830,6 @@ impl ProtonDriveNativeApp {
             }
         });
     }
-}
-
-/// The storage bar: a track visible on the card in both themes, filled to `fraction`.
-fn usage_bar(ui: &mut egui::Ui, fraction: f32) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(3), BORDER_SUBTLE());
-    if fraction > 0.0 {
-        // At least as wide as it is tall, so a little use still shows
-        let w = (rect.width() * fraction).max(rect.height());
-        let fill = egui::Rect::from_min_size(rect.min, Vec2::new(w, rect.height()));
-        ui.painter().rect_filled(fill, CornerRadius::same(3), PROTON_PURPLE);
-    }
-    resp
 }
 
 /// One problem in Needs attention, in its own box.
