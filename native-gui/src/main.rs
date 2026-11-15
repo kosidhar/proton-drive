@@ -214,30 +214,6 @@ const STATUS_DANGER: Color32 = Color32::from_rgb(220, 50, 81); // #DC3251
 const STATUS_DANGER_HOVER: Color32 = Color32::from_rgb(196, 43, 71); // #C42B47
 
 #[inline]
-fn table_header_bg() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(243, 241, 250)
-    } else {
-        Color32::from_rgb(26, 23, 36)
-    }
-}
-#[inline]
-fn row_hover_bg() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(240, 236, 252)
-    } else {
-        Color32::from_rgb(43, 38, 60)
-    }
-}
-#[inline]
-fn row_divider_color() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(234, 231, 244)
-    } else {
-        Color32::from_rgb(40, 35, 54)
-    }
-}
-#[inline]
 fn btn_secondary_hover_bg() -> Color32 {
     if is_light_mode() {
         Color32::from_rgb(228, 224, 242)
@@ -2288,44 +2264,31 @@ impl ProtonDriveNativeApp {
     fn render_activity_content(&mut self, ui: &mut egui::Ui, viewport_h: f32) {
         let content_top = ui.cursor().top();
 
-        // The search and the filter on the right, and Sign in while signed out (the title is the top bar's)
-        ui.horizontal(|ui| {
-            ui.set_min_height(34.0);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if !self.status.logged_in
-                    && proton_button(
-                        ui,
-                        Vec2::new(165.0, 34.0),
-                        "Sign in to Proton Drive",
-                        PROTON_PURPLE,
-                        PROTON_PURPLE_HOVER,
-                        None,
-                        Color32::WHITE,
-                        13.0,
-                    )
-                    .clicked()
-                {
-                    self.send_account_command(WorkerCommand::StartLogin);
+        // Sign in while signed out, the search and the filter; the row wraps to a second line when the page is narrow
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+            if !self.status.logged_in
+                && proton_button(
+                    ui,
+                    Vec2::new(165.0, 34.0),
+                    "Sign in to Proton Drive",
+                    PROTON_PURPLE,
+                    PROTON_PURPLE_HOVER,
+                    None,
+                    Color32::WHITE,
+                    13.0,
+                )
+                .clicked()
+            {
+                self.send_account_command(WorkerCommand::StartLogin);
+            }
+            let width = ui.available_width().clamp(120.0, ACTIVITY_SEARCH_WIDTH);
+            search_field(ui, &mut self.search_query, "Search activity", width);
+            for (filter, label) in activity::FILTERS.iter() {
+                if filter_chip(ui, label, self.activity_filter == *filter) {
+                    self.activity_filter = *filter;
                 }
-                ui.add_space(8.0);
-                // Room kept for the filter beside it, so a narrow window never pushes it out
-                let width = (ui.available_width() - ACTIVITY_FILTER_WIDTH).clamp(120.0, 280.0);
-                ui.add_sized(
-                    [width, 32.0],
-                    egui::TextEdit::singleline(&mut self.search_query)
-                        .hint_text("Search activity")
-                        .vertical_align(Align::Center),
-                );
-                ui.add_space(8.0);
-                // The filter, laid out from the right: All first, reading left to right
-                for (filter, label) in activity::FILTERS.iter().rev() {
-                    let on = self.activity_filter == *filter;
-                    let text = RichText::new(*label).size(12.5).color(if on { PROTON_PURPLE_TEXT() } else { TEXT_MUTED() });
-                    if ui.selectable_label(on, text).clicked() {
-                        self.activity_filter = *filter;
-                    }
-                }
-            });
+            }
         });
 
         if let Some(error) = &self.account_error {
@@ -2347,13 +2310,12 @@ impl ProtonDriveNativeApp {
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
 
-            // Full-width Column Header Bar for Recent Sync Activity
+            // The column names, quiet, over a line: no band
             let (hdr_rect, _) =
                 ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::hover());
-            ui.painter().rect_filled(
-                hdr_rect,
-                CornerRadius::same(7),
-                table_header_bg(),
+            ui.painter().line_segment(
+                [hdr_rect.left_bottom(), hdr_rect.right_bottom()],
+                Stroke::new(1.0_f32, BORDER_SUBTLE()),
             );
             let hdr_y = hdr_rect.center().y;
             let file_col_x = hdr_rect.min.x + 152.0;
@@ -2448,7 +2410,7 @@ impl ProtonDriveNativeApp {
                                 ui.painter().rect_filled(
                                     row_rect,
                                     CornerRadius::same(6),
-                                    row_hover_bg(),
+                                    BG_INPUT(),
                                 );
                             }
                             ui.painter().line_segment(
@@ -2456,7 +2418,7 @@ impl ProtonDriveNativeApp {
                                     egui::pos2(row_rect.min.x + 10.0, row_rect.max.y),
                                     egui::pos2(row_rect.max.x - 10.0, row_rect.max.y),
                                 ],
-                                Stroke::new(1.0_f32, row_divider_color()),
+                                Stroke::new(1.0_f32, BORDER_SUBTLE()),
                             );
 
                             let cy = row_rect.center().y;
@@ -3823,7 +3785,7 @@ const ACTIVITY_TABLE_MIN_HEIGHT: f32 = 200.0;
 const ACTIVITY_FETCHED: usize = 200;
 const ACTIVITY_SHOWN: usize = 200;
 /// About the width of the Activity filter (All, Uploads, Downloads, Problems), kept free beside the search
-const ACTIVITY_FILTER_WIDTH: f32 = 290.0;
+const ACTIVITY_SEARCH_WIDTH: f32 = 260.0;
 
 /// The family bold text is laid out in: Inter SemiBold (#279).
 const BOLD_FAMILY: &str = "bold";
@@ -4015,6 +3977,49 @@ fn draw_file_icon(painter: &egui::Painter, rect: egui::Rect, filename: &str) {
 }
 
 /// An Activity row's identity, to keep it open across refreshes: the daemon's id, or without one what it says
+/// A filter chip's fill and label: white on Proton's purple when selected, else the quiet input colours.
+fn chip_colors(p: &Palette, selected: bool) -> (Color32, Color32) {
+    if selected {
+        (PROTON_PURPLE, Color32::WHITE)
+    } else {
+        (p.input, p.text_weak)
+    }
+}
+
+/// A filter chip: a pill that fits its label. Returns whether it was clicked.
+fn filter_chip(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
+    let font = FontId::new(12.5, FontFamily::Proportional);
+    let width = text_width(ui.painter(), label, &font) + 24.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 28.0), Sense::click());
+    let (fill, text) = chip_colors(palette(), selected);
+    ui.painter().rect_filled(rect, CornerRadius::same(14), fill);
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, label, font, text);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+/// The search field: a rounded input with a magnifier on its left, outlined in purple only while it has focus.
+fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32) {
+    let id = egui::Id::new("activity_search");
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::hover());
+    let focused = ui.memory(|m| m.has_focus(id));
+    let stroke = if focused { Stroke::new(1.0_f32, PROTON_PURPLE) } else { Stroke::NONE };
+    ui.painter().rect(rect, CornerRadius::same(8), BG_INPUT(), stroke, egui::StrokeKind::Inside);
+    ui.painter().text(
+        egui::pos2(rect.min.x + 10.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        icons::SEARCH,
+        icons::font(16.0),
+        TEXT_MUTED(),
+    );
+    let edit_rect = egui::Rect::from_min_max(egui::pos2(rect.min.x + 34.0, rect.min.y), egui::pos2(rect.max.x - 8.0, rect.max.y));
+    // A child of the field's own box, so the row's spacing after it stays what the row says
+    let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(edit_rect));
+    inner.add_sized(
+        edit_rect.size(),
+        egui::TextEdit::singleline(text).id(id).hint_text(hint).frame(false).vertical_align(Align::Center),
+    );
+}
+
 fn activity_key(act: &ActivityRecord) -> String {
     match act.id {
         Some(id) => format!("#{id}"),
@@ -5535,6 +5540,29 @@ mod tests {
             nodes
         }
 
+        /// The colour the last frame painted this text in, the first time it painted it.
+        fn text_color_at(&self, text: &str) -> Option<Color32> {
+            self.texts(|t| t.galley.text() == text).first().map(|t| {
+                t.galley.job.sections.first().map_or(t.fallback_color, |s| s.format.color)
+            })
+        }
+
+        /// The rectangle and fill of the topmost rectangle the last frame painted under a point.
+        fn rect_under(&self, pos: egui::Pos2) -> Option<(egui::Rect, Color32)> {
+            fn rects(shape: &egui::Shape, out: &mut Vec<(egui::Rect, Color32)>) {
+                match shape {
+                    egui::Shape::Rect(r) => out.push((r.rect, r.fill)),
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| rects(s, out)),
+                    _ => {}
+                }
+            }
+            let mut all = Vec::new();
+            for clipped in &self.last.as_ref()?.shapes {
+                rects(&clipped.shape, &mut all);
+            }
+            all.into_iter().rev().find(|(rect, fill)| rect.contains(pos) && *fill != Color32::TRANSPARENT)
+        }
+
         /// The fill of the topmost rectangle the last frame painted under a point (a button's background).
         fn fill_under(&self, pos: egui::Pos2) -> Option<Color32> {
             fn rects(shape: &egui::Shape, out: &mut Vec<(egui::Rect, Color32)>) {
@@ -5951,6 +5979,61 @@ mod tests {
         h.frames(2);
         assert!(h.text_at("Docs/Report.pdf").is_none());
         assert!(h.text_at("No activity matches \"nothing like it\".").is_some());
+    }
+
+    // #275: the selected filter is white on purple, and each chip reads in both themes
+    #[test]
+    fn the_selected_chip_is_readable() {
+        for p in [&LIGHT, &DARK] {
+            for selected in [true, false] {
+                let (fill, text) = chip_colors(p, selected);
+                assert!(contrast(text, fill) >= 4.5, "selected {selected}: {}", contrast(text, fill));
+            }
+        }
+        let mut h = Harness::new();
+        h.app.tab = NavTab::Activity;
+        h.frames(3);
+        let all = h.text_at("All").expect("the All chip is painted");
+        assert_eq!(h.fill_under(all), Some(PROTON_PURPLE));
+        assert_eq!(h.text_color_at("All"), Some(Color32::WHITE));
+        let uploads = h.text_at("Uploads").expect("the Uploads chip is painted");
+        assert_eq!(h.fill_under(uploads), Some(palette().input));
+        assert_eq!(h.text_color_at("Uploads"), Some(palette().text_weak));
+        h.click(uploads);
+        assert_eq!(h.fill_under(h.text_at("Uploads").unwrap()), Some(PROTON_PURPLE));
+        assert_eq!(h.text_color_at("Uploads"), Some(Color32::WHITE));
+        assert_eq!(h.fill_under(h.text_at("All").unwrap()), Some(palette().input));
+    }
+
+    #[test]
+    fn activity_search_has_its_icon() {
+        let mut h = Harness::new();
+        h.app.tab = NavTab::Activity;
+        h.frames(3);
+        let hint = h.text_rect("Search activity").expect("the search hint is painted");
+        let icon = h.text_rect(icons::SEARCH).expect("the search glyph is painted");
+        assert!(icon.max.x <= hint.min.x, "the glyph {icon:?} sits left of the hint {hint:?}");
+        assert!((icon.center().y - hint.center().y).abs() < 4.0);
+        assert_eq!(h.fill_under(hint.center()), Some(palette().input));
+    }
+
+    // #280: every chip and the search field stay inside the page at the smallest window and 120% zoom
+    #[test]
+    fn activity_top_row_fits_at_the_smallest_window_and_120_percent_zoom() {
+        for logged_in in [true, false] {
+            let mut h = Harness::new();
+            h.app.tab = NavTab::Activity;
+            h.app.status.logged_in = logged_in;
+            h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
+            let right_max = 840.0 / 1.2;
+            for label in ["All", "Uploads", "Downloads", "Problems", "Search activity"] {
+                let pos = h.text_at(label).unwrap_or_else(|| panic!("{label} is painted (logged in {logged_in})"));
+                let (rect, _) = h.rect_under(pos).unwrap_or_else(|| panic!("{label} has a box"));
+                assert!(rect.max.x <= right_max, "{label} runs past the right edge: {rect:?} (logged in {logged_in})");
+                assert!(rect.min.x >= SIDEBAR_EDGE, "{label} runs into the sidebar: {rect:?} (logged in {logged_in})");
+            }
+            assert_eq!(h.text_at("Sign in to Proton Drive").is_some(), !logged_in);
+        }
     }
 
     #[test]
