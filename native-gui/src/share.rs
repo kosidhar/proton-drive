@@ -16,6 +16,7 @@ use eframe::egui::{
 use serde::Deserialize;
 
 use crate::home::{self, elided, primary_button, secondary_button};
+use crate::single_instance::PathProblem;
 use crate::{
     button_width, control_request_at, proton_button, toggle_switch, ProtonDriveNativeApp, WorkerCommand, BG_CARD,
     BG_INPUT, BORDER_SUBTLE, PROTON_PURPLE, PROTON_PURPLE_HOVER, STATUS_DANGER, STATUS_DANGER_HOVER, TEXT_MUTED,
@@ -103,6 +104,16 @@ const MAX_EXPIRY_YEARS: i64 = 10;
 const SHARE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// A change can take longer: inviting many people is a request for each.
 const SHARE_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Why the window can't share what a start named (`--share`), in its words: Files says the same for the two it can meet.
+pub fn refusal(problem: PathProblem) -> &'static str {
+    match problem {
+        PathProblem::NotAbsolute => "Proton Drive needs the item's full path, starting with /",
+        PathProblem::TooLong => "This path is too long for Proton Drive to share",
+        PathProblem::LineBreak => "Proton Drive can't share an item whose path has a line break in it",
+        PathProblem::NotUtf8 => "Proton Drive can't share an item whose path isn't valid UTF-8",
+    }
+}
 
 /// The item's path inside My files, from its absolute path and the sync folder; None when it isn't inside the folder
 /// (the folder itself included).
@@ -513,6 +524,20 @@ impl ShareWindow {
             copied: false,
             focus_field: false,
         }
+    }
+
+    /// The window for what a start named but can't be shared (`shown`, only to show): it says why, and asks nothing.
+    pub fn refused(shown: &str, problem: PathProblem) -> Self {
+        let mut w = Self::new(shown);
+        w.resolved = true;
+        w.info = Some(Err(refusal(problem).to_string()));
+        w
+    }
+
+    /// Whether it is on an item in the drive, or may yet be (it waits to know where the drive is): not one that could
+    /// only say why it can't share (outside the drive, or a path that can't be shared).
+    pub fn may_share(&self) -> bool {
+        !self.resolved || !self.rel_path.is_empty()
     }
 
     /// The change it sent that isn't answered yet, if any, as it is closed or replaced.

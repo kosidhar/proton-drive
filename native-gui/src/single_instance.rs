@@ -4,6 +4,7 @@
 //! The lock decides who is first, not the socket: a socket left by a crashed GUI is just removed by the next one to
 //! get the lock, and two starts at once can't both become the primary, since only one gets the lock.
 
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -61,6 +62,9 @@ const MAX_SECTION: usize = 32;
 /// The longest absolute path a share request carries (Linux's PATH_MAX)
 const MAX_SHARE_PATH: usize = 4096;
 const SHARE: &str = "share";
+const SHARE_REFUSED: &str = "share-refused";
+/// The most of a path a refusal carries, only to show it
+const MAX_SHOWN: usize = 1024;
 
 /// What a later start asks of the running app.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +73,40 @@ pub enum Request {
     Show(Option<String>),
     /// Show the window with the share window open for this absolute path (#216)
     Share(String),
+    /// Show the window with the share window saying why the path a start named can't be shared (#216). `shown` is
+    /// that path made fit to show (see `showable`): it is never used as a path.
+    ShareRefused { shown: String, problem: PathProblem },
+}
+
+/// Why a path given to share can't be shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathProblem {
+    /// Not a full path (it doesn't start with /)
+    NotAbsolute,
+    /// Longer than any path on Linux
+    TooLong,
+    /// It has a line break (or a NUL) in it, which can't travel on the request's one line
+    LineBreak,
+    /// It isn't UTF-8 text, which the request and the daemon's routes are
+    NotUtf8,
+}
+
+impl PathProblem {
+    /// As a refusal carries it
+    fn code(self) -> &'static str {
+        match self {
+            PathProblem::NotAbsolute => "not-absolute",
+            PathProblem::TooLong => "too-long",
+            PathProblem::LineBreak => "line-break",
+            PathProblem::NotUtf8 => "not-utf8",
+        }
+    }
+
+    fn from_code(code: &str) -> Option<Self> {
+        [PathProblem::NotAbsolute, PathProblem::TooLong, PathProblem::LineBreak, PathProblem::NotUtf8]
+            .into_iter()
+            .find(|p| p.code() == code)
+    }
 }
 
 /// A path travels on one line: absolute, within the limit, and with nothing that ends or breaks the line.
@@ -76,9 +114,37 @@ pub fn is_shareable_path(path: &str) -> bool {
     path.starts_with('/') && path.len() <= MAX_SHARE_PATH && !path.contains(['\n', '\0'])
 }
 
-/// The request a later start sends: `show`, `show <section>` to open the running app on that section (#203), or
-/// `share <absolute path>`: everything after `share ` up to the newline is the path. A section that isn't one plain
-/// lowercase word, or a path that can't travel on one line, isn't sent: the request is just `show`.
+/// What a start's `--share <path>` asks, from the path as the file system has it: to share it, or, for a path that
+/// can't be shared, to say why.
+pub fn share_request(path: &OsStr) -> Request {
+    let problem = match path.to_str() {
+        Some(text) if is_shareable_path(text) => return Request::Share(text.to_string()),
+        Some(text) if text.contains(['\n', '\0']) => PathProblem::LineBreak,
+        Some(text) if !text.starts_with('/') => PathProblem::NotAbsolute,
+        Some(_) => PathProblem::TooLong,
+        None => PathProblem::NotUtf8,
+    };
+    Request::ShareRefused { shown: showable(&path.to_string_lossy()), problem }
+}
+
+/// A path made fit to show on one line: what would break the line shown as U+FFFD (as a byte that isn't UTF-8 already
+/// is), and only its end when it is long, since the end names the item.
+fn showable(path: &str) -> String {
+    let line: String = path.chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).collect();
+    if line.len() <= MAX_SHOWN {
+        return line;
+    }
+    let mut start = line.len() - (MAX_SHOWN - '\u{2026}'.len_utf8());
+    while !line.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("\u{2026}{}", &line[start..])
+}
+
+/// The request a later start sends: `show`, `show <section>` to open the running app on that section (#203),
+/// `share <absolute path>` (everything after `share ` up to the newline is the path), or
+/// `share-refused <why> <the path as shown>` for a path that can't be shared (#216). A section that isn't one plain
+/// lowercase word isn't sent: the request is just `show`.
 fn request_message(request: &Request) -> String {
     match request {
         Request::Show(Some(section))
@@ -86,8 +152,10 @@ fn request_message(request: &Request) -> String {
         {
             format!("{SHOW} {section}\n")
         }
+        Request::Show(_) => format!("{SHOW}\n"),
         Request::Share(path) if is_shareable_path(path) => format!("{SHARE} {path}\n"),
-        _ => format!("{SHOW}\n"),
+        Request::Share(path) => request_message(&share_request(OsStr::new(path))),
+        Request::ShareRefused { shown, problem } => format!("{SHARE_REFUSED} {} {}\n", problem.code(), showable(shown)),
     }
 }
 
@@ -97,6 +165,10 @@ fn parse_request(line: &str) -> Option<Request> {
         // A path is whole only with its newline: a line cut at the read limit is not one
         let path = path.strip_suffix('\n')?;
         return is_shareable_path(path).then(|| Request::Share(path.to_string()));
+    }
+    if let Some(refusal) = line.strip_prefix("share-refused ") {
+        let (code, shown) = refusal.strip_suffix('\n')?.split_once(' ')?;
+        return Some(Request::ShareRefused { shown: showable(shown), problem: PathProblem::from_code(code)? });
     }
     let mut words = line.split_whitespace();
     if words.next() != Some(SHOW) {
@@ -196,7 +268,7 @@ pub fn serve(listener: UnixListener, on_request: impl Fn(Request) + Send + 'stat
         let Ok(mut stream) = stream else { continue };
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
         let mut line = String::new();
-        // A request is one line, at most `share ` + a path + the newline: never read more than that
+        // A request is one line, at most `share ` + a path + the newline (a refusal is shorter): never read more
         if BufReader::new(&stream).take(MAX_SHARE_PATH as u64 + 7).read_line(&mut line).is_err() {
             continue;
         }
@@ -283,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn a_share_path_that_isnt_absolute_or_is_too_long_is_not_sent() {
+    fn a_share_path_that_isnt_absolute_or_is_too_long_is_not_sent_as_a_share() {
         assert_eq!(parse_request("share relative\n"), None);
         assert_eq!(parse_request("share \n"), None);
         let long = format!("/{}", "a".repeat(5000));
@@ -293,10 +365,56 @@ mod tests {
         // Nothing that breaks the line, and no line cut short
         assert_eq!(parse_request("share /a\0b\n"), None);
         assert_eq!(parse_request("share /a/b"), None);
-        // What can't be sent as a share goes as a plain show
-        for odd in ["relative", "/a\nb", "/a\0b", long.as_str()] {
-            assert_eq!(request_message(&Request::Share(odd.to_string())), "show\n", "{odd:?}");
+        // What can't be sent as a share goes as a refusal saying why, for the running app to show (#216)
+        assert_eq!(request_message(&Request::Share("relative".into())), "share-refused not-absolute relative\n");
+        assert_eq!(request_message(&Request::Share("/a\nb".into())), "share-refused line-break /a\u{fffd}b\n");
+        assert_eq!(request_message(&Request::Share("/a\0b".into())), "share-refused line-break /a\u{fffd}b\n");
+        assert!(request_message(&Request::Share(long)).starts_with("share-refused too-long \u{2026}aaa"));
+    }
+
+    // #216: a later start's --share as the file system has it: a path that can't be shared becomes a refusal saying
+    // why, never a share of some other path, and the running app shows it
+    #[test]
+    fn a_share_path_that_cant_be_shared_becomes_a_refusal_saying_why() {
+        use std::os::unix::ffi::OsStrExt;
+        let refused = |shown: &str, problem| Request::ShareRefused { shown: shown.to_string(), problem };
+        assert_eq!(share_request(OsStr::new("/home/u/ProtonDrive/a b.pdf")), Request::Share("/home/u/ProtonDrive/a b.pdf".into()));
+        assert_eq!(share_request(OsStr::from_bytes(b"/d/caf\xe9.txt")), refused("/d/caf\u{fffd}.txt", PathProblem::NotUtf8));
+        assert_eq!(share_request(OsStr::new("/d/two\nlines.txt")), refused("/d/two\u{fffd}lines.txt", PathProblem::LineBreak));
+        assert_eq!(share_request(OsStr::new("Docs/a.pdf")), refused("Docs/a.pdf", PathProblem::NotAbsolute));
+        assert_eq!(share_request(OsStr::new("")), refused("", PathProblem::NotAbsolute));
+        // A path too long to travel: its end (which names the item) is shown, within the limit
+        let long = format!("/{}/end.pdf", "a".repeat(MAX_SHARE_PATH));
+        let Request::ShareRefused { shown, problem: PathProblem::TooLong } = share_request(OsStr::new(&long)) else {
+            panic!("too long");
+        };
+        assert!(shown.starts_with('\u{2026}') && shown.ends_with("aaa/end.pdf") && shown.len() <= MAX_SHOWN, "{shown}");
+        // A name that is too long and not UTF-8 is cut at a character's edge
+        let mut bytes = b"/".to_vec();
+        bytes.extend("\u{e9}".repeat(MAX_SHOWN).as_bytes());
+        bytes.push(0xff);
+        let Request::ShareRefused { shown, problem: PathProblem::NotUtf8 } = share_request(OsStr::from_bytes(&bytes)) else {
+            panic!("not UTF-8");
+        };
+        assert!(shown.len() <= MAX_SHOWN && shown.ends_with("\u{e9}\u{fffd}"), "{shown}");
+    }
+
+    #[test]
+    fn a_share_refusal_travels_on_one_line() {
+        for problem in [PathProblem::NotAbsolute, PathProblem::TooLong, PathProblem::LineBreak, PathProblem::NotUtf8] {
+            let request = Request::ShareRefused { shown: "/d/r\u{e9}sum\u{e9} 2.pdf".into(), problem };
+            let message = request_message(&request);
+            assert_eq!(message.matches('\n').count(), 1, "{message:?}");
+            assert_eq!(parse_request(&message), Some(request));
         }
+        // Even one made with a line break in it: it is shown on one line
+        let made = Request::ShareRefused { shown: "/d/a\nb".into(), problem: PathProblem::LineBreak };
+        assert_eq!(request_message(&made), "share-refused line-break /d/a\u{fffd}b\n");
+        assert_eq!(parse_request("share-refused not-absolute \n"), Some(Request::ShareRefused { shown: String::new(), problem: PathProblem::NotAbsolute }));
+        // An unknown reason, or a line cut short, isn't one
+        assert_eq!(parse_request("share-refused upside-down /a\n"), None);
+        assert_eq!(parse_request("share-refused line-break /a"), None);
+        assert_eq!(parse_request("share-refused\n"), None);
     }
 
     #[test]
@@ -310,12 +428,13 @@ mod tests {
         let sink = seen.clone();
         std::thread::spawn(move || serve(listener, move |request| sink.lock().unwrap().push(request)));
         let longest = format!("/{}", "a".repeat(MAX_SHARE_PATH - 1));
-        for path in ["/home/u/ProtonDrive/My Docs/a.pdf", longest.as_str()] {
+        for path in ["/home/u/ProtonDrive/My Docs/a.pdf", longest.as_str(), "Docs/a.pdf"] {
             assert!(matches!(claim(&paths, uid(), true, Duration::from_secs(2), &Request::Share(path.to_string())).unwrap(), Claim::Signalled));
         }
+        let refused = Request::ShareRefused { shown: "Docs/a.pdf".into(), problem: PathProblem::NotAbsolute };
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![Request::Share("/home/u/ProtonDrive/My Docs/a.pdf".to_string()), Request::Share(longest)]
+            vec![Request::Share("/home/u/ProtonDrive/My Docs/a.pdf".to_string()), Request::Share(longest), refused]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -343,6 +462,10 @@ mod tests {
         let share = Request::Share("/home/u/ProtonDrive/a.pdf".to_string());
         assert!(matches!(claim(&paths, uid(), true, Duration::from_secs(5), &share).unwrap(), Claim::Signalled));
         assert_eq!(shown.load(Ordering::SeqCst), 1);
+        // A refusal too
+        let refused = Request::ShareRefused { shown: "a.pdf".into(), problem: PathProblem::NotAbsolute };
+        assert!(matches!(claim(&paths, uid(), true, Duration::from_secs(5), &refused).unwrap(), Claim::Signalled));
+        assert_eq!(shown.load(Ordering::SeqCst), 2);
         assert!(started.elapsed() < Duration::from_secs(2));
         let _ = std::fs::remove_dir_all(&dir);
     }
