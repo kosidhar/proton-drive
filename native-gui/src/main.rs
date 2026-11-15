@@ -1768,7 +1768,22 @@ impl ProtonDriveNativeApp {
                     }
                     match result {
                         Ok(()) => self.load_shared(),
-                        Err(e) => self.shared.stop_error = Some(e),
+                        Err(e) => {
+                            // Reading the list again when Shared is next opened would drop this: off the page it is told
+                            // in the notice, with the item's name
+                            if self.tab != NavTab::Shared {
+                                let name = self
+                                    .shared
+                                    .items
+                                    .iter()
+                                    .flatten()
+                                    .find(|i| i.rel_path.as_deref() == Some(rel_path.as_str()))
+                                    .map(|i| i.name.clone())
+                                    .unwrap_or_else(|| rel_path.rsplit('/').next().unwrap_or(&rel_path).to_string());
+                                self.notice = Some(format!("Couldn't stop sharing {name}: {e}"));
+                            }
+                            self.shared.stop_error = Some(e);
+                        }
                     }
                 }
                 WorkerEvent::ShareLoaded(window, result) => self.share_loaded(window, result),
@@ -2003,22 +2018,25 @@ impl ProtonDriveNativeApp {
                 ui.label(RichText::new("Shared").size(20.0).strong().color(TEXT_PRIMARY()));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let loading = self.shared.loading;
-                    let refresh = ui
-                        .add_enabled_ui(!loading, |ui| {
-                            proton_button(
-                            ui,
-                            Vec2::new(button_width(ui, "Refresh"), 34.0),
-                            "Refresh",
-                            BG_CARD(),
-                            BG_CARD_ALT(),
-                            Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                            TEXT_PRIMARY(),
-                            13.0,
-                            )
-                        })
-                        .inner;
-                    if self.shared.error.is_none() && !loading && refresh.clicked() {
-                        self.load_shared();
+                    // Retry is the action while the list couldn't be read
+                    if self.shared.error.is_none() {
+                        let refresh = ui
+                            .add_enabled_ui(!loading, |ui| {
+                                proton_button(
+                                    ui,
+                                    Vec2::new(button_width(ui, "Refresh"), 34.0),
+                                    "Refresh",
+                                    BG_CARD(),
+                                    BG_CARD_ALT(),
+                                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                                    TEXT_PRIMARY(),
+                                    13.0,
+                                )
+                            })
+                            .inner;
+                        if refresh.clicked() {
+                            self.load_shared();
+                        }
                     }
                 });
             });
@@ -2081,9 +2099,10 @@ impl ProtonDriveNativeApp {
                         let name = truncate_middle_to_width(ui.painter(), &item.name, &name_font, name_w);
                         let folder_room = room - text_width(ui.painter(), &name, &name_font) - 10.0;
                         let folder = truncate_middle_to_width(ui.painter(), &folder, &small, folder_room);
+                        let whole = format!("{}\n{}", item.name, shared::folder_text(item));
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(name).size(14.0).strong().color(TEXT_PRIMARY()));
-                            ui.label(RichText::new(folder).size(12.5).color(TEXT_MUTED()));
+                            ui.label(RichText::new(name).size(14.0).strong().color(TEXT_PRIMARY())).on_hover_text(whole.clone());
+                            ui.label(RichText::new(folder).size(12.5).color(TEXT_MUTED())).on_hover_text(whole);
                         });
                         let exposure = shared::exposure_text(item, now, home::local_offset_secs);
                         let shown = truncate_middle_to_width(ui.painter(), &exposure, &small, ui.available_width());
@@ -2111,7 +2130,9 @@ impl ProtonDriveNativeApp {
                             ui.horizontal_wrapped(|ui| {
                                 for button in &buttons {
                                     let label = button.label();
-                                    if proton_button(
+                                    // One stop at a time: the other rows' Stop sharing wait for the answer
+                                    let can = *button != SharedAction::Stop || stopping.is_none();
+                                    if ui.add_enabled_ui(can, |ui| proton_button(
                                         ui,
                                         Vec2::new(button_width(ui, label), 28.0),
                                         label,
@@ -2120,7 +2141,8 @@ impl ProtonDriveNativeApp {
                                         Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
                                         TEXT_PRIMARY(),
                                         13.0,
-                                    )
+                                    ))
+                                    .inner
                                     .clicked()
                                     {
                                         act = Some((*button, i));
@@ -2167,7 +2189,7 @@ impl ProtonDriveNativeApp {
             }
             SharedAction::Stop => {
                 if let Some(rel_path) = item.rel_path.clone().filter(|_| self.shared.stopping.is_none()) {
-                    let question = shared::stop_question(&item);
+                    let question = shared::stop_question(&item, home::now_ms());
                     self.pending_confirm = Some(PendingConfirm::StopSharing { rel_path, question });
                 }
             }
@@ -4457,10 +4479,11 @@ fn main() -> eframe::Result {
             || cli_paused_until_min.is_some()
             || cli_pause_choices
             || cli_fake_share.is_some()
-            || cli_fake_shared.is_some())
+            || cli_fake_shared.is_some()
+            || cli_confirm_stop_sharing.is_some())
     {
         eprintln!(
-            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --fake-share and --fake-shared only apply together with --screenshot; ignoring them"
+            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --fake-share, --fake-shared and --confirm-stop-sharing only apply together with --screenshot; ignoring them"
         );
     }
     let fake_share = match cli_fake_share {
@@ -4473,6 +4496,10 @@ fn main() -> eframe::Result {
         }
         _ => None,
     };
+    if screenshot_target.is_some() && initial_tab != NavTab::Shared && (cli_fake_shared.is_some() || cli_confirm_stop_sharing.is_some()) {
+        eprintln!("protondrive-gui: --fake-shared and --confirm-stop-sharing only show with --tab shared; ignoring them");
+        cli_confirm_stop_sharing = None;
+    }
     let fake_shared = match cli_fake_shared {
         Some(state) if screenshot_target.is_some() => {
             let list = shared::fake_shared(&state, home::now_ms());
@@ -4654,7 +4681,7 @@ fn main() -> eframe::Result {
                     app.shared.loaded(seq, fake_shared.unwrap_or_else(|| Ok(Vec::new())));
                     if let (Some(name), Some(items)) = (&cli_confirm_stop_sharing, &app.shared.items) {
                         app.pending_confirm = items.iter().find(|i| &i.name == name && i.unreadable.is_none()).and_then(|i| {
-                            Some(PendingConfirm::StopSharing { rel_path: i.rel_path.clone()?, question: shared::stop_question(i) })
+                            Some(PendingConfirm::StopSharing { rel_path: i.rel_path.clone()?, question: shared::stop_question(i, home::now_ms()) })
                         });
                     }
                 }
@@ -6488,6 +6515,9 @@ mod tests {
             WorkerCommand::StartFresh,
             // The Share window's reads and changes: all over the control socket (#216)
             WorkerCommand::ShareLoad { window, rel_path: "a.pdf".into() },
+            // The Shared section's read and its Stop sharing (#253)
+            WorkerCommand::SharedLoad { seq: 1 },
+            WorkerCommand::SharedStop { rel_path: "a.pdf".into() },
             WorkerCommand::SharePassword { window, rel_path: "a.pdf".into() },
             WorkerCommand::ShareEnsureLink { window, rel_path: "a.pdf".into() },
             WorkerCommand::ShareSettings { window, rel_path: "a.pdf".into(), password: Some(None), expires_at: None },
@@ -6592,6 +6622,7 @@ mod tests {
         h.frames(3);
         assert!(h.text_at(shared::EMPTY).is_none());
         assert!(h.text_at(offline).is_some());
+        assert!(h.text_at("Refresh").is_none(), "Retry is the action here");
         h.click(h.text_at("Retry").unwrap());
         assert_eq!(h.sent(), ["shared list"]);
     }
@@ -6754,10 +6785,10 @@ mod tests {
         let mut h = shared_with_rows();
         let item = shared_rows().remove(0);
         h.click(on_row(&h, "report.pdf", "Stop sharing"));
-        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::StopSharing { rel_path: "Documents/report.pdf".into(), question: shared::stop_question(&item) }));
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::StopSharing { rel_path: "Documents/report.pdf".into(), question: shared::stop_question(&item, home::now_ms()) }));
         h.frames(2);
         assert!(h.text_at("Stop sharing?").is_some());
-        assert!(h.text_at(&shared::stop_question(&item)).is_some());
+        assert!(h.text_at(&shared::stop_question(&item, home::now_ms())).is_some());
         assert_eq!(h.sent(), Vec::<String>::new());
         let button = *h.text_at_all("Stop sharing").last().unwrap();
         h.click(button);
@@ -6791,6 +6822,32 @@ mod tests {
     }
 
     #[test]
+    fn another_row_cannot_be_stopped_while_a_stop_is_out() {
+        let mut h = shared_with_rows();
+        h.app.shared.stopping = Some("Documents/report.pdf".into());
+        h.frames(2);
+        h.click(on_row(&h, "Icons", "Stop sharing"));
+        assert!(h.app.pending_confirm.is_none());
+        assert_eq!(h.sent(), Vec::<String>::new());
+        // the row's other buttons still work
+        h.click(on_row(&h, "Icons", "Manage…"));
+        assert!(h.app.share.is_some());
+    }
+
+    #[test]
+    fn a_stop_that_fails_after_leaving_shared_is_told_in_the_notice() {
+        let mut h = shared_with_rows();
+        h.app.shared.stopping = Some("Documents/report.pdf".into());
+        h.click(h.text_at("Home").unwrap());
+        h.event(WorkerEvent::SharedStopped("Documents/report.pdf".into(), Err("Proton Drive is offline".into())));
+        assert_eq!(h.app.notice.as_deref(), Some("Couldn't stop sharing report.pdf: Proton Drive is offline"));
+        // on Shared itself the list shows it, and no notice
+        let mut h = shared_with_rows();
+        h.event(WorkerEvent::SharedStopped("Documents/report.pdf".into(), Err("Proton Drive is offline".into())));
+        assert_eq!(h.app.notice, None);
+    }
+
+    #[test]
     fn a_failed_stop_says_why_and_keeps_the_list() {
         let mut h = shared_with_rows();
         h.app.shared.stopping = Some("Documents/report.pdf".into());
@@ -6800,6 +6857,19 @@ mod tests {
         assert!(h.text_at("Proton Drive is offline").is_some());
         assert!(h.text_at("report.pdf").is_some(), "the list stays");
         assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_rows_name_and_folder_are_whole_on_hover() {
+        let mut h = shared_with_rows();
+        h.ctx.style_mut(|s| {
+            s.interaction.tooltip_delay = 0.0;
+            s.interaction.show_tooltips_only_when_still = false;
+        });
+        let name = h.text_at("report.pdf").unwrap();
+        h.frame(vec![egui::Event::PointerMoved(name)]);
+        h.frames(5);
+        assert!(h.text_at("report.pdf\nDocuments").is_some(), "the tooltip has the full name and folder");
     }
 
     #[test]
