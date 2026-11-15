@@ -125,6 +125,10 @@ describe('RemoteOpsJournal', () => {
         const trash = journal.enqueue({ kind: 'trash', nodeUid: 'vol~a', path: 'Docs/b.txt' });
         const other = journal.enqueue({ kind: 'trash', nodeUid: 'vol~z', path: 'Docs/z.txt' });
         expect(journal.get(trash)).toMatchObject({ path: 'Docs/a.txt' });
+        expect(journal.cloudPathOf(rename)).toBe('Docs/a.txt');
+        const unknown = journal.enqueue({ kind: 'rename', nodeUid: 'vol~n', toPath: 'N2' });
+        expect(journal.cloudPathOf(unknown)).toBeNull(); // not known
+        journal.complete(unknown);
 
         journal.setCloudPathAfter(rename, 'vol~a', 'Docs/b.txt');
         journal.complete(rename);

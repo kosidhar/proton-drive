@@ -105,6 +105,12 @@ export class RemoteOpsJournal {
         );
     }
 
+    // Where Proton Drive has an operation's node, as the operation keeps it (null: not known)
+    cloudPathOf(id: number): string | null {
+        const row = this.db.query('SELECT path FROM remote_ops WHERE id = $id').get({ $id: id }) as { path: string | null } | null;
+        return row?.path ?? null;
+    }
+
     // A rename or move that reached Proton Drive put the node at `path` there: the operations on it after that one keep
     // it as where Proton Drive has the node (a trash after a rename, say, is of the item under its new name)
     setCloudPathAfter(id: number, nodeUid: string, path: string): void {
