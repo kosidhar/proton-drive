@@ -1,6 +1,5 @@
 import path from 'node:path';
 
-import { createShareService } from './shareService';
 import { syncLoginEntry } from '../linux/autostart';
 import { ensureSystemTrayIndicator, getSystemdServiceStatus, sendDesktopNotification } from '../linux/notifications';
 import {
@@ -26,6 +25,7 @@ import { DriveController } from './driveController';
 import { pauseRoute } from './pauseRoute';
 import { withAvailability } from './remoteListing';
 import { isTrustedLocalRequest } from './requestGuard';
+import { createShareService } from './shareService';
 import { refuseOnTcp } from './tcpRefusals';
 import { findHelper, fuseAvailable, mergeStrayInto, VfsSupervisor } from './vfsSupervisor';
 

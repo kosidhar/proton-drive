@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
-import type { ShareService } from '../src/daemon/shareService';
 import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 import { defaultControlSocketPath, startControlServer } from '../src/daemon/controlServer';
+import type { ShareService } from '../src/daemon/shareService';
 import { DriveOpError, type VfsEntry } from '../src/sync/driveOps';
 import { type AvailabilityAction, type AvailabilityResult, type FilesMissingAction, FilesMissingRefused } from '../src/sync/syncEngine';
 
