@@ -351,6 +351,18 @@ pub fn storage(account: Option<&AccountInfo>) -> Option<Storage> {
     })
 }
 
+/// A usage bar, 4 pt high and as wide as there is room: its `track`, filled with `fraction` of it in `fill` (at least a
+/// dot, so that a little use still shows). The sidebar's meter and the account menu share it.
+pub(crate) fn usage_bar(ui: &mut egui::Ui, fraction: f32, fill: Color32, track: Color32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 4.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(2), track);
+    if fraction > 0.0 {
+        let used = egui::Rect::from_min_size(rect.min, egui::vec2((rect.width() * fraction).max(rect.height()), rect.height()));
+        ui.painter().rect_filled(used, egui::CornerRadius::same(2), fill);
+    }
+    resp
+}
+
 /// The headline's colour.
 fn tone_color(tone: Tone) -> Color32 {
     match tone {
