@@ -1,4 +1,4 @@
-import { ConnectionError, MemberRole, type ProtonDriveClient, type ShareResult, type URLAccess } from '@protontech/drive-sdk';
+import { ConnectionError, MemberRole, type MaybeMissingNode, type ProtonDriveClient, type ShareResult, type URLAccess } from '@protontech/drive-sdk';
 
 export type ShareRole = 'viewer' | 'editor';
 
@@ -10,7 +10,22 @@ export interface ShareInfo {
 // The message is shown to the user as is
 export class ShareError extends Error {}
 
+export type SharedPlace = 'my-files' | 'hidden' | 'elsewhere';
+
+export interface SharedItem {
+    name: string;
+    relPath: string | null;
+    where: SharedPlace;
+    link: ShareInfo['link'];
+    people: number;
+    unreadable?: string;
+}
+
+// How many items' sharing is read at once
+export const LIST_CONCURRENCY = 4;
+
 export interface ShareService {
+    list(): Promise<SharedItem[]>;
     info(path: string): Promise<ShareInfo>;
     password(path: string): Promise<string | null>;
     ensureLink(path: string): Promise<{ url: string; created: boolean }>;
@@ -22,8 +37,10 @@ export interface ShareService {
 }
 
 export interface ShareServiceDeps {
-    sdk: Pick<ProtonDriveClient, 'getSharingInfo' | 'shareNode' | 'unshareNode'>;
+    sdk: Pick<ProtonDriveClient, 'getSharingInfo' | 'shareNode' | 'unshareNode' | 'iterateSharedNodeUids' | 'iterateNodes'>;
     nodeFor(path: string): { uid: string; name: string } | { refused: string };
+    // The remote index's path for a node, and whether it is hidden from this computer; null when the index doesn't have it
+    placeOf(uid: string): { relPath: string; hidden: boolean } | null;
     logActivity(entry: { action: 'share'; localRelPath: string; details: string }): void;
     now(): number;
 }
@@ -161,7 +178,71 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
         }
     }
 
+    const byText = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
     return {
+        // Everything the user has shared, as Proton Drive has it now: the uids come from the server (iterateSharedNodeUids),
+        // not the SDK's cache, which may not know of a share made elsewhere. Nothing is logged: it only reads.
+        async list() {
+            try {
+                const uids: string[] = [];
+                for await (const uid of sdk.iterateSharedNodeUids()) uids.push(uid);
+                const items: Array<SharedItem | null> = [];
+                const nodes: MaybeMissingNode[] = [];
+                for await (const n of sdk.iterateNodes(uids)) nodes.push(n);
+
+                async function readOne(n: MaybeMissingNode): Promise<SharedItem | null> {
+                    if ('missingUid' in n) {
+                        return {
+                            name: 'An item',
+                            relPath: null,
+                            where: 'elsewhere',
+                            link: null,
+                            people: 0,
+                            unreadable: "This item can't be found in Proton Drive",
+                        };
+                    }
+                    const name = n.name.ok ? n.name.value : 'An item';
+                    const place = n.trashTime ? null : deps.placeOf(n.uid);
+                    const here = place && place.relPath !== '' ? place : null;
+                    const where: SharedPlace = !here ? 'elsewhere' : here.hidden ? 'hidden' : 'my-files';
+                    const relPath = here ? here.relPath : null;
+                    let result: ShareResult | undefined;
+                    try {
+                        result = await sdk.getSharingInfo(n.uid);
+                    } catch (e) {
+                        if (isOffline(e)) throw e;
+                        return { name, relPath, where, link: null, people: 0, unreadable: "Proton Drive couldn't say how this item is shared" };
+                    }
+                    if (!result) return null;
+                    return { name, relPath, where, link: toInfo(result).link, people: everyone(result).length };
+                }
+
+                // A small pool: the first failure (offline) stops the rest from starting
+                let next = 0;
+                let failed = false;
+                const worker = async () => {
+                    while (!failed && next < nodes.length) {
+                        const i = next++;
+                        try {
+                            items[i] = await readOne(nodes[i]);
+                        } catch (e) {
+                            failed = true;
+                            throw e;
+                        }
+                    }
+                };
+                await Promise.all(Array.from({ length: Math.min(LIST_CONCURRENCY, nodes.length) }, worker));
+
+                const listed = items.filter((i): i is SharedItem => i !== null);
+                const inFiles = listed.filter((i) => i.where !== 'elsewhere').sort((a, b) => byText(a.relPath ?? '', b.relPath ?? ''));
+                const elsewhere = listed.filter((i) => i.where === 'elsewhere').sort((a, b) => byText(a.name, b.name));
+                return [...inFiles, ...elsewhere];
+            } catch (e) {
+                throw plainError(e);
+            }
+        },
+
         info: (path) => run(path, async (n) => toInfo(await sdk.getSharingInfo(n.uid))),
 
         password: (path) =>

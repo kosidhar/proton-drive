@@ -15,6 +15,7 @@ function fake(opts: { fail?: Error } = {}) {
             return result;
         };
     const service: ShareService = {
+        list: rec('list', []),
         info: rec('info', INFO),
         password: rec('password', 'pw'),
         ensureLink: rec('ensureLink', { url: 'https://x', created: true }),
