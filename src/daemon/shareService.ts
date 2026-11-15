@@ -69,6 +69,15 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
         }
     }
 
+    // The address as the item's list has it: acting on someone not on it would send a new invitation (or do nothing)
+    async function listed(uid: string, email: string): Promise<string> {
+        const r = await sdk.getSharingInfo(uid);
+        const all = r ? [...r.members, ...r.protonInvitations, ...r.nonProtonInvitations] : [];
+        const found = all.find((m) => m.inviteeEmail.toLowerCase() === email.toLowerCase());
+        if (!found) throw new ShareError("That person doesn't have access to this item");
+        return found.inviteeEmail;
+    }
+
     const log = (path: string, details: string) => deps.logActivity({ action: 'share', localRelPath: path, details });
 
     function toInfo(result: Awaited<ReturnType<typeof sdk.getSharingInfo>>): ShareInfo {
@@ -118,6 +127,10 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
             return run(path, async (n) => {
                 const current = (await sdk.getSharingInfo(n.uid))?.urlAccess;
                 if (!current) throw new ShareError('Turn the link on first');
+                // The SDK refuses a past expiry, so an expired link can only change together with its expiry
+                if (change.expiresAt === undefined && current.expirationTime && current.expirationTime.getTime() <= deps.now()) {
+                    throw new ShareError('This link has expired: set a new expiry date, or remove the expiry, to change it');
+                }
                 // The SDK's updateSharedLink REPLACES the link's settings with what it is given: a customPassword or
                 // expiration left out is cleared (it re-encrypts with only the generated password, and sends no expiry).
                 // So an unchanged value has to be sent again explicitly, from the link as it is now; null clears.
@@ -150,7 +163,8 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
 
         async setRole(path, email, role) {
             return run(path, async (n) => {
-                const result = await sdk.shareNode(n.uid, { users: [{ email, role: sdkRole(role) }] });
+                const listedEmail = await listed(n.uid, email);
+                const result = await sdk.shareNode(n.uid, { users: [{ email: listedEmail, role: sdkRole(role) }] });
                 log(path, `Changed someone's access to ${n.name}`);
                 return toInfo(result);
             });
@@ -158,7 +172,7 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
 
         async removePerson(path, email) {
             return run(path, async (n) => {
-                await sdk.unshareNode(n.uid, { users: [email] });
+                await sdk.unshareNode(n.uid, { users: [await listed(n.uid, email)] });
                 log(path, `Removed someone's access to ${n.name}`);
                 return infoOf(n.uid);
             });
