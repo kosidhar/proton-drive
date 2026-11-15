@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { defaultControlSocketPath, startControlServer } from '../src/daemon/controlServer';
+import type { ShareService } from '../src/daemon/shareService';
 import { DriveOpError, type VfsEntry } from '../src/sync/driveOps';
 import { type AvailabilityAction, type AvailabilityResult, type FilesMissingAction, FilesMissingRefused } from '../src/sync/syncEngine';
 
@@ -402,6 +403,37 @@ describe('POST /vfs/mount', () => {
         });
         expect((await call(socketPath, '/vfs/mount')).status).toBe(405);
         expect(calls).toBe(0);
+    });
+});
+
+describe('/share routes', () => {
+    async function startWith(share?: ShareService, signedIn = true, shareLog?: (line: string) => void) {
+        const root = mkdtempSync(path.join(os.tmpdir(), 'pd-control-'));
+        cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+        const socketPath = path.join(root, 'control.sock');
+        const server = await startControlServer({ socketPath, engine: makeFake() as never, share, shareSignedIn: () => signedIn, shareLog });
+        cleanups.push(() => server.stop());
+        return socketPath;
+    }
+    const service = { info: async () => ({ link: null, people: [] }) } as unknown as ShareService;
+
+    test('/share/info answers through the control server', async () => {
+        const res = await call(await startWith(service), '/share/info?path=Docs');
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ link: null, people: [] });
+    });
+
+    test("a failure is 500, and the daemon's log gets only its class", async () => {
+        const lines: string[] = [];
+        const failing = { info: async () => Promise.reject(new RangeError('a@b.co')) } as unknown as ShareService;
+        const res = await call(await startWith(failing, true, (line) => lines.push(line)), '/share/info?path=Docs');
+        expect(res.status).toBe(500);
+        expect(lines).toEqual(['Sharing failed: RangeError']);
+    });
+
+    test('404 with no service wired, and 400 while signed out', async () => {
+        expect((await call(await startWith(), '/share/info?path=Docs')).status).toBe(404);
+        expect((await call(await startWith(service, false), '/share/info?path=Docs')).status).toBe(400);
     });
 });
 

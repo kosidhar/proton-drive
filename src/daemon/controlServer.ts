@@ -15,6 +15,8 @@ import {
 import type { ConflictRecord } from '../sync/syncStateDb';
 import { type FileManagerSource, FM_ROUTES, fileManagerRoute } from './fileManagerRoutes';
 import { parseSettingsRequest, type SettingsChange } from './settingsValidation';
+import { shareRoute } from './shareRoutes';
+import type { ShareService } from './shareService';
 import type { DriveMoveAction } from './vfsSupervisor';
 
 // Pin, free, hide and unhide change what is on disk, and so do the virtual drive's hydrate, rename and delete, so they
@@ -60,6 +62,11 @@ export interface ControlServerOptions {
     // Save settings, which may move the drive folder or switch the virtual drive (see driveSettings in settingsRoute.ts);
     // the request is checked already, and the answer is the response
     driveSettings?: (change: SettingsChange) => Promise<Response>;
+    // Sharing an item (see ShareService, shareRoutes.ts), while signed in: absent, the /share routes are not found
+    share?: ShareService;
+    shareSignedIn?: () => boolean;
+    // Where a share route's unexpected failure is logged (only the error's class)
+    shareLog?: (line: string) => void;
     // Make a folder in the cloud, in the folder My files or elsewhere by its path; answers the folder made
     remoteMkdir?: (parentPath: string, name: string) => Promise<{ uid: string; name: string }>;
     // Sign in (starts the browser sign-in and answers its URL, with what the app must show) and sign out
@@ -393,6 +400,9 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
             }
             if (url.pathname === '/vfs/space') {
                 return spaceRoute(req, opts.space);
+            }
+            if (url.pathname.startsWith('/share/')) {
+                return shareRoute(req, url, opts.share, opts.shareSignedIn ?? (() => false), opts.shareLog);
             }
             if (url.pathname === '/drive/move') {
                 return driveMoveRoute(req, opts.driveMove);
