@@ -49,6 +49,8 @@ answer belongs one click away on the desktop, along with the means to act on it.
 
 ### Daemon: `GET /share/list` (control socket only, never TCP)
 
+It answers `{ items: [...] }`.
+
 - **Listing:**
   - The route lists the uids of the nodes the user shared with the SDK's `iterateSharedNodeUids`. That call is not
     deprecated and asks the API each time, unlike `iterateSharedNodes`, which reads the SDK's cache.
@@ -61,7 +63,8 @@ answer belongs one click away on the desktop, along with the means to act on it.
     - `my-files`: everything.
     - `hidden`: the item is hidden from this computer (`hiddenBy`). The existing share routes refuse it, as Share's
       spec says.
-    - `elsewhere`: not in My files, such as Photos, Computers, or Proton Drive's trash.
+    - `elsewhere`: not in My files, such as Photos, Computers, or Proton Drive's trash, or the My files folder itself
+      (an empty path, which the share routes refuse).
   - **`link`** has the same shape and the same password rules as `/share/info`. The URL is shown without an older
     link's password, and the password itself is never sent.
   - **`people`** counts members and invitations, the same people the Share window lists.
@@ -73,7 +76,7 @@ answer belongs one click away on the desktop, along with the means to act on it.
 - **Logging:** nothing goes to the log or the activity history for a read. Log lines never include link URLs or anyone's
   address.
 
-### Daemon: `DELETE /share {path}` (stop sharing)
+### Daemon: `DELETE /share/all {path}` (stop sharing)
 
 - It removes the item's sharing completely, the link and everyone at once: `unshareNode(uid)` with no settings deletes
   the share.
@@ -88,7 +91,7 @@ The sidebar becomes **Home, Shared, Activity, Settings**. `--tab shared` opens i
 Shared                                              [Refresh]
 ─────────────────────────────────────────────────────────────
 report.pdf        Documents
-Link · password · expires 30 Nov · 2 people
+Link · password · expires 2026-11-30 · 2 people
                  [Copy link] [Manage…] [Show in Files] [Stop sharing]
 Icons             (top level)
 2 people · no link
@@ -98,14 +101,15 @@ holiday.jpg       Photos (not in My files)    [Manage on the web]
 
 - **Each row:**
   - **First line:** the name, then the folder.
-  - **Second line:** what it exposes, e.g. "Link · password · expires 30 Nov · 2 people", "2 people · no link", or
+  - **Second line:** what it exposes, e.g. "Link · password · expires 2026-11-30 · 2 people" (dates as the Share window writes them), "Link expired 2026-11-01 · 2 people", "2 people · no link", or
     "Link · anyone with it can view".
 - **Actions for `my-files` items:**
-  - **Copy link:** only when the item has a link. It copies the URL and says "Link copied".
+  - **Copy link:** only when the item has a link that hasn't expired, as in the Share window. It copies the URL and says
+    "Link copied".
   - **Manage…:** opens the existing Share window for the item. When the window closes, the list loads again.
   - **Show in Files:** shows the item selected in its folder, with the app's existing helper.
   - **Stop sharing:** asks first: "Stop sharing report.pdf? The link stops working and 2 people lose access." (Only
-    the parts that apply are named.) It then calls `DELETE /share`, and the row goes once the list loads again.
+    the parts that apply are named.) It then calls `DELETE /share/all`, and the row goes once the list loads again.
 - **`hidden` and `elsewhere` items:** one button, **Manage on the web**, which opens `https://drive.proton.me/shared`.
   The row says why ("Hidden from this computer", "Not in My files").
 - **States:**
@@ -119,8 +123,9 @@ holiday.jpg       Photos (not in My files)    [Manage on the web]
 
 ## Constraints
 
-- **The SDK calls stay in the daemon,** and the routes exist only on the control socket (as for Share). They are not on
-  the TCP API and not in `tcpRefusals.ts`, because `/share` paths aren't `/api/*`.
+- **The SDK calls stay in the daemon,** and the routes exist only on the control socket (as for Share), under `/share/`,
+  which is what the socket hands to the share routes. They are not on the TCP API and not in `tcpRefusals.ts`, because
+  `/share` paths aren't `/api/*`.
 - **Same words as the Share window and Proton's web app** where they overlap: "Stop sharing", "Manage", "Copy link".
 - **Tests, in each layer:**
   - **Daemon:** the list route and stop sharing, against a mocked SDK. Cover:
