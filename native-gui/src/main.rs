@@ -1,5 +1,6 @@
 mod activity;
 mod home;
+mod icons;
 mod settings;
 mod share;
 mod shared;
@@ -64,99 +65,149 @@ fn detect_system_light_mode() -> bool {
     false
 }
 
-// Official Proton Carbon (Dark) & Proton Snow (Light) Adaptive Palette
-#[inline]
-#[allow(non_snake_case)]
-fn BG_CANVAS() -> Color32 {
+/// The app's colours in one theme. The token functions below (`BG_CANVAS()`, …) read the theme in use, so tests can
+/// check both palettes without switching themes.
+pub(crate) struct Palette {
+    /// The section area and the top bar
+    pub(crate) canvas: Color32,
+    pub(crate) sidebar: Color32,
+    /// The sidebar's row for the section that is open
+    pub(crate) sidebar_selected: Color32,
+    /// A sidebar row under the pointer
+    pub(crate) sidebar_hover: Color32,
+    /// Section names and "Proton Drive" in the sidebar
+    pub(crate) sidebar_text: Color32,
+    /// The sidebar's quieter text and its icons
+    pub(crate) sidebar_weak: Color32,
+    /// The sidebar's storage meter: what is used, over the track
+    pub(crate) storage_fill: Color32,
+    pub(crate) storage_track: Color32,
+    pub(crate) card: Color32,
+    pub(crate) card_alt: Color32,
+    pub(crate) input: Color32,
+    /// Separators and card edges
+    pub(crate) border_weak: Color32,
+    /// Secondary buttons' outline
+    pub(crate) border_norm: Color32,
+    pub(crate) text: Color32,
+    pub(crate) text_weak: Color32,
+    pub(crate) purple_soft: Color32,
+    pub(crate) purple_text: Color32,
+    /// Folders in lists
+    pub(crate) folder: Color32,
+}
+
+/// Proton's light theme, as drive.proton.me shows it (#276)
+pub(crate) const LIGHT: Palette = Palette {
+    canvas: Color32::WHITE,
+    sidebar: Color32::from_rgb(0x21, 0x1A, 0x42),
+    sidebar_selected: Color32::from_rgb(0x2E, 0x23, 0x59),
+    sidebar_hover: Color32::from_rgb(0x28, 0x20, 0x4D),
+    sidebar_text: Color32::WHITE,
+    sidebar_weak: Color32::from_rgb(0xB1, 0xA1, 0xF5),
+    storage_fill: Color32::from_rgb(0xB1, 0xA1, 0xF5),
+    storage_track: Color32::from_rgb(0x3E, 0x2F, 0x7F),
+    card: Color32::WHITE,
+    card_alt: Color32::from_rgb(0xF5, 0xF4, 0xF2),
+    input: Color32::from_rgb(0xF5, 0xF4, 0xF2),
+    border_weak: Color32::from_rgb(0xEA, 0xE7, 0xE4),
+    border_norm: Color32::from_rgb(0xD1, 0xCF, 0xCD),
+    text: Color32::from_rgb(0x0C, 0x0C, 0x14),
+    text_weak: Color32::from_rgb(0x5C, 0x59, 0x58),
+    purple_soft: Color32::from_rgb(0xEB, 0xE5, 0xFF),
+    purple_text: Color32::from_rgb(0x5D, 0x38, 0xEB),
+    folder: Color32::from_rgb(0xF5, 0xA4, 0x28),
+};
+
+/// Proton Carbon, the app's dark theme as it was. The colours it didn't have are taken from it.
+pub(crate) const DARK: Palette = Palette {
+    canvas: Color32::from_rgb(26, 24, 35),           // #1A1823
+    sidebar: Color32::from_rgb(20, 18, 27),          // #14121B
+    sidebar_selected: Color32::from_rgb(44, 37, 69), // #2C2545, as an open section's row was (the soft purple)
+    sidebar_hover: Color32::from_rgb(33, 29, 44),    // #211D2C, the cards'
+    sidebar_text: Color32::from_rgb(247, 246, 252),  // #F7F6FC, the text's
+    sidebar_weak: Color32::from_rgb(162, 158, 178),  // #A29EB2, the weak text's
+    storage_fill: PROTON_PURPLE,                     // as Home's storage bar was
+    storage_track: Color32::from_rgb(48, 43, 64),    // #302B40, the weak border's, as Home's storage bar was
+    card: Color32::from_rgb(33, 29, 44),             // #211D2C
+    card_alt: Color32::from_rgb(42, 37, 56),         // #2A2538
+    input: Color32::from_rgb(35, 31, 48),            // #231F30
+    border_weak: Color32::from_rgb(48, 43, 64),      // #302B40
+    border_norm: Color32::from_rgb(74, 67, 96),      // #4A4360, as an off switch's track is
+    text: Color32::from_rgb(247, 246, 252),          // #F7F6FC
+    text_weak: Color32::from_rgb(162, 158, 178),     // #A29EB2
+    purple_soft: Color32::from_rgb(44, 37, 69),      // #2C2545
+    purple_text: Color32::from_rgb(214, 204, 255),   // #D6CCFF
+    folder: Color32::from_rgb(0xF5, 0xA4, 0x28),
+};
+
+/// The palette of the theme in use.
+fn palette() -> &'static Palette {
     if is_light_mode() {
-        Color32::from_rgb(245, 244, 250) // #F5F4FA Proton Snow canvas
+        &LIGHT
     } else {
-        Color32::from_rgb(26, 24, 35) // #1A1823 Proton Carbon canvas
+        &DARK
     }
 }
-#[inline]
-#[allow(non_snake_case)]
-fn BG_SIDEBAR() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(255, 255, 255) // #FFFFFF Crisp white sidebar & header
-    } else {
-        Color32::from_rgb(20, 18, 27) // #14121B
-    }
+
+/// The colour tokens, each a colour of the palette in use.
+macro_rules! tokens {
+    ($($(#[$attr:meta])* $name:ident => $field:ident,)*) => {
+        $(
+            $(#[$attr])*
+            #[inline]
+            #[allow(non_snake_case)]
+            fn $name() -> Color32 {
+                palette().$field
+            }
+        )*
+    };
 }
-#[inline]
-#[allow(non_snake_case)]
-fn BG_CARD() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(255, 255, 255) // #FFFFFF
-    } else {
-        Color32::from_rgb(33, 29, 44) // #211D2C
-    }
+
+tokens! {
+    BG_CANVAS => canvas,
+    BG_SIDEBAR => sidebar,
+    BG_CARD => card,
+    BG_CARD_ALT => card_alt,
+    BG_INPUT => input,
+    BORDER_SUBTLE => border_weak,
+    BORDER_NORM => border_norm,
+    TEXT_PRIMARY => text,
+    TEXT_MUTED => text_weak,
+    PROTON_PURPLE_SOFT => purple_soft,
+    PROTON_PURPLE_TEXT => purple_text,
+    #[expect(dead_code, reason = "the sidebar's, not drawn with them yet")]
+    SIDEBAR_SELECTED => sidebar_selected,
+    #[expect(dead_code, reason = "the sidebar's, not drawn with them yet")]
+    SIDEBAR_HOVER => sidebar_hover,
+    #[expect(dead_code, reason = "the sidebar's, not drawn with them yet")]
+    SIDEBAR_TEXT => sidebar_text,
+    #[expect(dead_code, reason = "the sidebar's, not drawn with them yet")]
+    SIDEBAR_WEAK => sidebar_weak,
+    #[expect(dead_code, reason = "the sidebar's, not drawn with them yet")]
+    STORAGE_FILL => storage_fill,
+    #[expect(dead_code, reason = "the sidebar's, not drawn with them yet")]
+    STORAGE_TRACK => storage_track,
+    #[expect(dead_code, reason = "the Shared list's, not drawn with it yet")]
+    FOLDER_ICON => folder,
 }
-#[inline]
-#[allow(non_snake_case)]
-fn BG_CARD_ALT() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(240, 238, 248) // #F0EEF8
-    } else {
-        Color32::from_rgb(42, 37, 56) // #2A2538
+
+/// The WCAG contrast ratio of two opaque colours, from 1 (the same) to 21 (black on white).
+#[cfg(test)]
+fn contrast(a: Color32, b: Color32) -> f32 {
+    fn luminance(c: Color32) -> f32 {
+        let lin = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
     }
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
-#[inline]
-#[allow(non_snake_case)]
-fn BG_INPUT() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(243, 241, 250) // #F3F1FA
-    } else {
-        Color32::from_rgb(35, 31, 48) // #231F30
-    }
-}
-#[inline]
-#[allow(non_snake_case)]
-fn BORDER_SUBTLE() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(222, 218, 235) // #DEDAEB
-    } else {
-        Color32::from_rgb(48, 43, 64) // #302B40
-    }
-}
-#[inline]
-#[allow(non_snake_case)]
-fn TEXT_PRIMARY() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(28, 24, 43) // #1C182B
-    } else {
-        Color32::from_rgb(247, 246, 252)
-    }
-}
-#[inline]
-#[allow(non_snake_case)]
-fn TEXT_MUTED() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(106, 101, 126) // #6A657E
-    } else {
-        Color32::from_rgb(162, 158, 178)
-    }
-}
+
 const PROTON_PURPLE: Color32 = Color32::from_rgb(109, 74, 255); // #6D4AFF
-const PROTON_PURPLE_HOVER: Color32 = Color32::from_rgb(126, 94, 255); // #7E5EFF
-#[inline]
-#[allow(non_snake_case)]
-fn PROTON_PURPLE_SOFT() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(235, 229, 255) // #EBE5FF
-    } else {
-        Color32::from_rgb(44, 37, 69) // #2C2545
-    }
-}
-#[inline]
-#[allow(non_snake_case)]
-fn PROTON_PURPLE_TEXT() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(93, 56, 235) // #5D38EB
-    } else {
-        Color32::from_rgb(214, 204, 255)
-    }
-}
+const PROTON_PURPLE_HOVER: Color32 = Color32::from_rgb(0x62, 0x43, 0xE6); // #6243E6, Proton's
 const STATUS_SUCCESS: Color32 = Color32::from_rgb(25, 150, 118); // #199676
 const STATUS_WARNING: Color32 = Color32::from_rgb(230, 138, 0); // #E68A00
 const STATUS_DANGER: Color32 = Color32::from_rgb(220, 50, 81); // #DC3251
@@ -3638,6 +3689,31 @@ fn click_shield(ctx: &egui::Context, id: &str, order: egui::Order, dim: Option<C
         });
 }
 
+/// A button's room and background: `fill`, or `hover_fill` under the pointer, with radius 8 and the outline if any.
+/// It is named `label` for screen readers (and `Harness::widget_at`), whatever it paints.
+fn button_shell(
+    ui: &mut egui::Ui,
+    size: Vec2,
+    label: &str,
+    fill: Color32,
+    hover_fill: Color32,
+    stroke: Option<Stroke>,
+) -> (egui::Rect, egui::Response) {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let enabled = ui.is_enabled();
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let bg = if resp.hovered() { hover_fill } else { fill };
+    ui.painter().rect_filled(rect, CornerRadius::same(8), bg);
+    if let Some(s) = stroke {
+        ui.painter()
+            .rect_stroke(rect, CornerRadius::same(8), s, egui::StrokeKind::Inside);
+    }
+    (rect, resp)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn proton_button(
     ui: &mut egui::Ui,
@@ -3649,16 +3725,7 @@ fn proton_button(
     text_color: Color32,
     font_size: f32,
 ) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    if resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let bg = if resp.hovered() { hover_fill } else { fill };
-    ui.painter().rect_filled(rect, CornerRadius::same(8), bg);
-    if let Some(s) = stroke {
-        ui.painter()
-            .rect_stroke(rect, CornerRadius::same(8), s, egui::StrokeKind::Inside);
-    }
+    let (rect, resp) = button_shell(ui, size, label, fill, hover_fill, stroke);
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -3669,9 +3736,74 @@ fn proton_button(
     resp
 }
 
+/// The room on each side of a button's label.
+const BUTTON_PADDING: f32 = 16.0;
+
 /// A button just wide enough for its label at 13 pt.
 fn button_width(ui: &egui::Ui, label: &str) -> f32 {
-    text_width(ui.painter(), label, &FontId::proportional(13.0)) + 32.0
+    text_width(ui.painter(), label, &FontId::proportional(13.0)) + 2.0 * BUTTON_PADDING
+}
+
+/// The size of an icon on a button.
+const BUTTON_ICON_SIZE: f32 = 16.0;
+/// The room between a button's icon and its label.
+const BUTTON_ICON_GAP: f32 = 6.0;
+
+/// What a button with a label looks like (#276).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ButtonKind {
+    /// Filled purple, white text: the one thing a card most likely wants done
+    Primary,
+    /// The card's colour with an outline, filled with the weak background on hover
+    Secondary,
+    /// Red, for a confirmation that deletes
+    #[cfg_attr(not(test), expect(dead_code, reason = "the dialogs don't use action_button yet"))]
+    Danger,
+}
+
+/// A button as wide as its icon and label: the icon (one of `icons::*`) first, then the label, in `kind`'s colours.
+/// The icon is painted as text of its own, so the label stays findable as painted text.
+fn action_button(ui: &mut egui::Ui, kind: ButtonKind, icon: Option<&str>, label: &str, height: f32) -> egui::Response {
+    let (fill, hover_fill, stroke, text_color) = match kind {
+        ButtonKind::Primary => (PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE),
+        ButtonKind::Secondary => (BG_CARD(), BG_INPUT(), Some(Stroke::new(1.0_f32, BORDER_NORM())), TEXT_PRIMARY()),
+        ButtonKind::Danger => (STATUS_DANGER, STATUS_DANGER_HOVER, None, Color32::WHITE),
+    };
+    let size = Vec2::new(action_button_width(ui, icon, label), height);
+    let (rect, resp) = button_shell(ui, size, label, fill, hover_fill, stroke);
+    let mut x = rect.left() + BUTTON_PADDING;
+    if let Some(icon) = icon {
+        let icon_font = FontId::proportional(BUTTON_ICON_SIZE);
+        let at = egui::pos2(x, rect.center().y);
+        ui.painter().text(at, egui::Align2::LEFT_CENTER, icon, icon_font.clone(), text_color);
+        x += text_width(ui.painter(), icon, &icon_font) + BUTTON_ICON_GAP;
+    }
+    let font = FontId::proportional(13.0);
+    ui.painter().text(egui::pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, label, font, text_color);
+    resp
+}
+
+/// How wide `action_button` makes a button with this icon and label.
+fn action_button_width(ui: &egui::Ui, icon: Option<&str>, label: &str) -> f32 {
+    let icon_room = icon.map_or(0.0, |icon| {
+        text_width(ui.painter(), icon, &FontId::proportional(BUTTON_ICON_SIZE)) + BUTTON_ICON_GAP
+    });
+    button_width(ui, label) + icon_room
+}
+
+/// An icon-only button, 28×28, with no fill until hovered. `label`, what a button with words would have said, is its
+/// tooltip and its name for screen readers.
+#[cfg_attr(not(test), expect(dead_code, reason = "no screen has icon-only buttons yet"))]
+fn icon_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
+    let (rect, resp) = button_shell(ui, Vec2::splat(28.0), label, Color32::TRANSPARENT, BG_CARD_ALT(), None);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        FontId::proportional(BUTTON_ICON_SIZE),
+        TEXT_PRIMARY(),
+    );
+    resp.on_hover_text(label)
 }
 
 /// An on/off switch; the caller flips the state when it is clicked.
@@ -3733,6 +3865,8 @@ fn configure_proton_theme(ctx: &egui::Context) {
         prop.insert(0, "Inter".to_owned());
         prop.insert(1, "InterMedium".to_owned());
     }
+    // The icons (see icons.rs): Inter has none of their characters, so text stays Inter and they fall back to Phosphor
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
         mono.insert(0, "JetBrainsMono".to_owned());
     }
@@ -5141,7 +5275,12 @@ mod tests {
         last: Option<egui::FullOutput>,
         /// The window's size in points (the real window's size divided by the zoom)
         screen: Vec2,
+        /// What a frame shows instead of the app, to test a widget on its own (see `Harness::widget`)
+        scene: Option<Scene>,
     }
+
+    /// Widgets added to a bare panel, frame after frame
+    type Scene = Box<dyn FnMut(&mut egui::Ui)>;
 
     /// Held by the tests that set the single-instance request statics, which every test of the app shares
     static REQUEST_STATICS: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -5216,7 +5355,17 @@ mod tests {
             let ctx = egui::Context::default();
             configure_proton_theme(&ctx);
             apply_proton_visuals(&ctx, false);
-            let mut h = Self { ctx, app, commands, events, last: None, screen: Vec2::new(1440.0, 900.0) };
+            // Widgets then say what they are, and `widget_at` finds them by name, as a screen reader would
+            ctx.enable_accesskit();
+            let mut h = Self { ctx, app, commands, events, last: None, screen: Vec2::new(1440.0, 900.0), scene: None };
+            h.frames(3);
+            h
+        }
+
+        /// A window showing only what `scene` adds to its panel, to test a widget on its own.
+        fn widget(scene: impl FnMut(&mut egui::Ui) + 'static) -> Self {
+            let mut h = Self::new();
+            h.scene = Some(Box::new(scene));
             h.frames(3);
             h
         }
@@ -5249,7 +5398,13 @@ mod tests {
                 ..Default::default()
             };
             let app = &mut self.app;
-            self.last = Some(self.ctx.run(input, |ctx| app.render_ui(ctx)));
+            let scene = &mut self.scene;
+            self.last = Some(self.ctx.run(input, |ctx| match scene {
+                Some(scene) => {
+                    egui::CentralPanel::default().show(ctx, |ui| scene(ui));
+                }
+                None => app.render_ui(ctx),
+            }));
         }
 
         /// The window at `size` (as the OS sees it) with the keyboard zoom at `zoom`: egui then has `size / zoom` points.
@@ -5334,6 +5489,26 @@ mod tests {
                 find(&clipped.shape, text, &mut out);
             }
             out
+        }
+
+        /// The centre of the first widget the last frame named exactly `label` for screen readers (an icon-only
+        /// button's name is its old label).
+        fn widget_at(&self, label: &str) -> Option<egui::Pos2> {
+            self.widgets_at_all(label).into_iter().next()
+        }
+
+        /// The centres of every widget the last frame named exactly `label` for screen readers.
+        fn widgets_at_all(&self, label: &str) -> Vec<egui::Pos2> {
+            let Some(update) = self.last.as_ref().and_then(|o| o.platform_output.accesskit_update.as_ref()) else {
+                return Vec::new();
+            };
+            update
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.label() == Some(label))
+                .filter_map(|(_, node)| node.bounds())
+                .map(|b| egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
+                .collect()
         }
 
         /// The fill of the topmost rectangle the last frame painted under a point (a button's background).
@@ -7361,19 +7536,6 @@ mod tests {
         }
     }
 
-    /// WCAG contrast ratio of two opaque colours.
-    fn contrast(a: Color32, b: Color32) -> f32 {
-        fn luminance(c: Color32) -> f32 {
-            let lin = |v: u8| {
-                let v = v as f32 / 255.0;
-                if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-            };
-            0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
-        }
-        let (la, lb) = (luminance(a), luminance(b));
-        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
-    }
-
     #[test]
     fn the_destructive_buttons_white_label_reads_at_rest_and_on_hover() {
         assert!(contrast(Color32::WHITE, STATUS_DANGER) >= 4.5, "{}", contrast(Color32::WHITE, STATUS_DANGER));
@@ -8301,5 +8463,124 @@ mod tests {
         assert_eq!(share::info_at(&sock, "a.pdf"), Err(share::SHARE_NEEDS_RESTART.to_string()));
         server.join().unwrap();
         let _ = std::fs::remove_file(&sock);
+    }
+
+    // #276: Proton's colours, as drive.proton.me shows them in light mode
+    #[test]
+    fn the_light_palette_is_protons() {
+        assert_eq!(LIGHT.sidebar, Color32::from_rgb(0x21, 0x1A, 0x42));
+        assert_eq!(LIGHT.sidebar_selected, Color32::from_rgb(0x2E, 0x23, 0x59));
+        assert_eq!(LIGHT.sidebar_text, Color32::WHITE);
+        assert_eq!(LIGHT.sidebar_weak, Color32::from_rgb(0xB1, 0xA1, 0xF5));
+        assert_eq!(
+            (LIGHT.storage_fill, LIGHT.storage_track),
+            (Color32::from_rgb(0xB1, 0xA1, 0xF5), Color32::from_rgb(0x3E, 0x2F, 0x7F))
+        );
+        assert_eq!((LIGHT.canvas, LIGHT.card), (Color32::WHITE, Color32::WHITE));
+        assert_eq!(
+            (LIGHT.card_alt, LIGHT.input),
+            (Color32::from_rgb(0xF5, 0xF4, 0xF2), Color32::from_rgb(0xF5, 0xF4, 0xF2))
+        );
+        assert_eq!(
+            (LIGHT.border_weak, LIGHT.border_norm),
+            (Color32::from_rgb(0xEA, 0xE7, 0xE4), Color32::from_rgb(0xD1, 0xCF, 0xCD))
+        );
+        assert_eq!(
+            (LIGHT.text, LIGHT.text_weak),
+            (Color32::from_rgb(0x0C, 0x0C, 0x14), Color32::from_rgb(0x5C, 0x59, 0x58))
+        );
+        assert_eq!(LIGHT.folder, Color32::from_rgb(0xF5, 0xA4, 0x28));
+        assert_eq!(PROTON_PURPLE_HOVER, Color32::from_rgb(0x62, 0x43, 0xE6));
+    }
+
+    #[test]
+    fn the_dark_palette_keeps_todays_colours() {
+        assert_eq!(DARK.canvas, Color32::from_rgb(26, 24, 35));
+        assert_eq!(DARK.sidebar, Color32::from_rgb(20, 18, 27));
+        assert_eq!(DARK.card, Color32::from_rgb(33, 29, 44));
+        assert_eq!(DARK.text, Color32::from_rgb(247, 246, 252));
+    }
+
+    #[test]
+    fn contrast_is_the_wcag_ratio() {
+        assert!((contrast(Color32::BLACK, Color32::WHITE) - 21.0).abs() < 0.01);
+        assert_eq!(contrast(Color32::WHITE, Color32::BLACK), contrast(Color32::BLACK, Color32::WHITE), "either way");
+        assert_eq!(contrast(PROTON_PURPLE, PROTON_PURPLE), 1.0);
+        // #767676 on white is the lightest grey that reads at 4.5:1
+        let grey = Color32::from_rgb(0x76, 0x76, 0x76);
+        assert!((contrast(grey, Color32::WHITE) - 4.54).abs() < 0.01, "{}", contrast(grey, Color32::WHITE));
+    }
+
+    #[test]
+    fn text_reads_at_4_5_to_1_in_both_palettes() {
+        for p in [&LIGHT, &DARK] {
+            for (fg, bg, what) in [
+                (p.text, p.canvas, "text"),
+                (p.text_weak, p.canvas, "weak text"),
+                (p.text, p.card, "text on cards"),
+                (p.sidebar_text, p.sidebar, "sidebar"),
+                (p.sidebar_text, p.sidebar_selected, "selected section"),
+                (p.sidebar_weak, p.sidebar, "sidebar weak"),
+                (Color32::WHITE, PROTON_PURPLE, "primary button"),
+            ] {
+                assert!(contrast(fg, bg) >= 4.5, "{what}: {:.2}", contrast(fg, bg));
+            }
+        }
+    }
+
+    #[test]
+    fn an_icon_button_is_found_by_its_label_and_says_it_on_hover() {
+        let mut h = Harness::widget(|ui| {
+            icon_button(ui, icons::REFRESH, "Refresh");
+        });
+        let at = h.widget_at("Refresh").expect("named Refresh for screen readers");
+        assert!(h.text_at(icons::REFRESH).is_some(), "the icon is painted");
+        assert_eq!(h.text_at("Refresh"), None, "and no label");
+        assert_eq!(h.fill_under(at), Some(BG_CANVAS()), "no fill of its own");
+        h.frame(vec![egui::Event::PointerMoved(at)]);
+        h.frames(120); // 2 s, as frames come at 60 a second
+        assert!(h.text_at("Refresh").is_some(), "the tooltip says what it does");
+        assert_eq!(h.fill_under(at), Some(BG_CARD_ALT()), "until hovered");
+    }
+
+    #[test]
+    fn an_action_buttons_label_is_still_painted_text() {
+        let h = Harness::widget(|ui| {
+            action_button(ui, ButtonKind::Secondary, Some(icons::SYNC), "Sync now", 32.0);
+        });
+        let label = h.text_at("Sync now").expect("the label is painted text");
+        assert!(h.widget_at("Sync now").is_some(), "and the button's name");
+        let icon = h.text_at(icons::SYNC).expect("the icon is painted");
+        assert!(icon.x < label.x, "the icon comes before the label");
+    }
+
+    #[test]
+    fn a_proton_button_is_named_by_its_label() {
+        let h = Harness::widget(|ui| {
+            proton_button(ui, Vec2::new(90.0, 30.0), "Unblock", BG_CARD_ALT(), BG_INPUT(), None, TEXT_PRIMARY(), 12.5);
+        });
+        let button = h.widget_at("Unblock").expect("named by its label");
+        let label = h.text_at("Unblock").unwrap();
+        assert!((button - label).length() < 3.0, "the button {button:?} is where its label {label:?} is painted");
+    }
+
+    #[test]
+    fn each_button_kind_has_its_look() {
+        let mut h = Harness::widget(|ui| {
+            action_button(ui, ButtonKind::Primary, None, "Primary", 32.0);
+            action_button(ui, ButtonKind::Secondary, Some(icons::TRASH), "Secondary", 32.0);
+            action_button(ui, ButtonKind::Danger, None, "Danger", 32.0);
+            home::secondary_button(ui, "Old secondary", 32.0);
+            home::primary_button(ui, "Old primary", 32.0);
+        });
+        let fill = |h: &Harness, label| h.fill_under(h.widget_at(label).unwrap());
+        assert_eq!(fill(&h, "Primary"), Some(PROTON_PURPLE));
+        assert_eq!(fill(&h, "Secondary"), Some(BG_CARD()));
+        assert_eq!(fill(&h, "Danger"), Some(STATUS_DANGER));
+        assert_eq!(fill(&h, "Old secondary"), Some(BG_CARD()));
+        assert_eq!(fill(&h, "Old primary"), Some(PROTON_PURPLE));
+        h.frame(vec![egui::Event::PointerMoved(h.widget_at("Secondary").unwrap())]);
+        h.frames(2);
+        assert_eq!(fill(&h, "Secondary"), Some(BG_INPUT()), "a secondary button's hover");
     }
 }

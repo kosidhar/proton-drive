@@ -6,11 +6,10 @@ use std::sync::atomic::Ordering;
 use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, ScrollArea, Stroke, Vec2};
 
 use crate::{
-    btn_secondary_hover_bg, button_width, card_frame, drive_status_line, files_safe_hint, format_bytes, offers_mount_again,
-    proton_button, render_transfer_line, shown_folder, spawn_reaped, AccountInfo, ConflictRecord, DaemonStatus,
+    action_button, btn_secondary_hover_bg, card_frame, drive_status_line, files_safe_hint, format_bytes, offers_mount_again,
+    render_transfer_line, shown_folder, spawn_reaped, AccountInfo, ButtonKind, ConflictRecord, DaemonStatus,
     PendingConfirm, ProtonDriveNativeApp, VfsStatus, WorkerCommand, BG_CARD_ALT, BORDER_SUBTLE, PROTON_PURPLE,
-    PROTON_PURPLE_HOVER, PROTON_PURPLE_TEXT, SCREENSHOT_MODE, STATUS_DANGER, STATUS_SUCCESS, STATUS_WARNING, TEXT_MUTED,
-    TEXT_PRIMARY,
+    PROTON_PURPLE_TEXT, SCREENSHOT_MODE, STATUS_DANGER, STATUS_SUCCESS, STATUS_WARNING, TEXT_MUTED, TEXT_PRIMARY,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -462,14 +461,11 @@ thread_local! {
 
 /// A secondary (outlined) button, as wide as its label.
 pub(crate) fn secondary_button(ui: &mut egui::Ui, label: &str, height: f32) -> egui::Response {
-    let size = Vec2::new(button_width(ui, label), height);
-    let stroke = Some(Stroke::new(1.0_f32, BORDER_SUBTLE()));
-    proton_button(ui, size, label, BG_CARD_ALT(), btn_secondary_hover_bg(), stroke, TEXT_PRIMARY(), 13.0)
+    action_button(ui, ButtonKind::Secondary, None, label, height)
 }
 
 pub(crate) fn primary_button(ui: &mut egui::Ui, label: &str, height: f32) -> egui::Response {
-    let size = Vec2::new(button_width(ui, label), height);
-    proton_button(ui, size, label, PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE, 13.0)
+    action_button(ui, ButtonKind::Primary, None, label, height)
 }
 
 const PAUSE_CHOICES_ID: &str = "pause_choices";
