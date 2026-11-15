@@ -1,12 +1,12 @@
 import { describe, expect, mock, test } from 'bun:test';
 
-import { ConnectionError, DecryptionError, ProtonDriveError, RateLimitedError, ServerError, ValidationError } from '@protontech/drive-sdk/errors';
+import { AbortError, ConnectionError, DecryptionError, ProtonDriveError, RateLimitedError, ServerError, ValidationError } from '@protontech/drive-sdk/errors';
 import { ErrorCode } from '@protontech/drive-sdk/internal/apiService/errorCodes';
 import { APICodeError, APIHTTPError, NotFoundAPIError } from '@protontech/drive-sdk/internal/apiService/errors';
 import { BatchLoading } from '@protontech/drive-sdk/internal/batchLoading';
 import { SharingManagement } from '@protontech/drive-sdk/internal/sharing/sharingManagement';
 
-import { createShareService, LIST_CONCURRENCY, ShareError, type ShareService, type ShareServiceDeps } from '../src/daemon/shareService';
+import { createShareService, LIST_CONCURRENCY, ListCancelled, ShareError, type ShareService, type ShareServiceDeps } from '../src/daemon/shareService';
 
 const EXPIRY = new Date('2027-01-02T03:04:05Z');
 // A link's URL ends with the 12-character password the SDK generates for it
@@ -744,24 +744,43 @@ describe('list', () => {
         delays?: Record<string, number>;
         places?: Record<string, { relPath: string; hidden: boolean } | null>;
         // Replaces iterateNodes: as the SDK's batch loader, which may throw after yielding the nodes it could load
-        iterateNodes?: (uids: string[]) => AsyncGenerator<any>;
-        iterateSharedNodeUids?: () => AsyncGenerator<string>;
+        iterateNodes?: (uids: string[], signal?: AbortSignal) => AsyncGenerator<any>;
+        iterateSharedNodeUids?: (signal?: AbortSignal) => AsyncGenerator<string>;
+        // Called as each sharing read starts
+        onRead?: (uid: string) => void;
     }) {
         const logs: unknown[] = [];
         let active = 0;
-        // reads: the uids whose sharing was asked for, in the order the reads started
-        const stats = { max: 0, reads: [] as string[] };
+        let loading = 0;
+        // reads: the uids whose sharing was asked for, in the order the reads started. listings: how many times what is
+        // shared was listed; loads: the uids of each node load. max: the most SDK calls under way at once, loads and reads
+        // alike; maxLoads: the most node loads at once. signals: the signal each listing and load was given
+        const stats = { max: 0, maxLoads: 0, reads: [] as string[], listings: 0, loads: [] as string[][], signals: [] as unknown[] };
         const sdk: any = {
-            async *iterateSharedNodeUids() {
-                if (opts.iterateSharedNodeUids) return yield* opts.iterateSharedNodeUids();
+            async *iterateSharedNodeUids(signal?: AbortSignal) {
+                stats.listings++;
+                stats.signals.push(signal);
+                if (opts.iterateSharedNodeUids) return yield* opts.iterateSharedNodeUids(signal);
                 for (const n of opts.nodes) yield n.uid ?? n.missingUid;
             },
-            async *iterateNodes(uids: string[]) {
-                if (opts.iterateNodes) return yield* opts.iterateNodes(uids);
-                for (const uid of uids) yield opts.nodes.find((n) => (n.uid ?? n.missingUid) === uid);
+            async *iterateNodes(uids: string[], signal?: AbortSignal) {
+                stats.loads.push(uids);
+                stats.signals.push(signal);
+                active++;
+                loading++;
+                stats.max = Math.max(stats.max, active);
+                stats.maxLoads = Math.max(stats.maxLoads, loading);
+                try {
+                    if (opts.iterateNodes) return yield* opts.iterateNodes(uids, signal);
+                    for (const uid of uids) yield opts.nodes.find((n) => (n.uid ?? n.missingUid) === uid);
+                } finally {
+                    active--;
+                    loading--;
+                }
             },
             async getSharingInfo(uid: string) {
                 stats.reads.push(uid);
+                opts.onRead?.(uid);
                 active++;
                 stats.max = Math.max(stats.max, active);
                 try {
@@ -1226,5 +1245,175 @@ describe('list', () => {
                 ['b', "Proton Drive couldn't say how this item is shared"],
             ]);
         }
+    });
+
+    // #257: once the app has given up on the list (its request is gone), nothing more is asked of Proton Drive
+    const sharedNodes = (count: number) => Array.from({ length: count }, (_, i) => node(`u${i}`, `n${String(i).padStart(2, '0')}`));
+    const allShared = (nodes: any[]) => Object.fromEntries(nodes.map((n) => [n.uid, shared()]));
+
+    test('a list cancelled before it starts asks Proton Drive nothing, and is cancelled', async () => {
+        const nodes = sharedNodes(3);
+        const { svc, stats, logs } = listSetup({ nodes, sharing: allShared(nodes) });
+        const e = await rejects(svc.list(AbortSignal.abort()));
+        expect(e).toBeInstanceOf(ListCancelled);
+        expect(e.message).toBe('Cancelled');
+        expect([stats.listings, stats.loads, stats.reads]).toEqual([0, [], []]);
+        expect(logs).toEqual([]);
+    });
+
+    test('a list cancelled midway starts no other sharing read, and is cancelled', async () => {
+        const nodes = sharedNodes(10);
+        const cancel = new AbortController();
+        let reads = 0;
+        const { svc, stats, logs } = listSetup({
+            nodes,
+            sharing: allShared(nodes),
+            // Cancelled as the sixth read starts: the reads under way finish, and no other starts
+            onRead: () => {
+                if (++reads === 6) cancel.abort();
+            },
+        });
+        const e = await rejects(svc.list(cancel.signal));
+        expect(e).toBeInstanceOf(ListCancelled);
+        await Bun.sleep(30);
+        expect(stats.reads).toEqual(['u0', 'u1', 'u2', 'u3', 'u4', 'u5']);
+        expect(logs).toEqual([]);
+    });
+
+    test('a list cancelled while listing what is shared asks for no more of it, and loads nothing', async () => {
+        const cancel = new AbortController();
+        let steps = 0;
+        const { svc, stats } = listSetup({
+            nodes: sharedNodes(3),
+            async *iterateSharedNodeUids() {
+                cancel.abort();
+                yield 'u0';
+                steps++; // the next page
+                yield 'u1';
+            },
+        });
+        expect(await rejects(svc.list(cancel.signal))).toBeInstanceOf(ListCancelled);
+        expect([steps, stats.loads, stats.reads]).toEqual([0, [], []]);
+    });
+
+    test('a list cancelled while loading nodes loads no more, loads none again alone, and reads nothing', async () => {
+        const nodes = sharedNodes(3);
+        const cancel = new AbortController();
+        let steps = 0;
+        const { svc, stats } = listSetup({
+            nodes,
+            sharing: allShared(nodes),
+            async *iterateNodes() {
+                yield nodes[0];
+                cancel.abort();
+                yield nodes[1];
+                steps++; // the next batch
+                yield nodes[2];
+            },
+        });
+        expect(await rejects(svc.list(cancel.signal))).toBeInstanceOf(ListCancelled);
+        expect([steps, stats.loads.length, stats.reads]).toEqual([0, 1, []]);
+    });
+
+    test('a list cancelled while loading nodes again alone loads no more, and reads nothing', async () => {
+        const nodes = sharedNodes(10);
+        const cancel = new AbortController();
+        const { svc, stats } = listSetup({
+            nodes,
+            sharing: allShared(nodes),
+            // The batch loads none; alone, the second load is where the list is cancelled
+            async *iterateNodes(uids) {
+                if (uids.length > 1) throw new Error('Some items could not be loaded');
+                if (uids[0] === 'u1') cancel.abort();
+                await Bun.sleep(5);
+                yield nodes.find((n) => n.uid === uids[0]);
+            },
+        });
+        expect(await rejects(svc.list(cancel.signal))).toBeInstanceOf(ListCancelled);
+        await Bun.sleep(30);
+        expect(stats.loads.slice(1)).toEqual([['u0'], ['u1']]);
+        expect(stats.reads).toEqual([]);
+    });
+
+    // The SDK's own listing and loading are given the signal too, and stop a request under way with their AbortError:
+    // that is the list cancelled, never a node that couldn't be loaded (loaded again alone) or an unreadable item
+    test("the SDK's listing and loading get the signal, and their AbortError is the list cancelled", async () => {
+        const nodes = sharedNodes(3);
+        const cancel = new AbortController();
+        const done = listSetup({ nodes, sharing: allShared(nodes) });
+        expect(await done.svc.list(cancel.signal)).toHaveLength(3);
+        expect(done.stats.signals).toEqual([cancel.signal, cancel.signal]);
+
+        const stopped = (signal?: AbortSignal) => {
+            if (signal?.aborted) throw new ProtonDriveError('Some items could not be loaded', { cause: [new AbortError('Request aborted')] });
+        };
+        const whileLoading = new AbortController();
+        const loading = listSetup({
+            nodes,
+            sharing: allShared(nodes),
+            async *iterateNodes(_uids, signal) {
+                yield nodes[0];
+                whileLoading.abort();
+                stopped(signal);
+                yield nodes[1];
+            },
+        });
+        expect(await rejects(loading.svc.list(whileLoading.signal))).toBeInstanceOf(ListCancelled);
+        expect([loading.stats.loads.length, loading.stats.reads]).toEqual([1, []]);
+
+        const whileListing = new AbortController();
+        const listing = listSetup({
+            nodes,
+            async *iterateSharedNodeUids(signal) {
+                yield 'u0';
+                whileListing.abort();
+                if (signal?.aborted) throw new AbortError('Request aborted');
+                yield 'u1';
+            },
+        });
+        expect(await rejects(listing.svc.list(whileListing.signal))).toBeInstanceOf(ListCancelled);
+        expect([listing.stats.loads, listing.stats.reads]).toEqual([[], []]);
+    });
+
+    test('nodes a failed batch left out are loaded again in the same pool: several at once, never over 4 calls, all listed', async () => {
+        const nodes = sharedNodes(12);
+        const { svc, stats } = listSetup({
+            nodes,
+            sharing: allShared(nodes),
+            // The batch yields the first two, then throws; alone, each of the other 10 loads after a while
+            async *iterateNodes(uids) {
+                if (uids.length > 1) {
+                    yield nodes[0];
+                    yield nodes[1];
+                    throw new Error('Some items could not be loaded');
+                }
+                await Bun.sleep(5);
+                yield nodes.find((n) => n.uid === uids[0]);
+            },
+        });
+        const items = await svc.list();
+        expect(items.map((i) => [i.name, i.unreadable])).toEqual(nodes.map((n) => [n.name.value, undefined]));
+        expect(stats.loads.slice(1)).toEqual(nodes.slice(2).map((n) => [n.uid]));
+        expect(stats.maxLoads).toBeGreaterThan(1);
+        expect(stats.max).toBe(LIST_CONCURRENCY);
+    });
+
+    test('offline while loading a node again alone fails the whole list, and starts nothing more', async () => {
+        const nodes = sharedNodes(10);
+        const { svc, stats } = listSetup({
+            nodes,
+            sharing: allShared(nodes),
+            // The batch loads none; alone, u0 finds the network gone at once, and the loads that started with it take longer
+            async *iterateNodes(uids) {
+                if (uids.length > 1) throw new Error('Some items could not be loaded');
+                if (uids[0] === 'u0') throw new ConnectionError('down');
+                await Bun.sleep(20);
+                yield nodes.find((n) => n.uid === uids[0]);
+            },
+        });
+        expect((await rejects(svc.list())).message).toBe(OFFLINE);
+        await Bun.sleep(60); // the loads already under way finish; no other load, nor any read, starts
+        expect(stats.loads.slice(1)).toEqual([['u0'], ['u1'], ['u2'], ['u3']]);
+        expect(stats.reads).toEqual([]);
     });
 });
