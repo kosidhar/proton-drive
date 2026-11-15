@@ -4,7 +4,8 @@ import { selfOrDescendant, selfOrDescendantWhere } from './pathRange';
 
 // A change made through the virtual drive that Proton Drive has yet to get. Renames and moves name the node and the path
 // it now has here (the new folder and name are worked out from it when the operation runs); a trash names the node and
-// the path Proton Drive has it at (where it was deleted here, unless renames or moves of it before were still pending).
+// the path Proton Drive has it at (where it was deleted here, unless renames or moves of it before were still pending:
+// then where the cloud has it until they run, and where they put it once they have).
 export type RemoteOp =
     | { id: number; kind: 'rename'; nodeUid: string; toPath: string; attempts: number }
     | { id: number; kind: 'move'; nodeUid: string; toPath: string; attempts: number } // toPath gives the new parent and name
@@ -13,6 +14,7 @@ export type RemoteOp =
 // What enqueue takes: an operation without its id and attempts. A rename or move may also say where the node was here.
 // Each operation keeps, in its `path`, where Proton Drive has the node: the path given, or, while earlier operations on
 // the same node are pending, the one the earliest of them kept (those haven't run, so the cloud still has it there).
+// One of them that runs leaves the node elsewhere: those after it then keep that place (see setCloudPathAfter).
 // The sync pass and local change handling leave that path alone too, even once an earlier operation is superseded.
 export type NewRemoteOp =
     | { kind: 'rename' | 'move'; nodeUid: string; toPath: string; fromPath?: string }
@@ -93,9 +95,26 @@ export class RemoteOpsJournal {
         return row ? toOp(row) : null;
     }
 
-    // Whether a later operation on the same node is pending: it decides where the node ends up, or trashes it
-    hasLaterOn(id: number, nodeUid: string): boolean {
-        return this.db.query('SELECT 1 FROM remote_ops WHERE nodeUid = $nodeUid AND id > $id LIMIT 1').get({ $nodeUid: nodeUid, $id: id }) !== null;
+    // Whether a later operation on the same node is pending: of any kind, only a rename or move (`moves`: it decides where
+    // the node ends up, so an earlier rename or move has nothing left to do), or only a trash (`trash`)
+    hasLaterOn(id: number, nodeUid: string, only?: 'moves' | 'trash'): boolean {
+        const kind = only === 'moves' ? " AND kind != 'trash'" : only === 'trash' ? " AND kind = 'trash'" : '';
+        return (
+            this.db.query(`SELECT 1 FROM remote_ops WHERE nodeUid = $nodeUid AND id > $id${kind} LIMIT 1`).get({ $nodeUid: nodeUid, $id: id }) !==
+            null
+        );
+    }
+
+    // Where Proton Drive has an operation's node, as the operation keeps it (null: not known)
+    cloudPathOf(id: number): string | null {
+        const row = this.db.query('SELECT path FROM remote_ops WHERE id = $id').get({ $id: id }) as { path: string | null } | null;
+        return row?.path ?? null;
+    }
+
+    // A rename or move that reached Proton Drive put the node at `path` there: the operations on it after that one keep
+    // it as where Proton Drive has the node (a trash after a rename, say, is of the item under its new name)
+    setCloudPathAfter(id: number, nodeUid: string, path: string): void {
+        this.db.query('UPDATE remote_ops SET path = $path WHERE nodeUid = $nodeUid AND id > $id').run({ $nodeUid: nodeUid, $id: id, $path: path });
     }
 
     hasPending(): boolean {

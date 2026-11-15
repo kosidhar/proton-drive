@@ -104,6 +104,40 @@ describe('RemoteOpsJournal', () => {
         expect(journal.hasLaterOn(a, 'vol~a')).toBe(false);
     });
 
+    // #234: a later trash doesn't supersede a rename or move, which goes first
+    test('hasLaterOn can look only at later renames and moves, or only at later trashes', () => {
+        const journal = new RemoteOpsJournal(stateDb.connection);
+        const a = journal.enqueue({ kind: 'rename', nodeUid: 'vol~a', toPath: 'A2' });
+        const b = journal.enqueue({ kind: 'rename', nodeUid: 'vol~b', toPath: 'B2' });
+        journal.enqueue({ kind: 'trash', nodeUid: 'vol~a', path: 'A2' });
+        journal.enqueue({ kind: 'move', nodeUid: 'vol~b', toPath: 'X/B2' });
+
+        expect(journal.hasLaterOn(a, 'vol~a', 'moves')).toBe(false);
+        expect(journal.hasLaterOn(a, 'vol~a', 'trash')).toBe(true);
+        expect(journal.hasLaterOn(b, 'vol~b', 'moves')).toBe(true);
+        expect(journal.hasLaterOn(b, 'vol~b', 'trash')).toBe(false);
+    });
+
+    // #234: the rename runs before the trash after it, which then finds the node where the rename put it
+    test('once a rename or move reaches Proton Drive, the operations on the node after it keep where it put the node', () => {
+        const journal = new RemoteOpsJournal(stateDb.connection);
+        const rename = journal.enqueue({ kind: 'rename', nodeUid: 'vol~a', toPath: 'Docs/b.txt', fromPath: 'Docs/a.txt' });
+        const trash = journal.enqueue({ kind: 'trash', nodeUid: 'vol~a', path: 'Docs/b.txt' });
+        const other = journal.enqueue({ kind: 'trash', nodeUid: 'vol~z', path: 'Docs/z.txt' });
+        expect(journal.get(trash)).toMatchObject({ path: 'Docs/a.txt' });
+        expect(journal.cloudPathOf(rename)).toBe('Docs/a.txt');
+        const unknown = journal.enqueue({ kind: 'rename', nodeUid: 'vol~n', toPath: 'N2' });
+        expect(journal.cloudPathOf(unknown)).toBeNull(); // not known
+        journal.complete(unknown);
+
+        journal.setCloudPathAfter(rename, 'vol~a', 'Docs/b.txt');
+        journal.complete(rename);
+
+        expect(journal.get(trash)).toMatchObject({ kind: 'trash', path: 'Docs/b.txt' });
+        expect(journal.get(other)).toMatchObject({ kind: 'trash', path: 'Docs/z.txt' });
+        expect(journal.guard().paths.sort()).toEqual(['Docs/b.txt', 'Docs/z.txt']);
+    });
+
     test('a later local rename takes the targets of pending moves along, and leaves look-alike paths alone', () => {
         const journal = new RemoteOpsJournal(stateDb.connection);
         const intoNew = journal.enqueue({ kind: 'move', nodeUid: 'vol~x', toPath: 'New/x.txt' });
