@@ -53,7 +53,8 @@ const SECTION_ICON_GAP: f32 = 10.0;
 /// What the storage meter says the account uses of its quota: "3.0 GB / 510.0 GB". None without the account's usage
 /// or a quota, as `home::storage`.
 pub(crate) fn storage_meter_text(account: Option<&AccountInfo>) -> Option<String> {
-    let a = account.filter(|a| a.max_space > 0)?;
+    let a = account?;
+    home::storage(Some(a))?;
     Some(format!("{} / {}", format_bytes(a.used_space), format_bytes(a.max_space)))
 }
 
@@ -68,6 +69,12 @@ pub(crate) fn tab_title(tab: NavTab) -> &'static str {
 }
 
 impl ProtonDriveNativeApp {
+    /// Whether the confirmation dialog or the Share window is open: nothing under either takes clicks or keys, and
+    /// the account menu doesn't stay over them.
+    pub(crate) fn dialog_open(&self) -> bool {
+        self.pending_confirm.is_some() || self.share.is_some()
+    }
+
     /// The sidebar, navy in light mode as on drive.proton.me, and dark in dark mode.
     pub(crate) fn render_sidebar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("proton_sidebar")
@@ -81,7 +88,7 @@ impl ProtonDriveNativeApp {
             .show(ctx, |ui| {
                 // What is greyed out fades into the sidebar's colour, not into the theme's light grey
                 ui.visuals_mut().widgets.noninteractive.weak_bg_fill = BG_SIDEBAR();
-                if self.pending_confirm.is_some() {
+                if self.dialog_open() {
                     ui.disable(); // As in the section: nothing under the confirmation dialog takes clicks while it is open
                 }
                 self.render_logo(ui);
@@ -155,7 +162,7 @@ impl ProtonDriveNativeApp {
                 .inner;
             if let (Some(storage), Some(meter)) = (storage, meter) {
                 ui.add_space(6.0);
-                let bar = storage_bar(ui, storage.fraction);
+                let bar = home::usage_bar(ui, storage.fraction, STORAGE_FILL(), STORAGE_TRACK());
                 // How much of it is Drive's
                 meter.union(bar).on_hover_text(storage.tooltip);
             }
@@ -200,17 +207,6 @@ fn section_row(ui: &mut egui::Ui, icon: &str, label: &str, open: bool, count: Op
     resp
 }
 
-/// The storage meter's bar: its track, filled with what is used (at least a dot, so that a little use still shows).
-fn storage_bar(ui: &mut egui::Ui, fraction: f32) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 4.0), Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(2), STORAGE_TRACK());
-    if fraction > 0.0 {
-        let used = egui::Rect::from_min_size(rect.min, Vec2::new((rect.width() * fraction).max(rect.height()), rect.height()));
-        ui.painter().rect_filled(used, CornerRadius::same(2), STORAGE_FILL());
-    }
-    resp
-}
-
 /// Who the top bar says is signed in.
 struct AccountShown {
     name: String,
@@ -233,7 +229,7 @@ impl ProtonDriveNativeApp {
     /// opens the account menu.
     pub(crate) fn render_top_bar(&mut self, ctx: &egui::Context) {
         // Nothing under the confirmation dialog or the Share window takes clicks, and the menu doesn't stay over them
-        let dialog = self.pending_confirm.is_some() || self.share.is_some();
+        let dialog = self.dialog_open();
         if dialog {
             self.account_menu_open = false;
         }
@@ -317,7 +313,8 @@ impl ProtonDriveNativeApp {
         let (rect, resp) = ui.allocate_exact_size(size, if shown.signed_in { Sense::click() } else { Sense::hover() });
         let enabled = ui.is_enabled();
         if shown.signed_in {
-            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, "Account"));
+            let open = self.account_menu_open;
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, open, "Account"));
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
@@ -393,7 +390,7 @@ impl ProtonDriveNativeApp {
         let menu = ctx.memory(|m| m.area_rect(egui::Id::new(ACCOUNT_MENU_ID)));
         let outside = ctx.input(|i| {
             let on_menu = matches!((menu, i.pointer.interact_pos()), (Some(menu), Some(at)) if menu.contains(at));
-            i.key_pressed(egui::Key::Escape) || (i.pointer.primary_clicked() && !on_menu)
+            i.key_pressed(egui::Key::Escape) || (i.pointer.any_click() && !on_menu)
         });
         match picked {
             Some(AccountAction::OpenWeb) => home::open_in_browser(home::PROTON_DRIVE_WEB_URL),
@@ -445,12 +442,7 @@ fn account_menu_storage(ui: &mut egui::Ui, storage: &home::Storage) {
         })
         .response;
     ui.add_space(6.0);
-    let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 4.0), Sense::hover());
-    ui.painter().rect_filled(bar, CornerRadius::same(2), BORDER_SUBTLE());
-    if storage.fraction > 0.0 {
-        let used = egui::Rect::from_min_size(bar.min, Vec2::new((bar.width() * storage.fraction).max(bar.height()), bar.height()));
-        ui.painter().rect_filled(used, CornerRadius::same(2), PROTON_PURPLE);
-    }
+    let bar = home::usage_bar(ui, storage.fraction, PROTON_PURPLE, BORDER_SUBTLE());
     // How much of it is Drive's
-    row.union(ui.interact(bar, ui.id().with("account_menu_storage_bar"), Sense::hover())).on_hover_text(&storage.tooltip);
+    row.union(bar).on_hover_text(&storage.tooltip);
 }

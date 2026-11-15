@@ -1451,7 +1451,7 @@ impl ProtonDriveNativeApp {
         configure_proton_theme(&cc.egui_ctx);
         apply_proton_visuals(&cc.egui_ctx, initial_light);
 
-        let logo_texture = load_glyph_texture(&cc.egui_ctx);
+        let logo_texture = load_logo_texture(&cc.egui_ctx);
         let startup_cache = load_startup_cache();
         let mut initial_status = startup_cache.status.unwrap_or_default();
         if initial_status.state == "syncing" {
@@ -1653,7 +1653,7 @@ impl ProtonDriveNativeApp {
         let _ = self.tx.send(cmd);
     }
 
-    /// Sign-in and sign-out problems show under Activity's title, in Settings' Account card and on Home, until the next try.
+    /// Sign-in and sign-out problems show under Activity's search row, in Settings' Account card and on Home, until the next try.
     fn show_account_error(&mut self, text: String) {
         self.login_url = None;
         self.notice = Some(text.clone());
@@ -2801,7 +2801,7 @@ impl ProtonDriveNativeApp {
             )
             .show(ctx, |ui| {
                 // Nothing under the confirmation dialog or the Share window takes clicks or keys while it is open
-                if self.pending_confirm.is_some() || self.share.is_some() {
+                if self.dialog_open() {
                     ui.disable();
                 }
                 match self.tab {
@@ -3630,7 +3630,7 @@ fn action_button_width(ui: &egui::Ui, icon: Option<&str>, label: &str) -> f32 {
 
 /// An icon-only button, 28×28, with no fill until hovered. `label`, what a button with words would have said, is its
 /// tooltip and its name for screen readers.
-#[cfg_attr(not(test), expect(dead_code, reason = "no screen has icon-only buttons yet"))]
+#[cfg_attr(not(test), expect(dead_code, reason = "outside tests only the gear, through icon_button_pressed, is an icon-only button"))]
 fn icon_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
     icon_button_pressed(ui, icon, label, false)
 }
@@ -3643,6 +3643,9 @@ fn icon_button_pressed(ui: &mut egui::Ui, icon: &str, label: &str, pressed: bool
         (Color32::TRANSPARENT, BG_CARD_ALT(), TEXT_PRIMARY())
     };
     let (rect, resp) = button_shell(ui, Vec2::splat(28.0), label, fill, hover_fill, None);
+    // Says whether it is pressed, as the sections say whether they are open
+    let enabled = ui.is_enabled();
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, pressed, label));
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, icons::font(BUTTON_ICON_SIZE), color);
     resp.on_hover_text(label)
 }
@@ -3761,14 +3764,15 @@ fn load_app_icon() -> Option<IconData> {
 }
 
 /// The logo the sidebar shows: the folder mark alone, without the app icon's tile (#273). Rendered once from
-/// assets/app-icon/protondrive-mark.svg, at 128 px.
+/// assets/app-icon/protondrive-mark.svg, at 128 px. To regenerate it:
+/// `resvg -w 128 -h 128 assets/app-icon/protondrive-mark.svg assets/app-icon/protondrive-mark-128.png`
 const LOGO_PNG: &[u8] = include_bytes!("../../assets/app-icon/protondrive-mark-128.png");
 
-fn load_glyph_texture(ctx: &egui::Context) -> Option<TextureHandle> {
+fn load_logo_texture(ctx: &egui::Context) -> Option<TextureHandle> {
     let img = image::load_from_memory(LOGO_PNG).ok()?.to_rgba8();
     let size = [img.width() as usize, img.height() as usize];
     let color_img = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
-    Some(ctx.load_texture("proton_drive_glyph", color_img, TextureOptions::LINEAR))
+    Some(ctx.load_texture("proton_drive_logo", color_img, TextureOptions::LINEAR))
 }
 
 fn save_color_image_png(img: &egui::ColorImage, path: &str) {
@@ -5251,52 +5255,35 @@ mod tests {
             self.frames(30);
         }
 
-        /// Where the last frame painted exactly this text.
-        fn text_at(&self, text: &str) -> Option<egui::Pos2> {
-            fn find(shape: &egui::Shape, text: &str) -> Option<egui::Pos2> {
+        /// Every text the last frame painted that `matches`, in the order painted.
+        fn texts(&self, matches: impl Fn(&egui::epaint::TextShape) -> bool) -> Vec<&egui::epaint::TextShape> {
+            fn find<'a>(shape: &'a egui::Shape, matches: &impl Fn(&egui::epaint::TextShape) -> bool, out: &mut Vec<&'a egui::epaint::TextShape>) {
                 match shape {
-                    egui::Shape::Text(t) if t.galley.text() == text => Some(t.visual_bounding_rect().center()),
-                    egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, text)),
-                    _ => None,
+                    egui::Shape::Text(t) if matches(t) => out.push(t),
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, matches, out)),
+                    _ => {}
                 }
             }
-            self.last.as_ref()?.shapes.iter().find_map(|c| find(&c.shape, text))
+            let mut out = Vec::new();
+            for clipped in self.last.iter().flat_map(|o| o.shapes.iter()) {
+                find(&clipped.shape, &matches, &mut out);
+            }
+            out
+        }
+
+        /// Where the last frame painted exactly this text.
+        fn text_at(&self, text: &str) -> Option<egui::Pos2> {
+            self.text_rect(text).map(|r| r.center())
         }
 
         /// The box the last frame painted this text in, the first time it painted it.
         fn text_rect(&self, text: &str) -> Option<egui::Rect> {
-            fn find(shape: &egui::Shape, text: &str) -> Option<egui::Rect> {
-                match shape {
-                    egui::Shape::Text(t) if t.galley.text() == text => Some(t.visual_bounding_rect()),
-                    egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, text)),
-                    _ => None,
-                }
-            }
-            self.last.as_ref()?.shapes.iter().find_map(|c| find(&c.shape, text))
+            self.texts(|t| t.galley.text() == text).first().map(|t| t.visual_bounding_rect())
         }
 
         /// The box the last frame painted text starting with `prefix` in (a line shortened to fit), the first time.
         fn text_rect_starting(&self, prefix: &str) -> Option<egui::Rect> {
-            fn find(shape: &egui::Shape, prefix: &str) -> Option<egui::Rect> {
-                match shape {
-                    egui::Shape::Text(t) if t.galley.text().starts_with(prefix) => Some(t.visual_bounding_rect()),
-                    egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, prefix)),
-                    _ => None,
-                }
-            }
-            self.last.as_ref()?.shapes.iter().find_map(|c| find(&c.shape, prefix))
-        }
-
-        /// How the last frame laid out this text, the first time it painted it: its font and size.
-        fn galley_of(&self, text: &str) -> Option<std::sync::Arc<egui::Galley>> {
-            fn find(shape: &egui::Shape, text: &str) -> Option<std::sync::Arc<egui::Galley>> {
-                match shape {
-                    egui::Shape::Text(t) if t.galley.text() == text => Some(t.galley.clone()),
-                    egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, text)),
-                    _ => None,
-                }
-            }
-            self.last.as_ref()?.shapes.iter().find_map(|c| find(&c.shape, text))
+            self.texts(|t| t.galley.text().starts_with(prefix)).first().map(|t| t.visual_bounding_rect())
         }
 
         /// Everywhere the last frame painted exactly this text, in the order painted.
@@ -5306,18 +5293,7 @@ mod tests {
 
         /// The boxes the last frame painted exactly this text in, in the order painted.
         fn text_rects_all(&self, text: &str) -> Vec<egui::Rect> {
-            fn find(shape: &egui::Shape, text: &str, out: &mut Vec<egui::Rect>) {
-                match shape {
-                    egui::Shape::Text(t) if t.galley.text() == text => out.push(t.visual_bounding_rect()),
-                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, text, out)),
-                    _ => {}
-                }
-            }
-            let mut out = Vec::new();
-            for clipped in self.last.iter().flat_map(|o| o.shapes.iter()) {
-                find(&clipped.shape, text, &mut out);
-            }
-            out
+            self.texts(|t| t.galley.text() == text).into_iter().map(|t| t.visual_bounding_rect()).collect()
         }
 
         /// The centre of the first widget the last frame named exactly `label` for screen readers (an icon-only
@@ -5338,6 +5314,16 @@ mod tests {
                 .filter_map(|(_, node)| node.bounds())
                 .map(|b| egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
                 .collect()
+        }
+
+        /// The accessibility nodes the last frame named exactly `label`, left to right.
+        fn nodes_named(&self, label: &str) -> Vec<egui::accesskit::Node> {
+            let Some(update) = self.last.as_ref().and_then(|o| o.platform_output.accesskit_update.as_ref()) else {
+                return Vec::new();
+            };
+            let mut nodes: Vec<_> = update.nodes.iter().filter(|(_, n)| n.label() == Some(label)).map(|(_, n)| n.clone()).collect();
+            nodes.sort_by(|a, b| a.bounds().map_or(0.0, |r| r.x0).total_cmp(&b.bounds().map_or(0.0, |r| r.x0)));
+            nodes
         }
 
         /// The fill of the topmost rectangle the last frame painted under a point (a button's background).
@@ -6770,7 +6756,10 @@ mod tests {
         let mut h = home_with(|s| s.sync_dir = String::new());
         tooltips_at_once(&h);
         let open = h.text_at(chrome::OPEN_IN_FILES).expect("still offered, greyed out");
-        assert_ne!(h.fill_under(open), Some(PROTON_PURPLE), "greyed out");
+        // A disabled widget fades into the colour it sits on (the sidebar's)
+        let faded = egui::ecolor::tint_color_towards(PROTON_PURPLE, BG_SIDEBAR());
+        assert_eq!(h.fill_under(open), Some(faded), "greyed out: the primary fill, faded as a disabled widget's is");
+        assert_ne!(faded, PROTON_PURPLE);
         hover(&mut h, open);
         assert!(h.text_at(chrome::OPEN_IN_FILES_WAITS).is_some(), "the hover says why");
         h.click(open);
@@ -6882,7 +6871,7 @@ mod tests {
             assert!(shown[0].y < chrome::TOP_BAR_HEIGHT, "{tab:?}: in the top bar, at {:?}", shown[0]);
         }
         // In bold (the sidebar has no "Settings" to find first)
-        assert!(painted_bold(&h, "Settings"));
+        assert!(painted_bold(&h, "Settings", f32::MAX));
     }
 
     #[test]
@@ -7048,6 +7037,75 @@ mod tests {
             assert_eq!(h.app.tab, NavTab::Home);
             assert!(!h.app.account_menu_open);
         }
+        assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    /// The top bar's last node named `label` (the gear, the account), as screen readers get it.
+    fn top_bar_node(h: &Harness, label: &str) -> egui::accesskit::Node {
+        h.nodes_named(label).pop().unwrap_or_else(|| panic!("{label} is named"))
+    }
+
+    #[test]
+    fn the_top_bar_is_disabled_under_a_dialog_and_under_the_share_window() {
+        let mut h = Harness::new();
+        h.app.status.account = Some(gautam());
+        h.frames(2);
+        for label in ["Settings", "Account"] {
+            assert!(!top_bar_node(&h, label).is_disabled(), "{label} works with no dialog");
+        }
+        h.app.pending_confirm = Some(PendingConfirm::StartFresh);
+        h.frames(2);
+        for label in ["Settings", "Account"] {
+            assert!(top_bar_node(&h, label).is_disabled(), "{label} under the confirmation");
+        }
+        h.app.pending_confirm = None;
+        h.frames(2);
+        h.app.open_share("/home/u/ProtonDrive/Docs/report.pdf");
+        h.frames(3);
+        assert!(h.app.share.is_some());
+        for label in ["Settings", "Account"] {
+            assert!(top_bar_node(&h, label).is_disabled(), "{label} under the Share window");
+        }
+    }
+
+    #[test]
+    fn the_gear_and_the_account_say_whether_they_are_pressed() {
+        use egui::accesskit::Toggled;
+        let mut h = Harness::new();
+        h.app.status.account = Some(gautam());
+        h.frames(2);
+        assert_eq!(top_bar_node(&h, "Settings").toggled(), Some(Toggled::False), "Home is open");
+        assert_eq!(top_bar_node(&h, "Account").toggled(), Some(Toggled::False), "no menu");
+        h.app.open_tab(NavTab::Settings);
+        h.frames(2);
+        assert_eq!(top_bar_node(&h, "Settings").toggled(), Some(Toggled::True), "Settings is open");
+        h.click(h.widget_at("Account").unwrap());
+        assert!(h.app.account_menu_open);
+        assert_eq!(top_bar_node(&h, "Account").toggled(), Some(Toggled::True), "the menu is open");
+    }
+
+    #[test]
+    fn a_right_click_outside_the_account_menu_closes_it_and_clicks_nothing() {
+        let mut h = Harness::new();
+        h.app.status.account = Some(gautam());
+        h.app.open_tab(NavTab::Shared);
+        h.frames(2);
+        h.click(h.widget_at("Account").unwrap());
+        assert!(h.app.account_menu_open);
+        h.sent();
+        let at = h.text_at("Home").expect("the sidebar's Home");
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        h.frame(vec![egui::Event::PointerMoved(at)]);
+        h.frame(vec![button(true)]);
+        h.frame(vec![button(false)]);
+        h.frames(2);
+        assert!(!h.app.account_menu_open, "a right-click outside closes it");
+        assert_eq!(h.app.tab, NavTab::Shared);
         assert_eq!(h.sent(), Vec::<String>::new());
     }
 
@@ -8679,10 +8737,18 @@ mod tests {
 
     #[test]
     fn the_dark_palette_keeps_todays_colours() {
-        assert_eq!(DARK.canvas, Color32::from_rgb(26, 24, 35));
-        assert_eq!(DARK.sidebar, Color32::from_rgb(20, 18, 27));
-        assert_eq!(DARK.card, Color32::from_rgb(33, 29, 44));
-        assert_eq!(DARK.text, Color32::from_rgb(247, 246, 252));
+        // Every dark value main had (dacfcea), the sidebar's being its own panel's
+        let rgb = Color32::from_rgb;
+        assert_eq!(DARK.canvas, rgb(26, 24, 35));
+        assert_eq!(DARK.sidebar, rgb(20, 18, 27));
+        assert_eq!(DARK.card, rgb(33, 29, 44));
+        assert_eq!(DARK.card_alt, rgb(42, 37, 56));
+        assert_eq!(DARK.input, rgb(35, 31, 48));
+        assert_eq!(DARK.border_weak, rgb(48, 43, 64));
+        assert_eq!(DARK.text, rgb(247, 246, 252));
+        assert_eq!(DARK.text_weak, rgb(162, 158, 178));
+        assert_eq!(DARK.purple_soft, rgb(44, 37, 69));
+        assert_eq!(DARK.purple_text, rgb(214, 204, 255));
     }
 
     #[test]
@@ -8701,6 +8767,9 @@ mod tests {
             for (fg, bg, what) in [
                 (p.text, p.canvas, "text"),
                 (p.text_weak, p.canvas, "weak text"),
+                (p.text_weak, p.card_alt, "weak text on a hovered row"),
+                (p.text_weak, p.input, "weak text on an input"),
+                (p.purple_text, p.purple_soft, "the plan pill"),
                 (p.text, p.card, "text on cards"),
                 (p.sidebar_text, p.sidebar, "sidebar"),
                 (p.sidebar_text, p.sidebar_selected, "selected section"),
@@ -8811,9 +8880,10 @@ mod tests {
         ctx.fonts(|f| f.layout_no_wrap(text.into(), FontId::proportional(size), Color32::WHITE)).size().x
     }
 
-    /// Whether the last frame laid `text` out in the bold family, the first time it painted it.
-    fn painted_bold(h: &Harness, text: &str) -> bool {
-        let galley = h.galley_of(text).unwrap_or_else(|| panic!("{text:?} is painted"));
+    /// Whether the last frame laid `text` out in the bold family, the first time it painted it left of `left_of`.
+    fn painted_bold(h: &Harness, text: &str, left_of: f32) -> bool {
+        let shown = h.texts(|t| t.galley.text() == text && t.visual_bounding_rect().right() < left_of);
+        let galley = &shown.first().unwrap_or_else(|| panic!("{text:?} is painted")).galley;
         galley.job.sections.iter().all(|s| s.format.font_id.family == FontFamily::Name(BOLD_FAMILY.into()))
     }
 
@@ -8828,9 +8898,9 @@ mod tests {
         assert!((laid - width_in(INTER_SEMIBOLD, line, 16.0)).abs() < 0.5, "{laid} wide, not SemiBold's");
         assert!(laid > width_in(INTER_REGULAR, line, 16.0) + 4.0, "{laid} wide, as Regular is");
         // And what is meant to be bold is laid out in it
-        assert!(painted_bold(&h, "Proton Drive"), "the sidebar's brand");
-        assert!(painted_bold(&h, "Home"), "the open section's name");
-        assert!(painted_bold(&h, "Your drive"), "a card's title");
-        assert!(!painted_bold(&h, "Shared"), "a section that isn't open stays regular");
+        assert!(painted_bold(&h, "Proton Drive", f32::MAX), "the sidebar's brand");
+        assert!(painted_bold(&h, "Home", SIDEBAR_EDGE), "the open section's name, in the sidebar");
+        assert!(painted_bold(&h, "Your drive", f32::MAX), "a card's title");
+        assert!(!painted_bold(&h, "Shared", SIDEBAR_EDGE), "a section that isn't open stays regular");
     }
 }
