@@ -82,12 +82,14 @@ class Harness:
         self.now = 1000.0
         self.threads = []
         self.scheduled = []  # [(fn, seconds)] handed to later()
+        self.copied = []
         self.files = ext.ProtonDriveFiles(
             request=self.request,
             run=lambda work, done: self.runs.append((work, done)),
             notify=lambda title, body: self.notes.append((title, body)),
             clock=lambda: self.now,
             later=lambda fn, seconds: self.scheduled.append((fn, seconds)),
+            copy=lambda text: self.copied.append(text),
         )
         if root:
             self.files.set_root(root)
@@ -533,9 +535,22 @@ class FileMenuTest(unittest.TestCase):
 
     def test_the_items_menu_offers_only_actions_on_the_selection(self):
         ext.ProtonDriveNautilusExtension.get_file_items(self.menu, [FakeFile(f"{ROOT}/Docs/b.txt")])
-        self.assertEqual(self.labels(), ["Always keep on this device", "Free up space", "Hide from this computer"])
+        self.assertEqual(self.labels(), ["Always keep on this device", "Free up space", "Hide from this computer", "Copy Link"])
         for label in self.labels():
             self.assertFalse(label.startswith("Proton Drive"), label)
+
+    def test_copy_link_is_in_the_menu_for_one_item_only_and_copies_it(self):
+        ext.ProtonDriveNautilusExtension.get_file_items(self.menu, [FakeFile(f"{ROOT}/Docs/a.txt"), FakeFile(f"{ROOT}/Docs/b.txt")])
+        self.assertNotIn("Copy Link", self.labels())
+        ext.Nautilus.MenuItem.reset_mock()
+        ext.ProtonDriveNautilusExtension.get_file_items(self.menu, [FakeFile(f"{ROOT}/Docs/a.txt")])
+        self.assertEqual(self.labels()[-1], "Copy Link")
+        item = ext.Nautilus.MenuItem.return_value
+        activate = [c for c in item.connect.call_args_list if c.args[0] == "activate"][-1].args[1]
+        self.h.answers[("POST", "/share/link")] = {"url": "https://drive.proton.me/urls/X", "created": False}
+        activate(item)
+        self.h.release()
+        self.assertEqual(self.h.copied, ["https://drive.proton.me/urls/X"])
 
     def test_a_file_the_drive_keeps_for_itself_gets_nothing(self):
         items = ext.ProtonDriveNautilusExtension.get_file_items(self.menu, [FakeFile(f"{ROOT}/Docs/.git")])
@@ -550,6 +565,56 @@ class FileMenuTest(unittest.TestCase):
             source = f.read()
         for gone in ("Sync Now", "Status & Settings", "Proton Drive: "):
             self.assertNotIn(gone, source.split("class ProtonDriveNautilusExtension(")[1], gone)
+
+
+class CopyLinkTest(unittest.TestCase):
+    """#216: Copy Link puts the share link of exactly one item on the clipboard."""
+
+    URL = "https://drive.proton.me/urls/X"
+
+    def setUp(self):
+        self.h = Harness({("POST", "/share/link"): {"url": self.URL, "created": True}})
+
+    def test_it_copies_the_url_and_says_so(self):
+        self.h.files.copy_link(f"{ROOT}/Docs/report.pdf")
+        self.assertEqual(self.h.requests, [])  # nothing on the main thread
+        self.h.release()
+        self.assertEqual(self.h.requests, [("POST", "/share/link", {"path": "Docs/report.pdf"})])
+        self.assertNotEqual(self.h.threads[0], threading.main_thread())
+        self.assertEqual(self.h.copied, [self.URL])
+        self.assertEqual(self.h.notes, [("Link copied", "Anyone with the link can view report.pdf")])
+
+    def test_an_existing_link_is_copied_without_the_warning(self):
+        self.h.answers[("POST", "/share/link")] = {"url": self.URL, "created": False}
+        self.h.files.copy_link(f"{ROOT}/Docs/report.pdf")
+        self.h.release()
+        self.assertEqual(self.h.copied, [self.URL])
+        self.assertEqual(self.h.notes, [("Link copied", "report.pdf")])
+
+    def test_a_failure_is_reported_and_nothing_is_copied(self):
+        self.h.answers[("POST", "/share/link")] = ext.ControlError("Not uploaded yet: report.pdf")
+        self.h.files.copy_link(f"{ROOT}/Docs/report.pdf")
+        self.h.release()
+        self.assertEqual(self.h.copied, [])
+        self.assertEqual(self.h.notes, [("Couldn't copy the link", "Not uploaded yet: report.pdf")])
+
+    def test_no_clipboard_is_a_notification_not_a_crash(self):
+        def broken(text):
+            raise RuntimeError("no display")
+
+        self.h.files.copy = broken
+        self.h.files.copy_link(f"{ROOT}/Docs/report.pdf")
+        self.h.release()
+        self.assertEqual(self.h.notes, [("Couldn't copy the link", "No clipboard is available")])
+
+    def test_it_is_offered_for_exactly_one_item_in_the_drive(self):
+        f = self.h.files
+        self.assertEqual(f.share_items_for([f"{ROOT}/Docs/a.txt"]), ["copy-link"])
+        self.assertEqual(f.share_items_for([f"{ROOT}/Docs/a.txt", f"{ROOT}/Docs/b.txt"]), [])
+        self.assertEqual(f.share_items_for([f"{ROOT}/Docs/.xdg-volume-info"]), [])
+        self.assertEqual(f.share_items_for([ROOT]), [])
+        self.assertEqual(f.share_items_for(["/tmp/elsewhere.txt"]), [])
+        self.assertEqual(f.share_items_for([None]), [])
 
 
 class OtherFileManagersTest(unittest.TestCase):
