@@ -51,6 +51,8 @@ FALLBACK_ROOT = os.path.expanduser("~/ProtonDrive")  # for the menu only, while 
 PIN_LABEL = "Always keep on this device"
 FREE_LABEL = "Free up space"
 HIDE_LABEL = "Hide from this computer"
+COPY_LINK_LABEL = "Copy Link"
+SHARE_LABEL = "Share…"  # used by the Share window item (#216)
 NOT_RUNNING = "Proton Drive isn't running"
 
 UNKNOWN = object()  # a state not fetched yet (None is "no emblem": a local item matching an ignore pattern)
@@ -433,8 +435,9 @@ class ProtonDriveFiles:
     whose folder's states aren't known yet is answered with no emblem, and gets it when they arrive: add_emblem works
     on a file at any time."""
 
-    def __init__(self, request, run, notify, clock=time.monotonic, later=None):
+    def __init__(self, request, run, notify, clock=time.monotonic, later=None, copy=None):
         self.request = request
+        self.copy = copy or (lambda text: (_ for _ in ()).throw(RuntimeError("no clipboard")))
         self.run = run
         self.notify = notify
         self.clock = clock
@@ -585,6 +588,36 @@ class ProtonDriveFiles:
         actions.append("hide")
         return actions
 
+    def share_items_for(self, paths):
+        """Which sharing items to offer: Copy Link for exactly one item inside the drive (not the drive itself, not a
+        file it keeps for itself, not one an ignore pattern leaves out of the drive)."""
+        if len(paths) == 1 and self.selection(paths) == "items" and self.state_of(paths[0]) is not None:
+            return ["copy-link"]
+        return []
+
+    def copy_link(self, path):
+        """Asks the daemon for the item's share link (making one only if none exists) and puts it on the clipboard.
+        Never logs the link or the error text."""
+        rel = rel_to_root(self.menu_root(), path)
+        name = os.path.basename(path)
+
+        def work():
+            return self.request("POST", "/share/link", {"path": rel}, ACTION_READ_TIMEOUT)
+
+        def done(result, error):
+            if error is not None or not isinstance(result, dict) or not result.get("url"):
+                text = str(error) if isinstance(error, ControlError) else "Proton Drive didn't answer."
+                self.notify("Couldn't copy the link", text)
+                return
+            try:
+                self.copy(str(result["url"]))
+            except Exception:
+                self.notify("Couldn't copy the link", "No clipboard is available")
+                return
+            self.notify("Link copied", f"Anyone with the link can view {name}" if result.get("created") else name)
+
+        self.run(work, done)
+
     def act(self, action, paths):
         root = self.menu_root()
         targets = [p for p in paths if self.state_of(p) is not None]
@@ -720,6 +753,19 @@ def _transient(error):
     return text.startswith("Can't reach") or text.startswith("Proton Drive is still working")
 
 
+def _copy_to_clipboard(text):
+    """Puts text on GTK 4's clipboard. Raises when there is no display or no GTK 4: the caller says so."""
+    import gi
+
+    gi.require_version("Gdk", "4.0")
+    from gi.repository import Gdk
+
+    display = Gdk.Display.get_default()
+    if display is None:
+        raise RuntimeError("no display")
+    display.get_clipboard().set(text)
+
+
 def _later(fn, seconds):
     """fn() on the main loop, that many seconds from now."""
 
@@ -821,6 +867,7 @@ class ProtonDriveNautilusExtension(
             run=_run_in_thread,
             notify=_notify,
             later=_later,
+            copy=_copy_to_clipboard,
         )
         self.files.ask_root()
         threading.Thread(
@@ -858,6 +905,12 @@ class ProtonDriveNautilusExtension(
             item = Nautilus.MenuItem(name=f"ProtonDrive::{action.capitalize()}", label=label, tip=tip)
             item.connect("activate", lambda _menu, a=action: self.files.act(a, paths))
             items.append(item)
+
+        if kind == "items":
+            for action in self.files.share_items_for(paths):
+                item = Nautilus.MenuItem(name="ProtonDrive::CopyLink", label=COPY_LINK_LABEL, tip="Copy a link anyone can use to view this")
+                item.connect("activate", lambda _menu: self.files.copy_link(paths[0]))
+                items.append(item)
 
         # Only actions on what was clicked (#214): syncing and the app are in the tray
         return items
