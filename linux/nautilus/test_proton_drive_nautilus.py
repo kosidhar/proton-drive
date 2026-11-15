@@ -577,6 +577,20 @@ class FileMenuTest(unittest.TestCase):
         self.assertEqual(len(tried), 3)
         self.assertEqual(tried[1:], ["/usr/bin/protondrive-gui", "protondrive-gui"])
 
+    def test_share_refuses_a_path_the_app_cant_be_given_and_says_why(self):
+        # GIO hands over a name that isn't UTF-8 with each byte it can't read as a lone surrogate; a line break can't
+        # travel in the app's one-line request. Neither starts the app, and Files says why.
+        cases = [
+            (f"{ROOT}/Docs/caf\udce9.txt", "Proton Drive can't share an item whose path isn't valid UTF-8"),
+            (f"{ROOT}/Docs/two\nlines.txt", "Proton Drive can't share an item whose path has a line break in it"),
+        ]
+        for path, why in cases:
+            self.h.notes.clear()
+            with mock.patch.object(ext, "_spawn_detached") as spawn:
+                self.h.files.share(path)
+            spawn.assert_not_called()
+            self.assertEqual(self.h.notes, [("Couldn't open Share", why)], repr(path))
+
     def test_a_file_the_drive_keeps_for_itself_gets_nothing(self):
         items = ext.ProtonDriveNautilusExtension.get_file_items(self.menu, [FakeFile(f"{ROOT}/Docs/.git")])
         self.assertEqual(items, [])

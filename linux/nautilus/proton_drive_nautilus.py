@@ -335,6 +335,19 @@ def rel_to_root(root, path):
     return None
 
 
+def share_path_problem(path):
+    """Why the app can't be asked to share the item at path, or None. The request is one line of UTF-8 text: a path
+    with a line break can't travel in it, nor one that isn't UTF-8 (GIO hands Python each byte of such a name it can't
+    read as a lone surrogate, \\udc80 to \\udcff, which UTF-8 can't encode)."""
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        return "Proton Drive can't share an item whose path isn't valid UTF-8"
+    if "\n" in path:
+        return "Proton Drive can't share an item whose path has a line break in it"
+    return None
+
+
 def skipped(rel: str) -> bool:
     """Files the drive keeps for itself, which never get an emblem or a menu."""
     for part in rel.split("/"):
@@ -597,6 +610,10 @@ class ProtonDriveFiles:
 
     def share(self, path):
         """Opens the app's Share window on the item (#216), starting the app if it isn't running."""
+        problem = share_path_problem(path)
+        if problem:
+            self.notify("Couldn't open Share", problem)
+            return
         for exe in (os.path.expanduser("~/.local/bin/protondrive-gui"), "/usr/bin/protondrive-gui", "protondrive-gui"):
             try:
                 _spawn_detached([exe, "--share", path])
