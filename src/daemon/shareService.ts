@@ -219,7 +219,12 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
 
     // An item Proton Drive can't name: the name its path in My files ends with, when the remote index has it
     function indexedName(uid: string): string {
-        const relPath = deps.placeOf(uid)?.relPath ?? '';
+        let relPath = '';
+        try {
+            relPath = deps.placeOf(uid)?.relPath ?? '';
+        } catch {
+            // The index can't be read: the item stays unnamed
+        }
         return relPath.split('/').pop() || 'An item';
     }
 
@@ -274,30 +279,39 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                         };
                     }
                     const name = n.name.ok ? n.name.value : indexedName(n.uid);
-                    const place = n.trashTime ? null : deps.placeOf(n.uid);
-                    const here = place && place.relPath !== '' ? place : null;
-                    const where: SharedPlace = !here ? 'elsewhere' : here.hidden ? 'hidden' : 'my-files';
-                    const relPath = here ? here.relPath : null;
-                    let result: ShareResult | undefined;
+                    let relPath: string | null = null;
+                    let where: SharedPlace = 'elsewhere';
                     try {
-                        result = await sdk.getSharingInfo(n.uid);
+                        const place = n.trashTime ? null : deps.placeOf(n.uid);
+                        const here = place && place.relPath !== '' ? place : null;
+                        where = !here ? 'elsewhere' : here.hidden ? 'hidden' : 'my-files';
+                        relPath = here ? here.relPath : null;
+                        let result: ShareResult | undefined;
+                        try {
+                            result = await sdk.getSharingInfo(n.uid);
+                        } catch (e) {
+                            if (failsTheList(e)) throw e;
+                            return { name, relPath, where, link: null, people: 0, unreadable: "Proton Drive couldn't say how this item is shared" };
+                        }
+                        // The server just listed it as shared, but the SDK reads the node's share from its cache, which learns
+                        // of a share made elsewhere only from its events: listed, never left out, as nothing public may be hidden
+                        if (!result) {
+                            return {
+                                name,
+                                relPath,
+                                where,
+                                link: null,
+                                people: 0,
+                                unreadable: 'Proton Drive is still catching up with this item: refresh in a moment',
+                            };
+                        }
+                        return { name, relPath, where, link: toInfo(result).link, people: everyone(result).length };
                     } catch (e) {
                         if (failsTheList(e)) throw e;
-                        return { name, relPath, where, link: null, people: 0, unreadable: "Proton Drive couldn't say how this item is shared" };
+                        // An error on this computer (the index, say) with one item: that item alone is unreadable. The list has no
+                        // logger, and nothing about the item (its link, the people on it) belongs in a log anyway
+                        return { name, relPath, where, link: null, people: 0, unreadable: "Proton Drive couldn't read this item on this computer" };
                     }
-                    // The server just listed it as shared, but the SDK reads the node's share from its cache, which learns
-                    // of a share made elsewhere only from its events: listed, never left out, as nothing public may be hidden
-                    if (!result) {
-                        return {
-                            name,
-                            relPath,
-                            where,
-                            link: null,
-                            people: 0,
-                            unreadable: 'Proton Drive is still catching up with this item: refresh in a moment',
-                        };
-                    }
-                    return { name, relPath, where, link: toInfo(result).link, people: everyone(result).length };
                 }
 
                 // A small pool: the first failure of the whole list (offline, busy) stops the rest from starting
