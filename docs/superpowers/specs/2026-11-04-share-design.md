@@ -93,7 +93,10 @@ Copy Link
 
 Opened with `protondrive-gui --share <absolute path>`. A running app gets the request through the single-instance
 socket as `share <path>` (#203's protocol, extended: one line, path up to 4096 bytes, no newline). It shows the Share
-window in front of whatever section is open.
+window in front of whatever section is open. A path the app can't take (not absolute, too long, with a line break, or
+not UTF-8) goes as `share-refused <not-absolute|too-long|line-break|not-utf8> <path as shown>`. The path is cut to
+1024 bytes, with control characters replaced. The Share window then opens saying why, with nothing to change. An older
+app, which doesn't know the line, just shows itself.
 
 ```
 ┌ Share "report.pdf" ───────────────────────────────┐
