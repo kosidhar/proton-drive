@@ -25,6 +25,7 @@ import { DriveController } from './driveController';
 import { pauseRoute } from './pauseRoute';
 import { withAvailability } from './remoteListing';
 import { isTrustedLocalRequest } from './requestGuard';
+import { createShareService } from './shareService';
 import { refuseOnTcp } from './tcpRefusals';
 import { findHelper, fuseAvailable, mergeStrayInto, VfsSupervisor } from './vfsSupervisor';
 
@@ -531,6 +532,21 @@ export async function startSyncDaemon(options: {
                 signIn,
                 signOut,
                 makeRemoteFolder,
+                share: createShareService({
+                    sdk: runtime.sdk,
+                    nodeFor: (relPath) => {
+                        if (engine.availability.hiddenBy(relPath)) {
+                            return { refused: 'Hidden from this computer: unhide it in Settings to share it' };
+                        }
+                        const entry = engine.remoteIndex.getByPath(relPath);
+                        if (!entry) return { refused: 'Not uploaded yet: Proton Drive can share it once it has uploaded' };
+                        return { uid: entry.uid, name: entry.name };
+                    },
+                    logActivity: (entry) => stateDb.logActivity(entry),
+                    now: Date.now,
+                }),
+                shareSignedIn: () => runtime.auth.isLoggedIn(),
+                shareLog: (line) => runtime.logger.error(line),
                 // The drive's size (#181): what the account uses of its storage, from what the app shows (asked of the
                 // API at most once a minute)
                 space: async () => {
