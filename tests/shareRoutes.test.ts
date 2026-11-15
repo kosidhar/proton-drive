@@ -24,6 +24,7 @@ function fake(opts: { fail?: Error } = {}) {
         invite: rec('invite', INFO),
         setRole: rec('setRole', INFO),
         removePerson: rec('removePerson', INFO),
+        stopSharing: rec('stopSharing', INFO),
     };
     return { service, calls };
 }
