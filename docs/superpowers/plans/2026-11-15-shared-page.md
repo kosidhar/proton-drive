@@ -108,7 +108,8 @@ The behaviour the tests pin:
   - otherwise `my-files`.
   - `relPath` is `placeOf`'s path for `my-files` and `hidden`, and `null` for `elsewhere`.
 - **Sharing:** `sdk.getSharingInfo(uid)` per item, at most `LIST_CONCURRENCY` at once.
-  - **`undefined`** (no longer shared): the item is left out.
+  - **`undefined`** (the SDK's node cache hasn't caught up): listed as unreadable, "Proton Drive is still catching up
+    with this item: refresh in a moment" (ruling R5, which replaced "left out").
   - **An offline error** (`isOffline`): the whole `list()` throws the same `ShareError` as `plainError` gives. Never a
     partial list.
   - **Any other error:** the item is listed with `unreadable: "Proton Drive couldn't say how this item is shared"`,
@@ -128,7 +129,7 @@ The behaviour the tests pin:
     - `where each item is: my files, hidden, elsewhere, trashed, the My files folder itself`: the five cases give
       `my-files`, `hidden`, `elsewhere`, `elsewhere` and `elsewhere`. The trashed one and the root have
       `relPath: null`.
-    - `an item no longer shared by the time it is read is left out`.
+    - `an item the SDK hasn't caught up with is listed as unreadable, not dropped` (ruling R5).
     - `an item whose sharing can't be read is listed as unreadable; the rest is unaffected`.
     - `a node Proton Drive can't find is listed as "An item", unreadable`.
     - `offline while reading is the offline refusal, not a partial list`: `ConnectionError` on one item rejects with
@@ -243,7 +244,7 @@ The behaviour:
   ```
 - Produces, in `share.rs`:
   - `pub fn list_at(socket: &Path) -> Result<Vec<shared::SharedItem>, String>`: GET `/share/list`, read with
-    `SHARE_READ_TIMEOUT`.
+    `SHARE_WRITE_TIMEOUT` (120 s): listing grows with the number of shared items (ruling R7, #257).
   - `pub fn stop_sharing_at(socket: &Path, rel_path: &str) -> Result<(), String>`: DELETE `/share/all` with `{ path }`,
     through `share_change`.
   - Both go through `share_request`, so a 404 reads as `SHARE_NEEDS_RESTART`, and an unreadable reply as `UNREADABLE`
@@ -254,7 +255,7 @@ The wording rules:
   - For `my-files` and `hidden`: the folder of `rel_path` (`"Documents/Work/a.txt"` gives `"Documents/Work"`), or
     `"(top level)"` for an item at the top.
   - `hidden` adds `" · Hidden from this computer"`.
-  - `elsewhere` is `"Not in My files"`.
+  - `elsewhere` is `"Not on this computer"` (ruling R4: it also covers Proton Docs and items not indexed yet).
 - **`exposure_text`:**
   - An `unreadable` item shows its text.
   - Otherwise, the link part:

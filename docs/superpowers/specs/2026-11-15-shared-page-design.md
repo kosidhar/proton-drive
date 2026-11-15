@@ -63,13 +63,17 @@ It answers `{ items: [...] }`.
     - `my-files`: everything.
     - `hidden`: the item is hidden from this computer (`hiddenBy`). The existing share routes refuse it, as Share's
       spec says.
-    - `elsewhere`: not in My files, such as Photos, Computers, or Proton Drive's trash, or the My files folder itself
-      (an empty path, which the share routes refuse).
+    - `elsewhere`: not on this computer, such as Photos, Computers, Proton Drive's trash, Proton Docs, an item not
+      indexed yet, or the My files folder itself (an empty path, which the share routes refuse).
   - **`link`** has the same shape and the same password rules as `/share/info`. The URL is shown without an older
     link's password, and the password itself is never sent.
   - **`people`** counts members and invitations, the same people the Share window lists.
 - **Order:** My files first, by path, then everything else by name.
-- **Errors:** offline, or not signed in, is a 400 `{ error }` in plain words, as the share routes give.
+- **Errors:** offline, or not signed in, is a 400 `{ error }` in plain words, as the share routes give. So is Proton
+  Drive's rate or server-error limit ("Proton Drive is busy: try again in a minute"). Neither ever gives a partial list.
+- **An item the server lists as shared whose sharing the SDK hasn't caught up with yet** (its node cache lags changes
+  made elsewhere by up to about 30 seconds) is listed, unreadable: "Proton Drive is still catching up with this item:
+  refresh in a moment". It is never dropped.
 - **One unreadable item** (its node or its sharing can't be read) is still listed, with its name, or "An item" when
   even that is unknown. It has `unreadable: "<why, in plain words>"`, with `link: null` and `people: 0`, so the app can
   say why. The rest of the list is unaffected.
@@ -82,6 +86,8 @@ It answers `{ items: [...] }`.
   the share.
 - It refuses what the other share routes refuse: not uploaded, hidden.
 - It writes an activity entry: "Stopped sharing report.pdf".
+- A share already deleted elsewhere (the SDK answers `NotFoundAPIError`) counts as stopped: it succeeds, with no
+  activity entry.
 
 ### App: the Shared section
 
@@ -111,7 +117,9 @@ holiday.jpg       Photos (not in My files)    [Manage on the web]
   - **Stop sharing:** asks first: "Stop sharing report.pdf? The link stops working and 2 people lose access." (Only
     the parts that apply are named.) It then calls `DELETE /share/all`, and the row goes once the list loads again.
 - **`hidden` and `elsewhere` items:** one button, **Manage on the web**, which opens `https://drive.proton.me/shared`.
-  The row says why ("Hidden from this computer", "Not in My files").
+  The row says why ("Hidden from this computer", "Not on this computer"). `elsewhere` covers more than items outside My
+  files: Proton Docs and Sheets, items not indexed yet, and nodes that couldn't be loaded are in My files but not on
+  this computer, so the wording stays neutral.
 - **States:**
   - **Loading:** "Loading what you've shared…", with the previous list kept and greyed out on a reload.
   - **Offline or failed:** the daemon's message, with Retry.
