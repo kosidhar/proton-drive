@@ -331,6 +331,22 @@ pub fn remove_person_at(socket: &Path, rel_path: &str, email: &str) -> Result<()
     share_change(socket, "DELETE", "/share/person", serde_json::json!({ "path": rel_path, "email": email }))
 }
 
+/// Everything the account shares (GET /share/list). Read with the longer timeout: the listing grows with the number of
+/// shared items (#257).
+pub fn list_at(socket: &Path) -> Result<Vec<crate::shared::SharedItem>, String> {
+    #[derive(Deserialize)]
+    struct Reply {
+        items: Vec<crate::shared::SharedItem>,
+    }
+    let reply = share_request(socket, "GET", "/share/list", None, SHARE_WRITE_TIMEOUT)?;
+    serde_json::from_value::<Reply>(reply).map(|r| r.items).map_err(|_| UNREADABLE.to_string())
+}
+
+/// Stops all sharing of an item: its link and everyone invited (DELETE /share/all).
+pub fn stop_sharing_at(socket: &Path, rel_path: &str) -> Result<(), String> {
+    share_change(socket, "DELETE", "/share/all", serde_json::json!({ "path": rel_path }))
+}
+
 /// Screenshot-only: `--fake-share <state>`, how the item is shared in each state the window shows (none, a link, a link
 /// with a password and an expiry a week out, a link that expired yesterday, and a link with three people: a member
 /// editor, a Proton invitation and an invitation by email); None for an unknown state.
@@ -863,8 +879,13 @@ impl ProtonDriveNativeApp {
     /// Closes the Share window, or makes way for another: closing never waits, so a change it sent that isn't
     /// answered yet is remembered, to tell if it fails.
     pub(crate) fn leave_share(&mut self) {
+        let was_open = self.share.is_some();
         if let Some(left) = self.share.take().and_then(ShareWindow::left_change) {
             self.share_left.push(left);
+        }
+        // What was shared may have changed in the window: the Shared section reads it again (#253)
+        if was_open && self.tab == crate::NavTab::Shared {
+            self.load_shared();
         }
     }
 
@@ -894,6 +915,10 @@ impl ProtonDriveNativeApp {
         let left = self.share_left.remove(i);
         if let Err(problem) = result {
             self.notice = Some(left.failed(&problem));
+        }
+        // The Shared section read the list when the window closed, perhaps before this change landed (#253)
+        if self.tab == crate::NavTab::Shared {
+            self.load_shared();
         }
         if let Some(cmd) = self.share.as_mut().and_then(|w| w.changed_elsewhere(&left.rel_path)) {
             let _ = self.tx.send(cmd);
