@@ -26,6 +26,8 @@ export function controlServerOptions(deps: {
     signOut: NonNullable<ControlServerOptions['logout']>;
     makeRemoteFolder: NonNullable<ControlServerOptions['remoteMkdir']>;
     space?: ControlServerOptions['space'];
+    share?: ControlServerOptions['share'];
+    shareSignedIn?: ControlServerOptions['shareSignedIn'];
 }): ControlServerOptions {
     const { socketPath, engine, drive, stateDb } = deps;
     return {
@@ -33,6 +35,8 @@ export function controlServerOptions(deps: {
         engine,
         mountAgain: () => drive.mountAgain(),
         space: deps.space,
+        share: deps.share,
+        shareSignedIn: deps.shareSignedIn,
         driveMove: (action, from, to) => drive.resolveMove(action, from, to),
         driveSettings: (change) =>
             driveSettings(change, {
