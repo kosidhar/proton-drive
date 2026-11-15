@@ -10,7 +10,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,6 +26,7 @@ use crate::inodes::{Inodes, ROOT_INO};
 use crate::listing::{self, Entry, Kind, VOLUME_INFO_CONTENT, VOLUME_INFO_NAME};
 use crate::readers::{classify_open, opener_interrupted, process_comm, Reader};
 use crate::trash::{TrashArea, TrashNode};
+use crate::unlinker::Unlinker;
 
 /// How long the kernel may keep an entry or its attributes.
 const TTL: Duration = Duration::from_secs(1);
@@ -56,6 +57,8 @@ impl DriveFs {
             handles: Mutex::new(HashMap::new()),
             notifier: Arc::new(OnceLock::new()),
             mount: Arc::new(OnceLock::new()),
+            unlinker: Mutex::new(None),
+            unlinker_pid: AtomicU32::new(0),
             drops,
             trash: TrashArea::new(uid),
             next_fh: AtomicU64::new(1),
@@ -96,6 +99,12 @@ impl DriveFs {
     pub fn mount_slot(&self) -> Arc<OnceLock<Mount>> {
         self.state.mount.clone()
     }
+
+    /// Hands the drive the child that unlinks what the trash drops (see unlinker.rs). Before the session runs.
+    pub fn use_unlinker(&self, unlinker: Unlinker) {
+        self.state.unlinker_pid.store(unlinker.pid(), Ordering::SeqCst);
+        *lock(&self.state.unlinker) = Some(unlinker);
+    }
 }
 
 /// The drive as mounted: its mount point, and the device its files have there.
@@ -119,7 +128,11 @@ struct State {
     handles: Mutex<HashMap<u64, (u64, Handle)>>,
     notifier: Arc<OnceLock<Notifier>>,
     mount: Arc<OnceLock<Mount>>,
-    /// Names the trash dropped, for the thread that unlinks them through the mount
+    /// The child that unlinks what the trash drops, until the thread that talks to it takes it; and its pid, 0 once
+    /// it is gone
+    unlinker: Mutex<Option<Unlinker>>,
+    unlinker_pid: AtomicU32,
+    /// Names the trash dropped, for the thread that has them unlinked through the mount
     drops: Sender<Dropped>,
     trash: TrashArea,
     next_fh: AtomicU64,
@@ -329,16 +342,44 @@ struct Dropped {
     name: OsString,
 }
 
-/// The thread that unlinks, through the drive's own mount, the names the trash drops from files/ and info/: the kernel
-/// tells its inotify watchers of an unlink, which gvfsd-trash counts the trash's items by, and of nothing FUSE can send
-/// (#236). The unlink waits for the folder's lock in the kernel, which the request that dropped the name holds until
-/// its reply is in; so it is never made from a thread whose reply is pending, and this thread holds no lock of ours
-/// while it waits. Failing that, the kernel's entry is dropped all the same, without a word to its watchers.
+/// The thread that has the names the trash drops from files/ and info/ unlinked through the drive's own mount: the
+/// kernel tells its inotify watchers of an unlink, which gvfsd-trash counts the trash's items by, and of nothing FUSE
+/// can send (#236). The unlinker child makes the unlink (see unlinker.rs), which waits for the folder's lock in the
+/// kernel: held by the request that dropped the name until its reply is in, so asked only once that reply is sent,
+/// and by any rename into the folder after it. This thread only waits for the child's answer, which a signal ends.
+///
+/// Without the child, or when it couldn't unlink, the name goes all the same, and the kernel's entry with it, without
+/// a word to its watchers. That invalidation waits for the folder's lock in this thread, as it always has.
 fn start_unlinker(state: Weak<State>, dropped: Receiver<Dropped>) {
     let _ = std::thread::Builder::new().name("trash-unlink".into()).spawn(move || {
+        let mut child: Option<Unlinker> = None;
+        let mut started = false;
         for Dropped { folder, dir, name } in dropped {
             let Some(state) = state.upgrade() else { return };
-            if !state.unlink_through_mount(folder, &dir, &name) {
+            // Handed over before any request is served, so there by the first drop if it ever is
+            if !started {
+                child = lock(&state.unlinker).take();
+                started = true;
+            }
+            let asked = match (child.as_mut(), state.mount.get()) {
+                (Some(unlinker), Some(mount)) => {
+                    Some(unlinker.unlink(mount.dev, folder, &mount.path.join(&dir), &name))
+                }
+                _ => None,
+            };
+            let unlinked = match asked {
+                Some(Ok(unlinked)) => unlinked,
+                Some(Err(_)) => {
+                    log!("protondrive-vfs: the trash's unlinker stopped: Files may count trashed items from now on");
+                    state.unlinker_pid.store(0, Ordering::SeqCst);
+                    if let Some(gone) = child.take() {
+                        gone.end();
+                    }
+                    false
+                }
+                None => false,
+            };
+            if !unlinked {
                 state.take_gone(&dir.join(&name));
                 // Set before any request is served, so never missing here
                 if let Some(notifier) = state.notifier.get() {
@@ -867,30 +908,26 @@ impl State {
         was
     }
 
-    /// Unlinks `name`, which the trash dropped from folder `dir` (number `folder`), through the drive's own mount (see
-    /// take_gone). Only there: the folder opened must have the mount's device and the folder's number, so nothing is
-    /// unlinked once the drive is unmounted, or wherever else the path leads. Never on a session thread. Whether it was
-    /// unlinked.
-    fn unlink_through_mount(&self, folder: u64, dir: &Path, name: &OsStr) -> bool {
-        let Some(mount) = self.mount.get() else { return false };
-        let Ok(name) = CString::new(name.as_bytes()) else { return false };
-        // O_PATH: the folder isn't opened as such (no opendir), only held to unlink in
-        let opened =
-            OpenOptions::new().read(true).custom_flags(libc::O_PATH | libc::O_DIRECTORY).open(mount.path.join(dir));
-        let Ok(folder_fd) = opened else { return false };
-        if !folder_fd.metadata().is_ok_and(|meta| meta.dev() == mount.dev && meta.ino() == folder) {
-            return false;
+    /// An unlink or rmdir in the trash folder by process `pid`. A name the trash dropped goes (see take_gone). The
+    /// unlinker's never reaches anything else: the name it was sent may have gone since (expired, or unlinked by
+    /// someone else), and a new .trashinfo taken it. Anyone else's goes as it always has.
+    fn remove_in_trash(&self, rel: &Path, removal: Removal, pid: u32) -> Result<(), Errno> {
+        if self.take_gone(rel) {
+            return Ok(());
         }
-        // An item dropped from files/ is a file to a lookup, but still a folder to an entry the kernel holds of it
-        for flags in [0, libc::AT_REMOVEDIR, 0] {
-            if unsafe { libc::unlinkat(folder_fd.as_raw_fd(), name.as_ptr(), flags) } == 0 {
-                return true;
-            }
-            if !matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EISDIR | libc::ENOTDIR)) {
-                return false;
-            }
+        if pid != 0 && self.unlinker_pid.load(Ordering::SeqCst) == pid {
+            return Err(Errno::ENOENT);
         }
-        false
+        match (removal, self.trash.info_name(rel)) {
+            // GIO takes back the .trashinfo of an item it failed to trash
+            (Removal::Unlink, Some(info)) => {
+                self.trash.remove_info(info)?;
+                lock(&self.inodes).remove(rel);
+                Ok(())
+            }
+            _ if self.trash.node(rel).is_some() => Err(Errno::EPERM),
+            _ => Err(Errno::ENOENT),
+        }
     }
 }
 
@@ -1116,7 +1153,7 @@ impl Filesystem for DriveFs {
         }
     }
 
-    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let s = &self.state;
         let Some(parent_rel) = s.path_of(parent) else { return reply.error(Errno::ENOENT) };
         let rel = parent_rel.join(name);
@@ -1124,21 +1161,9 @@ impl Filesystem for DriveFs {
             return reply.error(Errno::ENOENT);
         }
         if s.is_trash_path(&rel) {
-            // A name the trash dropped, unlinked through the mount so its watchers hear it went
-            if s.take_gone(&rel) {
-                return reply.ok();
-            }
-            return match s.trash.info_name(&rel) {
-                // GIO takes back the .trashinfo of an item it failed to trash
-                Some(info) => match s.trash.remove_info(info) {
-                    Ok(()) => {
-                        lock(&s.inodes).remove(&rel);
-                        reply.ok()
-                    }
-                    Err(errno) => reply.error(errno),
-                },
-                None if s.trash.node(&rel).is_some() => reply.error(Errno::EPERM),
-                None => reply.error(Errno::ENOENT),
+            return match s.remove_in_trash(&rel, Removal::Unlink, req.pid()) {
+                Ok(()) => reply.ok(),
+                Err(errno) => reply.error(errno),
             };
         }
         if is_volume_info(&rel) {
@@ -1147,7 +1172,7 @@ impl Filesystem for DriveFs {
         s.delete(rel, Removal::Unlink, reply);
     }
 
-    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let s = &self.state;
         let Some(parent_rel) = s.path_of(parent) else { return reply.error(Errno::ENOENT) };
         let rel = parent_rel.join(name);
@@ -1155,11 +1180,10 @@ impl Filesystem for DriveFs {
             return reply.error(Errno::ENOENT);
         }
         if s.is_trash_path(&rel) {
-            // A folder dropped from files/, unlinked through the mount
-            if s.take_gone(&rel) {
-                return reply.ok();
-            }
-            return reply.error(if s.trash.node(&rel).is_some() { Errno::EPERM } else { Errno::ENOENT });
+            return match s.remove_in_trash(&rel, Removal::Rmdir, req.pid()) {
+                Ok(()) => reply.ok(),
+                Err(errno) => reply.error(errno),
+            };
         }
         if is_volume_info(&rel) {
             return reply.error(Errno::EPERM);
@@ -1772,6 +1796,33 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
         g.open();
         assert!(first.join().unwrap());
+    }
+
+    // A queued unlink can outlive its drop (expired, or unlinked by someone else) while a new .trashinfo takes the
+    // name: the unlinker's own unlink only ever takes a dropped name. Anyone else's goes as it always has
+    #[test]
+    fn the_unlinkers_unlink_only_takes_what_the_trash_dropped() {
+        let g = Gated::new("trash-unlink");
+        let s = &g.drive.state;
+        let unlinker = 4242;
+        s.unlinker_pid.store(unlinker, Ordering::SeqCst);
+        let (files, info) = (s.trash_files_dir(), s.trash_info_dir().join("a.trashinfo"));
+        s.trash.create_info(OsStr::new("a.trashinfo"), true, false).unwrap();
+        assert_eq!(s.remove_in_trash(&info, Removal::Unlink, unlinker), Err(Errno::ENOENT));
+        assert!(matches!(s.trash.node(&info), Some(TrashNode::InfoFile { .. })), "the new .trashinfo stays");
+        assert_eq!(s.trash.trashed(OsStr::new("x")), None);
+        assert_eq!(s.remove_in_trash(&files.join("x"), Removal::Unlink, unlinker), Ok(()));
+        assert_eq!(s.remove_in_trash(&files.join("x"), Removal::Unlink, unlinker), Err(Errno::ENOENT), "once");
+        assert_eq!(s.trash.trashed(OsStr::new("Folder")), None);
+        assert_eq!(s.remove_in_trash(&files.join("Folder"), Removal::Rmdir, unlinker), Ok(()));
+        assert_eq!(s.remove_in_trash(&files, Removal::Rmdir, unlinker), Err(Errno::ENOENT));
+        // Anyone else: GIO takes back a .trashinfo, and can't remove the trash's own folders
+        assert_eq!(s.trash.trashed(OsStr::new("y")), None);
+        assert_eq!(s.remove_in_trash(&files.join("y"), Removal::Unlink, 1), Ok(()), "a dropped name, all the same");
+        assert_eq!(s.remove_in_trash(&info, Removal::Unlink, 1), Ok(()));
+        assert_eq!(s.trash.node(&info), None);
+        assert_eq!(s.remove_in_trash(&files, Removal::Rmdir, 1), Err(Errno::EPERM));
+        assert_eq!(s.remove_in_trash(&files.join("z"), Removal::Unlink, 1), Err(Errno::ENOENT));
     }
 
     #[test]
