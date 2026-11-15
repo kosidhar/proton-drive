@@ -3766,7 +3766,7 @@ pub(crate) enum ButtonKind {
 fn action_button(ui: &mut egui::Ui, kind: ButtonKind, icon: Option<&str>, label: &str, height: f32) -> egui::Response {
     let (fill, hover_fill, stroke, text_color) = match kind {
         ButtonKind::Primary => (PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE),
-        ButtonKind::Secondary => (BG_CARD(), BG_INPUT(), Some(Stroke::new(1.0_f32, BORDER_NORM())), TEXT_PRIMARY()),
+        ButtonKind::Secondary => (BG_CARD(), BG_CARD_ALT(), Some(Stroke::new(1.0_f32, BORDER_NORM())), TEXT_PRIMARY()),
         ButtonKind::Danger => (STATUS_DANGER, STATUS_DANGER_HOVER, None, Color32::WHITE),
     };
     let size = Vec2::new(action_button_width(ui, icon, label), height);
@@ -8581,6 +8581,7 @@ mod tests {
         assert_eq!(fill(&h, "Old primary"), Some(PROTON_PURPLE));
         h.frame(vec![egui::Event::PointerMoved(h.widget_at("Secondary").unwrap())]);
         h.frames(2);
-        assert_eq!(fill(&h, "Secondary"), Some(BG_INPUT()), "a secondary button's hover");
+        // The weak background: the same as an input's in light, and visible on a card in dark (an input's isn't)
+        assert_eq!(fill(&h, "Secondary"), Some(BG_CARD_ALT()), "a secondary button's hover");
     }
 }
