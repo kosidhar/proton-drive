@@ -34,6 +34,7 @@ export interface ShareService {
     invite(path: string, emails: string[], role: ShareRole): Promise<ShareInfo>;
     setRole(path: string, email: string, role: ShareRole): Promise<ShareInfo>;
     removePerson(path: string, email: string): Promise<ShareInfo>;
+    stopSharing(path: string): Promise<ShareInfo>;
 }
 
 export interface ShareServiceDeps {
@@ -326,6 +327,15 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                 // What is left, or nothing once the SDK has deleted the emptied share
                 const result = await sdk.unshareNode(n.uid, { urlAccess: 'remove' });
                 log(path, `Stopped sharing the link to ${n.name}`);
+                return toInfo(result);
+            });
+        },
+
+        async stopSharing(path) {
+            return run(path, async (n) => {
+                // No settings: the SDK deletes the whole share, the link and everyone
+                const result = await sdk.unshareNode(n.uid);
+                log(path, `Stopped sharing ${n.name}`);
                 return toInfo(result);
             });
         },

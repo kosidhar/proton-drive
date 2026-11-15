@@ -44,6 +44,11 @@ function makeFake(initial: any) {
             if (failWith) throw failWith;
             const s = args[1];
             if (!state) return undefined;
+            // No settings at all: the whole share goes, the link and everyone
+            if (s === undefined) {
+                state = undefined;
+                return undefined;
+            }
             if (s.urlAccess === 'remove') state.urlAccess = undefined;
             const gone = (m: any) => (s.users ?? []).includes(m.inviteeEmail);
             state.members = state.members.filter((m: any) => !gone(m));
@@ -170,6 +175,39 @@ describe('ShareService', () => {
         e = await rejects(svc.info('a.txt'));
         expect(e).toBeInstanceOf(ShareError);
         expect(e.message).toBe('Proton Drive refused: Nope');
+        expect(logs).toEqual([]);
+    });
+
+    test('stopSharing removes the whole share in one call and logs "Stopped sharing report.pdf"', async () => {
+        const { svc, fake, logs } = setup(shared(), () => ({ uid: 'n1', name: 'report.pdf' }));
+        expect(await svc.stopSharing('report.pdf')).toEqual({ link: null, people: [] });
+        const u = fake.calls.filter((c) => c.fn === 'unshareNode');
+        expect(u.length).toBe(1);
+        expect(u[0].args.length).toBe(1);
+        expect(logs.length).toBe(1);
+        expect(JSON.stringify(logs)).toContain('Stopped sharing report.pdf');
+    });
+
+    test('stopSharing refuses an item not uploaded or hidden, calling nothing', async () => {
+        const { svc, fake, logs } = setup(shared(), () => ({ refused: 'Not uploaded yet' }));
+        const e = await rejects(svc.stopSharing('a'));
+        expect(e).toBeInstanceOf(ShareError);
+        expect(e.message).toBe('Not uploaded yet');
+        expect(fake.calls).toEqual([]);
+        expect(logs).toEqual([]);
+    });
+
+    test('stopSharing an item no longer shared is not an error', async () => {
+        const { svc } = setup(undefined);
+        expect(await svc.stopSharing('a.txt')).toEqual({ link: null, people: [] });
+    });
+
+    test('stopSharing offline is the offline refusal and logs nothing', async () => {
+        const { svc, fake, logs } = setup(shared());
+        fake.fail(new TypeError('fetch failed'));
+        const e = await rejects(svc.stopSharing('a.txt'));
+        expect(e).toBeInstanceOf(ShareError);
+        expect(e.message).toBe('Proton Drive is offline: try again when you are connected');
         expect(logs).toEqual([]);
     });
 
