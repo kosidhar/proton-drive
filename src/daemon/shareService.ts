@@ -28,6 +28,8 @@ export class ListCancelled extends ShareError {
 export type SharedPlace = 'my-files' | 'hidden' | 'elsewhere';
 
 export interface SharedItem {
+    // The node uid the server listed: stopping sharing names it, so it acts on this item and not on whatever is at its path later
+    uid: string;
     name: string;
     relPath: string | null;
     where: SharedPlace;
@@ -49,7 +51,7 @@ export interface ShareService {
     invite(path: string, emails: string[], role: ShareRole): Promise<ShareInfo>;
     setRole(path: string, email: string, role: ShareRole): Promise<ShareInfo>;
     removePerson(path: string, email: string): Promise<ShareInfo>;
-    stopSharing(path: string): Promise<ShareInfo>;
+    stopSharing(path: string, uid: string): Promise<ShareInfo>;
 }
 
 export interface ShareServiceDeps {
@@ -282,6 +284,7 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                 async function readOne(n: MaybeMissingNode): Promise<SharedItem> {
                     if ('missingUid' in n) {
                         return {
+                            uid: n.missingUid,
                             name: indexedName(n.missingUid),
                             relPath: null,
                             where: 'elsewhere',
@@ -303,12 +306,13 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                             result = await sdk.getSharingInfo(n.uid);
                         } catch (e) {
                             if (failsTheList(e)) throw e;
-                            return { name, relPath, where, link: null, people: 0, unreadable: "Proton Drive couldn't say how this item is shared" };
+                            return { uid: n.uid, name, relPath, where, link: null, people: 0, unreadable: "Proton Drive couldn't say how this item is shared" };
                         }
                         // The server just listed it as shared, but the SDK reads the node's share from its cache, which learns
                         // of a share made elsewhere only from its events: listed, never left out, as nothing public may be hidden
                         if (!result) {
                             return {
+                                uid: n.uid,
                                 name,
                                 relPath,
                                 where,
@@ -317,12 +321,12 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                                 unreadable: 'Proton Drive is still catching up with this item: refresh in a moment',
                             };
                         }
-                        return { name, relPath, where, link: toInfo(result).link, people: everyone(result).length };
+                        return { uid: n.uid, name, relPath, where, link: toInfo(result).link, people: everyone(result).length };
                     } catch (e) {
                         if (failsTheList(e)) throw e;
                         // An error on this computer (the index, say) with one item: that item alone is unreadable. The list has no
                         // logger, and nothing about the item (its link, the people on it) belongs in a log anyway
-                        return { name, relPath, where, link: null, people: 0, unreadable: "Proton Drive couldn't read this item on this computer" };
+                        return { uid: n.uid, name, relPath, where, link: null, people: 0, unreadable: "Proton Drive couldn't read this item on this computer" };
                     }
                 }
 
@@ -347,6 +351,7 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                                 const loaded = await loadAlone(w.uid);
                                 if (!loaded) {
                                     unreadable[i] = {
+                                        uid: w.uid,
                                         name: indexedName(w.uid),
                                         relPath: null,
                                         where: 'elsewhere',
@@ -440,8 +445,10 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
             });
         },
 
-        async stopSharing(path) {
+        async stopSharing(path, uid) {
             return run(path, async (n) => {
+                // The path may hold another item now than the one that was listed (moved, replaced): nothing is touched then
+                if (n.uid !== uid) throw new ShareError('This item changed since the list was loaded: refresh');
                 let result: ShareResult | undefined;
                 try {
                     // No settings: the SDK deletes the whole share, the link and everyone
