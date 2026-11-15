@@ -522,7 +522,7 @@ fn menu_item(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
 }
 
 fn card_title(ui: &mut egui::Ui, title: &str) {
-    ui.label(RichText::new(title).size(15.5).strong().color(TEXT_PRIMARY()));
+    ui.label(RichText::new(title).font(crate::bold(15.5)).color(TEXT_PRIMARY()));
 }
 
 /// A line that never wraps: elided to the room left, the whole of `full` on hover.
