@@ -7,6 +7,7 @@
 //! focused, out of sight, and GNOME then let that hidden window draw only once a second, which held up the whole app.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use eframe::egui::{
@@ -90,6 +91,8 @@ pub const CANT_SHOW_PASSWORD: &str = "Proton Drive can't show this link's passwo
 pub const DAEMON_UNREACHABLE: &str = "Can't reach Proton Drive's background service";
 /// What a daemon from before the /share routes answers (404): restarting it brings them
 pub const SHARE_NEEDS_RESTART: &str = "Restart Proton Drive to share from here";
+/// Under an expired link, whose Copy link is off (Files' Copy Link refuses it too)
+pub const LINK_EXPIRED: &str = "This link has expired: set a new date, or remove the expiry, to use it again";
 const UNREADABLE: &str = "Unreadable reply from the Proton Drive background service";
 /// As many addresses as the daemon takes in one invitation
 const MAX_INVITES: usize = 50;
@@ -318,8 +321,8 @@ pub fn remove_person_at(socket: &Path, rel_path: &str, email: &str) -> Result<()
 }
 
 /// Screenshot-only: `--fake-share <state>`, how the item is shared in each state the window shows (none, a link, a link
-/// with a password and an expiry a week out, and a link with three people: a member editor, a Proton invitation and an
-/// invitation by email); None for an unknown state.
+/// with a password and an expiry a week out, a link that expired yesterday, and a link with three people: a member
+/// editor, a Proton invitation and an invitation by email); None for an unknown state.
 pub fn fake_share_info(state: &str, now_ms: i64, offset_at: impl Fn(i64) -> i64) -> Option<ShareInfo> {
     let link = |has_password: bool, expires_at: Option<i64>| ShareLink {
         url: "https://drive.proton.me/urls/7XK2M9QD4A#aB3dE5fG7hJ9".into(),
@@ -334,6 +337,10 @@ pub fn fake_share_info(state: &str, now_ms: i64, offset_at: impl Fn(i64) -> i64)
         "link-password" => {
             let week = end_of_day(local_day(now_ms, &offset_at) + 7, &offset_at);
             ShareInfo { link: Some(link(true, Some(week))), people: vec![] }
+        }
+        "link-expired" => {
+            let yesterday = end_of_day(local_day(now_ms, &offset_at) - 1, &offset_at);
+            ShareInfo { link: Some(link(false, Some(yesterday))), people: vec![] }
         }
         "people" => ShareInfo {
             link: Some(link(false, None)),
@@ -373,16 +380,50 @@ pub enum Confirm {
     RemovePerson(String),
 }
 
-/// The change out, if any: what to do once it went through.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The change out, if any: what to do once it went through, or what to say if it didn't.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Change {
     LinkOn,
     LinkOff,
     Password,
     Expiry,
     Invite,
-    Role,
-    RemovePerson,
+    /// Someone's role (their address)
+    Role(String),
+    /// Someone's access (their address)
+    RemovePerson(String),
+}
+
+/// Which Share window a request came from. Each window gets its own, and its answers come back with it, so an answer
+/// for a window since closed or replaced never lands in another, even one open on the same item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowId(u64);
+
+static NEXT_WINDOW: AtomicU64 = AtomicU64::new(1);
+
+/// A change a window sent, still out when the window was closed or replaced (closing never waits): if it fails, the
+/// app's notice says so, since no window is left to.
+pub struct LeftChange {
+    window: WindowId,
+    rel_path: String,
+    name: String,
+    change: Change,
+}
+
+impl LeftChange {
+    /// What the notice says when it failed.
+    fn failed(&self, problem: &str) -> String {
+        let name = &self.name;
+        match &self.change {
+            Change::LinkOn => format!("Couldn't turn on the link to {name}: {problem}"),
+            Change::LinkOff => format!("Couldn't stop sharing the link to {name}: {problem}"),
+            Change::Password => format!("Couldn't change the password of the link to {name}: {problem}"),
+            Change::Expiry => format!("Couldn't change when the link to {name} expires: {problem}"),
+            Change::Invite => format!("Couldn't invite people to {name}: {problem}"),
+            Change::Role(email) => format!("Couldn't change {email}'s access to {name}: {problem}"),
+            Change::RemovePerson(email) => format!("Couldn't remove {email}'s access to {name}: {problem}"),
+        }
+    }
 }
 
 /// What the user did in the window.
@@ -419,6 +460,8 @@ impl Action {
 
 /// The Share window's state, for the item at `abs_path`.
 pub struct ShareWindow {
+    /// This window's, carried by its requests and their answers
+    pub id: WindowId,
     pub abs_path: String,
     /// The item's path inside My files; empty until known, and when it isn't in the drive
     pub rel_path: String,
@@ -452,6 +495,7 @@ impl ShareWindow {
     pub fn new(abs_path: &str) -> Self {
         let name = Path::new(abs_path).file_name().map_or_else(|| abs_path.to_string(), |n| n.to_string_lossy().into_owned());
         Self {
+            id: WindowId(NEXT_WINDOW.fetch_add(1, Ordering::Relaxed)),
             abs_path: abs_path.to_string(),
             rel_path: String::new(),
             name,
@@ -469,6 +513,34 @@ impl ShareWindow {
             copied: false,
             focus_field: false,
         }
+    }
+
+    /// The change it sent that isn't answered yet, if any, as it is closed or replaced.
+    pub fn left_change(self) -> Option<LeftChange> {
+        let change = self.busy?;
+        Some(LeftChange { window: self.id, rel_path: self.rel_path, name: self.name, change })
+    }
+
+    /// Share… again on its item: it reads again (what it shows, an error included, may be out of date), unless
+    /// something is typed in it, or it already waits for the daemon.
+    fn again(&mut self) -> Option<WorkerCommand> {
+        // While a read failed, no field shows: nothing typed is in sight to keep
+        let typed = matches!(self.info, Some(Ok(_)))
+            && (!self.invite_input.trim().is_empty()
+                || self.password_editor.is_some()
+                || self.expiry_editor.is_some()
+                || self.confirm.is_some());
+        if typed || !self.resolved || self.rel_path.is_empty() || self.busy.is_some() || self.loading {
+            return None;
+        }
+        self.error = None;
+        Some(self.load())
+    }
+
+    /// A change sent from a window since closed, for this item, was answered: what this window read may be from before
+    /// it, so it reads again (unless its own change is out: the read after that one comes anyway).
+    fn changed_elsewhere(&mut self, rel_path: &str) -> Option<WorkerCommand> {
+        (self.resolved && !self.rel_path.is_empty() && self.rel_path == rel_path && self.busy.is_none()).then(|| self.load())
     }
 
     /// Works out the item's path inside My files from the sync folder the daemon reported, once, and asks how it is
@@ -508,7 +580,7 @@ impl ShareWindow {
 
     fn load(&mut self) -> WorkerCommand {
         self.loading = true;
-        WorkerCommand::ShareLoad { rel_path: self.rel_path.clone() }
+        WorkerCommand::ShareLoad { window: self.id, rel_path: self.rel_path.clone() }
     }
 
     fn link(&self) -> Option<&ShareLink> {
@@ -517,12 +589,12 @@ impl ShareWindow {
 
     /// A change goes out: the window waits for it, and a shown password is hidden again (it may be about to change).
     fn start(&mut self, change: Change) {
-        self.busy = Some(change);
-        self.error = None;
-        self.copied = false;
         if matches!(change, Change::LinkOn | Change::LinkOff | Change::Password) {
             self.password = PasswordView::Hidden;
         }
+        self.busy = Some(change);
+        self.error = None;
+        self.copied = false;
     }
 
     /// Does what the user asked; what to send the worker, if anything. Nothing goes while a change, or the read after
@@ -532,14 +604,14 @@ impl ShareWindow {
         if !action.is_local() && (self.working() || self.rel_path.is_empty()) {
             return None;
         }
-        let rel_path = self.rel_path.clone();
+        let (window, rel_path) = (self.id, self.rel_path.clone());
         match action {
             Action::LinkOn => {
                 if self.link().is_some() {
                     return None;
                 }
                 self.start(Change::LinkOn);
-                Some(WorkerCommand::ShareEnsureLink { rel_path })
+                Some(WorkerCommand::ShareEnsureLink { window, rel_path })
             }
             Action::AskLinkOff => {
                 self.confirm = self.link().is_some().then_some(Confirm::LinkOff);
@@ -558,16 +630,16 @@ impl ShareWindow {
                     self.start(Change::LinkOff);
                     self.password_editor = None;
                     self.expiry_editor = None;
-                    Some(WorkerCommand::ShareRemoveLink { rel_path })
+                    Some(WorkerCommand::ShareRemoveLink { window, rel_path })
                 }
                 Confirm::RemovePerson(email) => {
-                    self.start(Change::RemovePerson);
-                    Some(WorkerCommand::ShareRemovePerson { rel_path, email })
+                    self.start(Change::RemovePerson(email.clone()));
+                    Some(WorkerCommand::ShareRemovePerson { window, rel_path, email })
                 }
             },
             Action::ShowPassword => {
                 self.password = PasswordView::Loading;
-                Some(WorkerCommand::SharePassword { rel_path })
+                Some(WorkerCommand::SharePassword { window, rel_path })
             }
             Action::HidePassword => {
                 self.password = PasswordView::Hidden;
@@ -590,11 +662,11 @@ impl ShareWindow {
                     return None;
                 }
                 self.start(Change::Password);
-                Some(WorkerCommand::ShareSettings { rel_path, password: Some(Some(typed)), expires_at: None })
+                Some(WorkerCommand::ShareSettings { window, rel_path, password: Some(Some(typed)), expires_at: None })
             }
             Action::RemovePassword => {
                 self.start(Change::Password);
-                Some(WorkerCommand::ShareSettings { rel_path, password: Some(None), expires_at: None })
+                Some(WorkerCommand::ShareSettings { window, rel_path, password: Some(None), expires_at: None })
             }
             Action::EditExpiry => {
                 let current = self.link().and_then(|l| l.expires_at).filter(|at| *at > now_ms);
@@ -614,7 +686,7 @@ impl ShareWindow {
             Action::SaveExpiry => match expiry_from_date(self.expiry_editor.as_deref()?, now_ms, offset_at) {
                 Ok(at) => {
                     self.start(Change::Expiry);
-                    Some(WorkerCommand::ShareSettings { rel_path, password: None, expires_at: Some(Some(at)) })
+                    Some(WorkerCommand::ShareSettings { window, rel_path, password: None, expires_at: Some(Some(at)) })
                 }
                 Err(problem) => {
                     self.error = Some((Section::Link, problem));
@@ -623,12 +695,12 @@ impl ShareWindow {
             },
             Action::RemoveExpiry => {
                 self.start(Change::Expiry);
-                Some(WorkerCommand::ShareSettings { rel_path, password: None, expires_at: Some(None) })
+                Some(WorkerCommand::ShareSettings { window, rel_path, password: None, expires_at: Some(None) })
             }
             Action::Invite => match parse_emails(&self.invite_input) {
                 Ok(emails) => {
                     self.start(Change::Invite);
-                    Some(WorkerCommand::ShareInvite { rel_path, emails, role: self.invite_role })
+                    Some(WorkerCommand::ShareInvite { window, rel_path, emails, role: self.invite_role })
                 }
                 Err(problem) => {
                     self.error = Some((Section::Invite, problem));
@@ -645,8 +717,8 @@ impl ShareWindow {
                     return None;
                 }
                 person.role = role;
-                self.start(Change::Role);
-                Some(WorkerCommand::ShareRole { rel_path, email, role })
+                self.start(Change::Role(email.clone()));
+                Some(WorkerCommand::ShareRole { window, rel_path, email, role })
             }
             Action::Retry => {
                 self.error = None;
@@ -678,7 +750,7 @@ impl ShareWindow {
             Err(problem) => {
                 let section = match change {
                     Some(Change::Invite) => Section::Invite,
-                    Some(Change::Role | Change::RemovePerson) => Section::People,
+                    Some(Change::Role(_) | Change::RemovePerson(_)) => Section::People,
                     _ => Section::Link,
                 };
                 self.error = Some((section, problem));
@@ -758,25 +830,53 @@ impl ProtonDriveNativeApp {
         }
     }
 
-    /// The open window, if it is the one for this item (an answer for one since closed or replaced is dropped).
-    fn share_for(&mut self, rel_path: &str) -> Option<&mut ShareWindow> {
-        self.share.as_mut().filter(|w| w.resolved && !w.rel_path.is_empty() && w.rel_path == rel_path)
+    /// The open window, if it is the one that asked (an answer for one since closed or replaced has none).
+    fn share_for(&mut self, window: WindowId) -> Option<&mut ShareWindow> {
+        self.share.as_mut().filter(|w| w.id == window)
     }
 
-    pub(crate) fn share_loaded(&mut self, rel_path: &str, result: Result<ShareInfo, String>) {
-        if let Some(w) = self.share_for(rel_path) {
-            w.loaded(result);
+    /// Closes the Share window, or makes way for another: closing never waits, so a change it sent that isn't
+    /// answered yet is remembered, to tell if it fails.
+    pub(crate) fn leave_share(&mut self) {
+        if let Some(left) = self.share.take().and_then(ShareWindow::left_change) {
+            self.share_left.push(left);
         }
     }
 
-    pub(crate) fn share_done(&mut self, rel_path: &str, result: Result<(), String>) {
-        if let Some(cmd) = self.share_for(rel_path).map(|w| w.done(result)) {
+    /// Share… again on the open window's item: it reads again, unless something is typed in it.
+    pub(crate) fn share_again(&mut self) {
+        if let Some(cmd) = self.share.as_mut().and_then(ShareWindow::again) {
             let _ = self.tx.send(cmd);
         }
     }
 
-    pub(crate) fn share_password(&mut self, rel_path: &str, result: Result<Option<String>, String>) {
-        if let Some(w) = self.share_for(rel_path) {
+    pub(crate) fn share_loaded(&mut self, window: WindowId, result: Result<ShareInfo, String>) {
+        if let Some(w) = self.share_for(window) {
+            w.loaded(result);
+        }
+    }
+
+    pub(crate) fn share_done(&mut self, window: WindowId, result: Result<(), String>) {
+        if let Some(w) = self.share_for(window) {
+            let cmd = w.done(result);
+            let _ = self.tx.send(cmd);
+            return;
+        }
+        // A change from a window closed or replaced since: no window can show its failure, so the notice does
+        let Some(i) = self.share_left.iter().position(|c| c.window == window) else {
+            return;
+        };
+        let left = self.share_left.remove(i);
+        if let Err(problem) = result {
+            self.notice = Some(left.failed(&problem));
+        }
+        if let Some(cmd) = self.share.as_mut().and_then(|w| w.changed_elsewhere(&left.rel_path)) {
+            let _ = self.tx.send(cmd);
+        }
+    }
+
+    pub(crate) fn share_password(&mut self, window: WindowId, result: Result<Option<String>, String>) {
+        if let Some(w) = self.share_for(window) {
             w.password_arrived(result);
         }
     }
@@ -837,7 +937,7 @@ impl ProtonDriveNativeApp {
                 ui.label(RichText::new("Working…").size(12.5).color(TEXT_MUTED()));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                // Closing never waits: what is out still happens, and its answer is dropped
+                // Closing never waits: what is out still happens, and a failure is told in the app's notice
                 if primary_button(ui, "Done", 34.0).clicked() {
                     close = true;
                 }
@@ -849,7 +949,7 @@ impl ProtonDriveNativeApp {
             }
         }
         if close {
-            self.share = None;
+            self.leave_share();
         }
     }
 
@@ -1015,6 +1115,7 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
         error_line(ui, w, Section::Link);
         return;
     };
+    let (expiry, expired) = expiry_text(link.expires_at, now, home::local_offset_secs);
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         let copy_w = button_width(ui, "Copy link");
@@ -1028,8 +1129,12 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
                 ui.set_width(field_w - 22.0);
                 elided(ui, RichText::new(&link.url).size(12.5).color(TEXT_PRIMARY()), &link.url);
             });
-        let label = if w.copied { "Copied" } else { "Copy link" };
-        if proton_button(ui, Vec2::new(copy_w, 34.0), label, PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE, 13.0).clicked() {
+        // An expired link leads nowhere: it isn't copied (an older link, without its password in the URL, still is)
+        let label = if w.copied && !expired { "Copied" } else { "Copy link" };
+        let copy = ui.add_enabled_ui(!expired, |ui| {
+            proton_button(ui, Vec2::new(copy_w, 34.0), label, PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE, 13.0)
+        });
+        if copy.inner.clicked() {
             ui.ctx().copy_text(link.url.clone());
             w.copied = true;
         }
@@ -1037,7 +1142,9 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
     let can = if link.role == Role::Editor { "edit" } else { "view" };
     muted(
         ui,
-        if link.has_password {
+        if expired {
+            LINK_EXPIRED.to_string()
+        } else if link.has_password {
             format!("Anyone with the link and the password can {can}.")
         } else {
             format!("Anyone with the link can {can}.")
@@ -1103,7 +1210,6 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
         });
     }
 
-    let (expiry, expired) = expiry_text(link.expires_at, now, home::local_offset_secs);
     ui.horizontal(|ui| {
         field_label(ui, "Expires");
         let color = if expired {
