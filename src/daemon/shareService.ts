@@ -1,4 +1,4 @@
-import { MemberRole, type ProtonDriveClient } from '@protontech/drive-sdk';
+import { MemberRole, type ProtonDriveClient, type URLAccess } from '@protontech/drive-sdk';
 
 export type ShareRole = 'viewer' | 'editor';
 
@@ -33,6 +33,20 @@ const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const sdkRole = (role: ShareRole): MemberRole => (role === 'editor' ? MemberRole.Editor : MemberRole.Viewer);
 
 const toRole = (sdkRole: string): ShareRole => (sdkRole === 'editor' || sdkRole === 'admin' ? 'editor' : 'viewer');
+
+// A link made by an older Proton Drive has no generated password: the SDK puts its whole password, the user's own, after
+// the '#' of the URL and leaves customPassword empty (cryptoService.ts, decryptShareUrlPassword: flags Legacy and
+// CustomPassword). The SDK tells such a link by a fragment that isn't the 12 characters it generates
+// (sharingManagement.ts, updateSharedLink: `generatedPassword.length !== PUBLIC_LINK_GENERATED_PASSWORD_LENGTH`), and
+// so does this, and by a second '#'. An older link whose own password is exactly 12 characters can't be told apart.
+const GENERATED_PASSWORD_LENGTH = 12;
+function isOlderLink(url: string): boolean {
+    const parts = url.split('#');
+    return parts.length !== 2 || parts[1].length !== GENERATED_PASSWORD_LENGTH;
+}
+
+// The URL as it may be shown: an older link's without the password after its '#'
+const shownUrl = (url: string) => (isOlderLink(url) ? url.split('#')[0] : url);
 
 function isOffline(e: unknown): boolean {
     const err = e as { name?: string; message?: string; code?: string } | null;
@@ -106,8 +120,8 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
         return {
             link: u
                 ? {
-                      url: u.url,
-                      hasPassword: !!u.customPassword,
+                      url: shownUrl(u.url),
+                      hasPassword: !!u.customPassword || isOlderLink(u.url),
                       expiresAt: u.expirationTime ? u.expirationTime.getTime() : null,
                       role: toRole(u.role),
                   }
@@ -124,13 +138,26 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
         };
     }
 
+    // Copy Link hands out a link only as it works, and never renews or rewrites one: that is for the Share window
+    function refuseUnusable(link: URLAccess, name: string): void {
+        if (isOlderLink(link.url)) {
+            throw new ShareError('This link was made with an older Proton Drive: open it on drive.proton.me to copy it');
+        }
+        if (link.expirationTime && link.expirationTime.getTime() <= deps.now()) {
+            throw new ShareError(`The link to ${name} has expired: set a new expiry in Share… to use it again`);
+        }
+    }
+
     const infoOf = (uid: string) => sdk.getSharingInfo(uid).then(toInfo);
 
     return {
         info: (path) => run(path, (n) => infoOf(n.uid)),
 
         password: (path) =>
-            run(path, async (n) => (await sdk.getSharingInfo(n.uid))?.urlAccess?.customPassword ?? null),
+            run(path, async (n) => {
+                const link = (await sdk.getSharingInfo(n.uid))?.urlAccess;
+                return link && !isOlderLink(link.url) ? (link.customPassword ?? null) : null;
+            }),
 
         async ensureLink(path) {
             return run(path, async (n) => {
@@ -141,7 +168,10 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                 // nothing at all: it finds the item's share the same way (or makes an empty one, which the link below then
                 // uses) and answers its real state, without writing to a link. A link found then is returned as it is.
                 const existing = (await sdk.getSharingInfo(n.uid))?.urlAccess ?? (await sdk.shareNode(n.uid, {})).urlAccess;
-                if (existing) return { url: existing.url, created: false };
+                if (existing) {
+                    refuseUnusable(existing, n.name);
+                    return { url: existing.url, created: false };
+                }
                 const made = await sdk.shareNode(n.uid, { urlAccess: { role: MemberRole.Viewer } });
                 if (!made.urlAccess) throw new Error('no link was made');
                 log(path, `Shared ${n.name} with a link`);
