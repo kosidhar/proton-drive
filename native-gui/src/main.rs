@@ -2670,40 +2670,18 @@ impl ProtonDriveNativeApp {
                 let working = self.files_missing_working;
                 let mut chosen = None;
                 ui.horizontal(|ui| {
-                    let keep_text = if working { TEXT_MUTED() } else if virtual_layout { Color32::WHITE } else { TEXT_PRIMARY() };
-                    let keep = if virtual_layout {
-                        proton_button(ui, Vec2::new(190.0, 32.0), "Keep them online-only", PROTON_PURPLE, PROTON_PURPLE_HOVER, None, keep_text, 12.5)
-                    } else {
-                        proton_button(
-                            ui,
-                            Vec2::new(190.0, 32.0),
-                            "Keep them online-only",
-                            BG_CARD_ALT(),
-                            btn_secondary_hover_bg(),
-                            Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                            keep_text,
-                            12.5,
-                        )
-                    };
-                    if keep.on_hover_text("Nothing is deleted, on this computer or in Proton Drive").clicked() {
-                        chosen = Some(MissingChoice::KeepOnlineOnly);
-                    }
-                    ui.add_space(4.0);
-                    if proton_button(
-                        ui,
-                        Vec2::new(250.0, 32.0),
-                        "Delete them from Proton Drive too",
-                        BG_CARD_ALT(),
-                        btn_secondary_hover_bg(),
-                        Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                        if working { TEXT_MUTED() } else { STATUS_DANGER },
-                        12.5,
-                    )
-                    .on_hover_text("Asks first. While they are missing, nothing is deleted in Proton Drive.")
-                    .clicked()
-                    {
-                        chosen = Some(MissingChoice::DeleteInCloud);
-                    }
+                    ui.add_enabled_ui(!working, |ui| {
+                        let kind = if virtual_layout { ButtonKind::Primary } else { ButtonKind::Secondary };
+                        let keep = action_button(ui, kind, Some(icons::ONLINE_ONLY), "Keep them online-only", 32.0);
+                        if keep.on_hover_text("Nothing is deleted, on this computer or in Proton Drive").clicked() {
+                            chosen = Some(MissingChoice::KeepOnlineOnly);
+                        }
+                        ui.add_space(4.0);
+                        let delete = action_button(ui, ButtonKind::Secondary, Some(icons::TRASH), "Delete them from Proton Drive too", 32.0);
+                        if delete.on_hover_text("Asks first. While they are missing, nothing is deleted in Proton Drive.").clicked() {
+                            chosen = Some(MissingChoice::DeleteInCloud);
+                        }
+                    });
                 });
                 match chosen {
                     _ if working => {}
@@ -2746,29 +2724,17 @@ impl ProtonDriveNativeApp {
                 let mut start_fresh = false;
                 let mut sign_out = false;
                 ui.horizontal(|ui| {
-                    let text = if working { TEXT_MUTED() } else { Color32::WHITE };
-                    if proton_button(ui, Vec2::new(210.0, 32.0), "Start fresh with this account", PROTON_PURPLE, PROTON_PURPLE_HOVER, None, text, 12.5)
-                        .on_hover_text("Asks first. The files on this computer stay, and upload to this account.")
-                        .clicked()
-                    {
-                        start_fresh = true;
-                    }
-                    ui.add_space(4.0);
-                    if proton_button(
-                        ui,
-                        Vec2::new(110.0, 32.0),
-                        "Sign out",
-                        BG_CARD_ALT(),
-                        btn_secondary_hover_bg(),
-                        Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                        if working { TEXT_MUTED() } else { TEXT_PRIMARY() },
-                        12.5,
-                    )
-                    .on_hover_text("Then sign in to the account the files were synced with")
-                    .clicked()
-                    {
-                        sign_out = true;
-                    }
+                    ui.add_enabled_ui(!working, |ui| {
+                        let fresh = action_button(ui, ButtonKind::Primary, Some(icons::RESTART), "Start fresh with this account", 32.0);
+                        if fresh.on_hover_text("Asks first. The files on this computer stay, and upload to this account.").clicked() {
+                            start_fresh = true;
+                        }
+                        ui.add_space(4.0);
+                        let out = action_button(ui, ButtonKind::Secondary, Some(icons::SIGN_OUT), "Sign out", 32.0);
+                        if out.on_hover_text("Then sign in to the account the files were synced with").clicked() {
+                            sign_out = true;
+                        }
+                    });
                 });
                 if !working && start_fresh {
                     self.pending_confirm = Some(PendingConfirm::StartFresh);
@@ -2968,14 +2934,12 @@ impl ProtonDriveNativeApp {
                             for action in &mv.actions {
                                 let Some(label) = move_action_label(action) else { continue };
                                 // Going on is the main way out; moving back is the other
-                                let primary = action != "move-back";
-                                let (fill, hover, stroke, text) = if primary {
-                                    (PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE)
-                                } else {
-                                    (BG_CARD(), btn_secondary_hover_bg(), Some(Stroke::new(1.0_f32, BORDER_SUBTLE())), TEXT_PRIMARY())
+                                let (kind, icon) = match action.as_str() {
+                                    "move-back" => (ButtonKind::Secondary, icons::MOVE_BACK),
+                                    "finish" => (ButtonKind::Primary, icons::CHECK),
+                                    _ => (ButtonKind::Primary, icons::REFRESH),
                                 };
-                                let size = Vec2::new(button_width(ui, label), 32.0);
-                                if proton_button(ui, size, label, fill, hover, stroke, text, 13.0).clicked() {
+                                if action_button(ui, kind, Some(icon), label, 32.0).clicked() {
                                     chosen = Some(action.clone());
                                 }
                                 ui.add_space(4.0);
@@ -6179,14 +6143,14 @@ mod tests {
         let launched = || home::LAUNCHED.with(|l| std::mem::take(&mut *l.borrow_mut()));
         launched();
         let mut h = home_with(|s| s.sync_dir = "/srv/u/ProtonDrive".into());
-        h.click(h.text_at("Open Proton Drive Trash").expect("the trash is offered on Home"));
+        h.click(h.text_at("Trash").expect("the trash is offered on Home"));
         assert_eq!(launched(), vec!["https://drive.proton.me/trash".to_string()]);
         h.click(h.text_at("Open in Files").unwrap());
         assert_eq!(launched(), vec!["/srv/u/ProtonDrive".to_string()]);
         assert_eq!(h.sent(), Vec::<String>::new()); // nothing goes to the daemon
         // Not before a folder is set up
         let h = home_with(|s| s.sync_dir = String::new());
-        assert!(h.text_at("Open Proton Drive Trash").is_none());
+        assert!(h.text_at("Trash").is_none());
 
         let mut h = Harness::settings(None, None);
         h.app.status.logged_in = true;
@@ -6204,10 +6168,37 @@ mod tests {
         // A screenshot opens nothing, from the same buttons
         home::AS_SCREENSHOT.with(|s| s.set(true));
         let mut h = home_with(|s| s.sync_dir = "/srv/u/ProtonDrive".into());
-        h.click(h.text_at("Open Proton Drive Trash").unwrap());
+        h.click(h.text_at("Trash").unwrap());
         h.click(h.text_at("Open in Files").unwrap());
         home::AS_SCREENSHOT.with(|s| s.set(false));
         assert_eq!(launched(), Vec::<String>::new(), "a screenshot opens nothing");
+    }
+
+    #[test]
+    fn home_offers_trash_with_its_old_hover() {
+        let mut h = home_with(|s| s.sync_dir = "/srv/u/ProtonDrive".into());
+        let label = h.text_at("Trash").expect("Home offers Trash");
+        assert!(h.text_at("Open Proton Drive Trash").is_none(), "the long name is Settings'");
+        let glyph = h.text_at(icons::TRASH).expect("the trash icon is painted");
+        assert!(glyph.x < label.x && (glyph.y - label.y).abs() < 4.0, "the icon {glyph:?} is before the label {label:?}");
+        tooltips_at_once(&h);
+        hover(&mut h, label);
+        assert!(h.text_at(&home::trash_hover("/srv/u/ProtonDrive")).is_some(), "hovering Trash says where restored files go");
+    }
+
+    #[test]
+    fn home_buttons_carry_their_icons_before_their_labels() {
+        let h = home_with(|s| {
+            s.sync_dir = "/srv/u/ProtonDrive".into();
+            s.stats.total_bytes = 1024;
+        });
+        for (label, icon) in [("Sync now", icons::SYNC), ("Pause", icons::PAUSE), ("Free up space…", icons::ONLINE_ONLY)] {
+            let at = h.text_at(label).unwrap_or_else(|| panic!("{label}"));
+            let glyph = h.text_at(icon).unwrap_or_else(|| panic!("{label}'s icon is painted"));
+            assert!(glyph.x < at.x && (glyph.y - at.y).abs() < 4.0, "{label}'s icon {glyph:?} is before it at {at:?}");
+        }
+        let h = home_with(|s| s.settings.paused = true);
+        assert!(h.text_at(icons::RESUME).is_some() && h.text_at("Resume").is_some());
     }
 
     #[test]
