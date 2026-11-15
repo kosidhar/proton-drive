@@ -30,8 +30,6 @@ pub struct SharedItem {
     pub unreadable: Option<String>,
 }
 
-// Used by Task 6 (the row buttons)
-#[allow(dead_code)]
 pub const WEB_SHARED_URL: &str = "https://drive.proton.me/shared";
 pub const LOADING: &str = "Loading what you've shared…";
 pub const EMPTY: &str = "Nothing shared yet. Right-click a file or folder in Files and choose Share… or Copy Link.";
@@ -83,8 +81,6 @@ pub fn exposure_text(item: &SharedItem, now_ms: i64, offset_at: impl Fn(i64) -> 
 }
 
 /// Whether Copy link applies: the item is in My files, its sharing is readable and its link is live.
-// Used by Task 6 (the row buttons)
-#[allow(dead_code)]
 pub fn can_copy(item: &SharedItem, now_ms: i64) -> bool {
     item.place == Place::MyFiles
         && item.unreadable.is_none()
@@ -92,8 +88,6 @@ pub fn can_copy(item: &SharedItem, now_ms: i64) -> bool {
 }
 
 /// The question before stopping all sharing of an item, naming only what is lost.
-// Used by Task 6 (stopping)
-#[allow(dead_code)]
 pub fn stop_question(item: &SharedItem) -> String {
     let mut lost = Vec::new();
     if item.link.is_some() {
@@ -279,6 +273,12 @@ pub struct SharedPage {
     pub error: Option<String>,
     /// The number of the newest read
     pub seq: u64,
+    /// The rel_path whose sharing is being stopped: its buttons wait for the answer
+    pub stopping: Option<String>,
+    /// The rel_path whose link was just copied, until the next read
+    pub copied: Option<String>,
+    /// Why the last Stop sharing failed, shown above the list (which stays)
+    pub stop_error: Option<String>,
 }
 
 impl SharedPage {
@@ -287,6 +287,8 @@ impl SharedPage {
         self.seq += 1;
         self.loading = true;
         self.error = None;
+        self.copied = None;
+        self.stop_error = None;
         self.seq
     }
 

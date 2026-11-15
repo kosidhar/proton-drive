@@ -881,8 +881,13 @@ impl ProtonDriveNativeApp {
     /// Closes the Share window, or makes way for another: closing never waits, so a change it sent that isn't
     /// answered yet is remembered, to tell if it fails.
     pub(crate) fn leave_share(&mut self) {
+        let was_open = self.share.is_some();
         if let Some(left) = self.share.take().and_then(ShareWindow::left_change) {
             self.share_left.push(left);
+        }
+        // What was shared may have changed in the window: the Shared section reads it again (#253)
+        if was_open && self.tab == crate::NavTab::Shared {
+            self.load_shared();
         }
     }
 
