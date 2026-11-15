@@ -177,6 +177,7 @@ Any of these makes the feature a failure, even if everything else works.
     - *The target name is taken remotely:* the moved item gets the existing conflict-copy name (`name (conflict <date> <device>)`), with a notification.
     - *The source was trashed remotely before replay:* if there is a local copy, upload it as a new file at the new path, so nothing is lost; if it was online-only, drop the operation and notify.
     - *A delete of an item that was changed remotely:* still trash it. The item stays recoverable from the Proton Drive trash.
+    - *A rename or move followed by a delete, before either reached Proton:* the rename or move still goes first, so the item is in the Proton Drive trash under the name, and from the folder, the user last gave it. Only a later rename or move of the same item replaces an earlier one. A network or server failure keeps the order: the delete waits. Any other failure drops the rename, with no conflict name and no notification, and the item is trashed under the name Proton has (#234).
   - **Pause** stops background transfers and journal replay. Opening an online-only file is an explicit user action, so it still downloads while paused.
 - **Retire the old selective sync.** `excludedFolders` is migrated (§5.7) and retired. The CLI's `selective-sync exclude/include` map to hide and unhide (my call).
 - **New CLI commands** to set and inspect state, e.g. `protondrive pin|free|hide|unhide|status <path>`. Naming is the builder's call.
