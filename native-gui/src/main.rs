@@ -1412,6 +1412,8 @@ struct ProtonDriveNativeApp {
     fake_paused_until: Option<i64>,
     /// Home's Pause choices are open (#205)
     pause_choices_open: bool,
+    /// The top bar's account menu is open (#274)
+    account_menu_open: bool,
 
     // Window geometry state
     window_geometry: WindowGeometry,
@@ -1539,6 +1541,7 @@ impl ProtonDriveNativeApp {
             fake_account_mismatch: false,
             fake_paused_until: None,
             pause_choices_open: false,
+            account_menu_open: false,
             window_geometry,
             maximize_applied_on_open: false,
             applied_light_mode: initial_light,
@@ -1698,6 +1701,10 @@ impl ProtonDriveNativeApp {
                         }
                         if s.logged_in {
                             self.login_url = None;
+                        }
+                        // Signed out meanwhile (from Settings, the tray…): the account menu has nothing left to offer
+                        if !s.logged_in && s.account.is_none() {
+                            self.account_menu_open = false;
                         }
                         // The list Needs attention shows may have changed: reload it while any is open (see
                         // should_reload_conflicts)
@@ -1865,8 +1872,9 @@ impl ProtonDriveNativeApp {
         }
     }
 
-    /// Shows a section; Settings reads what is hidden as it opens.
+    /// Shows a section, closing the account menu; Settings reads what is hidden as it opens.
     fn open_tab(&mut self, tab: NavTab) {
+        self.account_menu_open = false;
         if tab == NavTab::Settings && self.tab != NavTab::Settings {
             self.load_hidden();
         }
@@ -1886,9 +1894,9 @@ impl ProtonDriveNativeApp {
     /// Shared: what you've shared, with where it is and what it exposes.
     fn render_shared(&mut self, ui: &mut egui::Ui) {
         ScrollArea::vertical().id_salt("shared_scroll").auto_shrink([false, false]).show(ui, |ui| {
+            // Refresh, on the right (the title is the top bar's)
             ui.horizontal(|ui| {
                 ui.set_min_height(34.0);
-                ui.label(RichText::new("Shared").size(20.0).strong().color(TEXT_PRIMARY()));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let loading = self.shared.loading;
                     // Retry is the action while the list couldn't be read
@@ -2115,10 +2123,9 @@ impl ProtonDriveNativeApp {
     fn render_activity_content(&mut self, ui: &mut egui::Ui, viewport_h: f32) {
         let content_top = ui.cursor().top();
 
-        // The title, and the search at the top right (or Sign in while signed out)
+        // The search and the filter on the right, and Sign in while signed out (the title is the top bar's)
         ui.horizontal(|ui| {
             ui.set_min_height(34.0);
-            ui.label(RichText::new("Activity").size(20.0).strong().color(TEXT_PRIMARY()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if !self.status.logged_in
                     && proton_button(
@@ -2136,7 +2143,7 @@ impl ProtonDriveNativeApp {
                     self.send_account_command(WorkerCommand::StartLogin);
                 }
                 ui.add_space(8.0);
-                // Room kept for the filter beside it, so a narrow window never runs it over the title
+                // Room kept for the filter beside it, so a narrow window never pushes it out
                 let width = (ui.available_width() - ACTIVITY_FILTER_WIDTH).clamp(120.0, 280.0);
                 ui.add_sized(
                     [width, 32.0],
@@ -2780,9 +2787,11 @@ impl ProtonDriveNativeApp {
         let _ = self.tx.send(WorkerCommand::ResolveFilesMissing { choice, root, names });
     }
 
-    /// One frame of the window's contents: sidebar, the current section and anything floating over them.
+    /// One frame of the window's contents: the sidebar, the top bar, the current section and anything floating over
+    /// them.
     fn render_ui(&mut self, ctx: &egui::Context) {
         self.render_sidebar(ctx);
+        self.render_top_bar(ctx);
 
         egui::CentralPanel::default()
             .frame(
@@ -3623,14 +3632,18 @@ fn action_button_width(ui: &egui::Ui, icon: Option<&str>, label: &str) -> f32 {
 /// tooltip and its name for screen readers.
 #[cfg_attr(not(test), expect(dead_code, reason = "no screen has icon-only buttons yet"))]
 fn icon_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
-    let (rect, resp) = button_shell(ui, Vec2::splat(28.0), label, Color32::TRANSPARENT, BG_CARD_ALT(), None);
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        icon,
-        icons::font(BUTTON_ICON_SIZE),
-        TEXT_PRIMARY(),
-    );
+    icon_button_pressed(ui, icon, label, false)
+}
+
+/// `icon_button`, filled with the soft purple while `pressed`: the top bar's gear while Settings is open.
+fn icon_button_pressed(ui: &mut egui::Ui, icon: &str, label: &str, pressed: bool) -> egui::Response {
+    let (fill, hover_fill, color) = if pressed {
+        (PROTON_PURPLE_SOFT(), PROTON_PURPLE_SOFT(), PROTON_PURPLE_TEXT())
+    } else {
+        (Color32::TRANSPARENT, BG_CARD_ALT(), TEXT_PRIMARY())
+    };
+    let (rect, resp) = button_shell(ui, Vec2::splat(28.0), label, fill, hover_fill, None);
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, icons::font(BUTTON_ICON_SIZE), color);
     resp.on_hover_text(label)
 }
 
@@ -4240,7 +4253,7 @@ USAGE:
   protondrive-gui [OPTIONS]
 
 OPTIONS:
-  --tab <TAB>           initial section (home | activity | settings)
+  --tab <TAB>           initial section (home | shared | activity | settings)
   --screenshot <PATH>   render UI, save a PNG screenshot to PATH, and exit
   --search <QUERY>      pre-fill the activity search
   --share <PATH>        open the share window for the item at the absolute PATH (in a running app too)
@@ -4260,6 +4273,7 @@ OPTIONS:
   --account-mismatch    with --screenshot: show the daemon holding the records of another Proton account
   --paused-until-min <N>  with --screenshot: show sync paused until N minutes from now (0: until resumed)
   --pause-choices       with --screenshot: show Home's Pause choices open
+  --account-menu        with --screenshot: show the top bar's account menu open
   --fake-share <S>      with --screenshot: show the Share window (for --share's item, else Docs/report.pdf in the
                         drive) as S (none | link | link-password | link-expired | people)
   --confirm-stop-sharing <NAME>  with --screenshot and --fake-shared list: show the Stop sharing confirmation for that row
@@ -4300,6 +4314,7 @@ fn main() -> eframe::Result {
     let mut cli_account_mismatch = false;
     let mut cli_paused_until_min: Option<i64> = None;
     let mut cli_pause_choices = false;
+    let mut cli_account_menu = false;
     let mut cli_fake_share: Option<String> = None;
     let mut cli_fake_shared: Option<String> = None;
     let mut cli_confirm_stop_sharing: Option<String> = None;
@@ -4354,6 +4369,9 @@ fn main() -> eframe::Result {
             }
             "--pause-choices" => {
                 cli_pause_choices = true;
+            }
+            "--account-menu" => {
+                cli_account_menu = true;
             }
             "--fake-share" => {
                 cli_fake_share = text(args.next());
@@ -4411,12 +4429,13 @@ fn main() -> eframe::Result {
             || cli_account_mismatch
             || cli_paused_until_min.is_some()
             || cli_pause_choices
+            || cli_account_menu
             || cli_fake_share.is_some()
             || cli_fake_shared.is_some()
             || cli_confirm_stop_sharing.is_some())
     {
         eprintln!(
-            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --fake-share, --fake-shared and --confirm-stop-sharing only apply together with --screenshot; ignoring them"
+            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --account-menu, --fake-share, --fake-shared and --confirm-stop-sharing only apply together with --screenshot; ignoring them"
         );
     }
     let fake_share = match cli_fake_share {
@@ -4581,6 +4600,7 @@ fn main() -> eframe::Result {
                 // Epoch ms from the minutes asked for (0: paused until resumed)
                 app.fake_paused_until = cli_paused_until_min.map(|min| if min > 0 { home::now_ms() + min * 60_000 } else { 0 });
                 app.pause_choices_open = cli_pause_choices;
+                app.account_menu_open = cli_account_menu;
                 let mut status = std::mem::take(&mut app.status);
                 app.apply_fake_drive(&mut status);
                 app.apply_fake_files_missing(&mut status);
@@ -5105,9 +5125,10 @@ mod tests {
                 fake_attention: None,
                 fake_transfers: None,
                 fake_signed_out: false,
-            fake_account_mismatch: false,
-            fake_paused_until: None,
-            pause_choices_open: false,
+                fake_account_mismatch: false,
+                fake_paused_until: None,
+                pause_choices_open: false,
+                account_menu_open: false,
                 window_geometry: WindowGeometry::default(),
                 maximize_applied_on_open: true,
                 applied_light_mode: false,
@@ -5254,6 +5275,18 @@ mod tests {
             self.last.as_ref()?.shapes.iter().find_map(|c| find(&c.shape, text))
         }
 
+        /// The box the last frame painted text starting with `prefix` in (a line shortened to fit), the first time.
+        fn text_rect_starting(&self, prefix: &str) -> Option<egui::Rect> {
+            fn find(shape: &egui::Shape, prefix: &str) -> Option<egui::Rect> {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text().starts_with(prefix) => Some(t.visual_bounding_rect()),
+                    egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, prefix)),
+                    _ => None,
+                }
+            }
+            self.last.as_ref()?.shapes.iter().find_map(|c| find(&c.shape, prefix))
+        }
+
         /// How the last frame laid out this text, the first time it painted it: its font and size.
         fn galley_of(&self, text: &str) -> Option<std::sync::Arc<egui::Galley>> {
             fn find(shape: &egui::Shape, text: &str) -> Option<std::sync::Arc<egui::Galley>> {
@@ -5268,9 +5301,14 @@ mod tests {
 
         /// Everywhere the last frame painted exactly this text, in the order painted.
         fn text_at_all(&self, text: &str) -> Vec<egui::Pos2> {
-            fn find(shape: &egui::Shape, text: &str, out: &mut Vec<egui::Pos2>) {
+            self.text_rects_all(text).into_iter().map(|r| r.center()).collect()
+        }
+
+        /// The boxes the last frame painted exactly this text in, in the order painted.
+        fn text_rects_all(&self, text: &str) -> Vec<egui::Rect> {
+            fn find(shape: &egui::Shape, text: &str, out: &mut Vec<egui::Rect>) {
                 match shape {
-                    egui::Shape::Text(t) if t.galley.text() == text => out.push(t.visual_bounding_rect().center()),
+                    egui::Shape::Text(t) if t.galley.text() == text => out.push(t.visual_bounding_rect()),
                     egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, text, out)),
                     _ => {}
                 }
@@ -5587,15 +5625,15 @@ mod tests {
             max_space: 510 * GB,
             ..Default::default()
         });
-        h.app.open_tab(NavTab::Settings);
         h.frames(2);
-        // Settings starts with the account: name, email, plan, storage and Sign out
-        assert!(h.text_at("Account").is_some());
-        assert!(h.text_at("Gautam C").is_some());
-        assert!(h.text_at("GC").is_some());
-        assert!(h.text_at("gc@proton.me").is_some());
-        assert!(h.text_at("Proton Unlimited").is_some());
-        assert!(h.text_at("51.0 GB of 510.0 GB").is_some());
+        h.click(h.widget_at("Settings").expect("the top bar's gear"));
+        assert_eq!(h.app.tab, NavTab::Settings);
+        // Settings starts with the account: name, email, plan, storage and Sign out (the top bar shows the name, email
+        // and initials too)
+        let in_section = |h: &Harness, text: &str| h.text_at_all(text).iter().any(|p| p.y > chrome::TOP_BAR_HEIGHT);
+        for shown in ["Account", "Gautam C", "GC", "gc@proton.me", "Proton Unlimited", "51.0 GB of 510.0 GB"] {
+            assert!(in_section(&h, shown), "{shown}");
+        }
         h.click(h.text_at("Sign out").expect("Sign out is offered"));
         assert_eq!(h.sent(), vec!["sign out".to_string()]);
         // Nothing of the old sidebar, top bar or popover is left (Home has its own Pause and Sync now)
@@ -6682,7 +6720,9 @@ mod tests {
         let settings: Vec<_> = h.text_at_all("Settings").into_iter().filter(|p| p.x < SIDEBAR_EDGE).collect();
         assert_eq!(settings, Vec::<egui::Pos2>::new(), "Settings leaves the sidebar (the top bar's gear opens it)");
         // Nor is the account at its foot any more (it moves to the top bar)
-        assert!(h.text_at("Not signed in").is_none() && h.text_at("Proton Account").is_none() && h.text_at("PD").is_none());
+        for gone in ["Not signed in", "Proton Account", "PD"] {
+            assert!(h.text_at_all(gone).iter().all(|p| p.x > SIDEBAR_EDGE), "{gone}");
+        }
     }
 
     #[test]
@@ -6696,9 +6736,9 @@ mod tests {
         h.click(activity);
         assert_eq!(h.app.tab, NavTab::Activity);
         assert_eq!(h.fill_under(h.text_at("Activity").unwrap()), Some(SIDEBAR_SELECTED()));
-        // The sections are named for screen readers too
+        // The sections are named for screen readers too (the top bar's title is another "Activity")
         for label in ["Home", "Shared", "Activity"] {
-            assert!(h.widget_at(label).is_some_and(|p| p.x < SIDEBAR_EDGE), "{label}");
+            assert!(h.widgets_at_all(label).iter().any(|p| p.x < SIDEBAR_EDGE), "{label}");
         }
     }
 
@@ -6801,6 +6841,214 @@ mod tests {
         assert_eq!(img.get_pixel(2, 2)[3], 0, "a corner is transparent");
         assert_eq!(img.get_pixel(64, 0)[3], 0, "the middle of the top edge is transparent: no tile behind the folder");
         assert_eq!(img.get_pixel(64, 64)[3], 255, "the folder is there");
+    }
+
+    // #274: the top bar: the section's title, the gear for Settings, and the account, which opens a menu (not Settings)
+    fn gautam() -> AccountInfo {
+        AccountInfo {
+            display_name: "Gautam C".into(),
+            email: "gc@proton.me".into(),
+            initials: "GC".into(),
+            used_space: 51 * GB,
+            max_space: 510 * GB,
+            ..Default::default()
+        }
+    }
+
+    /// Home, signed in as `gautam()`, with the account menu open.
+    fn account_menu() -> Harness {
+        let mut h = Harness::new();
+        h.app.status.account = Some(gautam());
+        h.frames(2);
+        h.click(h.widget_at("Account").expect("the account is one button, named Account"));
+        assert!(h.app.account_menu_open);
+        h
+    }
+
+    /// Where the last frame painted this text in the top bar (right of the sidebar, above the section).
+    fn in_top_bar(h: &Harness, text: &str) -> Vec<egui::Pos2> {
+        h.text_at_all(text).into_iter().filter(|p| p.x > SIDEBAR_EDGE && p.y < chrome::TOP_BAR_HEIGHT).collect()
+    }
+
+    #[test]
+    fn the_top_bar_titles_each_section_once() {
+        let mut h = Harness::new();
+        for tab in [NavTab::Home, NavTab::Shared, NavTab::Activity, NavTab::Settings] {
+            h.app.open_tab(tab);
+            h.frames(3);
+            let title = chrome::tab_title(tab);
+            let shown: Vec<_> = h.text_at_all(title).into_iter().filter(|p| p.x > SIDEBAR_EDGE).collect();
+            assert_eq!(shown.len(), 1, "{tab:?}: {title:?} is shown once beside the sidebar, at {shown:?}");
+            assert!(shown[0].y < chrome::TOP_BAR_HEIGHT, "{tab:?}: in the top bar, at {:?}", shown[0]);
+        }
+        // In bold (the sidebar has no "Settings" to find first)
+        assert!(painted_bold(&h, "Settings"));
+    }
+
+    #[test]
+    fn the_gear_opens_settings() {
+        let mut h = Harness::new();
+        let gear = h.widget_at("Settings").expect("the gear, named Settings");
+        assert!(gear.x > SIDEBAR_EDGE && gear.y < chrome::TOP_BAR_HEIGHT, "in the top bar, at {gear:?}");
+        assert_eq!(in_top_bar(&h, icons::SETTINGS).len(), 1, "drawn as the gear");
+        h.click(gear);
+        assert_eq!(h.app.tab, NavTab::Settings);
+        assert_eq!(h.fill_under(gear), Some(PROTON_PURPLE_SOFT()), "it looks pressed while Settings is open");
+        h.click(h.text_at("Home").unwrap());
+        h.frame(vec![egui::Event::PointerMoved(egui::pos2(600.0, 400.0))]);
+        h.frames(2);
+        assert_ne!(h.fill_under(gear), Some(PROTON_PURPLE_SOFT()), "and not once it is closed");
+    }
+
+    #[test]
+    fn clicking_the_account_opens_the_menu_not_settings() {
+        let mut h = Harness::new();
+        h.app.status.account = Some(gautam());
+        h.frames(2);
+        // The name over the email, then the initials, on the right
+        let (name, email, initials) = (in_top_bar(&h, "Gautam C"), in_top_bar(&h, "gc@proton.me"), in_top_bar(&h, "GC"));
+        assert!(name.len() == 1 && email.len() == 1 && initials.len() == 1, "{name:?} {email:?} {initials:?}");
+        assert!(name[0].y < email[0].y && email[0].x < initials[0].x, "{name:?} {email:?} {initials:?}");
+        let gear = h.widget_at("Settings").unwrap();
+        assert!(gear.x < name[0].x, "the gear {gear:?} is left of the account {name:?}");
+        assert!(h.text_at("Sign out").is_none());
+
+        h.click(h.widget_at("Account").expect("the account is one button, named Account"));
+        assert_eq!(h.app.tab, NavTab::Home, "not Settings");
+        assert!(h.app.account_menu_open);
+        for item in ["Sign out", "Open Proton Drive on the web", "Proton Unlimited", "51.0 GB of 510.0 GB", "Proton storage"] {
+            let at = h.text_at(item).unwrap_or_else(|| panic!("the menu shows {item:?}"));
+            assert!(at.y > chrome::TOP_BAR_HEIGHT, "{item:?}: under the top bar, at {at:?}");
+        }
+        assert_eq!(h.sent(), Vec::<String>::new(), "opening it does nothing else");
+    }
+
+    #[test]
+    fn sign_out_in_the_menu_signs_out_at_once_and_closes_it() {
+        let mut h = account_menu();
+        h.click(h.text_at("Sign out").unwrap());
+        assert_eq!(h.sent(), vec!["sign out".to_string()]);
+        assert!(!h.app.account_menu_open);
+        assert!(h.text_at("Sign out").is_none());
+    }
+
+    #[test]
+    fn web_in_the_menu_opens_drive_proton_me() {
+        let launched = || home::LAUNCHED.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        launched();
+        let mut h = account_menu();
+        h.click(h.text_at("Open Proton Drive on the web").unwrap());
+        assert_eq!(launched(), vec![home::PROTON_DRIVE_WEB_URL.to_string()]);
+        assert!(!h.app.account_menu_open);
+        assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn escape_and_a_click_outside_close_the_menu_without_clicking_through() {
+        let mut h = account_menu();
+        press_key(&mut h, egui::Key::Escape);
+        assert!(!h.app.account_menu_open);
+        assert!(h.text_at("Sign out").is_none());
+
+        h.app.open_tab(NavTab::Shared);
+        h.frames(2);
+        h.sent();
+        h.click(h.widget_at("Account").unwrap());
+        assert!(h.app.account_menu_open);
+        h.click(h.text_at("Home").expect("the sidebar's Home"));
+        assert!(!h.app.account_menu_open, "a click outside closes it");
+        assert_eq!(h.app.tab, NavTab::Shared, "and clicks nothing under it");
+        assert_eq!(h.sent(), Vec::<String>::new());
+        // The account again, with the menu open, closes it too
+        h.click(h.widget_at("Account").unwrap());
+        h.click(h.widget_at("Account").unwrap());
+        assert!(!h.app.account_menu_open);
+    }
+
+    #[test]
+    fn opening_a_section_closes_the_menu() {
+        let mut h = account_menu();
+        h.app.open_tab(NavTab::Activity);
+        h.frames(2);
+        assert!(!h.app.account_menu_open);
+        assert!(h.text_at("Sign out").is_none());
+    }
+
+    #[test]
+    fn signed_out_the_account_area_says_so_and_opens_nothing() {
+        let mut h = Harness::new();
+        h.app.status.logged_in = false;
+        h.app.status.account = None;
+        h.frames(2);
+        let at = in_top_bar(&h, "Not signed in");
+        assert_eq!(at.len(), 1, "said in the top bar");
+        assert_eq!(in_top_bar(&h, "PD").len(), 1, "with PD for initials");
+        h.click(at[0]);
+        assert!(!h.app.account_menu_open);
+        assert!(h.text_at("Sign out").is_none());
+        // Until the daemon first answers, it says so
+        h.app.initial_connecting = true;
+        h.frames(2);
+        assert_eq!(in_top_bar(&h, "Connecting…").len(), 1);
+        // Signed in without the account's details (an older daemon): the menu still offers Sign out
+        h.app.initial_connecting = false;
+        h.app.status.logged_in = true;
+        h.frames(2);
+        assert_eq!(in_top_bar(&h, "Proton Account").len(), 1);
+        h.click(h.widget_at("Account").unwrap());
+        assert!(h.app.account_menu_open);
+        assert!(h.text_at("Sign out").is_some());
+        // Signed out meanwhile (from Settings, the tray…): the menu goes
+        let status = DaemonStatus { logged_in: false, account: None, ..h.app.status.clone() };
+        h.event(WorkerEvent::StatusAndActivity { status: Box::new(Ok(status)), activity: Vec::new() });
+        assert!(!h.app.account_menu_open);
+        assert!(h.text_at("Sign out").is_none());
+    }
+
+    #[test]
+    fn a_long_name_does_not_push_the_title_or_gear_off_at_840() {
+        let mut h = Harness::new();
+        let name = "Bartholomew ".repeat(5);
+        let email = format!("{}@proton.me", "featherstonehaugh".repeat(3));
+        assert!(name.len() >= 60 && email.len() >= 60);
+        h.app.status.account = Some(AccountInfo { display_name: name.clone(), email, initials: "BB".into(), ..gautam() });
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
+        let inside = |h: &Harness, r: egui::Rect| {
+            r.left() > SIDEBAR_EDGE && r.right() <= h.screen.x && r.top() >= 0.0 && r.bottom() <= chrome::TOP_BAR_HEIGHT
+        };
+        for tab in [NavTab::Home, NavTab::Shared, NavTab::Activity, NavTab::Settings] {
+            h.app.open_tab(tab);
+            h.frames(3);
+            let title = chrome::tab_title(tab);
+            let title = *h.text_rects_all(title).iter().find(|r| r.left() > SIDEBAR_EDGE).expect("the title is shown");
+            // On Settings the title is named Settings too: the gear is the one on the right
+            let gear = h.widgets_at_all("Settings").into_iter().max_by(|a, b| a.x.total_cmp(&b.x)).unwrap();
+            let gear = egui::Rect::from_center_size(gear, Vec2::splat(28.0));
+            // (Settings' Account card shows them too)
+            let initials: Vec<_> = h.text_rects_all("BB").into_iter().filter(|r| r.top() < chrome::TOP_BAR_HEIGHT).collect();
+            assert!(initials.len() == 1 && inside(&h, title) && inside(&h, gear) && inside(&h, initials[0]), "{tab:?}");
+            assert!(title.right() < gear.left(), "{tab:?}: the title {title:?} runs under the gear {gear:?}");
+            // The name is shortened to fit, between the gear and the initials
+            let shown = h.text_rect_starting("Bartholomew").expect("the name is painted, shortened");
+            assert!(gear.right() < shown.left() && shown.right() < initials[0].left(), "{tab:?}: {shown:?} {gear:?}");
+            assert!(in_top_bar(&h, &name).is_empty(), "shortened");
+        }
+    }
+
+    #[test]
+    fn the_top_bar_takes_no_clicks_under_a_dialog() {
+        let mut h = Harness::new();
+        h.app.status.account = Some(gautam());
+        h.frames(2);
+        let (gear, account) = (h.widget_at("Settings").unwrap(), h.widget_at("Account").unwrap());
+        for at in [gear, account] {
+            h.app.pending_confirm = Some(PendingConfirm::StartFresh);
+            h.frames(2);
+            h.click(at);
+            assert_eq!(h.app.tab, NavTab::Home);
+            assert!(!h.app.account_menu_open);
+        }
+        assert_eq!(h.sent(), Vec::<String>::new());
     }
 
     #[test]

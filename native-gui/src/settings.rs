@@ -198,7 +198,7 @@ impl ProtonDriveNativeApp {
 }
 
 /// The plan, in a small pill beside the name.
-fn plan_pill(ui: &mut egui::Ui, plan: &str) {
+pub(crate) fn plan_pill(ui: &mut egui::Ui, plan: &str) {
     Frame::NONE
         .fill(crate::PROTON_PURPLE_SOFT())
         .corner_radius(CornerRadius::same(5))
