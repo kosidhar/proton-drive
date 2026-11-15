@@ -971,6 +971,8 @@ static SCREENSHOT_MODE: AtomicBool = AtomicBool::new(false);
 static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// The section a later start asked for, opened with the window (#203)
 static SECTION_REQUESTED: std::sync::Mutex<Option<NavTab>> = std::sync::Mutex::new(None);
+/// The absolute path a later start asked to share, opened with the window (#216)
+static SHARE_REQUESTED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// The running app's context, so the single-instance listener can wake it
 static APP_CONTEXT: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
 
@@ -1206,6 +1208,13 @@ fn save_startup_cache(status: &DaemonStatus, activities: &[ActivityRecord]) {
     }
 }
 
+/// The share window's state. A placeholder until the window itself is built (#216).
+// read by the Share window in Task 5
+#[cfg_attr(not(test), allow(dead_code))]
+struct ShareWindow {
+    abs_path: String,
+}
+
 struct ProtonDriveNativeApp {
     tab: NavTab,
     tx: Sender<WorkerCommand>,
@@ -1307,6 +1316,10 @@ struct ProtonDriveNativeApp {
     frames_rendered: u32,
     screenshot_requested: bool,
     last_poll: Instant,
+    /// The share window, while one is open (#216)
+    // read by the Share window in Task 5
+    #[cfg_attr(not(test), allow(dead_code))]
+    share: Option<ShareWindow>,
 }
 
 impl ProtonDriveNativeApp {
@@ -1418,6 +1431,7 @@ impl ProtonDriveNativeApp {
             frames_rendered: 0,
             screenshot_requested: false,
             last_poll: Instant::now(),
+            share: None,
         }
     }
 
@@ -3076,6 +3090,12 @@ impl ProtonDriveNativeApp {
 }
 
 impl ProtonDriveNativeApp {
+    /// Opens the share window for the item at `abs_path` (an absolute path in the Proton Drive folder), as `--share`
+    /// asks (#216).
+    fn open_share(&mut self, abs_path: &str) {
+        self.share = Some(ShareWindow { abs_path: abs_path.to_string() });
+    }
+
     /// Opened again from the tray or the launcher: bring this window back instead of a second one (#129), on the section
     /// it asked for, if any (#203).
     fn answer_show_request(&mut self, ctx: &egui::Context) {
@@ -3084,6 +3104,9 @@ impl ProtonDriveNativeApp {
         }
         if let Some(tab) = SECTION_REQUESTED.lock().map(|mut s| s.take()).unwrap_or(None) {
             self.tab = tab;
+        }
+        if let Some(path) = SHARE_REQUESTED.lock().map(|mut s| s.take()).unwrap_or(None) {
+            self.open_share(&path);
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -3914,6 +3937,7 @@ OPTIONS:
   --tab <TAB>           initial section (home | activity | settings)
   --screenshot <PATH>   render UI, save a PNG screenshot to PATH, and exit
   --search <QUERY>      pre-fill the activity search
+  --share <PATH>        open the share window for the item at the absolute PATH (in a running app too)
   --confirm-free-all    with --screenshot: show the Free up space confirmation (for the whole drive)
   --drive-status <S>    with --screenshot: show the virtual drive as S (mounted | ejected | plain | crashed | busy |
                         starting | moving | move-failed | different-disk | fuse-unavailable)
@@ -3947,6 +3971,7 @@ fn main() -> eframe::Result {
     let mut screenshot_target: Option<String> = None;
     let mut initial_tab = NavTab::Home;
     let mut cli_tab: Option<String> = None;
+    let mut cli_share: Option<String> = None;
     let mut cli_theme_override: Option<String> = None;
     let mut cli_search: Option<String> = None;
     let mut cli_size: Option<[f32; 2]> = None;
@@ -4030,6 +4055,9 @@ fn main() -> eframe::Result {
             "--search" => {
                 cli_search = args.next();
             }
+            "--share" => {
+                cli_share = args.next();
+            }
             "--tab" => {
                 if let Some(t) = args.next() {
                     initial_tab = parse_tab(&t);
@@ -4084,15 +4112,29 @@ fn main() -> eframe::Result {
     if screenshot_target.is_none() {
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty());
         let in_runtime_dir = runtime_dir.is_some();
+        // A later start that names an item shares it; a path that can't travel as one line just shows the window
+        let request = match cli_share.as_deref().filter(|p| single_instance::is_shareable_path(p)) {
+            Some(path) => single_instance::Request::Share(path.to_string()),
+            None => single_instance::Request::Show(cli_tab.clone()),
+        };
         let paths = single_instance::instance_paths(runtime_dir, node_tmpdir(|name| std::env::var_os(name)), own_uid());
-        match single_instance::claim(&paths, own_uid(), in_runtime_dir, Duration::from_secs(5), cli_tab.as_deref()) {
+        match single_instance::claim(&paths, own_uid(), in_runtime_dir, Duration::from_secs(5), &request) {
             Ok(single_instance::Claim::Signalled) => return Ok(()),
             Ok(single_instance::Claim::Primary { lock, listener }) => {
                 _instance_lock = Some(lock);
                 thread::spawn(move || {
-                    single_instance::serve(listener, |section| {
-                        if let Ok(mut requested) = SECTION_REQUESTED.lock() {
-                            *requested = section.as_deref().map(parse_tab);
+                    single_instance::serve(listener, |request| {
+                        match request {
+                            single_instance::Request::Show(section) => {
+                                if let Ok(mut requested) = SECTION_REQUESTED.lock() {
+                                    *requested = section.as_deref().map(parse_tab);
+                                }
+                            }
+                            single_instance::Request::Share(path) => {
+                                if let Ok(mut requested) = SHARE_REQUESTED.lock() {
+                                    *requested = Some(path);
+                                }
+                            }
                         }
                         SHOW_REQUESTED.store(true, AtomicOrdering::SeqCst);
                         if let Some(ctx) = APP_CONTEXT.get() {
@@ -4166,6 +4208,9 @@ fn main() -> eframe::Result {
             );
             if let Some(q) = cli_search {
                 app.search_query = q;
+            }
+            if let Some(path) = cli_share.as_deref().filter(|p| single_instance::is_shareable_path(p)) {
+                app.open_share(path);
             }
             // Screenshot-only: these flags only draw the dialogs, nothing is sent
             if app.screenshot_target.is_some() {
@@ -4620,6 +4665,9 @@ mod tests {
         last: Option<egui::FullOutput>,
     }
 
+    /// Held by the tests that set the single-instance request statics, which every test of the app shares
+    static REQUEST_STATICS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     impl Harness {
         fn new() -> Self {
             let (tx, commands) = mpsc::channel();
@@ -4683,6 +4731,7 @@ mod tests {
                 frames_rendered: 0,
                 screenshot_requested: false,
                 last_poll: Instant::now(),
+                share: None,
             };
             let ctx = egui::Context::default();
             configure_proton_theme(&ctx);
@@ -4836,9 +4885,10 @@ mod tests {
     }
 
     // #203: a later start that names a section (the tray's problems item asks for Home) opens the running app there; one
-    // that names none leaves it where it is. The only test that touches these statics, so it can't race another.
+    // that names none leaves it where it is. The tests that touch these statics hold REQUEST_STATICS, so they can't race.
     #[test]
     fn a_later_start_opens_the_running_app_on_the_section_it_asks_for() {
+        let _statics = REQUEST_STATICS.lock().unwrap_or_else(|e| e.into_inner());
         let mut h = Harness::new();
         h.app.tab = NavTab::Settings;
         *SECTION_REQUESTED.lock().unwrap() = Some(NavTab::Home);
@@ -4852,6 +4902,23 @@ mod tests {
         h.app.answer_show_request(&h.ctx);
         assert_eq!(h.app.tab, NavTab::Activity);
         assert!(!SHOW_REQUESTED.load(AtomicOrdering::SeqCst));
+    }
+
+    // #216: a later start with --share opens the share window on the running app
+    #[test]
+    fn a_later_start_with_share_opens_the_window_on_the_running_app() {
+        let _statics = REQUEST_STATICS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut h = Harness::new();
+        assert!(h.app.share.is_none());
+        *SHARE_REQUESTED.lock().unwrap() = Some("/home/u/ProtonDrive/My Docs/a.pdf".to_string());
+        SHOW_REQUESTED.store(true, AtomicOrdering::SeqCst);
+        h.app.answer_show_request(&h.ctx);
+        assert_eq!(h.app.share.as_ref().map(|w| w.abs_path.as_str()), Some("/home/u/ProtonDrive/My Docs/a.pdf"));
+        assert!(SHARE_REQUESTED.lock().unwrap().is_none(), "taken once");
+        // A plain show afterwards leaves the open window alone
+        SHOW_REQUESTED.store(true, AtomicOrdering::SeqCst);
+        h.app.answer_show_request(&h.ctx);
+        assert!(h.app.share.is_some());
     }
 
     #[test]
