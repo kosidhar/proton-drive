@@ -6422,8 +6422,11 @@ export class ProtonDriveSyncEngine {
     // Proton Docs and Sheets, so the folders whose listing holds one are added to `unsupportedIn` when given.
     // With replayFirst (the sync pass's crawl of online-only folders), the drive changes asked for during the pass are sent
     // before each folder is listed: between two listings, never while one is on its way, so no listing asked for before a
-    // change is recorded after it (#235). As one may have renamed, moved or deleted the folder, it is then taken where the
-    // index has it now, by its uid, and skipped if the index no longer has it.
+    // change is sent is recorded after it (#235). As one may have renamed, moved or deleted the folder, it is then taken
+    // where the index has it now, by its uid, and skipped if the index no longer has it. Its listing is looked up that way
+    // again once it is in: a rename or move through the drive meanwhile changed only where this computer has the folder
+    // (none reached Proton Drive while the listing was out), so the listing is still the folder's own, recorded at its
+    // new path; one deleted or hidden meanwhile is not recorded.
     private async indexRemoteSubtree(
         node: NodeEntity,
         relPath: string,
@@ -6446,6 +6449,16 @@ export class ProtonDriveSyncEngine {
         } catch (error: unknown) {
             this.logger.warn(`Could not list ${relPath} for the remote index: ${error}`);
             return false;
+        }
+        if (replayFirst) {
+            const now = this.index.getByUid(node.uid)?.relPath;
+            if (now === undefined) {
+                return false;
+            }
+            if (this.policy.hiddenBy(now)?.hide === 'hidden') {
+                return true;
+            }
+            relPath = now;
         }
         if (!this.recordListing(node, relPath, children)) {
             return false;
