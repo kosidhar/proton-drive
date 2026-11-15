@@ -37,7 +37,7 @@ impl ProtonDriveNativeApp {
             None if self.status.logged_in => ("Proton Account".to_string(), String::new(), "PD".to_string()),
             None => ("Not signed in".to_string(), String::new(), "PD".to_string()),
         };
-        let card = card_frame().show(ui, |ui| {
+        card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.label(RichText::new("Account").size(16.0).strong().color(TEXT_PRIMARY()));
             ui.add_space(12.0);
@@ -115,10 +115,6 @@ impl ProtonDriveNativeApp {
                 ui.add(egui::Label::new(RichText::new(text).size(12.0).color(PROTON_PURPLE_TEXT())).wrap());
             }
         });
-        // Opened from the sidebar's account footer: bring the card into view once
-        if std::mem::take(&mut self.jump_to_account) {
-            card.response.scroll_to_me(Some(Align::TOP));
-        }
     }
 
     /// Hidden from this computer: each hidden item with Unhide (POST /availability, as the browser sent it).
@@ -202,7 +198,7 @@ impl ProtonDriveNativeApp {
 }
 
 /// The plan, in a small pill beside the name.
-fn plan_pill(ui: &mut egui::Ui, plan: &str) {
+pub(crate) fn plan_pill(ui: &mut egui::Ui, plan: &str) {
     Frame::NONE
         .fill(crate::PROTON_PURPLE_SOFT())
         .corner_radius(CornerRadius::same(5))

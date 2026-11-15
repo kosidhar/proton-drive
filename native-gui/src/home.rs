@@ -6,11 +6,10 @@ use std::sync::atomic::Ordering;
 use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, ScrollArea, Stroke, Vec2};
 
 use crate::{
-    btn_secondary_hover_bg, button_width, card_frame, drive_status_line, files_safe_hint, format_bytes, offers_mount_again,
-    proton_button, render_transfer_line, shown_folder, spawn_reaped, AccountInfo, ConflictRecord, DaemonStatus,
+    action_button, btn_secondary_hover_bg, card_frame, drive_status_line, files_safe_hint, format_bytes, offers_mount_again,
+    render_transfer_line, shown_folder, spawn_reaped, AccountInfo, ButtonKind, ConflictRecord, DaemonStatus,
     PendingConfirm, ProtonDriveNativeApp, VfsStatus, WorkerCommand, BG_CARD_ALT, BORDER_SUBTLE, PROTON_PURPLE,
-    PROTON_PURPLE_HOVER, PROTON_PURPLE_TEXT, SCREENSHOT_MODE, STATUS_DANGER, STATUS_SUCCESS, STATUS_WARNING, TEXT_MUTED,
-    TEXT_PRIMARY,
+    PROTON_PURPLE_TEXT, SCREENSHOT_MODE, STATUS_DANGER, STATUS_SUCCESS, STATUS_WARNING, TEXT_MUTED, TEXT_PRIMARY,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -352,6 +351,18 @@ pub fn storage(account: Option<&AccountInfo>) -> Option<Storage> {
     })
 }
 
+/// A usage bar, 4 pt high and as wide as there is room: its `track`, filled with `fraction` of it in `fill` (at least a
+/// dot, so that a little use still shows). The sidebar's meter and the account menu share it.
+pub(crate) fn usage_bar(ui: &mut egui::Ui, fraction: f32, fill: Color32, track: Color32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 4.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(2), track);
+    if fraction > 0.0 {
+        let used = egui::Rect::from_min_size(rect.min, egui::vec2((rect.width() * fraction).max(rect.height()), rect.height()));
+        ui.painter().rect_filled(used, egui::CornerRadius::same(2), fill);
+    }
+    resp
+}
+
 /// The headline's colour.
 fn tone_color(tone: Tone) -> Color32 {
     match tone {
@@ -364,7 +375,7 @@ fn tone_color(tone: Tone) -> Color32 {
 }
 
 /// Opens a folder in the file manager; a screenshot opens nothing.
-fn open_in_files(folder: &std::path::Path) {
+pub(crate) fn open_in_files(folder: &std::path::Path) {
     open_externally(folder.as_os_str(), screenshot());
 }
 
@@ -462,14 +473,11 @@ thread_local! {
 
 /// A secondary (outlined) button, as wide as its label.
 pub(crate) fn secondary_button(ui: &mut egui::Ui, label: &str, height: f32) -> egui::Response {
-    let size = Vec2::new(button_width(ui, label), height);
-    let stroke = Some(Stroke::new(1.0_f32, BORDER_SUBTLE()));
-    proton_button(ui, size, label, BG_CARD_ALT(), btn_secondary_hover_bg(), stroke, TEXT_PRIMARY(), 13.0)
+    action_button(ui, ButtonKind::Secondary, None, label, height)
 }
 
 pub(crate) fn primary_button(ui: &mut egui::Ui, label: &str, height: f32) -> egui::Response {
-    let size = Vec2::new(button_width(ui, label), height);
-    proton_button(ui, size, label, PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE, 13.0)
+    action_button(ui, ButtonKind::Primary, None, label, height)
 }
 
 const PAUSE_CHOICES_ID: &str = "pause_choices";
@@ -484,22 +492,26 @@ fn pause_choices(ctx: &egui::Context, anchor: egui::Rect) -> Option<PauseChoice>
         .fixed_pos(anchor.right_bottom() + Vec2::new(0.0, 6.0))
         .pivot(egui::Align2::RIGHT_TOP)
         .show(ctx, |ui| {
-            Frame::NONE
-                .fill(crate::BG_CARD())
-                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
-                .corner_radius(CornerRadius::same(10))
-                .shadow(egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_rgba_unmultiplied(0, 0, 0, 90) })
-                .inner_margin(Margin::same(6))
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    for choice in PauseChoice::ALL {
-                        if menu_item(ui, choice.label(), 168.0).clicked() {
-                            picked = Some(choice);
-                        }
+            menu_frame().show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for choice in PauseChoice::ALL {
+                    if menu_item(ui, None, choice.label(), 168.0).clicked() {
+                        picked = Some(choice);
                     }
-                });
+                }
+            });
         });
     picked
+}
+
+/// A small menu's card, floating over the window: Pause's choices, the account menu.
+pub(crate) fn menu_frame() -> Frame {
+    Frame::NONE
+        .fill(crate::BG_CARD())
+        .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
+        .corner_radius(CornerRadius::same(10))
+        .shadow(egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_rgba_unmultiplied(0, 0, 0, 90) })
+        .inner_margin(Margin::same(6))
 }
 
 /// Whether a click landed on the Pause choices, as last drawn. Takes their place rather than the context: it is read
@@ -508,15 +520,23 @@ fn pause_choices_hit(choices: Option<egui::Rect>, pointer: Option<egui::Pos2>) -
     matches!((choices, pointer), (Some(rect), Some(pos)) if rect.contains(pos))
 }
 
-/// A row of a small menu: its label on the left, highlighted on hover.
-fn menu_item(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
+/// A row of a small menu: its icon (one of `icons::*`), if any, and its label on the left, highlighted on hover.
+pub(crate) fn menu_item(ui: &mut egui::Ui, icon: Option<&str>, label: &str, width: f32) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 30.0), egui::Sense::click());
+    let enabled = ui.is_enabled();
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         ui.painter().rect_filled(rect, CornerRadius::same(6), btn_secondary_hover_bg());
     }
+    let mut x = rect.left() + 10.0;
+    if let Some(icon) = icon {
+        let at = egui::pos2(x, rect.center().y);
+        ui.painter().text(at, egui::Align2::LEFT_CENTER, icon, crate::icons::font(16.0), TEXT_MUTED());
+        x += 16.0 + 10.0;
+    }
     ui.painter().text(
-        rect.left_center() + Vec2::new(10.0, 0.0),
+        egui::pos2(x, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
         egui::FontId::proportional(13.0),
@@ -526,7 +546,7 @@ fn menu_item(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
 }
 
 fn card_title(ui: &mut egui::Ui, title: &str) {
-    ui.label(RichText::new(title).size(15.5).strong().color(TEXT_PRIMARY()));
+    ui.label(RichText::new(title).font(crate::bold(15.5)).color(TEXT_PRIMARY()));
 }
 
 /// A line that never wraps: elided to the room left, the whole of `full` on hover.
@@ -788,7 +808,8 @@ impl ProtonDriveNativeApp {
         });
     }
 
-    /// Your drive: where it is and how it is shown, the account's storage, and what is on this computer.
+    /// Your drive: where it is and how it is shown, its trash, and what is on this computer. Open in Files is the
+    /// sidebar's, and the account's storage is at the sidebar's foot.
     fn render_your_drive(&mut self, ui: &mut egui::Ui) {
         let sync_dir = self.status.sync_dir.clone();
         card_frame().show(ui, |ui| {
@@ -797,12 +818,8 @@ impl ProtonDriveNativeApp {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // Laid out from the right: Open in Files, then the trash beside it. Neither before a folder is set up
+                    // The trash, on the right. Not before a folder is set up
                     if !sync_dir.is_empty() {
-                        if secondary_button(ui, "Open in Files", 32.0).clicked() {
-                            open_in_files(std::path::Path::new(&sync_dir));
-                        }
-                        ui.add_space(8.0);
                         if secondary_button(ui, OPEN_TRASH, 32.0).on_hover_text(trash_hover(&sync_dir)).clicked() {
                             open_in_browser(PROTON_DRIVE_TRASH_URL);
                         }
@@ -815,23 +832,6 @@ impl ProtonDriveNativeApp {
                     });
                 });
             });
-
-            if let Some(s) = storage(self.status.account.as_ref()) {
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(10.0);
-                let row = ui
-                    .horizontal(|ui| {
-                        ui.label(RichText::new("Proton storage").size(13.0).color(TEXT_PRIMARY()));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new(&s.text).size(13.0).strong().color(TEXT_PRIMARY()));
-                        });
-                    })
-                    .response;
-                ui.add_space(6.0);
-                let bar = usage_bar(ui, s.fraction);
-                row.union(bar).on_hover_text(&s.tooltip);
-            }
 
             ui.add_space(12.0);
             ui.separator();
@@ -854,19 +854,6 @@ impl ProtonDriveNativeApp {
             }
         });
     }
-}
-
-/// The storage bar: a track visible on the card in both themes, filled to `fraction`.
-fn usage_bar(ui: &mut egui::Ui, fraction: f32) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(3), BORDER_SUBTLE());
-    if fraction > 0.0 {
-        // At least as wide as it is tall, so a little use still shows
-        let w = (rect.width() * fraction).max(rect.height());
-        let fill = egui::Rect::from_min_size(rect.min, Vec2::new(w, rect.height()));
-        ui.painter().rect_filled(fill, CornerRadius::same(3), PROTON_PURPLE);
-    }
-    resp
 }
 
 /// One problem in Needs attention, in its own box.
