@@ -270,23 +270,31 @@ mod tests {
 }
 
 /// What the Shared section shows: the list as last read (kept while the next read is out), whether one is out, and why
-/// the last one failed.
+/// the last one failed. Each read has a number; only the newest one's answer counts, since answers can arrive in any
+/// order.
 #[derive(Default)]
 pub struct SharedPage {
     pub items: Option<Vec<SharedItem>>,
     pub loading: bool,
     pub error: Option<String>,
+    /// The number of the newest read
+    pub seq: u64,
 }
 
 impl SharedPage {
-    /// A read goes out: the rows shown stay until it answers.
-    pub fn begin_load(&mut self) {
+    /// A read goes out: the rows shown stay until it answers. Returns its number.
+    pub fn begin_load(&mut self) -> u64 {
+        self.seq += 1;
         self.loading = true;
         self.error = None;
+        self.seq
     }
 
-    /// The read answered. A failure drops the list: it can't be known to be current.
-    pub fn loaded(&mut self, result: Result<Vec<SharedItem>, String>) {
+    /// A read answered. One that isn't the newest is ignored. A failure drops the list: it can't be known to be current.
+    pub fn loaded(&mut self, seq: u64, result: Result<Vec<SharedItem>, String>) {
+        if seq != self.seq {
+            return;
+        }
         self.loading = false;
         match result {
             Ok(items) => {
