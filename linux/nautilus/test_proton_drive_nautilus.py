@@ -535,7 +535,7 @@ class FileMenuTest(unittest.TestCase):
 
     def test_the_items_menu_offers_only_actions_on_the_selection(self):
         ext.ProtonDriveNautilusExtension.get_file_items(self.menu, [FakeFile(f"{ROOT}/Docs/b.txt")])
-        self.assertEqual(self.labels(), ["Always keep on this device", "Free up space", "Hide from this computer", "Copy Link"])
+        self.assertEqual(self.labels(), ["Always keep on this device", "Free up space", "Hide from this computer", "Share…", "Copy Link"])
         for label in self.labels():
             self.assertFalse(label.startswith("Proton Drive"), label)
 
@@ -551,6 +551,45 @@ class FileMenuTest(unittest.TestCase):
         activate(item)
         self.h.release()
         self.assertEqual(self.h.copied, ["https://drive.proton.me/urls/X"])
+
+    def test_share_opens_the_app_on_the_item(self):
+        path = f"{ROOT}/Docs/a.txt"
+        ext.ProtonDriveNautilusExtension.get_file_items(self.menu, [FakeFile(path)])
+        self.assertEqual(self.labels()[-2], "Share…")
+        item = ext.Nautilus.MenuItem.return_value
+        activates = [c.args[1] for c in item.connect.call_args_list if c.args[0] == "activate"]
+        with mock.patch.object(ext, "_spawn_detached") as spawn:
+            activates[-2](item)
+        argv = spawn.call_args.args[0]
+        self.assertTrue(argv[0].endswith("protondrive-gui"), argv)
+        self.assertEqual(argv[1:], ["--share", path])
+
+    def test_share_tries_the_next_place_when_the_app_is_not_in_the_first(self):
+        tried = []
+
+        def spawn(argv):
+            tried.append(argv[0])
+            if len(tried) < 3:
+                raise OSError("nope")
+
+        with mock.patch.object(ext, "_spawn_detached", spawn):
+            self.h.files.share("/x/y")
+        self.assertEqual(len(tried), 3)
+        self.assertEqual(tried[1:], ["/usr/bin/protondrive-gui", "protondrive-gui"])
+
+    def test_share_refuses_a_path_the_app_cant_be_given_and_says_why(self):
+        # GIO hands over a name that isn't UTF-8 with each byte it can't read as a lone surrogate; a line break can't
+        # travel in the app's one-line request. Neither starts the app, and Files says why.
+        cases = [
+            (f"{ROOT}/Docs/caf\udce9.txt", "Proton Drive can't share an item whose path isn't valid UTF-8"),
+            (f"{ROOT}/Docs/two\nlines.txt", "Proton Drive can't share an item whose path has a line break in it"),
+        ]
+        for path, why in cases:
+            self.h.notes.clear()
+            with mock.patch.object(ext, "_spawn_detached") as spawn:
+                self.h.files.share(path)
+            spawn.assert_not_called()
+            self.assertEqual(self.h.notes, [("Couldn't open Share", why)], repr(path))
 
     def test_a_file_the_drive_keeps_for_itself_gets_nothing(self):
         items = ext.ProtonDriveNautilusExtension.get_file_items(self.menu, [FakeFile(f"{ROOT}/Docs/.git")])
@@ -609,7 +648,7 @@ class CopyLinkTest(unittest.TestCase):
 
     def test_it_is_offered_for_exactly_one_item_in_the_drive(self):
         f = self.h.files
-        self.assertEqual(f.share_items_for([f"{ROOT}/Docs/a.txt"]), ["copy-link"])
+        self.assertEqual(f.share_items_for([f"{ROOT}/Docs/a.txt"]), ["share", "copy-link"])
         self.assertEqual(f.share_items_for([f"{ROOT}/Docs/a.txt", f"{ROOT}/Docs/b.txt"]), [])
         self.assertEqual(f.share_items_for([f"{ROOT}/Docs/.xdg-volume-info"]), [])
         self.assertEqual(f.share_items_for([ROOT]), [])

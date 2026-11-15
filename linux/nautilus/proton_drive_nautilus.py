@@ -52,7 +52,7 @@ PIN_LABEL = "Always keep on this device"
 FREE_LABEL = "Free up space"
 HIDE_LABEL = "Hide from this computer"
 COPY_LINK_LABEL = "Copy Link"
-SHARE_LABEL = "Share…"  # used by the Share window item (#216)
+SHARE_LABEL = "Share…"
 NOT_RUNNING = "Proton Drive isn't running"
 
 UNKNOWN = object()  # a state not fetched yet (None is "no emblem": a local item matching an ignore pattern)
@@ -335,6 +335,19 @@ def rel_to_root(root, path):
     return None
 
 
+def share_path_problem(path):
+    """Why the app can't be asked to share the item at path, or None. The request is one line of UTF-8 text: a path
+    with a line break can't travel in it, nor one that isn't UTF-8 (GIO hands Python each byte of such a name it can't
+    read as a lone surrogate, \\udc80 to \\udcff, which UTF-8 can't encode)."""
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        return "Proton Drive can't share an item whose path isn't valid UTF-8"
+    if "\n" in path:
+        return "Proton Drive can't share an item whose path has a line break in it"
+    return None
+
+
 def skipped(rel: str) -> bool:
     """Files the drive keeps for itself, which never get an emblem or a menu."""
     for part in rel.split("/"):
@@ -589,11 +602,25 @@ class ProtonDriveFiles:
         return actions
 
     def share_items_for(self, paths):
-        """Which sharing items to offer: Copy Link for exactly one item inside the drive (not the drive itself, not a
+        """Which sharing items to offer: Share… and Copy Link for exactly one item inside the drive (not the drive itself, not a
         file it keeps for itself, not one an ignore pattern leaves out of the drive)."""
         if len(paths) == 1 and self.selection(paths) == "items" and self.state_of(paths[0]) is not None:
-            return ["copy-link"]
+            return ["share", "copy-link"]
         return []
+
+    def share(self, path):
+        """Opens the app's Share window on the item (#216), starting the app if it isn't running."""
+        problem = share_path_problem(path)
+        if problem:
+            self.notify("Couldn't open Share", problem)
+            return
+        for exe in (os.path.expanduser("~/.local/bin/protondrive-gui"), "/usr/bin/protondrive-gui", "protondrive-gui"):
+            try:
+                _spawn_detached([exe, "--share", path])
+                return
+            except OSError:
+                continue
+        self.notify("Couldn't open Share", "The Proton Drive app isn't installed.")
 
     def copy_link(self, path):
         """Asks the daemon for the item's share link (making one only if none exists) and puts it on the clipboard.
@@ -908,8 +935,12 @@ class ProtonDriveNautilusExtension(
 
         if kind == "items":
             for action in self.files.share_items_for(paths):
-                item = Nautilus.MenuItem(name="ProtonDrive::CopyLink", label=COPY_LINK_LABEL, tip="Copy a link anyone can use to view this")
-                item.connect("activate", lambda _menu: self.files.copy_link(paths[0]))
+                if action == "share":
+                    item = Nautilus.MenuItem(name="ProtonDrive::Share", label=SHARE_LABEL, tip="Share this in the Proton Drive app: link, people, who has access")
+                    item.connect("activate", lambda _menu: self.files.share(paths[0]))
+                else:
+                    item = Nautilus.MenuItem(name="ProtonDrive::CopyLink", label=COPY_LINK_LABEL, tip="Copy a link anyone can use to view this")
+                    item.connect("activate", lambda _menu: self.files.copy_link(paths[0]))
                 items.append(item)
 
         # Only actions on what was clicked (#214): syncing and the app are in the tray
