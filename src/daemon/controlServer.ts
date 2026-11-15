@@ -1,6 +1,4 @@
 import { chmodSync, lstatSync, mkdirSync, unlinkSync } from 'node:fs';
-import { shareRoute } from './shareRoutes';
-import type { ShareService } from './shareService';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,6 +15,8 @@ import {
 import type { ConflictRecord } from '../sync/syncStateDb';
 import { type FileManagerSource, FM_ROUTES, fileManagerRoute } from './fileManagerRoutes';
 import { parseSettingsRequest, type SettingsChange } from './settingsValidation';
+import { shareRoute } from './shareRoutes';
+import type { ShareService } from './shareService';
 import type { DriveMoveAction } from './vfsSupervisor';
 
 // Pin, free, hide and unhide change what is on disk, and so do the virtual drive's hydrate, rename and delete, so they
