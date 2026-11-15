@@ -1,10 +1,12 @@
 import { describe, expect, mock, test } from 'bun:test';
 
-import { ConnectionError, ServerError, ValidationError } from '@protontech/drive-sdk/errors';
+import { ConnectionError, DecryptionError, ProtonDriveError, RateLimitedError, ServerError, ValidationError } from '@protontech/drive-sdk/errors';
 import { ErrorCode } from '@protontech/drive-sdk/internal/apiService/errorCodes';
+import { APICodeError, APIHTTPError, NotFoundAPIError } from '@protontech/drive-sdk/internal/apiService/errors';
+import { BatchLoading } from '@protontech/drive-sdk/internal/batchLoading';
 import { SharingManagement } from '@protontech/drive-sdk/internal/sharing/sharingManagement';
 
-import { createShareService, LIST_CONCURRENCY, ShareError, type ShareService } from '../src/daemon/shareService';
+import { createShareService, LIST_CONCURRENCY, ShareError, type ShareService, type ShareServiceDeps } from '../src/daemon/shareService';
 
 const EXPIRY = new Date('2027-01-02T03:04:05Z');
 // A link's URL ends with the 12-character password the SDK generates for it
@@ -184,8 +186,22 @@ describe('ShareService', () => {
         const u = fake.calls.filter((c) => c.fn === 'unshareNode');
         expect(u.length).toBe(1);
         expect(u[0].args.length).toBe(1);
-        expect(logs.length).toBe(1);
-        expect(JSON.stringify(logs)).toContain('Stopped sharing report.pdf');
+        expect(logs).toEqual([{ action: 'share', localRelPath: 'report.pdf', details: 'Stopped sharing report.pdf' }]);
+    });
+
+    // The share was deleted elsewhere (the web app, another device) while the SDK's cache still holds its shareId: the
+    // SDK's reading of it is answered 2501, "does not exist"
+    test('stopSharing an item whose share is already gone is done, and logs nothing', async () => {
+        const { svc, fake, logs } = setup(shared(), () => ({ uid: 'n1', name: 'report.pdf' }));
+        fake.fail(new NotFoundAPIError('Share does not exist', ErrorCode.NOT_EXISTS));
+        expect(await svc.stopSharing('report.pdf')).toEqual({ link: null, people: [] });
+        expect(logs).toEqual([]);
+        // Any other refusal is still one
+        fake.fail(new ValidationError('Insufficient permissions', ErrorCode.NOT_ENOUGH_PERMISSIONS));
+        const e = await rejects(svc.stopSharing('report.pdf'));
+        expect(e).toBeInstanceOf(ShareError);
+        expect(e.message).toBe('Proton Drive refused: Insufficient permissions');
+        expect(logs).toEqual([]);
     });
 
     test('stopSharing refuses an item not uploaded or hidden, calling nothing', async () => {
@@ -415,6 +431,19 @@ describe('ShareService, after the PR 1 review', () => {
     });
 });
 
+// The client's sharing calls over the SDK's own SharingManagement, as ProtonDriveClient passes them on (listing is unused)
+function overSharingManagement(mgmt: SharingManagement): ShareServiceDeps['sdk'] {
+    return {
+        getSharingInfo: (uid) => mgmt.getSharingInfo(uid as string),
+        shareNode: (uid, settings) => mgmt.shareNode(uid as string, settings),
+        unshareNode: (uid, settings) => mgmt.unshareNode(uid as string, settings),
+        async *iterateSharedNodeUids() {},
+        async *iterateNodes() {},
+    };
+}
+
+const quietLogger = { debug() {}, info() {}, warn() {}, error() {} };
+
 // Finding 1 of the PR 1 review: the SDK keeps nodes in a cache on disk and learns of a share made elsewhere only from its
 // events, so getSharingInfo can say "not shared" while the item has a link. Asking shareNode for a link then UPDATES that
 // link with the settings given, which replace its own: its password and expiry were wiped.
@@ -477,9 +506,8 @@ describe('Copy Link while the SDK has not heard of a link made elsewhere', () =>
             encryptURLAccess: async () => ({ crypto: 'c', srp: 's' }),
             generatePublicLinkPassword: async () => 'newgenerated',
         };
-        const quiet = { debug() {}, info() {}, warn() {}, error() {} };
         const mgmt = new SharingManagement(
-            quiet,
+            quietLogger,
             apiService as never,
             { hasSharedByMeNodeUidsLoaded: async () => false } as never,
             cryptoService as never,
@@ -489,11 +517,7 @@ describe('Copy Link while the SDK has not heard of a link made elsewhere', () =>
         );
         const logs: string[] = [];
         const svc = createShareService({
-            sdk: {
-                getSharingInfo: (uid: any) => mgmt.getSharingInfo(uid as string),
-                shareNode: (uid: any, s: any) => mgmt.shareNode(uid as string, s),
-                unshareNode: (uid: any, s: any) => mgmt.unshareNode(uid as string, s),
-            } as any,
+            sdk: overSharingManagement(mgmt),
             placeOf: () => null,
             nodeFor: () => ({ uid: 'vol~node', name: 'report.pdf' }),
             logActivity: (e) => logs.push(e.details),
@@ -503,6 +527,52 @@ describe('Copy Link while the SDK has not heard of a link made elsewhere', () =>
         expect(await svc.ensureLink('Docs/report.pdf')).toEqual({ url: LINK_URL, created: false });
         expect(updateURLAccess).not.toHaveBeenCalled();
         expect(createURLAccess).not.toHaveBeenCalled();
+        expect(logs).toEqual([]);
+    });
+});
+
+// PR 1 final review, finding 4: the share was deleted elsewhere, but the SDK's node cache still holds its shareId (it
+// learns of the change only from its events). Reading the share is answered 2501, "does not exist".
+describe('Stop sharing an item already unshared elsewhere', () => {
+    test("through the SDK's own sharing code: done, deleting nothing and logging nothing", async () => {
+        const deleteShare = mock(async () => {});
+        const apiService = {
+            getShareInvitations: async () => [],
+            getShareExternalInvitations: async () => [],
+            getShareMembers: async () => [],
+            getURLAccess: async () => undefined,
+            deleteShare,
+        };
+        const nodesService = {
+            getNode: async (uid: string) => ({ uid, parentUid: 'p', shareId: 'goneShareId' }),
+            getNodeKeys: async () => ({ key: 'k' }),
+            notifyNodeChanged: async () => {},
+        };
+        const sharesService = {
+            loadEncryptedShare: async () => {
+                throw new NotFoundAPIError('Share does not exist', ErrorCode.NOT_EXISTS);
+            },
+        };
+        const mgmt = new SharingManagement(
+            quietLogger,
+            apiService as never,
+            { hasSharedByMeNodeUidsLoaded: async () => false } as never,
+            { decryptShare: async () => ({ passphraseSessionKey: 's' }) } as never,
+            { hasProtonAccount: async () => true } as never,
+            sharesService as never,
+            nodesService as never,
+        );
+        const logs: string[] = [];
+        const svc = createShareService({
+            sdk: overSharingManagement(mgmt),
+            placeOf: () => null,
+            nodeFor: () => ({ uid: 'vol~node', name: 'report.pdf' }),
+            logActivity: (e) => logs.push(e.details),
+            now: () => 1000,
+        });
+
+        expect(await svc.stopSharing('Docs/report.pdf')).toEqual({ link: null, people: [] });
+        expect(deleteShare).not.toHaveBeenCalled();
         expect(logs).toEqual([]);
     });
 });
@@ -665,20 +735,25 @@ void (null as unknown as ShareService);
 describe('list', () => {
     const node = (uid: string, name: string, over: any = {}) => ({ uid, name: { ok: true, value: name }, ...over });
 
-    // nodes: what iterateNodes yields; sharing: per uid (a missing key is "no longer shared"); fails: per uid
+    // nodes: what iterateNodes yields; sharing: per uid (a missing key is "not shared" as far as the SDK's cache knows);
+    // fails: per uid; delays: how long each sharing read takes, in ms (2 when not given)
     function listSetup(opts: {
         nodes: any[];
         sharing?: Record<string, any>;
         fails?: Record<string, unknown>;
+        delays?: Record<string, number>;
         places?: Record<string, { relPath: string; hidden: boolean } | null>;
         // Replaces iterateNodes: as the SDK's batch loader, which may throw after yielding the nodes it could load
         iterateNodes?: (uids: string[]) => AsyncGenerator<any>;
+        iterateSharedNodeUids?: () => AsyncGenerator<string>;
     }) {
         const logs: unknown[] = [];
         let active = 0;
-        const stats = { max: 0 };
+        // reads: the uids whose sharing was asked for, in the order the reads started
+        const stats = { max: 0, reads: [] as string[] };
         const sdk: any = {
             async *iterateSharedNodeUids() {
+                if (opts.iterateSharedNodeUids) return yield* opts.iterateSharedNodeUids();
                 for (const n of opts.nodes) yield n.uid ?? n.missingUid;
             },
             async *iterateNodes(uids: string[]) {
@@ -686,10 +761,11 @@ describe('list', () => {
                 for (const uid of uids) yield opts.nodes.find((n) => (n.uid ?? n.missingUid) === uid);
             },
             async getSharingInfo(uid: string) {
+                stats.reads.push(uid);
                 active++;
                 stats.max = Math.max(stats.max, active);
                 try {
-                    await new Promise((r) => setTimeout(r, 2));
+                    await new Promise((r) => setTimeout(r, opts.delays?.[uid] ?? 2));
                     if (opts.fails?.[uid]) throw opts.fails[uid];
                     return opts.sharing?.[uid];
                 } finally {
@@ -743,9 +819,20 @@ describe('list', () => {
         expect(byName.root.relPath).toBeNull();
     });
 
-    test('an item no longer shared by the time it is read is left out', async () => {
-        const { svc } = listSetup({ nodes: [node('a', 'a'), node('b', 'b')], sharing: { a: shared() } });
-        expect((await svc.list()).map((i) => i.name)).toEqual(['a']);
+    // The uids come fresh from the server, but getSharingInfo reads the node's shareId from the SDK's node cache, which
+    // learns of a share made elsewhere only from its events: until then it answers "not shared"
+    test('an item the server lists as shared but the SDK has not caught up with yet is listed, never left out', async () => {
+        const { svc } = listSetup({
+            nodes: [node('a', 'a'), node('b', 'b'), node('c', 'c')],
+            sharing: { a: shared() },
+            places: { a: { relPath: 'a', hidden: false }, b: { relPath: 'docs/b', hidden: false } },
+        });
+        const catchingUp = 'Proton Drive is still catching up with this item: refresh in a moment';
+        expect(await svc.list()).toEqual([
+            { name: 'a', relPath: 'a', where: 'my-files', link: expect.anything(), people: 3 },
+            { name: 'b', relPath: 'docs/b', where: 'my-files', link: null, people: 0, unreadable: catchingUp },
+            { name: 'c', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: catchingUp },
+        ]);
     });
 
     test("an item whose sharing can't be read is listed as unreadable; the rest is unaffected", async () => {
@@ -767,6 +854,47 @@ describe('list', () => {
             { name: 'An item', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: "This item can't be found in Proton Drive" },
             { name: 'An item', relPath: null, where: 'elsewhere', link: expect.anything(), people: 3 },
         ]);
+    });
+
+    // PR 1 final review, finding 5: "with its name, or 'An item' when even that is unknown"
+    test('an item Proton Drive can\'t name is listed by the name its path in My files ends with', async () => {
+        const all = [node('a', 'a'), { uid: 'n', name: { ok: false, error: new Error('x') } }, node('c', 'c'), { missingUid: 'm' }];
+        const { svc } = listSetup({
+            nodes: all,
+            sharing: { a: shared(), n: shared() },
+            places: {
+                a: { relPath: 'a', hidden: false },
+                n: { relPath: 'Documents/Taxes/2026.pdf', hidden: false },
+                c: { relPath: 'Photos/beach.jpg', hidden: false },
+                m: { relPath: 'Old/gone.txt', hidden: false },
+            },
+            // The batch yields a and n, then throws; alone, c still can't be loaded
+            async *iterateNodes(uids) {
+                if (uids.length > 1) {
+                    yield all[0];
+                    yield all[1];
+                    yield all[3];
+                    throw new Error('Some items could not be loaded');
+                }
+                throw new Error('parent key');
+            },
+        });
+        expect(await svc.list()).toEqual([
+            { name: '2026.pdf', relPath: 'Documents/Taxes/2026.pdf', where: 'my-files', link: expect.anything(), people: 3 },
+            { name: 'a', relPath: 'a', where: 'my-files', link: expect.anything(), people: 3 },
+            { name: 'beach.jpg', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: "Proton Drive couldn't read this item" },
+            { name: 'gone.txt', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: "This item can't be found in Proton Drive" },
+        ]);
+    });
+
+    test('an item with no name and no path, or the My files folder itself, is "An item"', async () => {
+        const unnamed = (uid: string) => ({ uid, name: { ok: false, error: new Error('x') } });
+        const { svc } = listSetup({
+            nodes: [unnamed('n'), unnamed('r')],
+            sharing: { n: shared(), r: shared() },
+            places: { r: { relPath: '', hidden: false } },
+        });
+        expect((await svc.list()).map((i) => i.name)).toEqual(['An item', 'An item']);
     });
 
     test('offline while reading is the offline refusal, not a partial list', async () => {
@@ -837,16 +965,213 @@ describe('list', () => {
         ]);
     });
 
+    // PR 1 final review, finding 1. Every SDK site that throws "Some items could not be loaded" gives the failures it met
+    // as an ARRAY in `cause` (batchLoading.ts loadRest, nodesAccess.ts, nodes/apiService.ts), sometimes one inside another
+    const OFFLINE = 'Proton Drive is offline: try again when you are connected';
+    const BUSY = 'Proton Drive is busy: try again in a minute';
+    const loadFailed = (...errors: unknown[]) => new ProtonDriveError('Some items could not be loaded', { cause: errors });
+
+    // iterateNodes as the SDK's nodesAccess makes it, with nothing cached: every uid goes through its BatchLoading, which
+    // keeps a failed fetch and throws it at the end, wrapped. fetch stands for the API's batch request.
+    function throughBatchLoading(fetch: (uids: string[]) => AsyncGenerator<any>) {
+        return async function* (uids: string[]) {
+            const loading = new BatchLoading<string, any>({ iterateItems: fetch, batchSize: 10 });
+            for (const uid of uids) yield* loading.load(uid);
+            yield* loading.loadRest();
+        };
+    }
+
     test('offline wrapped by the SDK while loading nodes is the offline refusal', async () => {
+        const shapes = [loadFailed(new ConnectionError('down')), loadFailed(new Error('parent key'), loadFailed(new ConnectionError('down')))];
+        for (const err of shapes) {
+            let loads = 0;
+            const { svc, stats } = listSetup({
+                nodes: [node('a', 'a'), node('b', 'b')],
+                sharing: { a: shared(), b: shared() },
+                async *iterateNodes() {
+                    loads++;
+                    throw err;
+                },
+            });
+            const e = await rejects(svc.list());
+            expect(e).toBeInstanceOf(ShareError);
+            expect(e.message).toBe(OFFLINE);
+            // Not tried again one item at a time, each spending the SDK's retries
+            expect(loads).toBe(1);
+            expect(stats.reads).toEqual([]);
+        }
+    });
+
+    test("offline under the SDK's own BatchLoading is the offline refusal, with no item tried again alone", async () => {
+        let fetches = 0;
+        const { svc, stats } = listSetup({
+            nodes: [node('a', 'a'), node('b', 'b'), node('c', 'c')],
+            sharing: { a: shared(), b: shared(), c: shared() },
+            // The API's batch request: nodes/apiService.ts rethrows a ConnectionError as it is
+            iterateNodes: throughBatchLoading(async function* () {
+                fetches++;
+                throw new ConnectionError('down');
+            }),
+        });
+        const e = await rejects(svc.list());
+        expect(e).toBeInstanceOf(ShareError);
+        expect(e.message).toBe(OFFLINE);
+        expect(fetches).toBe(1);
+        expect(stats.reads).toEqual([]);
+    });
+
+    test('offline while listing what is shared is the offline refusal', async () => {
         const { svc } = listSetup({
             nodes: [node('a', 'a')],
             sharing: { a: shared() },
-            async *iterateNodes() {
-                throw new Error('Some items could not be loaded', { cause: new ConnectionError('down') });
+            async *iterateSharedNodeUids() {
+                yield 'a';
+                throw new ConnectionError('down');
             },
         });
         const e = await rejects(svc.list());
         expect(e).toBeInstanceOf(ShareError);
-        expect(e.message).toBe('Proton Drive is offline: try again when you are connected');
+        expect(e.message).toBe(OFFLINE);
+    });
+
+    test('offline on the first sharing read stops the rest from starting', async () => {
+        for (const offline of [new ConnectionError('down'), loadFailed(new ConnectionError('down'))]) {
+            const nodes = Array.from({ length: 10 }, (_, i) => node(`u${i}`, `n${i}`));
+            const sharing = Object.fromEntries(nodes.map((n) => [n.uid, shared()]));
+            // u0 fails at once; the reads that started with it take longer
+            const delays = Object.fromEntries(nodes.map((n) => [n.uid, n.uid === 'u0' ? 0 : 20]));
+            const { svc, stats } = listSetup({ nodes, sharing, delays, fails: { u0: offline } });
+            const e = await rejects(svc.list());
+            expect(e.message).toBe(OFFLINE);
+            await Bun.sleep(60); // the reads already under way finish; no other starts
+            expect(stats.reads).toEqual(['u0', 'u1', 'u2', 'u3']);
+        }
+    });
+
+    test('a failure that is not the network, wrapped the same way, is still one unreadable item', async () => {
+        const all = [node('a', 'a'), node('b', 'b')];
+        const { svc } = listSetup({
+            nodes: all,
+            sharing: { a: shared(), b: shared() },
+            places: { a: { relPath: 'a', hidden: false } },
+            async *iterateNodes(uids) {
+                if (uids.length > 1) {
+                    yield all[0];
+                    throw loadFailed(new DecryptionError('bad key'));
+                }
+                throw loadFailed(new DecryptionError('bad key'));
+            },
+        });
+        expect(await svc.list()).toEqual([
+            { name: 'a', relPath: 'a', where: 'my-files', link: expect.anything(), people: 3 },
+            { name: 'An item', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: "Proton Drive couldn't read this item" },
+        ]);
+    });
+
+    test('an error whose causes loop back on themselves ends, as one unreadable item', async () => {
+        const loops = [
+            // Each the other's cause
+            () => {
+                const a: any = new ProtonDriveError('Some items could not be loaded');
+                a.cause = new ProtonDriveError('Some items could not be loaded', { cause: a });
+                return a;
+            },
+            // Among its own causes, and its cause's
+            () => {
+                const a: any = new ProtonDriveError('Some items could not be loaded');
+                a.cause = [loadFailed(a), a];
+                return a;
+            },
+        ];
+        for (const looped of loops) {
+            const all = [node('a', 'a'), node('b', 'b')];
+            const { svc } = listSetup({
+                nodes: all,
+                sharing: { a: shared(), b: shared() },
+                places: { a: { relPath: 'a', hidden: false } },
+                async *iterateNodes(uids) {
+                    if (uids.length > 1) yield all[0];
+                    throw looped();
+                },
+            });
+            expect((await svc.list()).map((i) => [i.name, i.unreadable])).toEqual([
+                ['a', undefined],
+                ['An item', "Proton Drive couldn't read this item"],
+            ]);
+        }
+    });
+
+    // PR 1 final review, finding 2. Past too many 429s or server errors in a row, the SDK refuses every request for a while
+    // (internal/apiService/apiService.ts, fetch): every item would fail the same way, so the list does
+    const LIMITS = [
+        new RateLimitedError('Too many server requests, please try again later'),
+        new ServerError('Too many server errors, please try again later'),
+    ];
+
+    test("the SDK's account-wide limits while reading sharing fail the whole list as busy, and stop the reads", async () => {
+        for (const limit of [...LIMITS, loadFailed(LIMITS[0])]) {
+            const nodes = Array.from({ length: 10 }, (_, i) => node(`u${i}`, `n${i}`));
+            const sharing = Object.fromEntries(nodes.map((n) => [n.uid, shared()]));
+            const fails = Object.fromEntries(nodes.map((n) => [n.uid, limit]));
+            const { svc, stats } = listSetup({ nodes, sharing, fails });
+            const e = await rejects(svc.list());
+            expect(e).toBeInstanceOf(ShareError);
+            expect([limit.message, e.message]).toEqual([limit.message, BUSY]);
+            await Bun.sleep(20);
+            expect(stats.reads.length).toBeLessThanOrEqual(LIST_CONCURRENCY);
+        }
+    });
+
+    test("the SDK's account-wide limits while loading nodes, or listing, fail the whole list as busy", async () => {
+        // nodes/apiService.ts rethrows a RateLimitedError as it is, and keeps any other failure (so the server-error
+        // limit) to throw it at the end, wrapped; BatchLoading then wraps either again
+        const fetches = [
+            async function* () {
+                throw LIMITS[0];
+            },
+            async function* () {
+                throw loadFailed(LIMITS[1]);
+            },
+        ];
+        for (const fetch of fetches) {
+            let loads = 0;
+            const { svc, stats } = listSetup({
+                nodes: [node('a', 'a'), node('b', 'b')],
+                sharing: { a: shared(), b: shared() },
+                iterateNodes: throughBatchLoading(async function* () {
+                    loads++;
+                    yield* fetch();
+                }),
+            });
+            const e = await rejects(svc.list());
+            expect(e.message).toBe(BUSY);
+            expect(loads).toBe(1);
+            expect(stats.reads).toEqual([]);
+        }
+        for (const limit of LIMITS) {
+            const { svc } = listSetup({
+                nodes: [node('a', 'a')],
+                async *iterateSharedNodeUids() {
+                    throw limit;
+                },
+            });
+            expect((await rejects(svc.list())).message).toBe(BUSY);
+        }
+    });
+
+    test('any other server error is one unreadable item, and the rest is listed', async () => {
+        // The server's own words in an error are not the SDK's limit, whatever they say
+        for (const err of [new ServerError('Something went wrong'), new APIHTTPError('Too many requests', 429), new APICodeError('Too many shares', 2000)]) {
+            const { svc } = listSetup({
+                nodes: [node('a', 'a'), node('b', 'b')],
+                sharing: { a: shared(), b: shared() },
+                fails: { b: err },
+                places: { a: { relPath: 'a', hidden: false }, b: { relPath: 'b', hidden: false } },
+            });
+            expect((await svc.list()).map((i) => [i.name, i.unreadable])).toEqual([
+                ['a', undefined],
+                ['b', "Proton Drive couldn't say how this item is shared"],
+            ]);
+        }
     });
 });

@@ -1,4 +1,12 @@
-import { ConnectionError, MemberRole, type MaybeMissingNode, type ProtonDriveClient, type ShareResult, type URLAccess } from '@protontech/drive-sdk';
+import {
+    ConnectionError,
+    MemberRole,
+    RateLimitedError,
+    type MaybeMissingNode,
+    type ProtonDriveClient,
+    type ShareResult,
+    type URLAccess,
+} from '@protontech/drive-sdk';
 
 export type ShareRole = 'viewer' | 'editor';
 
@@ -66,14 +74,25 @@ function isOlderLink(url: string): boolean {
 // The URL as it may be shown: an older link's without the password after its '#'
 const shownUrl = (url: string) => (isOlderLink(url) ? url.split('#')[0] : url);
 
+// Whether the error, or one wrapped in it, is one that `is` matches. The SDK wraps the failures it met while loading
+// several things in one ProtonDriveError ('Some items could not be loaded'), with an ARRAY of them as its cause
+// (batchLoading.ts loadRest, nodesAccess.ts, nodes/apiService.ts), and the node loader's BatchLoading wraps such an error
+// from the API again. The depth cap ends a chain that loops back on itself.
+const MAX_CAUSE_DEPTH = 4;
+function inChain(e: unknown, is: (e: unknown) => boolean, depth = 0): boolean {
+    if (e === null || e === undefined || depth > MAX_CAUSE_DEPTH) return false;
+    if (is(e)) return true;
+    const cause = (e as { cause?: unknown }).cause;
+    const inner = [...(Array.isArray(cause) ? cause : [cause]), ...(e instanceof AggregateError ? e.errors : [])];
+    return inner.some((c) => inChain(c, is, depth + 1));
+}
+
 // The network, not Proton Drive: the SDK's ConnectionError, a request that timed out (ky's TimeoutError, once the SDK's
 // retries are spent) or found no network (OfflineError), or a fetch that couldn't connect. Not remoteErrors.isTransient,
 // which counts every ServerError, refusals answered with an API code among them: those read as refused, not offline.
 const OFFLINE_ERRORS = new Set(['ConnectionError', 'TimeoutError', 'OfflineError', 'NetworkError']);
-function isOffline(e: unknown): boolean {
-    const err = e as { name?: string; message?: string; code?: string; cause?: unknown } | null;
-    // The SDK wraps a failure it met while loading something else (ProtonDriveError 'Some items could not be loaded')
-    if (err?.cause && err.cause !== e && isOffline(err.cause)) return true;
+function isNetworkFailure(e: unknown): boolean {
+    const err = e as { name?: string; message?: string; code?: string } | null;
     if (e instanceof ConnectionError || OFFLINE_ERRORS.has(err?.name ?? '')) return true;
     const text = `${err?.name ?? ''} ${err?.code ?? ''} ${err?.message ?? ''}`;
     return (
@@ -81,6 +100,18 @@ function isOffline(e: unknown): boolean {
         /ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|NetworkError|offline/i.test(text)
     );
 }
+const isOffline = (e: unknown) => inChain(e, isNetworkFailure);
+
+// The SDK's own limits for the whole account: past too many 429s, or server errors, in a row it refuses every request
+// for a while (internal/apiService/apiService.ts, fetch) with a RateLimitedError, or a plain ServerError "Too many
+// server errors…". Only a plain ServerError: its subclasses carry the server's own message, which may start the same way
+// for another reason. (The SDK's messages are English: the daemon sets no locale for them.)
+function isSdkLimit(e: unknown): boolean {
+    const err = e as { name?: string; message?: string } | null;
+    if (e instanceof RateLimitedError || err?.name === 'RateLimitedError') return true;
+    return err?.name === 'ServerError' && /^Too many/.test(err.message ?? '');
+}
+const isBusy = (e: unknown) => inChain(e, isSdkLimit);
 
 function plainError(e: unknown): ShareError {
     if (e instanceof ShareError) return e;
@@ -183,6 +214,15 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
 
     const byText = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
+    // What fails the whole list rather than one item: every other item would fail the same way
+    const failsTheList = (e: unknown) => isOffline(e) || isBusy(e);
+
+    // An item Proton Drive can't name: the name its path in My files ends with, when the remote index has it
+    function indexedName(uid: string): string {
+        const relPath = deps.placeOf(uid)?.relPath ?? '';
+        return relPath.split('/').pop() || 'An item';
+    }
+
     return {
         // Everything the user has shared, as Proton Drive has it now: the uids come from the server (iterateSharedNodeUids),
         // not the SDK's cache, which may not know of a share made elsewhere. Nothing is logged: it only reads.
@@ -190,13 +230,13 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
             try {
                 const uids: string[] = [];
                 for await (const uid of sdk.iterateSharedNodeUids()) uids.push(uid);
-                const items: Array<SharedItem | null> = [];
+                const items: SharedItem[] = [];
                 const nodes: MaybeMissingNode[] = [];
                 const unreadable: SharedItem[] = [];
                 try {
                     for await (const n of sdk.iterateNodes(uids)) nodes.push(n);
                 } catch (e) {
-                    if (isOffline(e)) throw e;
+                    if (failsTheList(e)) throw e;
                     // The SDK's batch loader throws after the nodes it could load, for ones it couldn't (a parent's key, say),
                     // and reports no missing node then. Load the rest one at a time: one that still fails is listed as unreadable
                     const loaded = new Set(nodes.map((n) => ('missingUid' in n ? n.missingUid : n.uid)));
@@ -209,9 +249,9 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                             }
                             if (!any) throw new Error('not loaded');
                         } catch (one) {
-                            if (isOffline(one)) throw one;
+                            if (failsTheList(one)) throw one;
                             unreadable.push({
-                                name: 'An item',
+                                name: indexedName(uid),
                                 relPath: null,
                                 where: 'elsewhere',
                                 link: null,
@@ -222,10 +262,10 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                     }
                 }
 
-                async function readOne(n: MaybeMissingNode): Promise<SharedItem | null> {
+                async function readOne(n: MaybeMissingNode): Promise<SharedItem> {
                     if ('missingUid' in n) {
                         return {
-                            name: 'An item',
+                            name: indexedName(n.missingUid),
                             relPath: null,
                             where: 'elsewhere',
                             link: null,
@@ -233,7 +273,7 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                             unreadable: "This item can't be found in Proton Drive",
                         };
                     }
-                    const name = n.name.ok ? n.name.value : 'An item';
+                    const name = n.name.ok ? n.name.value : indexedName(n.uid);
                     const place = n.trashTime ? null : deps.placeOf(n.uid);
                     const here = place && place.relPath !== '' ? place : null;
                     const where: SharedPlace = !here ? 'elsewhere' : here.hidden ? 'hidden' : 'my-files';
@@ -242,14 +282,25 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                     try {
                         result = await sdk.getSharingInfo(n.uid);
                     } catch (e) {
-                        if (isOffline(e)) throw e;
+                        if (failsTheList(e)) throw e;
                         return { name, relPath, where, link: null, people: 0, unreadable: "Proton Drive couldn't say how this item is shared" };
                     }
-                    if (!result) return null;
+                    // The server just listed it as shared, but the SDK reads the node's share from its cache, which learns
+                    // of a share made elsewhere only from its events: listed, never left out, as nothing public may be hidden
+                    if (!result) {
+                        return {
+                            name,
+                            relPath,
+                            where,
+                            link: null,
+                            people: 0,
+                            unreadable: 'Proton Drive is still catching up with this item: refresh in a moment',
+                        };
+                    }
                     return { name, relPath, where, link: toInfo(result).link, people: everyone(result).length };
                 }
 
-                // A small pool: the first failure (offline) stops the rest from starting
+                // A small pool: the first failure of the whole list (offline, busy) stops the rest from starting
                 let next = 0;
                 let failed = false;
                 const worker = async () => {
@@ -265,11 +316,12 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                 };
                 await Promise.all(Array.from({ length: Math.min(LIST_CONCURRENCY, nodes.length) }, worker));
 
-                const listed = [...items.filter((i): i is SharedItem => i !== null), ...unreadable];
+                const listed = [...items, ...unreadable];
                 const inFiles = listed.filter((i) => i.where !== 'elsewhere').sort((a, b) => byText(a.relPath ?? '', b.relPath ?? ''));
                 const elsewhere = listed.filter((i) => i.where === 'elsewhere').sort((a, b) => byText(a.name, b.name));
                 return [...inFiles, ...elsewhere];
             } catch (e) {
+                if (!isOffline(e) && isBusy(e)) throw new ShareError('Proton Drive is busy: try again in a minute');
                 throw plainError(e);
             }
         },
@@ -333,8 +385,16 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
 
         async stopSharing(path) {
             return run(path, async (n) => {
-                // No settings: the SDK deletes the whole share, the link and everyone
-                const result = await sdk.unshareNode(n.uid);
+                let result: ShareResult | undefined;
+                try {
+                    // No settings: the SDK deletes the whole share, the link and everyone
+                    result = await sdk.unshareNode(n.uid);
+                } catch (e) {
+                    // The share is gone already, stopped elsewhere while the SDK's cache still held it: reading or deleting
+                    // it is answered 2501, "does not exist". Nothing was stopped here, so nothing is logged
+                    if ((e as { name?: string } | null)?.name === 'NotFoundAPIError') return { link: null, people: [] };
+                    throw e;
+                }
                 log(path, `Stopped sharing ${n.name}`);
                 return toInfo(result);
             });
