@@ -45,6 +45,8 @@ struct Fake {
     exdev_while_online: Vec<String>,
     /// What GET /vfs/space answers: the account's storage, or nothing known (#181)
     space: Value,
+    /// How long a delete takes to answer
+    delete_delay: Duration,
 }
 
 impl Fake {
@@ -56,7 +58,13 @@ impl Fake {
             rename_refusals: HashMap::new(),
             exdev_while_online: Vec::new(),
             space: Value::Null,
+            delete_delay: Duration::ZERO,
         }
+    }
+
+    fn slow_deletes(mut self, delay: Duration) -> Fake {
+        self.delete_delay = delay;
+        self
     }
 
     fn with_space(mut self, used: u64, max: u64) -> Fake {
@@ -223,6 +231,7 @@ fn serve(mut stream: UnixStream, backing: &Path, fake: &Fake, calls: &Calls) {
         ("POST", None) if target == "/vfs/delete" => {
             let body = without_deadline(&body);
             calls.deletes.lock().unwrap().push(body.clone());
+            thread::sleep(fake.delete_delay);
             match fake_delete(backing, fake, body["path"].as_str().unwrap_or(""), body["onlyIfEmpty"] == json!(true)) {
                 Ok(()) => (200, json!({ "ok": true })),
                 Err(code) => (400, json!({ "error": "Refused", "code": code })),
@@ -1286,6 +1295,324 @@ fn gio_trash_deletes_through_the_daemon_and_leaves_the_trash_empty() {
     let list = run(Command::new("gio").args(["trash", "--list"]));
     let listed = String::from_utf8_lossy(&list.stdout);
     assert!(!listed.contains(h.mountpoint.to_str().unwrap()), "{listed}");
+}
+
+/// An inotify watch on folders, as gvfsd-trash keeps one on each trash's files/ to count what is in it.
+struct Inotify {
+    fd: i32,
+    watches: Vec<(i32, PathBuf)>,
+    /// What has been heard so far: the folder, the event's mask and the name it is about
+    heard: Vec<(PathBuf, u32, String)>,
+}
+
+impl Inotify {
+    fn new() -> Inotify {
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(fd >= 0, "inotify_init1: {}", std::io::Error::last_os_error());
+        Inotify { fd, watches: Vec::new(), heard: Vec::new() }
+    }
+
+    fn watch(&mut self, dir: &Path) {
+        let mask = libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO;
+        let wd = unsafe { libc::inotify_add_watch(self.fd, c_path(dir).as_ptr(), mask) };
+        assert!(wd >= 0, "inotify_add_watch {dir:?}: {}", std::io::Error::last_os_error());
+        self.watches.push((wd, dir.to_path_buf()));
+    }
+
+    /// Whether an event in `mask` about `name` in `dir` is heard within `limit`.
+    fn hears(&mut self, dir: &Path, mask: u32, name: &str, limit: Duration) -> bool {
+        let started = Instant::now();
+        loop {
+            self.read_events();
+            if self.heard.iter().any(|(d, m, n)| d == dir && m & mask != 0 && n == name) {
+                return true;
+            }
+            let left = limit.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return false;
+            }
+            let mut ready = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+            unsafe { libc::poll(&mut ready, 1, left.as_millis().clamp(1, 1000) as i32) };
+        }
+    }
+
+    fn read_events(&mut self) {
+        // struct inotify_event: wd, mask, cookie, len, then the name padded with NULs to len
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                return;
+            }
+            let mut at = 0;
+            while at + 16 <= n as usize {
+                let field = |i: usize| u32::from_ne_bytes(buf[at + i..at + i + 4].try_into().unwrap());
+                let (wd, mask, len) = (field(0) as i32, field(4), field(12) as usize);
+                let name = buf[at + 16..at + 16 + len].split(|&b| b == 0).next().unwrap_or_default();
+                if let Some((_, dir)) = self.watches.iter().find(|(w, _)| *w == wd) {
+                    self.heard.push((dir.clone(), mask, String::from_utf8_lossy(name).into_owned()));
+                }
+                at += 16 + len;
+            }
+        }
+    }
+}
+
+impl Drop for Inotify {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
+    }
+}
+
+/// Makes a file that mustn't be there yet (O_EXCL, as GIO makes a .trashinfo), writes `content` and closes it.
+fn write_new(path: &Path, content: &[u8]) {
+    let mut made = std::fs::OpenOptions::new().write(true).create_new(true).open(path).unwrap();
+    made.write_all(content).unwrap();
+}
+
+// Files' Trash icon counts what gvfsd-trash hears of in each trash's files/: an item moved in adds one, and only a
+// delete takes it off again (#236). The drive deletes what is moved into its files/, and drops the .trashinfo written
+// in info/ along the way, so a watcher must hear both go, whichever of them is ready last.
+#[test]
+fn watchers_of_the_trash_hear_each_trashed_item_and_its_trashinfo_go() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    std::fs::write(h.backing.join("local.txt"), b"local").unwrap();
+    std::fs::create_dir(h.backing.join("Folder")).unwrap();
+    std::fs::write(h.backing.join("Folder/in.txt"), b"in").unwrap();
+    h.start_daemon(HashMap::from([("", vec![file("online.txt", 5)])]));
+    h.mount();
+    let trash = h.path(&trash_name());
+    let (files, info) = (trash.join("files"), trash.join("info"));
+    let trashinfo = |name: &str| info.join(format!("{name}.trashinfo"));
+    let content = |name: &str| format!("[Trash Info]\nPath={name}\nDeletionDate=2026-11-14T10:00:00\n").into_bytes();
+    // The folder's entries are in the kernel's cache as it is trashed
+    assert_eq!(ls(&h.path("Folder")), ["in.txt"]);
+    let mut watch = Inotify::new();
+    watch.watch(&files);
+    watch.watch(&info);
+
+    // GLib 2.88's order: an empty placeholder, an empty temp file renamed over it, then one with the content, and
+    // only then the item into files/. The .trashinfo goes as the item does
+    write_new(&trashinfo("online.txt"), b"");
+    write_new(&info.join("online.txt.trashinfo.0VNPX3"), b"");
+    assert_eq!(renameat2(&info.join("online.txt.trashinfo.0VNPX3"), &trashinfo("online.txt"), 0), None);
+    write_new(&info.join("online.txt.trashinfo.CJNPX3"), &content("online.txt"));
+    assert_eq!(renameat2(&info.join("online.txt.trashinfo.CJNPX3"), &trashinfo("online.txt"), 0), None);
+    assert_eq!(renameat2(&h.path("online.txt"), &files.join("online.txt"), 0), None);
+
+    // The item into files/ first, its content renamed into place after: the .trashinfo goes at that rename
+    write_new(&trashinfo("local.txt"), b"");
+    assert_eq!(renameat2(&h.path("local.txt"), &files.join("local.txt"), 0), None);
+    write_new(&info.join("local.txt.trashinfo.ABCDEF"), &content("local.txt"));
+    assert_eq!(renameat2(&info.join("local.txt.trashinfo.ABCDEF"), &trashinfo("local.txt"), 0), None);
+
+    // A folder into files/ first, its .trashinfo written in place and closed after: it goes as it is closed
+    write_new(&trashinfo("Folder"), b"");
+    assert_eq!(renameat2(&h.path("Folder"), &files.join("Folder"), 0), None);
+    let mut placeholder = std::fs::OpenOptions::new().write(true).open(trashinfo("Folder")).unwrap();
+    placeholder.write_all(&content("Folder")).unwrap();
+    drop(placeholder);
+
+    for name in ["online.txt", "local.txt", "Folder"] {
+        assert!(watch.hears(&files, libc::IN_MOVED_TO, name, LIMIT), "{name} never moved in: {:?}", watch.heard);
+        let gone = watch.hears(&files, libc::IN_DELETE, name, Duration::from_secs(5));
+        assert!(gone, "no delete of files/{name} was heard: {:?}", watch.heard);
+        let info_gone = watch.hears(&info, libc::IN_DELETE, &format!("{name}.trashinfo"), Duration::from_secs(5));
+        assert!(info_gone, "no delete of info/{name}.trashinfo was heard: {:?}", watch.heard);
+        for gone in [files.join(name), trashinfo(name)] {
+            let found = std::fs::symlink_metadata(&gone).map_err(|e| e.kind());
+            assert_eq!(found.err(), Some(std::io::ErrorKind::NotFound), "{gone:?}");
+        }
+    }
+    let trashed = ["online.txt", "local.txt", "Folder"].map(|path| json!({ "path": path, "trash": true }));
+    assert_eq!(h.daemon().deletes(), trashed);
+    assert_eq!(h.daemon().hydrate_calls(), 0);
+    assert_eq!(ls(&files), Vec::<String>::new());
+    assert_eq!(ls(&info), Vec::<String>::new());
+    assert_eq!(ls(&h.mountpoint), [".xdg-volume-info"]);
+}
+
+// The daemon can take longer to delete than the kernel keeps an entry (1 s): by the time the item goes from files/,
+// the kernel looks its name up again, and must still hear it go
+#[test]
+fn watchers_of_the_trash_hear_an_item_go_after_a_slow_delete() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    std::fs::write(h.backing.join("slow.txt"), b"slow").unwrap();
+    std::fs::create_dir(h.backing.join("Slow")).unwrap();
+    std::fs::write(h.backing.join("Slow/in.txt"), b"in").unwrap();
+    h.start_fake(Fake::new(HashMap::new()).slow_deletes(Duration::from_millis(1500)));
+    h.mount();
+    let files = h.path(&trash_name()).join("files");
+    let mut watch = Inotify::new();
+    watch.watch(&files);
+
+    for name in ["slow.txt", "Slow"] {
+        assert_eq!(renameat2(&h.path(name), &files.join(name), 0), None);
+        let gone = watch.hears(&files, libc::IN_DELETE, name, Duration::from_secs(5));
+        assert!(gone, "no delete of files/{name} was heard: {:?}", watch.heard);
+        let found = std::fs::symlink_metadata(files.join(name)).map_err(|e| e.kind());
+        assert_eq!(found.err(), Some(std::io::ErrorKind::NotFound), "{name}");
+    }
+    let trashed = ["slow.txt", "Slow"].map(|path| json!({ "path": path, "trash": true }));
+    assert_eq!(h.daemon().deletes(), trashed);
+    assert_eq!(ls(&files), Vec::<String>::new());
+}
+
+// Without its unlinker, the drive still trashes as it did before #236: the names go, the kernel's entries with them,
+// and the log says so once, naming nothing
+#[test]
+fn the_drive_still_trashes_once_its_unlinker_is_gone() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    for name in ["secret-one.txt", "secret-two.txt"] {
+        std::fs::write(h.backing.join(name), b"x").unwrap();
+    }
+    h.start_daemon(HashMap::new());
+    h.mount();
+    let pid = h.helper.as_ref().unwrap().id();
+    let children = children_of(pid);
+    assert_eq!(children.len(), 1, "the helper's children: {children:?}");
+    let comm = std::fs::read_to_string(format!("/proc/{}/comm", children[0])).unwrap();
+    assert_eq!(comm.trim_end(), "trash-unlinker");
+    unsafe { libc::kill(children[0] as i32, libc::SIGKILL) };
+    let files = h.path(&trash_name()).join("files");
+
+    for name in ["secret-one.txt", "secret-two.txt"] {
+        assert_eq!(renameat2(&h.path(name), &files.join(name), 0), None, "{name}");
+    }
+    let trashed = ["secret-one.txt", "secret-two.txt"].map(|path| json!({ "path": path, "trash": true }));
+    assert_eq!(h.daemon().deletes(), trashed);
+    assert_eq!(ls(&files), Vec::<String>::new());
+    let started = Instant::now();
+    while !h.stderr().contains("unlinker stopped") && started.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let log = h.stderr();
+    assert_eq!(log.matches("unlinker stopped").count(), 1, "{log}");
+    assert!(!log.contains("secret"), "{log}");
+    // Reaped, not left a zombie
+    let started = Instant::now();
+    while std::fs::metadata(format!("/proc/{}", children[0])).is_ok() && started.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(std::fs::metadata(format!("/proc/{}", children[0])).is_err(), "the unlinker wasn't reaped");
+}
+
+/// The FUSE connection of a test mount: its number in /sys/fs/fuse/connections.
+fn connection_of(mountpoint: &Path) -> u32 {
+    let wanted = mountpoint.to_str().unwrap();
+    let ours = std::env::temp_dir().join("protondrive-vfs-test-");
+    assert!(wanted.starts_with(ours.to_str().unwrap()), "only ever a test mount: {wanted}");
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    let line = mountinfo.lines().find(|l| l.split(' ').nth(4) == Some(wanted)).expect("the test mount in mountinfo");
+    let (major, minor) = line.split(' ').nth(2).unwrap().split_once(':').unwrap();
+    assert_eq!(major, "0");
+    minor.parse().unwrap()
+}
+
+/// The processes `pid` started that are still running.
+fn children_of(pid: u32) -> Vec<u32> {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { return Vec::new() };
+    let lists = tasks.flatten().map(|t| std::fs::read_to_string(t.path().join("children")).unwrap_or_default());
+    lists.flat_map(|l| l.split_whitespace().filter_map(|p| p.parse().ok()).collect::<Vec<u32>>()).collect()
+}
+
+/// The threads of `pid` in uninterruptible sleep (D), by name.
+fn waiting_threads(pid: u32) -> Vec<String> {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { return Vec::new() };
+    let stats = tasks.flatten().map(|t| std::fs::read_to_string(t.path().join("stat")).unwrap_or_default());
+    // pid (comm) state ...: comm may hold spaces and parentheses
+    let waiting = stats.filter_map(|s| {
+        let (open, close) = (s.find('(')?, s.rfind(')')?);
+        (s.get(close + 2..close + 3) == Some("D")).then(|| s[open + 1..close].to_string())
+    });
+    waiting.collect()
+}
+
+/// Waits up to `limit` for the helper to be reaped: its exit status, if it was.
+fn reaped(helper: &mut Child, limit: Duration) -> Option<ExitStatus> {
+    let started = Instant::now();
+    while started.elapsed() < limit {
+        if let Some(status) = helper.try_wait().unwrap() {
+            return Some(status);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+// An unlink in the trash waits on the kernel's lock of files/ for as long as the next rename into it holds it, which
+// is as long as the daemon takes to delete. A helper killed meanwhile (a systemd stop, a logout) must still go, and its
+// connection with it, so that the app's renames return: nothing in the helper may be stuck on that lock (#236)
+#[test]
+fn a_helper_killed_while_trashes_queue_up_goes_and_the_renames_return() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    let n = 8;
+    for k in 0..n {
+        std::fs::write(h.backing.join(format!("i{k}.txt")), b"x").unwrap();
+    }
+    h.start_fake(Fake::new(HashMap::new()).slow_deletes(Duration::from_millis(1000)));
+    h.mount();
+    let connection = connection_of(&h.mountpoint);
+    let pid = h.helper.as_ref().unwrap().id();
+    let files = h.path(&trash_name()).join("files");
+    assert!(files.is_dir());
+    let started_with = children_of(pid);
+    let (tx, renamed) = std::sync::mpsc::channel();
+    for k in 0..n {
+        let (from, to, tx) = (h.path(&format!("i{k}.txt")), files.join(format!("i{k}.txt")), tx.clone());
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100 * k as u64));
+            let _ = tx.send((k, renameat2(&from, &to, 0)));
+        });
+    }
+    // Each rename holds files/ through its delete. An unlink there that comes after the next rename took the lock
+    // waits, uninterruptibly, behind it: that is when the helper is killed
+    let (started, mut since) = (Instant::now(), None::<Instant>);
+    let waiting = loop {
+        let mut waiting = waiting_threads(pid);
+        waiting.extend(children_of(pid).into_iter().flat_map(waiting_threads));
+        since = if waiting.is_empty() { None } else { since.or(Some(Instant::now())) };
+        if since.is_some_and(|at| at.elapsed() >= Duration::from_millis(300)) {
+            break Some(waiting);
+        }
+        if started.elapsed() > Duration::from_secs(n as u64 + 2) {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    // Killed whatever was seen, so that the test always ends the same way
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let status = reaped(h.helper.as_mut().unwrap(), Duration::from_secs(5));
+    if status.is_none() {
+        // Ends the connection, which frees whatever is stuck, so the test leaves nothing behind
+        let _ = std::fs::write(format!("/sys/fs/fuse/connections/{connection}/abort"), b"1");
+        assert!(reaped(h.helper.as_mut().unwrap(), LIMIT).is_some(), "the helper outlived its connection");
+    }
+    h.helper = None;
+    let returned: Vec<usize> =
+        (0..n).filter_map(|_| renamed.recv_timeout(Duration::from_secs(5)).ok()).map(|(k, _)| k).collect();
+    let left = |pid: &u32| std::fs::metadata(format!("/proc/{pid}")).is_ok();
+    let started = Instant::now();
+    while started_with.iter().any(left) && started.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(waiting.is_some(), "no unlink ever waited on files/");
+    assert!(status.is_some(), "the helper outlived SIGKILL until its connection was aborted: {waiting:?} waited");
+    assert_eq!(returned.len(), n, "renames still waiting after the helper went: only {returned:?} returned");
+    let stayed: Vec<&u32> = started_with.iter().filter(|p| left(p)).collect();
+    assert!(stayed.is_empty(), "the helper's children outlived it: {stayed:?}");
 }
 
 #[test]
