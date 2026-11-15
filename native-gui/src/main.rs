@@ -183,7 +183,6 @@ tokens! {
     SIDEBAR_WEAK => sidebar_weak,
     STORAGE_FILL => storage_fill,
     STORAGE_TRACK => storage_track,
-    #[expect(dead_code, reason = "the Shared list's, not drawn with it yet")]
     FOLDER_ICON => folder,
 }
 
@@ -879,6 +878,216 @@ fn start_fresh_at(socket: &std::path::Path) -> Result<(), String> {
     control_request_at(socket, "POST", "/account/start-fresh", Some(&serde_json::json!({})), DRIVE_READ_TIMEOUT).map(|_| ())
 }
 
+/// The least the Shared list's Location column keeps before the name gives way.
+const SHARED_LOCATION_MIN: f32 = 56.0;
+
+/// How the Shared list's text columns share `room`, as (name, location, sharing). Sharing has what its marks need (up
+/// to half the room) and what a longer reason wants (up to two fifths). The name has at least half the rest, so the
+/// columns line up, and more as it needs. Location gives way first, down to `SHARED_LOCATION_MIN`; then the name.
+fn shared_columns(room: f32, name_want: f32, sharing_need: f32, sharing_want: f32) -> (f32, f32, f32) {
+    let room = room.max(0.0);
+    let sharing = sharing_want.min(room * 0.4).max(sharing_need.min(room * 0.5));
+    let rest = room - sharing;
+    // max then min, not clamp: rounding can put the bounds a hair the wrong way round, which clamp panics on
+    let name = name_want.max(rest * 0.5).min(rest - SHARED_LOCATION_MIN.min(rest * 0.5));
+    (name, rest - name, sharing)
+}
+
+/// A Shared row's height.
+const SHARED_ROW_HEIGHT: f32 = 44.0;
+/// The room between the Shared list's columns.
+const SHARED_COLUMN_GAP: f32 = 12.0;
+/// The room between a row's actions.
+const SHARED_ACTION_GAP: f32 = 4.0;
+/// The room after a row's actions, before the end of its line.
+const SHARED_ROW_END: f32 = 4.0;
+
+/// Something the Sharing column paints: a glyph (in the icons' font) or words.
+struct SharingPiece {
+    text: String,
+    glyph: bool,
+    color: Color32,
+    /// Left out first when the column is too narrow for everything ("Link expired": the broken link, in red, says it)
+    spare: bool,
+}
+
+/// What a row's Sharing column paints, left to right: its marks, "Link expired" after a broken link and the number of
+/// people after their mark; or, for an item whose sharing couldn't be read, the warning and why.
+fn sharing_pieces(item: &shared::SharedItem, now_ms: i64) -> Vec<SharingPiece> {
+    let piece = |text: &str, glyph, color| SharingPiece { text: text.to_string(), glyph, color, spare: false };
+    if let Some(reason) = &item.unreadable {
+        return vec![piece(icons::WARNING, true, TEXT_MUTED()), piece(reason, false, TEXT_MUTED())];
+    }
+    let marks = shared::sharing_marks(item, now_ms);
+    if marks.is_empty() {
+        return vec![piece(&shared::exposure_text(item, now_ms, home::local_offset_secs), false, TEXT_MUTED())];
+    }
+    let mut pieces = Vec::new();
+    for mark in marks {
+        if mark == icons::LINK_BROKEN {
+            pieces.push(piece(mark, true, STATUS_DANGER));
+            pieces.push(SharingPiece { spare: true, ..piece("Link expired", false, STATUS_DANGER) });
+        } else {
+            pieces.push(piece(mark, true, TEXT_MUTED()));
+        }
+        if mark == icons::PEOPLE {
+            pieces.push(piece(&item.people.to_string(), false, TEXT_MUTED()));
+        }
+    }
+    pieces
+}
+
+/// The fonts of the Sharing column's glyphs and words.
+fn sharing_font(piece: &SharingPiece) -> FontId {
+    if piece.glyph {
+        icons::font(BUTTON_ICON_SIZE)
+    } else {
+        FontId::proportional(13.0)
+    }
+}
+
+/// The room before a piece of the Sharing column: little between a mark and its words, more before the next mark.
+fn sharing_gap(before: &SharingPiece, piece: &SharingPiece) -> f32 {
+    match (before.glyph, piece.glyph) {
+        (true, false) => 4.0,
+        (true, true) => 6.0,
+        _ => 10.0,
+    }
+}
+
+/// How wide the Sharing column's pieces are, side by side.
+fn sharing_width(painter: &egui::Painter, pieces: &[&SharingPiece]) -> f32 {
+    let widths: f32 = pieces.iter().map(|p| text_width(painter, &p.text, &sharing_font(p))).sum();
+    widths + pieces.windows(2).map(|w| sharing_gap(w[0], w[1])).sum::<f32>()
+}
+
+/// The pieces that fit `width`: all of them, or all but the spare ones.
+fn sharing_fit<'a>(painter: &egui::Painter, pieces: &'a [SharingPiece], width: f32) -> Vec<&'a SharingPiece> {
+    let all: Vec<&SharingPiece> = pieces.iter().collect();
+    if sharing_width(painter, &all) <= width {
+        all
+    } else {
+        pieces.iter().filter(|p| !p.spare).collect()
+    }
+}
+
+/// The Shared list: the column headers, then a row per item, with lines between them and no card. Returns the button
+/// clicked, with its row's index.
+fn shared_list(ui: &mut egui::Ui, items: &[shared::SharedItem], now_ms: i64, stopping: Option<&str>) -> Option<(SharedAction, usize)> {
+    // Room before the name, and between a name's icon and the name
+    const START: f32 = 8.0;
+    const ICON_ROOM: f32 = BUTTON_ICON_SIZE + 8.0;
+    let name_font = FontId::proportional(14.0);
+    let text_font = FontId::proportional(13.0);
+    let header_font = FontId::proportional(12.0);
+    let pieces: Vec<Vec<SharingPiece>> = items.iter().map(|item| sharing_pieces(item, now_ms)).collect();
+    let painter = ui.painter().clone();
+
+    // The columns, from what they would like and the room there is. Room for the most buttons a row has, so that
+    // the actions never move
+    let actions_room = 4.0 * ICON_BUTTON_SIZE + 3.0 * SHARED_ACTION_GAP;
+    let width = ui.available_width();
+    let room = width - START - SHARED_ROW_END - actions_room - 3.0 * SHARED_COLUMN_GAP;
+    let name_want = items.iter().map(|i| ICON_ROOM + text_width(&painter, &i.name, &name_font)).fold(0.0, f32::max);
+    // Sharing needs room for every readable row's marks, and wants room for its words and an unreadable row's reason
+    let sharing_need = items
+        .iter()
+        .zip(&pieces)
+        .filter(|(i, _)| i.unreadable.is_none())
+        .map(|(_, p)| sharing_width(&painter, &sharing_fit(&painter, p, 0.0)))
+        .fold(text_width(&painter, "Sharing", &header_font), f32::max);
+    let sharing_want = pieces.iter().map(|p| sharing_width(&painter, &p.iter().collect::<Vec<_>>())).fold(sharing_need, f32::max);
+    let (name_w, location_w, sharing_w) = shared_columns(room, name_want, sharing_need, sharing_want);
+
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let line = |painter: &egui::Painter, rect: egui::Rect| {
+        painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0_f32, BORDER_SUBTLE()));
+    };
+    let (header, _) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::hover());
+    let name_x = header.left() + START;
+    let location_x = name_x + name_w + SHARED_COLUMN_GAP;
+    let sharing_x = location_x + location_w + SHARED_COLUMN_GAP;
+    for (title, x) in [("Name", name_x), ("Location", location_x), ("Sharing", sharing_x)] {
+        painter.text(egui::pos2(x, header.center().y), egui::Align2::LEFT_CENTER, title, header_font.clone(), TEXT_MUTED());
+    }
+    line(&painter, header);
+
+    let mut act = None;
+    for (i, (item, pieces)) in items.iter().zip(&pieces).enumerate() {
+        let (row, _) = ui.allocate_exact_size(Vec2::new(width, SHARED_ROW_HEIGHT), Sense::hover());
+        line(&painter, row);
+        let y = row.center().y;
+        let cell = |x: f32, w: f32| egui::Rect::from_min_max(egui::pos2(x, row.top()), egui::pos2(x + w.max(0.0), row.bottom()));
+        let in_cell = |rect: egui::Rect| painter.with_clip_rect(rect.intersect(painter.clip_rect()));
+        let enabled = ui.is_enabled();
+        // Each cell is named for screen readers, as a label would be, and says the whole of it on hover
+        let describe = |rect: egui::Rect, what: &str, says: &str, hover: &str| {
+            let resp = ui.interact(rect, ui.id().with(("shared_cell", i, what)), Sense::hover());
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, enabled, says));
+            resp.on_hover_text(hover);
+        };
+        let whole = format!("{}\n{}", item.name, shared::folder_text(item));
+
+        // Name: a folder's or a file's icon, then the name
+        let name_cell = cell(name_x, name_w);
+        let p = in_cell(name_cell);
+        let icon_color = if shared::name_icon(&item.name) == icons::FOLDER { FOLDER_ICON() } else { TEXT_MUTED() };
+        p.text(egui::pos2(name_x, y), egui::Align2::LEFT_CENTER, shared::name_icon(&item.name), icons::font(BUTTON_ICON_SIZE), icon_color);
+        let name = truncate_middle_to_width(&p, &item.name, &name_font, name_w - ICON_ROOM);
+        p.text(egui::pos2(name_x + ICON_ROOM, y), egui::Align2::LEFT_CENTER, name, name_font.clone(), TEXT_PRIMARY());
+        describe(name_cell, "name", &item.name, &whole);
+
+        // Location: the folder, or where the item is instead, in weak text
+        let location_cell = cell(location_x, location_w);
+        let location = shared::location_text(item);
+        let color = if item.place == shared::Place::MyFiles { TEXT_PRIMARY() } else { TEXT_MUTED() };
+        let p = in_cell(location_cell);
+        let shown = truncate_middle_to_width(&p, &location, &text_font, location_w);
+        p.text(egui::pos2(location_x, y), egui::Align2::LEFT_CENTER, shown, text_font.clone(), color);
+        describe(location_cell, "location", &location, &whole);
+
+        // Sharing: the marks, or the warning and why; the whole sentence on hover
+        let sharing_cell = cell(sharing_x, sharing_w);
+        let p = in_cell(sharing_cell);
+        let mut x = sharing_x;
+        let fit = sharing_fit(&p, pieces, sharing_w);
+        for (k, piece) in fit.iter().enumerate() {
+            if k > 0 {
+                x += sharing_gap(fit[k - 1], piece);
+            }
+            let font = sharing_font(piece);
+            // Words are shortened to the column; a glyph past its edge is cut off by it
+            let text = if piece.glyph { piece.text.clone() } else { truncate_middle_to_width(&p, &piece.text, &font, sharing_cell.right() - x) };
+            let w = text_width(&p, &text, &font);
+            p.text(egui::pos2(x, y), egui::Align2::LEFT_CENTER, text, font, piece.color);
+            x += w;
+        }
+        let exposure = shared::exposure_text(item, now_ms, home::local_offset_secs);
+        describe(sharing_cell, "sharing", &exposure, &exposure);
+
+        // The actions, on the right: weak until the row is hovered. A row being stopped waits for the answer
+        let buttons = SharedAction::for_item(item, now_ms);
+        let n = buttons.len() as f32;
+        let actions_w = n * ICON_BUTTON_SIZE + (n - 1.0).max(0.0) * SHARED_ACTION_GAP;
+        let right = row.right() - SHARED_ROW_END;
+        let actions = egui::Rect::from_min_max(egui::pos2(right - actions_w, row.top()), egui::pos2(right, row.bottom()));
+        let color = if ui.rect_contains_pointer(row) { TEXT_PRIMARY() } else { TEXT_MUTED() };
+        let busy = stopping.is_some() && stopping == item.rel_path.as_deref();
+        let mut actions_ui = ui.new_child(egui::UiBuilder::new().id_salt(("shared_actions", i)).max_rect(actions).layout(Layout::left_to_right(Align::Center)));
+        actions_ui.spacing_mut().item_spacing.x = SHARED_ACTION_GAP;
+        actions_ui.add_enabled_ui(!busy, |ui| {
+            for button in &buttons {
+                // One stop at a time: the other rows' Stop sharing wait for the answer
+                let can = *button != SharedAction::Stop || stopping.is_none();
+                if ui.add_enabled_ui(can, |ui| icon_button_colored(ui, button.icon(), button.label(), color)).inner.clicked() {
+                    act = Some((*button, i));
+                }
+            }
+        });
+    }
+    act
+}
+
 /// A button on a row of the Shared page.
 #[derive(Clone, Copy, PartialEq)]
 enum SharedAction {
@@ -898,6 +1107,37 @@ impl SharedAction {
             SharedAction::Stop => "Stop sharing",
             SharedAction::ManageOnWeb => "Manage on the web",
         }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            SharedAction::CopyLink => icons::COPY,
+            SharedAction::Manage => icons::MANAGE,
+            SharedAction::ShowInFiles => icons::FOLDER_OPEN,
+            SharedAction::Stop => icons::LINK_BROKEN,
+            SharedAction::ManageOnWeb => icons::WEB,
+        }
+    }
+
+    /// The buttons a row gets. An item whose sharing couldn't be read gets only what doesn't depend on it (Show in
+    /// Files, the web), never Stop sharing, Manage… or Copy link (#253); one outside My files, only the web.
+    fn for_item(item: &shared::SharedItem, now_ms: i64) -> Vec<SharedAction> {
+        let has_path = item.rel_path.is_some();
+        let mut buttons = Vec::new();
+        if item.unreadable.is_some() {
+            if has_path && item.place == shared::Place::MyFiles {
+                buttons.push(SharedAction::ShowInFiles);
+            }
+            buttons.push(SharedAction::ManageOnWeb);
+        } else if item.place == shared::Place::MyFiles && has_path {
+            if shared::can_copy(item, now_ms) {
+                buttons.push(SharedAction::CopyLink);
+            }
+            buttons.extend([SharedAction::Manage, SharedAction::ShowInFiles, SharedAction::Stop]);
+        } else {
+            buttons.push(SharedAction::ManageOnWeb);
+        }
+        buttons
     }
 }
 
@@ -1891,168 +2131,82 @@ impl ProtonDriveNativeApp {
         let _ = self.tx.send(WorkerCommand::SharedLoad { seq });
     }
 
-    /// Shared: what you've shared, with where it is and what it exposes.
+    /// Shared: what you've shared, as a list of Proton's kind: each item's name, where it is, what it exposes and what
+    /// can be done with it.
     fn render_shared(&mut self, ui: &mut egui::Ui) {
-        ScrollArea::vertical().id_salt("shared_scroll").auto_shrink([false, false]).show(ui, |ui| {
-            // Refresh, on the right (the title is the top bar's)
+        // A gutter for the scroll bar, as Settings has, so that it never draws over the actions; the toolbar keeps it
+        // too, so that Refresh lines up with them
+        let gutter = Margin { left: 0, right: 12, top: 0, bottom: 0 };
+        // The toolbar, which stays while the list scrolls: what was just done on the left, Refresh on the right, in
+        // line with the rows' actions (the title is the top bar's)
+        let toolbar = Margin { right: gutter.right + SHARED_ROW_END as i8, ..gutter };
+        Frame::NONE.inner_margin(toolbar).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.set_min_height(34.0);
+                if self.shared.copied.is_some() {
+                    ui.label(RichText::new(icons::CHECK).font(icons::font(16.0)).color(STATUS_SUCCESS));
+                    ui.label(RichText::new("Link copied").size(13.0).color(TEXT_MUTED()));
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let loading = self.shared.loading;
                     // Retry is the action while the list couldn't be read
                     if self.shared.error.is_none() {
-                        let refresh = ui
-                            .add_enabled_ui(!loading, |ui| {
-                                proton_button(
-                                    ui,
-                                    Vec2::new(button_width(ui, "Refresh"), 34.0),
-                                    "Refresh",
-                                    BG_CARD(),
-                                    BG_CARD_ALT(),
-                                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                                    TEXT_PRIMARY(),
-                                    13.0,
-                                )
-                            })
-                            .inner;
+                        let refresh = ui.add_enabled_ui(!self.shared.loading, |ui| icon_button(ui, icons::REFRESH, "Refresh")).inner;
                         if refresh.clicked() {
                             self.load_shared();
                         }
                     }
                 });
             });
-            ui.add_space(14.0);
+        });
+        ui.add_space(8.0);
 
-            if let Some(error) = self.shared.error.clone() {
-                ui.add(egui::Label::new(RichText::new(error).size(13.0).color(STATUS_DANGER)).wrap());
-                ui.add_space(10.0);
-                if proton_button(
-                    ui,
-                    Vec2::new(button_width(ui, "Retry"), 34.0),
-                    "Retry",
-                    PROTON_PURPLE,
-                    PROTON_PURPLE_HOVER,
-                    None,
-                    Color32::WHITE,
-                    13.0,
-                )
-                .clicked()
-                {
-                    self.load_shared();
-                }
-                return;
-            }
-            let loading = self.shared.loading;
-            if loading {
-                ui.label(RichText::new(shared::LOADING).size(13.0).color(TEXT_MUTED()));
-                ui.add_space(10.0);
-            }
-            let Some(items) = &self.shared.items else { return };
-            if items.is_empty() {
-                if !loading {
-                    ui.add(egui::Label::new(RichText::new(shared::EMPTY).size(13.0).color(TEXT_MUTED())).wrap());
-                    ui.add_space(8.0);
-                    Self::shared_photos_note(ui, self.screenshot_target.is_some());
-                }
-                return;
-            }
-            let now = home::now_ms();
-            if let Some(error) = &self.shared.stop_error {
-                ui.add(egui::Label::new(RichText::new(error).size(13.0).color(STATUS_DANGER)).wrap());
-                ui.add_space(10.0);
-            }
-            let stopping = self.shared.stopping.clone();
-            let copied = self.shared.copied.clone();
-            let mut act: Option<(SharedAction, usize)> = None;
-            // The rows of the list being replaced stay, greyed out and without clicks
-            ui.add_enabled_ui(!loading, |ui| {
-                card_frame().show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    for (i, item) in items.iter().enumerate() {
-                        if i > 0 {
-                            ui.separator();
-                        }
-                        // First line: the name, then the folder after it; second line: what it exposes
-                        let small = FontId::new(12.5, FontFamily::Proportional);
-                        let name_font = FontId::new(14.0, FontFamily::Proportional);
-                        let folder = shared::folder_text(item);
-                        let room = ui.available_width();
-                        // The name keeps at most two thirds of the line, so a long one never pushes the folder out
-                        let name_w = text_width(ui.painter(), &item.name, &name_font).min(room * 0.66);
-                        let name = truncate_middle_to_width(ui.painter(), &item.name, &name_font, name_w);
-                        let folder_room = room - text_width(ui.painter(), &name, &name_font) - 10.0;
-                        let folder = truncate_middle_to_width(ui.painter(), &folder, &small, folder_room);
-                        let whole = format!("{}\n{}", item.name, shared::folder_text(item));
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(name).size(14.0).strong().color(TEXT_PRIMARY())).on_hover_text(whole.clone());
-                            ui.label(RichText::new(folder).size(12.5).color(TEXT_MUTED())).on_hover_text(whole);
-                        });
-                        let exposure = shared::exposure_text(item, now, home::local_offset_secs);
-                        let shown = truncate_middle_to_width(ui.painter(), &exposure, &small, ui.available_width());
-                        ui.label(RichText::new(shown).size(12.5).color(TEXT_MUTED()));
-                        // Third line: what can be done with it. An item whose sharing couldn't be read gets only what
-                        // doesn't depend on it (Show in Files, the web), never Stop sharing, Manage… or Copy link (#253)
-                        let busy = stopping.is_some() && stopping == item.rel_path;
-                        let has_path = item.rel_path.is_some();
-                        let mut buttons: Vec<SharedAction> = Vec::new();
-                        if item.unreadable.is_some() {
-                            if has_path && item.place == shared::Place::MyFiles {
-                                buttons.push(SharedAction::ShowInFiles);
-                            }
-                            buttons.push(SharedAction::ManageOnWeb);
-                        } else if item.place == shared::Place::MyFiles && has_path {
-                            if shared::can_copy(item, now) {
-                                buttons.push(SharedAction::CopyLink);
-                            }
-                            buttons.extend([SharedAction::Manage, SharedAction::ShowInFiles, SharedAction::Stop]);
-                        } else {
-                            buttons.push(SharedAction::ManageOnWeb);
-                        }
-                        ui.add_space(4.0);
-                        ui.add_enabled_ui(!busy, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                for button in &buttons {
-                                    let label = button.label();
-                                    // One stop at a time: the other rows' Stop sharing wait for the answer
-                                    let can = *button != SharedAction::Stop || stopping.is_none();
-                                    // Each button gets its space from this row's layout (a child area from
-                                    // `add_enabled_ui` alone starts at the cursor and never wraps, #262)
-                                    let size = Vec2::new(button_width(ui, label), 28.0);
-                                    let clicked = ui
-                                        .allocate_ui(size, |ui| {
-                                            ui.add_enabled_ui(can, |ui| {
-                                                proton_button(
-                                                    ui,
-                                                    size,
-                                                    label,
-                                                    BG_CARD_ALT(),
-                                                    btn_secondary_hover_bg(),
-                                                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                                                    TEXT_PRIMARY(),
-                                                    13.0,
-                                                )
-                                            })
-                                            .inner
-                                        })
-                                        .inner
-                                        .clicked();
-                                    if clicked {
-                                        act = Some((*button, i));
-                                    }
-                                }
-                                if copied.is_some() && copied == item.rel_path {
-                                    ui.label(RichText::new("Link copied").size(12.5).color(TEXT_MUTED()));
-                                }
-                            });
-                        });
+        ScrollArea::vertical().id_salt("shared_scroll").auto_shrink([false, false]).show(ui, |ui| {
+            Frame::NONE.inner_margin(gutter).show(ui, |ui| {
+                if let Some(error) = self.shared.error.clone() {
+                    ui.add(egui::Label::new(RichText::new(error).size(13.0).color(STATUS_DANGER)).wrap());
+                    ui.add_space(10.0);
+                    if proton_button(
+                        ui,
+                        Vec2::new(button_width(ui, "Retry"), 34.0),
+                        "Retry",
+                        PROTON_PURPLE,
+                        PROTON_PURPLE_HOVER,
+                        None,
+                        Color32::WHITE,
+                        13.0,
+                    )
+                    .clicked()
+                    {
+                        self.load_shared();
                     }
-                });
+                    return;
+                }
+                let loading = self.shared.loading;
+                if loading {
+                    ui.label(RichText::new(shared::LOADING).size(13.0).color(TEXT_MUTED()));
+                    ui.add_space(10.0);
+                }
+                let Some(items) = &self.shared.items else { return };
+                if items.is_empty() {
+                    if !loading {
+                        ui.add(egui::Label::new(RichText::new(shared::EMPTY).size(13.0).color(TEXT_MUTED())).wrap());
+                        ui.add_space(8.0);
+                        Self::shared_photos_note(ui, self.screenshot_target.is_some());
+                    }
+                    return;
+                }
+                if let Some(error) = &self.shared.stop_error {
+                    ui.add(egui::Label::new(RichText::new(error).size(13.0).color(STATUS_DANGER)).wrap());
+                    ui.add_space(10.0);
+                }
+                // The rows of the list being replaced stay, greyed out and without clicks
+                let act = ui.add_enabled_ui(!loading, |ui| shared_list(ui, items, home::now_ms(), self.shared.stopping.as_deref())).inner;
+                ui.add_space(12.0);
+                Self::shared_photos_note(ui, self.screenshot_target.is_some());
+                if let Some((action, i)) = act {
+                    self.act_on_shared_row(ui.ctx(), action, i);
+                }
             });
-            ui.add_space(10.0);
-            Self::shared_photos_note(ui, self.screenshot_target.is_some());
-            if let Some((action, i)) = act {
-                self.act_on_shared_row(ui.ctx(), action, i);
-            }
         });
     }
 
@@ -3595,26 +3749,35 @@ fn action_button_width(ui: &egui::Ui, icon: Option<&str>, label: &str) -> f32 {
     button_width(ui, label) + icon_room
 }
 
+/// The width and height of an icon-only button.
+const ICON_BUTTON_SIZE: f32 = 28.0;
+
 /// An icon-only button, 28×28, with no fill until hovered. `label`, what a button with words would have said, is its
 /// tooltip and its name for screen readers.
-#[cfg_attr(not(test), expect(dead_code, reason = "outside tests only the gear, through icon_button_pressed, is an icon-only button"))]
 fn icon_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
     icon_button_pressed(ui, icon, label, false)
 }
 
+/// `icon_button` with its icon in `color`: a list row's actions, weak until their row is hovered.
+fn icon_button_colored(ui: &mut egui::Ui, icon: &str, label: &str, color: Color32) -> egui::Response {
+    icon_button_drawn(ui, icon, label, false, color)
+}
+
 /// `icon_button`, filled with the soft purple while `pressed`: the top bar's gear while Settings is open.
 fn icon_button_pressed(ui: &mut egui::Ui, icon: &str, label: &str, pressed: bool) -> egui::Response {
-    let (fill, hover_fill, color) = if pressed {
-        (PROTON_PURPLE_SOFT(), PROTON_PURPLE_SOFT(), PROTON_PURPLE_TEXT())
-    } else {
-        (Color32::TRANSPARENT, BG_CARD_ALT(), TEXT_PRIMARY())
-    };
-    let (rect, resp) = button_shell(ui, Vec2::splat(28.0), label, fill, hover_fill, None);
+    icon_button_drawn(ui, icon, label, pressed, if pressed { PROTON_PURPLE_TEXT() } else { TEXT_PRIMARY() })
+}
+
+fn icon_button_drawn(ui: &mut egui::Ui, icon: &str, label: &str, pressed: bool, color: Color32) -> egui::Response {
+    let (fill, hover_fill) =
+        if pressed { (PROTON_PURPLE_SOFT(), PROTON_PURPLE_SOFT()) } else { (Color32::TRANSPARENT, BG_CARD_ALT()) };
+    let (rect, resp) = button_shell(ui, Vec2::splat(ICON_BUTTON_SIZE), label, fill, hover_fill, None);
     // Says whether it is pressed, as the sections say whether they are open
     let enabled = ui.is_enabled();
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, pressed, label));
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, icons::font(BUTTON_ICON_SIZE), color);
-    resp.on_hover_text(label)
+    // With no words of its own, it says what it is even while it waits (greyed out)
+    resp.on_hover_text(label).on_disabled_hover_text(label)
 }
 
 /// An on/off switch; the caller flips the state when it is clicked.
@@ -5281,6 +5444,18 @@ mod tests {
                 .filter_map(|(_, node)| node.bounds())
                 .map(|b| egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
                 .collect()
+        }
+
+        /// The centre of the first label the last frame gave screen readers with exactly this text (egui hands a
+        /// label's text over as its value, not its name).
+        fn label_at(&self, text: &str) -> Option<egui::Pos2> {
+            let update = self.last.as_ref()?.platform_output.accesskit_update.as_ref()?;
+            update
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.role() == egui::accesskit::Role::Label && node.value() == Some(text))
+                .find_map(|(_, node)| node.bounds())
+                .map(|b| egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
         }
 
         /// The accessibility nodes the last frame named exactly `label`, left to right.
@@ -7148,9 +7323,10 @@ mod tests {
         assert!(h.text_at(shared::LOADING).is_none());
         for item in &rows {
             assert!(h.text_at(&item.name).is_some(), "{}", item.name);
-            assert!(h.text_at(&shared::folder_text(item)).is_some(), "{}", shared::folder_text(item));
+            assert!(h.text_at(&shared::location_text(item)).is_some(), "{}", shared::location_text(item));
+            // What it exposes is the Sharing column's, whole for screen readers (and on hover)
             let exposure = shared::exposure_text(item, home::now_ms(), home::local_offset_secs);
-            assert!(h.text_at(&exposure).is_some(), "{exposure}");
+            assert!(h.label_at(&exposure).is_some(), "{exposure}");
         }
         h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(vec![])));
         h.frames(3);
@@ -7160,7 +7336,7 @@ mod tests {
         h.frames(3);
         assert!(h.text_at(shared::EMPTY).is_none());
         assert!(h.text_at(offline).is_some());
-        assert!(h.text_at("Refresh").is_none(), "Retry is the action here");
+        assert!(h.widget_at("Refresh").is_none(), "Retry is the action here");
         h.click(h.text_at("Retry").unwrap());
         assert_eq!(h.sent(), ["shared list"]);
     }
@@ -7173,7 +7349,7 @@ mod tests {
         h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(rows.clone())));
         h.frames(3);
         h.sent();
-        h.click(h.text_at("Refresh").unwrap());
+        h.click(h.widget_at("Refresh").unwrap());
         assert_eq!(h.sent(), ["shared list"]);
         h.frames(3);
         assert!(h.text_at(shared::LOADING).is_some());
@@ -7219,27 +7395,136 @@ mod tests {
         h.click(h.text_at("Shared").unwrap());
         h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(shared_rows())));
         h.sent();
-        h.click(h.text_at("Refresh").unwrap());
+        // An icon, named Refresh
+        assert!(h.text_at(icons::REFRESH).is_some());
+        assert!(h.text_at("Refresh").is_none());
+        h.click(h.widget_at("Refresh").unwrap());
         assert_eq!(h.sent(), ["shared list"]);
         h.frames(3);
-        h.click(h.text_at("Refresh").unwrap());
+        h.click(h.widget_at("Refresh").unwrap());
         assert_eq!(h.sent(), Vec::<String>::new());
     }
 
+    /// The colour `text` was painted in at `pos`, as drawn (faded if its widget is disabled).
+    fn painted_color(h: &Harness, text: &str, pos: egui::Pos2) -> Option<Color32> {
+        h.texts(|t| t.galley.text() == text)
+            .into_iter()
+            .find(|t| t.visual_bounding_rect().expand(4.0).contains(pos))
+            .and_then(|t| t.galley.rows.first()?.visuals.mesh.vertices.first().map(|v| v.color))
+    }
+
+    /// Where the last frame painted `text` on the line of `y` (within half a row of it).
+    fn on_line(h: &Harness, text: &str, y: f32) -> Option<egui::Rect> {
+        h.text_rects_all(text).into_iter().find(|r| (r.center().y - y).abs() < SHARED_ROW_HALF)
+    }
+
+    /// Half a Shared row's height: what is on a row's line is within this of its name's centre.
+    const SHARED_ROW_HALF: f32 = 22.0;
+
     #[test]
-    fn a_row_has_its_name_and_folder_on_one_line_and_what_it_exposes_below() {
-        let mut h = Harness::new();
-        h.click(h.text_at("Shared").unwrap());
+    fn a_row_shows_its_name_location_sharing_and_actions_on_one_line() {
+        let h = shared_with_rows();
+        let item = &shared_rows()[0];
+        let name = h.text_rect(&item.name).unwrap();
+        let y = name.center().y;
+        let location = h.text_rect(&shared::location_text(item)).unwrap();
+        let file = on_line(&h, icons::FILE, y).expect("a file's icon before its name");
+        let marks: Vec<egui::Rect> =
+            shared::sharing_marks(item, home::now_ms()).iter().map(|m| on_line(&h, m, y).unwrap_or_else(|| panic!("{m:?}"))).collect();
+        let actions = row_buttons(&h, &item.name);
+        let first_action = on_row(&h, &item.name, actions[0]);
+        for (what, at) in [("location", location.center()), ("icon", file.center()), ("first mark", marks[0].center()), ("action", first_action)] {
+            assert!((at.y - y).abs() < 4.0, "{what} on the name's line: {at:?}, {y}");
+        }
+        assert!(file.right() < name.left() && name.right() < location.left(), "{file:?} {name:?} {location:?}");
+        assert!(location.right() < marks[0].left() && marks.windows(2).all(|m| m[0].right() < m[1].left()), "{location:?} {marks:?}");
+        assert!(marks.last().unwrap().right() < first_action.x, "the actions on the right");
+        let count = on_line(&h, "2", y).expect("the number of people, after their mark");
+        assert!(count.left() > marks.last().unwrap().right());
+        // Each column under its header
+        for (header, left) in [("Name", file.left()), ("Location", location.left()), ("Sharing", marks[0].left())] {
+            let at = h.text_rect(header).unwrap_or_else(|| panic!("{header:?}"));
+            assert!((at.left() - left).abs() < 3.0, "{header:?} at {}, its column at {left}", at.left());
+        }
+        // A folder's icon is Proton's orange; a file's is grey
+        let icons_y = h.text_at("Icons").unwrap().y;
+        let folder = on_line(&h, icons::FOLDER, icons_y).expect("a folder's icon").center();
+        assert_eq!(painted_color(&h, icons::FOLDER, folder), Some(FOLDER_ICON()));
+        assert_eq!(painted_color(&h, icons::FILE, file.center()), Some(TEXT_MUTED()));
+    }
+
+    #[test]
+    fn shared_has_column_headers_and_no_card() {
+        let h = shared_with_rows();
+        let name = h.text_at("report.pdf").unwrap();
+        for header in ["Name", "Location", "Sharing"] {
+            let at = h.text_at(header).unwrap_or_else(|| panic!("{header:?} is painted"));
+            assert!(at.y < name.y, "{header:?} above the rows");
+        }
+        assert!(h.rects_filled(BG_CARD()).iter().all(|r| !r.contains(name)), "no card around the rows");
+    }
+
+    #[test]
+    fn the_sharing_column_marks_an_expired_link_an_unreadable_row_and_says_it_all_on_hover() {
+        let mut h = shared_with_rows();
+        tooltips_at_once(&h);
         let rows = shared_rows();
-        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(rows.clone())));
-        h.frames(3);
-        let item = &rows[0];
-        let name = h.text_at(&item.name).unwrap();
-        let folder = h.text_at(&shared::folder_text(item)).unwrap();
-        let exposure = h.text_at(&shared::exposure_text(item, home::now_ms(), home::local_offset_secs)).unwrap();
-        assert!((name.y - folder.y).abs() < 4.0, "{name:?} {folder:?}");
-        assert!(folder.x > name.x);
-        assert!(exposure.y > name.y + 8.0);
+        // An expired link: the broken link and "Link expired", in red
+        let old_notes = h.text_at("old-notes.txt").unwrap();
+        let expired = on_line(&h, "Link expired", old_notes.y).expect("said on its row").center();
+        assert_eq!(painted_color(&h, "Link expired", expired), Some(STATUS_DANGER));
+        let broken = on_line(&h, icons::LINK_BROKEN, old_notes.y).filter(|r| r.center().x < expired.x).expect("the broken link before it");
+        assert_eq!(painted_color(&h, icons::LINK_BROKEN, broken.center()), Some(STATUS_DANGER));
+        // A row whose sharing wasn't read: the warning and why, in place of the marks
+        let budget = rows.iter().find(|i| i.unreadable.is_some()).unwrap();
+        let y = h.text_at(&budget.name).unwrap().y;
+        assert!(on_line(&h, icons::WARNING, y).is_some(), "the warning");
+        assert!(h.texts(|t| t.galley.text().starts_with("Proton Drive")).iter().any(|t| (t.visual_bounding_rect().center().y - y).abs() < 4.0), "and why");
+        assert!(on_line(&h, icons::PEOPLE, y).is_none(), "no marks");
+        // The whole of what an item exposes, on hover
+        let report = &rows[0];
+        let exposure = shared::exposure_text(report, home::now_ms(), home::local_offset_secs);
+        assert!(h.text_at(&exposure).is_none());
+        let lock = on_line(&h, icons::LOCK, h.text_at(&report.name).unwrap().y).expect("the password's mark").center();
+        h.frame(vec![egui::Event::PointerMoved(lock)]);
+        h.frames(5);
+        assert!(h.text_at(&exposure).is_some(), "the tooltip says what it exposes");
+    }
+
+    #[test]
+    fn a_rows_actions_are_weak_until_the_row_is_hovered() {
+        let mut h = shared_with_rows();
+        let stop = on_row(&h, "Icons", "Stop sharing");
+        assert_eq!(painted_color(&h, icons::LINK_BROKEN, stop), Some(TEXT_MUTED()));
+        // Over the row's name: its actions turn to the text's colour; the other rows' stay weak
+        h.frame(vec![egui::Event::PointerMoved(h.text_at("Icons").unwrap())]);
+        h.frames(2);
+        assert_eq!(painted_color(&h, icons::LINK_BROKEN, stop), Some(TEXT_PRIMARY()));
+        assert_eq!(painted_color(&h, icons::MANAGE, on_row(&h, "Icons", "Manage…")), Some(TEXT_PRIMARY()));
+        assert_eq!(painted_color(&h, icons::LINK_BROKEN, on_row(&h, "report.pdf", "Stop sharing")), Some(TEXT_MUTED()));
+    }
+
+    #[test]
+    fn the_shared_columns_give_way_location_first_then_the_name() {
+        let sum = |(n, l, s): (f32, f32, f32)| n + l + s;
+        // Room to spare: Sharing has what it needs, and the name half the rest, so the columns line up
+        assert_eq!(shared_columns(600.0, 100.0, 120.0, 120.0), (240.0, 240.0, 120.0));
+        // A long name takes what it needs from Location
+        assert_eq!(shared_columns(600.0, 300.0, 120.0, 120.0), (300.0, 180.0, 120.0));
+        // Narrower: Location gives way first, down to its least…
+        assert_eq!(shared_columns(400.0, 300.0, 120.0, 120.0), (224.0, SHARED_LOCATION_MIN, 120.0));
+        // …then the name
+        assert_eq!(shared_columns(300.0, 300.0, 120.0, 120.0), (124.0, SHARED_LOCATION_MIN, 120.0));
+        // A reason too long for the row takes at most two fifths of the room; what the marks need, up to half
+        assert_eq!(shared_columns(1000.0, 100.0, 120.0, 600.0).2, 400.0);
+        assert_eq!(shared_columns(200.0, 100.0, 120.0, 120.0).2, 100.0);
+        for room in [120.0, 200.0, 300.0, 400.0, 600.0, 1000.0] {
+            for (name, need, want) in [(50.0, 120.0, 120.0), (300.0, 120.0, 600.0), (900.0, 60.0, 60.0)] {
+                let cols = shared_columns(room, name, need, want);
+                assert!((sum(cols) - room).abs() < 0.01, "{room} {cols:?}");
+                assert!(cols.0 >= 0.0 && cols.1 >= 0.0 && cols.2 >= 0.0, "{room} {cols:?}");
+            }
+        }
     }
 
     // #253: acting on a row
@@ -7253,20 +7538,25 @@ mod tests {
         h
     }
 
-    /// The buttons painted on the row of `name`, top to bottom (the row runs to the next name's line).
+    /// The buttons on the row of `name`, left to right, by their names for screen readers (they are icons).
     fn row_buttons(h: &Harness, name: &str) -> Vec<&'static str> {
-        let names: Vec<f32> = shared_rows().iter().filter_map(|i| h.text_at(&i.name)).map(|p| p.y).collect();
-        let top = h.text_at(name).unwrap_or_else(|| panic!("{name:?} is painted")).y;
-        let bottom = names.iter().copied().filter(|y| *y > top).fold(f32::MAX, f32::min);
-        ["Copy link", "Manage…", "Show in Files", "Stop sharing", "Manage on the web"]
+        let y = h.text_at(name).unwrap_or_else(|| panic!("{name:?} is painted")).y;
+        let mut found: Vec<(f32, &'static str)> = ["Copy link", "Manage…", "Show in Files", "Stop sharing", "Manage on the web"]
             .into_iter()
-            .filter(|label| h.text_at_all(label).iter().any(|p| p.y > top && p.y < bottom))
-            .collect()
+            .flat_map(|label| h.widgets_at_all(label).into_iter().filter(|p| (p.y - y).abs() < SHARED_ROW_HALF).map(move |p| (p.x, label)))
+            .collect();
+        found.sort_by(|a, b| a.0.total_cmp(&b.0));
+        found.into_iter().map(|(_, label)| label).collect()
     }
 
+    /// The button named `label` on the row of `name`.
     fn on_row(h: &Harness, name: &str, label: &str) -> egui::Pos2 {
-        let top = h.text_at(name).unwrap().y;
-        h.text_at_all(label).into_iter().filter(|p| p.y > top).min_by(|a, b| a.y.total_cmp(&b.y)).unwrap_or_else(|| panic!("{label:?} under {name:?}"))
+        let y = h.text_at(name).unwrap_or_else(|| panic!("{name:?} is painted")).y;
+        h.widgets_at_all(label)
+            .into_iter()
+            .filter(|p| (p.y - y).abs() < SHARED_ROW_HALF)
+            .min_by(|a, b| (a.y - y).abs().total_cmp(&(b.y - y).abs()))
+            .unwrap_or_else(|| panic!("{label:?} on the row of {name:?}"))
     }
 
     #[test]
@@ -7410,38 +7700,47 @@ mod tests {
     #[test]
     fn another_rows_stop_sharing_looks_greyed_out_while_a_stop_is_out() {
         let mut h = shared_with_rows();
-        let enabled = h.fill_under(on_row(&h, "Icons", "Stop sharing")).expect("Stop sharing has a fill");
+        tooltips_at_once(&h);
+        let stop = on_row(&h, "Icons", "Stop sharing");
+        let enabled = painted_color(&h, icons::LINK_BROKEN, stop).expect("Stop sharing's icon is painted");
         h.app.shared.stopping = Some("Documents/report.pdf".into());
         h.frames(2);
-        let disabled = h.fill_under(on_row(&h, "Icons", "Stop sharing")).expect("Stop sharing has a fill");
+        let disabled = painted_color(&h, icons::LINK_BROKEN, stop).expect("Stop sharing's icon is painted");
         assert_ne!(disabled, enabled, "the waiting button is painted differently");
         // the row's other buttons keep their look
-        assert_eq!(h.fill_under(on_row(&h, "Icons", "Manage…")), Some(BG_CARD_ALT()));
+        assert_eq!(painted_color(&h, icons::MANAGE, on_row(&h, "Icons", "Manage…")), Some(enabled));
+        // and the waiting one still says what it is, on hover
+        assert!(h.text_at("Stop sharing").is_none());
+        h.frame(vec![egui::Event::PointerMoved(stop)]);
+        h.frames(5);
+        assert!(h.text_at("Stop sharing").is_some(), "its tooltip");
     }
 
-    /// #262: at the narrowest window with the keyboard zoom up, a row's buttons wrap instead of running past the card
+    /// The actions never move: at the narrowest window with the keyboard zoom up, every row's buttons are whole inside
+    /// the window, and every column is still shown (#262's buttons wrapped instead)
     #[test]
-    fn a_rows_buttons_wrap_inside_the_card_when_narrow_and_zoomed() {
+    fn a_rows_actions_stay_inside_the_window_narrow_and_zoomed() {
         let mut h = shared_with_rows();
         h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
-        let name = h.text_at("report.pdf").unwrap();
-        let card = h.rects_filled(BG_CARD()).into_iter().filter(|r| r.contains(name)).max_by(|a, b| a.width().total_cmp(&b.width())).expect("the card");
-        assert!(card.right() <= h.screen.x, "the card {card:?} fits the window {:?}", h.screen);
-        let labels = ["Copy link", "Manage…", "Show in Files", "Stop sharing"];
-        assert_eq!(row_buttons(&h, "report.pdf"), labels);
-        let mut ys = Vec::new();
-        for label in labels {
-            let at = on_row(&h, "report.pdf", label);
-            let half = button_width_of(&h, label) / 2.0;
-            assert!(at.x + half <= card.right(), "{label:?} runs to {} past the card's edge {}", at.x + half, card.right());
-            ys.push(at.y);
+        for (label, rows) in [("Copy link", 1), ("Manage…", 3), ("Show in Files", 4), ("Stop sharing", 3), ("Manage on the web", 3)] {
+            let nodes = h.nodes_named(label);
+            assert_eq!(nodes.len(), rows, "{label:?} on each of its rows");
+            for node in nodes {
+                let right = node.bounds().expect("placed").x1 as f32;
+                assert!(right <= h.screen.x - 4.0, "{label:?} runs to {right}, past the window's {}", h.screen.x);
+            }
         }
-        assert!(ys.last() > ys.first(), "the last button went to a new line: {ys:?}");
+        for header in ["Name", "Location", "Sharing"] {
+            assert!(h.text_at(header).is_some(), "{header:?} is shown");
+        }
+        // Names too, shortened in the middle
+        for item in shared_rows() {
+            let (first, last) = (item.name.chars().next().unwrap(), item.name.chars().last().unwrap());
+            let shown = h.texts(|t| t.galley.text().starts_with(first) && t.galley.text().ends_with(last)).len();
+            assert!(shown > 0, "{:?} shows its start and its end", item.name);
+        }
     }
 
-    fn button_width_of(h: &Harness, label: &str) -> f32 {
-        h.ctx.fonts(|f| f.layout_no_wrap(label.into(), FontId::proportional(13.0), Color32::WHITE).size().x) + 32.0
-    }
 
     #[test]
     fn a_stop_that_fails_after_leaving_shared_is_told_in_the_notice() {
@@ -7527,7 +7826,7 @@ mod tests {
         h.frames(2);
         assert!(h.text_at("Link copied").is_some());
         assert_eq!(h.sent(), Vec::<String>::new());
-        h.click(h.text_at("Refresh").unwrap());
+        h.click(h.widget_at("Refresh").unwrap());
         h.frames(2);
         assert_eq!(h.app.shared.copied, None, "until the next load");
     }
