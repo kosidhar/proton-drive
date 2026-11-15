@@ -120,6 +120,10 @@ holiday.jpg       Photos (not in My files)    [Manage on the web]
   The row says why ("Hidden from this computer", "Not on this computer"). `elsewhere` covers more than items outside My
   files: Proton Docs and Sheets, items not indexed yet, and nodes that couldn't be loaded are in My files but not on
   this computer, so the wording stays neutral.
+- **Photos note:** below the list, and below the empty-state text (not while the first load runs, not on an error), the
+  page says "Photos and albums you share from Photos may not be listed here." with a "See them on drive.proton.me" link
+  to the web Shared page. The daemon doesn't list Photos shares: the SDK's Photos client creates a Photos volume on the
+  account when there is none, and the SDK has no read-only check, so opening the page would change the account (#256).
 - **States:**
   - **Loading:** "Loading what you've shared…", with the previous list kept and greyed out on a reload.
   - **Offline or failed:** the daemon's message, with Retry.
