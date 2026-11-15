@@ -2094,7 +2094,7 @@ impl ProtonDriveNativeApp {
                         let has_path = item.rel_path.is_some();
                         let mut buttons: Vec<SharedAction> = Vec::new();
                         if item.unreadable.is_some() {
-                            if has_path {
+                            if has_path && item.place == shared::Place::MyFiles {
                                 buttons.push(SharedAction::ShowInFiles);
                             }
                             buttons.push(SharedAction::ManageOnWeb);
@@ -2626,7 +2626,7 @@ impl ProtonDriveNativeApp {
                         ui.add_space(20.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             // Deleting from Proton Drive is destructive: red, not the primary purple
-                            let (fill, hover) = if matches!(confirm, PendingConfirm::DeleteMissing { .. }) {
+                            let (fill, hover) = if matches!(confirm, PendingConfirm::DeleteMissing { .. } | PendingConfirm::StopSharing { .. }) {
                                 (STATUS_DANGER, STATUS_DANGER_HOVER)
                             } else {
                                 (PROTON_PURPLE, PROTON_PURPLE_HOVER)
@@ -6710,6 +6710,35 @@ mod tests {
         assert_eq!(row_buttons(&h, "holiday.jpg"), ["Manage on the web"]);
         // R10: its sharing wasn't read, so nothing that acts on it
         assert_eq!(row_buttons(&h, "Budget.xlsx"), ["Show in Files", "Manage on the web"]);
+    }
+
+    #[test]
+    fn an_unreadable_hidden_row_has_only_manage_on_the_web() {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared").unwrap());
+        let mut rows = shared_rows();
+        let mut hidden = rows.remove(3);
+        hidden.unreadable = Some("Proton Drive is still catching up with this item: refresh in a moment".into());
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(vec![hidden])));
+        h.frames(3);
+        assert_eq!(row_buttons(&h, "Taxes"), ["Manage on the web"]);
+    }
+
+    #[test]
+    fn a_change_landing_after_the_share_window_closed_reloads_the_list_again() {
+        let mut h = shared_with_rows();
+        h.click(on_row(&h, "report.pdf", "Manage…"));
+        h.sent();
+        let first = shown(&h);
+        h.event(WorkerEvent::ShareLoaded(first, Ok(share::ShareInfo { link: Some(share_link(false, None)), people: vec![] })));
+        h.frames(3);
+        h.click(h.text_at("On").expect("the link switch, on"));
+        h.click(*h.text_at_all("Stop sharing").last().expect("the confirmation's button"));
+        assert_eq!(h.sent(), vec!["share link off Documents/report.pdf".to_string()]);
+        h.click(h.text_at("Done").expect("Done"));
+        assert_eq!(h.sent(), ["shared list"], "read at close");
+        h.event(WorkerEvent::ShareDone(first, Ok(())));
+        assert_eq!(h.sent(), ["shared list"], "and again once the change landed");
     }
 
     #[test]

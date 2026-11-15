@@ -343,8 +343,6 @@ pub fn list_at(socket: &Path) -> Result<Vec<crate::shared::SharedItem>, String> 
 }
 
 /// Stops all sharing of an item: its link and everyone invited (DELETE /share/all).
-// Used by Task 6 (stopping)
-#[allow(dead_code)]
 pub fn stop_sharing_at(socket: &Path, rel_path: &str) -> Result<(), String> {
     share_change(socket, "DELETE", "/share/all", serde_json::json!({ "path": rel_path }))
 }
@@ -917,6 +915,10 @@ impl ProtonDriveNativeApp {
         let left = self.share_left.remove(i);
         if let Err(problem) = result {
             self.notice = Some(left.failed(&problem));
+        }
+        // The Shared section read the list when the window closed, perhaps before this change landed (#253)
+        if self.tab == crate::NavTab::Shared {
+            self.load_shared();
         }
         if let Some(cmd) = self.share.as_mut().and_then(|w| w.changed_elsewhere(&left.rel_path)) {
             let _ = self.tx.send(cmd);
