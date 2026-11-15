@@ -181,6 +181,38 @@ describe('ShareService', () => {
         expect(sent(t.fake)).toEqual({ role: 'viewer', customPassword: 's3cret', expiration: undefined });
     });
 
+    test('setLinkSettings on an expired link needs the expiry set too', async () => {
+        const expired = () => shared({ urlAccess: { ...shared().urlAccess, expirationTime: new Date(500) } });
+        let t = setup(expired());
+        const e = await rejects(t.svc.setLinkSettings('a.txt', { password: 'new' }));
+        expect(e).toBeInstanceOf(ShareError);
+        expect(e.message).toBe('This link has expired: set a new expiry date, or remove the expiry, to change it');
+        expect(t.fake.calls.some((c) => c.fn === 'shareNode')).toBe(false);
+
+        t = setup(expired());
+        await t.svc.setLinkSettings('a.txt', { password: 'new', expiresAt: null });
+        expect(t.fake.calls.find((c) => c.fn === 'shareNode')!.args[1].urlAccess).toEqual({ role: 'viewer', customPassword: 'new', expiration: undefined });
+
+        t = setup(expired());
+        await t.svc.setLinkSettings('a.txt', { password: 'new', expiresAt: 5_000_000_000_000 });
+        expect(t.fake.calls.find((c) => c.fn === 'shareNode')!.args[1].urlAccess.expiration).toEqual(new Date(5_000_000_000_000));
+    });
+
+    test('setRole and removePerson act only on someone already on the list', async () => {
+        const { svc, fake, logs } = setup(shared());
+        for (const c of [() => svc.setRole('a.txt', 'stranger@x.co', 'editor'), () => svc.removePerson('a.txt', 'stranger@x.co')]) {
+            const e = await rejects(c());
+            expect(e).toBeInstanceOf(ShareError);
+            expect(e.message).toBe("That person doesn't have access to this item");
+        }
+        expect(fake.calls.some((c) => c.fn === 'shareNode' || c.fn === 'unshareNode')).toBe(false);
+        expect(logs).toEqual([]);
+        await svc.setRole('a.txt', 'INV@x.co', 'editor');
+        await svc.removePerson('a.txt', 'Ext@X.co');
+        expect(fake.calls.find((c) => c.fn === 'shareNode')!.args[1]).toEqual({ users: [{ email: 'inv@x.co', role: 'editor' }] });
+        expect(fake.calls.find((c) => c.fn === 'unshareNode')!.args[1]).toEqual({ users: ['ext@x.co'] });
+    });
+
     test('invite checks every address first', async () => {
         const { svc, fake } = setup(shared());
         const e = await rejects(svc.invite('a.txt', ['a@b.co', 'not-an-email'], 'viewer'));
@@ -213,13 +245,13 @@ describe('ShareService', () => {
     });
 
     test('activity says what was shared without passwords or addresses', async () => {
-        const { svc, logs } = setup(undefined);
+        const { svc, logs } = setup(shared({ urlAccess: undefined }));
         await svc.ensureLink('a.txt');
         await svc.setLinkSettings('a.txt', { password: 's3cret' });
         await svc.removeLink('a.txt');
         await svc.invite('a.txt', ['a@b.co', 'c@d.co'], 'viewer');
-        await svc.setRole('a.txt', 'a@b.co', 'editor');
-        await svc.removePerson('a.txt', 'a@b.co');
+        await svc.setRole('a.txt', 'mem@x.co', 'editor');
+        await svc.removePerson('a.txt', 'mem@x.co');
         expect(logs.map((l) => l.details)).toEqual([
             'Shared a.txt with a link',
             'Changed the link to a.txt',
