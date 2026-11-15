@@ -52,6 +52,20 @@ pub const MANAGE: &str = ph::USER_GEAR;
 pub const WEB: &str = ph::GLOBE;
 pub const SEARCH: &str = ph::MAGNIFYING_GLASS;
 pub const SIGN_OUT: &str = ph::SIGN_OUT;
+/// Free up space, Keep online-only: a file kept in Proton Drive alone
+pub const ONLINE_ONLY: &str = ph::CLOUD;
+/// Mount again: put the drive back
+pub const MOUNT: &str = ph::HARD_DRIVES;
+/// Start fresh with this account
+pub const RESTART: &str = ph::ARROW_COUNTER_CLOCKWISE;
+/// Move files back
+pub const MOVE_BACK: &str = ph::ARROW_U_UP_LEFT;
+/// Keep Both: the two versions of a file
+pub const KEEP_BOTH: &str = ph::FILES;
+/// Keep Local: this computer's version
+pub const KEEP_LOCAL: &str = ph::DESKTOP;
+/// Keep Remote: the Proton Drive version
+pub const KEEP_REMOTE: &str = ph::CLOUD_ARROW_DOWN;
 
 // States and things
 /// Up to date, done
@@ -70,9 +84,10 @@ pub const FILE: &str = ph::FILE;
 
 /// Every icon, for the tests
 #[cfg(test)]
-pub const ALL: [&str; 26] = [
+pub const ALL: [&str; 33] = [
     HOME, SHARED, ACTIVITY, SETTINGS, FOLDER_OPEN, TRASH, SYNC, PAUSE, RESUME, CHECK, WARNING, OFFLINE, LINK,
     LINK_BROKEN, LOCK, CLOCK, PEOPLE, COPY, MANAGE, WEB, REFRESH, SEARCH, INFO, SIGN_OUT, FOLDER, FILE,
+    ONLINE_ONLY, MOUNT, RESTART, MOVE_BACK, KEEP_BOTH, KEEP_LOCAL, KEEP_REMOTE,
 ];
 
 #[cfg(test)]
