@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
-import { ShareError, type ShareInfo, type ShareService } from '../src/daemon/shareService';
+import { ListCancelled, ShareError, type ShareInfo, type ShareService } from '../src/daemon/shareService';
 import { shareRoute } from '../src/daemon/shareRoutes';
 
 const INFO: ShareInfo = { link: null, people: [] };
@@ -62,7 +62,7 @@ describe('share routes', () => {
             ['invite', 'Docs', ['a@b.co'], 'editor'],
             ['setRole', 'Docs', 'a@b.co', 'viewer'],
             ['removePerson', 'Docs', 'a@b.co'],
-            ['list'],
+            ['list', expect.any(AbortSignal)],
             ['stopSharing', 'Documents/report.pdf'],
         ]);
     });
@@ -161,6 +161,27 @@ describe('share routes', () => {
         await go(fake({ fail: new ShareError('Not uploaded yet') }).service, 'GET', '/share/info?path=a', undefined, true, log);
         await go(fake().service, 'POST', '/share/role', { path: 'a', role: 'viewer' }, true, log);
         expect(lines).toEqual(['Sharing failed: TypeError']);
+    });
+
+    // #257: the app gave up on the list (its request is gone), and the list stops: nothing for anyone to read, nothing logged
+    test("the list is given the request's signal, and a list cancelled is 400 Cancelled, logging nothing", async () => {
+        const lines: string[] = [];
+        const gone = new AbortController();
+        let given: AbortSignal | undefined;
+        const service = {
+            list: async (signal?: AbortSignal) => {
+                given = signal;
+                gone.abort();
+                if (signal?.aborted) throw new ListCancelled();
+                return [];
+            },
+        } as unknown as ShareService;
+        const url = new URL('http://localhost/share/list');
+        const req = new Request(url, { signal: gone.signal });
+        const res = await shareRoute(req, url, service, () => true, (line) => lines.push(line));
+        expect(given).toBe(req.signal);
+        expect([res.status, await res.json()]).toEqual([400, { error: 'Cancelled' }]);
+        expect(lines).toEqual([]);
     });
 
     test('a wrong method is 405, no service is 404, signed out is 400', async () => {

@@ -74,7 +74,9 @@ function yearsFrom(now: number, years: number): number {
 type Handler = (share: ShareService, req: Request, url: URL) => Promise<unknown>;
 
 const ROUTES: Record<string, Partial<Record<string, Handler>>> = {
-    '/share/list': { GET: async (s) => ({ items: await s.list() }) },
+    // The list stops once the app hangs up: Bun aborts the request's signal then. It is ListCancelled, a ShareError, so
+    // 400 Cancelled for no one to read, and nothing logged
+    '/share/list': { GET: async (s, r) => ({ items: await s.list(r.signal) }) },
     '/share/all': { DELETE: async (s, r) => s.stopSharing(pathOf((await bodyOf(r)).path)) },
     '/share/info': { GET: (s, _r, url) => s.info(pathOf(url.searchParams.get('path'))) },
     '/share/password': {
