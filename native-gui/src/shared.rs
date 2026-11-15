@@ -32,6 +32,9 @@ pub struct SharedItem {
 
 pub const WEB_SHARED_URL: &str = "https://drive.proton.me/shared";
 pub const LOADING: &str = "Loading what you've shared…";
+/// Under the list and the empty text: the daemon never asks for Photos shares (#256)
+pub const PHOTOS_NOTE: &str = "Photos and albums you share from Photos may not be listed here.";
+pub const PHOTOS_LINK: &str = "See them on drive.proton.me";
 pub const EMPTY: &str = "Nothing shared yet. Right-click a file or folder in Files and choose Share… or Copy Link.";
 
 /// The folder an item is in, and whether it is hidden or not here.
