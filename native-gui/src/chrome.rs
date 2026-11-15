@@ -6,8 +6,8 @@ use std::path::Path;
 use eframe::egui::{self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Vec2};
 
 use crate::{
-    action_button_sized, format_bytes, home, icons, AccountInfo, ButtonKind, NavTab, ProtonDriveNativeApp, BG_SIDEBAR,
-    SIDEBAR_HOVER, SIDEBAR_SELECTED, SIDEBAR_TEXT, SIDEBAR_WEAK, STATUS_DANGER, STORAGE_FILL, STORAGE_TRACK,
+    action_button_sized, bold, format_bytes, home, icons, AccountInfo, ButtonKind, NavTab, ProtonDriveNativeApp,
+    BG_SIDEBAR, SIDEBAR_HOVER, SIDEBAR_SELECTED, SIDEBAR_TEXT, SIDEBAR_WEAK, STATUS_DANGER, STORAGE_FILL, STORAGE_TRACK,
 };
 
 /// The sidebar's one button: the drive's folder in the file manager
@@ -68,7 +68,7 @@ impl ProtonDriveNativeApp {
                 egui::Image::new(tex).paint_at(ui, rect);
             }
             ui.add_space(2.0);
-            ui.label(RichText::new("Proton Drive").size(18.5).strong().color(SIDEBAR_TEXT()));
+            ui.label(RichText::new("Proton Drive").font(bold(18.5)).color(SIDEBAR_TEXT()));
         });
     }
 
@@ -151,7 +151,9 @@ fn section_row(ui: &mut egui::Ui, icon: &str, label: &str, open: bool, count: Op
     let x = rect.left() + SECTION_PADDING;
     painter.text(egui::pos2(x, y), egui::Align2::LEFT_CENTER, icon, icons::font(SECTION_ICON_SIZE), icon_color);
     let x = x + SECTION_ICON_SIZE + SECTION_ICON_GAP;
-    painter.text(egui::pos2(x, y), egui::Align2::LEFT_CENTER, label, FontId::proportional(13.5), SIDEBAR_TEXT());
+    // The open section's name is bold, as on drive.proton.me
+    let font = if open { bold(13.5) } else { FontId::proportional(13.5) };
+    painter.text(egui::pos2(x, y), egui::Align2::LEFT_CENTER, label, font, SIDEBAR_TEXT());
     if let Some(count) = count {
         let galley = painter.layout_no_wrap(count.to_string(), FontId::proportional(11.0), Color32::WHITE);
         let height = galley.size().y + 4.0;

@@ -3662,6 +3662,15 @@ const ACTIVITY_SHOWN: usize = 200;
 /// About the width of the Activity filter (All, Uploads, Downloads, Problems), kept free beside the search
 const ACTIVITY_FILTER_WIDTH: f32 = 290.0;
 
+/// The family bold text is laid out in: Inter SemiBold (#279).
+const BOLD_FAMILY: &str = "bold";
+
+/// The font for bold text at `size` points: titles, the brand, the open section. egui's `RichText::strong` only picks
+/// the strong text colour, and only where no colour is set, so text meant to be bold says so with this font.
+pub(crate) fn bold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(BOLD_FAMILY.into()))
+}
+
 fn configure_proton_theme(ctx: &egui::Context) {
     // Embed Inter & JetBrains Mono fonts (matching Proton Carbon Design System & WordCraft)
     let mut fonts = egui::FontDefinitions::default();
@@ -3693,6 +3702,10 @@ fn configure_proton_theme(ctx: &egui::Context) {
         prop.insert(0, "Inter".to_owned());
         prop.insert(1, "InterMedium".to_owned());
     }
+    // Bold text: Inter SemiBold, then whatever the proportional family falls back to (#279)
+    let mut bold_fonts = vec!["InterSemiBold".to_owned()];
+    bold_fonts.extend(fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default());
+    fonts.families.insert(FontFamily::Name(BOLD_FAMILY.into()), bold_fonts);
     // The icons, in a family of their own (see icons.rs)
     icons::add_to_fonts(&mut fonts);
     if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
@@ -5234,6 +5247,18 @@ mod tests {
             fn find(shape: &egui::Shape, text: &str) -> Option<egui::Rect> {
                 match shape {
                     egui::Shape::Text(t) if t.galley.text() == text => Some(t.visual_bounding_rect()),
+                    egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, text)),
+                    _ => None,
+                }
+            }
+            self.last.as_ref()?.shapes.iter().find_map(|c| find(&c.shape, text))
+        }
+
+        /// How the last frame laid out this text, the first time it painted it: its font and size.
+        fn galley_of(&self, text: &str) -> Option<std::sync::Arc<egui::Galley>> {
+            fn find(shape: &egui::Shape, text: &str) -> Option<std::sync::Arc<egui::Galley>> {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == text => Some(t.galley.clone()),
                     egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, text)),
                     _ => None,
                 }
@@ -8522,5 +8547,42 @@ mod tests {
         h.frames(2);
         // The weak background: the same as an input's in light, and visible on a card in dark (an input's isn't)
         assert_eq!(fill(&h, "Secondary"), Some(BG_CARD_ALT()), "a secondary button's hover");
+    }
+
+    const INTER_REGULAR: &[u8] = include_bytes!("../../assets/fonts/Inter-Regular.ttf");
+    const INTER_SEMIBOLD: &[u8] = include_bytes!("../../assets/fonts/Inter-SemiBold.ttf");
+
+    /// How wide `text` is at `size` points in one face of Inter alone.
+    fn width_in(face: &'static [u8], text: &str, size: f32) -> f32 {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert("face".into(), std::sync::Arc::new(egui::FontData::from_static(face)));
+        fonts.families.insert(FontFamily::Proportional, vec!["face".into()]);
+        ctx.set_fonts(fonts);
+        let _ = ctx.run(egui::RawInput::default(), |_| {}); // the fonts load with the first frame
+        ctx.fonts(|f| f.layout_no_wrap(text.into(), FontId::proportional(size), Color32::WHITE)).size().x
+    }
+
+    /// Whether the last frame laid `text` out in the bold family, the first time it painted it.
+    fn painted_bold(h: &Harness, text: &str) -> bool {
+        let galley = h.galley_of(text).unwrap_or_else(|| panic!("{text:?} is painted"));
+        galley.job.sections.iter().all(|s| s.format.font_id.family == FontFamily::Name(BOLD_FAMILY.into()))
+    }
+
+    // #279: egui's .strong() only picks a colour, and the app sets one on almost every label, so nothing was ever bold
+    #[test]
+    fn bold_text_is_laid_out_in_inter_semibold() {
+        let h = Harness::new(); // On Home
+        // The bold family is Inter SemiBold: a line in it is as wide as in SemiBold, and wider than in Regular (short
+        // words differ too little to tell)
+        let line = "Proton Drive keeps your files in sync";
+        let laid = h.ctx.fonts(|f| f.layout_no_wrap(line.into(), bold(16.0), Color32::WHITE)).size().x;
+        assert!((laid - width_in(INTER_SEMIBOLD, line, 16.0)).abs() < 0.5, "{laid} wide, not SemiBold's");
+        assert!(laid > width_in(INTER_REGULAR, line, 16.0) + 4.0, "{laid} wide, as Regular is");
+        // And what is meant to be bold is laid out in it
+        assert!(painted_bold(&h, "Proton Drive"), "the sidebar's brand");
+        assert!(painted_bold(&h, "Home"), "the open section's name");
+        assert!(painted_bold(&h, "Your drive"), "a card's title");
+        assert!(!painted_bold(&h, "Shared"), "a section that isn't open stays regular");
     }
 }
