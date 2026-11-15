@@ -16,6 +16,8 @@ pub(crate) enum ActivityKind {
     /// A real removal from this computer: deleted here, or following a delete in Proton Drive
     RemovedLocally,
     MovedToCloudTrash,
+    /// Shared with a link or with people (#216)
+    Shared,
     Conflict,
     Failed,
     Other,
@@ -34,6 +36,7 @@ pub(crate) fn activity_kind(action: &str, details: &str) -> ActivityKind {
         "delete-local" if details.starts_with("Hidden from this computer") => ActivityKind::Hidden,
         "delete-local" => ActivityKind::RemovedLocally,
         "delete-remote" | "trash-remote" => ActivityKind::MovedToCloudTrash,
+        "share" => ActivityKind::Shared,
         "conflict" => ActivityKind::Conflict,
         "error" => ActivityKind::Failed,
         _ => ActivityKind::Other,
@@ -50,6 +53,7 @@ pub(crate) fn kind_label(kind: ActivityKind) -> &'static str {
         ActivityKind::Hidden => "Hidden here",
         ActivityKind::RemovedLocally => "− Removed locally",
         ActivityKind::MovedToCloudTrash => "Trash (Cloud)",
+        ActivityKind::Shared => "Shared",
         ActivityKind::Conflict => "! Conflict",
         ActivityKind::Failed => "✕ Failed",
         ActivityKind::Other => "• Synced",
@@ -161,6 +165,7 @@ mod tests {
         }
         assert_eq!(kind_label(ActivityKind::FreedUp), "Freed up space");
         assert_eq!(kind_label(ActivityKind::RemovedLocally), "− Removed locally");
+        assert_eq!(kind_label(ActivityKind::Shared), "Shared");
         assert!(shows_cloud(ActivityKind::FreedUp) && shows_cloud(ActivityKind::Hidden));
         assert!(!shows_cloud(ActivityKind::RemovedLocally));
         for (action, kind) in [
@@ -168,6 +173,7 @@ mod tests {
             ("download", ActivityKind::Downloaded),
             ("mkdir", ActivityKind::FolderCreated),
             ("trash-remote", ActivityKind::MovedToCloudTrash),
+            ("share", ActivityKind::Shared),
             ("conflict", ActivityKind::Conflict),
             ("error", ActivityKind::Failed),
             ("sync", ActivityKind::Other),
@@ -180,7 +186,7 @@ mod tests {
     #[test]
     fn the_filter_keeps_uploads_downloads_or_conflicts_and_failures() {
         use ActivityKind::*;
-        let kinds = [Uploaded, Downloaded, FolderCreated, FreedUp, Hidden, RemovedLocally, MovedToCloudTrash, Conflict, Failed, Other];
+        let kinds = [Uploaded, Downloaded, FolderCreated, FreedUp, Hidden, RemovedLocally, MovedToCloudTrash, Shared, Conflict, Failed, Other];
         let kept = |f| kinds.iter().copied().filter(|k| in_filter(*k, f)).collect::<Vec<_>>();
         assert_eq!(kept(ActivityFilter::All), kinds.to_vec());
         assert_eq!(kept(ActivityFilter::Uploads), vec![Uploaded]);

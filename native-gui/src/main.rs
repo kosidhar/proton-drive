@@ -3575,6 +3575,7 @@ fn activity_pill_colors(kind: activity::ActivityKind) -> (Color32, Color32) {
         Downloaded => (Color32::from_rgba_unmultiplied(30, 168, 133, 34), STATUS_SUCCESS),
         Uploaded => (Color32::from_rgba_unmultiplied(109, 74, 255, 42), PROTON_PURPLE_TEXT()),
         FreedUp | Hidden => (Color32::from_rgba_unmultiplied(109, 74, 255, 26), PROTON_PURPLE_TEXT()),
+        Shared => (Color32::from_rgba_unmultiplied(109, 74, 255, 26), PROTON_PURPLE_TEXT()),
         FolderCreated | Other => (BG_CARD_ALT(), TEXT_PRIMARY()),
         RemovedLocally => (BG_CARD_ALT(), TEXT_MUTED()),
         MovedToCloudTrash => (Color32::from_rgba_unmultiplied(245, 158, 11, 34), STATUS_WARNING),
