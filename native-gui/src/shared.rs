@@ -30,19 +30,13 @@ pub struct SharedItem {
     pub unreadable: Option<String>,
 }
 
-// Used by Task 5 (the page's view)
+// Used by Task 6 (the row buttons)
 #[allow(dead_code)]
 pub const WEB_SHARED_URL: &str = "https://drive.proton.me/shared";
-// Used by Task 5 (the page's view)
-#[allow(dead_code)]
 pub const LOADING: &str = "Loading what you've shared…";
-// Used by Task 5 (the page's view)
-#[allow(dead_code)]
 pub const EMPTY: &str = "Nothing shared yet. Right-click a file or folder in Files and choose Share… or Copy Link.";
 
 /// The folder an item is in, and whether it is hidden or not here.
-// Used by Task 5 (the page's view)
-#[allow(dead_code)]
 pub fn folder_text(item: &SharedItem) -> String {
     if item.place == Place::Elsewhere {
         return "Not on this computer".to_string();
@@ -58,8 +52,6 @@ pub fn folder_text(item: &SharedItem) -> String {
 }
 
 /// What an item exposes, in one line: its link, and who else has it.
-// Used by Task 5 (the page's view)
-#[allow(dead_code)]
 pub fn exposure_text(item: &SharedItem, now_ms: i64, offset_at: impl Fn(i64) -> i64) -> String {
     if let Some(text) = &item.unreadable {
         return text.clone();
@@ -91,7 +83,7 @@ pub fn exposure_text(item: &SharedItem, now_ms: i64, offset_at: impl Fn(i64) -> 
 }
 
 /// Whether Copy link applies: the item is in My files, its sharing is readable and its link is live.
-// Used by Task 5 (the page's view)
+// Used by Task 6 (the row buttons)
 #[allow(dead_code)]
 pub fn can_copy(item: &SharedItem, now_ms: i64) -> bool {
     item.place == Place::MyFiles
@@ -121,8 +113,6 @@ pub fn stop_question(item: &SharedItem) -> String {
 
 /// Screenshot-only: `--fake-shared <state>`, the page's rows ("list"), none ("empty") or the daemon not answering
 /// ("offline"); None for an unknown state.
-// Used by Task 5 (screenshots)
-#[allow(dead_code)]
 pub fn fake_shared(state: &str, now_ms: i64) -> Option<Result<Vec<SharedItem>, String>> {
     const DAY: i64 = 86_400_000;
     let link = |has_password: bool, expires_at: Option<i64>| ShareLink {
@@ -276,5 +266,37 @@ mod tests {
         assert_eq!(fake_shared("empty", NOW), Some(Ok(vec![])));
         assert_eq!(fake_shared("offline", NOW), Some(Err(share::DAEMON_UNREACHABLE.to_string())));
         assert_eq!(fake_shared("bogus", NOW), None);
+    }
+}
+
+/// What the Shared section shows: the list as last read (kept while the next read is out), whether one is out, and why
+/// the last one failed.
+#[derive(Default)]
+pub struct SharedPage {
+    pub items: Option<Vec<SharedItem>>,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+impl SharedPage {
+    /// A read goes out: the rows shown stay until it answers.
+    pub fn begin_load(&mut self) {
+        self.loading = true;
+        self.error = None;
+    }
+
+    /// The read answered. A failure drops the list: it can't be known to be current.
+    pub fn loaded(&mut self, result: Result<Vec<SharedItem>, String>) {
+        self.loading = false;
+        match result {
+            Ok(items) => {
+                self.items = Some(items);
+                self.error = None;
+            }
+            Err(message) => {
+                self.items = None;
+                self.error = Some(message);
+            }
+        }
     }
 }
