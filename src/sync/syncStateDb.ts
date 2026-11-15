@@ -77,6 +77,7 @@ export interface ActivityRecord {
         | 'delete-local'
         | 'free-up'
         | 'hide'
+        | 'share'
         | 'trash-remote'
         | 'mkdir'
         | 'conflict'
