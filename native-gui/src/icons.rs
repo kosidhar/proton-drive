@@ -1,8 +1,27 @@
-//! The app's icons, named by what they mean: Phosphor glyphs (egui-phosphor, MIT), drawn as text in any
-//! proportional font, which falls back to Phosphor for them. One glyph means one thing everywhere (#276).
+//! The app's icons, named by what they mean: Phosphor glyphs (egui-phosphor, MIT), drawn as text in their own font
+//! family (`font`). One glyph means one thing everywhere (#276).
+//!
+//! Never in the proportional family: Inter, the app's font, has glyphs of its own at many private-use code points,
+//! Phosphor's among them, and would draw those instead (#278).
 #![cfg_attr(not(test), allow(dead_code, reason = "a vocabulary: each screen takes the names it needs"))]
 
+use std::sync::Arc;
+
 use egui_phosphor::regular as ph;
+
+/// The icons' font family: Phosphor's regular weight alone.
+const FAMILY: &str = "icons";
+
+/// The font to draw an icon in, at `size` points.
+pub fn font(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name(FAMILY.into()))
+}
+
+/// Adds Phosphor to `fonts`, as the icons' family only.
+pub fn add_to_fonts(fonts: &mut egui::FontDefinitions) {
+    fonts.font_data.insert("phosphor".into(), Arc::new(egui_phosphor::Variant::Regular.font_data()));
+    fonts.families.insert(egui::FontFamily::Name(FAMILY.into()), vec!["phosphor".into()]);
+}
 
 // Sections
 pub const HOME: &str = ph::HOUSE;
@@ -49,21 +68,23 @@ pub const INFO: &str = ph::INFO;
 pub const FOLDER: &str = ph::FOLDER;
 pub const FILE: &str = ph::FILE;
 
+/// Every icon, for the tests
+#[cfg(test)]
+pub const ALL: [&str; 26] = [
+    HOME, SHARED, ACTIVITY, SETTINGS, FOLDER_OPEN, TRASH, SYNC, PAUSE, RESUME, CHECK, WARNING, OFFLINE, LINK,
+    LINK_BROKEN, LOCK, CLOCK, PEOPLE, COPY, MANAGE, WEB, REFRESH, SEARCH, INFO, SIGN_OUT, FOLDER, FILE,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const ALL: [&str; 26] = [
-        HOME, SHARED, ACTIVITY, SETTINGS, FOLDER_OPEN, TRASH, SYNC, PAUSE, RESUME, CHECK, WARNING, OFFLINE, LINK,
-        LINK_BROKEN, LOCK, CLOCK, PEOPLE, COPY, MANAGE, WEB, REFRESH, SEARCH, INFO, SIGN_OUT, FOLDER, FILE,
-    ];
 
     #[test]
     fn each_icon_is_drawn_from_the_icon_font_and_means_one_thing() {
         let ctx = egui::Context::default();
         crate::configure_proton_theme(&ctx);
         let _ = ctx.run(egui::RawInput::default(), |_| {}); // the fonts load with the first frame
-        let font = egui::FontId::proportional(16.0);
+        let font = font(16.0);
         for (i, icon) in ALL.iter().enumerate() {
             assert!(ctx.fonts(|f| f.has_glyphs(&font, icon)), "{icon:?} has no glyph");
             assert!(!ALL[..i].contains(icon), "{icon:?} is used for two things");

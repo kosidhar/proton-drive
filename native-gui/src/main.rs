@@ -3773,7 +3773,7 @@ fn action_button(ui: &mut egui::Ui, kind: ButtonKind, icon: Option<&str>, label:
     let (rect, resp) = button_shell(ui, size, label, fill, hover_fill, stroke);
     let mut x = rect.left() + BUTTON_PADDING;
     if let Some(icon) = icon {
-        let icon_font = FontId::proportional(BUTTON_ICON_SIZE);
+        let icon_font = icons::font(BUTTON_ICON_SIZE);
         let at = egui::pos2(x, rect.center().y);
         ui.painter().text(at, egui::Align2::LEFT_CENTER, icon, icon_font.clone(), text_color);
         x += text_width(ui.painter(), icon, &icon_font) + BUTTON_ICON_GAP;
@@ -3786,7 +3786,7 @@ fn action_button(ui: &mut egui::Ui, kind: ButtonKind, icon: Option<&str>, label:
 /// How wide `action_button` makes a button with this icon and label.
 fn action_button_width(ui: &egui::Ui, icon: Option<&str>, label: &str) -> f32 {
     let icon_room = icon.map_or(0.0, |icon| {
-        text_width(ui.painter(), icon, &FontId::proportional(BUTTON_ICON_SIZE)) + BUTTON_ICON_GAP
+        text_width(ui.painter(), icon, &icons::font(BUTTON_ICON_SIZE)) + BUTTON_ICON_GAP
     });
     button_width(ui, label) + icon_room
 }
@@ -3800,7 +3800,7 @@ fn icon_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         icon,
-        FontId::proportional(BUTTON_ICON_SIZE),
+        icons::font(BUTTON_ICON_SIZE),
         TEXT_PRIMARY(),
     );
     resp.on_hover_text(label)
@@ -3865,8 +3865,8 @@ fn configure_proton_theme(ctx: &egui::Context) {
         prop.insert(0, "Inter".to_owned());
         prop.insert(1, "InterMedium".to_owned());
     }
-    // The icons (see icons.rs): Inter has none of their characters, so text stays Inter and they fall back to Phosphor
-    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    // The icons, in a family of their own (see icons.rs)
+    icons::add_to_fonts(&mut fonts);
     if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
         mono.insert(0, "JetBrainsMono".to_owned());
     }
@@ -5468,6 +5468,18 @@ mod tests {
             fn find(shape: &egui::Shape, text: &str) -> Option<egui::Pos2> {
                 match shape {
                     egui::Shape::Text(t) if t.galley.text() == text => Some(t.visual_bounding_rect().center()),
+                    egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, text)),
+                    _ => None,
+                }
+            }
+            self.last.as_ref()?.shapes.iter().find_map(|c| find(&c.shape, text))
+        }
+
+        /// The box the last frame painted this text in, the first time it painted it.
+        fn text_rect(&self, text: &str) -> Option<egui::Rect> {
+            fn find(shape: &egui::Shape, text: &str) -> Option<egui::Rect> {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == text => Some(t.visual_bounding_rect()),
                     egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, text)),
                     _ => None,
                 }
@@ -8541,6 +8553,34 @@ mod tests {
         h.frames(120); // 2 s, as frames come at 60 a second
         assert!(h.text_at("Refresh").is_some(), "the tooltip says what it does");
         assert_eq!(h.fill_under(at), Some(BG_CARD_ALT()), "until hovered");
+    }
+
+    /// The size of `icon` drawn at 16 pt in Phosphor alone.
+    fn phosphor_glyph_size(icon: &str) -> Vec2 {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert("phosphor".into(), std::sync::Arc::new(egui_phosphor::Variant::Regular.font_data()));
+        fonts.families.insert(FontFamily::Proportional, vec!["phosphor".into()]);
+        ctx.set_fonts(fonts);
+        let _ = ctx.run(egui::RawInput::default(), |_| {}); // the fonts load with the first frame
+        ctx.fonts(|f| f.layout_no_wrap(icon.into(), FontId::proportional(16.0), Color32::WHITE)).mesh_bounds.size()
+    }
+
+    // Inter, the app's font, has glyphs of its own at some of Phosphor's private-use code points (the house, the gear,
+    // the open folder…): an icon drawn in Inter's family shows Inter's glyph instead of Phosphor's
+    #[test]
+    fn each_icon_is_drawn_as_phosphors_glyph() {
+        let mut wrong = Vec::new();
+        for icon in icons::ALL {
+            let h = Harness::widget(move |ui| {
+                action_button(ui, ButtonKind::Secondary, Some(icon), "Label", 32.0);
+            });
+            let drawn = h.text_rect(icon).expect("the icon is painted").size();
+            if (drawn - phosphor_glyph_size(icon)).length() > 1.0 {
+                wrong.push(format!("{icon:?} drawn {drawn:?}, Phosphor's is {:?}", phosphor_glyph_size(icon)));
+            }
+        }
+        assert_eq!(wrong, Vec::<String>::new());
     }
 
     #[test]
