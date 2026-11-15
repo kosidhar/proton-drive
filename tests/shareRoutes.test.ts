@@ -50,6 +50,8 @@ describe('share routes', () => {
         expect((await go(service, 'POST', '/share/invite', { path: 'Docs', emails: ['a@b.co'], role: 'editor' })).status).toBe(200);
         expect((await go(service, 'POST', '/share/role', { path: 'Docs', email: 'a@b.co', role: 'viewer' })).status).toBe(200);
         expect((await go(service, 'DELETE', '/share/person', { path: 'Docs', email: 'a@b.co' })).status).toBe(200);
+        expect(await go(service, 'GET', '/share/list')).toEqual({ status: 200, json: { items: [] } });
+        expect(await go(service, 'DELETE', '/share/all', { path: 'Documents/report.pdf' })).toEqual({ status: 200, json: INFO as never });
         expect(calls).toEqual([
             ['info', 'Docs/a.txt'],
             ['password', 'Docs'],
@@ -60,6 +62,8 @@ describe('share routes', () => {
             ['invite', 'Docs', ['a@b.co'], 'editor'],
             ['setRole', 'Docs', 'a@b.co', 'viewer'],
             ['removePerson', 'Docs', 'a@b.co'],
+            ['list'],
+            ['stopSharing', 'Documents/report.pdf'],
         ]);
     });
 
@@ -71,6 +75,15 @@ describe('share routes', () => {
         for (const body of [{}, { path: '' }, { path: '/a' }, { path: 3 }]) {
             expect((await go(service, 'POST', '/share/link', body)).json).toEqual({ error: PATH_ERROR });
         }
+        for (const body of [{}, { path: '' }, { path: '/a' }, { path: 3 }]) {
+            expect((await go(service, 'DELETE', '/share/all', body)).json).toEqual({ error: PATH_ERROR });
+        }
+        expect(calls).toEqual([]);
+    });
+
+    test('listing while signed out is Sign in to share', async () => {
+        const { service, calls } = fake();
+        expect(await go(service, 'GET', '/share/list', undefined, false)).toEqual({ status: 400, json: { error: 'Sign in to share' } });
         expect(calls).toEqual([]);
     });
 
