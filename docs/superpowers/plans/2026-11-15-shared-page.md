@@ -392,7 +392,10 @@ The behaviour:
   - the harness's `sent()` shows it as `stop sharing {rel_path:?}`.
 
 The behaviour:
-- **Buttons on a `my-files` row** (unreadable ones too, minus Copy link):
+- **Buttons on an unreadable row** (ruling R10): Show in Files when it has a path, and Manage on the web. Never Stop
+  sharing, Manage… or Copy link: its sharing wasn't read (the SDK may not have caught up), so they would act on a stale
+  view, and Stop sharing could report done while the share stays live (#220).
+- **Buttons on a readable `my-files` row:**
   - Copy link, only when `can_copy`;
   - Manage…;
   - Show in Files;
