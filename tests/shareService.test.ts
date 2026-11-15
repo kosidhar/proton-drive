@@ -182,7 +182,7 @@ describe('ShareService', () => {
 
     test('stopSharing removes the whole share in one call and logs "Stopped sharing report.pdf"', async () => {
         const { svc, fake, logs } = setup(shared(), () => ({ uid: 'n1', name: 'report.pdf' }));
-        expect(await svc.stopSharing('report.pdf')).toEqual({ link: null, people: [] });
+        expect(await svc.stopSharing('report.pdf', 'n1')).toEqual({ link: null, people: [] });
         const u = fake.calls.filter((c) => c.fn === 'unshareNode');
         expect(u.length).toBe(1);
         expect(u[0].args.length).toBe(1);
@@ -194,19 +194,29 @@ describe('ShareService', () => {
     test('stopSharing an item whose share is already gone is done, and logs nothing', async () => {
         const { svc, fake, logs } = setup(shared(), () => ({ uid: 'n1', name: 'report.pdf' }));
         fake.fail(new NotFoundAPIError('Share does not exist', ErrorCode.NOT_EXISTS));
-        expect(await svc.stopSharing('report.pdf')).toEqual({ link: null, people: [] });
+        expect(await svc.stopSharing('report.pdf', 'n1')).toEqual({ link: null, people: [] });
         expect(logs).toEqual([]);
         // Any other refusal is still one
         fake.fail(new ValidationError('Insufficient permissions', ErrorCode.NOT_ENOUGH_PERMISSIONS));
-        const e = await rejects(svc.stopSharing('report.pdf'));
+        const e = await rejects(svc.stopSharing('report.pdf', 'n1'));
         expect(e).toBeInstanceOf(ShareError);
         expect(e.message).toBe('Proton Drive refused: Insufficient permissions');
         expect(logs).toEqual([]);
     });
 
+    // #260: the item listed is the one stopped, not whatever is at its path when the request arrives
+    test('stopSharing refuses when the path now holds a different item: refresh, calling nothing and logging nothing', async () => {
+        const { svc, fake, logs } = setup(shared(), () => ({ uid: 'other', name: 'report.pdf' }));
+        const e = await rejects(svc.stopSharing('report.pdf', 'n1'));
+        expect(e).toBeInstanceOf(ShareError);
+        expect(e.message).toBe('This item changed since the list was loaded: refresh');
+        expect(fake.calls).toEqual([]);
+        expect(logs).toEqual([]);
+    });
+
     test('stopSharing refuses an item not uploaded or hidden, calling nothing', async () => {
         const { svc, fake, logs } = setup(shared(), () => ({ refused: 'Not uploaded yet' }));
-        const e = await rejects(svc.stopSharing('a'));
+        const e = await rejects(svc.stopSharing('a', 'n1'));
         expect(e).toBeInstanceOf(ShareError);
         expect(e.message).toBe('Not uploaded yet');
         expect(fake.calls).toEqual([]);
@@ -215,13 +225,13 @@ describe('ShareService', () => {
 
     test('stopSharing an item no longer shared is not an error', async () => {
         const { svc } = setup(undefined);
-        expect(await svc.stopSharing('a.txt')).toEqual({ link: null, people: [] });
+        expect(await svc.stopSharing('a.txt', 'node1')).toEqual({ link: null, people: [] });
     });
 
     test('stopSharing offline is the offline refusal and logs nothing', async () => {
         const { svc, fake, logs } = setup(shared());
         fake.fail(new TypeError('fetch failed'));
-        const e = await rejects(svc.stopSharing('a.txt'));
+        const e = await rejects(svc.stopSharing('a.txt', 'node1'));
         expect(e).toBeInstanceOf(ShareError);
         expect(e.message).toBe('Proton Drive is offline: try again when you are connected');
         expect(logs).toEqual([]);
@@ -571,7 +581,7 @@ describe('Stop sharing an item already unshared elsewhere', () => {
             now: () => 1000,
         });
 
-        expect(await svc.stopSharing('Docs/report.pdf')).toEqual({ link: null, people: [] });
+        expect(await svc.stopSharing('Docs/report.pdf', 'vol~node')).toEqual({ link: null, people: [] });
         expect(deleteShare).not.toHaveBeenCalled();
         expect(logs).toEqual([]);
     });
@@ -809,7 +819,7 @@ describe('list', () => {
             places: { a: { relPath: 'docs/a.txt', hidden: false } },
         });
         const info = await setup(shared()).svc.info('a.txt');
-        expect(await svc.list()).toEqual([{ name: 'a.txt', relPath: 'docs/a.txt', where: 'my-files', link: info.link, people: 3 }]);
+        expect(await svc.list()).toEqual([{ uid: 'a', name: 'a.txt', relPath: 'docs/a.txt', where: 'my-files', link: info.link, people: 3 }]);
     });
 
     test('where each item is: my files, hidden, elsewhere, trashed, the My files folder itself', async () => {
@@ -848,9 +858,9 @@ describe('list', () => {
         });
         const catchingUp = 'Proton Drive is still catching up with this item: refresh in a moment';
         expect(await svc.list()).toEqual([
-            { name: 'a', relPath: 'a', where: 'my-files', link: expect.anything(), people: 3 },
-            { name: 'b', relPath: 'docs/b', where: 'my-files', link: null, people: 0, unreadable: catchingUp },
-            { name: 'c', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: catchingUp },
+            { uid: 'a', name: 'a', relPath: 'a', where: 'my-files', link: expect.anything(), people: 3 },
+            { uid: 'b', name: 'b', relPath: 'docs/b', where: 'my-files', link: null, people: 0, unreadable: catchingUp },
+            { uid: 'c', name: 'c', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: catchingUp },
         ]);
     });
 
@@ -862,16 +872,16 @@ describe('list', () => {
             places: { a: { relPath: 'a', hidden: false }, b: { relPath: 'b', hidden: false } },
         });
         expect(await svc.list()).toEqual([
-            { name: 'a', relPath: 'a', where: 'my-files', link: expect.anything(), people: 3 },
-            { name: 'b', relPath: 'b', where: 'my-files', link: null, people: 0, unreadable: "Proton Drive couldn't say how this item is shared" },
+            { uid: 'a', name: 'a', relPath: 'a', where: 'my-files', link: expect.anything(), people: 3 },
+            { uid: 'b', name: 'b', relPath: 'b', where: 'my-files', link: null, people: 0, unreadable: "Proton Drive couldn't say how this item is shared" },
         ]);
     });
 
     test('a node Proton Drive can\'t find is listed as "An item", unreadable', async () => {
         const { svc } = listSetup({ nodes: [{ missingUid: 'x' }, { uid: 'n', name: { ok: false, error: new Error('x') } }], sharing: { n: shared() } });
         expect(await svc.list()).toEqual([
-            { name: 'An item', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: "This item can't be found in Proton Drive" },
-            { name: 'An item', relPath: null, where: 'elsewhere', link: expect.anything(), people: 3 },
+            { uid: 'x', name: 'An item', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: "This item can't be found in Proton Drive" },
+            { uid: 'n', name: 'An item', relPath: null, where: 'elsewhere', link: expect.anything(), people: 3 },
         ]);
     });
 
@@ -899,10 +909,10 @@ describe('list', () => {
             },
         });
         expect(await svc.list()).toEqual([
-            { name: '2026.pdf', relPath: 'Documents/Taxes/2026.pdf', where: 'my-files', link: expect.anything(), people: 3 },
-            { name: 'a', relPath: 'a', where: 'my-files', link: expect.anything(), people: 3 },
-            { name: 'beach.jpg', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: "Proton Drive couldn't read this item" },
-            { name: 'gone.txt', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: "This item can't be found in Proton Drive" },
+            { uid: 'n', name: '2026.pdf', relPath: 'Documents/Taxes/2026.pdf', where: 'my-files', link: expect.anything(), people: 3 },
+            { uid: 'a', name: 'a', relPath: 'a', where: 'my-files', link: expect.anything(), people: 3 },
+            { uid: 'c', name: 'beach.jpg', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: "Proton Drive couldn't read this item" },
+            { uid: 'm', name: 'gone.txt', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: "This item can't be found in Proton Drive" },
         ]);
     });
 
@@ -957,7 +967,7 @@ describe('list', () => {
             ['c.txt', 'my-files', 'docs/c.txt', undefined],
             ['b.txt', 'elsewhere', null, LOCAL],
         ]);
-        expect(items[2]).toEqual({ name: 'b.txt', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: LOCAL });
+        expect(items[2]).toEqual({ uid: 'b', name: 'b.txt', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: LOCAL });
     });
 
     test('a sharing result the daemon cannot read lists that item as unreadable, with the place it knows', async () => {
@@ -977,7 +987,7 @@ describe('list', () => {
             ['c.txt', undefined],
             ['b.txt', LOCAL],
         ]);
-        expect(items.find((i) => i.name === 'b.txt')).toEqual({ name: 'b.txt', relPath: 'docs/b.txt', where: 'hidden', link: null, people: 0, unreadable: LOCAL });
+        expect(items.find((i) => i.name === 'b.txt')).toEqual({ uid: 'b', name: 'b.txt', relPath: 'docs/b.txt', where: 'hidden', link: null, people: 0, unreadable: LOCAL });
     });
 
     test('never more than 4 sharing reads at once, and all 60 items listed in order', async () => {
@@ -1031,9 +1041,9 @@ describe('list', () => {
             },
         });
         expect(await svc.list()).toEqual([
-            { name: 'a', relPath: 'a', where: 'my-files', link: expect.anything(), people: 3 },
-            { name: 'b', relPath: 'b', where: 'my-files', link: expect.anything(), people: 3 },
-            { name: 'An item', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: "Proton Drive couldn't read this item" },
+            { uid: 'a', name: 'a', relPath: 'a', where: 'my-files', link: expect.anything(), people: 3 },
+            { uid: 'b', name: 'b', relPath: 'b', where: 'my-files', link: expect.anything(), people: 3 },
+            { uid: 'c', name: 'An item', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: "Proton Drive couldn't read this item" },
         ]);
     });
 
@@ -1135,8 +1145,8 @@ describe('list', () => {
             },
         });
         expect(await svc.list()).toEqual([
-            { name: 'a', relPath: 'a', where: 'my-files', link: expect.anything(), people: 3 },
-            { name: 'An item', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: "Proton Drive couldn't read this item" },
+            { uid: 'a', name: 'a', relPath: 'a', where: 'my-files', link: expect.anything(), people: 3 },
+            { uid: 'b', name: 'An item', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: "Proton Drive couldn't read this item" },
         ]);
     });
 

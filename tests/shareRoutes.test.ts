@@ -51,7 +51,7 @@ describe('share routes', () => {
         expect((await go(service, 'POST', '/share/role', { path: 'Docs', email: 'a@b.co', role: 'viewer' })).status).toBe(200);
         expect((await go(service, 'DELETE', '/share/person', { path: 'Docs', email: 'a@b.co' })).status).toBe(200);
         expect(await go(service, 'GET', '/share/list')).toEqual({ status: 200, json: { items: [] } });
-        expect(await go(service, 'DELETE', '/share/all', { path: 'Documents/report.pdf' })).toEqual({ status: 200, json: INFO as never });
+        expect(await go(service, 'DELETE', '/share/all', { path: 'Documents/report.pdf', uid: 'vol~n1' })).toEqual({ status: 200, json: INFO as never });
         expect(calls).toEqual([
             ['info', 'Docs/a.txt'],
             ['password', 'Docs'],
@@ -63,7 +63,7 @@ describe('share routes', () => {
             ['setRole', 'Docs', 'a@b.co', 'viewer'],
             ['removePerson', 'Docs', 'a@b.co'],
             ['list', expect.any(AbortSignal)],
-            ['stopSharing', 'Documents/report.pdf'],
+            ['stopSharing', 'Documents/report.pdf', 'vol~n1'],
         ]);
     });
 
@@ -77,6 +77,16 @@ describe('share routes', () => {
         }
         for (const body of [{}, { path: '' }, { path: '/a' }, { path: 3 }]) {
             expect((await go(service, 'DELETE', '/share/all', body)).json).toEqual({ error: PATH_ERROR });
+        }
+        expect(calls).toEqual([]);
+    });
+
+    // #260: stopping sharing names the item that was listed
+    test('stopping sharing without the listed item\'s uid is a 400 before the service', async () => {
+        const { service, calls } = fake();
+        const UID_ERROR = 'uid must be the uid of the listed item';
+        for (const body of [{ path: 'a' }, { path: 'a', uid: '' }, { path: 'a', uid: 3 }, { path: 'a', uid: null }]) {
+            expect([body, await go(service, 'DELETE', '/share/all', body)]).toEqual([body, { status: 400, json: { error: UID_ERROR } }]);
         }
         expect(calls).toEqual([]);
     });
