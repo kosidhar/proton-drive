@@ -990,8 +990,8 @@ static SCREENSHOT_MODE: AtomicBool = AtomicBool::new(false);
 static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// The section a later start asked for, opened with the window (#203)
 static SECTION_REQUESTED: std::sync::Mutex<Option<NavTab>> = std::sync::Mutex::new(None);
-/// The absolute path a later start asked to share, opened with the window (#216)
-static SHARE_REQUESTED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// What a later start asked to share (or why it can't be), opened with the window (#216)
+static SHARE_REQUESTED: std::sync::Mutex<Option<single_instance::Request>> = std::sync::Mutex::new(None);
 /// The running app's context, so the single-instance listener can wake it
 static APP_CONTEXT: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
 
@@ -3120,14 +3120,28 @@ impl ProtonDriveNativeApp {
     /// Opens the share window for the item at `abs_path` (an absolute path in the Proton Drive folder), as `--share`
     /// asks (#216).
     fn open_share(&mut self, abs_path: &str) {
-        // The same item again: the window stays (what was typed in it too), and reads again if nothing was
-        if self.share.as_ref().is_some_and(|w| w.abs_path == abs_path) {
+        // The same item again: the window stays (what was typed in it too), and reads again if nothing was. One that
+        // could only say why it can't share is opened afresh: what it showed as the path is only a likeness of one
+        if self.share.as_ref().is_some_and(|w| w.abs_path == abs_path && w.may_share()) {
             self.share_again();
             return;
         }
         self.leave_share();
         self.share = Some(share::ShareWindow::new(abs_path));
         self.resolve_share();
+    }
+
+    /// Does what a start's `--share` asked, on a first start or from a later one: opens the Share window on the item,
+    /// or, for a path that can't be shared, opens it saying why (#216).
+    fn open_share_request(&mut self, request: single_instance::Request) {
+        match request {
+            single_instance::Request::Share(path) => self.open_share(&path),
+            single_instance::Request::ShareRefused { shown, problem } => {
+                self.leave_share();
+                self.share = Some(share::ShareWindow::refused(&shown, problem));
+            }
+            single_instance::Request::Show(_) => {}
+        }
     }
 
     /// Opened again from the tray or the launcher: bring this window back instead of a second one (#129), on the section
@@ -3139,8 +3153,8 @@ impl ProtonDriveNativeApp {
         if let Some(tab) = SECTION_REQUESTED.lock().map(|mut s| s.take()).unwrap_or(None) {
             self.tab = tab;
         }
-        if let Some(path) = SHARE_REQUESTED.lock().map(|mut s| s.take()).unwrap_or(None) {
-            self.open_share(&path);
+        if let Some(request) = SHARE_REQUESTED.lock().map(|mut s| s.take()).unwrap_or(None) {
+            self.open_share_request(request);
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -4033,7 +4047,7 @@ fn main() -> eframe::Result {
     let mut screenshot_target: Option<String> = None;
     let mut initial_tab = NavTab::Home;
     let mut cli_tab: Option<String> = None;
-    let mut cli_share: Option<String> = None;
+    let mut cli_share: Option<std::ffi::OsString> = None;
     let mut cli_theme_override: Option<String> = None;
     let mut cli_search: Option<String> = None;
     let mut cli_size: Option<[f32; 2]> = None;
@@ -4053,23 +4067,26 @@ fn main() -> eframe::Result {
     let mut cli_paused_until_min: Option<i64> = None;
     let mut cli_pause_choices = false;
     let mut cli_fake_share: Option<String> = None;
-    let mut args = std::env::args().skip(1);
+    // The arguments as the system gives them: one that isn't UTF-8 (a file's name can be anything) mustn't stop the app
+    // (#216). --share's path is kept as it is; every other value is read as text, as near as it can be
+    let text = |arg: Option<std::ffi::OsString>| arg.map(|a| a.to_string_lossy().into_owned());
+    let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
-        match arg.as_str() {
+        match arg.to_str().unwrap_or_default() {
             "--screenshot" => {
-                screenshot_target = args.next();
+                screenshot_target = text(args.next());
             }
             "--confirm-free-all" => {
                 cli_confirm_free_all = true;
             }
             "--drive-status" => {
-                cli_drive_status = args.next();
+                cli_drive_status = text(args.next());
             }
             "--drive-move" => {
-                cli_drive_move = args.next();
+                cli_drive_move = text(args.next());
             }
             "--drive-error" => {
-                cli_drive_error = args.next();
+                cli_drive_error = text(args.next());
             }
             "--confirm-drive-off" => {
                 cli_confirm_drive_off = true;
@@ -4082,10 +4099,10 @@ fn main() -> eframe::Result {
                 cli_confirm_files_missing = true;
             }
             "--fake-attention" => {
-                cli_fake_attention = args.next().and_then(|v| v.parse().ok());
+                cli_fake_attention = text(args.next()).and_then(|v| v.parse().ok());
             }
             "--fake-transfers" => {
-                cli_fake_transfers = args.next().and_then(|v| v.parse().ok());
+                cli_fake_transfers = text(args.next()).and_then(|v| v.parse().ok());
             }
             "--signed-out" => {
                 cli_signed_out = true;
@@ -4094,38 +4111,38 @@ fn main() -> eframe::Result {
                 cli_account_mismatch = true;
             }
             "--paused-until-min" => {
-                cli_paused_until_min = args.next().and_then(|v| v.parse().ok()).filter(|m: &i64| *m >= 0);
+                cli_paused_until_min = text(args.next()).and_then(|v| v.parse().ok()).filter(|m: &i64| *m >= 0);
             }
             "--pause-choices" => {
                 cli_pause_choices = true;
             }
             "--fake-share" => {
-                cli_fake_share = args.next();
+                cli_fake_share = text(args.next());
             }
             "--hidden-items" => {
                 cli_hidden_items = true;
             }
             "--login-error" => {
-                cli_login_error = args.next();
+                cli_login_error = text(args.next());
             }
             "--theme" => {
-                cli_theme_override = args.next();
+                cli_theme_override = text(args.next());
             }
             "--size" => {
-                let raw = args.next().unwrap_or_default();
+                let raw = text(args.next()).unwrap_or_default();
                 cli_size = parse_window_size(&raw);
                 if cli_size.is_none() {
                     eprintln!("protondrive-gui: ignoring invalid --size {raw:?} (expected WxH, e.g. 1280x800)");
                 }
             }
             "--search" => {
-                cli_search = args.next();
+                cli_search = text(args.next());
             }
             "--share" => {
                 cli_share = args.next();
             }
             "--tab" => {
-                if let Some(t) = args.next() {
+                if let Some(t) = text(args.next()) {
                     initial_tab = parse_tab(&t);
                     cli_tab = Some(t);
                 }
@@ -4184,16 +4201,16 @@ fn main() -> eframe::Result {
         None
     };
 
+    // What --share asks: the item, or, for a path that can't be shared, to say why (in the window, never nothing)
+    let share_request = cli_share.as_deref().map(single_instance::share_request);
+
     // One app window per user (#129): a second start shows the running window and exits. A screenshot runs beside it
     let mut _instance_lock: Option<std::fs::File> = None;
     if screenshot_target.is_none() {
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty());
         let in_runtime_dir = runtime_dir.is_some();
-        // A later start that names an item shares it; a path that can't travel as one line just shows the window
-        let request = match cli_share.as_deref().filter(|p| single_instance::is_shareable_path(p)) {
-            Some(path) => single_instance::Request::Share(path.to_string()),
-            None => single_instance::Request::Show(cli_tab.clone()),
-        };
+        // A later start that names an item shares it (or says why it can't); one that doesn't shows the window
+        let request = share_request.clone().unwrap_or_else(|| single_instance::Request::Show(cli_tab.clone()));
         let paths = single_instance::instance_paths(runtime_dir, node_tmpdir(|name| std::env::var_os(name)), own_uid());
         match single_instance::claim(&paths, own_uid(), in_runtime_dir, Duration::from_secs(5), &request) {
             Ok(single_instance::Claim::Signalled) => return Ok(()),
@@ -4207,9 +4224,9 @@ fn main() -> eframe::Result {
                                     *requested = section.as_deref().map(parse_tab);
                                 }
                             }
-                            single_instance::Request::Share(path) => {
+                            share @ (single_instance::Request::Share(_) | single_instance::Request::ShareRefused { .. }) => {
                                 if let Ok(mut requested) = SHARE_REQUESTED.lock() {
-                                    *requested = Some(path);
+                                    *requested = Some(share);
                                 }
                             }
                         }
@@ -4286,8 +4303,8 @@ fn main() -> eframe::Result {
             if let Some(q) = cli_search {
                 app.search_query = q;
             }
-            if let Some(path) = cli_share.as_deref().filter(|p| single_instance::is_shareable_path(p)) {
-                app.open_share(path);
+            if let Some(request) = share_request {
+                app.open_share_request(request);
             }
             // Screenshot-only: these flags only draw the dialogs, nothing is sent
             if app.screenshot_target.is_some() {
@@ -5018,7 +5035,7 @@ mod tests {
         let _statics = REQUEST_STATICS.lock().unwrap_or_else(|e| e.into_inner());
         let mut h = Harness::new();
         assert!(h.app.share.is_none());
-        *SHARE_REQUESTED.lock().unwrap() = Some("/home/u/ProtonDrive/My Docs/a.pdf".to_string());
+        *SHARE_REQUESTED.lock().unwrap() = Some(single_instance::Request::Share("/home/u/ProtonDrive/My Docs/a.pdf".to_string()));
         SHOW_REQUESTED.store(true, AtomicOrdering::SeqCst);
         h.app.answer_show_request(&h.ctx);
         assert_eq!(h.app.share.as_ref().map(|w| w.abs_path.as_str()), Some("/home/u/ProtonDrive/My Docs/a.pdf"));
@@ -5027,6 +5044,45 @@ mod tests {
         SHOW_REQUESTED.store(true, AtomicOrdering::SeqCst);
         h.app.answer_show_request(&h.ctx);
         assert!(h.app.share.is_some());
+    }
+
+    // Minor 5: a --share that can't be done (not a full path, a line break, not UTF-8) opens the window saying why,
+    // on a first start and in a running app, rather than nothing at all
+    #[test]
+    fn a_share_that_cant_be_done_opens_the_window_saying_why() {
+        use std::os::unix::ffi::OsStrExt;
+        let _statics = REQUEST_STATICS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut h = Harness::new();
+        h.app.status.sync_dir = "/home/u/ProtonDrive".into();
+        // A first start
+        h.app.open_share_request(single_instance::share_request(std::ffi::OsStr::new("Docs/report.pdf")));
+        h.frames(3);
+        assert!(h.text_at("Share \"report.pdf\"").is_some());
+        assert!(h.text_at(share::refusal(single_instance::PathProblem::NotAbsolute)).is_some());
+        assert!(h.text_at("Try again").is_none(), "nothing to try again");
+        assert_eq!(h.sent(), Vec::<String>::new());
+
+        // A running app, asked by a later start: a line break, then a name that isn't UTF-8
+        let cases: [(&[u8], &str, single_instance::PathProblem); 2] = [
+            (b"/home/u/ProtonDrive/two\nlines.txt", "Share \"two\u{fffd}lines.txt\"", single_instance::PathProblem::LineBreak),
+            (b"/home/u/ProtonDrive/caf\xe9.txt", "Share \"caf\u{fffd}.txt\"", single_instance::PathProblem::NotUtf8),
+        ];
+        for (path, title, problem) in cases {
+            *SHARE_REQUESTED.lock().unwrap() = Some(single_instance::share_request(std::ffi::OsStr::from_bytes(path)));
+            SHOW_REQUESTED.store(true, AtomicOrdering::SeqCst);
+            h.app.answer_show_request(&h.ctx);
+            h.frames(3);
+            assert!(h.text_at(title).is_some(), "{title}");
+            assert!(h.text_at(share::refusal(problem)).is_some(), "{problem:?}");
+            assert_eq!(h.sent(), Vec::<String>::new());
+        }
+        // A file truly named as the refusal showed the last one: a window of its own, which reads, not the refusal
+        h.app.open_share("/home/u/ProtonDrive/caf\u{fffd}.txt");
+        assert_eq!(h.sent(), vec!["share info caf\u{fffd}.txt".to_string()]);
+        h.frames(2);
+        assert!(h.text_at(share::refusal(single_instance::PathProblem::NotUtf8)).is_none());
+        h.click(h.text_at("Done").unwrap());
+        assert!(h.app.share.is_none());
     }
 
     #[test]
