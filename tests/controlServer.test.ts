@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import type { ShareService } from '../src/daemon/shareService';
 import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -402,6 +403,29 @@ describe('POST /vfs/mount', () => {
         });
         expect((await call(socketPath, '/vfs/mount')).status).toBe(405);
         expect(calls).toBe(0);
+    });
+});
+
+describe('/share routes', () => {
+    async function startWith(share?: ShareService, signedIn = true) {
+        const root = mkdtempSync(path.join(os.tmpdir(), 'pd-control-'));
+        cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+        const socketPath = path.join(root, 'control.sock');
+        const server = await startControlServer({ socketPath, engine: makeFake() as never, share, shareSignedIn: () => signedIn });
+        cleanups.push(() => server.stop());
+        return socketPath;
+    }
+    const service = { info: async () => ({ link: null, people: [] }) } as unknown as ShareService;
+
+    test('/share/info answers through the control server', async () => {
+        const res = await call(await startWith(service), '/share/info?path=Docs');
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ link: null, people: [] });
+    });
+
+    test('404 with no service wired, and 400 while signed out', async () => {
+        expect((await call(await startWith(), '/share/info?path=Docs')).status).toBe(404);
+        expect((await call(await startWith(service, false), '/share/info?path=Docs')).status).toBe(400);
     });
 });
 

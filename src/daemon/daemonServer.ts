@@ -1,5 +1,6 @@
 import path from 'node:path';
 
+import { createShareService } from './shareService';
 import { syncLoginEntry } from '../linux/autostart';
 import { ensureSystemTrayIndicator, getSystemdServiceStatus, sendDesktopNotification } from '../linux/notifications';
 import {
@@ -531,6 +532,20 @@ export async function startSyncDaemon(options: {
                 signIn,
                 signOut,
                 makeRemoteFolder,
+                share: createShareService({
+                    sdk: runtime.sdk,
+                    nodeFor: (relPath) => {
+                        if (engine.availability.hiddenBy(relPath)) {
+                            return { refused: 'Hidden from this computer: unhide it in Settings to share it' };
+                        }
+                        const entry = engine.remoteIndex.getByPath(relPath);
+                        if (!entry) return { refused: 'Not uploaded yet: Proton Drive can share it once it has uploaded' };
+                        return { uid: entry.uid, name: entry.name };
+                    },
+                    logActivity: (entry) => stateDb.logActivity(entry),
+                    now: Date.now,
+                }),
+                shareSignedIn: () => runtime.auth.isLoggedIn(),
                 // The drive's size (#181): what the account uses of its storage, from what the app shows (asked of the
                 // API at most once a minute)
                 space: async () => {

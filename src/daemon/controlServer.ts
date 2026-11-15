@@ -1,4 +1,6 @@
 import { chmodSync, lstatSync, mkdirSync, unlinkSync } from 'node:fs';
+import { shareRoute } from './shareRoutes';
+import type { ShareService } from './shareService';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -60,6 +62,9 @@ export interface ControlServerOptions {
     // Save settings, which may move the drive folder or switch the virtual drive (see driveSettings in settingsRoute.ts);
     // the request is checked already, and the answer is the response
     driveSettings?: (change: SettingsChange) => Promise<Response>;
+    // Sharing an item (see ShareService, shareRoutes.ts), while signed in: absent, the /share routes are not found
+    share?: ShareService;
+    shareSignedIn?: () => boolean;
     // Make a folder in the cloud, in the folder My files or elsewhere by its path; answers the folder made
     remoteMkdir?: (parentPath: string, name: string) => Promise<{ uid: string; name: string }>;
     // Sign in (starts the browser sign-in and answers its URL, with what the app must show) and sign out
@@ -393,6 +398,9 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
             }
             if (url.pathname === '/vfs/space') {
                 return spaceRoute(req, opts.space);
+            }
+            if (url.pathname.startsWith('/share/')) {
+                return shareRoute(req, url, opts.share, opts.shareSignedIn ?? (() => false));
             }
             if (url.pathname === '/drive/move') {
                 return driveMoveRoute(req, opts.driveMove);
