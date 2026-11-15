@@ -14,6 +14,7 @@ import { Config } from '../config';
 import { ColoredConsoleMetricHandler } from './consoleHandler';
 import { FileLogHandler } from './fileHandler';
 import { ColoredLogFormatter } from './logFormatters';
+import { MaskingLogHandler } from './logMasking';
 import { CliMetrics, MetricHandler, UserPlan } from './metricHandler';
 import { flushSentry } from './sentry';
 import { SentryLogHandler } from './sentryHandler';
@@ -56,7 +57,8 @@ export function initTelemetry(config: Config) {
 
     const telemetry = new Telemetry({
         logFilter: new AppLogFilter(config.logLevel, config.sdkLogLevel ?? config.logLevel),
-        logHandlers,
+        // Every logger's lines, the SDKs' too, with email addresses masked (#216)
+        logHandlers: [new MaskingLogHandler(logHandlers)],
         metricHandlers,
     });
 
