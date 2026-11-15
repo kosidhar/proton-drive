@@ -2665,20 +2665,27 @@ impl ProtonDriveNativeApp {
                             )
                             .clicked()
                             {
-                                if confirm == PendingConfirm::VirtualDriveOff {
-                                    self.send_drive_command(WorkerCommand::SetVirtualDrive(false));
-                                } else if let PendingConfirm::DeleteMissing { root, names, .. } = &confirm {
-                                    self.resolve_files_missing(MissingChoice::DeleteInCloud, root.clone(), names.clone());
-                                } else if let PendingConfirm::StopSharing { rel_path, .. } = &confirm {
-                                    self.shared.stopping = Some(rel_path.clone());
-                                    self.shared.stop_error = None;
-                                    let _ = self.tx.send(WorkerCommand::SharedStop { rel_path: rel_path.clone() });
-                                } else if confirm == PendingConfirm::StartFresh {
-                                    self.start_fresh_working = true;
-                                    self.start_fresh_error = None;
-                                    let _ = self.tx.send(WorkerCommand::StartFresh);
-                                } else {
-                                    self.send_availability(action_path.clone(), action);
+                                // Exhaustive on purpose: a new variant must say what it sends, not fall into availability
+                                match &confirm {
+                                    PendingConfirm::VirtualDriveOff => {
+                                        self.send_drive_command(WorkerCommand::SetVirtualDrive(false));
+                                    }
+                                    PendingConfirm::DeleteMissing { root, names, .. } => {
+                                        self.resolve_files_missing(MissingChoice::DeleteInCloud, root.clone(), names.clone());
+                                    }
+                                    PendingConfirm::StopSharing { rel_path, .. } => {
+                                        self.shared.stopping = Some(rel_path.clone());
+                                        self.shared.stop_error = None;
+                                        let _ = self.tx.send(WorkerCommand::SharedStop { rel_path: rel_path.clone() });
+                                    }
+                                    PendingConfirm::StartFresh => {
+                                        self.start_fresh_working = true;
+                                        self.start_fresh_error = None;
+                                        let _ = self.tx.send(WorkerCommand::StartFresh);
+                                    }
+                                    PendingConfirm::FreeAll { .. } => {
+                                        self.send_availability(action_path.clone(), action);
+                                    }
                                 }
                                 self.pending_confirm = None;
                             }
@@ -5461,6 +5468,62 @@ mod tests {
         assert_eq!(h.app.pending_confirm, None);
         assert_eq!(h.app.tab, NavTab::Home);
         assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    /// Opens `confirm`, clicks its button (`label`) and returns the harness for the checks on what was sent.
+    fn confirm_and_click(confirm: PendingConfirm, label: &str) -> Harness {
+        let mut h = Harness::new();
+        h.app.pending_confirm = Some(confirm);
+        h.frames(2);
+        let button = *h.text_at_all(label).last().unwrap_or_else(|| panic!("the dialog's {label:?} button is painted"));
+        h.click(button);
+        assert_eq!(h.app.pending_confirm, None);
+        h
+    }
+
+    #[test]
+    fn confirming_free_all_for_a_folder_sends_free_for_that_folder() {
+        let h = confirm_and_click(PendingConfirm::FreeAll { rel_path: "Docs".into() }, "Free up space");
+        assert_eq!(h.sent(), vec![r#"free "Docs""#.to_string()]);
+        assert_eq!(h.app.working, vec!["Docs".to_string()]);
+    }
+
+    #[test]
+    fn confirming_virtual_drive_off_sends_only_the_virtual_drive_switch() {
+        let h = confirm_and_click(PendingConfirm::VirtualDriveOff, "Switch off");
+        assert_eq!(h.sent(), vec!["virtual drive false".to_string()]);
+        assert!(h.app.drive_working);
+        assert!(h.app.working.is_empty());
+    }
+
+    #[test]
+    fn confirming_delete_missing_sends_only_the_delete_in_cloud_choice() {
+        let h = confirm_and_click(
+            PendingConfirm::DeleteMissing { root: "/home/u/ProtonDrive".into(), names: vec!["Docs".into()], items: 3 },
+            "Delete from Proton Drive",
+        );
+        assert_eq!(h.sent(), vec!["files missing: delete-in-cloud /home/u/ProtonDrive Docs".to_string()]);
+        assert!(h.app.files_missing_working);
+        assert!(h.app.working.is_empty());
+    }
+
+    #[test]
+    fn confirming_start_fresh_sends_only_start_fresh() {
+        let h = confirm_and_click(PendingConfirm::StartFresh, "Start fresh");
+        assert_eq!(h.sent(), vec!["start fresh".to_string()]);
+        assert!(h.app.start_fresh_working);
+        assert!(h.app.working.is_empty());
+    }
+
+    #[test]
+    fn confirming_stop_sharing_sends_only_the_stop_for_that_item() {
+        let h = confirm_and_click(
+            PendingConfirm::StopSharing { rel_path: "Documents/report.pdf".into(), question: "Stop sharing report.pdf?".into() },
+            "Stop sharing",
+        );
+        assert_eq!(h.sent(), vec![r#"stop sharing "Documents/report.pdf""#.to_string()]);
+        assert_eq!(h.app.shared.stopping.as_deref(), Some("Documents/report.pdf"));
+        assert!(h.app.working.is_empty());
     }
 
     #[test]
