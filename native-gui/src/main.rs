@@ -963,19 +963,24 @@ enum WorkerCommand {
     ResolveFilesMissing { choice: MissingChoice, root: String, names: Vec<String> },
     /// Start fresh with the account signed in to (POST /account/start-fresh, #35)
     StartFresh,
-    /// The Share window (#216), each over the control socket for the item at `rel_path` (inside My files): how it is
-    /// shared (a read)
-    ShareLoad { rel_path: String },
+    /// The Share window (#216), each over the control socket for the item at `rel_path` (inside My files), and
+    /// answered to the `window` that asked: how it is shared (a read)
+    ShareLoad { window: share::WindowId, rel_path: String },
     /// Turn the link on (POST /share/link: makes one only if there is none)
-    ShareEnsureLink { rel_path: String },
+    ShareEnsureLink { window: share::WindowId, rel_path: String },
     /// Set or clear the link's password and expiry: None leaves one as it is, Some(None) clears it
-    ShareSettings { rel_path: String, password: Option<Option<String>>, expires_at: Option<Option<i64>> },
-    ShareRemoveLink { rel_path: String },
-    ShareInvite { rel_path: String, emails: Vec<String>, role: share::Role },
-    ShareRole { rel_path: String, email: String, role: share::Role },
-    ShareRemovePerson { rel_path: String, email: String },
+    ShareSettings {
+        window: share::WindowId,
+        rel_path: String,
+        password: Option<Option<String>>,
+        expires_at: Option<Option<i64>>,
+    },
+    ShareRemoveLink { window: share::WindowId, rel_path: String },
+    ShareInvite { window: share::WindowId, rel_path: String, emails: Vec<String>, role: share::Role },
+    ShareRole { window: share::WindowId, rel_path: String, email: String, role: share::Role },
+    ShareRemovePerson { window: share::WindowId, rel_path: String, email: String },
     /// The link's password, only when Show is clicked (a read)
-    SharePassword { rel_path: String },
+    SharePassword { window: share::WindowId, rel_path: String },
 }
 
 /// Set once in `main` when the app only renders a screenshot: nothing that changes anything is ever sent then, and
@@ -1088,12 +1093,12 @@ enum WorkerEvent {
     /// What was asked about the missing files (deleted on purpose, or kept online-only) went through, or why not
     FilesMissingDone(Result<(), String>),
     StartFreshDone(Result<(), String>),
-    /// How the item at the path (inside My files) is shared, or why that couldn't be read (#216)
-    ShareLoaded(String, Result<share::ShareInfo, String>),
-    /// A change made in the Share window went through, or why not
-    ShareDone(String, Result<(), String>),
+    /// How the item of the Share window that asked is shared, or why that couldn't be read (#216)
+    ShareLoaded(share::WindowId, Result<share::ShareInfo, String>),
+    /// A change made in that Share window went through, or why not
+    ShareDone(share::WindowId, Result<(), String>),
     /// The link's password (None when Proton Drive can't show it here), or why it couldn't be read
-    SharePassword(String, Result<Option<String>, String>),
+    SharePassword(share::WindowId, Result<Option<String>, String>),
 }
 
 /// A line telling how something went: done, or why not.
@@ -1331,6 +1336,8 @@ struct ProtonDriveNativeApp {
     last_poll: Instant,
     /// The Share window, while one is open (#216)
     share: Option<share::ShareWindow>,
+    /// Changes sent from Share windows closed or replaced before they were answered: a failure goes to the notice
+    share_left: Vec<share::LeftChange>,
 }
 
 impl ProtonDriveNativeApp {
@@ -1443,6 +1450,7 @@ impl ProtonDriveNativeApp {
             screenshot_requested: false,
             last_poll: Instant::now(),
             share: None,
+            share_left: Vec::new(),
         }
     }
 
@@ -1698,9 +1706,9 @@ impl ProtonDriveNativeApp {
                 WorkerEvent::ConflictsLoaded(conflicts) => {
                     self.conflicts = conflicts;
                 }
-                WorkerEvent::ShareLoaded(rel_path, result) => self.share_loaded(&rel_path, result),
-                WorkerEvent::ShareDone(rel_path, result) => self.share_done(&rel_path, result),
-                WorkerEvent::SharePassword(rel_path, result) => self.share_password(&rel_path, result),
+                WorkerEvent::ShareLoaded(window, result) => self.share_loaded(window, result),
+                WorkerEvent::ShareDone(window, result) => self.share_done(window, result),
+                WorkerEvent::SharePassword(window, result) => self.share_password(window, result),
                 WorkerEvent::AvailabilityDone { path, result } => {
                     if let Some(i) = self.working.iter().position(|w| w == &path) {
                         self.working.remove(i);
@@ -3112,10 +3120,12 @@ impl ProtonDriveNativeApp {
     /// Opens the share window for the item at `abs_path` (an absolute path in the Proton Drive folder), as `--share`
     /// asks (#216).
     fn open_share(&mut self, abs_path: &str) {
-        // The same item again: the window stays as it is (what was typed in it too)
+        // The same item again: the window stays (what was typed in it too), and reads again if nothing was
         if self.share.as_ref().is_some_and(|w| w.abs_path == abs_path) {
+            self.share_again();
             return;
         }
+        self.leave_share();
         self.share = Some(share::ShareWindow::new(abs_path));
         self.resolve_share();
     }
@@ -3886,37 +3896,30 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                 off_thread(&tx, &ctx, move || WorkerEvent::StartFreshDone(start_fresh_at(&control_socket_path())))
             }
             // The Share window's requests reach Proton's servers through the daemon: each runs on its own thread
-            WorkerCommand::ShareLoad { rel_path } => off_thread(&tx, &ctx, move || {
-                let result = share::info_at(&control_socket_path(), &rel_path);
-                WorkerEvent::ShareLoaded(rel_path, result)
+            WorkerCommand::ShareLoad { window, rel_path } => off_thread(&tx, &ctx, move || {
+                WorkerEvent::ShareLoaded(window, share::info_at(&control_socket_path(), &rel_path))
             }),
-            WorkerCommand::SharePassword { rel_path } => off_thread(&tx, &ctx, move || {
-                let result = share::password_at(&control_socket_path(), &rel_path);
-                WorkerEvent::SharePassword(rel_path, result)
+            WorkerCommand::SharePassword { window, rel_path } => off_thread(&tx, &ctx, move || {
+                WorkerEvent::SharePassword(window, share::password_at(&control_socket_path(), &rel_path))
             }),
-            WorkerCommand::ShareEnsureLink { rel_path } => off_thread(&tx, &ctx, move || {
-                let result = share::ensure_link_at(&control_socket_path(), &rel_path);
-                WorkerEvent::ShareDone(rel_path, result)
+            WorkerCommand::ShareEnsureLink { window, rel_path } => off_thread(&tx, &ctx, move || {
+                WorkerEvent::ShareDone(window, share::ensure_link_at(&control_socket_path(), &rel_path))
             }),
-            WorkerCommand::ShareSettings { rel_path, password, expires_at } => off_thread(&tx, &ctx, move || {
+            WorkerCommand::ShareSettings { window, rel_path, password, expires_at } => off_thread(&tx, &ctx, move || {
                 let result = share::settings_at(&control_socket_path(), &rel_path, password.as_ref().map(|p| p.as_deref()), expires_at);
-                WorkerEvent::ShareDone(rel_path, result)
+                WorkerEvent::ShareDone(window, result)
             }),
-            WorkerCommand::ShareRemoveLink { rel_path } => off_thread(&tx, &ctx, move || {
-                let result = share::remove_link_at(&control_socket_path(), &rel_path);
-                WorkerEvent::ShareDone(rel_path, result)
+            WorkerCommand::ShareRemoveLink { window, rel_path } => off_thread(&tx, &ctx, move || {
+                WorkerEvent::ShareDone(window, share::remove_link_at(&control_socket_path(), &rel_path))
             }),
-            WorkerCommand::ShareInvite { rel_path, emails, role } => off_thread(&tx, &ctx, move || {
-                let result = share::invite_at(&control_socket_path(), &rel_path, &emails, role);
-                WorkerEvent::ShareDone(rel_path, result)
+            WorkerCommand::ShareInvite { window, rel_path, emails, role } => off_thread(&tx, &ctx, move || {
+                WorkerEvent::ShareDone(window, share::invite_at(&control_socket_path(), &rel_path, &emails, role))
             }),
-            WorkerCommand::ShareRole { rel_path, email, role } => off_thread(&tx, &ctx, move || {
-                let result = share::role_at(&control_socket_path(), &rel_path, &email, role);
-                WorkerEvent::ShareDone(rel_path, result)
+            WorkerCommand::ShareRole { window, rel_path, email, role } => off_thread(&tx, &ctx, move || {
+                WorkerEvent::ShareDone(window, share::role_at(&control_socket_path(), &rel_path, &email, role))
             }),
-            WorkerCommand::ShareRemovePerson { rel_path, email } => off_thread(&tx, &ctx, move || {
-                let result = share::remove_person_at(&control_socket_path(), &rel_path, &email);
-                WorkerEvent::ShareDone(rel_path, result)
+            WorkerCommand::ShareRemovePerson { window, rel_path, email } => off_thread(&tx, &ctx, move || {
+                WorkerEvent::ShareDone(window, share::remove_person_at(&control_socket_path(), &rel_path, &email))
             }),
         }
     }
@@ -4012,7 +4015,7 @@ OPTIONS:
   --paused-until-min <N>  with --screenshot: show sync paused until N minutes from now (0: until resumed)
   --pause-choices       with --screenshot: show Home's Pause choices open
   --fake-share <S>      with --screenshot: show the Share window (for --share's item, else Docs/report.pdf in the
-                        drive) as S (none | link | link-password | people)
+                        drive) as S (none | link | link-password | link-expired | people)
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --version             print the version
   -h, --help            print this help
@@ -4159,7 +4162,7 @@ fn main() -> eframe::Result {
         Some(state) if screenshot_target.is_some() => {
             let info = share::fake_share_info(&state, home::now_ms(), home::local_offset_secs);
             if info.is_none() {
-                eprintln!("protondrive-gui: ignoring unknown --fake-share {state:?} (none | link | link-password | people)");
+                eprintln!("protondrive-gui: ignoring unknown --fake-share {state:?} (none | link | link-password | link-expired | people)");
             }
             info
         }
@@ -4820,6 +4823,7 @@ mod tests {
                 screenshot_requested: false,
                 last_poll: Instant::now(),
                 share: None,
+                share_left: Vec::new(),
             };
             let ctx = egui::Context::default();
             configure_proton_theme(&ctx);
@@ -4959,21 +4963,21 @@ mod tests {
                     WorkerCommand::StartLogin => Some("sign in".to_string()),
                     WorkerCommand::StartFresh => Some("start fresh".to_string()),
                     WorkerCommand::Logout => Some("sign out".to_string()),
-                    WorkerCommand::ShareLoad { rel_path } => Some(format!("share info {rel_path}")),
-                    WorkerCommand::SharePassword { rel_path } => Some(format!("share password {rel_path}")),
-                    WorkerCommand::ShareEnsureLink { rel_path } => Some(format!("share link on {rel_path}")),
-                    WorkerCommand::ShareRemoveLink { rel_path } => Some(format!("share link off {rel_path}")),
-                    WorkerCommand::ShareSettings { rel_path, password, expires_at } => Some(format!(
+                    WorkerCommand::ShareLoad { rel_path, .. } => Some(format!("share info {rel_path}")),
+                    WorkerCommand::SharePassword { rel_path, .. } => Some(format!("share password {rel_path}")),
+                    WorkerCommand::ShareEnsureLink { rel_path, .. } => Some(format!("share link on {rel_path}")),
+                    WorkerCommand::ShareRemoveLink { rel_path, .. } => Some(format!("share link off {rel_path}")),
+                    WorkerCommand::ShareSettings { rel_path, password, expires_at, .. } => Some(format!(
                         "share settings {}",
                         share::settings_body(&rel_path, password.as_ref().map(|p| p.as_deref()), expires_at)
                     )),
-                    WorkerCommand::ShareInvite { rel_path, emails, role } => {
+                    WorkerCommand::ShareInvite { rel_path, emails, role, .. } => {
                         Some(format!("share invite {rel_path} {} {}", emails.join(","), role.as_str()))
                     }
-                    WorkerCommand::ShareRole { rel_path, email, role } => {
+                    WorkerCommand::ShareRole { rel_path, email, role, .. } => {
                         Some(format!("share role {rel_path} {email} {}", role.as_str()))
                     }
-                    WorkerCommand::ShareRemovePerson { rel_path, email } => Some(format!("share remove {rel_path} {email}")),
+                    WorkerCommand::ShareRemovePerson { rel_path, email, .. } => Some(format!("share remove {rel_path} {email}")),
                     _ => None,
                 })
                 .collect()
@@ -6057,6 +6061,7 @@ mod tests {
         for cmd in &reads {
             assert!(allowed_in_screenshot_mode(cmd));
         }
+        let window = share::ShareWindow::new("/a.pdf").id;
         let writes = [
             WorkerCommand::TriggerSync,
             WorkerCommand::SetPaused { paused: true, until: None },
@@ -6077,14 +6082,14 @@ mod tests {
             WorkerCommand::ResolveFilesMissing { choice: MissingChoice::KeepOnlineOnly, root: "/r".into(), names: vec!["Docs".into()] },
             WorkerCommand::StartFresh,
             // The Share window's reads and changes: all over the control socket (#216)
-            WorkerCommand::ShareLoad { rel_path: "a.pdf".into() },
-            WorkerCommand::SharePassword { rel_path: "a.pdf".into() },
-            WorkerCommand::ShareEnsureLink { rel_path: "a.pdf".into() },
-            WorkerCommand::ShareSettings { rel_path: "a.pdf".into(), password: Some(None), expires_at: None },
-            WorkerCommand::ShareRemoveLink { rel_path: "a.pdf".into() },
-            WorkerCommand::ShareInvite { rel_path: "a.pdf".into(), emails: vec!["a@b.co".into()], role: share::Role::Viewer },
-            WorkerCommand::ShareRole { rel_path: "a.pdf".into(), email: "a@b.co".into(), role: share::Role::Editor },
-            WorkerCommand::ShareRemovePerson { rel_path: "a.pdf".into(), email: "a@b.co".into() },
+            WorkerCommand::ShareLoad { window, rel_path: "a.pdf".into() },
+            WorkerCommand::SharePassword { window, rel_path: "a.pdf".into() },
+            WorkerCommand::ShareEnsureLink { window, rel_path: "a.pdf".into() },
+            WorkerCommand::ShareSettings { window, rel_path: "a.pdf".into(), password: Some(None), expires_at: None },
+            WorkerCommand::ShareRemoveLink { window, rel_path: "a.pdf".into() },
+            WorkerCommand::ShareInvite { window, rel_path: "a.pdf".into(), emails: vec!["a@b.co".into()], role: share::Role::Viewer },
+            WorkerCommand::ShareRole { window, rel_path: "a.pdf".into(), email: "a@b.co".into(), role: share::Role::Editor },
+            WorkerCommand::ShareRemovePerson { window, rel_path: "a.pdf".into(), email: "a@b.co".into() },
         ];
         for cmd in &writes {
             assert!(!allowed_in_screenshot_mode(cmd));
@@ -6731,7 +6736,7 @@ mod tests {
         h.app.open_share("/home/u/ProtonDrive/Docs/report.pdf");
         assert_eq!(h.sent(), vec![format!("share info {SHARED}")], "opening it reads how the item is shared");
         if let Some(info) = info {
-            h.event(WorkerEvent::ShareLoaded(SHARED.into(), Ok(info)));
+            h.event(WorkerEvent::ShareLoaded(shown(&h), Ok(info)));
         }
         h.frames(3);
         h
@@ -6739,6 +6744,11 @@ mod tests {
 
     fn window(h: &mut Harness) -> &mut share::ShareWindow {
         h.app.share.as_mut().expect("the Share window is open")
+    }
+
+    /// The open Share window's id, which the daemon's answers to it carry.
+    fn shown(h: &Harness) -> share::WindowId {
+        h.app.share.as_ref().expect("the Share window is open").id
     }
 
     /// Where the last frame painted `text` on the row of `row` (the nearest one to it, up or down).
@@ -6762,17 +6772,18 @@ mod tests {
         let mut h = share_window(None);
         assert!(h.text_at("Share \"report.pdf\"").is_some(), "titled with the item's name");
         assert!(h.text_at("Loading…").is_some());
-        h.event(WorkerEvent::ShareLoaded(SHARED.into(), Ok(share::ShareInfo::default())));
+        h.event(WorkerEvent::ShareLoaded(shown(&h), Ok(share::ShareInfo::default())));
         assert!(h.text_at("Loading…").is_none());
         assert!(h.text_at("Off").is_some(), "no link: the switch is off");
         assert!(h.text_at("You").is_some() && h.text_at("Owner").is_some());
-        // An answer for another item (a window since replaced) changes nothing
-        h.event(WorkerEvent::ShareLoaded("Other.pdf".into(), Err("Not uploaded yet".into())));
+        // An answer for another window (one since replaced) changes nothing
+        let other = share::ShareWindow::new("/home/u/ProtonDrive/Other.pdf").id;
+        h.event(WorkerEvent::ShareLoaded(other, Err("Not uploaded yet".into())));
         assert!(h.text_at("Not uploaded yet").is_none());
 
         // The daemon's refusal is shown as it says it, and Try again reads again
         let refusal = "Not uploaded yet: Proton Drive can share it once it has uploaded";
-        h.event(WorkerEvent::ShareLoaded(SHARED.into(), Err(refusal.into())));
+        h.event(WorkerEvent::ShareLoaded(shown(&h), Err(refusal.into())));
         assert!(h.text_at(refusal).is_some());
         h.click(h.text_at("Try again").expect("a failed read can be tried again"));
         assert_eq!(h.sent(), vec![format!("share info {SHARED}")]);
@@ -6838,9 +6849,9 @@ mod tests {
         // Nothing more goes while it runs
         h.click(h.text_at("Off").unwrap());
         assert_eq!(h.sent(), Vec::<String>::new());
-        h.event(WorkerEvent::ShareDone(SHARED.into(), Ok(())));
+        h.event(WorkerEvent::ShareDone(shown(&h), Ok(())));
         assert_eq!(h.sent(), vec![format!("share info {SHARED}")], "it reads again after every change");
-        h.event(WorkerEvent::ShareLoaded(SHARED.into(), Ok(share::ShareInfo { link: Some(share_link(false, None)), people: vec![] })));
+        h.event(WorkerEvent::ShareLoaded(shown(&h), Ok(share::ShareInfo { link: Some(share_link(false, None)), people: vec![] })));
         assert!(h.text_at("Working…").is_none());
         assert!(h.text_at("Anyone with the link can view.").is_some());
 
@@ -6871,7 +6882,7 @@ mod tests {
         h.click(in_row(&h, "Password", "Show"));
         assert_eq!(h.sent(), vec![format!("share password {SHARED}")]);
         assert!(h.text_at("hunter2").is_none());
-        h.event(WorkerEvent::SharePassword(SHARED.into(), Ok(Some("hunter2".into()))));
+        h.event(WorkerEvent::SharePassword(shown(&h), Ok(Some("hunter2".into()))));
         assert!(h.text_at("hunter2").is_some());
         h.click(in_row(&h, "Password", "Hide"));
         assert!(h.text_at("hunter2").is_none());
@@ -6881,7 +6892,7 @@ mod tests {
         // An older link's password, which Proton Drive can't show here
         h.click(in_row(&h, "Password", "Show"));
         assert_eq!(h.sent(), vec![format!("share password {SHARED}")]);
-        h.event(WorkerEvent::SharePassword(SHARED.into(), Ok(None)));
+        h.event(WorkerEvent::SharePassword(shown(&h), Ok(None)));
         assert!(h.text_at(share::CANT_SHOW_PASSWORD).is_some());
     }
 
@@ -6899,17 +6910,17 @@ mod tests {
         h.click(h.text_at("Save").unwrap());
         let body = serde_json::json!({ "path": SHARED, "password": "n3w-pass" });
         assert_eq!(h.sent(), vec![format!("share settings {body}")]);
-        h.event(WorkerEvent::ShareDone(SHARED.into(), Ok(())));
+        h.event(WorkerEvent::ShareDone(shown(&h), Ok(())));
         assert_eq!(window(&mut h).password_editor, None, "the field closes once it is set");
         assert_eq!(h.sent(), vec![format!("share info {SHARED}")]);
 
-        h.event(WorkerEvent::ShareLoaded(SHARED.into(), Ok(share::ShareInfo { link: Some(share_link(true, None)), people: vec![] })));
+        h.event(WorkerEvent::ShareLoaded(shown(&h), Ok(share::ShareInfo { link: Some(share_link(true, None)), people: vec![] })));
         h.click(in_row(&h, "Password", "Remove"));
         let body = serde_json::json!({ "path": SHARED, "password": null });
         assert_eq!(h.sent(), vec![format!("share settings {body}")]);
         // A refusal is shown as the daemon words it, and the window reads again
         let refusal = "This link has expired: set a new expiry date, or remove the expiry, to change it";
-        h.event(WorkerEvent::ShareDone(SHARED.into(), Err(refusal.into())));
+        h.event(WorkerEvent::ShareDone(shown(&h), Err(refusal.into())));
         assert!(h.text_at(refusal).is_some());
         assert_eq!(h.sent(), vec![format!("share info {SHARED}")]);
     }
@@ -6927,13 +6938,13 @@ mod tests {
         h.click(h.text_at("Set").expect("the date's Set"));
         let body = serde_json::json!({ "path": SHARED, "expiresAt": share::end_of_day(today + 7, home::local_offset_secs) });
         assert_eq!(h.sent(), vec![format!("share settings {body}")]);
-        h.event(WorkerEvent::ShareDone(SHARED.into(), Ok(())));
+        h.event(WorkerEvent::ShareDone(shown(&h), Ok(())));
         assert_eq!(window(&mut h).expiry_editor, None);
         assert_eq!(h.sent(), vec![format!("share info {SHARED}")]);
         // The window waits for that read before taking another change
         h.click(in_row(&h, "Expires", "Set date…"));
         assert_eq!(window(&mut h).expiry_editor, None);
-        h.event(WorkerEvent::ShareLoaded(SHARED.into(), Ok(share::ShareInfo { link: Some(share_link(false, None)), people: vec![] })));
+        h.event(WorkerEvent::ShareLoaded(shown(&h), Ok(share::ShareInfo { link: Some(share_link(false, None)), people: vec![] })));
 
         // A date that isn't one is said so, and nothing is sent
         h.click(in_row(&h, "Expires", "Set date…"));
@@ -6944,7 +6955,7 @@ mod tests {
         assert!(h.text_at("Type the date as YYYY-MM-DD").is_some());
 
         let at = share::end_of_day(today + 3, home::local_offset_secs);
-        h.event(WorkerEvent::ShareLoaded(SHARED.into(), Ok(share::ShareInfo { link: Some(share_link(false, Some(at))), people: vec![] })));
+        h.event(WorkerEvent::ShareLoaded(shown(&h), Ok(share::ShareInfo { link: Some(share_link(false, Some(at))), people: vec![] })));
         h.click(in_row(&h, "Expires", "Remove"));
         let body = serde_json::json!({ "path": SHARED, "expiresAt": null });
         assert_eq!(h.sent(), vec![format!("share settings {body}")]);
@@ -6966,15 +6977,15 @@ mod tests {
         assert_eq!(h.sent(), vec![format!("share invite {SHARED} a@b.co,c@d.org editor")]);
         assert!(h.text_at("Not a valid email address: nope").is_none());
         // Refused: the addresses stay, to change and send again
-        h.event(WorkerEvent::ShareDone(SHARED.into(), Err("Already has access: change their role instead".into())));
+        h.event(WorkerEvent::ShareDone(shown(&h), Err("Already has access: change their role instead".into())));
         assert!(h.text_at("Already has access: change their role instead").is_some());
         assert_eq!(window(&mut h).invite_input, "a@b.co, c@d.org");
         assert_eq!(h.sent(), vec![format!("share info {SHARED}")]);
-        h.event(WorkerEvent::ShareLoaded(SHARED.into(), Ok(share::ShareInfo::default())));
+        h.event(WorkerEvent::ShareLoaded(shown(&h), Ok(share::ShareInfo::default())));
         assert!(h.text_at("Already has access: change their role instead").is_some(), "the refusal stays after the read");
         h.click(h.text_at("Invite").unwrap());
         assert_eq!(h.sent(), vec![format!("share invite {SHARED} a@b.co,c@d.org editor")]);
-        h.event(WorkerEvent::ShareDone(SHARED.into(), Ok(())));
+        h.event(WorkerEvent::ShareDone(shown(&h), Ok(())));
         assert_eq!(window(&mut h).invite_input, "", "invited: the field empties");
     }
 
@@ -7017,7 +7028,7 @@ mod tests {
         assert_eq!(h.sent(), vec![format!("share role {SHARED} alex@proton.me viewer")]);
         let alex = |h: &mut Harness| window(h).info.clone().unwrap().unwrap().people[0].role;
         assert_eq!(alex(&mut h), share::Role::Viewer, "shown at once");
-        h.event(WorkerEvent::ShareDone(SHARED.into(), Err("Proton Drive is offline".into())));
+        h.event(WorkerEvent::ShareDone(shown(&h), Err("Proton Drive is offline".into())));
         assert!(h.text_at("Proton Drive is offline").is_some());
         assert_eq!(h.sent(), vec![format!("share info {SHARED}")], "the roles as they are come back");
     }
@@ -7043,6 +7054,200 @@ mod tests {
         assert!(h.app.share.is_none());
     }
 
+    // Important 1: closing the window never waits for a change, but a change that then fails is still told
+    #[test]
+    fn a_change_that_fails_after_its_window_closed_is_told_in_the_notice() {
+        let offline = || Err("Proton Drive is offline".to_string());
+        // Done while the link is being turned off
+        let mut h = share_window(Some(with_people()));
+        let first = shown(&h);
+        h.click(h.text_at("On").expect("the link switch, on"));
+        h.click(h.text_at("Stop sharing").expect("the confirmation's button"));
+        assert_eq!(h.sent(), vec![format!("share link off {SHARED}")]);
+        h.click(h.text_at("Done").unwrap());
+        assert!(h.app.share.is_none(), "Done doesn't wait");
+        h.event(WorkerEvent::ShareDone(first, offline()));
+        assert_eq!(h.app.notice.as_deref(), Some("Couldn't stop sharing the link to report.pdf: Proton Drive is offline"));
+        assert!(h.text_at("Couldn't stop sharing the link to report.pdf: Proton Drive is offline").is_some(), "on Home");
+        assert_eq!(h.sent(), Vec::<String>::new(), "no window to read again for");
+        // Told once: a second answer for that window is nobody's
+        h.app.notice = None;
+        h.event(WorkerEvent::ShareDone(first, offline()));
+        assert_eq!(h.app.notice, None);
+
+        // Escape while someone's access is being removed
+        let mut h = share_window(Some(with_people()));
+        let second = shown(&h);
+        h.click(in_row(&h, "sam@proton.me", "×"));
+        h.click(h.text_at("Remove access").unwrap());
+        assert_eq!(h.sent(), vec![format!("share remove {SHARED} sam@proton.me")]);
+        press_key(&mut h, egui::Key::Escape);
+        assert!(h.app.share.is_none(), "Escape doesn't wait either");
+        h.event(WorkerEvent::ShareDone(second, offline()));
+        assert_eq!(h.app.notice.as_deref(), Some("Couldn't remove sam@proton.me's access to report.pdf: Proton Drive is offline"));
+
+        // Files' Share… for another item, while a password is being set: that window replaces this one
+        let mut h = share_window(Some(share::ShareInfo { link: Some(share_link(false, None)), people: vec![] }));
+        let third = shown(&h);
+        h.click(in_row(&h, "Password", "Set password"));
+        window(&mut h).password_editor = Some("n3w-pass".into());
+        h.frames(2);
+        h.click(h.text_at("Save").unwrap());
+        assert_eq!(h.sent().len(), 1);
+        h.app.open_share("/home/u/ProtonDrive/Notes/plan.txt");
+        assert_eq!(h.sent(), vec!["share info Notes/plan.txt".to_string()]);
+        h.event(WorkerEvent::ShareDone(third, Err("Timed out".into())));
+        assert_eq!(h.app.notice.as_deref(), Some("Couldn't change the password of the link to report.pdf: Timed out"));
+        assert_eq!(window(&mut h).error, None, "not shown in the other item's window");
+        assert_eq!(h.sent(), Vec::<String>::new(), "the open window is another item's: it has nothing to read again");
+
+        // One that went through says nothing
+        let mut h = share_window(Some(share::ShareInfo::default()));
+        let fourth = shown(&h);
+        h.click(h.text_at("Off").unwrap());
+        assert_eq!(h.sent(), vec![format!("share link on {SHARED}")]);
+        h.click(h.text_at("Done").unwrap());
+        h.event(WorkerEvent::ShareDone(fourth, Ok(())));
+        assert_eq!(h.app.notice, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    // Minor 3: an answer for a window since closed never lands in one opened again on the same item
+    #[test]
+    fn an_answer_for_a_closed_window_does_not_land_in_one_reopened_on_the_same_item() {
+        let mut h = share_window(Some(with_people()));
+        let closed = shown(&h);
+        h.click(in_row(&h, "alex@proton.me", "Editor"));
+        h.click(*h.text_at_all("Viewer").last().unwrap());
+        assert_eq!(h.sent(), vec![format!("share role {SHARED} alex@proton.me viewer")]);
+        press_key(&mut h, egui::Key::Escape);
+        assert!(h.app.share.is_none());
+        h.app.open_share("/home/u/ProtonDrive/Docs/report.pdf");
+        assert_eq!(h.sent(), vec![format!("share info {SHARED}")]);
+        assert_ne!(shown(&h), closed, "a window of its own");
+        // The closed window's read can't fill this one either
+        h.event(WorkerEvent::ShareLoaded(closed, Ok(share::ShareInfo::default())));
+        assert!(h.text_at("Loading…").is_some());
+        h.event(WorkerEvent::ShareLoaded(shown(&h), Ok(with_people())));
+        window(&mut h).invite_input = "kim@proton.me".into();
+        h.frames(2);
+        h.click(h.text_at("Invite").unwrap());
+        assert_eq!(h.sent(), vec![format!("share invite {SHARED} kim@proton.me viewer")]);
+        // The closed window's role change is answered: the new window still waits for its invitation
+        h.event(WorkerEvent::ShareDone(closed, Err("Proton Drive is offline".into())));
+        assert!(h.text_at("Working…").is_some(), "the invitation is still out");
+        assert!(h.text_at("Proton Drive is offline").is_none(), "not pinned on the invitation");
+        assert_eq!(window(&mut h).invite_input, "kim@proton.me");
+        assert_eq!(h.app.notice.as_deref(), Some("Couldn't change alex@proton.me's access to report.pdf: Proton Drive is offline"));
+        assert_eq!(h.sent(), Vec::<String>::new(), "it reads again once its own invitation is answered");
+        h.event(WorkerEvent::ShareDone(shown(&h), Ok(())));
+        assert_eq!(h.sent(), vec![format!("share info {SHARED}")]);
+        assert_eq!(window(&mut h).invite_input, "", "its own answer did land");
+    }
+
+    // A change from a closed window answered while one is open again on its item: what that one read may be from
+    // before the change, so it reads again
+    #[test]
+    fn a_window_open_again_on_the_item_reads_again_once_the_closed_ones_change_is_answered() {
+        let mut h = share_window(Some(share::ShareInfo { link: Some(share_link(false, None)), people: vec![] }));
+        let closed = shown(&h);
+        h.click(h.text_at("On").unwrap());
+        h.click(h.text_at("Stop sharing").unwrap());
+        assert_eq!(h.sent(), vec![format!("share link off {SHARED}")]);
+        h.click(h.text_at("Done").unwrap());
+        h.app.open_share("/home/u/ProtonDrive/Docs/report.pdf");
+        assert_eq!(h.sent(), vec![format!("share info {SHARED}")]);
+        // Read before the link went: it still shows it
+        h.event(WorkerEvent::ShareLoaded(shown(&h), Ok(share::ShareInfo { link: Some(share_link(false, None)), people: vec![] })));
+        h.event(WorkerEvent::ShareDone(closed, Ok(())));
+        assert_eq!(h.sent(), vec![format!("share info {SHARED}")]);
+        assert_eq!(h.app.notice, None);
+        h.event(WorkerEvent::ShareLoaded(shown(&h), Ok(share::ShareInfo::default())));
+        assert!(h.text_at("Off").is_some());
+    }
+
+    // Minor 7: Share… again on the same item reads again when nothing has been typed in its window, so an error the
+    // daemon gave earlier (Not uploaded yet, before the upload finished) doesn't stay
+    #[test]
+    fn share_again_on_the_same_item_reads_again_unless_something_is_typed() {
+        let mut h = share_window(None);
+        let refusal = "Not uploaded yet: Proton Drive can share it once it has uploaded";
+        h.event(WorkerEvent::ShareLoaded(shown(&h), Err(refusal.into())));
+        h.app.open_share("/home/u/ProtonDrive/Docs/report.pdf");
+        assert_eq!(h.sent(), vec![format!("share info {SHARED}")], "the error may be out of date");
+        h.event(WorkerEvent::ShareLoaded(shown(&h), Ok(share::ShareInfo::default())));
+        assert!(h.text_at(refusal).is_none());
+        // Nothing typed: it reads again; while that read is out, not twice
+        h.app.open_share("/home/u/ProtonDrive/Docs/report.pdf");
+        assert_eq!(h.sent(), vec![format!("share info {SHARED}")]);
+        h.app.open_share("/home/u/ProtonDrive/Docs/report.pdf");
+        assert_eq!(h.sent(), Vec::<String>::new());
+        h.event(WorkerEvent::ShareLoaded(shown(&h), Ok(share::ShareInfo::default())));
+        // Something typed: the window stays as it is
+        window(&mut h).invite_input = "a@b.co".into();
+        h.app.open_share("/home/u/ProtonDrive/Docs/report.pdf");
+        assert_eq!(h.sent(), Vec::<String>::new());
+        assert_eq!(window(&mut h).invite_input, "a@b.co");
+    }
+
+    // Minor 2: an expired link can't be copied (Files refuses it too); it says why and what to do
+    #[test]
+    fn an_expired_link_cant_be_copied_and_says_why() {
+        let yesterday = home::now_ms() - 86_400_000;
+        let mut h = share_window(Some(share::ShareInfo { link: Some(share_link(false, Some(yesterday))), people: vec![] }));
+        assert!(h.text_at(share::LINK_EXPIRED).is_some(), "says why");
+        assert!(h.text_at("Anyone with the link can view.").is_none(), "no one can, now");
+        let pos = h.text_at("Copy link").expect("Copy link, disabled");
+        h.click(pos);
+        let copied = h.last.as_ref().unwrap().platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(_)));
+        assert!(!copied, "nothing on the clipboard");
+        assert!(h.text_at("Copied").is_none());
+        // A new date makes it copyable again (and an older link, with no expiry, still copies)
+        let next_week = home::now_ms() + 7 * 86_400_000;
+        h.event(WorkerEvent::ShareLoaded(shown(&h), Ok(share::ShareInfo { link: Some(share_link(false, Some(next_week))), people: vec![] })));
+        assert!(h.text_at(share::LINK_EXPIRED).is_none());
+        let pos = h.text_at("Copy link").unwrap();
+        h.frame(vec![egui::Event::PointerMoved(pos)]);
+        let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        h.frame(vec![button(true)]);
+        h.frame(vec![button(false)]);
+        let copied = h.last.as_ref().unwrap().platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if t == LINK_URL));
+        assert!(copied);
+    }
+
+    /// Clicks the field showing `hint`, types `text` into it and presses Enter.
+    fn type_and_enter(h: &mut Harness, hint: &str, text: &str) {
+        h.click(h.text_at(hint).unwrap_or_else(|| panic!("the field {hint:?}")));
+        h.frame(vec![egui::Event::Text(text.into())]);
+        press_key(h, egui::Key::Enter);
+    }
+
+    // Minor 6: Enter sends what was typed, as the button beside each field does
+    #[test]
+    fn enter_in_the_invite_password_and_date_fields_sends_as_their_buttons_do() {
+        let mut h = share_window(Some(share::ShareInfo { link: Some(share_link(false, None)), people: vec![] }));
+        type_and_enter(&mut h, "email@example.com, …", "a@b.co c@d.org");
+        assert_eq!(h.sent(), vec![format!("share invite {SHARED} a@b.co,c@d.org viewer")]);
+        h.event(WorkerEvent::ShareDone(shown(&h), Ok(())));
+        h.event(WorkerEvent::ShareLoaded(shown(&h), Ok(share::ShareInfo { link: Some(share_link(false, None)), people: vec![] })));
+        assert_eq!(h.sent(), vec![format!("share info {SHARED}")]);
+
+        h.click(in_row(&h, "Password", "Set password"));
+        type_and_enter(&mut h, "New password", "n3w-pass");
+        let body = serde_json::json!({ "path": SHARED, "password": "n3w-pass" });
+        assert_eq!(h.sent(), vec![format!("share settings {body}")]);
+        h.event(WorkerEvent::ShareDone(shown(&h), Ok(())));
+        h.event(WorkerEvent::ShareLoaded(shown(&h), Ok(share::ShareInfo { link: Some(share_link(true, None)), people: vec![] })));
+        assert_eq!(h.sent(), vec![format!("share info {SHARED}")]);
+
+        h.click(in_row(&h, "Expires", "Set date…"));
+        let today = share::local_day(home::now_ms(), home::local_offset_secs);
+        let date = share::date_text(today + 2);
+        type_and_enter(&mut h, "YYYY-MM-DD", &date);
+        let body = serde_json::json!({ "path": SHARED, "expiresAt": share::end_of_day(today + 2, home::local_offset_secs) });
+        assert_eq!(h.sent(), vec![format!("share settings {body}")]);
+    }
+
     #[test]
     fn the_share_screenshots_fake_each_state() {
         let now = 1_793_750_400_000;
@@ -7052,6 +7257,8 @@ mod tests {
         assert!(!link.has_password && link.expires_at.is_none());
         let with_password = state("link-password").unwrap().link.unwrap();
         assert!(with_password.has_password && with_password.expires_at.is_some_and(|at| at > now));
+        let expired = state("link-expired").unwrap().link.unwrap();
+        assert!(!expired.has_password && expired.expires_at.is_some_and(|at| at < now && at > now - 2 * 86_400_000));
         let people = state("people").unwrap();
         assert!(people.link.is_some());
         let states: Vec<share::PersonState> = people.people.iter().map(|p| p.state).collect();
