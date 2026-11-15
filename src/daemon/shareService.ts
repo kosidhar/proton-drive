@@ -70,7 +70,9 @@ const shownUrl = (url: string) => (isOlderLink(url) ? url.split('#')[0] : url);
 // which counts every ServerError, refusals answered with an API code among them: those read as refused, not offline.
 const OFFLINE_ERRORS = new Set(['ConnectionError', 'TimeoutError', 'OfflineError', 'NetworkError']);
 function isOffline(e: unknown): boolean {
-    const err = e as { name?: string; message?: string; code?: string } | null;
+    const err = e as { name?: string; message?: string; code?: string; cause?: unknown } | null;
+    // The SDK wraps a failure it met while loading something else (ProtonDriveError 'Some items could not be loaded')
+    if (err?.cause && err.cause !== e && isOffline(err.cause)) return true;
     if (e instanceof ConnectionError || OFFLINE_ERRORS.has(err?.name ?? '')) return true;
     const text = `${err?.name ?? ''} ${err?.code ?? ''} ${err?.message ?? ''}`;
     return (
@@ -189,7 +191,35 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                 for await (const uid of sdk.iterateSharedNodeUids()) uids.push(uid);
                 const items: Array<SharedItem | null> = [];
                 const nodes: MaybeMissingNode[] = [];
-                for await (const n of sdk.iterateNodes(uids)) nodes.push(n);
+                const unreadable: SharedItem[] = [];
+                try {
+                    for await (const n of sdk.iterateNodes(uids)) nodes.push(n);
+                } catch (e) {
+                    if (isOffline(e)) throw e;
+                    // The SDK's batch loader throws after the nodes it could load, for ones it couldn't (a parent's key, say),
+                    // and reports no missing node then. Load the rest one at a time: one that still fails is listed as unreadable
+                    const loaded = new Set(nodes.map((n) => ('missingUid' in n ? n.missingUid : n.uid)));
+                    for (const uid of uids.filter((u) => !loaded.has(u))) {
+                        try {
+                            let any = false;
+                            for await (const n of sdk.iterateNodes([uid])) {
+                                nodes.push(n);
+                                any = true;
+                            }
+                            if (!any) throw new Error('not loaded');
+                        } catch (one) {
+                            if (isOffline(one)) throw one;
+                            unreadable.push({
+                                name: 'An item',
+                                relPath: null,
+                                where: 'elsewhere',
+                                link: null,
+                                people: 0,
+                                unreadable: "Proton Drive couldn't read this item",
+                            });
+                        }
+                    }
+                }
 
                 async function readOne(n: MaybeMissingNode): Promise<SharedItem | null> {
                     if ('missingUid' in n) {
@@ -234,7 +264,7 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                 };
                 await Promise.all(Array.from({ length: Math.min(LIST_CONCURRENCY, nodes.length) }, worker));
 
-                const listed = items.filter((i): i is SharedItem => i !== null);
+                const listed = [...items.filter((i): i is SharedItem => i !== null), ...unreadable];
                 const inFiles = listed.filter((i) => i.where !== 'elsewhere').sort((a, b) => byText(a.relPath ?? '', b.relPath ?? ''));
                 const elsewhere = listed.filter((i) => i.where === 'elsewhere').sort((a, b) => byText(a.name, b.name));
                 return [...inFiles, ...elsewhere];

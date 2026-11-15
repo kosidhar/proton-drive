@@ -633,6 +633,8 @@ describe('list', () => {
         sharing?: Record<string, any>;
         fails?: Record<string, unknown>;
         places?: Record<string, { relPath: string; hidden: boolean } | null>;
+        // Replaces iterateNodes: as the SDK's batch loader, which may throw after yielding the nodes it could load
+        iterateNodes?: (uids: string[]) => AsyncGenerator<any>;
     }) {
         const logs: unknown[] = [];
         let active = 0;
@@ -642,6 +644,7 @@ describe('list', () => {
                 for (const n of opts.nodes) yield n.uid ?? n.missingUid;
             },
             async *iterateNodes(uids: string[]) {
+                if (opts.iterateNodes) return yield* opts.iterateNodes(uids);
                 for (const uid of uids) yield opts.nodes.find((n) => (n.uid ?? n.missingUid) === uid);
             },
             async getSharingInfo(uid: string) {
@@ -771,5 +774,41 @@ describe('list', () => {
         expect(JSON.stringify(items)).not.toContain('customPassword');
         expect(JSON.stringify(items)).not.toContain('mypassword');
         expect(logs).toEqual([]);
+    });
+
+    test("one node the SDK can't load leaves the rest of the list unaffected", async () => {
+        const all = ['a', 'b', 'c'].map((u) => node(u, u));
+        const { svc } = listSetup({
+            nodes: all,
+            sharing: { a: shared(), b: shared(), c: shared() },
+            places: { a: { relPath: 'a', hidden: false }, b: { relPath: 'b', hidden: false } },
+            // The batch yields a, then throws as the SDK does ("Some items could not be loaded"); one at a time, c still fails
+            async *iterateNodes(uids) {
+                if (uids.length > 1) {
+                    yield all[0];
+                    throw new Error('Some items could not be loaded');
+                }
+                if (uids[0] === 'c') throw new Error('parent key');
+                yield all.find((n) => n.uid === uids[0]);
+            },
+        });
+        expect(await svc.list()).toEqual([
+            { name: 'a', relPath: 'a', where: 'my-files', link: expect.anything(), people: 3 },
+            { name: 'b', relPath: 'b', where: 'my-files', link: expect.anything(), people: 3 },
+            { name: 'An item', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: "Proton Drive couldn't read this item" },
+        ]);
+    });
+
+    test('offline wrapped by the SDK while loading nodes is the offline refusal', async () => {
+        const { svc } = listSetup({
+            nodes: [node('a', 'a')],
+            sharing: { a: shared() },
+            async *iterateNodes() {
+                throw new Error('Some items could not be loaded', { cause: new ConnectionError('down') });
+            },
+        });
+        const e = await rejects(svc.list());
+        expect(e).toBeInstanceOf(ShareError);
+        expect(e.message).toBe('Proton Drive is offline: try again when you are connected');
     });
 });
