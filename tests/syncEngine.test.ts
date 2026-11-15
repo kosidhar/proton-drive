@@ -5,12 +5,14 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import {
+    AbortError,
     ConnectionError,
     type DriveEvent,
     DriveEventType,
     type NodeEntity,
     NodeType,
     type ProtonDriveClient,
+    RateLimitedError,
     ValidationError,
 } from '@protontech/drive-sdk';
 
@@ -5556,8 +5558,9 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await d.expectEveryRecordHasItsFile();
         });
 
-        // #234: the move still reaches Proton Drive before the delete, so the item is in its trash from where it was put
-        test('a move still waiting for its folder runs before the delete of the item: the folder is made, the item moved into it, then trashed', async () => {
+        // #234: an item deleted since its move is never moved in Proton Drive, nor a folder made for it (only a new name
+        // goes, in the folder it is in there)
+        test('a move still waiting for its folder is skipped once the item is deleted, and the delete reaches the cloud at once', async () => {
             const d = setup();
             d.add('Docs/a.txt', 'a');
             await pinnedAndSynced(d, d.add('Docs').uid);
@@ -5569,22 +5572,17 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             d.down.clear();
             await d.engine.replayRemoteOps();
 
-            const created = d.named('vol~Docs', 'New');
-            expect(created.length).toBe(1); // the folder is still here, so it goes to Proton Drive anyway
-            expect(d.calls.moved).toEqual([{ uid: 'vol~Docs/a.txt', parentUid: created[0]!.uid }]);
             expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+            expect(d.calls.moved).toEqual([]);
+            expect(d.named('vol~Docs', 'New')).toEqual([]); // nothing was made for it
             expect(d.journal()).toEqual([]);
             expect(await d.files.exists('Docs/New/a.txt')).toBe(false);
             expect(await d.files.exists('Docs/New')).toBe(true);
-            await d.engine.reconcileNow();
-            expect(d.named('vol~Docs', 'New').length).toBe(1);
-            expect(d.calls.uploads).toEqual([]);
-            expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
-            await d.expectEveryRecordHasItsFile();
         });
 
-        // #234: renames and moves of an item still on their way to Proton Drive when it is deleted reach it first, so the
-        // item is in the Proton Drive trash under the name, and from the folder, the user last gave it
+        // #234: the new name of an item still on its way to Proton Drive when the item is deleted reaches it first, in the
+        // folder Proton Drive has it in, so the item is in the Proton Drive trash under the name the user last gave it.
+        // It is never moved into another folder first (one shared, say, would show it until the trash lands).
         describe('a rename or move followed by a delete, before they reached Proton Drive (#234)', () => {
             // What Proton Drive trashed, with the name and folder each item had there then
             const trashedAs = (d: ReturnType<typeof setup>) => {
@@ -5663,7 +5661,27 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.expectEveryRecordHasItsFile();
             });
 
-            test('moved twice, then deleted: one move, to the last folder (and name), then the trash from there', async () => {
+            test('moved to another folder, then deleted: no move, and the trash takes the item from where Proton Drive has it', async () => {
+                const d = await heldBack({ 'Docs/a.txt': 'a', 'Other/x.txt': 'x' });
+
+                await d.engine.renameItem('Docs/a.txt', 'Other/a.txt');
+                await d.engine.deleteItem('Other/a.txt');
+                await d.resume();
+
+                expect(d.calls.moved).toEqual([]);
+                expect(d.calls.renamed).toEqual([]);
+                expect(d.trashed).toEqual([{ uid: 'vol~Docs/a.txt', name: 'a.txt', parentUid: 'vol~Docs' }]);
+                expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+                expect(trashLogged()).toEqual(['Docs/a.txt']);
+                expect(d.journal()).toEqual([]);
+                expect(d.nodes.get('vol~Other/x.txt')?.content).toBe('x');
+                await d.engine.reconcileNow();
+                expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+                expect(d.calls.uploads).toEqual([]);
+                await d.expectEveryRecordHasItsFile();
+            });
+
+            test('moved twice, to another folder under a new name, then deleted: only the last name, in place, then the trash', async () => {
                 const d = await heldBack({ 'Docs/a.txt': 'a', 'Other/x.txt': 'x', 'Archive/y.txt': 'y' });
 
                 await d.engine.renameItem('Docs/a.txt', 'Other/a.txt');
@@ -5671,11 +5689,11 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.engine.deleteItem('Archive/b.txt');
                 await d.resume();
 
-                expect(d.calls.moved).toEqual([{ uid: 'vol~Docs/a.txt', parentUid: 'vol~Archive' }]);
+                expect(d.calls.moved).toEqual([]);
                 expect(d.calls.renamed).toEqual([{ uid: 'vol~Docs/a.txt', name: 'b.txt' }]);
-                expect(d.trashed).toEqual([{ uid: 'vol~Docs/a.txt', name: 'b.txt', parentUid: 'vol~Archive' }]);
+                expect(d.trashed).toEqual([{ uid: 'vol~Docs/a.txt', name: 'b.txt', parentUid: 'vol~Docs' }]);
                 expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
-                expect(trashLogged()).toEqual(['Archive/b.txt']);
+                expect(trashLogged()).toEqual(['Docs/b.txt']);
                 expect(d.journal()).toEqual([]);
                 expect(d.nodes.get('vol~Other/x.txt')?.content).toBe('x');
                 expect(d.nodes.get('vol~Archive/y.txt')?.content).toBe('y');
@@ -5683,6 +5701,52 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
                 expect(d.calls.uploads).toEqual([]);
                 await d.expectEveryRecordHasItsFile();
+            });
+
+            test('moved into a folder made here under a new name, then deleted: the replay makes no folder for it, and renames it in place', async () => {
+                const d = setup();
+                d.add('Docs/a.txt', 'a');
+                await pinnedAndSynced(d, d.root.uid);
+                const trashed = trashedAs(d);
+                await mkdir(d.local('Docs/New'));
+                d.down.add('getNode'); // offline: the changes wait, and no sync pass runs
+
+                await d.engine.renameItem('Docs/a.txt', 'Docs/New/b.txt');
+                await d.engine.deleteItem('Docs/New/b.txt');
+                d.down.clear();
+                await d.engine.replayRemoteOps();
+
+                expect(d.named('vol~Docs', 'New')).toEqual([]);
+                expect(d.calls.moved).toEqual([]);
+                expect(d.calls.renamed).toEqual([{ uid: 'vol~Docs/a.txt', name: 'b.txt' }]);
+                expect(trashed).toEqual([{ uid: 'vol~Docs/a.txt', name: 'b.txt', parentUid: 'vol~Docs' }]);
+                expect(trashLogged()).toEqual(['Docs/b.txt']);
+                expect(d.journal()).toEqual([]);
+                // The folder, still here, goes to Proton Drive as any folder made here does: empty
+                await d.engine.reconcileNow();
+                const made = d.named('vol~Docs', 'New');
+                expect(made.length).toBe(1);
+                expect([...d.nodes.values()].filter((n) => n.parentUid === made[0]!.uid)).toEqual([]);
+                expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+                expect(d.calls.uploads).toEqual([]);
+                await d.expectEveryRecordHasItsFile();
+            });
+
+            // Probe P3 of the review: the folder can't be made there at all, and it doesn't matter
+            test('a move into a folder Proton Drive has a file in place of does not hold up the delete, and nothing is made or moved', async () => {
+                const d = await heldBack({ 'Docs/a.txt': 'a' });
+                await mkdir(d.local('Docs/New'));
+                await d.engine.renameItem('Docs/a.txt', 'Docs/New/a.txt');
+                await d.engine.deleteItem('Docs/New/a.txt');
+                d.add('Docs/New', 'a file of that name, made on the web');
+
+                await d.resume();
+
+                expect(d.calls.moved).toEqual([]);
+                expect(d.calls.renamed).toEqual([]);
+                expect(d.trashed).toEqual([{ uid: 'vol~Docs/a.txt', name: 'a.txt', parentUid: 'vol~Docs' }]);
+                expect(d.journal()).toEqual([]);
+                expect(d.named('vol~Docs', 'New').map((n) => n.content)).toEqual(['a file of that name, made on the web']);
             });
 
             test('a folder renamed, then deleted: the rename, then one trash of the folder, with what is in it', async () => {
@@ -5725,6 +5789,9 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             for (const [how, error] of [
                 ['offline', () => new ConnectionError('Network unreachable')],
                 ['the server failing (503)', () => new APIHTTPError('Service Unavailable', 503)],
+                ['an expired session (401)', () => new APIHTTPError('Unauthorized', 401)],
+                ['a rate limit', () => new RateLimitedError('Too many requests')],
+                ['an aborted request', () => new AbortError('Operation aborted')],
             ] as const) {
                 test(`a rename failing because of ${how} keeps the order: the trash waits for it, and goes after it`, async () => {
                     const d = await heldBack({ 'Docs/a.txt': 'a' });
@@ -5805,6 +5872,115 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(refusals).toBe(1);
                 });
             }
+
+            // The delete arrives while the rename is on its way, and Proton Drive then finds the name taken
+            test('a delete arriving while the rename is in flight, its name taken there: no conflict name, no notice, and the trash goes', async () => {
+                const d = await heldBack({ 'Docs/a.txt': 'mine' });
+                await d.engine.renameItem('Docs/a.txt', 'Docs/b.txt');
+                d.add('Docs/b.txt', 'theirs'); // made on the web meanwhile
+                const rename = (d.sdk as any).renameNode;
+                let first = true;
+                (d.sdk as any).renameNode = async (uid: string, name: string) => {
+                    if (first) {
+                        first = false;
+                        await d.engine.deleteItem('Docs/b.txt');
+                    }
+                    return rename(uid, name);
+                };
+
+                await d.resume();
+                await d.engine.replayRemoteOps();
+
+                expect(d.calls.renamed).toEqual([]);
+                expect(d.trashed).toEqual([{ uid: 'vol~Docs/a.txt', name: 'a.txt', parentUid: 'vol~Docs' }]);
+                expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+                expect(d.nodes.get('vol~Docs/b.txt')?.content).toBe('theirs');
+                expect(d.journal()).toEqual([]);
+                expect(actions('conflict')).toEqual([]);
+                expect(actions('error')).toEqual([]);
+            });
+
+            // The rename that lands says where it put the item, not where the item has been moved here since
+            test('moved here again while its rename is in flight, then deleted: the trash names the item where Proton Drive has it', async () => {
+                const d = await heldBack({ 'Docs/a.txt': 'a', 'Other/x.txt': 'x' });
+                await d.engine.renameItem('Docs/a.txt', 'Docs/b.txt');
+                const rename = (d.sdk as any).renameNode;
+                let first = true;
+                (d.sdk as any).renameNode = async (uid: string, name: string) => {
+                    if (first) {
+                        first = false;
+                        await d.engine.renameItem('Docs/b.txt', 'Other/b.txt');
+                        await d.engine.deleteItem('Other/b.txt');
+                    }
+                    return rename(uid, name);
+                };
+
+                await d.resume();
+                await d.engine.replayRemoteOps();
+
+                expect(d.calls.renamed).toEqual([{ uid: 'vol~Docs/a.txt', name: 'b.txt' }]);
+                expect(d.calls.moved).toEqual([]);
+                expect(d.trashed).toEqual([{ uid: 'vol~Docs/a.txt', name: 'b.txt', parentUid: 'vol~Docs' }]);
+                expect(trashLogged()).toEqual(['Docs/b.txt']);
+                expect(d.journal()).toEqual([]);
+            });
+
+            // Probe P1 of the review: the rename landed, its trash didn't yet
+            test('the rename lands and its trash waits: a sync pass meanwhile downloads, lists and uploads nothing of the item', async () => {
+                const d = await heldBack({ 'Docs/a.txt': 'a', 'Docs/keep.txt': 'k' });
+                await d.engine.renameItem('Docs/a.txt', 'Docs/b.txt');
+                await d.engine.deleteItem('Docs/b.txt');
+                d.down.add('trashNodes');
+
+                await d.resume();
+
+                expect(d.calls.renamed).toEqual([{ uid: 'vol~Docs/a.txt', name: 'b.txt' }]);
+                expect(d.journal()).toMatchObject([{ kind: 'trash', path: 'Docs/b.txt' }]);
+                const downloads = d.calls.downloads.length;
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+                expect(d.calls.downloads.length).toBe(downloads);
+                expect(d.calls.uploads).toEqual([]);
+                expect(await d.files.exists('Docs/a.txt')).toBe(false);
+                expect(await d.files.exists('Docs/b.txt')).toBe(false);
+                expect(d.engine.vfsChildren('Docs').map((e) => e.name)).toEqual(['keep.txt']);
+                d.down.clear();
+                await d.engine.replayRemoteOps();
+                expect(d.trashed).toEqual([{ uid: 'vol~Docs/a.txt', name: 'b.txt', parentUid: 'vol~Docs' }]);
+                expect(d.journal()).toEqual([]);
+                await d.engine.reconcileNow();
+                expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+                expect(d.calls.uploads).toEqual([]);
+                await d.expectEveryRecordHasItsFile();
+            });
+
+            // Probe P5 of the review: the doomed item now has the name a new file here takes
+            test('a new file at the new name while the trash waits is never written onto the doomed item, and uploads as its own', async () => {
+                const d = await heldBack({ 'Docs/a.txt': 'a', 'Docs/keep.txt': 'k' });
+                await d.engine.renameItem('Docs/a.txt', 'Docs/b.txt');
+                await d.engine.deleteItem('Docs/b.txt');
+                await d.files.writeLocal('Docs/b.txt', 'brand new');
+                d.down.add('trashNodes');
+                await d.resume();
+                expect(d.calls.renamed).toEqual([{ uid: 'vol~Docs/a.txt', name: 'b.txt' }]);
+
+                await (d.engine as any).handleLocalFileChangeNow('Docs/b.txt'); // as the watcher reports it
+                await d.engine.reconcileNow();
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('a');
+                d.down.clear();
+                await d.engine.replayRemoteOps();
+                await d.engine.reconcileNow();
+                await d.engine.reconcileNow();
+
+                expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+                expect(await readFile(d.local('Docs/b.txt'), 'utf8')).toBe('brand new');
+                const there = d.named('vol~Docs', 'b.txt');
+                expect(there.map((n) => n.content)).toEqual(['brand new']);
+                expect(there[0]!.uid).not.toBe('vol~Docs/a.txt');
+                expect(stateDb.getItemByPath('Docs/b.txt')?.nodeUid).toBe(there[0]!.uid);
+                await d.expectEveryRecordHasItsFile();
+            });
 
             test('an item trashed on the web before its rename and delete arrive is let go quietly', async () => {
                 const d = await heldBack({ 'Docs/a.txt': 'a' });
