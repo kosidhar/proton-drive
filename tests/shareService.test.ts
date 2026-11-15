@@ -368,6 +368,66 @@ describe('Copy Link while the SDK has not heard of a link made elsewhere', () =>
     });
 });
 
+// Findings 4 and 5: Copy Link hands out a link only as it works, and a link's password only through password()
+describe("links Copy Link doesn't hand out", () => {
+    const linkWrites = (fake: ReturnType<typeof makeFake>) => fake.calls.filter((c) => c.fn === 'shareNode' && c.args[1].urlAccess !== undefined);
+
+    test('an expired link is refused, never renewed', async () => {
+        for (const at of [500, 1000]) {
+            const { svc, fake, logs } = setup(shared({ urlAccess: { ...shared().urlAccess, expirationTime: new Date(at) } }));
+            const e = await rejects(svc.ensureLink('a.txt'));
+            expect(e).toBeInstanceOf(ShareError);
+            expect(e.message).toBe('The link to a.txt has expired: set a new expiry in Share… to use it again');
+            expect(linkWrites(fake)).toEqual([]);
+            expect(logs).toEqual([]);
+        }
+        // Found only through shareNode, as when the SDK's cache doesn't know of the share yet
+        const { svc, fake } = setup(undefined);
+        const real = shared({ urlAccess: { ...shared().urlAccess, expirationTime: new Date(1000) } });
+        fake.sdk.shareNode = async (...args: any[]) => {
+            fake.calls.push({ fn: 'shareNode', args });
+            return real;
+        };
+        expect((await rejects(svc.ensureLink('a.txt'))).message).toContain('has expired');
+        expect(linkWrites(fake)).toEqual([]);
+        // A link expiring later is handed out
+        expect(await setup(shared({ urlAccess: { ...shared().urlAccess, expirationTime: new Date(1001) } })).svc.ensureLink('a.txt')).toEqual({
+            url: LINK_URL,
+            created: false,
+        });
+    });
+
+    // An older Proton Drive made links with no generated password: the SDK puts the user's own password after the '#'
+    // and leaves customPassword empty
+    const legacy = (url: string) => shared({ urlAccess: { ...shared().urlAccess, url, customPassword: undefined } });
+    const LEGACY_URLS = [
+        'https://drive.proton.me/urls/X#myOwnPassword1',
+        'https://drive.proton.me/urls/X#short',
+        'https://drive.proton.me/urls/X#abcdefghijkl#xyz',
+        'https://drive.proton.me/urls/X',
+    ];
+
+    test("an older link's URL is shown without its password, as a link with a password", async () => {
+        for (const url of LEGACY_URLS) {
+            const info = await setup(legacy(url)).svc.info('a.txt');
+            expect([url, info.link]).toEqual([url, { url: 'https://drive.proton.me/urls/X', hasPassword: true, expiresAt: EXPIRY.getTime(), role: 'viewer' }]);
+        }
+        expect(JSON.stringify(await setup(legacy(LEGACY_URLS[0])).svc.info('a.txt'))).not.toContain('myOwnPassword1');
+    });
+
+    test("an older link's password is never handed out, and Copy Link refuses it", async () => {
+        for (const url of LEGACY_URLS) {
+            const t = setup(legacy(url));
+            expect(await t.svc.password('a.txt')).toBeNull();
+            const e = await rejects(t.svc.ensureLink('a.txt'));
+            expect(e).toBeInstanceOf(ShareError);
+            expect(e.message).toBe('This link was made with an older Proton Drive: open it on drive.proton.me to copy it');
+            expect(linkWrites(t.fake)).toEqual([]);
+            expect(t.logs).toEqual([]);
+        }
+    });
+});
+
 // Finding 2: an operation reads the item's sharing and then writes it whole, so two at once undid one another
 describe('share operations on one item run one at a time', () => {
     const tick = () => new Promise((r) => setTimeout(r, 5));
