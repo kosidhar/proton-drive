@@ -908,6 +908,59 @@ describe('list', () => {
         expect(e.message).toBe('Proton Drive is offline: try again when you are connected');
     });
 
+    const LOCAL = "Proton Drive couldn't read this item on this computer";
+
+    test('an index lookup that throws for one item lists that item as unreadable and leaves the rest alone', async () => {
+        const sdk: any = {
+            async *iterateSharedNodeUids() {
+                yield* ['a', 'b', 'c'];
+            },
+            async *iterateNodes(uids: string[]) {
+                for (const uid of uids) yield node(uid, `${uid}.txt`);
+            },
+            async getSharingInfo() {
+                return shared();
+            },
+        };
+        const svc = createShareService({
+            sdk,
+            nodeFor: () => ({ refused: 'unused' }),
+            placeOf: (uid) => {
+                if (uid === 'b') throw new Error('SQLITE_IOERR: disk I/O error');
+                return { relPath: `docs/${uid}.txt`, hidden: false };
+            },
+            logActivity() {},
+            now: () => 1000,
+        });
+        const items = await svc.list();
+        expect(items.map((i) => [i.name, i.where, i.relPath, i.unreadable])).toEqual([
+            ['a.txt', 'my-files', 'docs/a.txt', undefined],
+            ['c.txt', 'my-files', 'docs/c.txt', undefined],
+            ['b.txt', 'elsewhere', null, LOCAL],
+        ]);
+        expect(items[2]).toEqual({ name: 'b.txt', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: LOCAL });
+    });
+
+    test('a sharing result the daemon cannot read lists that item as unreadable, with the place it knows', async () => {
+        const broken = { ...shared(), urlAccess: { ...shared().urlAccess, url: undefined } };
+        const { svc } = listSetup({
+            nodes: [node('a', 'a.txt'), node('b', 'b.txt'), node('c', 'c.txt')],
+            sharing: { a: shared(), b: broken, c: shared() },
+            places: {
+                a: { relPath: 'a.txt', hidden: false },
+                b: { relPath: 'docs/b.txt', hidden: true },
+                c: { relPath: 'c.txt', hidden: false },
+            },
+        });
+        const items = await svc.list();
+        expect(items.map((i) => [i.name, i.unreadable])).toEqual([
+            ['a.txt', undefined],
+            ['c.txt', undefined],
+            ['b.txt', LOCAL],
+        ]);
+        expect(items.find((i) => i.name === 'b.txt')).toEqual({ name: 'b.txt', relPath: 'docs/b.txt', where: 'hidden', link: null, people: 0, unreadable: LOCAL });
+    });
+
     test('never more than 4 sharing reads at once, and all 60 items listed in order', async () => {
         expect(LIST_CONCURRENCY).toBe(4);
         const nodes: any[] = [];
