@@ -2,6 +2,7 @@ mod activity;
 mod home;
 mod settings;
 mod share;
+mod shared;
 mod single_instance;
 
 use std::process::Command;
@@ -5338,6 +5339,42 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
         let (sock, server) = serve_once(b"HTTP/1.1 404 Not Found\r\n\r\n");
         assert_eq!(hidden_items_at(&sock).unwrap_err(), HIDDEN_NEEDS_RESTART);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn the_shared_list_and_stop_sharing_go_over_the_control_socket() {
+        let reply: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"items\":[{\"name\":\"a.txt\",\"relPath\":\"a.txt\",\"where\":\"my-files\",\"link\":null,\"people\":1}]}";
+        let (sock, server) = serve_once(reply);
+        let items = share::list_at(&sock).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "a.txt");
+        assert!(server.join().unwrap().starts_with("GET /share/list HTTP/1.1\r\n"));
+        let _ = std::fs::remove_file(&sock);
+
+        // Not what it can't read, in serde's words
+        let (sock, server) = serve_once(b"HTTP/1.1 200 OK\r\n\r\n{\"items\":[{\"name\":\"secret@x.com\"}]}");
+        assert_eq!(share::list_at(&sock).unwrap_err(), "Unreadable reply from the Proton Drive background service");
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+
+        let (sock, server) = serve_once(b"HTTP/1.1 200 OK\r\n\r\n{\"link\":null,\"people\":[]}");
+        share::stop_sharing_at(&sock, "Docs/a b.txt").unwrap();
+        let request = server.join().unwrap();
+        assert!(request.starts_with("DELETE /share/all HTTP/1.1\r\n"), "{request}");
+        assert!(request.ends_with(r#"{"path":"Docs/a b.txt"}"#), "{request}");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn list_at_against_a_daemon_without_the_route_says_restart() {
+        let (sock, server) = serve_once(b"HTTP/1.1 404 Not Found\r\n\r\n{\"error\":\"Not found\"}");
+        assert_eq!(share::list_at(&sock).unwrap_err(), share::SHARE_NEEDS_RESTART);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+        let (sock, server) = serve_once(b"HTTP/1.1 404 Not Found\r\n\r\n");
+        assert_eq!(share::stop_sharing_at(&sock, "a").unwrap_err(), share::SHARE_NEEDS_RESTART);
         server.join().unwrap();
         let _ = std::fs::remove_file(&sock);
     }

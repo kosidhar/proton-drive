@@ -331,6 +331,26 @@ pub fn remove_person_at(socket: &Path, rel_path: &str, email: &str) -> Result<()
     share_change(socket, "DELETE", "/share/person", serde_json::json!({ "path": rel_path, "email": email }))
 }
 
+/// Everything the account shares (GET /share/list). Read with the longer timeout: the listing grows with the number of
+/// shared items (#257).
+// Used by Task 5 (the page's worker)
+#[allow(dead_code)]
+pub fn list_at(socket: &Path) -> Result<Vec<crate::shared::SharedItem>, String> {
+    #[derive(Deserialize)]
+    struct Reply {
+        items: Vec<crate::shared::SharedItem>,
+    }
+    let reply = share_request(socket, "GET", "/share/list", None, SHARE_WRITE_TIMEOUT)?;
+    serde_json::from_value::<Reply>(reply).map(|r| r.items).map_err(|_| UNREADABLE.to_string())
+}
+
+/// Stops all sharing of an item: its link and everyone invited (DELETE /share/all).
+// Used by Task 6 (stopping)
+#[allow(dead_code)]
+pub fn stop_sharing_at(socket: &Path, rel_path: &str) -> Result<(), String> {
+    share_change(socket, "DELETE", "/share/all", serde_json::json!({ "path": rel_path }))
+}
+
 /// Screenshot-only: `--fake-share <state>`, how the item is shared in each state the window shows (none, a link, a link
 /// with a password and an expiry a week out, a link that expired yesterday, and a link with three people: a member
 /// editor, a Proton invitation and an invitation by email); None for an unknown state.
