@@ -1,6 +1,6 @@
 # Share from Files and the app
 
-Tracking issue: #216. Proposed on 2026-11-04 and awaiting the user's approval.
+Tracking issue: #216. Approved by the user on 2026-11-14 ("design looks good, start building").
 
 ## Why
 
@@ -129,7 +129,8 @@ window in front of whatever section is open.
 
 - **The SDK calls stay in the daemon.** The app and the extension only call the control socket, as every other action
   does.
-- **No new route on the TCP API.** `tcpRefusals.ts` lists `/share/*` with "Share from the Proton Drive app".
+- **No new route on the TCP API.** The TCP API has no `/share` routes: they exist only on the control socket.
+  (`tcpRefusals.ts` doesn't list them: `refuseOnTcp` refuses exact `/api/*` paths that moved to the control socket.)
 - **Tests, in each layer:**
   - daemon: the routes against a mocked SDK (path to node, not uploaded, the no-password guarantees, Copy Link
     reusing a link);
