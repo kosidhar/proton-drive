@@ -333,8 +333,6 @@ pub fn remove_person_at(socket: &Path, rel_path: &str, email: &str) -> Result<()
 
 /// Everything the account shares (GET /share/list). Read with the longer timeout: the listing grows with the number of
 /// shared items (#257).
-// Used by Task 5 (the page's worker)
-#[allow(dead_code)]
 pub fn list_at(socket: &Path) -> Result<Vec<crate::shared::SharedItem>, String> {
     #[derive(Deserialize)]
     struct Reply {

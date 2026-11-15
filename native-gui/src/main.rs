@@ -199,6 +199,7 @@ fn btn_secondary_hover_bg() -> Color32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NavTab {
     Home,
+    Shared,
     Activity,
     Settings,
 }
@@ -209,6 +210,7 @@ fn parse_tab(name: &str) -> NavTab {
     match name {
         "activity" | "overview" => NavTab::Activity,
         "settings" => NavTab::Settings,
+        "shared" => NavTab::Shared,
         _ => NavTab::Home,
     }
 }
@@ -964,6 +966,8 @@ enum WorkerCommand {
     ResolveFilesMissing { choice: MissingChoice, root: String, names: Vec<String> },
     /// Start fresh with the account signed in to (POST /account/start-fresh, #35)
     StartFresh,
+    /// What is shared, for the Shared section (a read, over the control socket)
+    SharedLoad,
     /// The Share window (#216), each over the control socket for the item at `rel_path` (inside My files), and
     /// answered to the `window` that asked: how it is shared (a read)
     ShareLoad { window: share::WindowId, rel_path: String },
@@ -1094,6 +1098,8 @@ enum WorkerEvent {
     /// What was asked about the missing files (deleted on purpose, or kept online-only) went through, or why not
     FilesMissingDone(Result<(), String>),
     StartFreshDone(Result<(), String>),
+    /// What the Shared section lists, or why that couldn't be read (#253)
+    SharedLoaded(Result<Vec<shared::SharedItem>, String>),
     /// How the item of the Share window that asked is shared, or why that couldn't be read (#216)
     ShareLoaded(share::WindowId, Result<share::ShareInfo, String>),
     /// A change made in that Share window went through, or why not
@@ -1337,6 +1343,8 @@ struct ProtonDriveNativeApp {
     last_poll: Instant,
     /// The Share window, while one is open (#216)
     share: Option<share::ShareWindow>,
+    /// What the Shared section lists (#253)
+    shared: shared::SharedPage,
     /// Changes sent from Share windows closed or replaced before they were answered: a failure goes to the notice
     share_left: Vec<share::LeftChange>,
 }
@@ -1379,6 +1387,13 @@ impl ProtonDriveNativeApp {
         // RefreshAll autostarts the daemon if needed; the conflicts are what Home's Needs attention lists
         let _ = cmd_tx.send(WorkerCommand::RefreshAll);
         let _ = cmd_tx.send(WorkerCommand::LoadConflicts);
+
+        // Opened on Shared (--tab shared): the list is asked for as the window opens
+        let mut shared = shared::SharedPage::default();
+        if initial_tab == NavTab::Shared {
+            shared.begin_load();
+            let _ = cmd_tx.send(WorkerCommand::SharedLoad);
+        }
 
         let edit_sync_dir = initial_status.settings.sync_dir.clone();
         let edit_conflict_strategy = if initial_status.settings.conflict_strategy.is_empty() {
@@ -1451,6 +1466,7 @@ impl ProtonDriveNativeApp {
             screenshot_requested: false,
             last_poll: Instant::now(),
             share: None,
+            shared,
             share_left: Vec::new(),
         }
     }
@@ -1707,6 +1723,7 @@ impl ProtonDriveNativeApp {
                 WorkerEvent::ConflictsLoaded(conflicts) => {
                     self.conflicts = conflicts;
                 }
+                WorkerEvent::SharedLoaded(result) => self.shared.loaded(result),
                 WorkerEvent::ShareLoaded(window, result) => self.share_loaded(window, result),
                 WorkerEvent::ShareDone(window, result) => self.share_done(window, result),
                 WorkerEvent::SharePassword(window, result) => self.share_password(window, result),
@@ -1781,8 +1798,9 @@ impl ProtonDriveNativeApp {
                 ui.add_space(18.0);
 
                 let attention_badge = (!self.attention.is_empty()).then(|| self.attention.len().to_string());
-                let nav_items: [(NavTab, &str, Option<String>); 3] = [
+                let nav_items: [(NavTab, &str, Option<String>); 4] = [
                     (NavTab::Home, "Home", attention_badge),
+                    (NavTab::Shared, "Shared", None),
                     (NavTab::Activity, "Activity", None),
                     (NavTab::Settings, "Settings", None),
                 ];
@@ -1917,7 +1935,96 @@ impl ProtonDriveNativeApp {
         if tab == NavTab::Settings && self.tab != NavTab::Settings {
             self.load_hidden();
         }
+        if tab == NavTab::Shared && self.tab != NavTab::Shared {
+            self.load_shared();
+        }
         self.tab = tab;
+    }
+
+    /// Asks for what is shared. Each entry, Refresh and Retry asks again; the newest answer is the one shown.
+    fn load_shared(&mut self) {
+        self.shared.begin_load();
+        let _ = self.tx.send(WorkerCommand::SharedLoad);
+    }
+
+    /// Shared: what you've shared, with where it is and what it exposes.
+    fn render_shared(&mut self, ui: &mut egui::Ui) {
+        ScrollArea::vertical().id_salt("shared_scroll").auto_shrink([false, false]).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.set_min_height(34.0);
+                ui.label(RichText::new("Shared").size(20.0).strong().color(TEXT_PRIMARY()));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if self.shared.error.is_none()
+                        && proton_button(
+                            ui,
+                            Vec2::new(button_width(ui, "Refresh"), 34.0),
+                            "Refresh",
+                            BG_CARD(),
+                            BG_CARD_ALT(),
+                            Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                            TEXT_PRIMARY(),
+                            13.0,
+                        )
+                        .clicked()
+                    {
+                        self.load_shared();
+                    }
+                });
+            });
+            ui.add_space(14.0);
+
+            if let Some(error) = self.shared.error.clone() {
+                ui.add(egui::Label::new(RichText::new(error).size(13.0).color(STATUS_DANGER)).wrap());
+                ui.add_space(10.0);
+                if proton_button(
+                    ui,
+                    Vec2::new(button_width(ui, "Retry"), 34.0),
+                    "Retry",
+                    PROTON_PURPLE,
+                    PROTON_PURPLE_HOVER,
+                    None,
+                    Color32::WHITE,
+                    13.0,
+                )
+                .clicked()
+                {
+                    self.load_shared();
+                }
+                return;
+            }
+            let loading = self.shared.loading;
+            if loading {
+                ui.label(RichText::new(shared::LOADING).size(13.0).color(TEXT_MUTED()));
+                ui.add_space(10.0);
+            }
+            let Some(items) = &self.shared.items else { return };
+            if items.is_empty() {
+                if !loading {
+                    ui.add(egui::Label::new(RichText::new(shared::EMPTY).size(13.0).color(TEXT_MUTED())).wrap());
+                }
+                return;
+            }
+            let now = home::now_ms();
+            // The rows of the list being replaced stay, greyed out and without clicks
+            ui.add_enabled_ui(!loading, |ui| {
+                card_frame().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    for (i, item) in items.iter().enumerate() {
+                        if i > 0 {
+                            ui.separator();
+                        }
+                        let name_font = FontId::new(14.0, FontFamily::Proportional);
+                        let name = truncate_middle_to_width(ui.painter(), &item.name, &name_font, ui.available_width());
+                        ui.label(RichText::new(name).size(14.0).strong().color(TEXT_PRIMARY()));
+                        let small = FontId::new(12.5, FontFamily::Proportional);
+                        for text in [shared::folder_text(item), shared::exposure_text(item, now, home::local_offset_secs)] {
+                            let shown = truncate_middle_to_width(ui.painter(), &text, &small, ui.available_width());
+                            ui.label(RichText::new(shown).size(12.5).color(TEXT_MUTED()));
+                        }
+                    }
+                });
+            });
+        });
     }
 
     /// Asks for what is hidden from this computer, unless a read is already out.
@@ -2613,6 +2720,7 @@ impl ProtonDriveNativeApp {
                 }
                 match self.tab {
                     NavTab::Home => self.render_home(ui),
+                    NavTab::Shared => self.render_shared(ui),
                     NavTab::Activity => self.render_activity(ui),
                     NavTab::Settings => self.render_settings_tab(ui),
                 }
@@ -3155,7 +3263,7 @@ impl ProtonDriveNativeApp {
             return;
         }
         if let Some(tab) = SECTION_REQUESTED.lock().map(|mut s| s.take()).unwrap_or(None) {
-            self.tab = tab;
+            self.open_tab(tab);
         }
         if let Some(request) = SHARE_REQUESTED.lock().map(|mut s| s.take()).unwrap_or(None) {
             self.open_share_request(request);
@@ -3511,6 +3619,13 @@ fn draw_nav_icon(painter: &egui::Painter, rect: egui::Rect, tab: NavTab, color: 
                 egui::pos2(r.max.x, cy),
             ];
             painter.add(egui::Shape::line(pts, stroke));
+        }
+        NavTab::Shared => {
+            // Two linked rings
+            let rad = r.height() * 0.3;
+            let y = r.center().y;
+            painter.circle_stroke(egui::pos2(r.min.x + rad, y), rad, stroke);
+            painter.circle_stroke(egui::pos2(r.max.x - rad, y), rad, stroke);
         }
         NavTab::Activity => {
             // A list: a dot and a line per row
@@ -3914,6 +4029,9 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
                 off_thread(&tx, &ctx, move || WorkerEvent::StartFreshDone(start_fresh_at(&control_socket_path())))
             }
             // The Share window's requests reach Proton's servers through the daemon: each runs on its own thread
+            WorkerCommand::SharedLoad => {
+                off_thread(&tx, &ctx, move || WorkerEvent::SharedLoaded(share::list_at(&control_socket_path())))
+            }
             WorkerCommand::ShareLoad { window, rel_path } => off_thread(&tx, &ctx, move || {
                 WorkerEvent::ShareLoaded(window, share::info_at(&control_socket_path(), &rel_path))
             }),
@@ -4034,6 +4152,7 @@ OPTIONS:
   --pause-choices       with --screenshot: show Home's Pause choices open
   --fake-share <S>      with --screenshot: show the Share window (for --share's item, else Docs/report.pdf in the
                         drive) as S (none | link | link-password | link-expired | people)
+  --fake-shared <S>     with --screenshot: show the Shared section (--tab shared) as S (list | empty | offline)
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --version             print the version
   -h, --help            print this help
@@ -4071,6 +4190,7 @@ fn main() -> eframe::Result {
     let mut cli_paused_until_min: Option<i64> = None;
     let mut cli_pause_choices = false;
     let mut cli_fake_share: Option<String> = None;
+    let mut cli_fake_shared: Option<String> = None;
     // The arguments as the system gives them: one that isn't UTF-8 (a file's name can be anything) mustn't stop the app
     // (#216). --share's path is kept as it is; every other value is read as text, as near as it can be
     let text = |arg: Option<std::ffi::OsString>| arg.map(|a| a.to_string_lossy().into_owned());
@@ -4123,6 +4243,9 @@ fn main() -> eframe::Result {
             "--fake-share" => {
                 cli_fake_share = text(args.next());
             }
+            "--fake-shared" => {
+                cli_fake_shared = text(args.next());
+            }
             "--hidden-items" => {
                 cli_hidden_items = true;
             }
@@ -4173,10 +4296,11 @@ fn main() -> eframe::Result {
             || cli_account_mismatch
             || cli_paused_until_min.is_some()
             || cli_pause_choices
-            || cli_fake_share.is_some())
+            || cli_fake_share.is_some()
+            || cli_fake_shared.is_some())
     {
         eprintln!(
-            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices and --fake-share only apply together with --screenshot; ignoring them"
+            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --fake-share and --fake-shared only apply together with --screenshot; ignoring them"
         );
     }
     let fake_share = match cli_fake_share {
@@ -4186,6 +4310,16 @@ fn main() -> eframe::Result {
                 eprintln!("protondrive-gui: ignoring unknown --fake-share {state:?} (none | link | link-password | link-expired | people)");
             }
             info
+        }
+        _ => None,
+    };
+    let fake_shared = match cli_fake_shared {
+        Some(state) if screenshot_target.is_some() => {
+            let list = shared::fake_shared(&state, home::now_ms());
+            if list.is_none() {
+                eprintln!("protondrive-gui: ignoring unknown --fake-shared {state:?} (list | empty | offline)");
+            }
+            list
         }
         _ => None,
     };
@@ -4353,6 +4487,11 @@ fn main() -> eframe::Result {
                 if let Some(error) = cli_login_error {
                     app.show_account_error(format!("Couldn't start signing in: {error}"));
                 }
+                if app.tab == NavTab::Shared {
+                    // The worker doesn't read the list in a screenshot: show the fake one, or an empty one, rather than
+                    // loading forever
+                    app.shared.loaded(fake_shared.unwrap_or_else(|| Ok(Vec::new())));
+                }
                 if let Some(info) = fake_share {
                     // The item --share names, or one in the drive (as the startup cache knows it)
                     if app.share.is_none() {
@@ -4500,6 +4639,7 @@ mod tests {
         assert_eq!(parse_tab("home"), NavTab::Home);
         assert_eq!(parse_tab("activity"), NavTab::Activity);
         assert_eq!(parse_tab("settings"), NavTab::Settings);
+        assert_eq!(parse_tab("shared"), NavTab::Shared);
         // The old Sync Activity tab is Activity now
         assert_eq!(parse_tab("overview"), NavTab::Activity);
         // My files and Conflicts are gone: what they showed lives on Home
@@ -4844,6 +4984,7 @@ mod tests {
                 screenshot_requested: false,
                 last_poll: Instant::now(),
                 share: None,
+                shared: shared::SharedPage::default(),
                 share_left: Vec::new(),
             };
             let ctx = egui::Context::default();
@@ -4983,6 +5124,7 @@ mod tests {
                     WorkerCommand::ResolveConflict { id, choice } => Some(format!("resolve {id} {choice}")),
                     WorkerCommand::StartLogin => Some("sign in".to_string()),
                     WorkerCommand::StartFresh => Some("start fresh".to_string()),
+                    WorkerCommand::SharedLoad => Some("shared list".to_string()),
                     WorkerCommand::Logout => Some("sign out".to_string()),
                     WorkerCommand::ShareLoad { rel_path, .. } => Some(format!("share info {rel_path}")),
                     WorkerCommand::SharePassword { rel_path, .. } => Some(format!("share password {rel_path}")),
@@ -6230,6 +6372,79 @@ mod tests {
             assert!(h.text_at(DELETE_TOO).is_none(), "{tab:?}");
             assert!(h.text_at("1").is_some(), "{tab:?}: Home's badge");
         }
+    }
+
+    // #253: the Shared section
+    #[test]
+    fn the_sidebar_lists_home_shared_activity_settings_in_that_order() {
+        let h = Harness::new();
+        let ys: Vec<f32> = ["Home", "Shared", "Activity", "Settings"].iter().map(|l| h.text_at(l).expect(l).y).collect();
+        assert!(ys.windows(2).all(|w| w[0] < w[1]), "{ys:?}");
+    }
+
+    #[test]
+    fn opening_shared_asks_for_the_list_each_time_and_never_on_a_timer() {
+        let mut h = Harness::new();
+        h.sent();
+        h.click(h.text_at("Shared").unwrap());
+        assert_eq!(h.app.tab, NavTab::Shared);
+        assert_eq!(h.sent(), ["shared list"]);
+        h.frames(30);
+        assert_eq!(h.sent(), Vec::<String>::new());
+        h.click(h.text_at("Home").unwrap());
+        h.sent();
+        h.click(h.text_at("Shared").unwrap());
+        assert_eq!(h.sent(), ["shared list"]);
+    }
+
+    fn shared_rows() -> Vec<shared::SharedItem> {
+        shared::fake_shared("list", home::now_ms()).unwrap().unwrap()
+    }
+
+    #[test]
+    fn shared_shows_each_row_and_each_state() {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared").unwrap());
+        h.sent();
+        assert!(h.text_at(shared::LOADING).is_some());
+        let rows = shared_rows();
+        h.event(WorkerEvent::SharedLoaded(Ok(rows.clone())));
+        h.frames(3);
+        assert!(h.text_at(shared::LOADING).is_none());
+        for item in &rows {
+            assert!(h.text_at(&item.name).is_some(), "{}", item.name);
+            assert!(h.text_at(&shared::folder_text(item)).is_some(), "{}", shared::folder_text(item));
+            let exposure = shared::exposure_text(item, home::now_ms(), home::local_offset_secs);
+            assert!(h.text_at(&exposure).is_some(), "{exposure}");
+        }
+        h.event(WorkerEvent::SharedLoaded(Ok(vec![])));
+        h.frames(3);
+        assert!(h.text_at(shared::EMPTY).is_some());
+        let offline = "Proton Drive is offline: try again when you are connected";
+        h.event(WorkerEvent::SharedLoaded(Err(offline.into())));
+        h.frames(3);
+        assert!(h.text_at(shared::EMPTY).is_none());
+        assert!(h.text_at(offline).is_some());
+        h.click(h.text_at("Retry").unwrap());
+        assert_eq!(h.sent(), ["shared list"]);
+    }
+
+    #[test]
+    fn a_reload_keeps_the_list_until_the_new_one_comes() {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared").unwrap());
+        let rows = shared_rows();
+        h.event(WorkerEvent::SharedLoaded(Ok(rows.clone())));
+        h.frames(3);
+        h.sent();
+        h.click(h.text_at("Refresh").unwrap());
+        assert_eq!(h.sent(), ["shared list"]);
+        h.frames(3);
+        assert!(h.text_at(shared::LOADING).is_some());
+        assert!(h.text_at(&rows[0].name).is_some());
+        h.event(WorkerEvent::SharedLoaded(Ok(rows.clone())));
+        h.frames(3);
+        assert!(h.text_at(shared::LOADING).is_none());
     }
 
     // #35: signed in to another account than the files were synced with, Home's Needs attention says so first, and
