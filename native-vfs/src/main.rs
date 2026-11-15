@@ -75,6 +75,21 @@ fn unescape_mount_point(field: &str) -> Vec<u8> {
     out
 }
 
+/// The device of the drive's mount at `mountpoint` in mountinfo: the topmost one of its type there.
+fn mount_device(mountinfo: &str, mountpoint: &Path) -> Option<u64> {
+    let wanted = mountpoint.as_os_str().as_bytes();
+    let device = |line: &str| {
+        let fields: Vec<&str> = line.split(' ').collect();
+        let fs_type = line.split(" - ").nth(1)?.split(' ').next()?;
+        if fs_type != "fuse.protondrive" || fields.get(4).is_none_or(|f| unescape_mount_point(f) != wanted) {
+            return None;
+        }
+        let (major, minor) = fields.get(2)?.split_once(':')?;
+        Some(libc::makedev(major.parse().ok()?, minor.parse().ok()?))
+    };
+    mountinfo.lines().rev().find_map(device)
+}
+
 /// fusermount3 would stack a second mount on our own, hiding the first; refuse instead.
 fn already_mounted(mountinfo: &str, mountpoint: &Path) -> bool {
     let wanted = mountpoint.as_os_str().as_bytes();
@@ -122,7 +137,7 @@ fn run() -> i32 {
     config.n_threads = Some(4);
     let drive = fs::DriveFs::new(args.backing, daemon::DaemonClient::new(args.socket));
     drive.start_space_refresh();
-    let notifier = drive.notifier_slot();
+    let (notifier, mount) = (drive.notifier_slot(), drive.mount_slot());
     let session = match Session::new(drive, &mountpoint, &config) {
         Ok(session) => session,
         Err(err) => {
@@ -133,6 +148,11 @@ fn run() -> i32 {
     };
     // Set before any request is served, so a download's open can always refresh the kernel's attributes
     let _ = notifier.set(session.notifier());
+    // And so can what the trash drops be unlinked through this mount, and only this one (#236)
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    if let Some(dev) = mount_device(&mountinfo, &mountpoint) {
+        let _ = mount.set(fs::Mount { path: mountpoint.clone(), dev });
+    }
     // Returns once the kernel ends the session, which an unmount does
     match session.run() {
         Ok(()) => 0,
@@ -171,5 +191,18 @@ mod tests {
         assert!(already_mounted(mountinfo, Path::new("/mnt/my drive")));
         assert!(already_mounted(mountinfo, Path::new("/home/u/other")));
         assert!(!already_mounted(mountinfo, Path::new("/mnt/my")));
+    }
+
+    #[test]
+    fn finds_the_device_of_the_drives_own_mount() {
+        let mountinfo = "36 35 0:52 / /mnt/my\\040drive rw,noatime master:1 - fuse.protondrive protondrive rw\n\
+                         37 35 8:1 / /mnt/my\\040drive rw - ext4 /dev/sda1 rw\n\
+                         38 35 0:61 / /home/u/other rw - fuse.sshfs host: rw\n";
+        assert_eq!(mount_device(mountinfo, Path::new("/mnt/my drive")), Some(libc::makedev(0, 52)));
+        assert_eq!(mount_device(mountinfo, Path::new("/home/u/other")), None, "another file system's");
+        assert_eq!(mount_device(mountinfo, Path::new("/mnt/my")), None);
+        // Mounted again over the first: the topmost
+        let again = format!("{mountinfo}39 36 0:70 / /mnt/my\\040drive rw - fuse.protondrive protondrive rw\n");
+        assert_eq!(mount_device(&again, Path::new("/mnt/my drive")), Some(libc::makedev(0, 70)));
     }
 }
