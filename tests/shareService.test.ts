@@ -1335,8 +1335,55 @@ describe('list', () => {
         expect(stats.reads).toEqual([]);
     });
 
+    test('a list cancelled while all 4 workers are loading a node again alone reads no sharing after', async () => {
+        const nodes = sharedNodes(8);
+        const cancel = new AbortController();
+        const { svc, stats } = listSetup({
+            nodes,
+            sharing: allShared(nodes),
+            // The batch loads none; alone, the fourth load, with all 4 workers loading, is where the list is cancelled
+            async *iterateNodes(uids) {
+                if (uids.length > 1) throw new Error('Some items could not be loaded');
+                if (uids[0] === 'u3') cancel.abort();
+                await Bun.sleep(5);
+                yield nodes.find((n) => n.uid === uids[0]);
+            },
+        });
+        expect(await rejects(svc.list(cancel.signal))).toBeInstanceOf(ListCancelled);
+        await Bun.sleep(30);
+        expect(stats.loads.slice(1)).toEqual([['u0'], ['u1'], ['u2'], ['u3']]);
+        expect(stats.reads).toEqual([]);
+    });
+
+    test('a list cancelled during its last sharing read is still cancelled', async () => {
+        const nodes = sharedNodes(1);
+        const cancel = new AbortController();
+        const { svc } = listSetup({ nodes, sharing: allShared(nodes), onRead: () => cancel.abort() });
+        expect(await rejects(svc.list(cancel.signal))).toBeInstanceOf(ListCancelled);
+    });
+
+    test('the signal reaches the listing, the batch, and each node loaded again alone', async () => {
+        const nodes = sharedNodes(3);
+        const cancel = new AbortController();
+        const { svc, stats } = listSetup({
+            nodes,
+            sharing: allShared(nodes),
+            // The batch yields u0, then throws; alone, u1 and u2 load
+            async *iterateNodes(uids) {
+                if (uids.length > 1) {
+                    yield nodes[0];
+                    throw new Error('Some items could not be loaded');
+                }
+                yield nodes.find((n) => n.uid === uids[0]);
+            },
+        });
+        expect(await svc.list(cancel.signal)).toHaveLength(3);
+        expect(stats.loads).toEqual([['u0', 'u1', 'u2'], ['u1'], ['u2']]);
+        expect(stats.signals).toEqual([cancel.signal, cancel.signal, cancel.signal, cancel.signal]);
+    });
+
     // The SDK's own listing and loading are given the signal too, and stop a request under way with their AbortError:
-    // that is the list cancelled, never a node that couldn't be loaded (loaded again alone) or an unreadable item
+    // the list is then cancelled, and nothing more is loaded or read
     test("the SDK's listing and loading get the signal, and their AbortError is the list cancelled", async () => {
         const nodes = sharedNodes(3);
         const cancel = new AbortController();
