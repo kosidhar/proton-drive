@@ -1,5 +1,7 @@
 mod activity;
+mod chrome;
 mod home;
+mod icons;
 mod settings;
 mod share;
 mod shared;
@@ -64,99 +66,143 @@ fn detect_system_light_mode() -> bool {
     false
 }
 
-// Official Proton Carbon (Dark) & Proton Snow (Light) Adaptive Palette
-#[inline]
-#[allow(non_snake_case)]
-fn BG_CANVAS() -> Color32 {
+/// The app's colours in one theme. The token functions below (`BG_CANVAS()`, …) read the theme in use, so tests can
+/// check both palettes without switching themes.
+pub(crate) struct Palette {
+    /// The section area and the top bar
+    pub(crate) canvas: Color32,
+    pub(crate) sidebar: Color32,
+    /// The sidebar's row for the section that is open
+    pub(crate) sidebar_selected: Color32,
+    /// A sidebar row under the pointer
+    pub(crate) sidebar_hover: Color32,
+    /// Section names and "Proton Drive" in the sidebar
+    pub(crate) sidebar_text: Color32,
+    /// The sidebar's quieter text and its icons
+    pub(crate) sidebar_weak: Color32,
+    /// The sidebar's storage meter: what is used, over the track
+    pub(crate) storage_fill: Color32,
+    pub(crate) storage_track: Color32,
+    pub(crate) card: Color32,
+    pub(crate) card_alt: Color32,
+    pub(crate) input: Color32,
+    /// Separators and card edges
+    pub(crate) border_weak: Color32,
+    /// Secondary buttons' outline
+    pub(crate) border_norm: Color32,
+    pub(crate) text: Color32,
+    pub(crate) text_weak: Color32,
+    pub(crate) purple_soft: Color32,
+    pub(crate) purple_text: Color32,
+    /// Folders in lists
+    pub(crate) folder: Color32,
+}
+
+/// Proton's light theme, as drive.proton.me shows it (#276)
+pub(crate) const LIGHT: Palette = Palette {
+    canvas: Color32::WHITE,
+    sidebar: Color32::from_rgb(0x21, 0x1A, 0x42),
+    sidebar_selected: Color32::from_rgb(0x2E, 0x23, 0x59),
+    sidebar_hover: Color32::from_rgb(0x28, 0x20, 0x4D),
+    sidebar_text: Color32::WHITE,
+    sidebar_weak: Color32::from_rgb(0xB1, 0xA1, 0xF5),
+    storage_fill: Color32::from_rgb(0xB1, 0xA1, 0xF5),
+    storage_track: Color32::from_rgb(0x3E, 0x2F, 0x7F),
+    card: Color32::WHITE,
+    card_alt: Color32::from_rgb(0xF5, 0xF4, 0xF2),
+    input: Color32::from_rgb(0xF5, 0xF4, 0xF2),
+    border_weak: Color32::from_rgb(0xEA, 0xE7, 0xE4),
+    border_norm: Color32::from_rgb(0xD1, 0xCF, 0xCD),
+    text: Color32::from_rgb(0x0C, 0x0C, 0x14),
+    text_weak: Color32::from_rgb(0x5C, 0x59, 0x58),
+    purple_soft: Color32::from_rgb(0xEB, 0xE5, 0xFF),
+    purple_text: Color32::from_rgb(0x5D, 0x38, 0xEB),
+    folder: Color32::from_rgb(0xF5, 0xA4, 0x28),
+};
+
+/// Proton Carbon, the app's dark theme as it was. The colours it didn't have are taken from it.
+pub(crate) const DARK: Palette = Palette {
+    canvas: Color32::from_rgb(26, 24, 35),           // #1A1823
+    sidebar: Color32::from_rgb(20, 18, 27),          // #14121B
+    sidebar_selected: Color32::from_rgb(44, 37, 69), // #2C2545, as an open section's row was (the soft purple)
+    sidebar_hover: Color32::from_rgb(33, 29, 44),    // #211D2C, the cards'
+    sidebar_text: Color32::from_rgb(247, 246, 252),  // #F7F6FC, the text's
+    sidebar_weak: Color32::from_rgb(162, 158, 178),  // #A29EB2, the weak text's
+    storage_fill: PROTON_PURPLE,                     // as Home's storage bar was
+    storage_track: Color32::from_rgb(48, 43, 64),    // #302B40, the weak border's, as Home's storage bar was
+    card: Color32::from_rgb(33, 29, 44),             // #211D2C
+    card_alt: Color32::from_rgb(42, 37, 56),         // #2A2538
+    input: Color32::from_rgb(35, 31, 48),            // #231F30
+    border_weak: Color32::from_rgb(48, 43, 64),      // #302B40
+    border_norm: Color32::from_rgb(74, 67, 96),      // #4A4360, as an off switch's track is
+    text: Color32::from_rgb(247, 246, 252),          // #F7F6FC
+    text_weak: Color32::from_rgb(162, 158, 178),     // #A29EB2
+    purple_soft: Color32::from_rgb(44, 37, 69),      // #2C2545
+    purple_text: Color32::from_rgb(214, 204, 255),   // #D6CCFF
+    folder: Color32::from_rgb(0xF5, 0xA4, 0x28),
+};
+
+/// The palette of the theme in use.
+fn palette() -> &'static Palette {
     if is_light_mode() {
-        Color32::from_rgb(245, 244, 250) // #F5F4FA Proton Snow canvas
+        &LIGHT
     } else {
-        Color32::from_rgb(26, 24, 35) // #1A1823 Proton Carbon canvas
+        &DARK
     }
 }
-#[inline]
-#[allow(non_snake_case)]
-fn BG_SIDEBAR() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(255, 255, 255) // #FFFFFF Crisp white sidebar & header
-    } else {
-        Color32::from_rgb(20, 18, 27) // #14121B
-    }
+
+/// The colour tokens, each a colour of the palette in use.
+macro_rules! tokens {
+    ($($(#[$attr:meta])* $name:ident => $field:ident,)*) => {
+        $(
+            $(#[$attr])*
+            #[inline]
+            #[allow(non_snake_case)]
+            fn $name() -> Color32 {
+                palette().$field
+            }
+        )*
+    };
 }
-#[inline]
-#[allow(non_snake_case)]
-fn BG_CARD() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(255, 255, 255) // #FFFFFF
-    } else {
-        Color32::from_rgb(33, 29, 44) // #211D2C
-    }
+
+tokens! {
+    BG_CANVAS => canvas,
+    BG_SIDEBAR => sidebar,
+    BG_CARD => card,
+    BG_CARD_ALT => card_alt,
+    BG_INPUT => input,
+    BORDER_SUBTLE => border_weak,
+    BORDER_NORM => border_norm,
+    TEXT_PRIMARY => text,
+    TEXT_MUTED => text_weak,
+    PROTON_PURPLE_SOFT => purple_soft,
+    PROTON_PURPLE_TEXT => purple_text,
+    SIDEBAR_SELECTED => sidebar_selected,
+    SIDEBAR_HOVER => sidebar_hover,
+    SIDEBAR_TEXT => sidebar_text,
+    SIDEBAR_WEAK => sidebar_weak,
+    STORAGE_FILL => storage_fill,
+    STORAGE_TRACK => storage_track,
+    #[expect(dead_code, reason = "the Shared list's, not drawn with it yet")]
+    FOLDER_ICON => folder,
 }
-#[inline]
-#[allow(non_snake_case)]
-fn BG_CARD_ALT() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(240, 238, 248) // #F0EEF8
-    } else {
-        Color32::from_rgb(42, 37, 56) // #2A2538
+
+/// The WCAG contrast ratio of two opaque colours, from 1 (the same) to 21 (black on white).
+#[cfg(test)]
+fn contrast(a: Color32, b: Color32) -> f32 {
+    fn luminance(c: Color32) -> f32 {
+        let lin = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
     }
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
-#[inline]
-#[allow(non_snake_case)]
-fn BG_INPUT() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(243, 241, 250) // #F3F1FA
-    } else {
-        Color32::from_rgb(35, 31, 48) // #231F30
-    }
-}
-#[inline]
-#[allow(non_snake_case)]
-fn BORDER_SUBTLE() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(222, 218, 235) // #DEDAEB
-    } else {
-        Color32::from_rgb(48, 43, 64) // #302B40
-    }
-}
-#[inline]
-#[allow(non_snake_case)]
-fn TEXT_PRIMARY() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(28, 24, 43) // #1C182B
-    } else {
-        Color32::from_rgb(247, 246, 252)
-    }
-}
-#[inline]
-#[allow(non_snake_case)]
-fn TEXT_MUTED() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(106, 101, 126) // #6A657E
-    } else {
-        Color32::from_rgb(162, 158, 178)
-    }
-}
+
 const PROTON_PURPLE: Color32 = Color32::from_rgb(109, 74, 255); // #6D4AFF
-const PROTON_PURPLE_HOVER: Color32 = Color32::from_rgb(126, 94, 255); // #7E5EFF
-#[inline]
-#[allow(non_snake_case)]
-fn PROTON_PURPLE_SOFT() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(235, 229, 255) // #EBE5FF
-    } else {
-        Color32::from_rgb(44, 37, 69) // #2C2545
-    }
-}
-#[inline]
-#[allow(non_snake_case)]
-fn PROTON_PURPLE_TEXT() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(93, 56, 235) // #5D38EB
-    } else {
-        Color32::from_rgb(214, 204, 255)
-    }
-}
+const PROTON_PURPLE_HOVER: Color32 = Color32::from_rgb(0x62, 0x43, 0xE6); // #6243E6, Proton's
 const STATUS_SUCCESS: Color32 = Color32::from_rgb(25, 150, 118); // #199676
 const STATUS_WARNING: Color32 = Color32::from_rgb(230, 138, 0); // #E68A00
 const STATUS_DANGER: Color32 = Color32::from_rgb(220, 50, 81); // #DC3251
@@ -1299,8 +1345,6 @@ struct ProtonDriveNativeApp {
     /// The Activity row opened to show its full details and actions (see activity_key), with where Show in Files and
     /// Open go, looked up once when it was opened: never on every frame, as the drive may be slow to answer
     expanded_activity: Option<ExpandedActivity>,
-    /// The sidebar's account footer was clicked: Settings brings its Account card into view once
-    jump_to_account: bool,
 
     /// What is hidden from this computer, as last read (None until the first answer), and whether a read is out
     hidden: Option<Result<Vec<HiddenItem>, String>>,
@@ -1368,6 +1412,8 @@ struct ProtonDriveNativeApp {
     fake_paused_until: Option<i64>,
     /// Home's Pause choices are open (#205)
     pause_choices_open: bool,
+    /// The top bar's account menu is open (#274)
+    account_menu_open: bool,
 
     // Window geometry state
     window_geometry: WindowGeometry,
@@ -1405,7 +1451,7 @@ impl ProtonDriveNativeApp {
         configure_proton_theme(&cc.egui_ctx);
         apply_proton_visuals(&cc.egui_ctx, initial_light);
 
-        let logo_texture = load_glyph_texture(&cc.egui_ctx);
+        let logo_texture = load_logo_texture(&cc.egui_ctx);
         let startup_cache = load_startup_cache();
         let mut initial_status = startup_cache.status.unwrap_or_default();
         if initial_status.state == "syncing" {
@@ -1459,7 +1505,6 @@ impl ProtonDriveNativeApp {
             search_query: String::new(),
             activity_filter: activity::ActivityFilter::All,
             expanded_activity: None,
-            jump_to_account: false,
             hidden: None,
             hidden_loading: false,
             unhiding: None,
@@ -1496,6 +1541,7 @@ impl ProtonDriveNativeApp {
             fake_account_mismatch: false,
             fake_paused_until: None,
             pause_choices_open: false,
+            account_menu_open: false,
             window_geometry,
             maximize_applied_on_open: false,
             applied_light_mode: initial_light,
@@ -1607,7 +1653,7 @@ impl ProtonDriveNativeApp {
         let _ = self.tx.send(cmd);
     }
 
-    /// Sign-in and sign-out problems show under Activity's title, in Settings' Account card and on Home, until the next try.
+    /// Sign-in and sign-out problems show under Activity's search row, in Settings' Account card and on Home, until the next try.
     fn show_account_error(&mut self, text: String) {
         self.login_url = None;
         self.notice = Some(text.clone());
@@ -1655,6 +1701,10 @@ impl ProtonDriveNativeApp {
                         }
                         if s.logged_in {
                             self.login_url = None;
+                        }
+                        // Signed out meanwhile (from Settings, the tray…): the account menu has nothing left to offer
+                        if !s.logged_in && s.account.is_none() {
+                            self.account_menu_open = false;
                         }
                         // The list Needs attention shows may have changed: reload it while any is open (see
                         // should_reload_conflicts)
@@ -1822,178 +1872,9 @@ impl ProtonDriveNativeApp {
         }
     }
 
-    fn render_sidebar(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("proton_sidebar")
-            .resizable(false)
-            // The edge is egui's separator line, which the theme draws in BORDER_SUBTLE. A stroke on the frame as well
-            // made the panel 2 px wider than its 252 px, and that strip, outside what the panel paints, showed the
-            // window's black clear colour as a hard line (#254)
-            .show_separator_line(true)
-            .exact_width(252.0)
-            .frame(
-                Frame::NONE
-                    .fill(BG_SIDEBAR())
-                    .inner_margin(Margin::symmetric(16, 18)),
-            )
-            .show(ctx, |ui| {
-                if self.pending_confirm.is_some() {
-                    ui.disable(); // As in the section: nothing under the confirmation dialog takes clicks while it is open
-                }
-                // Brand Header (matching official Proton desktop header)
-                ui.horizontal(|ui| {
-                    if let Some(tex) = &self.logo_texture {
-                        ui.add(
-                            egui::Image::new(tex)
-                                .fit_to_exact_size(Vec2::new(30.0, 30.0))
-                                .corner_radius(CornerRadius::same(7)),
-                        );
-                    }
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("Proton Drive")
-                            .size(18.5)
-                            .strong()
-                            .color(TEXT_PRIMARY()),
-                    );
-                });
-
-                ui.add_space(18.0);
-
-                let attention_badge = (!self.attention.is_empty()).then(|| self.attention.len().to_string());
-                let nav_items: [(NavTab, &str, Option<String>); 4] = [
-                    (NavTab::Home, "Home", attention_badge),
-                    (NavTab::Shared, "Shared", None),
-                    (NavTab::Activity, "Activity", None),
-                    (NavTab::Settings, "Settings", None),
-                ];
-
-                for (tab, label, badge) in nav_items {
-                    let active = self.tab == tab;
-                    let fill = if active {
-                        PROTON_PURPLE_SOFT()
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-                    let text_color = if active {
-                        TEXT_PRIMARY()
-                    } else {
-                        TEXT_MUTED()
-                    };
-                    let icon_color = if active {
-                        PROTON_PURPLE_TEXT()
-                    } else {
-                        TEXT_MUTED()
-                    };
-
-                    let response = Frame::NONE
-                        .fill(fill)
-                        .corner_radius(CornerRadius::same(8))
-                        .inner_margin(Margin::symmetric(12, 9))
-                        .show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                let (icon_rect, _) =
-                                    ui.allocate_exact_size(Vec2::new(16.0, 16.0), Sense::hover());
-                                draw_nav_icon(ui.painter(), icon_rect, tab, icon_color);
-                                ui.add_space(6.0);
-
-                                let text = if active {
-                                    RichText::new(label).size(13.5).strong().color(text_color)
-                                } else {
-                                    RichText::new(label).size(13.5).color(text_color)
-                                };
-                                ui.label(text);
-
-                                // What needs the user: a count on Home, in the warning red
-                                if let Some(b_text) = badge {
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        Frame::NONE
-                                            .fill(STATUS_DANGER)
-                                            .corner_radius(CornerRadius::same(8))
-                                            .inner_margin(Margin::symmetric(7, 2))
-                                            .show(ui, |ui| {
-                                                ui.label(
-                                                    RichText::new(b_text)
-                                                        .size(11.0)
-                                                        .strong()
-                                                        .color(Color32::WHITE),
-                                                );
-                                            });
-                                    });
-                                }
-                            });
-                        })
-                        .response
-                        .interact(Sense::click());
-
-                    if response.hovered() {
-                        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    if response.clicked() {
-                        self.open_tab(tab);
-                    }
-                    ui.add_space(3.0);
-                }
-
-                // The footer sits at the bottom of the sidebar: the account, then the app's version
-                let footer_height = 64.0;
-                let remaining_h = (ui.available_height() - footer_height).max(12.0);
-                ui.add_space(remaining_h);
-
-                let (display_name, initials) = match &self.status.account {
-                    Some(acct) => (
-                        if acct.display_name.is_empty() { "Proton Account".to_string() } else { acct.display_name.clone() },
-                        if acct.initials.is_empty() { "PD".to_string() } else { acct.initials.clone() },
-                    ),
-                    None if self.status.logged_in => ("Proton Account".to_string(), "PD".to_string()),
-                    None if self.initial_connecting => ("Connecting…".to_string(), "PD".to_string()),
-                    None => ("Not signed in".to_string(), "PD".to_string()),
-                };
-                let footer = Frame::NONE
-                    .corner_radius(CornerRadius::same(8))
-                    .inner_margin(Margin::symmetric(8, 6))
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            let (avatar_rect, _) = ui.allocate_exact_size(Vec2::new(30.0, 30.0), Sense::hover());
-                            let avatar_fill =
-                                if is_light_mode() { Color32::from_rgb(235, 229, 255) } else { Color32::from_rgb(50, 41, 82) };
-                            ui.painter().rect_filled(avatar_rect, CornerRadius::same(8), avatar_fill);
-                            ui.painter().text(
-                                avatar_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                &initials,
-                                FontId::new(12.5, FontFamily::Proportional),
-                                TEXT_PRIMARY(),
-                            );
-                            ui.add_space(4.0);
-                            let name_font = FontId::new(13.0, FontFamily::Proportional);
-                            let shown = truncate_middle_to_width(ui.painter(), &display_name, &name_font, ui.available_width());
-                            ui.label(RichText::new(shown).size(13.0).strong().color(TEXT_PRIMARY()));
-                        });
-                    })
-                    .response
-                    .interact(Sense::click());
-                if footer.hovered() {
-                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                // The account is Settings' first card
-                if footer.clicked() {
-                    self.open_tab(NavTab::Settings);
-                    self.jump_to_account = true;
-                }
-
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
-                        .size(11.5)
-                        .color(TEXT_MUTED()),
-                );
-            });
-    }
-
-    /// Shows a section; Settings reads what is hidden as it opens.
+    /// Shows a section, closing the account menu; Settings reads what is hidden as it opens.
     fn open_tab(&mut self, tab: NavTab) {
+        self.account_menu_open = false;
         if tab == NavTab::Settings && self.tab != NavTab::Settings {
             self.load_hidden();
         }
@@ -2013,9 +1894,9 @@ impl ProtonDriveNativeApp {
     /// Shared: what you've shared, with where it is and what it exposes.
     fn render_shared(&mut self, ui: &mut egui::Ui) {
         ScrollArea::vertical().id_salt("shared_scroll").auto_shrink([false, false]).show(ui, |ui| {
+            // Refresh, on the right (the title is the top bar's)
             ui.horizontal(|ui| {
                 ui.set_min_height(34.0);
-                ui.label(RichText::new("Shared").size(20.0).strong().color(TEXT_PRIMARY()));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let loading = self.shared.loading;
                     // Retry is the action while the list couldn't be read
@@ -2242,10 +2123,9 @@ impl ProtonDriveNativeApp {
     fn render_activity_content(&mut self, ui: &mut egui::Ui, viewport_h: f32) {
         let content_top = ui.cursor().top();
 
-        // The title, and the search at the top right (or Sign in while signed out)
+        // The search and the filter on the right, and Sign in while signed out (the title is the top bar's)
         ui.horizontal(|ui| {
             ui.set_min_height(34.0);
-            ui.label(RichText::new("Activity").size(20.0).strong().color(TEXT_PRIMARY()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if !self.status.logged_in
                     && proton_button(
@@ -2263,7 +2143,7 @@ impl ProtonDriveNativeApp {
                     self.send_account_command(WorkerCommand::StartLogin);
                 }
                 ui.add_space(8.0);
-                // Room kept for the filter beside it, so a narrow window never runs it over the title
+                // Room kept for the filter beside it, so a narrow window never pushes it out
                 let width = (ui.available_width() - ACTIVITY_FILTER_WIDTH).clamp(120.0, 280.0);
                 ui.add_sized(
                     [width, 32.0],
@@ -2907,9 +2787,11 @@ impl ProtonDriveNativeApp {
         let _ = self.tx.send(WorkerCommand::ResolveFilesMissing { choice, root, names });
     }
 
-    /// One frame of the window's contents: sidebar, the current section and anything floating over them.
+    /// One frame of the window's contents: the sidebar, the top bar, the current section and anything floating over
+    /// them.
     fn render_ui(&mut self, ctx: &egui::Context) {
         self.render_sidebar(ctx);
+        self.render_top_bar(ctx);
 
         egui::CentralPanel::default()
             .frame(
@@ -2919,7 +2801,7 @@ impl ProtonDriveNativeApp {
             )
             .show(ctx, |ui| {
                 // Nothing under the confirmation dialog or the Share window takes clicks or keys while it is open
-                if self.pending_confirm.is_some() || self.share.is_some() {
+                if self.dialog_open() {
                     ui.disable();
                 }
                 match self.tab {
@@ -3638,6 +3520,31 @@ fn click_shield(ctx: &egui::Context, id: &str, order: egui::Order, dim: Option<C
         });
 }
 
+/// A button's room and background: `fill`, or `hover_fill` under the pointer, with radius 8 and the outline if any.
+/// It is named `label` for screen readers (and `Harness::widget_at`), whatever it paints.
+fn button_shell(
+    ui: &mut egui::Ui,
+    size: Vec2,
+    label: &str,
+    fill: Color32,
+    hover_fill: Color32,
+    stroke: Option<Stroke>,
+) -> (egui::Rect, egui::Response) {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let enabled = ui.is_enabled();
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let bg = if resp.hovered() { hover_fill } else { fill };
+    ui.painter().rect_filled(rect, CornerRadius::same(8), bg);
+    if let Some(s) = stroke {
+        ui.painter()
+            .rect_stroke(rect, CornerRadius::same(8), s, egui::StrokeKind::Inside);
+    }
+    (rect, resp)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn proton_button(
     ui: &mut egui::Ui,
@@ -3649,16 +3556,7 @@ fn proton_button(
     text_color: Color32,
     font_size: f32,
 ) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    if resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let bg = if resp.hovered() { hover_fill } else { fill };
-    ui.painter().rect_filled(rect, CornerRadius::same(8), bg);
-    if let Some(s) = stroke {
-        ui.painter()
-            .rect_stroke(rect, CornerRadius::same(8), s, egui::StrokeKind::Inside);
-    }
+    let (rect, resp) = button_shell(ui, size, label, fill, hover_fill, stroke);
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -3669,9 +3567,87 @@ fn proton_button(
     resp
 }
 
+/// The room on each side of a button's label.
+const BUTTON_PADDING: f32 = 16.0;
+
 /// A button just wide enough for its label at 13 pt.
 fn button_width(ui: &egui::Ui, label: &str) -> f32 {
-    text_width(ui.painter(), label, &FontId::proportional(13.0)) + 32.0
+    text_width(ui.painter(), label, &FontId::proportional(13.0)) + 2.0 * BUTTON_PADDING
+}
+
+/// The size of an icon on a button.
+const BUTTON_ICON_SIZE: f32 = 16.0;
+/// The room between a button's icon and its label.
+const BUTTON_ICON_GAP: f32 = 6.0;
+
+/// What a button with a label looks like (#276).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ButtonKind {
+    /// Filled purple, white text: the one thing a card most likely wants done
+    Primary,
+    /// The card's colour with an outline, filled with the weak background on hover
+    Secondary,
+    /// Red, for a confirmation that deletes
+    #[cfg_attr(not(test), expect(dead_code, reason = "the dialogs don't use action_button yet"))]
+    Danger,
+}
+
+/// A button as wide as its icon and label: the icon (one of `icons::*`) first, then the label, in `kind`'s colours.
+/// The icon is painted as text of its own, so the label stays findable as painted text.
+fn action_button(ui: &mut egui::Ui, kind: ButtonKind, icon: Option<&str>, label: &str, height: f32) -> egui::Response {
+    let size = Vec2::new(action_button_width(ui, icon, label), height);
+    action_button_sized(ui, kind, icon, label, size)
+}
+
+/// `action_button` at `size`, with its icon and label centred in it (as wide as the sidebar, say).
+fn action_button_sized(ui: &mut egui::Ui, kind: ButtonKind, icon: Option<&str>, label: &str, size: Vec2) -> egui::Response {
+    let (fill, hover_fill, stroke, text_color) = match kind {
+        ButtonKind::Primary => (PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE),
+        ButtonKind::Secondary => (BG_CARD(), BG_CARD_ALT(), Some(Stroke::new(1.0_f32, BORDER_NORM())), TEXT_PRIMARY()),
+        ButtonKind::Danger => (STATUS_DANGER, STATUS_DANGER_HOVER, None, Color32::WHITE),
+    };
+    let (rect, resp) = button_shell(ui, size, label, fill, hover_fill, stroke);
+    let content = action_button_width(ui, icon, label) - 2.0 * BUTTON_PADDING;
+    let mut x = rect.center().x - content / 2.0;
+    if let Some(icon) = icon {
+        let icon_font = icons::font(BUTTON_ICON_SIZE);
+        let at = egui::pos2(x, rect.center().y);
+        ui.painter().text(at, egui::Align2::LEFT_CENTER, icon, icon_font.clone(), text_color);
+        x += text_width(ui.painter(), icon, &icon_font) + BUTTON_ICON_GAP;
+    }
+    let font = FontId::proportional(13.0);
+    ui.painter().text(egui::pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, label, font, text_color);
+    resp
+}
+
+/// How wide `action_button` makes a button with this icon and label.
+fn action_button_width(ui: &egui::Ui, icon: Option<&str>, label: &str) -> f32 {
+    let icon_room = icon.map_or(0.0, |icon| {
+        text_width(ui.painter(), icon, &icons::font(BUTTON_ICON_SIZE)) + BUTTON_ICON_GAP
+    });
+    button_width(ui, label) + icon_room
+}
+
+/// An icon-only button, 28×28, with no fill until hovered. `label`, what a button with words would have said, is its
+/// tooltip and its name for screen readers.
+#[cfg_attr(not(test), expect(dead_code, reason = "outside tests only the gear, through icon_button_pressed, is an icon-only button"))]
+fn icon_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
+    icon_button_pressed(ui, icon, label, false)
+}
+
+/// `icon_button`, filled with the soft purple while `pressed`: the top bar's gear while Settings is open.
+fn icon_button_pressed(ui: &mut egui::Ui, icon: &str, label: &str, pressed: bool) -> egui::Response {
+    let (fill, hover_fill, color) = if pressed {
+        (PROTON_PURPLE_SOFT(), PROTON_PURPLE_SOFT(), PROTON_PURPLE_TEXT())
+    } else {
+        (Color32::TRANSPARENT, BG_CARD_ALT(), TEXT_PRIMARY())
+    };
+    let (rect, resp) = button_shell(ui, Vec2::splat(28.0), label, fill, hover_fill, None);
+    // Says whether it is pressed, as the sections say whether they are open
+    let enabled = ui.is_enabled();
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, pressed, label));
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, icons::font(BUTTON_ICON_SIZE), color);
+    resp.on_hover_text(label)
 }
 
 /// An on/off switch; the caller flips the state when it is clicked.
@@ -3701,6 +3677,15 @@ const ACTIVITY_FETCHED: usize = 200;
 const ACTIVITY_SHOWN: usize = 200;
 /// About the width of the Activity filter (All, Uploads, Downloads, Problems), kept free beside the search
 const ACTIVITY_FILTER_WIDTH: f32 = 290.0;
+
+/// The family bold text is laid out in: Inter SemiBold (#279).
+const BOLD_FAMILY: &str = "bold";
+
+/// The font for bold text at `size` points: titles, the brand, the open section. egui's `RichText::strong` only picks
+/// the strong text colour, and only where no colour is set, so text meant to be bold says so with this font.
+pub(crate) fn bold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(BOLD_FAMILY.into()))
+}
 
 fn configure_proton_theme(ctx: &egui::Context) {
     // Embed Inter & JetBrains Mono fonts (matching Proton Carbon Design System & WordCraft)
@@ -3733,6 +3718,12 @@ fn configure_proton_theme(ctx: &egui::Context) {
         prop.insert(0, "Inter".to_owned());
         prop.insert(1, "InterMedium".to_owned());
     }
+    // Bold text: Inter SemiBold, then whatever the proportional family falls back to (#279)
+    let mut bold_fonts = vec!["InterSemiBold".to_owned()];
+    bold_fonts.extend(fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default());
+    fonts.families.insert(FontFamily::Name(BOLD_FAMILY.into()), bold_fonts);
+    // The icons, in a family of their own (see icons.rs)
+    icons::add_to_fonts(&mut fonts);
     if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
         mono.insert(0, "JetBrainsMono".to_owned());
     }
@@ -3772,12 +3763,16 @@ fn load_app_icon() -> Option<IconData> {
     eframe::icon_data::from_png_bytes(png_bytes).ok()
 }
 
-fn load_glyph_texture(ctx: &egui::Context) -> Option<TextureHandle> {
-    let png_bytes = include_bytes!("../../linux/icons/protondrive-glyph-128.png");
-    let img = image::load_from_memory(png_bytes).ok()?.to_rgba8();
+/// The logo the sidebar shows: the folder mark alone, without the app icon's tile (#273). Rendered once from
+/// assets/app-icon/protondrive-mark.svg, at 128 px. To regenerate it:
+/// `resvg -w 128 -h 128 assets/app-icon/protondrive-mark.svg assets/app-icon/protondrive-mark-128.png`
+const LOGO_PNG: &[u8] = include_bytes!("../../assets/app-icon/protondrive-mark-128.png");
+
+fn load_logo_texture(ctx: &egui::Context) -> Option<TextureHandle> {
+    let img = image::load_from_memory(LOGO_PNG).ok()?.to_rgba8();
     let size = [img.width() as usize, img.height() as usize];
     let color_img = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
-    Some(ctx.load_texture("proton_drive_glyph", color_img, TextureOptions::LINEAR))
+    Some(ctx.load_texture("proton_drive_logo", color_img, TextureOptions::LINEAR))
 }
 
 fn save_color_image_png(img: &egui::ColorImage, path: &str) {
@@ -3804,82 +3799,6 @@ fn format_bytes(bytes: u64) -> String {
         idx += 1;
     }
     format!("{val:.1} {}", units[idx])
-}
-
-fn draw_nav_icon(painter: &egui::Painter, rect: egui::Rect, tab: NavTab, color: Color32) {
-    let stroke = Stroke::new(1.5_f32, color);
-    let r = rect.shrink(1.5);
-    match tab {
-        NavTab::Home => {
-            // The status pulse / waveform icon
-            let cy = r.center().y;
-            let w = r.width();
-            let pts = vec![
-                egui::pos2(r.min.x, cy),
-                egui::pos2(r.min.x + w * 0.25, cy),
-                egui::pos2(r.min.x + w * 0.40, r.min.y + 1.0),
-                egui::pos2(r.min.x + w * 0.60, r.max.y - 1.0),
-                egui::pos2(r.min.x + w * 0.75, cy),
-                egui::pos2(r.max.x, cy),
-            ];
-            painter.add(egui::Shape::line(pts, stroke));
-        }
-        NavTab::Shared => {
-            // Two linked rings
-            let rad = r.height() * 0.3;
-            let y = r.center().y;
-            painter.circle_stroke(egui::pos2(r.min.x + rad, y), rad, stroke);
-            painter.circle_stroke(egui::pos2(r.max.x - rad, y), rad, stroke);
-        }
-        NavTab::Activity => {
-            // A list: a dot and a line per row
-            for i in 0..3 {
-                let y = r.min.y + 2.0 + i as f32 * (r.height() - 4.0) / 2.0;
-                painter.circle_filled(egui::pos2(r.min.x + 1.2, y), 1.2, color);
-                painter.line_segment([egui::pos2(r.min.x + 4.5, y), egui::pos2(r.max.x, y)], stroke);
-            }
-        }
-        NavTab::Settings => {
-            draw_gear_icon(painter, rect.shrink(0.5), color);
-        }
-    }
-}
-
-fn draw_gear_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
-    // Official Proton Carbon `ic-cog-wheel` 8-tooth outline cogwheel + hollow center circle
-    let c = rect.center();
-    let radius = rect.width().min(rect.height()) * 0.5;
-    let r_outer = radius * 0.96;
-    let r_valley = radius * 0.72;
-    let r_hole = radius * 0.33;
-    let stroke = Stroke::new(1.35_f32, color);
-
-    let teeth = 8;
-    let step = std::f32::consts::TAU / teeth as f32;
-    let half_tip = 0.13_f32; // angular half-width of tooth crest (~7.5 deg)
-    let half_base = 0.22_f32; // angular half-width of tooth base (~12.6 deg)
-
-    let mut pts = Vec::with_capacity(teeth * 5);
-    for i in 0..teeth {
-        let theta = i as f32 * step;
-        let a0 = theta - half_base;
-        let a1 = theta - half_tip;
-        let a2 = theta + half_tip;
-        let a3 = theta + half_base;
-        let a_mid_valley = theta + step * 0.5;
-
-        pts.push(egui::pos2(c.x + a0.cos() * r_valley, c.y + a0.sin() * r_valley));
-        pts.push(egui::pos2(c.x + a1.cos() * r_outer, c.y + a1.sin() * r_outer));
-        pts.push(egui::pos2(c.x + a2.cos() * r_outer, c.y + a2.sin() * r_outer));
-        pts.push(egui::pos2(c.x + a3.cos() * r_valley, c.y + a3.sin() * r_valley));
-        pts.push(egui::pos2(
-            c.x + a_mid_valley.cos() * r_valley,
-            c.y + a_mid_valley.sin() * r_valley,
-        ));
-    }
-
-    painter.add(egui::Shape::closed_line(pts, stroke));
-    painter.circle_stroke(c, r_hole, stroke);
 }
 
 fn draw_folder_icon(painter: &egui::Painter, rect: egui::Rect, synced: bool) {
@@ -4338,7 +4257,7 @@ USAGE:
   protondrive-gui [OPTIONS]
 
 OPTIONS:
-  --tab <TAB>           initial section (home | activity | settings)
+  --tab <TAB>           initial section (home | shared | activity | settings)
   --screenshot <PATH>   render UI, save a PNG screenshot to PATH, and exit
   --search <QUERY>      pre-fill the activity search
   --share <PATH>        open the share window for the item at the absolute PATH (in a running app too)
@@ -4358,6 +4277,7 @@ OPTIONS:
   --account-mismatch    with --screenshot: show the daemon holding the records of another Proton account
   --paused-until-min <N>  with --screenshot: show sync paused until N minutes from now (0: until resumed)
   --pause-choices       with --screenshot: show Home's Pause choices open
+  --account-menu        with --screenshot: show the top bar's account menu open
   --fake-share <S>      with --screenshot: show the Share window (for --share's item, else Docs/report.pdf in the
                         drive) as S (none | link | link-password | link-expired | people)
   --confirm-stop-sharing <NAME>  with --screenshot and --fake-shared list: show the Stop sharing confirmation for that row
@@ -4398,6 +4318,7 @@ fn main() -> eframe::Result {
     let mut cli_account_mismatch = false;
     let mut cli_paused_until_min: Option<i64> = None;
     let mut cli_pause_choices = false;
+    let mut cli_account_menu = false;
     let mut cli_fake_share: Option<String> = None;
     let mut cli_fake_shared: Option<String> = None;
     let mut cli_confirm_stop_sharing: Option<String> = None;
@@ -4452,6 +4373,9 @@ fn main() -> eframe::Result {
             }
             "--pause-choices" => {
                 cli_pause_choices = true;
+            }
+            "--account-menu" => {
+                cli_account_menu = true;
             }
             "--fake-share" => {
                 cli_fake_share = text(args.next());
@@ -4509,12 +4433,13 @@ fn main() -> eframe::Result {
             || cli_account_mismatch
             || cli_paused_until_min.is_some()
             || cli_pause_choices
+            || cli_account_menu
             || cli_fake_share.is_some()
             || cli_fake_shared.is_some()
             || cli_confirm_stop_sharing.is_some())
     {
         eprintln!(
-            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --fake-share, --fake-shared and --confirm-stop-sharing only apply together with --screenshot; ignoring them"
+            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --account-menu, --fake-share, --fake-shared and --confirm-stop-sharing only apply together with --screenshot; ignoring them"
         );
     }
     let fake_share = match cli_fake_share {
@@ -4679,6 +4604,7 @@ fn main() -> eframe::Result {
                 // Epoch ms from the minutes asked for (0: paused until resumed)
                 app.fake_paused_until = cli_paused_until_min.map(|min| if min > 0 { home::now_ms() + min * 60_000 } else { 0 });
                 app.pause_choices_open = cli_pause_choices;
+                app.account_menu_open = cli_account_menu;
                 let mut status = std::mem::take(&mut app.status);
                 app.apply_fake_drive(&mut status);
                 app.apply_fake_files_missing(&mut status);
@@ -5141,7 +5067,12 @@ mod tests {
         last: Option<egui::FullOutput>,
         /// The window's size in points (the real window's size divided by the zoom)
         screen: Vec2,
+        /// What a frame shows instead of the app, to test a widget on its own (see `Harness::widget`)
+        scene: Option<Scene>,
     }
+
+    /// Widgets added to a bare panel, frame after frame
+    type Scene = Box<dyn FnMut(&mut egui::Ui)>;
 
     /// Held by the tests that set the single-instance request statics, which every test of the app shares
     static REQUEST_STATICS: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -5165,7 +5096,6 @@ mod tests {
                 search_query: String::new(),
                 activity_filter: activity::ActivityFilter::All,
                 expanded_activity: None,
-                jump_to_account: false,
                 hidden: None,
                 hidden_loading: false,
                 unhiding: None,
@@ -5199,9 +5129,10 @@ mod tests {
                 fake_attention: None,
                 fake_transfers: None,
                 fake_signed_out: false,
-            fake_account_mismatch: false,
-            fake_paused_until: None,
-            pause_choices_open: false,
+                fake_account_mismatch: false,
+                fake_paused_until: None,
+                pause_choices_open: false,
+                account_menu_open: false,
                 window_geometry: WindowGeometry::default(),
                 maximize_applied_on_open: true,
                 applied_light_mode: false,
@@ -5216,7 +5147,17 @@ mod tests {
             let ctx = egui::Context::default();
             configure_proton_theme(&ctx);
             apply_proton_visuals(&ctx, false);
-            let mut h = Self { ctx, app, commands, events, last: None, screen: Vec2::new(1440.0, 900.0) };
+            // Widgets then say what they are, and `widget_at` finds them by name, as a screen reader would
+            ctx.enable_accesskit();
+            let mut h = Self { ctx, app, commands, events, last: None, screen: Vec2::new(1440.0, 900.0), scene: None };
+            h.frames(3);
+            h
+        }
+
+        /// A window showing only what `scene` adds to its panel, to test a widget on its own.
+        fn widget(scene: impl FnMut(&mut egui::Ui) + 'static) -> Self {
+            let mut h = Self::new();
+            h.scene = Some(Box::new(scene));
             h.frames(3);
             h
         }
@@ -5249,7 +5190,13 @@ mod tests {
                 ..Default::default()
             };
             let app = &mut self.app;
-            self.last = Some(self.ctx.run(input, |ctx| app.render_ui(ctx)));
+            let scene = &mut self.scene;
+            self.last = Some(self.ctx.run(input, |ctx| match scene {
+                Some(scene) => {
+                    egui::CentralPanel::default().show(ctx, |ui| scene(ui));
+                }
+                None => app.render_ui(ctx),
+            }));
         }
 
         /// The window at `size` (as the OS sees it) with the keyboard zoom at `zoom`: egui then has `size / zoom` points.
@@ -5308,32 +5255,75 @@ mod tests {
             self.frames(30);
         }
 
-        /// Where the last frame painted exactly this text.
-        fn text_at(&self, text: &str) -> Option<egui::Pos2> {
-            fn find(shape: &egui::Shape, text: &str) -> Option<egui::Pos2> {
+        /// Every text the last frame painted that `matches`, in the order painted.
+        fn texts(&self, matches: impl Fn(&egui::epaint::TextShape) -> bool) -> Vec<&egui::epaint::TextShape> {
+            fn find<'a>(shape: &'a egui::Shape, matches: &impl Fn(&egui::epaint::TextShape) -> bool, out: &mut Vec<&'a egui::epaint::TextShape>) {
                 match shape {
-                    egui::Shape::Text(t) if t.galley.text() == text => Some(t.visual_bounding_rect().center()),
-                    egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, text)),
-                    _ => None,
-                }
-            }
-            self.last.as_ref()?.shapes.iter().find_map(|c| find(&c.shape, text))
-        }
-
-        /// Everywhere the last frame painted exactly this text, in the order painted.
-        fn text_at_all(&self, text: &str) -> Vec<egui::Pos2> {
-            fn find(shape: &egui::Shape, text: &str, out: &mut Vec<egui::Pos2>) {
-                match shape {
-                    egui::Shape::Text(t) if t.galley.text() == text => out.push(t.visual_bounding_rect().center()),
-                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, text, out)),
+                    egui::Shape::Text(t) if matches(t) => out.push(t),
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, matches, out)),
                     _ => {}
                 }
             }
             let mut out = Vec::new();
             for clipped in self.last.iter().flat_map(|o| o.shapes.iter()) {
-                find(&clipped.shape, text, &mut out);
+                find(&clipped.shape, &matches, &mut out);
             }
             out
+        }
+
+        /// Where the last frame painted exactly this text.
+        fn text_at(&self, text: &str) -> Option<egui::Pos2> {
+            self.text_rect(text).map(|r| r.center())
+        }
+
+        /// The box the last frame painted this text in, the first time it painted it.
+        fn text_rect(&self, text: &str) -> Option<egui::Rect> {
+            self.texts(|t| t.galley.text() == text).first().map(|t| t.visual_bounding_rect())
+        }
+
+        /// The box the last frame painted text starting with `prefix` in (a line shortened to fit), the first time.
+        fn text_rect_starting(&self, prefix: &str) -> Option<egui::Rect> {
+            self.texts(|t| t.galley.text().starts_with(prefix)).first().map(|t| t.visual_bounding_rect())
+        }
+
+        /// Everywhere the last frame painted exactly this text, in the order painted.
+        fn text_at_all(&self, text: &str) -> Vec<egui::Pos2> {
+            self.text_rects_all(text).into_iter().map(|r| r.center()).collect()
+        }
+
+        /// The boxes the last frame painted exactly this text in, in the order painted.
+        fn text_rects_all(&self, text: &str) -> Vec<egui::Rect> {
+            self.texts(|t| t.galley.text() == text).into_iter().map(|t| t.visual_bounding_rect()).collect()
+        }
+
+        /// The centre of the first widget the last frame named exactly `label` for screen readers (an icon-only
+        /// button's name is its old label).
+        fn widget_at(&self, label: &str) -> Option<egui::Pos2> {
+            self.widgets_at_all(label).into_iter().next()
+        }
+
+        /// The centres of every widget the last frame named exactly `label` for screen readers.
+        fn widgets_at_all(&self, label: &str) -> Vec<egui::Pos2> {
+            let Some(update) = self.last.as_ref().and_then(|o| o.platform_output.accesskit_update.as_ref()) else {
+                return Vec::new();
+            };
+            update
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.label() == Some(label))
+                .filter_map(|(_, node)| node.bounds())
+                .map(|b| egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
+                .collect()
+        }
+
+        /// The accessibility nodes the last frame named exactly `label`, left to right.
+        fn nodes_named(&self, label: &str) -> Vec<egui::accesskit::Node> {
+            let Some(update) = self.last.as_ref().and_then(|o| o.platform_output.accesskit_update.as_ref()) else {
+                return Vec::new();
+            };
+            let mut nodes: Vec<_> = update.nodes.iter().filter(|(_, n)| n.label() == Some(label)).map(|(_, n)| n.clone()).collect();
+            nodes.sort_by(|a, b| a.bounds().map_or(0.0, |r| r.x0).total_cmp(&b.bounds().map_or(0.0, |r| r.x0)));
+            nodes
         }
 
         /// The fill of the topmost rectangle the last frame painted under a point (a button's background).
@@ -5397,10 +5387,10 @@ mod tests {
         }
     }
 
-    /// Clicks the sidebar's Settings with nothing open, to prove `pos` is where it reacts, then goes back to Home.
-    fn settings_nav_reacts_at(h: &mut Harness, pos: egui::Pos2) {
+    /// Clicks the sidebar's Activity with nothing open, to prove `pos` is where it reacts, then goes back to Home.
+    fn activity_nav_reacts_at(h: &mut Harness, pos: egui::Pos2) {
         h.click(pos);
-        assert_eq!(h.app.tab, NavTab::Settings, "Settings did not react to a click at {pos:?}");
+        assert_eq!(h.app.tab, NavTab::Activity, "Activity did not react to a click at {pos:?}");
         h.app.tab = NavTab::Home;
         h.frames(2);
     }
@@ -5484,12 +5474,12 @@ mod tests {
     #[test]
     fn clicking_outside_a_confirm_dialog_closes_it_and_clicks_nothing_under_it() {
         let mut h = Harness::new();
-        let settings = h.text_at("Settings").expect("the sidebar's Settings is painted");
-        settings_nav_reacts_at(&mut h, settings);
+        let activity = h.text_at("Activity").expect("the sidebar's Activity is painted");
+        activity_nav_reacts_at(&mut h, activity);
 
         h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
         h.frames(2);
-        h.click(settings);
+        h.click(activity);
 
         assert_eq!(h.app.pending_confirm, None);
         assert_eq!(h.app.tab, NavTab::Home);
@@ -5500,13 +5490,13 @@ mod tests {
     #[test]
     fn a_click_in_the_frame_a_confirm_dialog_appears_clicks_nothing_under_it() {
         let mut h = Harness::new();
-        let settings = h.text_at("Settings").expect("the sidebar's Settings is painted");
-        settings_nav_reacts_at(&mut h, settings);
+        let activity = h.text_at("Activity").expect("the sidebar's Activity is painted");
+        activity_nav_reacts_at(&mut h, activity);
 
         // No frame has drawn the backdrop yet when the click arrives
         h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
         let button = |pressed| egui::Event::PointerButton {
-            pos: settings,
+            pos: activity,
             button: egui::PointerButton::Primary,
             pressed,
             modifiers: egui::Modifiers::NONE,
@@ -5611,8 +5601,7 @@ mod tests {
     }
 
     #[test]
-    fn the_sidebar_footer_shows_the_account_and_opens_settings_at_the_account() {
-        const GB: u64 = 1024 * 1024 * 1024;
+    fn settings_starts_with_the_account_and_signs_out_from_it() {
         let mut h = Harness::new();
         h.app.status.account = Some(AccountInfo {
             display_name: "Gautam C".into(),
@@ -5623,16 +5612,14 @@ mod tests {
             ..Default::default()
         });
         h.frames(2);
-        assert!(h.text_at("GC").is_some());
-        assert!(h.text_at(&format!("Version {}", env!("CARGO_PKG_VERSION"))).is_some());
-        let name = h.text_at("Gautam C").expect("the footer names the account");
-        h.click(name);
+        h.click(h.widget_at("Settings").expect("the top bar's gear"));
         assert_eq!(h.app.tab, NavTab::Settings);
-        // Settings starts with the account: name, email, plan, storage and Sign out
-        assert!(h.text_at("Account").is_some());
-        assert!(h.text_at("gc@proton.me").is_some());
-        assert!(h.text_at("Proton Unlimited").is_some());
-        assert!(h.text_at("51.0 GB of 510.0 GB").is_some());
+        // Settings starts with the account: name, email, plan, storage and Sign out (the top bar shows the name, email
+        // and initials too)
+        let in_section = |h: &Harness, text: &str| h.text_at_all(text).iter().any(|p| p.y > chrome::TOP_BAR_HEIGHT);
+        for shown in ["Account", "Gautam C", "GC", "gc@proton.me", "Proton Unlimited", "51.0 GB of 510.0 GB"] {
+            assert!(in_section(&h, shown), "{shown}");
+        }
         h.click(h.text_at("Sign out").expect("Sign out is offered"));
         assert_eq!(h.sent(), vec!["sign out".to_string()]);
         // Nothing of the old sidebar, top bar or popover is left (Home has its own Pause and Sync now)
@@ -6186,7 +6173,7 @@ mod tests {
     }
 
     // #201: a delete through the drive goes to the Proton Drive trash, which the app opens in the browser, from Home
-    // and from Settings' account card; a screenshot opens nothing
+    // and from Settings' account card; a screenshot opens nothing (nor does the sidebar's Open in Files)
     #[test]
     fn the_proton_drive_trash_opens_in_the_browser_from_home_and_settings() {
         let launched = || home::LAUNCHED.with(|l| std::mem::take(&mut *l.borrow_mut()));
@@ -6233,8 +6220,7 @@ mod tests {
     }
 
     #[test]
-    fn your_drive_shows_where_it_is_the_storage_and_frees_up_space_after_asking() {
-        const GB: u64 = 1024 * 1024 * 1024;
+    fn your_drive_shows_where_it_is_and_frees_up_space_after_asking() {
         let mut h = home_with(|s| {
             s.sync_dir = "/srv/u/ProtonDrive".into();
             s.vfs = Some(vfs("virtual", true, None));
@@ -6244,18 +6230,13 @@ mod tests {
         assert!(h.text_at("Your drive").is_some());
         assert!(h.text_at("/srv/u/ProtonDrive").is_some());
         assert!(h.text_at("Virtual drive · mounted").is_some());
-        assert!(h.text_at("Open in Files").is_some());
-        assert!(h.text_at("Proton storage").is_some());
-        assert!(h.text_at("51.0 GB of 510.0 GB").is_some());
         assert!(h.text_at("On this computer").is_some());
         assert!(h.text_at("169.0 MB").is_some());
         h.click(h.text_at("Free up space…").expect("Free up space is offered"));
         assert_eq!(h.app.pending_confirm, Some(PendingConfirm::FreeAll { rel_path: String::new() }));
         assert_eq!(h.sent(), Vec::<String>::new());
 
-        // Without the account's usage there is no storage row
         let h = home_with(|s| s.account = None);
-        assert!(h.text_at("Proton storage").is_none());
         assert!(h.text_at("Plain folder").is_some());
     }
 
@@ -6686,10 +6667,446 @@ mod tests {
 
     // #253: the Shared section
     #[test]
-    fn the_sidebar_lists_home_shared_activity_settings_in_that_order() {
+    fn the_sidebar_lists_home_shared_activity_in_that_order() {
         let h = Harness::new();
-        let ys: Vec<f32> = ["Home", "Shared", "Activity", "Settings"].iter().map(|l| h.text_at(l).expect(l).y).collect();
+        let ys: Vec<f32> = ["Home", "Shared", "Activity"].iter().map(|l| h.text_at(l).expect(l).y).collect();
         assert!(ys.windows(2).all(|w| w[0] < w[1]), "{ys:?}");
+    }
+
+    // #276: the sidebar as Proton's: the mark, Open in Files, the sections, and the storage meter over the version
+    const SIDEBAR_EDGE: f32 = 252.0;
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    fn tooltips_at_once(h: &Harness) {
+        h.ctx.style_mut(|s| {
+            s.interaction.tooltip_delay = 0.0;
+            s.interaction.show_tooltips_only_when_still = false;
+        });
+    }
+
+    fn hover(h: &mut Harness, pos: egui::Pos2) {
+        h.frame(vec![egui::Event::PointerMoved(pos)]);
+        h.frames(5);
+    }
+
+    /// An account using 3 GB of 510 GB, 2 GB of it in Drive.
+    fn three_of_510() -> AccountInfo {
+        AccountInfo { used_space: 3 * GB, max_space: 510 * GB, used_drive_space: 2 * GB, ..Default::default() }
+    }
+
+    #[test]
+    fn the_sidebar_offers_home_shared_and_activity_and_no_settings() {
+        let h = Harness::new();
+        for (label, icon) in [("Home", icons::HOME), ("Shared", icons::SHARED), ("Activity", icons::ACTIVITY)] {
+            let at = h.text_at(label).expect(label);
+            assert!(at.x < SIDEBAR_EDGE, "{label} at {at:?}");
+            let glyph = h.text_at(icon).unwrap_or_else(|| panic!("{label}'s icon is painted"));
+            assert!(glyph.x < at.x && (glyph.y - at.y).abs() < 4.0, "{label}'s icon {glyph:?} is before its name {at:?}");
+        }
+        let settings: Vec<_> = h.text_at_all("Settings").into_iter().filter(|p| p.x < SIDEBAR_EDGE).collect();
+        assert_eq!(settings, Vec::<egui::Pos2>::new(), "Settings leaves the sidebar (the top bar's gear opens it)");
+        // Nor is the account at its foot any more (it moves to the top bar)
+        for gone in ["Not signed in", "Proton Account", "PD"] {
+            assert!(h.text_at_all(gone).iter().all(|p| p.x > SIDEBAR_EDGE), "{gone}");
+        }
+    }
+
+    #[test]
+    fn the_open_section_is_filled_and_another_fills_under_the_pointer() {
+        let mut h = Harness::new();
+        assert_eq!(h.fill_under(h.text_at("Home").unwrap()), Some(SIDEBAR_SELECTED()));
+        assert_eq!(h.fill_under(h.text_at("Activity").unwrap()), Some(BG_SIDEBAR()));
+        let activity = h.text_at("Activity").unwrap();
+        hover(&mut h, activity);
+        assert_eq!(h.fill_under(activity), Some(SIDEBAR_HOVER()));
+        h.click(activity);
+        assert_eq!(h.app.tab, NavTab::Activity);
+        assert_eq!(h.fill_under(h.text_at("Activity").unwrap()), Some(SIDEBAR_SELECTED()));
+        // The sections are named for screen readers too (the top bar's title is another "Activity")
+        for label in ["Home", "Shared", "Activity"] {
+            assert!(h.widgets_at_all(label).iter().any(|p| p.x < SIDEBAR_EDGE), "{label}");
+        }
+    }
+
+    #[test]
+    fn open_in_files_in_the_sidebar_opens_the_drive_folder() {
+        let launched = || home::LAUNCHED.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        launched();
+        let mut h = home_with(|s| s.sync_dir = "/home/u/ProtonDrive".into());
+        h.sent();
+        let open = h.text_at_all(chrome::OPEN_IN_FILES);
+        assert_eq!(open.len(), 1, "offered once, in the sidebar, not on Home's card too: {open:?}");
+        assert!(open[0].x < SIDEBAR_EDGE, "{open:?}");
+        assert!(open[0].y < h.text_at("Home").unwrap().y, "above the sections");
+        assert_eq!(h.fill_under(open[0]), Some(PROTON_PURPLE), "the primary button");
+        h.click(open[0]);
+        assert_eq!(launched(), vec!["/home/u/ProtonDrive".to_string()]);
+        assert_eq!(h.sent(), Vec::<String>::new(), "nothing goes to the daemon");
+        // A screenshot opens nothing
+        home::AS_SCREENSHOT.with(|s| s.set(true));
+        h.click(open[0]);
+        home::AS_SCREENSHOT.with(|s| s.set(false));
+        assert_eq!(launched(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn open_in_files_waits_for_a_folder() {
+        let launched = || home::LAUNCHED.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        launched();
+        let mut h = home_with(|s| s.sync_dir = String::new());
+        tooltips_at_once(&h);
+        let open = h.text_at(chrome::OPEN_IN_FILES).expect("still offered, greyed out");
+        // A disabled widget fades into the colour it sits on (the sidebar's)
+        let faded = egui::ecolor::tint_color_towards(PROTON_PURPLE, BG_SIDEBAR());
+        assert_eq!(h.fill_under(open), Some(faded), "greyed out: the primary fill, faded as a disabled widget's is");
+        assert_ne!(faded, PROTON_PURPLE);
+        hover(&mut h, open);
+        assert!(h.text_at(chrome::OPEN_IN_FILES_WAITS).is_some(), "the hover says why");
+        h.click(open);
+        assert_eq!(launched(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_storage_meter_shows_used_over_total_and_the_version() {
+        let mut h = home_with(|s| s.account = Some(three_of_510()));
+        tooltips_at_once(&h);
+        let text = chrome::storage_meter_text(h.app.status.account.as_ref()).expect("a quota to show");
+        assert_eq!(text, "3.0 GB / 510.0 GB");
+        let meter = h.text_at(&text).expect("the meter's line is painted");
+        let version = h.text_at(env!("CARGO_PKG_VERSION")).expect("the version is painted");
+        for at in [meter, version] {
+            assert!(at.x < SIDEBAR_EDGE && at.y > 400.0, "at the foot of the sidebar: {at:?}");
+        }
+        assert!(meter.x < version.x && (meter.y - version.y).abs() < 2.0, "one line: {meter:?}, then {version:?}");
+        // The bar, over the line: its track, filled with what is used
+        let track = h.rects_filled(STORAGE_TRACK());
+        let track = track.iter().find(|r| r.right() <= SIDEBAR_EDGE).expect("the bar's track");
+        assert!(track.height() <= 4.0 && track.bottom() < h.text_rect(&text).unwrap().top(), "{track:?}");
+        let used = h.rects_filled(STORAGE_FILL());
+        let used = used.iter().find(|r| track.contains(r.center())).expect("the used part");
+        assert!(used.width() < track.width() / 10.0, "3 GB of 510 GB is a sliver: {used:?} of {track:?}");
+        hover(&mut h, meter);
+        assert!(h.text_at("Drive uses 2.0 GB").is_some(), "the hover says how much is Drive's");
+
+        // Signed out: the version alone
+        h.app.status.account = None;
+        h.frames(2);
+        assert!(h.text_at(&text).is_none());
+        assert!(h.text_at(env!("CARGO_PKG_VERSION")).is_some());
+        assert!(h.rects_filled(STORAGE_TRACK()).iter().all(|r| r.right() > SIDEBAR_EDGE), "no bar");
+        assert_eq!(chrome::storage_meter_text(None), None);
+        assert_eq!(chrome::storage_meter_text(Some(&AccountInfo::default())), None, "no quota, no meter");
+    }
+
+    #[test]
+    fn home_no_longer_shows_proton_storage() {
+        let h = home_with(|s| s.account = Some(three_of_510()));
+        assert!(h.text_at("Proton storage").is_none());
+        assert!(h.text_at("3.0 GB of 510.0 GB").is_none());
+        assert!(h.text_at("Your drive").is_some());
+    }
+
+    #[test]
+    fn the_sidebar_fits_at_840_by_540_zoomed() {
+        let mut h = home_with(|s| s.account = Some(three_of_510()));
+        h.app.fake_attention = Some(3);
+        h.app.refresh_attention();
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
+        let text = chrome::storage_meter_text(h.app.status.account.as_ref()).unwrap();
+        let rect = |label: &str| h.text_rect(label).unwrap_or_else(|| panic!("{label} is painted"));
+        let (name, open, home, activity, meter) =
+            (rect("Proton Drive"), rect(chrome::OPEN_IN_FILES), rect("Home"), rect("Activity"), rect(&text));
+        assert!(name.bottom() < open.top(), "the logo {name:?} is above Open in Files {open:?}");
+        assert!(open.bottom() < home.top(), "Open in Files {open:?} is above Home {home:?}");
+        assert!(activity.bottom() < meter.top(), "Activity {activity:?} is above the meter {meter:?}");
+        assert!(meter.bottom() <= h.screen.y, "the meter {meter:?} is inside the window {:?}", h.screen);
+        assert!(rect(env!("CARGO_PKG_VERSION")).right() <= SIDEBAR_EDGE, "the version stays in the sidebar");
+    }
+
+    #[test]
+    fn the_logo_has_no_dark_tile() {
+        let img = image::load_from_memory(LOGO_PNG).expect("the logo is a PNG").to_rgba8();
+        assert_eq!(img.dimensions(), (128, 128));
+        assert_eq!(img.get_pixel(2, 2)[3], 0, "a corner is transparent");
+        assert_eq!(img.get_pixel(64, 0)[3], 0, "the middle of the top edge is transparent: no tile behind the folder");
+        assert_eq!(img.get_pixel(64, 64)[3], 255, "the folder is there");
+    }
+
+    // #274: the top bar: the section's title, the gear for Settings, and the account, which opens a menu (not Settings)
+    fn gautam() -> AccountInfo {
+        AccountInfo {
+            display_name: "Gautam C".into(),
+            email: "gc@proton.me".into(),
+            initials: "GC".into(),
+            used_space: 51 * GB,
+            max_space: 510 * GB,
+            ..Default::default()
+        }
+    }
+
+    /// Home, signed in as `gautam()`, with the account menu open.
+    fn account_menu() -> Harness {
+        let mut h = Harness::new();
+        h.app.status.account = Some(gautam());
+        h.frames(2);
+        h.click(h.widget_at("Account").expect("the account is one button, named Account"));
+        assert!(h.app.account_menu_open);
+        h
+    }
+
+    /// Where the last frame painted this text in the top bar (right of the sidebar, above the section).
+    fn in_top_bar(h: &Harness, text: &str) -> Vec<egui::Pos2> {
+        h.text_at_all(text).into_iter().filter(|p| p.x > SIDEBAR_EDGE && p.y < chrome::TOP_BAR_HEIGHT).collect()
+    }
+
+    #[test]
+    fn the_top_bar_titles_each_section_once() {
+        let mut h = Harness::new();
+        for tab in [NavTab::Home, NavTab::Shared, NavTab::Activity, NavTab::Settings] {
+            h.app.open_tab(tab);
+            h.frames(3);
+            let title = chrome::tab_title(tab);
+            let shown: Vec<_> = h.text_at_all(title).into_iter().filter(|p| p.x > SIDEBAR_EDGE).collect();
+            assert_eq!(shown.len(), 1, "{tab:?}: {title:?} is shown once beside the sidebar, at {shown:?}");
+            assert!(shown[0].y < chrome::TOP_BAR_HEIGHT, "{tab:?}: in the top bar, at {:?}", shown[0]);
+        }
+        // In bold (the sidebar has no "Settings" to find first)
+        assert!(painted_bold(&h, "Settings", f32::MAX));
+    }
+
+    #[test]
+    fn the_gear_opens_settings() {
+        let mut h = Harness::new();
+        let gear = h.widget_at("Settings").expect("the gear, named Settings");
+        assert!(gear.x > SIDEBAR_EDGE && gear.y < chrome::TOP_BAR_HEIGHT, "in the top bar, at {gear:?}");
+        assert_eq!(in_top_bar(&h, icons::SETTINGS).len(), 1, "drawn as the gear");
+        h.click(gear);
+        assert_eq!(h.app.tab, NavTab::Settings);
+        assert_eq!(h.fill_under(gear), Some(PROTON_PURPLE_SOFT()), "it looks pressed while Settings is open");
+        h.click(h.text_at("Home").unwrap());
+        h.frame(vec![egui::Event::PointerMoved(egui::pos2(600.0, 400.0))]);
+        h.frames(2);
+        assert_ne!(h.fill_under(gear), Some(PROTON_PURPLE_SOFT()), "and not once it is closed");
+    }
+
+    #[test]
+    fn clicking_the_account_opens_the_menu_not_settings() {
+        let mut h = Harness::new();
+        h.app.status.account = Some(gautam());
+        h.frames(2);
+        // The name over the email, then the initials, on the right
+        let (name, email, initials) = (in_top_bar(&h, "Gautam C"), in_top_bar(&h, "gc@proton.me"), in_top_bar(&h, "GC"));
+        assert!(name.len() == 1 && email.len() == 1 && initials.len() == 1, "{name:?} {email:?} {initials:?}");
+        assert!(name[0].y < email[0].y && email[0].x < initials[0].x, "{name:?} {email:?} {initials:?}");
+        let gear = h.widget_at("Settings").unwrap();
+        assert!(gear.x < name[0].x, "the gear {gear:?} is left of the account {name:?}");
+        assert!(h.text_at("Sign out").is_none());
+
+        h.click(h.widget_at("Account").expect("the account is one button, named Account"));
+        assert_eq!(h.app.tab, NavTab::Home, "not Settings");
+        assert!(h.app.account_menu_open);
+        for item in ["Sign out", "Open Proton Drive on the web", "Proton Unlimited", "51.0 GB of 510.0 GB", "Proton storage"] {
+            let at = h.text_at(item).unwrap_or_else(|| panic!("the menu shows {item:?}"));
+            assert!(at.y > chrome::TOP_BAR_HEIGHT, "{item:?}: under the top bar, at {at:?}");
+        }
+        assert_eq!(h.sent(), Vec::<String>::new(), "opening it does nothing else");
+    }
+
+    #[test]
+    fn sign_out_in_the_menu_signs_out_at_once_and_closes_it() {
+        let mut h = account_menu();
+        h.click(h.text_at("Sign out").unwrap());
+        assert_eq!(h.sent(), vec!["sign out".to_string()]);
+        assert!(!h.app.account_menu_open);
+        assert!(h.text_at("Sign out").is_none());
+    }
+
+    #[test]
+    fn web_in_the_menu_opens_drive_proton_me() {
+        let launched = || home::LAUNCHED.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        launched();
+        let mut h = account_menu();
+        h.click(h.text_at("Open Proton Drive on the web").unwrap());
+        assert_eq!(launched(), vec![home::PROTON_DRIVE_WEB_URL.to_string()]);
+        assert!(!h.app.account_menu_open);
+        assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn escape_and_a_click_outside_close_the_menu_without_clicking_through() {
+        let mut h = account_menu();
+        press_key(&mut h, egui::Key::Escape);
+        assert!(!h.app.account_menu_open);
+        assert!(h.text_at("Sign out").is_none());
+
+        h.app.open_tab(NavTab::Shared);
+        h.frames(2);
+        h.sent();
+        h.click(h.widget_at("Account").unwrap());
+        assert!(h.app.account_menu_open);
+        h.click(h.text_at("Home").expect("the sidebar's Home"));
+        assert!(!h.app.account_menu_open, "a click outside closes it");
+        assert_eq!(h.app.tab, NavTab::Shared, "and clicks nothing under it");
+        assert_eq!(h.sent(), Vec::<String>::new());
+        // The account again, with the menu open, closes it too
+        h.click(h.widget_at("Account").unwrap());
+        h.click(h.widget_at("Account").unwrap());
+        assert!(!h.app.account_menu_open);
+    }
+
+    #[test]
+    fn opening_a_section_closes_the_menu() {
+        let mut h = account_menu();
+        h.app.open_tab(NavTab::Activity);
+        h.frames(2);
+        assert!(!h.app.account_menu_open);
+        assert!(h.text_at("Sign out").is_none());
+    }
+
+    #[test]
+    fn signed_out_the_account_area_says_so_and_opens_nothing() {
+        let mut h = Harness::new();
+        h.app.status.logged_in = false;
+        h.app.status.account = None;
+        h.frames(2);
+        let at = in_top_bar(&h, "Not signed in");
+        assert_eq!(at.len(), 1, "said in the top bar");
+        assert_eq!(in_top_bar(&h, "PD").len(), 1, "with PD for initials");
+        h.click(at[0]);
+        assert!(!h.app.account_menu_open);
+        assert!(h.text_at("Sign out").is_none());
+        // Until the daemon first answers, it says so
+        h.app.initial_connecting = true;
+        h.frames(2);
+        assert_eq!(in_top_bar(&h, "Connecting…").len(), 1);
+        // Signed in without the account's details (an older daemon): the menu still offers Sign out
+        h.app.initial_connecting = false;
+        h.app.status.logged_in = true;
+        h.frames(2);
+        assert_eq!(in_top_bar(&h, "Proton Account").len(), 1);
+        h.click(h.widget_at("Account").unwrap());
+        assert!(h.app.account_menu_open);
+        assert!(h.text_at("Sign out").is_some());
+        // Signed out meanwhile (from Settings, the tray…): the menu goes
+        let status = DaemonStatus { logged_in: false, account: None, ..h.app.status.clone() };
+        h.event(WorkerEvent::StatusAndActivity { status: Box::new(Ok(status)), activity: Vec::new() });
+        assert!(!h.app.account_menu_open);
+        assert!(h.text_at("Sign out").is_none());
+    }
+
+    #[test]
+    fn a_long_name_does_not_push_the_title_or_gear_off_at_840() {
+        let mut h = Harness::new();
+        let name = "Bartholomew ".repeat(5);
+        let email = format!("{}@proton.me", "featherstonehaugh".repeat(3));
+        assert!(name.len() >= 60 && email.len() >= 60);
+        h.app.status.account = Some(AccountInfo { display_name: name.clone(), email, initials: "BB".into(), ..gautam() });
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
+        let inside = |h: &Harness, r: egui::Rect| {
+            r.left() > SIDEBAR_EDGE && r.right() <= h.screen.x && r.top() >= 0.0 && r.bottom() <= chrome::TOP_BAR_HEIGHT
+        };
+        for tab in [NavTab::Home, NavTab::Shared, NavTab::Activity, NavTab::Settings] {
+            h.app.open_tab(tab);
+            h.frames(3);
+            let title = chrome::tab_title(tab);
+            let title = *h.text_rects_all(title).iter().find(|r| r.left() > SIDEBAR_EDGE).expect("the title is shown");
+            // On Settings the title is named Settings too: the gear is the one on the right
+            let gear = h.widgets_at_all("Settings").into_iter().max_by(|a, b| a.x.total_cmp(&b.x)).unwrap();
+            let gear = egui::Rect::from_center_size(gear, Vec2::splat(28.0));
+            // (Settings' Account card shows them too)
+            let initials: Vec<_> = h.text_rects_all("BB").into_iter().filter(|r| r.top() < chrome::TOP_BAR_HEIGHT).collect();
+            assert!(initials.len() == 1 && inside(&h, title) && inside(&h, gear) && inside(&h, initials[0]), "{tab:?}");
+            assert!(title.right() < gear.left(), "{tab:?}: the title {title:?} runs under the gear {gear:?}");
+            // The name is shortened to fit, between the gear and the initials
+            let shown = h.text_rect_starting("Bartholomew").expect("the name is painted, shortened");
+            assert!(gear.right() < shown.left() && shown.right() < initials[0].left(), "{tab:?}: {shown:?} {gear:?}");
+            assert!(in_top_bar(&h, &name).is_empty(), "shortened");
+        }
+    }
+
+    #[test]
+    fn the_top_bar_takes_no_clicks_under_a_dialog() {
+        let mut h = Harness::new();
+        h.app.status.account = Some(gautam());
+        h.frames(2);
+        let (gear, account) = (h.widget_at("Settings").unwrap(), h.widget_at("Account").unwrap());
+        for at in [gear, account] {
+            h.app.pending_confirm = Some(PendingConfirm::StartFresh);
+            h.frames(2);
+            h.click(at);
+            assert_eq!(h.app.tab, NavTab::Home);
+            assert!(!h.app.account_menu_open);
+        }
+        assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    /// The top bar's last node named `label` (the gear, the account), as screen readers get it.
+    fn top_bar_node(h: &Harness, label: &str) -> egui::accesskit::Node {
+        h.nodes_named(label).pop().unwrap_or_else(|| panic!("{label} is named"))
+    }
+
+    #[test]
+    fn the_top_bar_is_disabled_under_a_dialog_and_under_the_share_window() {
+        let mut h = Harness::new();
+        h.app.status.account = Some(gautam());
+        h.frames(2);
+        for label in ["Settings", "Account"] {
+            assert!(!top_bar_node(&h, label).is_disabled(), "{label} works with no dialog");
+        }
+        h.app.pending_confirm = Some(PendingConfirm::StartFresh);
+        h.frames(2);
+        for label in ["Settings", "Account"] {
+            assert!(top_bar_node(&h, label).is_disabled(), "{label} under the confirmation");
+        }
+        h.app.pending_confirm = None;
+        h.frames(2);
+        h.app.open_share("/home/u/ProtonDrive/Docs/report.pdf");
+        h.frames(3);
+        assert!(h.app.share.is_some());
+        for label in ["Settings", "Account"] {
+            assert!(top_bar_node(&h, label).is_disabled(), "{label} under the Share window");
+        }
+    }
+
+    #[test]
+    fn the_gear_and_the_account_say_whether_they_are_pressed() {
+        use egui::accesskit::Toggled;
+        let mut h = Harness::new();
+        h.app.status.account = Some(gautam());
+        h.frames(2);
+        assert_eq!(top_bar_node(&h, "Settings").toggled(), Some(Toggled::False), "Home is open");
+        assert_eq!(top_bar_node(&h, "Account").toggled(), Some(Toggled::False), "no menu");
+        h.app.open_tab(NavTab::Settings);
+        h.frames(2);
+        assert_eq!(top_bar_node(&h, "Settings").toggled(), Some(Toggled::True), "Settings is open");
+        h.click(h.widget_at("Account").unwrap());
+        assert!(h.app.account_menu_open);
+        assert_eq!(top_bar_node(&h, "Account").toggled(), Some(Toggled::True), "the menu is open");
+    }
+
+    #[test]
+    fn a_right_click_outside_the_account_menu_closes_it_and_clicks_nothing() {
+        let mut h = Harness::new();
+        h.app.status.account = Some(gautam());
+        h.app.open_tab(NavTab::Shared);
+        h.frames(2);
+        h.click(h.widget_at("Account").unwrap());
+        assert!(h.app.account_menu_open);
+        h.sent();
+        let at = h.text_at("Home").expect("the sidebar's Home");
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        h.frame(vec![egui::Event::PointerMoved(at)]);
+        h.frame(vec![button(true)]);
+        h.frame(vec![button(false)]);
+        h.frames(2);
+        assert!(!h.app.account_menu_open, "a right-click outside closes it");
+        assert_eq!(h.app.tab, NavTab::Shared);
+        assert_eq!(h.sent(), Vec::<String>::new());
     }
 
     #[test]
@@ -7361,19 +7778,6 @@ mod tests {
         }
     }
 
-    /// WCAG contrast ratio of two opaque colours.
-    fn contrast(a: Color32, b: Color32) -> f32 {
-        fn luminance(c: Color32) -> f32 {
-            let lin = |v: u8| {
-                let v = v as f32 / 255.0;
-                if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-            };
-            0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
-        }
-        let (la, lb) = (luminance(a), luminance(b));
-        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
-    }
-
     #[test]
     fn the_destructive_buttons_white_label_reads_at_rest_and_on_hover() {
         assert!(contrast(Color32::WHITE, STATUS_DANGER) >= 4.5, "{}", contrast(Color32::WHITE, STATUS_DANGER));
@@ -7776,8 +8180,8 @@ mod tests {
         assert_eq!(window(&mut h).invite_input, "a@b.co", "what was typed stays");
         assert_eq!(h.sent(), Vec::<String>::new());
         // The sidebar under the window doesn't react
-        let settings = h.text_at("Settings").expect("the sidebar is painted under the window");
-        h.click(settings);
+        let activity = h.text_at("Activity").expect("the sidebar is painted under the window");
+        h.click(activity);
         assert_eq!(h.app.tab, NavTab::Home);
         assert!(h.app.share.is_some(), "a click outside the window doesn't close it");
         // Another item replaces it
@@ -8301,5 +8705,202 @@ mod tests {
         assert_eq!(share::info_at(&sock, "a.pdf"), Err(share::SHARE_NEEDS_RESTART.to_string()));
         server.join().unwrap();
         let _ = std::fs::remove_file(&sock);
+    }
+
+    // #276: Proton's colours, as drive.proton.me shows them in light mode
+    #[test]
+    fn the_light_palette_is_protons() {
+        assert_eq!(LIGHT.sidebar, Color32::from_rgb(0x21, 0x1A, 0x42));
+        assert_eq!(LIGHT.sidebar_selected, Color32::from_rgb(0x2E, 0x23, 0x59));
+        assert_eq!(LIGHT.sidebar_text, Color32::WHITE);
+        assert_eq!(LIGHT.sidebar_weak, Color32::from_rgb(0xB1, 0xA1, 0xF5));
+        assert_eq!(
+            (LIGHT.storage_fill, LIGHT.storage_track),
+            (Color32::from_rgb(0xB1, 0xA1, 0xF5), Color32::from_rgb(0x3E, 0x2F, 0x7F))
+        );
+        assert_eq!((LIGHT.canvas, LIGHT.card), (Color32::WHITE, Color32::WHITE));
+        assert_eq!(
+            (LIGHT.card_alt, LIGHT.input),
+            (Color32::from_rgb(0xF5, 0xF4, 0xF2), Color32::from_rgb(0xF5, 0xF4, 0xF2))
+        );
+        assert_eq!(
+            (LIGHT.border_weak, LIGHT.border_norm),
+            (Color32::from_rgb(0xEA, 0xE7, 0xE4), Color32::from_rgb(0xD1, 0xCF, 0xCD))
+        );
+        assert_eq!(
+            (LIGHT.text, LIGHT.text_weak),
+            (Color32::from_rgb(0x0C, 0x0C, 0x14), Color32::from_rgb(0x5C, 0x59, 0x58))
+        );
+        assert_eq!(LIGHT.folder, Color32::from_rgb(0xF5, 0xA4, 0x28));
+        assert_eq!(PROTON_PURPLE_HOVER, Color32::from_rgb(0x62, 0x43, 0xE6));
+    }
+
+    #[test]
+    fn the_dark_palette_keeps_todays_colours() {
+        // Every dark value main had (dacfcea), the sidebar's being its own panel's
+        let rgb = Color32::from_rgb;
+        assert_eq!(DARK.canvas, rgb(26, 24, 35));
+        assert_eq!(DARK.sidebar, rgb(20, 18, 27));
+        assert_eq!(DARK.card, rgb(33, 29, 44));
+        assert_eq!(DARK.card_alt, rgb(42, 37, 56));
+        assert_eq!(DARK.input, rgb(35, 31, 48));
+        assert_eq!(DARK.border_weak, rgb(48, 43, 64));
+        assert_eq!(DARK.text, rgb(247, 246, 252));
+        assert_eq!(DARK.text_weak, rgb(162, 158, 178));
+        assert_eq!(DARK.purple_soft, rgb(44, 37, 69));
+        assert_eq!(DARK.purple_text, rgb(214, 204, 255));
+    }
+
+    #[test]
+    fn contrast_is_the_wcag_ratio() {
+        assert!((contrast(Color32::BLACK, Color32::WHITE) - 21.0).abs() < 0.01);
+        assert_eq!(contrast(Color32::WHITE, Color32::BLACK), contrast(Color32::BLACK, Color32::WHITE), "either way");
+        assert_eq!(contrast(PROTON_PURPLE, PROTON_PURPLE), 1.0);
+        // #767676 on white is the lightest grey that reads at 4.5:1
+        let grey = Color32::from_rgb(0x76, 0x76, 0x76);
+        assert!((contrast(grey, Color32::WHITE) - 4.54).abs() < 0.01, "{}", contrast(grey, Color32::WHITE));
+    }
+
+    #[test]
+    fn text_reads_at_4_5_to_1_in_both_palettes() {
+        for p in [&LIGHT, &DARK] {
+            for (fg, bg, what) in [
+                (p.text, p.canvas, "text"),
+                (p.text_weak, p.canvas, "weak text"),
+                (p.text_weak, p.card_alt, "weak text on a hovered row"),
+                (p.text_weak, p.input, "weak text on an input"),
+                (p.purple_text, p.purple_soft, "the plan pill"),
+                (p.text, p.card, "text on cards"),
+                (p.sidebar_text, p.sidebar, "sidebar"),
+                (p.sidebar_text, p.sidebar_selected, "selected section"),
+                (p.sidebar_weak, p.sidebar, "sidebar weak"),
+                (Color32::WHITE, PROTON_PURPLE, "primary button"),
+            ] {
+                assert!(contrast(fg, bg) >= 4.5, "{what}: {:.2}", contrast(fg, bg));
+            }
+        }
+    }
+
+    #[test]
+    fn an_icon_button_is_found_by_its_label_and_says_it_on_hover() {
+        let mut h = Harness::widget(|ui| {
+            icon_button(ui, icons::REFRESH, "Refresh");
+        });
+        let at = h.widget_at("Refresh").expect("named Refresh for screen readers");
+        assert!(h.text_at(icons::REFRESH).is_some(), "the icon is painted");
+        assert_eq!(h.text_at("Refresh"), None, "and no label");
+        assert_eq!(h.fill_under(at), Some(BG_CANVAS()), "no fill of its own");
+        h.frame(vec![egui::Event::PointerMoved(at)]);
+        h.frames(120); // 2 s, as frames come at 60 a second
+        assert!(h.text_at("Refresh").is_some(), "the tooltip says what it does");
+        assert_eq!(h.fill_under(at), Some(BG_CARD_ALT()), "until hovered");
+    }
+
+    /// The size of `icon` drawn at 16 pt in Phosphor alone.
+    fn phosphor_glyph_size(icon: &str) -> Vec2 {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert("phosphor".into(), std::sync::Arc::new(egui_phosphor::Variant::Regular.font_data()));
+        fonts.families.insert(FontFamily::Proportional, vec!["phosphor".into()]);
+        ctx.set_fonts(fonts);
+        let _ = ctx.run(egui::RawInput::default(), |_| {}); // the fonts load with the first frame
+        ctx.fonts(|f| f.layout_no_wrap(icon.into(), FontId::proportional(16.0), Color32::WHITE)).mesh_bounds.size()
+    }
+
+    // Inter, the app's font, has glyphs of its own at some of Phosphor's private-use code points (the house, the gear,
+    // the open folder…): an icon drawn in Inter's family shows Inter's glyph instead of Phosphor's
+    #[test]
+    fn each_icon_is_drawn_as_phosphors_glyph() {
+        let mut wrong = Vec::new();
+        for icon in icons::ALL {
+            let h = Harness::widget(move |ui| {
+                action_button(ui, ButtonKind::Secondary, Some(icon), "Label", 32.0);
+            });
+            let drawn = h.text_rect(icon).expect("the icon is painted").size();
+            if (drawn - phosphor_glyph_size(icon)).length() > 1.0 {
+                wrong.push(format!("{icon:?} drawn {drawn:?}, Phosphor's is {:?}", phosphor_glyph_size(icon)));
+            }
+        }
+        assert_eq!(wrong, Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_action_buttons_label_is_still_painted_text() {
+        let h = Harness::widget(|ui| {
+            action_button(ui, ButtonKind::Secondary, Some(icons::SYNC), "Sync now", 32.0);
+        });
+        let label = h.text_at("Sync now").expect("the label is painted text");
+        assert!(h.widget_at("Sync now").is_some(), "and the button's name");
+        let icon = h.text_at(icons::SYNC).expect("the icon is painted");
+        assert!(icon.x < label.x, "the icon comes before the label");
+    }
+
+    #[test]
+    fn a_proton_button_is_named_by_its_label() {
+        let h = Harness::widget(|ui| {
+            proton_button(ui, Vec2::new(90.0, 30.0), "Unblock", BG_CARD_ALT(), BG_INPUT(), None, TEXT_PRIMARY(), 12.5);
+        });
+        let button = h.widget_at("Unblock").expect("named by its label");
+        let label = h.text_at("Unblock").unwrap();
+        assert!((button - label).length() < 3.0, "the button {button:?} is where its label {label:?} is painted");
+    }
+
+    #[test]
+    fn each_button_kind_has_its_look() {
+        let mut h = Harness::widget(|ui| {
+            action_button(ui, ButtonKind::Primary, None, "Primary", 32.0);
+            action_button(ui, ButtonKind::Secondary, Some(icons::TRASH), "Secondary", 32.0);
+            action_button(ui, ButtonKind::Danger, None, "Danger", 32.0);
+            home::secondary_button(ui, "Old secondary", 32.0);
+            home::primary_button(ui, "Old primary", 32.0);
+        });
+        let fill = |h: &Harness, label| h.fill_under(h.widget_at(label).unwrap());
+        assert_eq!(fill(&h, "Primary"), Some(PROTON_PURPLE));
+        assert_eq!(fill(&h, "Secondary"), Some(BG_CARD()));
+        assert_eq!(fill(&h, "Danger"), Some(STATUS_DANGER));
+        assert_eq!(fill(&h, "Old secondary"), Some(BG_CARD()));
+        assert_eq!(fill(&h, "Old primary"), Some(PROTON_PURPLE));
+        h.frame(vec![egui::Event::PointerMoved(h.widget_at("Secondary").unwrap())]);
+        h.frames(2);
+        // The weak background: the same as an input's in light, and visible on a card in dark (an input's isn't)
+        assert_eq!(fill(&h, "Secondary"), Some(BG_CARD_ALT()), "a secondary button's hover");
+    }
+
+    const INTER_REGULAR: &[u8] = include_bytes!("../../assets/fonts/Inter-Regular.ttf");
+    const INTER_SEMIBOLD: &[u8] = include_bytes!("../../assets/fonts/Inter-SemiBold.ttf");
+
+    /// How wide `text` is at `size` points in one face of Inter alone.
+    fn width_in(face: &'static [u8], text: &str, size: f32) -> f32 {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert("face".into(), std::sync::Arc::new(egui::FontData::from_static(face)));
+        fonts.families.insert(FontFamily::Proportional, vec!["face".into()]);
+        ctx.set_fonts(fonts);
+        let _ = ctx.run(egui::RawInput::default(), |_| {}); // the fonts load with the first frame
+        ctx.fonts(|f| f.layout_no_wrap(text.into(), FontId::proportional(size), Color32::WHITE)).size().x
+    }
+
+    /// Whether the last frame laid `text` out in the bold family, the first time it painted it left of `left_of`.
+    fn painted_bold(h: &Harness, text: &str, left_of: f32) -> bool {
+        let shown = h.texts(|t| t.galley.text() == text && t.visual_bounding_rect().right() < left_of);
+        let galley = &shown.first().unwrap_or_else(|| panic!("{text:?} is painted")).galley;
+        galley.job.sections.iter().all(|s| s.format.font_id.family == FontFamily::Name(BOLD_FAMILY.into()))
+    }
+
+    // #279: egui's .strong() only picks a colour, and the app sets one on almost every label, so nothing was ever bold
+    #[test]
+    fn bold_text_is_laid_out_in_inter_semibold() {
+        let h = Harness::new(); // On Home
+        // The bold family is Inter SemiBold: a line in it is as wide as in SemiBold, and wider than in Regular (short
+        // words differ too little to tell)
+        let line = "Proton Drive keeps your files in sync";
+        let laid = h.ctx.fonts(|f| f.layout_no_wrap(line.into(), bold(16.0), Color32::WHITE)).size().x;
+        assert!((laid - width_in(INTER_SEMIBOLD, line, 16.0)).abs() < 0.5, "{laid} wide, not SemiBold's");
+        assert!(laid > width_in(INTER_REGULAR, line, 16.0) + 4.0, "{laid} wide, as Regular is");
+        // And what is meant to be bold is laid out in it
+        assert!(painted_bold(&h, "Proton Drive", f32::MAX), "the sidebar's brand");
+        assert!(painted_bold(&h, "Home", SIDEBAR_EDGE), "the open section's name, in the sidebar");
+        assert!(painted_bold(&h, "Your drive", f32::MAX), "a card's title");
+        assert!(!painted_bold(&h, "Shared", SIDEBAR_EDGE), "a section that isn't open stays regular");
     }
 }

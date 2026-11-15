@@ -7,6 +7,7 @@ description = "Native Rust desktop GUI for Proton Drive on Ubuntu"
 [dependencies]
 eframe = { version = "0.31", default-features = true, features = ["glow", "x11", "wayland"] }
 egui = "0.31"
+egui-phosphor = { version = "0.9", default-features = false, features = ["regular"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
