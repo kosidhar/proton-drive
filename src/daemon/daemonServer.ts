@@ -546,6 +546,7 @@ export async function startSyncDaemon(options: {
                     now: Date.now,
                 }),
                 shareSignedIn: () => runtime.auth.isLoggedIn(),
+                shareLog: (line) => runtime.logger.error(line),
                 // The drive's size (#181): what the account uses of its storage, from what the app shows (asked of the
                 // API at most once a minute)
                 space: async () => {

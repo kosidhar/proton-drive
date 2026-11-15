@@ -28,6 +28,7 @@ export function controlServerOptions(deps: {
     space?: ControlServerOptions['space'];
     share?: ControlServerOptions['share'];
     shareSignedIn?: ControlServerOptions['shareSignedIn'];
+    shareLog?: ControlServerOptions['shareLog'];
 }): ControlServerOptions {
     const { socketPath, engine, drive, stateDb } = deps;
     return {
@@ -37,6 +38,7 @@ export function controlServerOptions(deps: {
         space: deps.space,
         share: deps.share,
         shareSignedIn: deps.shareSignedIn,
+        shareLog: deps.shareLog,
         driveMove: (action, from, to) => drive.resolveMove(action, from, to),
         driveSettings: (change) =>
             driveSettings(change, {

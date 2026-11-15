@@ -27,10 +27,10 @@ function fake(opts: { fail?: Error } = {}) {
     return { service, calls };
 }
 
-async function go(service: ShareService | undefined, method: string, route: string, body?: unknown, signedIn = true) {
+async function go(service: ShareService | undefined, method: string, route: string, body?: unknown, signedIn = true, log?: (line: string) => void) {
     const url = new URL(`http://localhost${route}`);
     const req = new Request(url, { method, body: body === undefined ? undefined : JSON.stringify(body) });
-    const res = await shareRoute(req, url, service, () => signedIn);
+    const res = await shareRoute(req, url, service, () => signedIn, log);
     return { status: res.status, json: (await res.json()) as Record<string, unknown> };
 }
 
@@ -43,7 +43,7 @@ describe('share routes', () => {
         expect((await go(service, 'GET', '/share/password?path=Docs')).json).toEqual({ password: 'pw' });
         expect((await go(service, 'POST', '/share/link', { path: 'Docs' })).json).toEqual({ url: 'https://x', created: true });
         expect((await go(service, 'POST', '/share/link/settings', { path: 'Docs', password: 'p', expiresAt: null })).status).toBe(200);
-        expect((await go(service, 'POST', '/share/link/settings', { path: 'Docs' })).status).toBe(200);
+        expect((await go(service, 'POST', '/share/link/settings', { path: 'Docs', password: null })).status).toBe(200);
         expect((await go(service, 'DELETE', '/share/link', { path: 'Docs' })).json).toEqual(INFO as never);
         expect((await go(service, 'POST', '/share/invite', { path: 'Docs', emails: ['a@b.co'], role: 'editor' })).status).toBe(200);
         expect((await go(service, 'POST', '/share/role', { path: 'Docs', email: 'a@b.co', role: 'viewer' })).status).toBe(200);
@@ -53,7 +53,7 @@ describe('share routes', () => {
             ['password', 'Docs'],
             ['ensureLink', 'Docs'],
             ['setLinkSettings', 'Docs', { password: 'p', expiresAt: null }],
-            ['setLinkSettings', 'Docs', {}],
+            ['setLinkSettings', 'Docs', { password: null }],
             ['removeLink', 'Docs'],
             ['invite', 'Docs', ['a@b.co'], 'editor'],
             ['setRole', 'Docs', 'a@b.co', 'viewer'],
@@ -113,6 +113,39 @@ describe('share routes', () => {
         const other = await go(fake({ fail: new Error('secret@x.com') }).service, 'GET', '/share/info?path=a');
         expect(other.status).toBe(500);
         expect(JSON.stringify(other.json)).not.toContain('secret');
+    });
+
+    test('a link settings change with nothing to change is refused', async () => {
+        const { service, calls } = fake();
+        expect(await go(service, 'POST', '/share/link/settings', { path: 'Docs' })).toEqual({ status: 400, json: { error: 'Nothing to change' } });
+        expect(calls).toEqual([]);
+    });
+
+    test('expiresAt must be within 10 years', async () => {
+        const { service, calls } = fake();
+        const year = 365 * 86_400_000;
+        for (const expiresAt of [Date.now() + 11 * year, 8.64e15, Number.MAX_SAFE_INTEGER]) {
+            expect(await go(service, 'POST', '/share/link/settings', { path: 'a', expiresAt })).toEqual({
+                status: 400,
+                json: { error: 'expiresAt must be within 10 years' },
+            });
+        }
+        expect(calls).toEqual([]);
+        const nineYears = Date.now() + 9 * year;
+        expect((await go(service, 'POST', '/share/link/settings', { path: 'a', expiresAt: nineYears })).status).toBe(200);
+        expect(calls).toEqual([['setLinkSettings', 'a', { expiresAt: nineYears }]]);
+    });
+
+    test("a failure other than a refusal logs only the error's class, never its text", async () => {
+        const lines: string[] = [];
+        const log = (line: string) => lines.push(line);
+        const res = await go(fake({ fail: new TypeError('secret@x.com: s3cret') }).service, 'GET', '/share/info?path=a', undefined, true, log);
+        expect(res).toEqual({ status: 500, json: { error: 'Sharing failed' } });
+        expect(lines).toEqual(['Sharing failed: TypeError']);
+        // A refusal, or a bad request, is the user's to read, and logs nothing
+        await go(fake({ fail: new ShareError('Not uploaded yet') }).service, 'GET', '/share/info?path=a', undefined, true, log);
+        await go(fake().service, 'POST', '/share/role', { path: 'a', role: 'viewer' }, true, log);
+        expect(lines).toEqual(['Sharing failed: TypeError']);
     });
 
     test('a wrong method is 405, no service is 404, signed out is 400', async () => {

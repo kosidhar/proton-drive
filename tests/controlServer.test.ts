@@ -407,11 +407,11 @@ describe('POST /vfs/mount', () => {
 });
 
 describe('/share routes', () => {
-    async function startWith(share?: ShareService, signedIn = true) {
+    async function startWith(share?: ShareService, signedIn = true, shareLog?: (line: string) => void) {
         const root = mkdtempSync(path.join(os.tmpdir(), 'pd-control-'));
         cleanups.push(() => rmSync(root, { recursive: true, force: true }));
         const socketPath = path.join(root, 'control.sock');
-        const server = await startControlServer({ socketPath, engine: makeFake() as never, share, shareSignedIn: () => signedIn });
+        const server = await startControlServer({ socketPath, engine: makeFake() as never, share, shareSignedIn: () => signedIn, shareLog });
         cleanups.push(() => server.stop());
         return socketPath;
     }
@@ -421,6 +421,14 @@ describe('/share routes', () => {
         const res = await call(await startWith(service), '/share/info?path=Docs');
         expect(res.status).toBe(200);
         expect(await res.json()).toEqual({ link: null, people: [] });
+    });
+
+    test("a failure is 500, and the daemon's log gets only its class", async () => {
+        const lines: string[] = [];
+        const failing = { info: async () => Promise.reject(new RangeError('a@b.co')) } as unknown as ShareService;
+        const res = await call(await startWith(failing, true, (line) => lines.push(line)), '/share/info?path=Docs');
+        expect(res.status).toBe(500);
+        expect(lines).toEqual(['Sharing failed: RangeError']);
     });
 
     test('404 with no service wired, and 400 while signed out', async () => {

@@ -1,11 +1,13 @@
 import { ShareError, type ShareRole, type ShareService } from './shareService';
 
 // The share routes on the control socket (see ShareService). `path` is the item's path inside My files, as for
-// /availability. A ShareError is a refusal in plain words: 400 with its message, which the clients show as is. Nothing
-// here logs an error or a body: they can carry addresses and passwords.
+// /availability. A ShareError is a refusal in plain words: 400 with its message, which the clients show as is. Any other
+// failure is 500, and the daemon's log gets only the error's class: an error's text or a body can carry addresses and
+// passwords.
 
 const PATH_ERROR = 'path must be a path inside My files';
 const MAX_EMAILS = 50;
+const MAX_EXPIRY_YEARS = 10;
 
 class BadRequest extends Error {}
 
@@ -55,9 +57,18 @@ function linkChange(body: Record<string, unknown>, now: number): { password?: st
         if (at !== null && !(typeof at === 'number' && Number.isInteger(at) && at > now)) {
             throw new BadRequest('expiresAt must be a whole number in the future, or null');
         }
+        // Far enough out, a date can't be made (the SDK would then send no expiry at all)
+        if (at !== null && at > yearsFrom(now, MAX_EXPIRY_YEARS)) throw new BadRequest(`expiresAt must be within ${MAX_EXPIRY_YEARS} years`);
         change.expiresAt = at;
     }
+    if (change.password === undefined && change.expiresAt === undefined) throw new BadRequest('Nothing to change');
     return change;
+}
+
+function yearsFrom(now: number, years: number): number {
+    const at = new Date(now);
+    at.setUTCFullYear(at.getUTCFullYear() + years);
+    return at.getTime();
 }
 
 type Handler = (share: ShareService, req: Request, url: URL) => Promise<unknown>;
@@ -101,7 +112,13 @@ const ROUTES: Record<string, Partial<Record<string, Handler>>> = {
     },
 };
 
-export async function shareRoute(req: Request, url: URL, share: ShareService | undefined, signedIn: () => boolean): Promise<Response> {
+export async function shareRoute(
+    req: Request,
+    url: URL,
+    share: ShareService | undefined,
+    signedIn: () => boolean,
+    log: (line: string) => void = () => {},
+): Promise<Response> {
     if (!share) return bad('Not found', 404);
     const methods = ROUTES[url.pathname];
     if (!methods) return bad('Not found', 404);
@@ -112,6 +129,7 @@ export async function shareRoute(req: Request, url: URL, share: ShareService | u
         return Response.json(await handler(share, req, url));
     } catch (e) {
         if (e instanceof BadRequest || e instanceof ShareError) return bad(e.message);
+        log(`Sharing failed: ${e instanceof Error ? e.name : typeof e}`);
         return bad('Sharing failed', 500);
     }
 }
