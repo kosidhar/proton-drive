@@ -208,6 +208,9 @@ Any of these makes the feature a failure, even if everything else works.
 - **Move to Trash in Files** must work without a "delete permanently?" prompt, and must send the item to the Proton Drive trash.
   - GIO trashes items on non-home mounts into `<mount>/.Trash-$UID`.
   - Suggested approach: present a virtual `.Trash-$UID` where a rename into `files/` means a remote trash plus local removal, and where `.trashinfo` writes are accepted and discarded.
+  - Whatever leaves `files/` or `info/` that way must reach inotify watchers as a delete. Files' Trash icon counts what gvfsd-trash hears: an item moved in adds one, and only a delete takes it off (#236).
+    - FUSE's own `notify_delete` doesn't tell watchers on current kernels: the kernel drops the entry without an event.
+    - So the helper unlinks each dropped name through its own mount, off the request thread, and only once the folder it opened has the mount's device. The trash's unlink of such a name only takes it off, in memory.
 - **The mount point while unmounted** is kept read-only (`0555`), so apps can't write into it. If it holds stray files at mount time, move them into the backing store as new local files, using the existing conflict handling.
 - **No stuck mounts.**
   - If the helper or daemon dies, the next start recovers (`fusermount3 -uz`, then mount again), so the user never sees "Transport endpoint is not connected" for long.
