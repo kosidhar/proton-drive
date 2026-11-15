@@ -1745,12 +1745,15 @@ impl ProtonDriveNativeApp {
     fn render_sidebar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("proton_sidebar")
             .resizable(false)
+            // The edge is egui's separator line, which the theme draws in BORDER_SUBTLE. A stroke on the frame as well
+            // made the panel 2 px wider than its 252 px, and that strip, outside what the panel paints, showed the
+            // window's black clear colour as a hard line (#254)
+            .show_separator_line(true)
             .exact_width(252.0)
             .frame(
                 Frame::NONE
                     .fill(BG_SIDEBAR())
-                    .inner_margin(Margin::symmetric(16, 18))
-                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                    .inner_margin(Margin::symmetric(16, 18)),
             )
             .show(ctx, |ui| {
                 if self.pending_confirm.is_some() {
@@ -5428,7 +5431,7 @@ mod tests {
         assert!(h.text_at("Up to date").is_some());
         assert!(h.text_at("Resume").is_none());
         // #205: Pause opens its three choices and sends nothing yet; each choice sends the pause with its time
-        let pause = h.text_at("Pause").expect("Pause is the main button");
+        let pause = h.text_at("Pause").expect("Pause is a button");
         assert!(h.text_at("For 1 hour").is_none());
         h.click(pause);
         assert_eq!(h.sent(), Vec::<String>::new());
