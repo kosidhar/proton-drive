@@ -11,8 +11,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -43,28 +43,29 @@ pub struct DriveFs {
 
 impl DriveFs {
     pub fn new(backing: PathBuf, daemon: DaemonClient) -> Self {
-        let notifier = Arc::new(OnceLock::new());
         let uid = unsafe { libc::getuid() };
-        DriveFs {
-            state: Arc::new(State {
-                backing,
-                daemon,
-                inodes: Mutex::new(Inodes::new()),
-                listings: Mutex::new(HashMap::new()),
-                listing_epoch: AtomicU64::new(0),
-                fetching: Mutex::new(HashSet::new()),
-                fetched: Condvar::new(),
-                handles: Mutex::new(HashMap::new()),
-                invalidations: start_invalidator(notifier.clone()),
-                notifier,
-                trash: TrashArea::new(uid),
-                next_fh: AtomicU64::new(1),
-                uid,
-                gid: unsafe { libc::getgid() },
-                started: SystemTime::now(),
-                space: Mutex::new(None),
-            }),
-        }
+        let (drops, dropped) = mpsc::channel();
+        let state = Arc::new(State {
+            backing,
+            daemon,
+            inodes: Mutex::new(Inodes::new()),
+            listings: Mutex::new(HashMap::new()),
+            listing_epoch: AtomicU64::new(0),
+            fetching: Mutex::new(HashSet::new()),
+            fetched: Condvar::new(),
+            handles: Mutex::new(HashMap::new()),
+            notifier: Arc::new(OnceLock::new()),
+            mount: Arc::new(OnceLock::new()),
+            drops,
+            trash: TrashArea::new(uid),
+            next_fh: AtomicU64::new(1),
+            uid,
+            gid: unsafe { libc::getgid() },
+            started: SystemTime::now(),
+            space: Mutex::new(None),
+        });
+        start_unlinker(Arc::downgrade(&state), dropped);
+        DriveFs { state }
     }
 
     /// Keeps the account's storage up to date for statfs, on a thread of its own: statfs never waits on the daemon,
@@ -90,6 +91,17 @@ impl DriveFs {
     pub fn notifier_slot(&self) -> Arc<OnceLock<Notifier>> {
         self.state.notifier.clone()
     }
+
+    /// Where main puts the drive's mount, once the session exists, before it runs.
+    pub fn mount_slot(&self) -> Arc<OnceLock<Mount>> {
+        self.state.mount.clone()
+    }
+}
+
+/// The drive as mounted: its mount point, and the device its files have there.
+pub struct Mount {
+    pub path: PathBuf,
+    pub dev: u64,
 }
 
 /// Shared with the threads that wait for the daemon.
@@ -106,8 +118,9 @@ struct State {
     /// Each open's inode number and what it is
     handles: Mutex<HashMap<u64, (u64, Handle)>>,
     notifier: Arc<OnceLock<Notifier>>,
-    /// Kernel entries to drop, as (folder, name), for the thread that tells the kernel
-    invalidations: Sender<(u64, OsString)>,
+    mount: Arc<OnceLock<Mount>>,
+    /// Names the trash dropped, for the thread that unlinks them through the mount
+    drops: Sender<Dropped>,
     trash: TrashArea,
     next_fh: AtomicU64,
     uid: u32,
@@ -309,19 +322,31 @@ fn apply_change(target: Target, change: &AttrChange) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The thread that drops kernel entries. An invalidation waits for the folder's lock in the kernel, which the request
-/// that changed the folder holds until its reply is in; so it is never sent from a thread whose reply is pending, and
-/// this thread holds no lock of ours while it waits.
-fn start_invalidator(notifier: Arc<OnceLock<Notifier>>) -> Sender<(u64, OsString)> {
-    let (tx, rx) = mpsc::channel::<(u64, OsString)>();
-    let _ = std::thread::Builder::new().name("invalidate".into()).spawn(move || {
-        for (parent, name) in rx {
-            if let Some(notifier) = notifier.get() {
-                let _ = notifier.inval_entry(INodeNo(parent), &name);
+/// A name the trash dropped from one of its folders: the folder's number and path, and the name.
+struct Dropped {
+    folder: u64,
+    dir: PathBuf,
+    name: OsString,
+}
+
+/// The thread that unlinks, through the drive's own mount, the names the trash drops from files/ and info/: the kernel
+/// tells its inotify watchers of an unlink, which gvfsd-trash counts the trash's items by, and of nothing FUSE can send
+/// (#236). The unlink waits for the folder's lock in the kernel, which the request that dropped the name holds until
+/// its reply is in; so it is never made from a thread whose reply is pending, and this thread holds no lock of ours
+/// while it waits. Failing that, the kernel's entry is dropped all the same, without a word to its watchers.
+fn start_unlinker(state: Weak<State>, dropped: Receiver<Dropped>) {
+    let _ = std::thread::Builder::new().name("trash-unlink".into()).spawn(move || {
+        for Dropped { folder, dir, name } in dropped {
+            let Some(state) = state.upgrade() else { return };
+            if !state.unlink_through_mount(folder, &dir, &name) {
+                state.take_gone(&dir.join(&name));
+                // Set before any request is served, so never missing here
+                if let Some(notifier) = state.notifier.get() {
+                    let _ = notifier.inval_entry(INodeNo(folder), &name);
+                }
             }
         }
     });
-    tx
 }
 
 impl State {
@@ -499,6 +524,7 @@ impl State {
             Node::Trash(TrashNode::InfoFile { size, mtime, .. }) => {
                 virtual_attr(FileType::RegularFile, 0o600, *size, *mtime)
             }
+            Node::Trash(TrashNode::Gone) => virtual_attr(FileType::RegularFile, 0o600, 0, self.started),
             Node::Trash(_) => virtual_attr(FileType::Directory, 0o700, 0, self.started),
         }
     }
@@ -798,7 +824,7 @@ impl State {
                 let dropped = s.trash.trashed(&name);
                 reply.ok();
                 // The kernel has moved the item's entry into files/, which holds nothing
-                s.invalidate(files_ino, name);
+                s.dropped(files_ino, s.trash_files_dir(), name);
                 if let Some(info) = dropped {
                     s.info_dropped(info);
                 }
@@ -810,20 +836,61 @@ impl State {
         });
     }
 
+    fn trash_files_dir(&self) -> PathBuf {
+        Path::new(self.trash.name()).join("files")
+    }
+
     fn trash_info_dir(&self) -> PathBuf {
         Path::new(self.trash.name()).join("info")
     }
 
-    /// Asks the kernel to drop its entry for `name` in folder `parent`. Only once the reply that changed it is sent.
-    fn invalidate(&self, parent: u64, name: OsString) {
-        let _ = self.invalidations.send((parent, name));
+    /// Has `name`, which the trash dropped from folder `dir` (number `folder`), unlinked through the mount. Only once
+    /// the reply that dropped it is sent.
+    fn dropped(&self, folder: u64, dir: PathBuf, name: OsString) {
+        let _ = self.drops.send(Dropped { folder, dir, name });
     }
 
-    /// A .trashinfo that has gone: its number goes stale, and the kernel's entry for it goes.
+    /// A .trashinfo that has gone: its number goes stale, and it is unlinked through the mount.
     fn info_dropped(&self, name: OsString) {
         let dir = self.trash_info_dir();
         lock(&self.inodes).remove(&dir.join(&name));
-        self.invalidate(self.ino_of(&dir), name);
+        self.dropped(self.ino_of(&dir), dir, name);
+    }
+
+    /// The unlink of a name the trash dropped: it is no longer found, and the number a lookup gave it goes stale.
+    /// Nothing else happens, here or in the cloud. Whether it was one.
+    fn take_gone(&self, rel: &Path) -> bool {
+        let was = self.trash.take_gone(rel);
+        if was {
+            lock(&self.inodes).remove(rel);
+        }
+        was
+    }
+
+    /// Unlinks `name`, which the trash dropped from folder `dir` (number `folder`), through the drive's own mount (see
+    /// take_gone). Only there: the folder opened must have the mount's device and the folder's number, so nothing is
+    /// unlinked once the drive is unmounted, or wherever else the path leads. Never on a session thread. Whether it was
+    /// unlinked.
+    fn unlink_through_mount(&self, folder: u64, dir: &Path, name: &OsStr) -> bool {
+        let Some(mount) = self.mount.get() else { return false };
+        let Ok(name) = CString::new(name.as_bytes()) else { return false };
+        // O_PATH: the folder isn't opened as such (no opendir), only held to unlink in
+        let opened =
+            OpenOptions::new().read(true).custom_flags(libc::O_PATH | libc::O_DIRECTORY).open(mount.path.join(dir));
+        let Ok(folder_fd) = opened else { return false };
+        if !folder_fd.metadata().is_ok_and(|meta| meta.dev() == mount.dev && meta.ino() == folder) {
+            return false;
+        }
+        // An item dropped from files/ is a file to a lookup, but still a folder to an entry the kernel holds of it
+        for flags in [0, libc::AT_REMOVEDIR, 0] {
+            if unsafe { libc::unlinkat(folder_fd.as_raw_fd(), name.as_ptr(), flags) } == 0 {
+                return true;
+            }
+            if !matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EISDIR | libc::ENOTDIR)) {
+                return false;
+            }
+        }
+        false
     }
 }
 
@@ -1057,6 +1124,10 @@ impl Filesystem for DriveFs {
             return reply.error(Errno::ENOENT);
         }
         if s.is_trash_path(&rel) {
+            // A name the trash dropped, unlinked through the mount so its watchers hear it went
+            if s.take_gone(&rel) {
+                return reply.ok();
+            }
             return match s.trash.info_name(&rel) {
                 // GIO takes back the .trashinfo of an item it failed to trash
                 Some(info) => match s.trash.remove_info(info) {
@@ -1084,6 +1155,10 @@ impl Filesystem for DriveFs {
             return reply.error(Errno::ENOENT);
         }
         if s.is_trash_path(&rel) {
+            // A folder dropped from files/, unlinked through the mount
+            if s.take_gone(&rel) {
+                return reply.ok();
+            }
             return reply.error(if s.trash.node(&rel).is_some() { Errno::EPERM } else { Errno::ENOENT });
         }
         if is_volume_info(&rel) {
@@ -1170,8 +1245,8 @@ impl Filesystem for DriveFs {
                     }
                     reply.opened(s.add_handle(ino.0, Handle::TrashInfo(id)), FopenFlags::empty())
                 }
+                Some(TrashNode::Gone) | None => reply.error(Errno::ENOENT),
                 Some(_) => reply.error(Errno::EISDIR),
-                None => reply.error(Errno::ENOENT),
             };
         }
         if is_volume_info(&rel) {

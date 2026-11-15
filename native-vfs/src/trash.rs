@@ -2,6 +2,9 @@
 // goes. An item moved into its files/ is deleted through the daemon (the cloud keeps it in its own trash), so files/
 // always lists empty. The .trashinfo files GIO writes in info/ along the way live in memory only, and go once their
 // item is in files/ and they are complete, or after a minute when a trasher never finishes.
+//
+// What goes from files/ or info/ that way is still found by name (never listed) until it is unlinked through the
+// mount: only an unlink makes the kernel tell inotify watchers, which gvfsd-trash counts the trash's items by (#236).
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -25,6 +28,15 @@ pub enum TrashNode {
     Files,
     Info,
     InfoFile { id: u64, size: u64, mtime: SystemTime },
+    /// A name dropped from files/ or info/, there only to be unlinked
+    Gone,
+}
+
+/// The trash's folders that hold anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Holder {
+    Files,
+    Info,
 }
 
 pub struct TrashArea {
@@ -38,6 +50,8 @@ struct Inner {
     infos: HashMap<OsString, InfoFile>,
     /// Items moved into files/, by their name there, whose .trashinfo isn't complete yet
     trashed: HashMap<OsString, Instant>,
+    /// Names dropped from files/ or info/ and not yet unlinked
+    gone: HashMap<(Holder, OsString), Instant>,
 }
 
 struct InfoFile {
@@ -55,7 +69,7 @@ enum Place<'a> {
     Root,
     Files,
     Info,
-    InFiles,
+    InFiles(&'a OsStr),
     InInfo(&'a OsStr),
     /// Any other name in the trash folder, or deeper down: nothing is ever there
     Nowhere,
@@ -86,6 +100,7 @@ impl Inner {
         }
         self.trashed.remove(trashed);
         self.infos.remove(&info_name);
+        self.gone.insert((Holder::Info, info_name.clone()), Instant::now());
         Some(info_name)
     }
 }
@@ -106,7 +121,7 @@ impl TrashArea {
 
     /// True when rename_to is under .Trash-<uid>/files/
     pub fn trashed_source(&self, rename_to: &str) -> bool {
-        matches!(self.place(Path::new(rename_to)), Place::InFiles)
+        matches!(self.place(Path::new(rename_to)), Place::InFiles(_))
     }
 
     fn place<'a>(&self, rel: &'a Path) -> Place<'a> {
@@ -123,7 +138,7 @@ impl TrashArea {
             (None, ..) => Place::Root,
             (Some(dir), None, None) if dir.as_os_str() == "files" => Place::Files,
             (Some(dir), None, None) if dir.as_os_str() == "info" => Place::Info,
-            (Some(dir), Some(_), None) if dir.as_os_str() == "files" => Place::InFiles,
+            (Some(dir), Some(n), None) if dir.as_os_str() == "files" => Place::InFiles(n),
             (Some(dir), Some(n), None) if dir.as_os_str() == "info" => Place::InInfo(n),
             _ => Place::Nowhere,
         }
@@ -134,6 +149,7 @@ impl TrashArea {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.infos.retain(|_, info| info.created.elapsed() < INFO_TTL);
         inner.trashed.retain(|_, at| at.elapsed() < INFO_TTL);
+        inner.gone.retain(|_, at| at.elapsed() < INFO_TTL);
         inner
     }
 
@@ -143,13 +159,30 @@ impl TrashArea {
             Place::Root => Some(TrashNode::Root),
             Place::Files => Some(TrashNode::Files),
             Place::Info => Some(TrashNode::Info),
-            Place::InInfo(name) => self.inner().infos.get(name).map(|info| TrashNode::InfoFile {
-                id: info.id,
-                size: info.data.len() as u64,
-                mtime: info.mtime,
-            }),
-            Place::Outside | Place::InFiles | Place::Nowhere => None,
+            Place::InInfo(name) => {
+                let inner = self.inner();
+                match inner.infos.get(name) {
+                    Some(info) => {
+                        Some(TrashNode::InfoFile { id: info.id, size: info.data.len() as u64, mtime: info.mtime })
+                    }
+                    None => inner.gone.contains_key(&(Holder::Info, name.to_os_string())).then_some(TrashNode::Gone),
+                }
+            }
+            Place::InFiles(name) => {
+                self.inner().gone.contains_key(&(Holder::Files, name.to_os_string())).then_some(TrashNode::Gone)
+            }
+            Place::Outside | Place::Nowhere => None,
         }
+    }
+
+    /// An unlink of a name dropped from files/ or info/: it is no longer found. Whether it was one.
+    pub fn take_gone(&self, rel: &Path) -> bool {
+        let key = match self.place(rel) {
+            Place::InFiles(name) => (Holder::Files, name.to_os_string()),
+            Place::InInfo(name) => (Holder::Info, name.to_os_string()),
+            _ => return false,
+        };
+        self.inner().gone.remove(&key).is_some()
     }
 
     /// The names in a folder of the trash, each with whether it is a folder.
@@ -262,11 +295,13 @@ impl TrashArea {
         Ok(trashed_name_of(to).and_then(|trashed| inner.settle(trashed)))
     }
 
-    /// An item was moved into files/ under `name` (and deleted). Gives the name of its .trashinfo if that is complete,
-    /// which is then dropped.
+    /// An item was moved into files/ under `name` (and deleted), which drops it from there. Gives the name of its
+    /// .trashinfo if that is complete, which is then dropped too.
     pub fn trashed(&self, name: &OsStr) -> Option<OsString> {
         let mut inner = self.inner();
-        inner.trashed.insert(name.to_os_string(), Instant::now());
+        let now = Instant::now();
+        inner.trashed.insert(name.to_os_string(), now);
+        inner.gone.insert((Holder::Files, name.to_os_string()), now);
         inner.settle(name)
     }
 }
@@ -361,6 +396,33 @@ mod tests {
         assert!(info_names(&trash).is_empty());
     }
 
+    // #236: what goes from files/ and info/ is found by name, never listed, until something unlinks it, once
+    #[test]
+    fn dropped_names_are_found_but_not_listed_until_unlinked() {
+        let trash = TrashArea::new(1000);
+        let id = trash.create_info(os("a.trashinfo"), true, false).unwrap();
+        trash.write_info(id, 0, b"[Trash Info]\n").unwrap();
+        assert_eq!(trash.close_info(id), None);
+        assert_eq!(trash.trashed(os("a")), Some("a.trashinfo".into()));
+        let (item, info) = (Path::new(".Trash-1000/files/a"), Path::new(".Trash-1000/info/a.trashinfo"));
+        assert_eq!((trash.node(item), trash.node(info)), (Some(TrashNode::Gone), Some(TrashNode::Gone)));
+        assert!(trash.list(Path::new(".Trash-1000/files")).is_empty());
+        assert!(info_names(&trash).is_empty());
+        assert_eq!(trash.remove_info(os("a.trashinfo")), Err(Errno::ENOENT), "a dropped .trashinfo isn't one");
+        assert!(trash.take_gone(item));
+        assert!(!trash.take_gone(item), "it goes once");
+        assert_eq!((trash.node(item), trash.node(info)), (None, Some(TrashNode::Gone)));
+        // A new .trashinfo under that name is a real one, and goes as one
+        let again = trash.create_info(os("a.trashinfo"), true, false).unwrap();
+        assert!(matches!(trash.node(info), Some(TrashNode::InfoFile { id, .. }) if id == again));
+        assert_eq!(trash.remove_info(os("a.trashinfo")), Ok(()));
+        assert!(trash.take_gone(info));
+        assert_eq!(trash.node(info), None);
+        for rel in [".Trash-1000", ".Trash-1000/files", ".Trash-1000/info", "a", ".Trash-1000/files/b"] {
+            assert!(!trash.take_gone(Path::new(rel)), "{rel}");
+        }
+    }
+
     #[test]
     fn exclusive_creates_and_no_replace_renames_refuse_a_name_in_use() {
         let trash = TrashArea::new(1000);
@@ -407,8 +469,10 @@ mod tests {
             let mut inner = trash.inner.lock().unwrap();
             inner.infos.get_mut(os("h.trashinfo")).unwrap().created = long_ago;
             *inner.trashed.get_mut(os("i")).unwrap() = long_ago;
+            *inner.gone.get_mut(&(Holder::Files, "i".into())).unwrap() = long_ago;
         }
         assert_eq!(info_names(&trash), ["fresh.trashinfo"]);
         assert!(trash.inner().trashed.is_empty());
+        assert_eq!(trash.node(Path::new(".Trash-1000/files/i")), None, "a dropped name nothing unlinked");
     }
 }
