@@ -5,11 +5,15 @@ import { LogHandler, LogRecord } from '@protontech/drive-sdk/telemetry';
 // address's keys can't be loaded (addresses.ts), with an error whose message holds the request's URL, where the address
 // is URL-encoded (%40). Anything shaped like an address becomes <email>.
 //
-// Its parts stop at whitespace and at what bounds an address in a log line (quotes, brackets, slashes, commas, colons…),
-// so a path keeps its folders, and the domain must end in letters, so a version such as name@0.1.0-alpha is kept.
-const PART = String.raw`[^\s@/\\"'<>()[\]{},;:]+`;
+// The name before the @ stops at whitespace and at what bounds an address in a log line (quotes, brackets, slashes,
+// commas, colons…), so a path keeps its folders. The domain is made of what a host name is made of, and must end in
+// letters, so a version such as name@0.1.0-alpha is kept. An address starts only where a run of such characters starts:
+// tried from every character of a long run instead, each try would scan the rest of it, and a line with a long token
+// would take seconds.
+const CHAR = String.raw`[^\s@/\\"'<>()[\]{},;:]`;
+const DOMAIN = String.raw`[\p{L}\p{M}\p{N}._-]+`;
 const TOP_LEVEL_DOMAIN = String.raw`(?:\p{L}{2,}|xn--[\p{L}\p{N}-]+)`;
-const EMAIL = new RegExp(`${PART}(?:@|%40)${PART}\\.${TOP_LEVEL_DOMAIN}`, 'gu');
+const EMAIL = new RegExp(`(?<!${CHAR})${CHAR}+(?:@|%40)${DOMAIN}\\.${TOP_LEVEL_DOMAIN}`, 'gu');
 
 export function maskEmails(text: string): string {
     return text.replace(EMAIL, '<email>');
