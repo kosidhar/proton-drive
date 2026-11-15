@@ -2677,7 +2677,7 @@ impl ProtonDriveNativeApp {
                             chosen = Some(MissingChoice::KeepOnlineOnly);
                         }
                         ui.add_space(4.0);
-                        let delete = action_button(ui, ButtonKind::Secondary, Some(icons::TRASH), "Delete them from Proton Drive too", 32.0);
+                        let delete = action_button(ui, ButtonKind::DangerOutline, Some(icons::TRASH), "Delete them from Proton Drive too", 32.0);
                         if delete.on_hover_text("Asks first. While they are missing, nothing is deleted in Proton Drive.").clicked() {
                             chosen = Some(MissingChoice::DeleteInCloud);
                         }
@@ -3554,6 +3554,8 @@ pub(crate) enum ButtonKind {
     /// Red, for a confirmation that deletes
     #[cfg_attr(not(test), expect(dead_code, reason = "the dialogs don't use action_button yet"))]
     Danger,
+    /// A secondary button whose label is red: a choice that deletes, short of a confirmation
+    DangerOutline,
 }
 
 /// A button as wide as its icon and label: the icon (one of `icons::*`) first, then the label, in `kind`'s colours.
@@ -3569,6 +3571,7 @@ fn action_button_sized(ui: &mut egui::Ui, kind: ButtonKind, icon: Option<&str>, 
         ButtonKind::Primary => (PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE),
         ButtonKind::Secondary => (BG_CARD(), BG_CARD_ALT(), Some(Stroke::new(1.0_f32, BORDER_NORM())), TEXT_PRIMARY()),
         ButtonKind::Danger => (STATUS_DANGER, STATUS_DANGER_HOVER, None, Color32::WHITE),
+        ButtonKind::DangerOutline => (BG_CARD(), BG_CARD_ALT(), Some(Stroke::new(1.0_f32, BORDER_NORM())), STATUS_DANGER),
     };
     let (rect, resp) = button_shell(ui, size, label, fill, hover_fill, stroke);
     let content = action_button_width(ui, icon, label) - 2.0 * BUTTON_PADDING;
@@ -6654,6 +6657,20 @@ mod tests {
             assert!(h.text_at(DELETE_TOO).is_none(), "{tab:?}");
             assert!(h.text_at("1").is_some(), "{tab:?}: Home's badge");
         }
+    }
+
+    // R12: deleting from Proton Drive keeps its danger signal: an outlined button with a red label
+    #[test]
+    fn the_cloud_delete_choice_stays_red() {
+        let mut h = Harness::new();
+        held(&mut h);
+        let colors: Vec<Color32> = h
+            .texts(|t| t.galley.text() == DELETE_TOO)
+            .iter()
+            .flat_map(|t| t.galley.job.sections.iter().map(|s| s.format.color))
+            .collect();
+        assert_eq!(colors, vec![STATUS_DANGER], "the label's painted colour");
+        assert_eq!(h.fill_under(h.text_at(DELETE_TOO).unwrap()), Some(BG_CARD()), "outlined, not filled");
     }
 
     // #253: the Shared section
