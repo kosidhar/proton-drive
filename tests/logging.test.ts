@@ -94,6 +94,16 @@ describe('addresses in the log', () => {
         }
     });
 
+    test('a long line costs little to mask', () => {
+        const blob = 'x'.repeat(200_000);
+        const started = performance.now();
+        expect(maskEmails(`token ${blob} end`)).toBe(`token ${blob} end`);
+        expect(maskEmails(`token ${blob}@host end, then sam@example.com`)).toBe(`token ${blob}@host end, then <email>`);
+        const encoded = 'a%40'.repeat(50_000);
+        expect(maskEmails(encoded)).toBe(encoded);
+        expect(performance.now() - started).toBeLessThan(1000);
+    });
+
     test('a record keeps its level and logger, its message and error are masked, and the error itself is left alone', () => {
         const error = new Error('Request failed: GET https://mail-api.proton.me/core/v4/keys/all?Email=sam%40example.com');
         const record = { time: new Date(0), level: LogLevel.ERROR, loggerName: 'cli', message: 'Error loading public keys for email sam@example.com', error };
