@@ -920,6 +920,456 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
     });
 
+    // #235: changes made through the drive while a sync pass crawls the online-only folders reach Proton Drive between two
+    // of its listings, not once the whole crawl is over; the pass's walk still never runs alongside one
+    describe('drive changes during the online-only crawl (#235)', () => {
+        // Stopped even when a test fails, so no watcher outlives the database
+        const engines: ProtonDriveSyncEngine[] = [];
+        afterEach(async () => {
+            while (engines.length) await engines.pop()!.stop();
+        });
+        const setup = () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const drive = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                ...uploadAtOnce,
+                backingDir: path.join(tempDir, 'files'),
+            });
+            engines.push(engine);
+            // What the engine asks of Proton Drive and writes to the index, in order, each node named by the path it was
+            // added at (its uid): `list:<folder>` as a listing is asked for, `record:<folder>@<path>` as one is written to
+            // the index at a path, and `download:`, `rename:`, `move:` and `trash:` as each is done
+            const log: string[] = [];
+            const at = (uid: string) => (uid === drive.root.uid ? '' : uid.replace(/^vol~/, ''));
+            // Listings held open (see hold) answer with what the folder held when they were asked for, as a server does
+            // that answered before a change reached it
+            const holds = new Map<string, { asked: () => void; released: Promise<void> }>();
+            const sdk = drive.sdk as any;
+            const iterate = sdk.iterateFolderChildren;
+            sdk.iterateFolderChildren = async function* (parent: NodeEntity | string) {
+                const folder = at(typeof parent === 'string' ? parent : parent.uid);
+                log.push(`list:${folder}`);
+                const children: NodeEntity[] = [];
+                for await (const child of iterate(parent)) children.push(child);
+                const held = holds.get(folder);
+                if (held) {
+                    holds.delete(folder);
+                    held.asked();
+                    await held.released;
+                }
+                yield* children;
+            };
+            const downloader = sdk.getFileRevisionDownloader;
+            sdk.getFileRevisionDownloader = async (revisionUid: string) => {
+                log.push(`download:${at(revisionUid.replace(/~rev\d+$/, ''))}`);
+                return downloader(revisionUid);
+            };
+            const renameNode = sdk.renameNode;
+            sdk.renameNode = async (uid: string, name: string) => {
+                const renamed = await renameNode(uid, name);
+                log.push(`rename:${at(uid)}>${name}`);
+                return renamed;
+            };
+            const moveNodes = sdk.moveNodes;
+            sdk.moveNodes = async function* (uids: string[], parentUid: string) {
+                for await (const result of moveNodes(uids, parentUid)) {
+                    if (result.ok) log.push(`move:${at(result.uid)}>${at(parentUid)}`);
+                    yield result;
+                }
+            };
+            const trashNodes = sdk.trashNodes;
+            sdk.trashNodes = async function* (uids: string[]) {
+                for await (const result of trashNodes(uids)) {
+                    if (result.ok) log.push(`trash:${at(result.uid)}`);
+                    yield result;
+                }
+            };
+            const index = engine.remoteIndex;
+            const replaceChildren = index.replaceChildren.bind(index);
+            index.replaceChildren = (parentUid: string, parentRelPath: string, children) => {
+                log.push(`record:${at(parentUid)}@${parentRelPath}`);
+                replaceChildren(parentUid, parentRelPath, children);
+            };
+            // Holds the next listing of the folder added at `folder` open until released; `asked` settles once it is asked for
+            const hold = (folder: string) => {
+                let asked!: () => void;
+                let release!: () => void;
+                const reached = new Promise<void>((resolve) => (asked = resolve));
+                const released = new Promise<void>((resolve) => (release = resolve));
+                holds.set(folder, { asked, released });
+                return { asked: reached, release };
+            };
+            // The next pass crawls the online-only folders again, as after a TreeRefresh event
+            const crawlNext = () => {
+                (engine as any).onlineOnlyCrawlDue = true;
+            };
+            // No listing was recorded after a rename, move or trash reached Proton Drive since it was asked for. A listing
+            // thrown away (never recorded) is no longer looked at: the next listing of that folder starts afresh.
+            const expectNoChangeWhileListing = () => {
+                const sentSince = new Map<string, string[]>(); // by folder: the changes sent since its listing was asked for
+                for (const entry of log) {
+                    if (entry.startsWith('list:')) {
+                        sentSince.set(entry.slice('list:'.length), []);
+                    } else if (entry.startsWith('record:')) {
+                        const folder = entry.slice('record:'.length, entry.lastIndexOf('@'));
+                        expect({ recorded: entry, changesSentSinceAsked: sentSince.get(folder) ?? [] }).toEqual({
+                            recorded: entry,
+                            changesSentSinceAsked: [],
+                        });
+                        sentSince.delete(folder);
+                    } else if (/^(rename|move|trash):/.test(entry)) {
+                        for (const changes of sentSince.values()) changes.push(entry);
+                    }
+                }
+            };
+            return {
+                ...drive,
+                engine,
+                log,
+                hold,
+                crawlNext,
+                expectNoChangeWhileListing,
+                journal: () => new RemoteOpsJournal(stateDb.connection).pending(),
+            };
+        };
+
+        test('a drive rename made while the crawl runs reaches Proton Drive before the crawl ends', async () => {
+            const d = setup();
+            d.add('notes.txt', 'n');
+            d.add('A/a.txt', 'a');
+            d.add('B/b.txt', 'b');
+            const a = d.hold('A');
+            const b = d.hold('B');
+            const pass = d.engine.reconcileNow(); // the first pass crawls A and B, which aren't on this computer
+            await a.asked;
+            await d.engine.renameItem('notes.txt', 'renamed.txt');
+            a.release();
+            await b.asked; // the crawl is still on: B's listing is held open
+
+            expect(d.calls.renamed).toEqual([{ uid: 'vol~notes.txt', name: 'renamed.txt' }]);
+            expect(d.journal()).toEqual([]);
+            b.release();
+            await pass;
+            expect(d.log).toEqual(['list:', 'record:@', 'list:A', 'record:A@A', 'rename:notes.txt>renamed.txt', 'list:B', 'record:B@B']);
+            expect(d.engine.remoteIndex.getByPath('renamed.txt')?.uid).toBe('vol~notes.txt');
+            expect(d.engine.remoteIndex.getByPath('notes.txt')).toBeNull();
+        });
+
+        for (const [how, to, change] of [
+            ['renamed', 'C2', 'rename:C>C2'],
+            ['moved into a folder crawled already', 'A/C', 'move:C>A'],
+        ] as const) {
+            test(`a folder the crawl has yet to reach, ${how} through the drive, is listed where it is now and never recorded where it was`, async () => {
+                const d = setup();
+                d.add('A/a.txt', 'a');
+                d.add('C/Deep/c.txt', 'c');
+                const a = d.hold('A');
+                const pass = d.engine.reconcileNow(); // the first pass crawls A, then C
+                await a.asked;
+                await d.engine.renameItem('C', to);
+                a.release();
+                await pass;
+                await d.engine.replayRemoteOps();
+
+                // Sent before C's turn came, and C then listed (by its uid) at its new path
+                expect(d.log).toEqual([
+                    'list:',
+                    'record:@',
+                    'list:A',
+                    'record:A@A',
+                    change,
+                    'list:C',
+                    `record:C@${to}`,
+                    'list:C/Deep',
+                    `record:C/Deep@${to}/Deep`,
+                ]);
+                for (const under of ['', '/Deep', '/Deep/c.txt']) {
+                    expect({ path: `${to}${under}`, uid: d.engine.remoteIndex.getByPath(`${to}${under}`)?.uid }).toEqual({
+                        path: `${to}${under}`,
+                        uid: `vol~C${under}`,
+                    });
+                    expect(d.engine.remoteIndex.getByPath(`C${under}`)).toBeNull();
+                }
+                expect(d.journal()).toEqual([]);
+            });
+        }
+
+        test('a folder the crawl has yet to reach, deleted through the drive as its folder is listed, is never put back in the index', async () => {
+            const d = setup();
+            d.add('B/b.txt', 'b'); // crawled before A
+            d.add('A/C/c.txt', 'c');
+            d.add('A/a.txt', 'a');
+            await d.engine.reconcileNow(); // the first pass crawls: A/C is in the index
+            d.crawlNext();
+            d.log.length = 0;
+            const a = d.hold('A');
+            const pass = d.engine.reconcileNow();
+            await a.asked; // A's listing, which still holds C, is on its way
+            await d.engine.deleteItem('A/C');
+            a.release();
+            await pass;
+            await d.engine.replayRemoteOps();
+
+            expect(d.calls.trashed).toEqual([['vol~A/C']]);
+            for (const gone of ['A/C', 'A/C/c.txt']) {
+                expect(d.engine.remoteIndex.getByPath(gone)).toBeNull();
+            }
+            expect(d.engine.remoteIndex.getByPath('A/a.txt')).not.toBeNull();
+            // Never listed: the trash reached Proton Drive before its turn came
+            expect(d.log.filter((entry) => entry.includes('A/C'))).toEqual(['trash:A/C']);
+            d.expectNoChangeWhileListing();
+        });
+
+        test('a deleted folder the crawl has yet to reach is skipped, and not put back in the index', async () => {
+            const d = setup();
+            d.add('A/a.txt', 'a');
+            d.add('C/Deep/c.txt', 'c');
+            const a = d.hold('A');
+            const pass = d.engine.reconcileNow(); // the first pass crawls A, then C
+            await a.asked;
+            await d.engine.deleteItem('C');
+            a.release();
+            await pass;
+            await d.engine.replayRemoteOps();
+
+            expect(d.calls.trashed).toEqual([['vol~C']]);
+            expect(d.log).toEqual(['list:', 'record:@', 'list:A', 'record:A@A', 'trash:C']);
+            for (const gone of ['C', 'C/Deep', 'C/Deep/c.txt']) {
+                expect(d.engine.remoteIndex.getByPath(gone)).toBeNull();
+            }
+        });
+
+        test('a listing asked for before a drive change is recorded before that change is sent, never after', async () => {
+            const d = setup();
+            d.add('A/a.txt', 'a');
+            d.add('B/b.txt', 'b');
+            await d.engine.reconcileNow(); // the first pass crawls: A/a.txt is in the index
+            d.crawlNext();
+            d.log.length = 0;
+            const a = d.hold('A');
+            const pass = d.engine.reconcileNow();
+            await a.asked; // A's listing, with a.txt under its old name, is on its way
+            await d.engine.renameItem('A/a.txt', 'A/renamed.txt');
+            await Bun.sleep(20); // time enough for a change sent alongside the listing to land
+            expect(d.calls.renamed).toEqual([]);
+            a.release();
+            await pass;
+            await d.engine.replayRemoteOps();
+
+            expect(d.calls.renamed).toEqual([{ uid: 'vol~A/a.txt', name: 'renamed.txt' }]);
+            d.expectNoChangeWhileListing();
+            expect(d.engine.remoteIndex.getByPath('A/renamed.txt')?.uid).toBe('vol~A/a.txt');
+            expect(d.engine.remoteIndex.getByPath('A/a.txt')).toBeNull();
+        });
+
+        test('a drive change made during the walk waits for the walk to end, then goes before the crawl lists anything', async () => {
+            const d = setup();
+            d.add('notes.txt', 'n');
+            d.add('Docs/d.txt', 'd');
+            d.add('Other/o.txt', 'o');
+            d.engine.availability.setPin('vol~Docs', 'pinned', false);
+            const docs = d.hold('Docs');
+            const pass = d.engine.reconcileNow(); // walks the root and Docs, which is on this computer, then crawls Other
+            await docs.asked;
+            await d.engine.renameItem('notes.txt', 'renamed.txt');
+            await Bun.sleep(20);
+            expect(d.calls.renamed).toEqual([]);
+            docs.release();
+            await pass;
+
+            expect(d.log).toEqual([
+                'list:',
+                'record:@',
+                'list:Docs',
+                'record:Docs@Docs',
+                'download:Docs/d.txt',
+                'rename:notes.txt>renamed.txt',
+                'list:Other',
+                'record:Other@Other',
+            ]);
+        });
+
+        test('with no crawl in the pass, a drive change made during the walk goes once the pass is over', async () => {
+            const d = setup();
+            d.add('notes.txt', 'n');
+            d.add('Docs/d.txt', 'd');
+            d.add('Other/o.txt', 'o');
+            d.engine.availability.setPin('vol~Docs', 'pinned', false);
+            await d.engine.reconcileNow(); // the first pass crawls; the second doesn't
+            d.log.length = 0;
+            const docs = d.hold('Docs');
+            const pass = d.engine.reconcileNow();
+            await docs.asked;
+            await d.engine.renameItem('notes.txt', 'renamed.txt');
+            await Bun.sleep(20);
+            expect(d.calls.renamed).toEqual([]);
+            docs.release();
+            await pass;
+            await d.engine.replayRemoteOps();
+
+            expect(d.log).toEqual(['list:', 'record:@', 'list:Docs', 'record:Docs@Docs', 'rename:notes.txt>renamed.txt']);
+            expect(d.journal()).toEqual([]);
+        });
+
+        test('an online-only folder renamed through the drive during the walk is listed at its new path by the crawl', async () => {
+            const d = setup();
+            d.add('Docs/d.txt', 'd');
+            d.add('Other/Sub/o.txt', 'o');
+            d.engine.availability.setPin('vol~Docs', 'pinned', false);
+            const docs = d.hold('Docs');
+            const pass = d.engine.reconcileNow(); // walks the root and Docs, then crawls Other
+            await docs.asked;
+            await d.engine.renameItem('Other', 'Other2');
+            docs.release();
+            await pass;
+
+            expect(d.log).toEqual([
+                'list:',
+                'record:@',
+                'list:Docs',
+                'record:Docs@Docs',
+                'download:Docs/d.txt',
+                'rename:Other>Other2',
+                'list:Other',
+                'record:Other@Other2',
+                'list:Other/Sub',
+                'record:Other/Sub@Other2/Sub',
+            ]);
+            expect(d.engine.remoteIndex.getByPath('Other2/Sub/o.txt')?.uid).toBe('vol~Other/Sub/o.txt');
+            for (const old of ['Other', 'Other/Sub', 'Other/Sub/o.txt']) {
+                expect(d.engine.remoteIndex.getByPath(old)).toBeNull();
+            }
+            expect(d.journal()).toEqual([]);
+        });
+
+        test('a folder renamed through the drive while its own listing is on its way is recorded at its new path, with what is in it', async () => {
+            const d = setup();
+            d.add('A/a.txt', 'a');
+            d.add('C/Deep/c.txt', 'c');
+            await d.engine.reconcileNow(); // the first pass crawls
+            d.add('C/Deep/new.txt', 'new'); // added in the cloud since
+            d.crawlNext();
+            d.log.length = 0;
+            const c = d.hold('C');
+            const pass = d.engine.reconcileNow();
+            await c.asked; // C's listing is on its way, from before the rename
+            await d.engine.renameItem('C', 'C2');
+            c.release();
+            await pass;
+
+            // Its listing is still C's own (nothing reached Proton Drive while it was out), so it isn't thrown away
+            expect(d.log).toEqual([
+                'list:',
+                'record:@',
+                'list:A',
+                'record:A@A',
+                'list:C',
+                'record:C@C2',
+                'rename:C>C2',
+                'list:C/Deep',
+                'record:C/Deep@C2/Deep',
+            ]);
+            for (const under of ['', '/Deep', '/Deep/c.txt', '/Deep/new.txt']) {
+                expect({ path: `C2${under}`, uid: d.engine.remoteIndex.getByPath(`C2${under}`)?.uid }).toEqual({
+                    path: `C2${under}`,
+                    uid: `vol~C${under}`,
+                });
+                expect(d.engine.remoteIndex.getByPath(`C${under}`)).toBeNull();
+            }
+            expect(d.journal()).toEqual([]);
+            d.expectNoChangeWhileListing();
+        });
+
+        test('a rename that fails to reach Proton Drive mid-crawl stays pending, and the folder is recorded where it is here', async () => {
+            const d = setup();
+            d.add('A/a.txt', 'a');
+            d.add('C/Deep/c.txt', 'c');
+            const a = d.hold('A');
+            const pass = d.engine.reconcileNow(); // the first pass crawls A, then C
+            await a.asked;
+            d.failNext('renameNode'); // offline for a moment
+            await d.engine.renameItem('C', 'C2');
+            a.release();
+            await pass;
+
+            // Tried before C's turn came, and still to go; C is listed where it is here, and recorded there
+            expect(d.calls.renamed).toEqual([]);
+            expect(d.journal()).toMatchObject([{ kind: 'rename', nodeUid: 'vol~C', toPath: 'C2' }]);
+            expect(d.log).toEqual(['list:', 'record:@', 'list:A', 'record:A@A', 'list:C', 'record:C@C2', 'list:C/Deep', 'record:C/Deep@C2/Deep']);
+            const expectAtNewPath = () => {
+                for (const under of ['', '/Deep', '/Deep/c.txt']) {
+                    expect(d.engine.remoteIndex.getByPath(`C2${under}`)?.uid).toBe(`vol~C${under}`);
+                    expect(d.engine.remoteIndex.getByPath(`C${under}`)).toBeNull();
+                }
+            };
+            expectAtNewPath();
+
+            await d.engine.replayRemoteOps();
+            expect(d.calls.renamed).toEqual([{ uid: 'vol~C', name: 'C2' }]);
+            expect(d.journal()).toEqual([]);
+            expectAtNewPath();
+        });
+
+        // Only the sync pass's own crawl sends drive changes between its listings: an unhide's listing, or a pin's crawl,
+        // can run while the pass walks, and must not send one then
+        test('an unhide during the walk sends no drive change waiting for the pass', async () => {
+            const d = setup();
+            d.add('notes.txt', 'n');
+            d.add('Docs/d.txt', 'd');
+            d.add('Other/Sub/o.txt', 'o');
+            d.engine.availability.setPin('vol~Docs', 'pinned', false);
+            await d.engine.reconcileNow(); // the first pass crawls; the second doesn't
+            await d.engine.setAvailability('Other', 'hide');
+            d.log.length = 0;
+            const docs = d.hold('Docs');
+            const pass = d.engine.reconcileNow();
+            await docs.asked;
+            await d.engine.renameItem('notes.txt', 'renamed.txt');
+            // Lists Other's subtree again, while the walk is held. It runs in the availability chain, which a replay waits
+            // for too: one sent from here would never end, so what was sent is looked at before it is waited for.
+            const unhide = d.engine.setAvailability('Other', 'unhide');
+            await Bun.sleep(20);
+            expect(d.calls.renamed).toEqual([]);
+            await unhide;
+            expect(d.log).toEqual(expect.arrayContaining(['list:Other', 'list:Other/Sub']));
+            expect(d.calls.renamed).toEqual([]);
+            docs.release();
+            await pass;
+            await d.engine.replayRemoteOps();
+
+            expect(d.calls.renamed).toEqual([{ uid: 'vol~notes.txt', name: 'renamed.txt' }]);
+            expect(d.log.indexOf('rename:notes.txt>renamed.txt')).toBeGreaterThan(d.log.indexOf('record:Docs@Docs'));
+        });
+
+        test("a pin's crawl during the walk sends no drive change waiting for the pass", async () => {
+            const d = setup();
+            d.add('notes.txt', 'n');
+            d.add('Docs/d.txt', 'd');
+            d.add('Other/x.txt', 'x');
+            d.add('Other/Sub/o.txt', 'o');
+            d.engine.availability.setPin('vol~Docs', 'pinned', false);
+            await d.engine.reconcileNow(); // the first pass crawls; the second doesn't
+            d.log.length = 0;
+            const docs = d.hold('Docs');
+            const pass = d.engine.reconcileNow();
+            await docs.asked;
+            await d.engine.renameItem('notes.txt', 'renamed.txt');
+            // Other pinned, with Sub freed inside it: bringing Other down crawls Sub, while the walk is held
+            d.engine.availability.setPin('vol~Other', 'pinned', false);
+            d.engine.availability.setPin('vol~Other/Sub', 'unpinned', false);
+            await (d.engine as any).downloadPinned('Other');
+            expect(d.log).toEqual(expect.arrayContaining(['download:Other/x.txt', 'list:Other/Sub']));
+            await Bun.sleep(20);
+            expect(d.calls.renamed).toEqual([]);
+            docs.release();
+            await pass;
+            await d.engine.replayRemoteOps();
+
+            expect(d.calls.renamed).toEqual([{ uid: 'vol~notes.txt', name: 'renamed.txt' }]);
+            expect(d.log.indexOf('rename:notes.txt>renamed.txt')).toBeGreaterThan(d.log.indexOf('record:Docs@Docs'));
+        });
+    });
+
     describe('availability actions', () => {
         const setup = () => {
             const drive = makeMockDrive();

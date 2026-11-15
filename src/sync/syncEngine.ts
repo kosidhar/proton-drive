@@ -288,8 +288,8 @@ export class ProtonDriveSyncEngine {
     // What changed, for the file manager's emblems (see StateEvents and the control socket's /fm/events)
     readonly stateEvents: StateEvents;
     // Renames, moves and deletes made through the virtual drive that Proton Drive has yet to get, and the replay of them:
-    // one at a time (replayRun), again when asked meanwhile (replayAgain), and after the sync pass when asked during one
-    // (replayAfterPass)
+    // one at a time (replayRun), again when asked meanwhile (replayAgain), and, when asked during a sync pass, once its
+    // walk is over (replayAfterPass): between two listings of its crawl of online-only folders, or after the pass (#235)
     private readonly journal: RemoteOpsJournal;
     private replayRun: Promise<void> | null = null;
     private replayAgain = false;
@@ -1259,9 +1259,9 @@ export class ProtonDriveSyncEngine {
             }
             // Hides that were waiting for uploads finish once those are done
             await this.completePendingHides();
-            // Last, so nothing on this computer waits behind it
+            // Last, so nothing on this computer waits behind it; drive changes made meanwhile go between its listings
             if (crawl) {
-                await this.crawlOnlineOnly(onlineOnly);
+                await this.crawlOnlineOnly(onlineOnly, true);
             }
 
             this.lastSyncAt = Date.now();
@@ -1304,6 +1304,8 @@ export class ProtonDriveSyncEngine {
             if (confirmation !== null && this.missingConfirmed === confirmation && !keepConfirmation) {
                 this.missingConfirmed = null;
             }
+            // Drive changes asked for during the pass that its crawl didn't send: it had none, or they came after its last
+            // listing (or the pass ended before it)
             if (this.replayAfterPass) {
                 this.replayAfterPass = false;
                 void this.runReplay();
@@ -2513,7 +2515,7 @@ export class ProtonDriveSyncEngine {
         }
         // Decide from what the cloud holds right now; without the whole picture, trash nothing this time
         const holdsDocs = new Set<string>(); // folders holding Proton Docs or Sheets, which the index leaves out
-        if (!(await this.indexRemoteSubtree(remoteNode, relPath, holdsDocs))) {
+        if (!(await this.indexRemoteSubtree(remoteNode, relPath, { unsupportedIn: holdsDocs }))) {
             this.logger.warn(`Not trashing ${relPath} yet: could not list everything in it`);
             return;
         }
@@ -3555,14 +3557,25 @@ export class ProtonDriveSyncEngine {
         }
     }
 
-    // Records the subtrees of folders found online-only during a pass, one after another.
-    private async crawlOnlineOnly(folders: OnlineOnlyFolder[]): Promise<void> {
+    // Records the subtrees of folders found online-only during a pass, one after another. In the sync pass's own crawl
+    // (ofPass), drive changes asked for during the pass reach Proton Drive between two listings (see indexRemoteSubtree).
+    private async crawlOnlineOnly(folders: OnlineOnlyFolder[], ofPass = false): Promise<void> {
         for (const folder of folders) {
             if (this.stateDb.getSettings().paused) {
                 return;
             }
             this.currentAction = `Listing /my-files/${folder.relPath}`;
-            await this.indexRemoteSubtree(folder.node, folder.relPath);
+            await this.indexRemoteSubtree(folder.node, folder.relPath, { replayFirst: ofPass });
+        }
+    }
+
+    // Drive changes asked for while a sync pass runs (replayAfterPass) are sent from its crawl of online-only folders,
+    // before the next listing, rather than once the whole crawl is over (#235). Nothing of the pass is under way then:
+    // its walk is over, and no listing is on its way.
+    private async replayAskedDuringPass(): Promise<void> {
+        if (this.replayAfterPass) {
+            this.replayAfterPass = false;
+            await this.runReplay();
         }
     }
 
@@ -4378,7 +4391,9 @@ export class ProtonDriveSyncEngine {
 
     // Sends the journalled renames, moves and deletes to Proton Drive, in the order they were made (spec §5.2). A network
     // or server error leaves the operation pending and stops until the next time; nothing runs while paused. It never runs
-    // alongside a sync pass, whose listings it would make out of date: asked during one, it runs once the pass is over.
+    // alongside a sync pass's walk or one of its listings, which it would make out of date: asked during a pass, it runs
+    // once the walk is over, between two listings of the pass's crawl of online-only folders (see indexRemoteSubtree), or
+    // once the pass is over when it has no crawl or the crawl is done (#235).
     async replayRemoteOps(): Promise<void> {
         if (this.reconcileRunning) {
             this.replayAfterPass = true;
@@ -6405,7 +6420,23 @@ export class ProtonDriveSyncEngine {
     // whole subtree was recorded: false when paused, when the folder is not indexed at relPath, or when a listing failed
     // (that is logged, and the rest is still crawled). Nothing is listed below a hidden folder. The index leaves out
     // Proton Docs and Sheets, so the folders whose listing holds one are added to `unsupportedIn` when given.
-    private async indexRemoteSubtree(node: NodeEntity, relPath: string, unsupportedIn?: Set<string>): Promise<boolean> {
+    // With replayFirst (the sync pass's crawl of online-only folders), the drive changes asked for during the pass are sent
+    // before each folder is listed: between two listings, never while one is on its way, so no listing asked for before a
+    // change is sent is recorded after it (#235). As one may have renamed, moved or deleted the folder, it is then taken
+    // where the index has it now, by its uid, and skipped if the index no longer has it. Its listing is looked up that way
+    // again once it is in: a rename or move through the drive meanwhile changed only where this computer has the folder
+    // (none reached Proton Drive while the listing was out), so the listing is still the folder's own, recorded at its
+    // new path; one deleted or hidden meanwhile is not recorded.
+    private async indexRemoteSubtree(
+        node: NodeEntity,
+        relPath: string,
+        opts: { unsupportedIn?: Set<string>; replayFirst?: boolean } = {},
+    ): Promise<boolean> {
+        const { unsupportedIn, replayFirst = false } = opts;
+        if (replayFirst) {
+            await this.replayAskedDuringPass();
+            relPath = this.index.getByUid(node.uid)?.relPath ?? relPath;
+        }
         if (this.stateDb.getSettings().paused || this.index.getByUid(node.uid)?.relPath !== relPath) {
             return false;
         }
@@ -6419,6 +6450,16 @@ export class ProtonDriveSyncEngine {
             this.logger.warn(`Could not list ${relPath} for the remote index: ${error}`);
             return false;
         }
+        if (replayFirst) {
+            const now = this.index.getByUid(node.uid)?.relPath;
+            if (now === undefined) {
+                return false;
+            }
+            if (this.policy.hiddenBy(now)?.hide === 'hidden') {
+                return true;
+            }
+            relPath = now;
+        }
         if (!this.recordListing(node, relPath, children)) {
             return false;
         }
@@ -6428,7 +6469,7 @@ export class ProtonDriveSyncEngine {
         let complete = true;
         for (const child of children) {
             if (child.type === NodeType.Folder) {
-                complete = (await this.indexRemoteSubtree(child, `${relPath}/${getName(child)}`, unsupportedIn)) && complete;
+                complete = (await this.indexRemoteSubtree(child, `${relPath}/${getName(child)}`, opts)) && complete;
             }
         }
         return complete;
