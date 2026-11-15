@@ -96,6 +96,8 @@ pub(crate) struct Palette {
     pub(crate) purple_text: Color32,
     /// Folders in lists
     pub(crate) folder: Color32,
+    /// Red words: an error, an expired link. `STATUS_DANGER` stays for red fills and outlines
+    pub(crate) danger_text: Color32,
 }
 
 /// Proton's light theme, as drive.proton.me shows it (#276)
@@ -118,6 +120,7 @@ pub(crate) const LIGHT: Palette = Palette {
     purple_soft: Color32::from_rgb(0xEB, 0xE5, 0xFF),
     purple_text: Color32::from_rgb(0x5D, 0x38, 0xEB),
     folder: Color32::from_rgb(0xF5, 0xA4, 0x28),
+    danger_text: STATUS_DANGER, // 4.55:1 on white
 };
 
 /// Proton Carbon, the app's dark theme as it was. The colours it didn't have are taken from it.
@@ -140,6 +143,7 @@ pub(crate) const DARK: Palette = Palette {
     purple_soft: Color32::from_rgb(44, 37, 69),      // #2C2545
     purple_text: Color32::from_rgb(214, 204, 255),   // #D6CCFF
     folder: Color32::from_rgb(0xF5, 0xA4, 0x28),
+    danger_text: Color32::from_rgb(0xF5, 0x56, 0x6F), // #F5566F: STATUS_DANGER, lightened to read at 4.5:1 here
 };
 
 /// The palette of the theme in use.
@@ -184,6 +188,7 @@ tokens! {
     STORAGE_FILL => storage_fill,
     STORAGE_TRACK => storage_track,
     FOLDER_ICON => folder,
+    DANGER_TEXT => danger_text,
 }
 
 /// The WCAG contrast ratio of two opaque colours, from 1 (the same) to 21 (black on white).
@@ -925,8 +930,8 @@ fn sharing_pieces(item: &shared::SharedItem, now_ms: i64) -> Vec<SharingPiece> {
     let mut pieces = Vec::new();
     for mark in marks {
         if mark == icons::LINK_BROKEN {
-            pieces.push(piece(mark, true, STATUS_DANGER));
-            pieces.push(SharingPiece { spare: true, ..piece("Link expired", false, STATUS_DANGER) });
+            pieces.push(piece(mark, true, DANGER_TEXT()));
+            pieces.push(SharingPiece { spare: true, ..piece("Link expired", false, DANGER_TEXT()) });
         } else {
             pieces.push(piece(mark, true, TEXT_MUTED()));
         }
@@ -1037,12 +1042,18 @@ fn shared_list(ui: &mut egui::Ui, items: &[shared::SharedItem], now_ms: i64, sto
         p.text(egui::pos2(name_x + ICON_ROOM, y), egui::Align2::LEFT_CENTER, name, name_font.clone(), TEXT_PRIMARY());
         describe(name_cell, "name", &item.name, &whole);
 
-        // Location: the folder, or where the item is instead, in weak text
+        // Location: the folder, or where the item is instead, in weak text. A folder is cut in the middle, keeping
+        // its end; a phrase ("Hidden from this computer", "(top level)") at its end (R13)
         let location_cell = cell(location_x, location_w);
         let location = shared::location_text(item);
         let color = if item.place == shared::Place::MyFiles { TEXT_PRIMARY() } else { TEXT_MUTED() };
         let p = in_cell(location_cell);
-        let shown = truncate_middle_to_width(&p, &location, &text_font, location_w);
+        let is_folder = item.place == shared::Place::MyFiles && item.rel_path.as_deref().is_some_and(|r| r.contains('/'));
+        let shown = if is_folder {
+            truncate_middle_to_width(&p, &location, &text_font, location_w)
+        } else {
+            truncate_end_to_width(&p, &location, &text_font, location_w)
+        };
         p.text(egui::pos2(location_x, y), egui::Align2::LEFT_CENTER, shown, text_font.clone(), color);
         describe(location_cell, "location", &location, &whole);
 
@@ -1056,8 +1067,8 @@ fn shared_list(ui: &mut egui::Ui, items: &[shared::SharedItem], now_ms: i64, sto
                 x += sharing_gap(fit[k - 1], piece);
             }
             let font = sharing_font(piece);
-            // Words are shortened to the column; a glyph past its edge is cut off by it
-            let text = if piece.glyph { piece.text.clone() } else { truncate_middle_to_width(&p, &piece.text, &font, sharing_cell.right() - x) };
+            // Words, all phrases, are cut at their end to the column (R13); a glyph past its edge is cut off by it
+            let text = if piece.glyph { piece.text.clone() } else { truncate_end_to_width(&p, &piece.text, &font, sharing_cell.right() - x) };
             let w = text_width(&p, &text, &font);
             p.text(egui::pos2(x, y), egui::Align2::LEFT_CENTER, text, font, piece.color);
             x += w;
@@ -2163,7 +2174,7 @@ impl ProtonDriveNativeApp {
         ScrollArea::vertical().id_salt("shared_scroll").auto_shrink([false, false]).show(ui, |ui| {
             Frame::NONE.inner_margin(gutter).show(ui, |ui| {
                 if let Some(error) = self.shared.error.clone() {
-                    ui.add(egui::Label::new(RichText::new(error).size(13.0).color(STATUS_DANGER)).wrap());
+                    ui.add(egui::Label::new(RichText::new(error).size(13.0).color(DANGER_TEXT())).wrap());
                     ui.add_space(10.0);
                     if proton_button(
                         ui,
@@ -2196,7 +2207,7 @@ impl ProtonDriveNativeApp {
                     return;
                 }
                 if let Some(error) = &self.shared.stop_error {
-                    ui.add(egui::Label::new(RichText::new(error).size(13.0).color(STATUS_DANGER)).wrap());
+                    ui.add(egui::Label::new(RichText::new(error).size(13.0).color(DANGER_TEXT())).wrap());
                     ui.add_space(10.0);
                 }
                 // The rows of the list being replaced stay, greyed out and without clicks
@@ -3755,26 +3766,32 @@ const ICON_BUTTON_SIZE: f32 = 28.0;
 /// An icon-only button, 28×28, with no fill until hovered. `label`, what a button with words would have said, is its
 /// tooltip and its name for screen readers.
 fn icon_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
-    icon_button_pressed(ui, icon, label, false)
+    icon_button_drawn(ui, icon, label, None, TEXT_PRIMARY())
 }
 
 /// `icon_button` with its icon in `color`: a list row's actions, weak until their row is hovered.
 fn icon_button_colored(ui: &mut egui::Ui, icon: &str, label: &str, color: Color32) -> egui::Response {
-    icon_button_drawn(ui, icon, label, false, color)
+    icon_button_drawn(ui, icon, label, None, color)
 }
 
-/// `icon_button`, filled with the soft purple while `pressed`: the top bar's gear while Settings is open.
+/// `icon_button`, filled with the soft purple while `pressed`: the top bar's gear while Settings is open. Unlike the
+/// others, it is a toggle for screen readers.
 fn icon_button_pressed(ui: &mut egui::Ui, icon: &str, label: &str, pressed: bool) -> egui::Response {
-    icon_button_drawn(ui, icon, label, pressed, if pressed { PROTON_PURPLE_TEXT() } else { TEXT_PRIMARY() })
+    icon_button_drawn(ui, icon, label, Some(pressed), if pressed { PROTON_PURPLE_TEXT() } else { TEXT_PRIMARY() })
 }
 
-fn icon_button_drawn(ui: &mut egui::Ui, icon: &str, label: &str, pressed: bool, color: Color32) -> egui::Response {
+/// An icon-only button; `pressed` is None for a plain push button, or whether a toggle is on.
+fn icon_button_drawn(ui: &mut egui::Ui, icon: &str, label: &str, pressed: Option<bool>, color: Color32) -> egui::Response {
     let (fill, hover_fill) =
-        if pressed { (PROTON_PURPLE_SOFT(), PROTON_PURPLE_SOFT()) } else { (Color32::TRANSPARENT, BG_CARD_ALT()) };
+        if pressed == Some(true) { (PROTON_PURPLE_SOFT(), PROTON_PURPLE_SOFT()) } else { (Color32::TRANSPARENT, BG_CARD_ALT()) };
     let (rect, resp) = button_shell(ui, Vec2::splat(ICON_BUTTON_SIZE), label, fill, hover_fill, None);
-    // Says whether it is pressed, as the sections say whether they are open
+    // A toggle says whether it is pressed, as the sections say whether they are open; a push button only its name
+    // (egui marks any `selected` widget a toggle, pressed or not)
     let enabled = ui.is_enabled();
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, pressed, label));
+    resp.widget_info(|| match pressed {
+        Some(pressed) => egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, pressed, label),
+        None => egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label),
+    });
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, icons::font(BUTTON_ICON_SIZE), color);
     // With no words of its own, it says what it is even while it waits (greyed out)
     resp.on_hover_text(label).on_disabled_hover_text(label)
@@ -3875,6 +3892,8 @@ fn apply_proton_visuals(ctx: &egui::Context, light: bool) {
     };
     visuals.extreme_bg_color = BG_INPUT();
     visuals.selection.bg_fill = PROTON_PURPLE;
+    // Links in Proton's purple, not egui's blue; in the dark, its light purple, which reads at 4.5:1 there (R14)
+    visuals.hyperlink_color = if light { PROTON_PURPLE } else { DARK.purple_text };
     visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
     visuals.widgets.noninteractive.bg_fill = BG_CARD();
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER_SUBTLE());
@@ -4083,6 +4102,30 @@ fn text_width(painter: &egui::Painter, text: &str, font: &FontId) -> f32 {
 }
 
 /// Middle-truncate `s` so it fits within `max_width` pixels when drawn in `font`.
+/// `s` cut at its end to fit `max_width`, with an ellipsis: for a phrase, which reads from its start.
+fn truncate_end_to_width(painter: &egui::Painter, s: &str, font: &FontId, max_width: f32) -> String {
+    if max_width <= 0.0 {
+        return String::new();
+    }
+    if text_width(painter, s, font) <= max_width {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let cut = |n: usize| chars[..n].iter().collect::<String>().trim_end().to_string() + "…";
+    // Binary search for the longest start that still fits with its ellipsis
+    let (mut lo, mut hi) = (0, chars.len() - 1);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if text_width(painter, &cut(mid), font) <= max_width {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let out = cut(lo);
+    if text_width(painter, &out, font) <= max_width { out } else { String::new() }
+}
+
 fn truncate_middle_to_width(painter: &egui::Painter, s: &str, font: &FontId, max_width: f32) -> String {
     // No room at all (e.g. a collapsed column when zoomed in): draw nothing rather than overlap
     if max_width <= 0.0 {
@@ -4858,6 +4901,30 @@ mod tests {
             let out = truncate_middle_to_width(p, name, &font, 120.0);
             assert!(text_width(p, &out, &font) <= 120.0);
             assert!(out.starts_with('写') && out.ends_with(".txt"));
+        });
+    }
+
+    // R13: a phrase is cut at its end, so it still reads from its start
+    #[test]
+    fn truncate_end_to_width_cuts_a_phrase_at_its_end() {
+        with_painter(|p| {
+            let font = FontId::proportional(13.0);
+            assert_eq!(truncate_end_to_width(p, "(top level)", &font, 500.0), "(top level)", "it fits");
+            let phrase = "Proton Drive is still catching up with this item: refresh in a moment";
+            for max_width in [60.0, 150.0, 300.0] {
+                let out = truncate_end_to_width(p, phrase, &font, max_width);
+                assert!(text_width(p, &out, &font) <= max_width, "{out:?} wider than {max_width}");
+                assert!(out.ends_with('…') && phrase.starts_with(out.trim_end_matches('…')), "{out:?}");
+                // the longest that fits: one more letter (past the space the cut leaves out) doesn't
+                let kept = out.trim_end_matches('…');
+                let (at, next) = phrase[kept.len()..].char_indices().find(|(_, c)| !c.is_whitespace()).unwrap();
+                let longer = format!("{}…", &phrase[..kept.len() + at + next.len_utf8()]);
+                assert!(text_width(p, &longer, &font) > max_width, "{longer:?} would have fitted {max_width}");
+            }
+            assert_eq!(truncate_end_to_width(p, "Hidden from this computer", &font, 0.0), "", "no room");
+            assert_eq!(truncate_end_to_width(p, "Hidden from this computer", &font, -5.0), "");
+            let out = truncate_end_to_width(p, "日本語のとても長い説明の文です", &font, 60.0);
+            assert!(out.starts_with('日') && out.ends_with('…') && text_width(p, &out, &font) <= 60.0, "{out:?}");
         });
     }
 
@@ -7335,7 +7402,8 @@ mod tests {
         h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Err(offline.into())));
         h.frames(3);
         assert!(h.text_at(shared::EMPTY).is_none());
-        assert!(h.text_at(offline).is_some());
+        let said = h.text_at(offline).expect("the daemon's message");
+        assert_eq!(painted_color(&h, offline, said), Some(DANGER_TEXT()), "in the red that reads as text (R15)");
         assert!(h.widget_at("Refresh").is_none(), "Retry is the action here");
         h.click(h.text_at("Retry").unwrap());
         assert_eq!(h.sent(), ["shared list"]);
@@ -7469,12 +7537,12 @@ mod tests {
         let mut h = shared_with_rows();
         tooltips_at_once(&h);
         let rows = shared_rows();
-        // An expired link: the broken link and "Link expired", in red
+        // An expired link: the broken link and "Link expired", in the red that reads as text (R15)
         let old_notes = h.text_at("old-notes.txt").unwrap();
         let expired = on_line(&h, "Link expired", old_notes.y).expect("said on its row").center();
-        assert_eq!(painted_color(&h, "Link expired", expired), Some(STATUS_DANGER));
+        assert_eq!(painted_color(&h, "Link expired", expired), Some(DANGER_TEXT()));
         let broken = on_line(&h, icons::LINK_BROKEN, old_notes.y).filter(|r| r.center().x < expired.x).expect("the broken link before it");
-        assert_eq!(painted_color(&h, icons::LINK_BROKEN, broken.center()), Some(STATUS_DANGER));
+        assert_eq!(painted_color(&h, icons::LINK_BROKEN, broken.center()), Some(DANGER_TEXT()));
         // A row whose sharing wasn't read: the warning and why, in place of the marks
         let budget = rows.iter().find(|i| i.unreadable.is_some()).unwrap();
         let y = h.text_at(&budget.name).unwrap().y;
@@ -7525,6 +7593,71 @@ mod tests {
                 assert!(cols.0 >= 0.0 && cols.1 >= 0.0 && cols.2 >= 0.0, "{room} {cols:?}");
             }
         }
+    }
+
+    // A Shared action and Refresh are push buttons for screen readers; only the gear, which stays pressed while
+    // Settings is open, is a toggle
+    #[test]
+    fn shared_actions_and_refresh_are_push_buttons_and_the_gear_a_toggle() {
+        let h = shared_with_rows();
+        for label in ["Copy link", "Manage…", "Show in Files", "Stop sharing", "Manage on the web", "Refresh"] {
+            let nodes = h.nodes_named(label);
+            assert!(!nodes.is_empty(), "{label:?}");
+            for node in nodes {
+                assert_eq!(node.role(), egui::accesskit::Role::Button, "{label:?}");
+                assert_eq!(node.toggled(), None, "{label:?} is not a toggle");
+            }
+        }
+        let gear = h.nodes_named("Settings").into_iter().find(|n| n.role() == egui::accesskit::Role::Button).expect("the gear");
+        assert_eq!(gear.toggled(), Some(egui::accesskit::Toggled::False), "the gear says it isn't pressed");
+    }
+
+    // R13: phrases are cut at their end; paths (folders, names) in the middle, keeping their ends
+    #[test]
+    fn phrases_are_cut_at_the_end_and_paths_in_the_middle() {
+        let mut h = shared_with_rows();
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
+        // On the page, not the sidebar's "Proton Drive"
+        let painted = |start: &str| -> Vec<String> {
+            h.texts(|t| t.galley.text().starts_with(start) && t.visual_bounding_rect().left() > SIDEBAR_EDGE)
+                .iter()
+                .map(|t| t.galley.text().to_string())
+                .collect()
+        };
+        for (start, whole) in [
+            ("Hid", "Hidden from this computer"),
+            ("Not", "Not on this computer"),
+            ("(to", "(top level)"),
+            ("Proton D", "Proton Drive is still catching up with this item: refresh in a moment"),
+        ] {
+            let shown = painted(start);
+            assert_eq!(shown.len(), 1, "{whole:?}: {shown:?}");
+            assert!(shown[0].ends_with('…') && whole.starts_with(shown[0].trim_end_matches('…')), "{whole:?} cut at its end: {shown:?}");
+        }
+        // A folder keeps its end
+        let documents = painted("Do");
+        assert!(!documents.is_empty() && documents.iter().all(|d| d.contains('…') && d.ends_with("ts")), "{documents:?}");
+        // and the whole of it is on hover, as before
+        let taxes = h.text_at(&painted("Hid")[0]).unwrap();
+        tooltips_at_once(&h);
+        h.frame(vec![egui::Event::PointerMoved(taxes)]);
+        h.frames(5);
+        assert!(h.text_at("Taxes\nPrivate · Hidden from this computer").is_some());
+    }
+
+    // R14: links are Proton's purple, readable in both palettes
+    #[test]
+    fn links_are_proton_purple_in_both_palettes() {
+        let link_color = |h: &Harness| {
+            h.texts(|t| t.galley.text() == shared::PHOTOS_LINK).first().map(|t| t.fallback_color).expect("the Photos note's link")
+        };
+        let mut h = shared_with_rows();
+        assert_eq!(link_color(&h), DARK.purple_text, "dark");
+        assert!(contrast(DARK.purple_text, DARK.canvas) >= 4.5);
+        apply_proton_visuals(&h.ctx, true);
+        h.frames(2);
+        assert_eq!(link_color(&h), PROTON_PURPLE, "light");
+        assert!(contrast(PROTON_PURPLE, LIGHT.canvas) >= 4.5);
     }
 
     // #253: acting on a row
@@ -7782,7 +7915,8 @@ mod tests {
         h.event(WorkerEvent::SharedStopped("Documents/report.pdf".into(), Err("Proton Drive is offline".into())));
         h.frames(3);
         assert_eq!(h.app.shared.stopping, None);
-        assert!(h.text_at("Proton Drive is offline").is_some());
+        let said = h.text_at("Proton Drive is offline").expect("why");
+        assert_eq!(painted_color(&h, "Proton Drive is offline", said), Some(DANGER_TEXT()), "in the red that reads as text (R15)");
         assert!(h.text_at("report.pdf").is_some(), "the list stays");
         assert_eq!(h.sent(), Vec::<String>::new());
     }
@@ -9082,6 +9216,8 @@ mod tests {
                 (p.sidebar_text, p.sidebar_selected, "selected section"),
                 (p.sidebar_weak, p.sidebar, "sidebar weak"),
                 (Color32::WHITE, PROTON_PURPLE, "primary button"),
+                (p.danger_text, p.canvas, "red text"),
+                (p.danger_text, p.card, "red text on cards"),
             ] {
                 assert!(contrast(fg, bg) >= 4.5, "{what}: {:.2}", contrast(fg, bg));
             }
