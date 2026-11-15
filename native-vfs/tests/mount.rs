@@ -1509,7 +1509,8 @@ fn the_drive_still_trashes_once_its_unlinker_is_gone() {
 /// The FUSE connection of a test mount: its number in /sys/fs/fuse/connections.
 fn connection_of(mountpoint: &Path) -> u32 {
     let wanted = mountpoint.to_str().unwrap();
-    assert!(wanted.starts_with("/tmp/protondrive-vfs-test-"), "only ever a test mount: {wanted}");
+    let ours = std::env::temp_dir().join("protondrive-vfs-test-");
+    assert!(wanted.starts_with(ours.to_str().unwrap()), "only ever a test mount: {wanted}");
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
     let line = mountinfo.lines().find(|l| l.split(' ').nth(4) == Some(wanted)).expect("the test mount in mountinfo");
     let (major, minor) = line.split(' ').nth(2).unwrap().split_once(':').unwrap();
@@ -1601,7 +1602,7 @@ fn a_helper_killed_while_trashes_queue_up_goes_and_the_renames_return() {
     }
     h.helper = None;
     let returned: Vec<usize> =
-        (1..n).filter_map(|_| renamed.recv_timeout(Duration::from_secs(5)).ok()).map(|(k, _)| k).collect();
+        (0..n).filter_map(|_| renamed.recv_timeout(Duration::from_secs(5)).ok()).map(|(k, _)| k).collect();
     let left = |pid: &u32| std::fs::metadata(format!("/proc/{pid}")).is_ok();
     let started = Instant::now();
     while started_with.iter().any(left) && started.elapsed() < Duration::from_secs(5) {
@@ -1609,7 +1610,7 @@ fn a_helper_killed_while_trashes_queue_up_goes_and_the_renames_return() {
     }
     assert!(waiting.is_some(), "no unlink ever waited on files/");
     assert!(status.is_some(), "the helper outlived SIGKILL until its connection was aborted: {waiting:?} waited");
-    assert_eq!(returned.len(), n - 1, "renames still waiting after the helper went: only {returned:?} returned");
+    assert_eq!(returned.len(), n, "renames still waiting after the helper went: only {returned:?} returned");
     let stayed: Vec<&u32> = started_with.iter().filter(|p| left(p)).collect();
     assert!(stayed.is_empty(), "the helper's children outlived it: {stayed:?}");
 }

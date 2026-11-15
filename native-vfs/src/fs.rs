@@ -348,8 +348,8 @@ struct Dropped {
 /// kernel: held by the request that dropped the name until its reply is in, so asked only once that reply is sent,
 /// and by any rename into the folder after it. This thread only waits for the child's answer, which a signal ends.
 ///
-/// Without the child, or when it couldn't unlink, the name goes all the same, and the kernel's entry with it, without
-/// a word to its watchers. That invalidation waits for the folder's lock in this thread, as it always has.
+/// When the child couldn't unlink, the name goes all the same (see after_unlink). Without a child, the kernel's entry
+/// goes with it, without a word to its watchers: that invalidation waits for the folder's lock in this thread (#247).
 fn start_unlinker(state: Weak<State>, dropped: Receiver<Dropped>) {
     let _ = std::thread::Builder::new().name("trash-unlink".into()).spawn(move || {
         let mut child: Option<Unlinker> = None;
@@ -367,20 +367,15 @@ fn start_unlinker(state: Weak<State>, dropped: Receiver<Dropped>) {
                 }
                 _ => None,
             };
-            let unlinked = match asked {
-                Some(Ok(unlinked)) => unlinked,
-                Some(Err(_)) => {
-                    log!("protondrive-vfs: the trash's unlinker stopped: Files may count trashed items from now on");
-                    state.unlinker_pid.store(0, Ordering::SeqCst);
-                    if let Some(gone) = child.take() {
-                        gone.end();
-                    }
-                    false
+            if let Some(Err(_)) = asked {
+                log!("protondrive-vfs: the trash's unlinker stopped: Files may count trashed items from now on");
+                // Forgotten before it is reaped, when its pid is free for another process
+                state.unlinker_pid.store(0, Ordering::SeqCst);
+                if let Some(gone) = child.take() {
+                    gone.end();
                 }
-                None => false,
-            };
-            if !unlinked {
-                state.take_gone(&dir.join(&name));
+            }
+            if state.after_unlink(asked.as_ref(), &dir.join(&name)) {
                 // Set before any request is served, so never missing here
                 if let Some(notifier) = state.notifier.get() {
                     let _ = notifier.inval_entry(INodeNo(folder), &name);
@@ -908,6 +903,43 @@ impl State {
         was
     }
 
+    /// What is left to do about dropped name `rel` once the child was asked to unlink it (`asked`; None: no child to
+    /// ask). Whether the kernel's entry must still be dropped from here.
+    fn after_unlink(&self, asked: Option<&std::io::Result<bool>>, rel: &Path) -> bool {
+        match asked {
+            Some(Ok(true)) => false,
+            // It couldn't: the name went meanwhile (expired while the child waited behind a slow rename, or unlinked by
+            // someone else), or the folder wasn't the mount's. The name goes, and the kernel's entry expires of itself:
+            // dropping it from here would wait on the folder's lock in the helper, which a stop can't interrupt (#247)
+            Some(Ok(false)) => {
+                self.take_gone(rel);
+                false
+            }
+            // No child to ask, or none any more: the name goes, and the kernel's entry with it
+            Some(Err(_)) | None => {
+                self.take_gone(rel);
+                true
+            }
+        }
+    }
+
+    /// An unlink or rmdir by process `pid` answered here, without the daemon: in the trash folder, of the volume info,
+    /// or by the unlinker anywhere else, which it never has any business in. None for one the daemon carries out.
+    fn remove_here(&self, rel: &Path, removal: Removal, pid: u32) -> Option<Result<(), Errno>> {
+        if self.is_trash_path(rel) {
+            return Some(self.remove_in_trash(rel, removal, pid));
+        }
+        if is_volume_info(rel) || self.is_unlinker(pid) {
+            return Some(Err(Errno::EPERM));
+        }
+        None
+    }
+
+    /// Whether process `pid` is the unlinker child (see unlinker.rs).
+    fn is_unlinker(&self, pid: u32) -> bool {
+        pid != 0 && self.unlinker_pid.load(Ordering::SeqCst) == pid
+    }
+
     /// An unlink or rmdir in the trash folder by process `pid`. A name the trash dropped goes (see take_gone). The
     /// unlinker's never reaches anything else: the name it was sent may have gone since (expired, or unlinked by
     /// someone else), and a new .trashinfo taken it. Anyone else's goes as it always has.
@@ -915,7 +947,7 @@ impl State {
         if self.take_gone(rel) {
             return Ok(());
         }
-        if pid != 0 && self.unlinker_pid.load(Ordering::SeqCst) == pid {
+        if self.is_unlinker(pid) {
             return Err(Errno::ENOENT);
         }
         match (removal, self.trash.info_name(rel)) {
@@ -1160,16 +1192,11 @@ impl Filesystem for DriveFs {
         if listing::is_hidden_name(name) {
             return reply.error(Errno::ENOENT);
         }
-        if s.is_trash_path(&rel) {
-            return match s.remove_in_trash(&rel, Removal::Unlink, req.pid()) {
-                Ok(()) => reply.ok(),
-                Err(errno) => reply.error(errno),
-            };
+        match s.remove_here(&rel, Removal::Unlink, req.pid()) {
+            Some(Ok(())) => reply.ok(),
+            Some(Err(errno)) => reply.error(errno),
+            None => s.delete(rel, Removal::Unlink, reply),
         }
-        if is_volume_info(&rel) {
-            return reply.error(Errno::EPERM);
-        }
-        s.delete(rel, Removal::Unlink, reply);
     }
 
     fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -1179,16 +1206,11 @@ impl Filesystem for DriveFs {
         if listing::is_hidden_name(name) {
             return reply.error(Errno::ENOENT);
         }
-        if s.is_trash_path(&rel) {
-            return match s.remove_in_trash(&rel, Removal::Rmdir, req.pid()) {
-                Ok(()) => reply.ok(),
-                Err(errno) => reply.error(errno),
-            };
+        match s.remove_here(&rel, Removal::Rmdir, req.pid()) {
+            Some(Ok(())) => reply.ok(),
+            Some(Err(errno)) => reply.error(errno),
+            None => s.delete(rel, Removal::Rmdir, reply),
         }
-        if is_volume_info(&rel) {
-            return reply.error(Errno::EPERM);
-        }
-        s.delete(rel, Removal::Rmdir, reply);
     }
 
     fn rename(
@@ -1823,6 +1845,47 @@ mod tests {
         assert_eq!(s.trash.node(&info), None);
         assert_eq!(s.remove_in_trash(&files, Removal::Rmdir, 1), Err(Errno::EPERM));
         assert_eq!(s.remove_in_trash(&files.join("z"), Removal::Unlink, 1), Err(Errno::ENOENT));
+    }
+
+    // Dropping the kernel's entry from the helper waits on the folder's lock, which a stop can't interrupt (#247): only
+    // without a child to ask is it done. A child that couldn't unlink (the name went meanwhile) leaves it to expire
+    #[test]
+    fn only_a_missing_unlinker_leaves_the_kernels_entry_to_the_helper() {
+        let g = Gated::new("after-unlink");
+        let s = &g.drive.state;
+        let item = s.trash_files_dir().join("x");
+        let answers: [fn() -> Option<std::io::Result<bool>>; 3] =
+            [|| Some(Ok(false)), || Some(Err(std::io::ErrorKind::BrokenPipe.into())), || None];
+        for (answer, invalidate) in answers.into_iter().zip([false, true, true]) {
+            assert_eq!(s.trash.trashed(OsStr::new("x")), None);
+            let answer = answer();
+            assert_eq!(s.after_unlink(answer.as_ref(), &item), invalidate, "{answer:?}");
+            assert_eq!(s.trash.node(&item), None, "the name goes all the same: {answer:?}");
+        }
+        // Unlinked: the child's unlink took the name, and nothing is left to do
+        assert_eq!(s.trash.trashed(OsStr::new("x")), None);
+        assert!(!s.after_unlink(Some(&Ok(true)), &item));
+    }
+
+    // The unlinker only ever removes in the trash: anything else it asks is refused here, never sent to the daemon
+    #[test]
+    fn nothing_the_unlinker_removes_outside_the_trash_reaches_the_daemon() {
+        let g = Gated::new("unlinker-outside");
+        g.open();
+        let s = &g.drive.state;
+        let unlinker = 4242;
+        s.unlinker_pid.store(unlinker, Ordering::SeqCst);
+        for removal in [Removal::Unlink, Removal::Rmdir] {
+            for rel in ["a.txt", "Docs", "Docs/a.txt", VOLUME_INFO_NAME] {
+                assert_eq!(s.remove_here(Path::new(rel), removal, unlinker), Some(Err(Errno::EPERM)), "{rel}");
+            }
+            assert_eq!(s.remove_here(Path::new("a.txt"), removal, 1), None, "anyone else's goes to the daemon");
+        }
+        assert_eq!(s.remove_here(Path::new(VOLUME_INFO_NAME), Removal::Unlink, 1), Some(Err(Errno::EPERM)));
+        assert_eq!(s.trash.trashed(OsStr::new("x")), None);
+        let item = s.trash_files_dir().join("x");
+        assert_eq!(s.remove_here(&item, Removal::Unlink, unlinker), Some(Ok(())), "a dropped name, in the trash");
+        assert_eq!(g.listings.load(Ordering::SeqCst), 0, "nothing reached the daemon");
     }
 
     #[test]

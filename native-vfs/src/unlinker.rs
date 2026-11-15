@@ -18,11 +18,14 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// How the helper runs as the unlinker: `protondrive-vfs --trash-unlinker <the helper's pid>`
 pub const SUBCOMMAND: &str = "--trash-unlinker";
 /// More than any path the kernel takes
 const FIELD_MAX: usize = 64 * 1024;
+/// How long a child that stopped answering gets to be gone, once killed
+const REAP_WAIT: Duration = Duration::from_secs(5);
 
 /// An unlink of `name` in folder `dir`, which must be on device `dev` and have number `folder`.
 #[derive(Debug, PartialEq)]
@@ -91,14 +94,13 @@ impl Unlinker {
     /// Starts the child: the helper's own executable, as it is running even if replaced since. Before the session opens
     /// /dev/fuse, so that the child never holds it.
     pub fn start() -> io::Result<Unlinker> {
-        let mut child = Command::new("/proc/self/exe")
-            .arg0("protondrive-vfs")
-            .arg(SUBCOMMAND)
-            .arg(std::process::id().to_string())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .current_dir("/")
-            .spawn()?;
+        let mut command = Command::new("/proc/self/exe");
+        command.arg0("protondrive-vfs").arg(SUBCOMMAND).arg(std::process::id().to_string()).current_dir("/");
+        Unlinker::spawn(&mut command)
+    }
+
+    fn spawn(command: &mut Command) -> io::Result<Unlinker> {
+        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
         let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
             let _ = child.kill();
             return Err(io::Error::other("no pipes to the child"));
@@ -118,11 +120,15 @@ impl Unlinker {
         Ok(answer[0] == 1)
     }
 
-    /// Done with a child that stopped answering: it is killed if it isn't gone yet, and reaped if it is, never waited
-    /// for (it may be stuck in an unlink).
+    /// Done with a child that stopped answering. Its pipes are closed, so it is on its way out if not gone, and never
+    /// in an unlink: it is killed all the same, and reaped, so it doesn't stay a zombie under its pid. Waited for, but
+    /// not forever.
     pub fn end(mut self) {
         let _ = self.child.kill();
-        let _ = self.child.try_wait();
+        let started = Instant::now();
+        while matches!(self.child.try_wait(), Ok(None)) && started.elapsed() < REAP_WAIT {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -208,6 +214,18 @@ mod tests {
         assert_eq!((code, answers), (0, vec![1, 0]));
         let mut answers = Vec::new();
         assert_eq!(serve_on(&mut &[1u8, 2, 3][..], &mut answers, |_| true), 1, "garbage ends it");
+    }
+
+    // A child that stopped answering is reaped once done with: never left a zombie, which would keep its pid taken
+    #[test]
+    fn a_child_done_with_is_reaped() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec >&-; exec sleep 5"]);
+        let mut unlinker = Unlinker::spawn(&mut command).unwrap();
+        let pid = unlinker.pid() as i32;
+        assert!(unlinker.unlink(1, 2, Path::new("/d"), OsStr::new("x")).is_err(), "it never answers");
+        unlinker.end();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "the child is still there, if only as a zombie");
     }
 
     #[test]
