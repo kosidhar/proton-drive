@@ -542,8 +542,10 @@ export async function startSyncDaemon(options: {
                         if (!entry) return { refused: 'Not uploaded yet: Proton Drive can share it once it has uploaded' };
                         return { uid: entry.uid, name: entry.name };
                     },
-                    // Wired in Task 3 of the Shared page (#253), with GET /share/list
-                    placeOf: () => null,
+                    placeOf: (uid) => {
+                        const entry = engine.remoteIndex.getByUid(uid);
+                        return entry ? { relPath: entry.relPath, hidden: Boolean(engine.availability.hiddenBy(entry.relPath)) } : null;
+                    },
                     logActivity: (entry) => stateDb.logActivity(entry),
                     now: Date.now,
                 }),
