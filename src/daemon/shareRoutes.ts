@@ -18,6 +18,11 @@ function pathOf(value: unknown): string {
     return value;
 }
 
+function uidOf(value: unknown): string {
+    if (typeof value !== 'string' || value === '') throw new BadRequest('uid must be the uid of the listed item');
+    return value;
+}
+
 function roleOf(value: unknown): ShareRole {
     if (value !== 'viewer' && value !== 'editor') throw new BadRequest('role must be viewer or editor');
     return value;
@@ -77,7 +82,14 @@ const ROUTES: Record<string, Partial<Record<string, Handler>>> = {
     // The list stops once the app hangs up: Bun aborts the request's signal then. It is ListCancelled, a ShareError, so
     // 400 Cancelled for no one to read, and nothing logged
     '/share/list': { GET: async (s, r) => ({ items: await s.list(r.signal) }) },
-    '/share/all': { DELETE: async (s, r) => s.stopSharing(pathOf((await bodyOf(r)).path)) },
+    // The uid is the one the list gave the item: the daemon refuses when the path is no longer that item (#260)
+    '/share/all': {
+        DELETE: async (s, r) => {
+            const body = await bodyOf(r);
+            const path = pathOf(body.path);
+            return s.stopSharing(path, uidOf(body.uid));
+        },
+    },
     '/share/info': { GET: (s, _r, url) => s.info(pathOf(url.searchParams.get('path'))) },
     '/share/password': {
         GET: async (s, _r, url) => ({ password: await s.password(pathOf(url.searchParams.get('path'))) }),

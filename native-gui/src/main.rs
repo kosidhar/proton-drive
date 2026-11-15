@@ -869,7 +869,7 @@ enum PendingConfirm {
     /// Start fresh with the account signed in to: the files on this computer sync to it as new files (#35)
     StartFresh,
     /// Stop all sharing of an item of the Shared page: `question` is what it asks, naming what is lost (#253)
-    StopSharing { rel_path: String, question: String },
+    StopSharing { rel_path: String, uid: String, question: String },
 }
 
 /// What a confirmation dialog says, and what its button asks the daemon to do to which path.
@@ -1003,7 +1003,7 @@ enum WorkerCommand {
     /// What is shared, for the Shared section (a read, over the control socket)
     SharedLoad { seq: u64 },
     /// Stop all sharing of the item at `rel_path` (DELETE /share/all)
-    SharedStop { rel_path: String },
+    SharedStop { rel_path: String, uid: String },
     /// The Share window (#216), each over the control socket for the item at `rel_path` (inside My files), and
     /// answered to the `window` that asked: how it is shared (a read)
     ShareLoad { window: share::WindowId, rel_path: String },
@@ -2214,7 +2214,7 @@ impl ProtonDriveNativeApp {
             SharedAction::Stop => {
                 if let Some(rel_path) = item.rel_path.clone().filter(|_| self.shared.stopping.is_none()) {
                     let question = shared::stop_question(&item, home::now_ms());
-                    self.pending_confirm = Some(PendingConfirm::StopSharing { rel_path, question });
+                    self.pending_confirm = Some(PendingConfirm::StopSharing { rel_path, uid: item.uid.clone(), question });
                 }
             }
         }
@@ -2697,10 +2697,10 @@ impl ProtonDriveNativeApp {
                                     PendingConfirm::DeleteMissing { root, names, .. } => {
                                         self.resolve_files_missing(MissingChoice::DeleteInCloud, root.clone(), names.clone());
                                     }
-                                    PendingConfirm::StopSharing { rel_path, .. } => {
+                                    PendingConfirm::StopSharing { rel_path, uid, .. } => {
                                         self.shared.stopping = Some(rel_path.clone());
                                         self.shared.stop_error = None;
-                                        let _ = self.tx.send(WorkerCommand::SharedStop { rel_path: rel_path.clone() });
+                                        let _ = self.tx.send(WorkerCommand::SharedStop { rel_path: rel_path.clone(), uid: uid.clone() });
                                     }
                                     PendingConfirm::StartFresh => {
                                         self.start_fresh_working = true;
@@ -4236,8 +4236,8 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
             WorkerCommand::SharedLoad { seq } => {
                 off_thread(&tx, &ctx, move || WorkerEvent::SharedLoaded(seq, share::list_at(&control_socket_path())))
             }
-            WorkerCommand::SharedStop { rel_path } => off_thread(&tx, &ctx, move || {
-                let result = share::stop_sharing_at(&control_socket_path(), &rel_path);
+            WorkerCommand::SharedStop { rel_path, uid } => off_thread(&tx, &ctx, move || {
+                let result = share::stop_sharing_at(&control_socket_path(), &rel_path, &uid);
                 WorkerEvent::SharedStopped(rel_path, result)
             }),
             WorkerCommand::ShareLoad { window, rel_path } => off_thread(&tx, &ctx, move || {
@@ -4712,7 +4712,7 @@ fn main() -> eframe::Result {
                     app.shared.loaded(seq, fake_shared.unwrap_or_else(|| Ok(Vec::new())));
                     if let (Some(name), Some(items)) = (&cli_confirm_stop_sharing, &app.shared.items) {
                         app.pending_confirm = items.iter().find(|i| &i.name == name && i.unreadable.is_none()).and_then(|i| {
-                            Some(PendingConfirm::StopSharing { rel_path: i.rel_path.clone()?, question: shared::stop_question(i, home::now_ms()) })
+                            Some(PendingConfirm::StopSharing { rel_path: i.rel_path.clone()?, uid: i.uid.clone(), question: shared::stop_question(i, home::now_ms()) })
                         });
                     }
                 }
@@ -5374,7 +5374,7 @@ mod tests {
                     WorkerCommand::StartLogin => Some("sign in".to_string()),
                     WorkerCommand::StartFresh => Some("start fresh".to_string()),
                     WorkerCommand::SharedLoad { .. } => Some("shared list".to_string()),
-                    WorkerCommand::SharedStop { rel_path } => Some(format!("stop sharing {rel_path:?}")),
+                    WorkerCommand::SharedStop { rel_path, uid } => Some(format!("stop sharing {rel_path:?} {uid}")),
                     WorkerCommand::Logout => Some("sign out".to_string()),
                     WorkerCommand::ShareLoad { rel_path, .. } => Some(format!("share info {rel_path}")),
                     WorkerCommand::SharePassword { rel_path, .. } => Some(format!("share password {rel_path}")),
@@ -5567,10 +5567,10 @@ mod tests {
     #[test]
     fn confirming_stop_sharing_sends_only_the_stop_for_that_item() {
         let h = confirm_and_click(
-            PendingConfirm::StopSharing { rel_path: "Documents/report.pdf".into(), question: "Stop sharing report.pdf?".into() },
+            PendingConfirm::StopSharing { rel_path: "Documents/report.pdf".into(), uid: "vol~report".into(), question: "Stop sharing report.pdf?".into() },
             "Stop sharing",
         );
-        assert_eq!(h.sent(), vec![r#"stop sharing "Documents/report.pdf""#.to_string()]);
+        assert_eq!(h.sent(), vec![r#"stop sharing "Documents/report.pdf" vol~report"#.to_string()]);
         assert_eq!(h.app.shared.stopping.as_deref(), Some("Documents/report.pdf"));
         assert!(h.app.working.is_empty());
     }
@@ -5793,11 +5793,12 @@ mod tests {
 
     #[test]
     fn the_shared_list_and_stop_sharing_go_over_the_control_socket() {
-        let reply: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"items\":[{\"name\":\"a.txt\",\"relPath\":\"a.txt\",\"where\":\"my-files\",\"link\":null,\"people\":1}]}";
+        let reply: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"items\":[{\"uid\":\"vol~a\",\"name\":\"a.txt\",\"relPath\":\"a.txt\",\"where\":\"my-files\",\"link\":null,\"people\":1}]}";
         let (sock, server) = serve_once(reply);
         let items = share::list_at(&sock).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "a.txt");
+        assert_eq!(items[0].uid, "vol~a");
         assert!(server.join().unwrap().starts_with("GET /share/list HTTP/1.1\r\n"));
         let _ = std::fs::remove_file(&sock);
 
@@ -5808,10 +5809,10 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
 
         let (sock, server) = serve_once(b"HTTP/1.1 200 OK\r\n\r\n{\"link\":null,\"people\":[]}");
-        share::stop_sharing_at(&sock, "Docs/a b.txt").unwrap();
+        share::stop_sharing_at(&sock, "Docs/a b.txt", "vol~n1").unwrap();
         let request = server.join().unwrap();
         assert!(request.starts_with("DELETE /share/all HTTP/1.1\r\n"), "{request}");
-        assert!(request.ends_with(r#"{"path":"Docs/a b.txt"}"#), "{request}");
+        assert!(request.ends_with(r#"{"path":"Docs/a b.txt","uid":"vol~n1"}"#), "{request}");
         let _ = std::fs::remove_file(&sock);
     }
 
@@ -5822,7 +5823,7 @@ mod tests {
         server.join().unwrap();
         let _ = std::fs::remove_file(&sock);
         let (sock, server) = serve_once(b"HTTP/1.1 404 Not Found\r\n\r\n");
-        assert_eq!(share::stop_sharing_at(&sock, "a").unwrap_err(), share::SHARE_NEEDS_RESTART);
+        assert_eq!(share::stop_sharing_at(&sock, "a", "u").unwrap_err(), share::SHARE_NEEDS_RESTART);
         server.join().unwrap();
         let _ = std::fs::remove_file(&sock);
     }
@@ -6629,7 +6630,7 @@ mod tests {
             WorkerCommand::ShareLoad { window, rel_path: "a.pdf".into() },
             // The Shared section's read and its Stop sharing (#253)
             WorkerCommand::SharedLoad { seq: 1 },
-            WorkerCommand::SharedStop { rel_path: "a.pdf".into() },
+            WorkerCommand::SharedStop { rel_path: "a.pdf".into(), uid: "vol~a".into() },
             WorkerCommand::SharePassword { window, rel_path: "a.pdf".into() },
             WorkerCommand::ShareEnsureLink { window, rel_path: "a.pdf".into() },
             WorkerCommand::ShareSettings { window, rel_path: "a.pdf".into(), password: Some(None), expires_at: None },
@@ -6931,14 +6932,14 @@ mod tests {
         let mut h = shared_with_rows();
         let item = shared_rows().remove(0);
         h.click(on_row(&h, "report.pdf", "Stop sharing"));
-        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::StopSharing { rel_path: "Documents/report.pdf".into(), question: shared::stop_question(&item, home::now_ms()) }));
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::StopSharing { rel_path: "Documents/report.pdf".into(), uid: item.uid.clone(), question: shared::stop_question(&item, home::now_ms()) }));
         h.frames(2);
         assert!(h.text_at("Stop sharing?").is_some());
         assert!(h.text_at(&shared::stop_question(&item, home::now_ms())).is_some());
         assert_eq!(h.sent(), Vec::<String>::new());
         let button = *h.text_at_all("Stop sharing").last().unwrap();
         h.click(button);
-        assert_eq!(h.sent(), ["stop sharing \"Documents/report.pdf\""]);
+        assert_eq!(h.sent(), [format!("stop sharing \"Documents/report.pdf\" {}", item.uid)]);
         assert!(h.app.pending_confirm.is_none());
         assert_eq!(h.app.shared.stopping.as_deref(), Some("Documents/report.pdf"));
         h.event(WorkerEvent::SharedStopped("Documents/report.pdf".into(), Ok(())));
@@ -7028,6 +7029,26 @@ mod tests {
         let mut h = shared_with_rows();
         h.event(WorkerEvent::SharedStopped("Documents/report.pdf".into(), Err("Proton Drive is offline".into())));
         assert_eq!(h.app.notice, None);
+    }
+
+    /// #260: the daemon refuses a stop whose item is no longer at that path, in words that reach the user as any stop error
+    #[test]
+    fn the_daemons_refusal_of_a_changed_item_shows_as_a_stop_error() {
+        const CHANGED: &str = "This item changed since the list was loaded: refresh";
+        let (sock, server) =
+            serve_once(b"HTTP/1.1 400 Bad Request\r\n\r\n{\"error\":\"This item changed since the list was loaded: refresh\"}");
+        let refusal = share::stop_sharing_at(&sock, "Documents/report.pdf", "vol~old").unwrap_err();
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+        assert_eq!(refusal, CHANGED);
+
+        let mut h = shared_with_rows();
+        h.app.shared.stopping = Some("Documents/report.pdf".into());
+        h.event(WorkerEvent::SharedStopped("Documents/report.pdf".into(), Err(refusal)));
+        h.frames(3);
+        assert_eq!(h.app.shared.stopping, None);
+        assert!(h.text_at(CHANGED).is_some());
+        assert!(h.text_at("report.pdf").is_some(), "the list stays, for Refresh");
     }
 
     #[test]
