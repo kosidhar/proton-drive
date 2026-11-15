@@ -18,6 +18,8 @@ pub enum Place {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SharedItem {
+    /// The node uid the daemon listed: stopping sharing sends it, so it acts on this item and not on what is at its path later (#260)
+    pub uid: String,
     pub name: String,
     /// Where it is in the Proton Drive folder; None for an item not on this computer
     pub rel_path: Option<String>,
@@ -120,6 +122,7 @@ pub fn fake_shared(state: &str, now_ms: i64) -> Option<Result<Vec<SharedItem>, S
         role: Role::Viewer,
     };
     let item = |name: &str, rel_path: Option<&str>, place, link, people| SharedItem {
+        uid: format!("fake~{name}"),
         name: name.into(),
         rel_path: rel_path.map(String::from),
         place,
@@ -164,17 +167,17 @@ mod tests {
     }
 
     fn item(name: &str, rel_path: Option<&str>, place: Place, link: Option<ShareLink>, people: u32) -> SharedItem {
-        SharedItem { name: name.into(), rel_path: rel_path.map(String::from), place, link, people, unreadable: None }
+        SharedItem { uid: format!("vol~{name}"), name: name.into(), rel_path: rel_path.map(String::from), place, link, people, unreadable: None }
     }
 
     #[test]
     fn a_list_reply_is_read_each_kind_of_item() {
         let json = r#"{ "items": [
-            { "name": "report.pdf", "relPath": "Documents/report.pdf", "where": "my-files",
+            { "uid": "v~1", "name": "report.pdf", "relPath": "Documents/report.pdf", "where": "my-files",
               "link": { "url": "https://drive.proton.me/urls/A#a", "hasPassword": true, "expiresAt": 1800000000000, "role": "viewer" }, "people": 2 },
-            { "name": "Secret", "relPath": "Secret", "where": "hidden", "link": null, "people": 1 },
-            { "name": "holiday.jpg", "relPath": null, "where": "elsewhere", "link": null, "people": 0 },
-            { "name": "x", "relPath": "x", "where": "my-files", "link": null, "people": 0, "unreadable": "Still catching up" }
+            { "uid": "v~2", "name": "Secret", "relPath": "Secret", "where": "hidden", "link": null, "people": 1 },
+            { "uid": "v~3", "name": "holiday.jpg", "relPath": null, "where": "elsewhere", "link": null, "people": 0 },
+            { "uid": "v~4", "name": "x", "relPath": "x", "where": "my-files", "link": null, "people": 0, "unreadable": "Still catching up" }
         ] }"#;
         #[derive(Deserialize)]
         struct Reply {
@@ -182,6 +185,7 @@ mod tests {
         }
         let items = serde_json::from_str::<Reply>(json).unwrap().items;
         assert_eq!(items.len(), 4);
+        assert_eq!(items.iter().map(|i| i.uid.as_str()).collect::<Vec<_>>(), ["v~1", "v~2", "v~3", "v~4"]);
         assert_eq!(items[0].place, Place::MyFiles);
         assert_eq!(items[0].link.as_ref().unwrap().expires_at, Some(1_800_000_000_000));
         assert_eq!(items[1].place, Place::Hidden);

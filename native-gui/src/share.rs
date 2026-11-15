@@ -342,9 +342,10 @@ pub fn list_at(socket: &Path) -> Result<Vec<crate::shared::SharedItem>, String> 
     serde_json::from_value::<Reply>(reply).map(|r| r.items).map_err(|_| UNREADABLE.to_string())
 }
 
-/// Stops all sharing of an item: its link and everyone invited (DELETE /share/all).
-pub fn stop_sharing_at(socket: &Path, rel_path: &str) -> Result<(), String> {
-    share_change(socket, "DELETE", "/share/all", serde_json::json!({ "path": rel_path }))
+/// Stops all sharing of an item: its link and everyone invited (DELETE /share/all). `uid` is the one the list gave the
+/// item: the daemon refuses when the path no longer holds that item (#260).
+pub fn stop_sharing_at(socket: &Path, rel_path: &str, uid: &str) -> Result<(), String> {
+    share_change(socket, "DELETE", "/share/all", serde_json::json!({ "path": rel_path, "uid": uid }))
 }
 
 /// Screenshot-only: `--fake-share <state>`, how the item is shared in each state the window shows (none, a link, a link

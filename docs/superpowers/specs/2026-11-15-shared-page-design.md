@@ -56,7 +56,9 @@ It answers `{ items: [...] }`.
     deprecated and asks the API each time, unlike `iterateSharedNodes`, which reads the SDK's cache.
   - It loads those nodes (`iterateNodes`) and reads each one's sharing with `getSharingInfo`, a few at a time.
 - **Each item** is
-  `{ name, relPath | null, where: "my-files" | "hidden" | "elsewhere", link: { url, hasPassword, expiresAt | null, role } | null, people: number }`.
+  `{ uid, name, relPath | null, where: "my-files" | "hidden" | "elsewhere", link: { url, hasPassword, expiresAt | null, role } | null, people: number }`.
+  - **`uid`** is the node uid the server listed (for an item that can't be found or loaded, the uid it failed on). It is
+    always present. Stopping sharing sends it back, so the stop acts on this item (#260).
   - **`relPath`** is the item's path in My files, from the remote index by uid (`getByUid`). It is null when the index
     doesn't have the item.
   - **`where`** says what the app can do with the item:
@@ -80,11 +82,14 @@ It answers `{ items: [...] }`.
 - **Logging:** nothing goes to the log or the activity history for a read. Log lines never include link URLs or anyone's
   address.
 
-### Daemon: `DELETE /share/all {path}` (stop sharing)
+### Daemon: `DELETE /share/all {path, uid}` (stop sharing)
 
 - It removes the item's sharing completely, the link and everyone at once: `unshareNode(uid)` with no settings deletes
   the share.
-- It refuses what the other share routes refuse: not uploaded, hidden.
+- `uid` is required, the uid the list gave the item (a missing or empty one is a 400). The path is resolved as for the
+  other share routes, and refuses what they refuse: not uploaded, hidden. When the node at the path is not `uid` (the
+  item moved and another took its path since the list loaded), it refuses with "This item changed since the list was
+  loaded: refresh", calling nothing and logging nothing (#260). The Share window's routes stay path-based.
 - It writes an activity entry: "Stopped sharing report.pdf".
 - A share already deleted elsewhere (the SDK answers `NotFoundAPIError`) counts as stopped: it succeeds, with no
   activity entry.
