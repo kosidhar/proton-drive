@@ -2132,19 +2132,28 @@ impl ProtonDriveNativeApp {
                                     let label = button.label();
                                     // One stop at a time: the other rows' Stop sharing wait for the answer
                                     let can = *button != SharedAction::Stop || stopping.is_none();
-                                    if ui.add_enabled_ui(can, |ui| proton_button(
-                                        ui,
-                                        Vec2::new(button_width(ui, label), 28.0),
-                                        label,
-                                        BG_CARD_ALT(),
-                                        btn_secondary_hover_bg(),
-                                        Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                                        TEXT_PRIMARY(),
-                                        13.0,
-                                    ))
-                                    .inner
-                                    .clicked()
-                                    {
+                                    // Each button gets its space from this row's layout (a child area from
+                                    // `add_enabled_ui` alone starts at the cursor and never wraps, #262)
+                                    let size = Vec2::new(button_width(ui, label), 28.0);
+                                    let clicked = ui
+                                        .allocate_ui(size, |ui| {
+                                            ui.add_enabled_ui(can, |ui| {
+                                                proton_button(
+                                                    ui,
+                                                    size,
+                                                    label,
+                                                    BG_CARD_ALT(),
+                                                    btn_secondary_hover_bg(),
+                                                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                                                    TEXT_PRIMARY(),
+                                                    13.0,
+                                                )
+                                            })
+                                            .inner
+                                        })
+                                        .inner
+                                        .clicked();
+                                    if clicked {
                                         act = Some((*button, i));
                                     }
                                 }
@@ -5115,6 +5124,8 @@ mod tests {
         /// What the worker would answer, handled by `ProtonDriveNativeApp::process_worker_events`
         events: Sender<WorkerEvent>,
         last: Option<egui::FullOutput>,
+        /// The window's size in points (the real window's size divided by the zoom)
+        screen: Vec2,
     }
 
     /// Held by the tests that set the single-instance request statics, which every test of the app shares
@@ -5190,7 +5201,7 @@ mod tests {
             let ctx = egui::Context::default();
             configure_proton_theme(&ctx);
             apply_proton_visuals(&ctx, false);
-            let mut h = Self { ctx, app, commands, events, last: None };
+            let mut h = Self { ctx, app, commands, events, last: None, screen: Vec2::new(1440.0, 900.0) };
             h.frames(3);
             h
         }
@@ -5218,12 +5229,35 @@ mod tests {
 
         fn frame(&mut self, events: Vec<egui::Event>) {
             let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1440.0, 900.0))),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.screen)),
                 events,
                 ..Default::default()
             };
             let app = &mut self.app;
             self.last = Some(self.ctx.run(input, |ctx| app.render_ui(ctx)));
+        }
+
+        /// The window at `size` (as the OS sees it) with the keyboard zoom at `zoom`: egui then has `size / zoom` points.
+        fn resize_zoomed(&mut self, size: Vec2, zoom: f32) {
+            self.ctx.set_zoom_factor(zoom);
+            self.screen = size / zoom;
+            self.frames(3);
+        }
+
+        /// The rectangles the last frame painted with this fill.
+        fn rects_filled(&self, fill: Color32) -> Vec<egui::Rect> {
+            fn rects(shape: &egui::Shape, fill: Color32, out: &mut Vec<egui::Rect>) {
+                match shape {
+                    egui::Shape::Rect(r) if r.fill == fill => out.push(r.rect),
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| rects(s, fill, out)),
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for clipped in self.last.iter().flat_map(|o| o.shapes.iter()) {
+                rects(&clipped.shape, fill, &mut out);
+            }
+            out
         }
 
         fn frames(&mut self, n: usize) {
@@ -6895,6 +6929,43 @@ mod tests {
         // the row's other buttons still work
         h.click(on_row(&h, "Icons", "Manage…"));
         assert!(h.app.share.is_some());
+    }
+
+    /// #262: the greyed-out look of a Stop sharing that has to wait, not only that it doesn't answer a click
+    #[test]
+    fn another_rows_stop_sharing_looks_greyed_out_while_a_stop_is_out() {
+        let mut h = shared_with_rows();
+        let enabled = h.fill_under(on_row(&h, "Icons", "Stop sharing")).expect("Stop sharing has a fill");
+        h.app.shared.stopping = Some("Documents/report.pdf".into());
+        h.frames(2);
+        let disabled = h.fill_under(on_row(&h, "Icons", "Stop sharing")).expect("Stop sharing has a fill");
+        assert_ne!(disabled, enabled, "the waiting button is painted differently");
+        // the row's other buttons keep their look
+        assert_eq!(h.fill_under(on_row(&h, "Icons", "Manage…")), Some(BG_CARD_ALT()));
+    }
+
+    /// #262: at the narrowest window with the keyboard zoom up, a row's buttons wrap instead of running past the card
+    #[test]
+    fn a_rows_buttons_wrap_inside_the_card_when_narrow_and_zoomed() {
+        let mut h = shared_with_rows();
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
+        let name = h.text_at("report.pdf").unwrap();
+        let card = h.rects_filled(BG_CARD()).into_iter().filter(|r| r.contains(name)).max_by(|a, b| a.width().total_cmp(&b.width())).expect("the card");
+        assert!(card.right() <= h.screen.x, "the card {card:?} fits the window {:?}", h.screen);
+        let labels = ["Copy link", "Manage…", "Show in Files", "Stop sharing"];
+        assert_eq!(row_buttons(&h, "report.pdf"), labels);
+        let mut ys = Vec::new();
+        for label in labels {
+            let at = on_row(&h, "report.pdf", label);
+            let half = button_width_of(&h, label) / 2.0;
+            assert!(at.x + half <= card.right(), "{label:?} runs to {} past the card's edge {}", at.x + half, card.right());
+            ys.push(at.y);
+        }
+        assert!(ys.last() > ys.first(), "the last button went to a new line: {ys:?}");
+    }
+
+    fn button_width_of(h: &Harness, label: &str) -> f32 {
+        h.ctx.fonts(|f| f.layout_no_wrap(label.into(), FontId::proportional(13.0), Color32::WHITE).size().x) + 32.0
     }
 
     #[test]
