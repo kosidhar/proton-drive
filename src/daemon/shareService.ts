@@ -59,14 +59,34 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
         return node;
     };
 
+    // One operation at a time on each item (by its node): an operation reads the item's sharing and then writes it whole
+    // (setLinkSettings sends every setting of the link), so two at once would undo one another's change. Different items
+    // run side by side, and an operation that fails lets the next one go.
+    const queues = new Map<string, Promise<void>>();
+    async function oneAtATime<T>(uid: string, op: () => Promise<T>): Promise<T> {
+        const result = (queues.get(uid) ?? Promise.resolve()).then(op);
+        const settled = result.then(
+            () => undefined,
+            () => undefined,
+        );
+        queues.set(uid, settled);
+        try {
+            return await result;
+        } finally {
+            if (queues.get(uid) === settled) queues.delete(uid);
+        }
+    }
+
     // Runs one operation on one item: a refusal or an SDK failure becomes a ShareError, and nothing is logged for it
     async function run<T>(path: string, op: (node: { uid: string; name: string }) => Promise<T>): Promise<T> {
         const node = resolve(path);
-        try {
-            return await op(node);
-        } catch (e) {
-            throw plainError(e);
-        }
+        return oneAtATime(node.uid, async () => {
+            try {
+                return await op(node);
+            } catch (e) {
+                throw plainError(e);
+            }
+        });
     }
 
     // The address as the item's list has it: acting on someone not on it would send a new invitation (or do nothing)
@@ -114,7 +134,13 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
 
         async ensureLink(path) {
             return run(path, async (n) => {
-                const existing = (await sdk.getSharingInfo(n.uid))?.urlAccess;
+                // "No link" may be stale: the SDK keeps nodes in a cache on disk, and learns of a share made elsewhere (the web
+                // app, another device) only from its events. Asked for a link then, shareNode finds that the share exists,
+                // refreshes the node, and UPDATES the link it finds with the settings given, which replace the link's own
+                // (updateSharedLink): the role alone would clear its password and expiry. So shareNode is asked first for
+                // nothing at all: it finds the item's share the same way (or makes an empty one, which the link below then
+                // uses) and answers its real state, without writing to a link. A link found then is returned as it is.
+                const existing = (await sdk.getSharingInfo(n.uid))?.urlAccess ?? (await sdk.shareNode(n.uid, {})).urlAccess;
                 if (existing) return { url: existing.url, created: false };
                 const made = await sdk.shareNode(n.uid, { urlAccess: { role: MemberRole.Viewer } });
                 if (!made.urlAccess) throw new Error('no link was made');
