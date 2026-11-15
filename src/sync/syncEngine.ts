@@ -5421,6 +5421,9 @@ export class ProtonDriveSyncEngine {
         if (!node || node.trashTime) {
             return this.afterMoveSourceGone(op);
         }
+        if (this.trashFollows(op)) {
+            return this.renameBeforeTrash(op, node);
+        }
         const parentRel = parentOf(op.toPath);
         const parentUid = this.resolveFolderUid(parentRel);
         if (parentUid === null) {
@@ -5445,11 +5448,13 @@ export class ProtonDriveSyncEngine {
             }
             return 'again'; // Looked at afresh: a rename here meanwhile may have moved where it goes
         }
+        // Deleted here while this runs (a trash of it follows now), the item takes no conflict name, which the user never
+        // gave it, and a refusal of it isn't told: given up on (see replayFailed), it goes to the trash as Proton Drive has it
         let placedAs: string;
         try {
-            placedAs = await this.placeNode(node, parentUid, op.toPath);
+            placedAs = await this.placeNode(node, parentUid, op.toPath, () => !this.trashFollows(op));
         } catch (error: unknown) {
-            if (error instanceof ValidationError && !(error instanceof NodeWithSameNameExistsValidationError)) {
+            if (error instanceof ValidationError && !(error instanceof NodeWithSameNameExistsValidationError) && !this.trashFollows(op)) {
                 const gone = await this.isGoneFromCloud(op.nodeUid);
                 if (gone === true) {
                     return this.afterMoveSourceGone(op);
@@ -5507,9 +5512,43 @@ export class ProtonDriveSyncEngine {
         });
     }
 
-    // A later operation on the same item decides where it ends up, or trashes it: an earlier one has nothing left to do
+    // A later rename or move of the same item decides where it ends up: an earlier one has nothing left to do. A later
+    // trash doesn't: the new name goes first, so the item is in the Proton Drive trash under the name the user last gave
+    // it (#234, see renameBeforeTrash).
     private isSuperseded(op: RemoteOp): boolean {
-        return this.journal.hasLaterOn(op.id, op.nodeUid);
+        return this.journal.hasLaterOn(op.id, op.nodeUid, 'moves');
+    }
+
+    // Whether a trash of the item follows a rename or move of it
+    private trashFollows(op: RemoteOp): boolean {
+        return op.kind !== 'trash' && this.journal.hasLaterOn(op.id, op.nodeUid, 'trash');
+    }
+
+    // A rename or move of an item deleted here since (a trash of it follows) brings Proton Drive only its new name, in the
+    // folder Proton Drive has it in, so it goes to the trash under the name the user last gave it (#234). It is never
+    // moved into another folder first, where it would be seen (by those the folder is shared with, say) until its trash
+    // lands, which the network can hold up for long; nor is a folder made for it. A move alone has nothing left to do,
+    // and a name taken there gives no conflict name: the refusal gives the rename up (see replayFailed).
+    private async renameBeforeTrash(op: Exclude<RemoteOp, { kind: 'trash' }>, node: NodeEntity): Promise<'next' | 'stop'> {
+        const name = path.posix.basename(op.toPath);
+        if (getName(node) === name) {
+            this.journal.complete(op.id);
+            return 'next';
+        }
+        try {
+            await this.sdk.renameNode(node.uid, name);
+        } catch (error: unknown) {
+            return this.replayFailed(op, op.toPath, error);
+        }
+        // What follows names the item where Proton Drive has it now: in its folder there, under its new name
+        const at = this.journal.cloudPathOf(op.id);
+        this.stateDb.connection.transaction(() => {
+            if (at !== null) {
+                this.journal.setCloudPathAfter(op.id, op.nodeUid, joinRel(parentOf(at), name));
+            }
+            this.journal.complete(op.id);
+        })();
+        return 'next';
     }
 
     // A failed operation stays pending and replay stops, keeping the order; one that keeps failing for a reason that
@@ -5520,6 +5559,11 @@ export class ProtonDriveSyncEngine {
     // 2xxx family, which an outage or an expired session can answer with, only after GIVE_UP_UNMAPPED_AFTER_MS of
     // failing in a row (MIN_UNMAPPED_FAILURES times at least), tried again with backoff meanwhile; a failure of any other
     // kind ends that run. Network failures, 5xx, 401 and rate limits are never given up on.
+    // A rename that a trash of the item follows (see renameBeforeTrash) keeps the order only for the network, an aborted
+    // request, or a server error a later try may get past (a 5xx, 401, 408 or 429, a rate limit). Any other failure gives
+    // it up at once, so the trash isn't held up for a name (#234): a permanent refusal, a name taken there, and an API
+    // code outside the 2xxx family too, though an outage can answer with one. The item goes to the trash under the name
+    // Proton Drive has, as it was deleted here anyway. Only noted in the activity: there is nothing for the user to do.
     private async replayFailed(op: RemoteOp, where: string, error: unknown): Promise<'next' | 'stop'> {
         const message = messageOf(error);
         const now = Date.now();
@@ -5528,6 +5572,18 @@ export class ProtonDriveSyncEngine {
             this.logger.warn(`Could not apply a change to ${where} in Proton Drive yet; trying again later: ${message}`);
             return 'stop';
         };
+        if (this.trashFollows(op)) {
+            if (isTransient(error) && !permanentRefusal(error) && !unmappedApiCode(error)) {
+                return keep();
+            }
+            this.journal.complete(op.id);
+            this.stateDb.logActivity({
+                action: 'sync',
+                localRelPath: where,
+                details: `Not renamed or moved in Proton Drive before going to its trash: ${message}`,
+            });
+            return 'next';
+        }
         if (permanentRefusal(error)) {
             if (op.attempts + 1 < MAX_PERMANENT_REFUSALS) {
                 return keep();
@@ -5604,11 +5660,18 @@ export class ProtonDriveSyncEngine {
     }
 
     // Puts a node into its new folder under its new name, as far as Proton Drive lets it, and returns the name it got: a
-    // conflict name when the one asked for is taken there. It looks at where the node is first, so running it again after
-    // an interruption carries on from there.
-    private async placeNode(node: NodeEntity, parentUid: string, toPath: string): Promise<string> {
+    // conflict name when the one asked for is taken there, if `conflictName` says so at that moment (otherwise that
+    // refusal is thrown). It looks at where the node is first, so running it again after an interruption carries on from
+    // there.
+    private async placeNode(node: NodeEntity, parentUid: string, toPath: string, conflictName: () => boolean): Promise<string> {
         const name = path.posix.basename(toPath);
         const currentName = getName(node);
+        const underConflictName = (taken: unknown, inParent: boolean): Promise<string> => {
+            if (!conflictName()) {
+                throw taken;
+            }
+            return this.placeUnderConflictName(node.uid, parentUid, toPath, inParent);
+        };
         if (node.parentUid !== parentUid) {
             try {
                 await this.moveNodeTo(node.uid, parentUid);
@@ -5618,7 +5681,7 @@ export class ProtonDriveSyncEngine {
                 }
                 // Its present name is taken in the new folder, which the new name may not be: renamed first, then moved
                 if (currentName === name) {
-                    return this.placeUnderConflictName(node.uid, parentUid, toPath, false);
+                    return underConflictName(error, false);
                 }
                 try {
                     await this.sdk.renameNode(node.uid, name);
@@ -5628,7 +5691,7 @@ export class ProtonDriveSyncEngine {
                     if (!(retryError instanceof NodeWithSameNameExistsValidationError)) {
                         throw retryError;
                     }
-                    return this.placeUnderConflictName(node.uid, parentUid, toPath, false);
+                    return underConflictName(retryError, false);
                 }
             }
         }
@@ -5639,7 +5702,7 @@ export class ProtonDriveSyncEngine {
                 if (!(error instanceof NodeWithSameNameExistsValidationError)) {
                     throw error;
                 }
-                return this.placeUnderConflictName(node.uid, parentUid, toPath, true);
+                return underConflictName(error, true);
             }
         }
         return name;
@@ -5684,9 +5747,11 @@ export class ProtonDriveSyncEngine {
         }
     }
 
-    // The rename or move is in Proton Drive. When it got a conflict name there, its local copy, records and pending
-    // operations take that name too (unless it was renamed again here meanwhile, which a later operation brings to the
-    // cloud), and the user is told. Then the remote index takes what the cloud says.
+    // The rename or move is in Proton Drive: `op` is as it was when it was sent, and placedAs the name it got there. When
+    // that is a conflict name, its local copy, records and pending operations take that name too (unless it was renamed
+    // again here meanwhile, which a later operation brings to the cloud), and the user is told. The operations on the
+    // node after it (a trash, say) take where it put the node, not where the node has gone here since. Then the remote
+    // index takes what the cloud says.
     private async afterMoveReplayed(op: Exclude<RemoteOp, { kind: 'trash' }>, placedAs: string): Promise<void> {
         const wanted = path.posix.basename(op.toPath);
         const conflict = await this.inAvailabilityRun(async () => {
@@ -5701,7 +5766,10 @@ export class ProtonDriveSyncEngine {
                     this.logger.warn(`Could not rename ${renamed.from} to ${renamed.to} here as in Proton Drive: ${error}`);
                 }
             }
-            this.journal.complete(op.id);
+            this.stateDb.connection.transaction(() => {
+                this.journal.setCloudPathAfter(op.id, op.nodeUid, joinRel(parentOf(op.toPath), placedAs));
+                this.journal.complete(op.id);
+            })();
             return renamed;
         });
         try {
@@ -5709,7 +5777,8 @@ export class ProtonDriveSyncEngine {
         } catch (error: unknown) {
             this.logger.warn(`Could not read ${op.toPath} back from Proton Drive for the remote index: ${error}`);
         }
-        if (conflict) {
+        // Not told of an item deleted here meanwhile (a trash of it follows): that name is only the one it is trashed under
+        if (conflict && !this.trashFollows(op)) {
             this.tellUser(
                 'conflict',
                 'Proton Drive: name already taken',
@@ -5746,9 +5815,10 @@ export class ProtonDriveSyncEngine {
 
     // The item was deleted or trashed in Proton Drive before its rename or move reached it. A local copy stays and
     // uploads as a new item from where it is now, so nothing is lost; an online-only one has nothing left to move, and
-    // the user is told.
+    // the user is told, unless it was deleted here too (a trash of it follows), which is all the user wanted of it.
     private async afterMoveSourceGone(op: Exclude<RemoteOp, { kind: 'trash' }>): Promise<'next'> {
         await this.inAvailabilityRun(async () => {
+            const trashFollows = this.trashFollows(op);
             const fresh = this.journal.get(op.id);
             const toPath = fresh && fresh.kind !== 'trash' ? fresh.toPath : op.toPath;
             const record = this.stateDb.getItemByPath(toPath);
@@ -5766,7 +5836,7 @@ export class ProtonDriveSyncEngine {
                     localRelPath: toPath,
                     details: `${toPath} was deleted from Proton Drive before its rename reached it, so it uploads again as a new item`,
                 });
-            } else {
+            } else if (!trashFollows) {
                 this.tellUser(
                     'sync',
                     'Proton Drive: rename not applied',
