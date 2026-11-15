@@ -4,7 +4,7 @@ import { ConnectionError, ServerError, ValidationError } from '@protontech/drive
 import { ErrorCode } from '@protontech/drive-sdk/internal/apiService/errorCodes';
 import { SharingManagement } from '@protontech/drive-sdk/internal/sharing/sharingManagement';
 
-import { createShareService, ShareError, type ShareService } from '../src/daemon/shareService';
+import { createShareService, LIST_CONCURRENCY, ShareError, type ShareService } from '../src/daemon/shareService';
 
 const EXPIRY = new Date('2027-01-02T03:04:05Z');
 // A link's URL ends with the 12-character password the SDK generates for it
@@ -78,6 +78,7 @@ function setup(initial: any, nodeFor?: any) {
     const logs: Array<{ action: 'share'; localRelPath: string; details: string }> = [];
     const svc = createShareService({
         sdk: fake.sdk,
+        placeOf: () => null,
         nodeFor: nodeFor ?? (() => ({ uid: 'node1', name: 'a.txt' })),
         logActivity: (e) => logs.push(e),
         now: () => 1000,
@@ -346,6 +347,7 @@ describe('ShareService, after the PR 1 review', () => {
         const fake = makeFake(shared({ urlAccess: undefined }));
         const svc = createShareService({
             sdk: fake.sdk,
+            placeOf: () => null,
             nodeFor: () => ({ uid: 'node1', name: 'a.txt' }),
             logActivity: () => {
                 throw new Error('disk full');
@@ -450,10 +452,11 @@ describe('Copy Link while the SDK has not heard of a link made elsewhere', () =>
         const logs: string[] = [];
         const svc = createShareService({
             sdk: {
-                getSharingInfo: (uid) => mgmt.getSharingInfo(uid as string),
-                shareNode: (uid, s) => mgmt.shareNode(uid as string, s),
-                unshareNode: (uid, s) => mgmt.unshareNode(uid as string, s),
-            },
+                getSharingInfo: (uid: any) => mgmt.getSharingInfo(uid as string),
+                shareNode: (uid: any, s: any) => mgmt.shareNode(uid as string, s),
+                unshareNode: (uid: any, s: any) => mgmt.unshareNode(uid as string, s),
+            } as any,
+            placeOf: () => null,
             nodeFor: () => ({ uid: 'vol~node', name: 'report.pdf' }),
             logActivity: (e) => logs.push(e.details),
             now: () => new Date('2026-11-14T12:00:00Z').getTime(),
@@ -552,7 +555,7 @@ describe('share operations on one item run one at a time', () => {
 
     test('a password and an expiry set at once both stay', async () => {
         const fake = linkFake();
-        const svc = createShareService({ sdk: fake.sdk, nodeFor: () => ({ uid: 'n', name: 'a.txt' }), logActivity() {}, now: () => 1000 });
+        const svc = createShareService({ sdk: fake.sdk, placeOf: () => null, nodeFor: () => ({ uid: 'n', name: 'a.txt' }), logActivity() {}, now: () => 1000 });
         const future = Date.now() + 7 * 86_400_000;
         await Promise.all([svc.setLinkSettings('a.txt', { password: 'pw' }), svc.setLinkSettings('a.txt', { expiresAt: future })]);
         expect(fake.link().customPassword).toBe('pw');
@@ -570,7 +573,7 @@ describe('share operations on one item run one at a time', () => {
             }
             return getSharingInfo();
         };
-        const svc = createShareService({ sdk: fake.sdk, nodeFor: () => ({ uid: 'n', name: 'a.txt' }), logActivity() {}, now: () => 1000 });
+        const svc = createShareService({ sdk: fake.sdk, placeOf: () => null, nodeFor: () => ({ uid: 'n', name: 'a.txt' }), logActivity() {}, now: () => 1000 });
         const [first, second] = await Promise.allSettled([svc.setLinkSettings('a.txt', { password: 'pw' }), svc.info('a.txt')]);
         expect(first.status).toBe('rejected');
         expect(second).toMatchObject({ status: 'fulfilled', value: { link: { url: LINK_URL } } });
@@ -585,7 +588,7 @@ describe('share operations on one item run one at a time', () => {
                 return undefined;
             },
         };
-        const svc = createShareService({ sdk, nodeFor: (p) => ({ uid: p, name: p }), logActivity() {}, now: () => 1000 });
+        const svc = createShareService({ sdk, placeOf: () => null, nodeFor: (p) => ({ uid: p, name: p }), logActivity() {}, now: () => 1000 });
         const slow = svc.info('slow');
         const fast = await Promise.race([svc.info('fast'), Bun.sleep(500).then(() => 'held up')]);
         expect(fast).toEqual({ link: null, people: [] });
@@ -608,7 +611,7 @@ describe('share operations on one item run one at a time', () => {
                 return undefined;
             },
         };
-        const svc = createShareService({ sdk, nodeFor: () => ({ uid: 'n', name: 'a' }), logActivity() {}, now: () => 1000 });
+        const svc = createShareService({ sdk, placeOf: () => null, nodeFor: () => ({ uid: 'n', name: 'a' }), logActivity() {}, now: () => 1000 });
         const a = svc.info('a');
         const b = svc.info('a');
         await Bun.sleep(20);
@@ -620,3 +623,153 @@ describe('share operations on one item run one at a time', () => {
 });
 
 void (null as unknown as ShareService);
+
+describe('list', () => {
+    const node = (uid: string, name: string, over: any = {}) => ({ uid, name: { ok: true, value: name }, ...over });
+
+    // nodes: what iterateNodes yields; sharing: per uid (a missing key is "no longer shared"); fails: per uid
+    function listSetup(opts: {
+        nodes: any[];
+        sharing?: Record<string, any>;
+        fails?: Record<string, unknown>;
+        places?: Record<string, { relPath: string; hidden: boolean } | null>;
+    }) {
+        const logs: unknown[] = [];
+        let active = 0;
+        const stats = { max: 0 };
+        const sdk: any = {
+            async *iterateSharedNodeUids() {
+                for (const n of opts.nodes) yield n.uid ?? n.missingUid;
+            },
+            async *iterateNodes(uids: string[]) {
+                for (const uid of uids) yield opts.nodes.find((n) => (n.uid ?? n.missingUid) === uid);
+            },
+            async getSharingInfo(uid: string) {
+                active++;
+                stats.max = Math.max(stats.max, active);
+                try {
+                    await new Promise((r) => setTimeout(r, 2));
+                    if (opts.fails?.[uid]) throw opts.fails[uid];
+                    return opts.sharing?.[uid];
+                } finally {
+                    active--;
+                }
+            },
+        };
+        const svc = createShareService({
+            sdk,
+            nodeFor: () => ({ refused: 'unused' }),
+            placeOf: (uid) => opts.places?.[uid] ?? null,
+            logActivity: (e) => logs.push(e),
+            now: () => 1000,
+        });
+        return { svc, logs, stats };
+    }
+
+    test('each shared item with its link and how many people', async () => {
+        const { svc } = listSetup({
+            nodes: [node('a', 'a.txt')],
+            sharing: { a: shared() },
+            places: { a: { relPath: 'docs/a.txt', hidden: false } },
+        });
+        const info = await setup(shared()).svc.info('a.txt');
+        expect(await svc.list()).toEqual([{ name: 'a.txt', relPath: 'docs/a.txt', where: 'my-files', link: info.link, people: 3 }]);
+    });
+
+    test('where each item is: my files, hidden, elsewhere, trashed, the My files folder itself', async () => {
+        const { svc } = listSetup({
+            nodes: [node('m', 'mine'), node('h', 'hid'), node('e', 'else'), node('t', 'trashed', { trashTime: new Date() }), node('r', 'root')],
+            sharing: { m: shared(), h: shared(), e: shared(), t: shared(), r: shared() },
+            places: {
+                m: { relPath: 'mine', hidden: false },
+                h: { relPath: 'hid', hidden: true },
+                t: { relPath: 'trashed', hidden: false },
+                r: { relPath: '', hidden: false },
+            },
+        });
+        const byName = Object.fromEntries((await svc.list()).map((i) => [i.name, i]));
+        expect([byName.mine.where, byName.hid.where, byName.else.where, byName.trashed.where, byName.root.where]).toEqual([
+            'my-files',
+            'hidden',
+            'elsewhere',
+            'elsewhere',
+            'elsewhere',
+        ]);
+        expect(byName.mine.relPath).toBe('mine');
+        expect(byName.hid.relPath).toBe('hid');
+        expect(byName.else.relPath).toBeNull();
+        expect(byName.trashed.relPath).toBeNull();
+        expect(byName.root.relPath).toBeNull();
+    });
+
+    test('an item no longer shared by the time it is read is left out', async () => {
+        const { svc } = listSetup({ nodes: [node('a', 'a'), node('b', 'b')], sharing: { a: shared() } });
+        expect((await svc.list()).map((i) => i.name)).toEqual(['a']);
+    });
+
+    test("an item whose sharing can't be read is listed as unreadable; the rest is unaffected", async () => {
+        const { svc } = listSetup({
+            nodes: [node('a', 'a'), node('b', 'b')],
+            sharing: { a: shared() },
+            fails: { b: new Error('boom') },
+            places: { a: { relPath: 'a', hidden: false }, b: { relPath: 'b', hidden: false } },
+        });
+        expect(await svc.list()).toEqual([
+            { name: 'a', relPath: 'a', where: 'my-files', link: expect.anything(), people: 3 },
+            { name: 'b', relPath: 'b', where: 'my-files', link: null, people: 0, unreadable: "Proton Drive couldn't say how this item is shared" },
+        ]);
+    });
+
+    test('a node Proton Drive can\'t find is listed as "An item", unreadable', async () => {
+        const { svc } = listSetup({ nodes: [{ missingUid: 'x' }, { uid: 'n', name: { ok: false, error: new Error('x') } }], sharing: { n: shared() } });
+        expect(await svc.list()).toEqual([
+            { name: 'An item', relPath: null, where: 'elsewhere', link: null, people: 0, unreadable: "This item can't be found in Proton Drive" },
+            { name: 'An item', relPath: null, where: 'elsewhere', link: expect.anything(), people: 3 },
+        ]);
+    });
+
+    test('offline while reading is the offline refusal, not a partial list', async () => {
+        const { svc } = listSetup({
+            nodes: [node('a', 'a'), node('b', 'b')],
+            sharing: { a: shared(), b: shared() },
+            fails: { b: new ConnectionError('down') },
+        });
+        const e = await rejects(svc.list());
+        expect(e).toBeInstanceOf(ShareError);
+        expect(e.message).toBe('Proton Drive is offline: try again when you are connected');
+    });
+
+    test('never more than 4 sharing reads at once, and all 60 items listed in order', async () => {
+        expect(LIST_CONCURRENCY).toBe(4);
+        const nodes: any[] = [];
+        const sharing: any = {};
+        const places: any = {};
+        for (let i = 0; i < 60; i++) {
+            const uid = `u${i}`;
+            // 20 elsewhere (no place), named so that name order differs from uid order
+            nodes.push(node(uid, i % 3 === 0 ? `z${String(60 - i).padStart(2, '0')}` : `n${i}`));
+            sharing[uid] = shared();
+            if (i % 3 !== 0) places[uid] = { relPath: `f/${String(60 - i).padStart(2, '0')}`, hidden: i % 2 === 0 };
+        }
+        const { svc, stats } = listSetup({ nodes, sharing, places });
+        const items = await svc.list();
+        expect(stats.max).toBe(4);
+        expect(items).toHaveLength(60);
+        const inFiles = items.filter((i) => i.where !== 'elsewhere');
+        const elsewhere = items.filter((i) => i.where === 'elsewhere');
+        expect(items.slice(0, 40)).toEqual(inFiles);
+        expect(inFiles.map((i) => i.relPath)).toEqual(inFiles.map((i) => i.relPath).sort());
+        expect(elsewhere.map((i) => i.name)).toEqual(elsewhere.map((i) => i.name).sort());
+    });
+
+    test("an older link's password stays out, and nothing is logged", async () => {
+        const older = shared({ urlAccess: { uid: 'u', url: 'https://drive.proton.me/urls/X#mypassword', role: 'viewer', customPassword: undefined } });
+        const { svc, logs } = listSetup({ nodes: [node('a', 'a')], sharing: { a: older }, places: { a: { relPath: 'a', hidden: false } } });
+        const items = await svc.list();
+        expect(items[0].link?.url).not.toContain('#');
+        expect(items[0].link?.hasPassword).toBe(true);
+        expect(JSON.stringify(items)).not.toContain('customPassword');
+        expect(JSON.stringify(items)).not.toContain('mypassword');
+        expect(logs).toEqual([]);
+    });
+});
