@@ -88,10 +88,11 @@ pub fn can_copy(item: &SharedItem, now_ms: i64) -> bool {
 }
 
 /// The question before stopping all sharing of an item, naming only what is lost.
-pub fn stop_question(item: &SharedItem) -> String {
+pub fn stop_question(item: &SharedItem, now_ms: i64) -> String {
     let mut lost = Vec::new();
-    if item.link.is_some() {
-        lost.push("The link stops working".to_string());
+    if let Some(link) = &item.link {
+        let expired = link.expires_at.is_some_and(|at| at <= now_ms);
+        lost.push(if expired { "The expired link is removed" } else { "The link stops working" }.to_string());
     }
     match item.people {
         0 => {}
@@ -232,12 +233,17 @@ mod tests {
     fn the_stop_question_names_only_what_is_lost() {
         let l = || Some(link(false, None, Role::Viewer));
         assert_eq!(
-            stop_question(&item("report.pdf", Some("report.pdf"), Place::MyFiles, l(), 2)),
+            stop_question(&item("report.pdf", Some("report.pdf"), Place::MyFiles, l(), 2), NOW),
             "Stop sharing report.pdf? The link stops working and 2 people lose access."
         );
-        assert_eq!(stop_question(&item("Icons", Some("Icons"), Place::MyFiles, None, 1)), "Stop sharing Icons? 1 person loses access.");
-        assert_eq!(stop_question(&item("a.txt", Some("a.txt"), Place::MyFiles, l(), 0)), "Stop sharing a.txt? The link stops working.");
-        assert_eq!(stop_question(&item("a.txt", Some("a.txt"), Place::MyFiles, None, 0)), "Stop sharing a.txt?");
+        assert_eq!(stop_question(&item("Icons", Some("Icons"), Place::MyFiles, None, 1), NOW), "Stop sharing Icons? 1 person loses access.");
+        assert_eq!(stop_question(&item("a.txt", Some("a.txt"), Place::MyFiles, l(), 0), NOW), "Stop sharing a.txt? The link stops working.");
+        assert_eq!(stop_question(&item("a.txt", Some("a.txt"), Place::MyFiles, None, 0), NOW), "Stop sharing a.txt?");
+        let expired = Some(link(false, Some(NOW - DAY), Role::Viewer));
+        assert_eq!(
+            stop_question(&item("old-notes.txt", Some("old-notes.txt"), Place::MyFiles, expired, 1), NOW),
+            "Stop sharing old-notes.txt? The expired link is removed and 1 person loses access."
+        );
     }
 
     #[test]
