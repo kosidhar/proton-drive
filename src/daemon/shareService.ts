@@ -18,6 +18,13 @@ export interface ShareInfo {
 // The message is shown to the user as is
 export class ShareError extends Error {}
 
+// The list was cancelled (the app gave up on it): there is no one left to read the message
+export class ListCancelled extends ShareError {
+    constructor() {
+        super('Cancelled');
+    }
+}
+
 export type SharedPlace = 'my-files' | 'hidden' | 'elsewhere';
 
 export interface SharedItem {
@@ -33,7 +40,7 @@ export interface SharedItem {
 export const LIST_CONCURRENCY = 4;
 
 export interface ShareService {
-    list(): Promise<SharedItem[]>;
+    list(signal?: AbortSignal): Promise<SharedItem[]>;
     info(path: string): Promise<ShareInfo>;
     password(path: string): Promise<string | null>;
     ensureLink(path: string): Promise<{ url: string; created: boolean }>;
@@ -231,39 +238,44 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
     return {
         // Everything the user has shared, as Proton Drive has it now: the uids come from the server (iterateSharedNodeUids),
         // not the SDK's cache, which may not know of a share made elsewhere. Nothing is logged: it only reads.
-        async list() {
+        // Once `signal` is aborted (the app gave up on the list), nothing more is asked of Proton Drive: the SDK's listing
+        // and loading stop where they can, a sharing read under way finishes and is dropped, and the list is ListCancelled.
+        async list(signal) {
+            const stopIfCancelled = () => {
+                if (signal?.aborted) throw new ListCancelled();
+            };
             try {
+                stopIfCancelled();
                 const uids: string[] = [];
-                for await (const uid of sdk.iterateSharedNodeUids()) uids.push(uid);
-                const items: SharedItem[] = [];
+                // Each step may ask the server for the next page
+                for await (const uid of sdk.iterateSharedNodeUids(signal)) {
+                    uids.push(uid);
+                    stopIfCancelled();
+                }
                 const nodes: MaybeMissingNode[] = [];
-                const unreadable: SharedItem[] = [];
+                let notLoaded: string[] = [];
+                stopIfCancelled();
                 try {
-                    for await (const n of sdk.iterateNodes(uids)) nodes.push(n);
+                    for await (const n of sdk.iterateNodes(uids, signal)) {
+                        nodes.push(n);
+                        stopIfCancelled();
+                    }
                 } catch (e) {
-                    if (failsTheList(e)) throw e;
+                    if (signal?.aborted || failsTheList(e)) throw e;
                     // The SDK's batch loader throws after the nodes it could load, for ones it couldn't (a parent's key, say),
-                    // and reports no missing node then. Load the rest one at a time: one that still fails is listed as unreadable
+                    // and reports no missing node then. The rest are loaded again one at a time, in the pool below
                     const loaded = new Set(nodes.map((n) => ('missingUid' in n ? n.missingUid : n.uid)));
-                    for (const uid of uids.filter((u) => !loaded.has(u))) {
-                        try {
-                            let any = false;
-                            for await (const n of sdk.iterateNodes([uid])) {
-                                nodes.push(n);
-                                any = true;
-                            }
-                            if (!any) throw new Error('not loaded');
-                        } catch (one) {
-                            if (failsTheList(one)) throw one;
-                            unreadable.push({
-                                name: indexedName(uid),
-                                relPath: null,
-                                where: 'elsewhere',
-                                link: null,
-                                people: 0,
-                                unreadable: "Proton Drive couldn't read this item",
-                            });
-                        }
+                    notLoaded = uids.filter((u) => !loaded.has(u));
+                }
+
+                // A node the batch didn't load, loaded again alone: null when it still can't be
+                async function loadAlone(uid: string): Promise<MaybeMissingNode | null> {
+                    try {
+                        for await (const n of sdk.iterateNodes([uid], signal)) return n;
+                        return null;
+                    } catch (e) {
+                        if (signal?.aborted || failsTheList(e)) throw e;
+                        return null;
                     }
                 }
 
@@ -314,27 +326,58 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                     }
                 }
 
-                // A small pool: the first failure of the whole list (offline, busy) stops the rest from starting
+                // A small pool, for the nodes the batch loaded, then for the ones it didn't, each loaded again alone before its
+                // sharing is read: never more than LIST_CONCURRENCY calls at once. The first failure of the whole list (offline,
+                // busy), or the list cancelled, stops the rest from starting
+                const work = [...nodes.map((node) => ({ node })), ...notLoaded.map((uid) => ({ uid }))];
+                const items: Array<SharedItem | undefined> = [];
+                const unreadable: Array<SharedItem | undefined> = [];
                 let next = 0;
                 let failed = false;
                 const worker = async () => {
-                    while (!failed && next < nodes.length) {
-                        const i = next++;
-                        try {
-                            items[i] = await readOne(nodes[i]);
-                        } catch (e) {
-                            failed = true;
-                            throw e;
+                    try {
+                        while (!failed && next < work.length) {
+                            stopIfCancelled();
+                            const i = next++;
+                            const w = work[i];
+                            let node: MaybeMissingNode;
+                            if ('node' in w) {
+                                node = w.node;
+                            } else {
+                                const loaded = await loadAlone(w.uid);
+                                if (!loaded) {
+                                    unreadable[i] = {
+                                        name: indexedName(w.uid),
+                                        relPath: null,
+                                        where: 'elsewhere',
+                                        link: null,
+                                        people: 0,
+                                        unreadable: "Proton Drive couldn't read this item",
+                                    };
+                                    continue;
+                                }
+                                if (failed) return;
+                                stopIfCancelled();
+                                node = loaded;
+                            }
+                            items[i] = await readOne(node);
                         }
+                    } catch (e) {
+                        failed = true;
+                        throw e;
                     }
                 };
-                await Promise.all(Array.from({ length: Math.min(LIST_CONCURRENCY, nodes.length) }, worker));
+                await Promise.all(Array.from({ length: Math.min(LIST_CONCURRENCY, work.length) }, worker));
+                stopIfCancelled();
 
-                const listed = [...items, ...unreadable];
+                // The items read, in the order they were loaded, then the ones that couldn't be loaded at all
+                const listed = [...items, ...unreadable].filter((i): i is SharedItem => i !== undefined);
                 const inFiles = listed.filter((i) => i.where !== 'elsewhere').sort((a, b) => byText(a.relPath ?? '', b.relPath ?? ''));
                 const elsewhere = listed.filter((i) => i.where === 'elsewhere').sort((a, b) => byText(a.name, b.name));
                 return [...inFiles, ...elsewhere];
             } catch (e) {
+                // Whatever stopped the list once it was cancelled (the SDK's AbortError, say), no one is waiting for it
+                if (signal?.aborted) throw new ListCancelled();
                 if (!isOffline(e) && isBusy(e)) throw new ShareError('Proton Drive is busy: try again in a minute');
                 throw plainError(e);
             }

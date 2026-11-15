@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
 import { defaultControlSocketPath, startControlServer } from '../src/daemon/controlServer';
-import type { ShareService } from '../src/daemon/shareService';
+import { ListCancelled, type ShareService } from '../src/daemon/shareService';
 import { DriveOpError, type VfsEntry } from '../src/sync/driveOps';
 import { type AvailabilityAction, type AvailabilityResult, type FilesMissingAction, FilesMissingRefused } from '../src/sync/syncEngine';
 
@@ -434,6 +435,37 @@ describe('/share routes', () => {
     test('404 with no service wired, and 400 while signed out', async () => {
         expect((await call(await startWith(), '/share/info?path=Docs')).status).toBe(404);
         expect((await call(await startWith(service, false), '/share/info?path=Docs')).status).toBe(400);
+    });
+
+    // #257: the app gives up on a long list by closing its end of the socket; Bun then aborts the request's signal, which
+    // the list is given, so the list stops asking Proton Drive for more
+    test('the list hears it when the app hangs up', async () => {
+        let entered!: () => void;
+        const listing = new Promise<void>((resolve) => (entered = resolve));
+        let given: AbortSignal | undefined;
+        const waiting = {
+            list: async (signal?: AbortSignal) => {
+                given = signal;
+                entered();
+                // Waits for the abort, or gives up after a while so the server can stop
+                await new Promise<void>((resolve) => {
+                    signal?.addEventListener('abort', () => resolve(), { once: true });
+                    setTimeout(resolve, 3000);
+                });
+                throw new ListCancelled();
+            },
+        } as unknown as ShareService;
+        const socketPath = await startWith(waiting);
+        // As the app asks (main.rs, control_request_at): its own socket, one request, Connection: close
+        const app = net.createConnection({ path: socketPath });
+        await new Promise((resolve) => app.once('connect', resolve));
+        app.write('GET /share/list HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: application/json\r\n\r\n');
+        await listing;
+        expect(given?.aborted).toBe(false);
+        const hungUpAt = performance.now();
+        app.destroy();
+        while (!given?.aborted && performance.now() - hungUpAt < 2000) await Bun.sleep(5);
+        expect(given?.aborted).toBe(true);
     });
 });
 
