@@ -180,7 +180,7 @@ const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 /// The local day (days since 1970-01-01 by the local calendar) and the seconds into it, of a time in epoch ms, local
 /// time being `offset` seconds east of UTC.
-fn local_day_and_secs(ms: i64, offset: i64) -> (i64, i64) {
+pub(crate) fn local_day_and_secs(ms: i64, offset: i64) -> (i64, i64) {
     let secs = ms.div_euclid(1000) + offset;
     (secs.div_euclid(86_400), secs.rem_euclid(86_400))
 }
