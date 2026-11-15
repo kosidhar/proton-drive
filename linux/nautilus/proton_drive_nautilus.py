@@ -20,10 +20,9 @@ import threading
 import time
 import types
 import urllib.parse
-import weakref
 from collections import OrderedDict
 
-from gi.repository import GLib, GObject, Nautilus
+from gi.repository import Gio, GLib, GObject, Nautilus
 
 
 # The client functions below are the tray's (linux/tray/proton_drive_tray.py), unchanged: a test keeps them identical
@@ -395,41 +394,40 @@ class FolderCache:
 
 
 class FileTracker:
-    """The FileInfo Files last asked about at each path, held weakly where it can be, to invalidate on a change."""
+    """The paths Files asked about, to find its item again and invalidate it on a change.
 
-    def __init__(self, limit=TRACK_LIMIT):
+    Paths, not Files' items: PyGObject lets go of the Python object Files hands over as soon as the call returns, even
+    though Files keeps the item, so a weak reference to it is already gone by the next change (#232), and a strong one
+    would keep items alive that Files has let go of. lookup(path) gives the item Files has at path now, or None; a path
+    Files has let go of is forgotten."""
+
+    def __init__(self, lookup, limit=TRACK_LIMIT):
+        self.lookup = lookup
         self.limit = limit
-        self.refs = OrderedDict()
+        self.paths = OrderedDict()
 
-    def track(self, path, file):
-        try:
-            ref = weakref.ref(file)
-        except TypeError:
-            ref = lambda f=file: f  # noqa: E731 (bounded by the limit)
-        self.refs[path] = ref
-        self.refs.move_to_end(path)
-        while len(self.refs) > self.limit:
-            self.refs.popitem(last=False)
+    def track(self, path):
+        self.paths[path] = None
+        self.paths.move_to_end(path)
+        while len(self.paths) > self.limit:
+            self.paths.popitem(last=False)
 
     def get(self, path):
-        ref = self.refs.get(path)
-        file = ref() if ref else None
-        if ref and file is None:
-            del self.refs[path]
+        if path not in self.paths:
+            return None
+        file = self.lookup(path)
+        if file is None:
+            del self.paths[path]
         return file
 
     def within(self, top):
-        return [f for f in (self.get(p) for p in [p for p in self.refs if is_within(p, top)]) if f is not None]
+        return [f for f in (self.get(p) for p in [p for p in self.paths if is_within(p, top)]) if f is not None]
 
     def all(self):
-        return [f for f in (self.get(p) for p in list(self.refs)) if f is not None]
-
-    def prune(self):
-        for path in list(self.refs):
-            self.get(path)
+        return [f for f in (self.get(p) for p in list(self.paths)) if f is not None]
 
     def clear(self):
-        self.refs.clear()
+        self.paths.clear()
 
 
 def summarize(names, limit=3):
@@ -448,7 +446,7 @@ class ProtonDriveFiles:
     whose folder's states aren't known yet is answered with no emblem, and gets it when they arrive: add_emblem works
     on a file at any time."""
 
-    def __init__(self, request, run, notify, clock=time.monotonic, later=None, copy=None):
+    def __init__(self, request, run, notify, clock=time.monotonic, later=None, copy=None, lookup=None):
         self.request = request
         self.copy = copy or (lambda text: (_ for _ in ()).throw(RuntimeError("no clipboard")))
         self.run = run
@@ -461,7 +459,7 @@ class ProtonDriveFiles:
         self.fetch_failures = {}  # folder -> how many fetches of its states failed in a row
         self.stream_up = False
         self.cache = FolderCache()
-        self.tracker = FileTracker()
+        self.tracker = FileTracker(lookup or _lookup_file)  # lookup(path): the item Files has at path now, or None
         self.waiting = {}  # folder -> {id(file): file} answered without an emblem, waiting for its states
         self.generation = 0  # bumped by every change, so a fetch that started before it isn't cached
         self.busy = set()  # paths an action is working on, shown as syncing
@@ -507,13 +505,13 @@ class ProtonDriveFiles:
         path = file.get_location().get_path()
         if self.root is None:
             # Tracked, so that the root arriving makes Files ask again (set_root)
-            self.tracker.track(path, file)
+            self.tracker.track(path)
             self.ask_root()
             return
         rel = rel_to_root(self.root, path)
         if not rel or skipped(rel):
             return
-        self.tracker.track(path, file)
+        self.tracker.track(path)
         folder = os.path.dirname(path)
         entry = self.cache.get(folder, self.clock(), None if self.stream_up else STALE_WITHOUT_EVENTS)
         if entry is not None:
@@ -724,7 +722,6 @@ class ProtonDriveFiles:
             return
         self.stream_up = True
         self.generation += 1
-        self.tracker.prune()
         stale = {}  # each file once, however many paths of the change name it
         for path in event.get("paths") or []:
             self.cache.drop(path)
@@ -763,6 +760,14 @@ def _spawn_detached(argv) -> None:
         setsigdef=(signal.SIGPIPE, signal.SIGXFSZ),
     )
     GLib.child_watch_add(GLib.PRIORITY_DEFAULT, pid, lambda *_: None)
+
+
+def _lookup_file(path):
+    """The item Files has at path now, or None if it has none (#232)."""
+    try:
+        return Nautilus.FileInfo.lookup(Gio.File.new_for_path(path))
+    except Exception:  # a path GLib can't take
+        return None
 
 
 def _notify(title: str, body: str) -> None:

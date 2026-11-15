@@ -3,6 +3,7 @@
 
 Run: python3 linux/nautilus/test_proton_drive_nautilus.py
 """
+import gc
 import importlib.util
 import inspect
 import json
@@ -46,16 +47,22 @@ def load(name, file, extra_modules=()):
     return module
 
 
-ext = load("proton_drive_nautilus_under_test", os.path.join(HERE, "proton_drive_nautilus.py"))
+ext = load("proton_drive_nautilus_under_test", os.path.join(HERE, "proton_drive_nautilus.py"), extra_modules=("Gio",))
 ROOT = "/home/u/ProtonDrive"
 
 
+HELD = {}  # path -> the FakeFile Files has there now, as Nautilus.FileInfo.lookup would find it (#232)
+
+
 class FakeFile:
+    """An item Files holds, from when it's made until a test lets go of it (del HELD[path])."""
+
     def __init__(self, path, scheme="file"):
         self.path = path
         self.scheme = scheme
         self.emblems = []
         self.invalidated = 0
+        HELD[path] = self
 
     def get_uri_scheme(self):
         return self.scheme
@@ -69,6 +76,26 @@ class FakeFile:
     def invalidate_extension_info(self):
         self.invalidated += 1
         self.emblems = []
+
+
+class Wrapper:
+    """What PyGObject hands the extension for an item Files holds: a new Python object for each call, gone as soon as
+    nothing in Python holds it, while Files keeps the item (#232)."""
+
+    def __init__(self, item):
+        self.item = item
+
+    def get_uri_scheme(self):
+        return self.item.get_uri_scheme()
+
+    def get_location(self):
+        return self.item.get_location()
+
+    def add_emblem(self, name):
+        self.item.add_emblem(name)
+
+    def invalidate_extension_info(self):
+        self.item.invalidate_extension_info()
 
 
 class Harness:
@@ -90,6 +117,7 @@ class Harness:
             clock=lambda: self.now,
             later=lambda fn, seconds: self.scheduled.append((fn, seconds)),
             copy=lambda text: self.copied.append(text),
+            lookup=HELD.get,
         )
         if root:
             self.files.set_root(root)
@@ -672,6 +700,53 @@ class OtherFileManagersTest(unittest.TestCase):
         self.assertNotIn("Name=Open Proton Drive", dolphin)
 
 
+class LetGoTest(unittest.TestCase):
+    """Files' items reach the extension through Python objects PyGObject lets go of after each call: the item is still
+    refreshed later, because Files still has it (#232)."""
+
+    def setUp(self):
+        self.h = Harness({states_query(ROOT + "/Docs"): DOCS_STATES})
+        self.a = FakeFile(f"{ROOT}/Docs/a.txt")
+        self.h.files.file_info(Wrapper(self.a))
+        self.h.release()
+        gc.collect()
+        self.assertEqual(self.a.emblems, ["emblem-protondrive-pinned"])
+        self.a.invalidated = 0
+
+    def test_an_action_shows_the_item_syncing_then_as_it_is_now(self):
+        h = self.h
+        h.answers["/availability"] = lambda body: {"state": "pinned", "kept": [], "refused": None}
+        h.files.act("pin", [self.a.path])
+        self.assertEqual(self.a.invalidated, 1)
+        h.release()
+        self.assertEqual(self.a.invalidated, 2)
+
+    def test_a_change_refreshes_it(self):
+        self.h.files.on_event({"type": "changed", "paths": [self.a.path], "subtrees": []})
+        self.assertEqual(self.a.invalidated, 1)
+
+    def test_a_change_to_a_folder_above_refreshes_it(self):
+        self.h.files.on_event({"type": "changed", "paths": [], "subtrees": [f"{ROOT}/Docs"]})
+        self.assertEqual(self.a.invalidated, 1)
+
+    def test_the_daemon_starting_again_refreshes_it(self):
+        self.h.files.on_event({"type": "hello", "syncDir": ROOT, "mode": "virtual"})
+        self.assertEqual(self.a.invalidated, 1)
+
+    def test_the_drives_folder_known_late_refreshes_it(self):
+        h = Harness(root=None)
+        b = FakeFile(f"{ROOT}/Docs/b.txt")
+        h.files.file_info(Wrapper(b))
+        gc.collect()
+        h.files.set_root(ROOT)
+        self.assertEqual(b.invalidated, 1)
+
+    def test_an_item_files_let_go_of_is_left_alone(self):
+        del HELD[self.a.path]
+        self.h.files.on_event({"type": "changed", "paths": [self.a.path], "subtrees": [f"{ROOT}/Docs"]})
+        self.assertEqual(self.a.invalidated, 0)
+
+
 class ChangeTest(unittest.TestCase):
     def setUp(self):
         self.h = Harness(
@@ -720,13 +795,15 @@ class ChangeTest(unittest.TestCase):
             self.assertEqual(f.emblems, [])
         self.assertEqual(h.files.cache.entries, {})
 
-    def test_dead_files_are_let_go(self):
-        tracker = ext.FileTracker()
+    def test_a_path_files_let_go_of_is_forgotten(self):
+        tracker = ext.FileTracker(HELD.get)
         f = FakeFile("/x")
-        tracker.track("/x", f)
-        del f
-        tracker.prune()
-        self.assertEqual(tracker.refs, {})
+        tracker.track("/x")
+        self.assertIs(tracker.get("/x"), f)
+        del HELD["/x"]
+        self.assertIsNone(tracker.get("/x"))
+        self.assertEqual(tracker.paths, {})
+        self.assertEqual(f.invalidated, 0)
 
 
 def chunked(*lines):
