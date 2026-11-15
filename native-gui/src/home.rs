@@ -260,6 +260,11 @@ pub fn pause_button(status: &DaemonStatus) -> (&'static str, bool) {
     }
 }
 
+/// Whether the main button is the filled (primary) one: only Resume is. Pause looks like Sync now.
+pub fn pause_button_is_primary(status: &DaemonStatus) -> bool {
+    !pause_button(status).1
+}
+
 /// How the drive is shown, under its location.
 pub fn drive_kind(vfs: Option<&VfsStatus>) -> &'static str {
     match vfs {
@@ -576,7 +581,12 @@ impl ProtonDriveNativeApp {
                         sign_in = primary_button(ui, "Sign in", 34.0).clicked();
                     } else {
                         ui.add_enabled_ui(self.daemon_online, |ui| {
-                            let button = primary_button(ui, pause_label, 34.0);
+                            // Pause looks like Sync now; Resume, while paused, is the filled one
+                            let button = if pause_button_is_primary(&self.status) {
+                                primary_button(ui, pause_label, 34.0)
+                            } else {
+                                secondary_button(ui, pause_label, 34.0)
+                            };
                             if !pause_to {
                                 if button.clicked() {
                                     command = Some(WorkerCommand::SetPaused { paused: false, until: None });
@@ -1306,6 +1316,14 @@ mod tests {
         assert_eq!(pause_button(&status("syncing", vec![], false)), ("Pause", true));
         assert_eq!(pause_button(&status("paused", vec![], false)), ("Resume", false));
         assert_eq!(pause_button(&status("idle", vec![], true)), ("Resume", false));
+    }
+
+    #[test]
+    fn only_resume_is_the_filled_button() {
+        assert!(!pause_button_is_primary(&status("idle", vec![], false)));
+        assert!(!pause_button_is_primary(&status("syncing", vec![], false)));
+        assert!(pause_button_is_primary(&status("paused", vec![], false)));
+        assert!(pause_button_is_primary(&status("idle", vec![], true)));
     }
 
     #[test]
