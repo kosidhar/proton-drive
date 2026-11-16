@@ -347,6 +347,25 @@ describe("AvailabilityPolicy", () => {
     policy.setPin("root", "unpinned", true);
     expect(policy.pinnedSummary()).toEqual({ items: 0, wholeDrive: false });
   });
+
+  test("pinnedSummary doesn't count a hidden item's old mark as Always keep (#296)", () => {
+    policy.setPin("docs", "pinned", false);
+    policy.setPin("music", "pinned", false);
+    expect(policy.pinnedSummary()).toEqual({ items: 2, wholeDrive: false });
+
+    // A hide keeps the item's own pin row, but nothing of it is kept on this computer
+    policy.setHide("docs", "hidden");
+    expect(policy.stateOf("Docs")).toBe("hidden");
+    expect(policy.pinnedSummary()).toEqual({ items: 1, wholeDrive: false });
+    // Nor is anything of an item being hidden
+    policy.setHide("music", "pending");
+    expect(policy.stateOf("Music")).toBe("hiding");
+    expect(policy.pinnedSummary()).toEqual({ items: 0, wholeDrive: false });
+
+    // Unhidden, its mark counts again
+    policy.setHide("docs", null);
+    expect(policy.pinnedSummary()).toEqual({ items: 1, wholeDrive: false });
+  });
 });
 
 describe("AvailabilityPolicy.childStates", () => {
