@@ -1,11 +1,13 @@
 // Real mounts of the built helper over temp dirs, with a fake daemon on a temp socket. They run only with
-// PROTONDRIVE_VFS_MOUNT_TESTS=1, and always unmount, even when an assertion fails.
+// PROTONDRIVE_VFS_MOUNT_TESTS=1, and always unmount, even when an assertion fails. They need more than 5 GB free
+// where TMPDIR points (/tmp by default): the drive refuses writes that would leave its backing store's disk with
+// less than that (#295).
 
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -677,7 +679,8 @@ fn mounts_as_protondrive_with_the_drives_options() {
     assert_eq!((drive.f_blocks, drive.f_bsize, drive.f_frsize), (backing.f_blocks, backing.f_bsize, backing.f_frsize));
 }
 
-// #181: Disk Usage and df show the account's storage, never more room for writing than the local disk has
+// #181, #295: Disk Usage and df show the account's storage, and its free space as what is available, even when this
+// computer has less room (the guard keeps its disk from filling)
 #[test]
 fn the_drive_reports_the_accounts_storage() {
     if !enabled() {
@@ -687,7 +690,7 @@ fn the_drive_reports_the_accounts_storage() {
     let backing = statvfs(&h.backing);
     let block = backing.f_frsize;
     let local_free = backing.f_bavail * block;
-    // A quota bigger than the local disk's room, nearly all of it free: the local room is what is available
+    // A quota bigger than the local disk's room, nearly all of it free
     let max = local_free * 4 + 1_000_000_000;
     let used = 2_000_000_000;
     h.start_fake(Fake::new(HashMap::new()).with_space(used, max));
@@ -704,9 +707,49 @@ fn the_drive_reports_the_accounts_storage() {
     let near = |bytes: u64, want: u64| bytes.abs_diff(want) < block * 2;
     assert!(near(drive.f_blocks * block, max), "total {}", drive.f_blocks * block);
     assert!(near((drive.f_blocks - drive.f_bfree) * block, used), "used {}", (drive.f_blocks - drive.f_bfree) * block);
-    // The local disk's room, give or take what changed on it meanwhile
-    let available = drive.f_bavail * block;
-    assert!(available <= max - used && available.abs_diff(local_free) < 1_000_000_000, "available {available}");
+    let (free, available) = (drive.f_bfree * block, drive.f_bavail * block);
+    assert!(near(free, max - used) && near(available, max - used), "free {free}, available {available}");
+    assert!(available > local_free, "available {available}: the cloud's, not this computer's {local_free}");
+}
+
+// #295: what is written through the drive lands on this computer before it uploads, so a write that would leave the
+// system disk with less than 5 GB is refused (here by growing a file sparsely past the disk's room), and nothing
+// that was there is touched
+#[test]
+fn a_write_that_would_leave_the_system_disk_under_5_gb_is_refused() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    h.start_daemon(HashMap::new());
+    h.mount();
+
+    std::fs::write(h.path("a.txt"), b"hello").unwrap();
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(h.path("a.txt")).unwrap();
+    let backing = statvfs(&h.backing);
+    let local_free = backing.f_bavail * backing.f_frsize;
+    let errno = |result: std::io::Result<()>| result.err().and_then(|err| err.raw_os_error());
+    // By ftruncate, by a write past the end, and by truncate(2) on its path
+    assert_eq!(errno(file.set_len(local_free)), Some(libc::ENOSPC));
+    assert_eq!(errno(file.write_all_at(b"x", local_free)), Some(libc::ENOSPC));
+    assert_eq!(errno(run_truncate(&h.path("a.txt"), local_free)), Some(libc::ENOSPC));
+    assert_eq!(std::fs::read(h.backing.join("a.txt")).unwrap(), b"hello");
+    assert_eq!(std::fs::metadata(h.path("a.txt")).unwrap().len(), 5);
+    // Logged, for whoever wonders why with so much free space shown, but not once per refusal
+    let logged = h.stderr().matches("refused a write that would leave the system disk").count();
+    assert_eq!(logged, 1, "{}", h.stderr());
+    // An overwrite in place always goes through
+    file.write_all_at(b"HELLO", 0).unwrap();
+    assert_eq!(std::fs::read(h.backing.join("a.txt")).unwrap(), b"HELLO");
+}
+
+/// truncate(2) by path, as truncate(1) without an open file does.
+fn run_truncate(path: &Path, size: u64) -> std::io::Result<()> {
+    let path = c_path(path);
+    match errno_of(unsafe { libc::truncate(path.as_ptr(), size as libc::off_t) }) {
+        None => Ok(()),
+        Some(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+    }
 }
 
 fn statvfs(path: &Path) -> libc::statvfs {
