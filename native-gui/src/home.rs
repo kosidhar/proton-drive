@@ -895,8 +895,8 @@ impl ProtonDriveNativeApp {
         });
     }
 
-    /// Your drive: where it is and how it is shown, its trash, and what is on this computer. Open in Files is the
-    /// sidebar's, and the account's storage is here and at the sidebar's foot.
+    /// Your drive: where it is and how it is shown, its folder in Files and its trash, and what is on this computer. Open in Files is
+    /// the sidebar's too, and the account's storage is here and at the sidebar's foot.
     fn render_your_drive(&mut self, ui: &mut egui::Ui) {
         let sync_dir = self.status.sync_dir.clone();
         let account = self.status.account.clone();
@@ -904,26 +904,50 @@ impl ProtonDriveNativeApp {
             ui.set_min_width(ui.available_width());
             ui.label(RichText::new("Your drive").font(crate::bold(13.0)).color(TEXT_MUTED()));
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // The trash, on the right. Not before a folder is set up
-                    if !sync_dir.is_empty() {
-                        let trash = action_button_named(ui, ButtonKind::Secondary, Some(icons::TRASH), TRASH_BUTTON, OPEN_TRASH, 32.0);
-                        if trash.on_hover_text(trash_hover(&sync_dir)).clicked() {
-                            open_in_browser(PROTON_DRIVE_TRASH_URL);
+            let shown = if sync_dir.is_empty() { "Not set up yet".to_string() } else { shown_folder(&sync_dir) };
+            let kind = drive_kind(self.status.vfs.as_ref());
+            let name_and_kind = |ui: &mut egui::Ui| {
+                ui.horizontal(|ui| {
+                    decoration(ui, icons::FOLDER, 18.0, TEXT_MUTED());
+                    elided(ui, RichText::new(&shown).font(crate::bold(14.0)).color(TEXT_PRIMARY()), &sync_dir);
+                });
+                ui.label(RichText::new(kind).size(12.5).color(TEXT_MUTED()));
+            };
+            // Open in Files and the trash. Not before a folder is set up
+            let open = |ui: &mut egui::Ui| {
+                if action_button(ui, ButtonKind::Secondary, Some(icons::FOLDER_OPEN), crate::chrome::OPEN_IN_FILES, 32.0).clicked() {
+                    open_in_files(std::path::Path::new(&sync_dir));
+                }
+            };
+            let trash = |ui: &mut egui::Ui| {
+                let trash = action_button_named(ui, ButtonKind::Secondary, Some(icons::TRASH), TRASH_BUTTON, OPEN_TRASH, 32.0);
+                if trash.on_hover_text(trash_hover(&sync_dir)).clicked() {
+                    open_in_browser(PROTON_DRIVE_TRASH_URL);
+                }
+            };
+            if ui.available_width() < crate::settings::STACKED_BELOW {
+                // As under the status: the buttons go under the name when they would crowd it
+                ui.vertical(name_and_kind);
+                if !sync_dir.is_empty() {
+                    ui.add_space(10.0);
+                    ui.horizontal_wrapped(|ui| {
+                        open(ui);
+                        trash(ui);
+                    });
+                }
+            } else {
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if !sync_dir.is_empty() {
+                            trash(ui);
+                            ui.add_space(8.0);
+                            open(ui);
+                            ui.add_space(8.0);
                         }
-                        ui.add_space(8.0);
-                    }
-                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                        let shown = if sync_dir.is_empty() { "Not set up yet".to_string() } else { shown_folder(&sync_dir) };
-                        ui.horizontal(|ui| {
-                            decoration(ui, icons::FOLDER, 18.0, TEXT_MUTED());
-                            elided(ui, RichText::new(&shown).font(crate::bold(14.0)).color(TEXT_PRIMARY()), &sync_dir);
-                        });
-                        ui.label(RichText::new(drive_kind(self.status.vfs.as_ref())).size(12.5).color(TEXT_MUTED()));
+                        ui.with_layout(Layout::top_down(Align::Min), name_and_kind);
                     });
                 });
-            });
+            }
 
             if let (Some(line), Some(hover), Some(st)) =
                 (storage_line(account.as_ref()), storage_hover(account.as_ref()), storage(account.as_ref()))
