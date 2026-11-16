@@ -114,6 +114,8 @@ pub(crate) struct Palette {
     pub(crate) pill_danger: Color32,
     /// A switch's track while it is off
     pub(crate) switch_off: Color32,
+    /// The ring around what has the keyboard's focus
+    pub(crate) focus: Color32,
 }
 
 /// Proton's light theme, as drive.proton.me shows it (#276)
@@ -148,6 +150,7 @@ pub(crate) const LIGHT: Palette = Palette {
     pill_warning: Color32::from_rgb(0xA8, 0x5A, 0x00),
     pill_danger: STATUS_DANGER_HOVER,
     switch_off: Color32::from_rgb(0x85, 0x82, 0x7F), // 3.82:1 on white
+    focus: PROTON_PURPLE,                            // 5.15:1 on white, 4.69:1 on the weak background
 };
 
 /// Proton Carbon, the app's dark theme as it was. The colours it didn't have are taken from it.
@@ -182,6 +185,7 @@ pub(crate) const DARK: Palette = Palette {
     pill_warning: Color32::from_rgb(0xFF, 0xD6, 0xA3),
     pill_danger: Color32::from_rgb(0xFF, 0xBC, 0xC6),
     switch_off: Color32::from_rgb(0x77, 0x70, 0x8F), // 3.52:1 on a card
+    focus: Color32::from_rgb(214, 204, 255),           // the light purple: PROTON_PURPLE is 2.9:1 on a box here
 };
 
 /// The palette of the theme in use.
@@ -234,6 +238,7 @@ tokens! {
     WARNING_SOFT => warning_soft,
     WARNING_LINE => warning_line,
     SWITCH_OFF => switch_off,
+    FOCUS_RING => focus,
 }
 
 /// The WCAG contrast ratio of two opaque colours, from 1 (the same) to 21 (black on white).
@@ -2167,7 +2172,8 @@ impl ProtonDriveNativeApp {
             ui.horizontal(|ui| {
                 ui.set_min_height(34.0);
                 if self.shared.copied.is_some() {
-                    ui.label(RichText::new(icons::CHECK).font(icons::font(16.0)).color(STATUS_SUCCESS));
+                    // The words say it for screen readers: the check is only painted
+                    decoration(ui, icons::CHECK, 16.0, STATUS_SUCCESS);
                     ui.label(RichText::new("Link copied").size(13.0).color(TEXT_MUTED()));
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2493,15 +2499,19 @@ impl ProtonDriveNativeApp {
                                 activity::ActivityKind::RemovedLocally | activity::ActivityKind::FreedUp | activity::ActivityKind::Hidden
                             );
                             let is_folder_act = act.action == "mkdir" || taken_away && !act.local_rel_path.contains('.');
-                            let ic_rect = egui::Rect::from_center_size(
+                            // Phosphor's folder (orange, as Shared's, or grey once taken away) or file
+                            let (icon, icon_color) = match (is_folder_act, taken_away) {
+                                (true, false) => (icons::FOLDER, FOLDER_ICON()),
+                                (true, true) => (icons::FOLDER, TEXT_MUTED()),
+                                (false, _) => (icons::FILE, TEXT_MUTED()),
+                            };
+                            ui.painter().text(
                                 egui::pos2(r_file_x + 9.0, cy),
-                                Vec2::new(17.0, 14.5),
+                                egui::Align2::CENTER_CENTER,
+                                icon,
+                                icons::font(BUTTON_ICON_SIZE),
+                                icon_color,
                             );
-                            if is_folder_act {
-                                draw_folder_icon(ui.painter(), ic_rect, !taken_away);
-                            } else {
-                                draw_file_icon(ui.painter(), ic_rect, &act.local_rel_path);
-                            }
 
                             // Truncate by measured pixel width so long names/details never spill into the next column
                             let col_gap = 16.0;
@@ -2967,7 +2977,7 @@ impl ProtonDriveNativeApp {
             let shown = if sync_dir.is_empty() { "Not set up yet".to_string() } else { shown_folder(sync_dir) };
             settings::setting_row(ui, "Location", Some(home::drive_kind(Some(vfs))), None, |ui| {
                 ui.add(egui::Label::new(RichText::new(&shown).size(13.5).color(TEXT_PRIMARY())).truncate())
-                    .on_hover_text(sync_dir);
+                    .on_hover_text(sync_dir)
             });
             ui.add_space(settings::ROW_GAP);
 
@@ -3099,10 +3109,13 @@ impl ProtonDriveNativeApp {
                     ui.label(RichText::new("No apps are blocked.").size(13.0).color(TEXT_MUTED()));
                 }
                 for app in &apps {
-                    settings::setting_row(ui, app, None, None, |ui| {
-                        if home::secondary_button(ui, "Unblock", 30.0).clicked() {
+                    // A process name, as `ps` shows it: in monospace
+                    settings::code_row(ui, app, |ui| {
+                        let unblock = home::secondary_button(ui, "Unblock", 30.0);
+                        if unblock.clicked() {
                             asked = Some(Ok(without_blocked_app(&apps, app)));
                         }
+                        unblock
                     });
                     ui.add_space(settings::ROW_GAP);
                 }
@@ -3198,12 +3211,15 @@ impl ProtonDriveNativeApp {
                     let group = Vec2::new(field_w + gap + browse_w, 32.0);
                     ui.allocate_ui_with_layout(group, Layout::left_to_right(Align::Center), |ui| {
                         let field = egui::TextEdit::singleline(&mut self.edit_sync_dir).vertical_align(Align::Center);
-                        if ui.add_sized([field_w, 32.0], field).changed() {
+                        let field = ui.add_sized([field_w, 32.0], field);
+                        if field.changed() {
                             self.mark_settings_edited();
                         }
                         ui.add_space(6.0);
                         browse = action_button(ui, ButtonKind::Secondary, None, "Browse...", 32.0).clicked();
-                    });
+                        field
+                    })
+                    .inner
                 },
             );
             ui.add_space(settings::ROW_GAP);
@@ -3222,7 +3238,8 @@ impl ProtonDriveNativeApp {
                             self.mark_settings_edited();
                         }
                     }
-                });
+                })
+                .response
             });
             ui.add_space(settings::ROW_GAP);
 
@@ -3256,9 +3273,11 @@ impl ProtonDriveNativeApp {
                         .margin(margin)
                         .desired_width(ui.available_width().min(settings::WIDE_CONTROL) - margin.sum().x)
                         .font(FontId::new(13.0, FontFamily::Monospace));
-                    if ui.add(editor).changed() {
+                    let editor = ui.add(editor);
+                    if editor.changed() {
                         self.mark_settings_edited();
                     }
+                    editor
                 },
             );
 
@@ -3590,15 +3609,34 @@ fn action_button(ui: &mut egui::Ui, kind: ButtonKind, icon: Option<&str>, label:
     action_button_sized(ui, kind, icon, label, size)
 }
 
+/// `action_button` named `name` for screen readers rather than by its label: a short label that its icon and where it
+/// sits explain to the eye ("Trash"), said in full to the ear ("Open Proton Drive Trash").
+pub(crate) fn action_button_named(
+    ui: &mut egui::Ui,
+    kind: ButtonKind,
+    icon: Option<&str>,
+    label: &str,
+    name: &str,
+    height: f32,
+) -> egui::Response {
+    let size = Vec2::new(action_button_width(ui, icon, label), height);
+    button_with(ui, kind, icon, label, name, size)
+}
+
 /// `action_button` at `size`, with its icon and label centred in it (as wide as the sidebar, say).
 fn action_button_sized(ui: &mut egui::Ui, kind: ButtonKind, icon: Option<&str>, label: &str, size: Vec2) -> egui::Response {
+    button_with(ui, kind, icon, label, label, size)
+}
+
+/// An `action_button` at `size`, named `name`.
+fn button_with(ui: &mut egui::Ui, kind: ButtonKind, icon: Option<&str>, label: &str, name: &str, size: Vec2) -> egui::Response {
     let (fill, hover_fill, stroke, text_color) = match kind {
         ButtonKind::Primary => (PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE),
         ButtonKind::Secondary => (BG_CARD(), BG_CARD_ALT(), Some(Stroke::new(1.0_f32, BORDER_NORM())), TEXT_PRIMARY()),
         ButtonKind::Danger => (STATUS_DANGER, STATUS_DANGER_HOVER, None, Color32::WHITE),
         ButtonKind::DangerOutline => (BG_CARD(), BG_CARD_ALT(), Some(Stroke::new(1.0_f32, BORDER_NORM())), DANGER_TEXT()),
     };
-    let (rect, resp) = button_shell(ui, size, label, fill, hover_fill, stroke);
+    let (rect, resp) = button_shell(ui, size, name, fill, hover_fill, stroke);
     let content = action_button_width(ui, icon, label) - 2.0 * BUTTON_PADDING;
     let mut x = rect.center().x - content / 2.0;
     if let Some(icon) = icon {
@@ -3671,7 +3709,24 @@ fn icon_button_drawn(ui: &mut egui::Ui, icon: &str, label: &str, pressed: Option
     resp.on_hover_text(label).on_disabled_hover_text(label)
 }
 
-/// An on/off switch; the caller flips the state when it is clicked.
+/// A ring around `response`'s widget while it has the keyboard's focus, `radius` its corners' (#277).
+pub(crate) fn focus_ring(ui: &egui::Ui, response: &egui::Response, radius: f32) {
+    if response.has_focus() {
+        let ring = response.rect.expand(2.0);
+        ui.painter().rect_stroke(ring, CornerRadius::same((radius + 2.0) as u8), Stroke::new(2.0_f32, FOCUS_RING()), egui::StrokeKind::Outside);
+    }
+}
+
+/// A glyph that only decorates what is beside it: painted, with no node of its own for screen readers to read out.
+pub(crate) fn decoration(ui: &mut egui::Ui, icon: &str, size: f32, color: Color32) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(icon.to_owned(), icons::font(size), color);
+    let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    ui.painter().galley(rect.min, galley, color);
+    response
+}
+
+/// An on/off switch; the caller flips the state when it is clicked, by the pointer or by the keyboard (Space or Enter
+/// while it has the focus, which its ring shows).
 fn toggle_switch(ui: &mut egui::Ui, on: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(40.0, 22.0), Sense::click());
     if resp.hovered() {
@@ -3686,6 +3741,7 @@ fn toggle_switch(ui: &mut egui::Ui, on: bool) -> egui::Response {
     ui.painter().rect_filled(rect, CornerRadius::same(radius as u8), track);
     let knob_x = if on { rect.right() - radius } else { rect.left() + radius };
     ui.painter().circle_filled(egui::pos2(knob_x, rect.center().y), radius - 3.0, Color32::WHITE);
+    focus_ring(ui, &resp, radius);
     resp
 }
 
@@ -3819,89 +3875,37 @@ fn format_bytes(bytes: u64) -> String {
     format!("{val:.1} {}", units[idx])
 }
 
-fn draw_folder_icon(painter: &egui::Painter, rect: egui::Rect, synced: bool) {
-    let top_color = if synced {
-        Color32::from_rgb(142, 112, 255)
-    } else {
-        Color32::from_rgb(108, 102, 128)
-    };
-    let body_color = if synced {
-        PROTON_PURPLE
-    } else {
-        Color32::from_rgb(84, 78, 104)
-    };
-    let tab_rect = egui::Rect::from_min_size(
-        egui::pos2(rect.min.x, rect.min.y + 1.0),
-        Vec2::new(rect.width() * 0.46, 4.5),
-    );
-    let body_rect = egui::Rect::from_min_max(
-        egui::pos2(rect.min.x, rect.min.y + 4.0),
-        egui::pos2(rect.max.x, rect.max.y - 1.0),
-    );
-    painter.rect_filled(tab_rect, CornerRadius::same(2), top_color);
-    painter.rect_filled(body_rect, CornerRadius::same(3), body_color);
-}
-
-fn draw_file_icon(painter: &egui::Painter, rect: egui::Rect, filename: &str) {
-    let r = egui::Rect::from_min_max(
-        egui::pos2(rect.min.x + 2.0, rect.min.y + 1.0),
-        egui::pos2(rect.max.x - 2.0, rect.max.y - 1.0),
-    );
-    let ext = filename
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
-    let accent = match ext.as_str() {
-        "pdf" => Color32::from_rgb(235, 87, 87),
-        "png" | "jpg" | "jpeg" | "svg" | "webp" | "gif" => STATUS_SUCCESS,
-        "zip" | "tar" | "gz" | "7z" => STATUS_WARNING,
-        "md" | "txt" | "doc" | "docx" => PROTON_PURPLE_HOVER,
-        _ => Color32::from_rgb(154, 148, 176),
-    };
-    painter.rect_filled(r, CornerRadius::same(2), BG_CARD_ALT());
-    painter.rect_stroke(
-        r,
-        CornerRadius::same(2),
-        Stroke::new(1.3_f32, accent),
-        egui::StrokeKind::Inside,
-    );
-    // Two tiny horizontal text lines inside the document icon
-    painter.line_segment(
-        [
-            egui::pos2(r.min.x + 3.5, r.min.y + 6.0),
-            egui::pos2(r.max.x - 3.5, r.min.y + 6.0),
-        ],
-        Stroke::new(1.2_f32, accent),
-    );
-    painter.line_segment(
-        [
-            egui::pos2(r.min.x + 3.5, r.min.y + 9.5),
-            egui::pos2(r.max.x - 5.5, r.min.y + 9.5),
-        ],
-        Stroke::new(1.2_f32, accent),
-    );
-}
-
-/// An Activity row's identity, to keep it open across refreshes: the daemon's id, or without one what it says
-/// A filter chip's fill and label: white on Proton's purple when selected, else the quiet input colours.
-fn chip_colors(p: &Palette, selected: bool) -> (Color32, Color32) {
-    if selected {
-        (PROTON_PURPLE, Color32::WHITE)
-    } else {
-        (p.input, p.text_weak)
+/// A filter chip's fill and label: white on Proton's purple when selected, else the quiet input colours; a shade darker
+/// under the pointer.
+fn chip_colors(p: &Palette, selected: bool, hovered: bool) -> (Color32, Color32) {
+    match (selected, hovered) {
+        (true, false) => (PROTON_PURPLE, Color32::WHITE),
+        (true, true) => (PROTON_PURPLE_HOVER, Color32::WHITE),
+        (false, false) => (p.input, p.text_weak),
+        (false, true) => (p.border_weak, p.text_weak),
     }
 }
 
-/// A filter chip: a pill that fits its label. Returns whether it was clicked.
+/// A filter chip: a pill that fits its label, a toggle for screen readers, with a ring while it has the keyboard's
+/// focus. Returns whether it was clicked (or pressed with Space or Enter).
 fn filter_chip(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
     let font = FontId::new(12.5, FontFamily::Proportional);
-    let width = text_width(ui.painter(), label, &font) + 24.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 28.0), Sense::click());
-    let (fill, text) = chip_colors(palette(), selected);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(chip_width(ui, label), CHIP_HEIGHT), Sense::click());
+    let enabled = ui.is_enabled();
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, enabled, selected, label));
+    let (fill, text) = chip_colors(palette(), selected, resp.hovered());
     ui.painter().rect_filled(rect, CornerRadius::same(14), fill);
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, label, font, text);
+    focus_ring(ui, &resp, CHIP_HEIGHT / 2.0);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+/// A filter chip's height.
+const CHIP_HEIGHT: f32 = 28.0;
+
+/// How wide `filter_chip` makes the chip for `label`.
+fn chip_width(ui: &egui::Ui, label: &str) -> f32 {
+    text_width(ui.painter(), label, &FontId::new(12.5, FontFamily::Proportional)) + 24.0
 }
 
 /// The search field: a rounded input with a magnifier on its left, outlined in purple only while it has focus.
@@ -3927,6 +3931,7 @@ fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32) {
     );
 }
 
+/// An Activity row's identity, to keep it open across refreshes: the daemon's id, or without one what it says
 fn activity_key(act: &ActivityRecord) -> String {
     match act.id {
         Some(id) => format!("#{id}"),
@@ -5893,9 +5898,9 @@ mod tests {
     #[test]
     fn the_selected_chip_is_readable() {
         for p in [&LIGHT, &DARK] {
-            for selected in [true, false] {
-                let (fill, text) = chip_colors(p, selected);
-                assert!(contrast(text, fill) >= 4.5, "selected {selected}: {}", contrast(text, fill));
+            for (selected, hovered) in [(true, false), (true, true), (false, false), (false, true)] {
+                let (fill, text) = chip_colors(p, selected, hovered);
+                assert!(contrast(text, fill) >= 4.5, "selected {selected}, hovered {hovered}: {}", contrast(text, fill));
             }
         }
         let mut h = Harness::new();
@@ -5908,6 +5913,10 @@ mod tests {
         assert_eq!(h.fill_under(uploads), Some(palette().input));
         assert_eq!(h.text_color_at("Uploads"), Some(palette().text_weak));
         h.click(uploads);
+        // Under the pointer still, the purple's hover shade; away from it, the purple
+        assert_eq!(h.fill_under(h.text_at("Uploads").unwrap()), Some(PROTON_PURPLE_HOVER));
+        let away = egui::pos2(h.screen.x - 4.0, h.screen.y - 4.0);
+        hover(&mut h, away);
         assert_eq!(h.fill_under(h.text_at("Uploads").unwrap()), Some(PROTON_PURPLE));
         assert_eq!(h.text_color_at("Uploads"), Some(Color32::WHITE));
         assert_eq!(h.fill_under(h.text_at("All").unwrap()), Some(palette().input));
@@ -6476,14 +6485,14 @@ mod tests {
     }
 
     #[test]
-    fn home_offers_trash_with_its_old_hover() {
+    fn home_offers_trash_saying_where_it_goes_on_hover() {
         let mut h = home_with(|s| s.sync_dir = "/srv/u/ProtonDrive".into());
         let label = h.text_at("Trash").expect("Home offers Trash");
         let glyph = h.text_at(icons::TRASH).expect("the trash icon is painted");
         assert!(glyph.x < label.x && (glyph.y - label.y).abs() < 4.0, "the icon {glyph:?} is before the label {label:?}");
         tooltips_at_once(&h);
         hover(&mut h, label);
-        assert!(h.text_at(&home::trash_hover("/srv/u/ProtonDrive")).is_some(), "hovering Trash says where restored files go");
+        assert!(h.text_at(&home::trash_hover("/srv/u/ProtonDrive")).is_some(), "hovering Trash says it opens the web, and where restored files go");
     }
 
     #[test]
@@ -6531,7 +6540,8 @@ mod tests {
     fn the_trash_hover_says_where_restored_files_come_back() {
         assert_eq!(
             home::trash_hover(""),
-            "Deleted files stay here until you empty the trash or restore them. Restoring brings them back to ~/ProtonDrive."
+            "Open Proton Drive's trash on the web. Deleted files stay there until you empty the trash or restore them. \
+             Restoring brings them back to ~/ProtonDrive."
         );
         assert!(home::trash_hover("/srv/u/Elsewhere").ends_with("Restoring brings them back to /srv/u/Elsewhere."));
     }
@@ -7185,11 +7195,11 @@ mod tests {
     }
 
     /// Every filled rectangle the last frame painted (the cards, the boxes in them, the buttons), each with the clip it
-    /// was painted in: what of it shows.
-    fn filled_rects(h: &Harness) -> Vec<(egui::Rect, egui::Rect)> {
-        fn rects(shape: &egui::Shape, clip: egui::Rect, out: &mut Vec<(egui::Rect, egui::Rect)>) {
+    /// was painted in (what of it shows) and its fill.
+    fn filled_rects(h: &Harness) -> Vec<(egui::Rect, egui::Rect, Color32)> {
+        fn rects(shape: &egui::Shape, clip: egui::Rect, out: &mut Vec<(egui::Rect, egui::Rect, Color32)>) {
             match shape {
-                egui::Shape::Rect(r) if r.fill != Color32::TRANSPARENT => out.push((r.rect, clip)),
+                egui::Shape::Rect(r) if r.fill != Color32::TRANSPARENT => out.push((r.rect, clip, r.fill)),
                 egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| rects(s, clip, out)),
                 _ => {}
             }
@@ -7274,7 +7284,7 @@ mod tests {
                     for (name, b) in section_buttons(&h) {
                         all.insert(name.clone());
                         let own = |r: &egui::Rect| (r.min - b.min).length() < 0.5 && (r.max - b.max).length() < 0.5;
-                        let in_sight = frames.iter().any(|(r, clip)| own(r) && clip.top() <= b.top() + 0.5 && b.bottom() <= clip.bottom() + 0.5);
+                        let in_sight = frames.iter().any(|(r, clip, _)| own(r) && clip.top() <= b.top() + 0.5 && b.bottom() <= clip.bottom() + 0.5);
                         if !in_sight {
                             continue;
                         }
@@ -7283,7 +7293,7 @@ mod tests {
                         // Its box and its card hold the whole of it, and keep to the section's room (a card grown wider
                         // than the window has room for runs into the scroll bar's gutter and on out of the window)
                         let room = h.screen.x - SECTION_MARGIN.rightf() - SCROLL_GUTTER.rightf();
-                        for (frame, _) in frames.iter().filter(|(r, clip)| r.intersect(*clip).contains(b.center()) && !own(r) && !section(r)) {
+                        for (frame, _, _) in frames.iter().filter(|(r, clip, _)| r.intersect(*clip).contains(b.center()) && !own(r) && !section(r)) {
                             assert!(frame.expand(0.5).contains_rect(b), "{at}: {name:?} {b:?} runs out of the frame {frame:?}");
                             assert!(frame.right() <= room + 0.5, "{at}: the frame {frame:?} of {name:?} runs past the section's room {room}");
                         }
@@ -8874,34 +8884,327 @@ mod tests {
         assert!(h.text_at("Sign out").is_some(), "Sign out stays as it was");
     }
 
-    // #276: at the smallest window, at 120% zoom too (where the controls go under their labels), and at the screenshots'
-    // size, no text of Settings runs out of its card or over another
+    /// Every node the last frame gave screen readers, by id.
+    fn accesskit_nodes(h: &Harness) -> Vec<(egui::accesskit::NodeId, egui::accesskit::Node)> {
+        h.last
+            .as_ref()
+            .and_then(|o| o.platform_output.accesskit_update.as_ref())
+            .map_or_else(Vec::new, |update| update.nodes.clone())
+    }
+
+    /// What a node says: a widget's name, or a label's words.
+    fn says(node: &egui::accesskit::Node) -> String {
+        node.label().or(node.value()).unwrap_or_default().to_string()
+    }
+
+    /// Where a node is.
+    fn node_rect(node: &egui::accesskit::Node) -> egui::Rect {
+        let b = node.bounds().expect("placed");
+        egui::Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32))
+    }
+
+    /// What names a node for screen readers: what its labels say.
+    fn labelled_by(h: &Harness, node: &egui::accesskit::Node) -> Vec<String> {
+        let nodes = accesskit_nodes(h);
+        node.labelled_by().iter().filter_map(|id| nodes.iter().find(|(i, _)| i == id)).map(|(_, n)| says(n)).collect()
+    }
+
+    /// The node that has the keyboard's focus, if a widget has it.
+    fn focused(h: &Harness) -> Option<egui::accesskit::Node> {
+        let update = h.last.as_ref()?.platform_output.accesskit_update.as_ref()?;
+        update.nodes.iter().find(|(id, _)| *id == update.focus).map(|(_, n)| n.clone())
+    }
+
+    /// Each stop of the Tab key from where the focus is, once round, as what it is and what it says.
+    fn tab_stops(h: &mut Harness) -> Vec<(egui::accesskit::Role, String)> {
+        let mut stops = Vec::new();
+        for _ in 0..200 {
+            press_key(h, Key::Tab);
+            let Some(node) = focused(h) else { continue };
+            let stop = (node.role(), says(&node));
+            if stops.first() == Some(&stop) {
+                return stops;
+            }
+            stops.push(stop);
+        }
+        panic!("the Tab key never came round: {stops:?}");
+    }
+
+    /// Presses Tab until the widget saying `what` has the focus.
+    fn tab_to(h: &mut Harness, what: &str) {
+        for _ in 0..200 {
+            press_key(h, Key::Tab);
+            if focused(h).is_some_and(|n| says(&n) == what) {
+                return;
+            }
+        }
+        panic!("the Tab key never reaches {what:?}");
+    }
+
+    /// The focus rings the last frame painted.
+    fn focus_rings(h: &Harness) -> Vec<egui::Rect> {
+        fn rings(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Rect(r) if r.stroke.color == FOCUS_RING() && r.stroke.width >= 2.0 => out.push(r.rect),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| rings(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in h.last.iter().flat_map(|o| o.shapes.iter()) {
+            rings(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    const SYNC_FOLDER_INFO: &str = "Changing the sync location safely moves your existing synced files to the new folder, switches the real-time file watcher, and preserves all cloud files without re-uploading or deleting them.";
+    const IGNORE_INFO: &str = "Matching files or folders (e.g. .git, node_modules, *.part) are skipped during two-way sync.";
+    const AT_LOGIN_INFO: &str = "Syncs and mounts the drive at login, with the tray icon, without opening this window";
+    const DRIVE_INFO: &str = "Files you haven't downloaded appear in Files and download when you open them.";
+    const BLOCKED_INFO: &str = "These apps can't download online-only files. Files they already have on this computer still open.";
+    const HIDDEN_INFO: &str =
+        "Hidden items stay in Proton Drive, but aren't kept on this computer or shown in Files. To hide something, right-click it in Files.";
+
+    // R19: the ⓘ's words are for the keyboard too, the labels are no stops of the Tab key, and the controls are named by
+    // their labels and described by their ⓘ
     #[test]
-    fn settings_rows_fit_at_840_by_540_and_120_percent() {
+    fn settings_reads_to_the_keyboard_and_to_screen_readers() {
+        use egui::accesskit::Role;
+        let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        h.app.status.settings.blocked_apps = vec!["rg".into()];
+        h.frames(2);
+        let stops = tab_stops(&mut h);
+        for label in [
+            SWITCH,
+            "Location",
+            "Local Sync Folder",
+            "Conflict Resolution Strategy",
+            "Enable Ubuntu desktop notifications",
+            "Start Proton Drive when I log in",
+            "Ignore Patterns (Glob)",
+            "Theme",
+            "rg",
+        ] {
+            assert!(!stops.contains(&(Role::Label, label.into())), "{label:?} is a stop of the Tab key: {stops:?}");
+        }
+        for info in [SYNC_FOLDER_INFO, IGNORE_INFO, AT_LOGIN_INFO, DRIVE_INFO, BLOCKED_INFO, HIDDEN_INFO] {
+            assert!(stops.contains(&(Role::Label, info.into())), "the ⓘ saying {info:?} is a stop of the Tab key: {stops:?}");
+        }
+        // A switch is one stop, named by its words
+        assert!(stops.contains(&(Role::CheckBox, "Enable Ubuntu desktop notifications".into())), "{stops:?}");
+
+        // The ⓘ with the focus shows its words, with a ring
+        assert!(h.text_at(SYNC_FOLDER_INFO).is_none());
+        tab_to(&mut h, SYNC_FOLDER_INFO);
+        assert!(h.text_at(SYNC_FOLDER_INFO).is_some(), "the focused ⓘ says it");
+        let info = info_after(&h, "Local Sync Folder");
+        assert!(focus_rings(&h).iter().any(|r| r.contains(info)), "with its ring");
+
+        // Each control named by its label, and described by its ⓘ
+        let nodes = accesskit_nodes(&h);
+        let find = |role: Role, label: &str| {
+            nodes
+                .iter()
+                .map(|(_, n)| n)
+                .find(|n| n.role() == role && labelled_by(&h, n) == vec![label.to_string()])
+                .unwrap_or_else(|| panic!("a {role:?} named by {label:?}"))
+        };
+        for (role, label, info) in [
+            (Role::TextInput, "Local Sync Folder", Some(SYNC_FOLDER_INFO)),
+            (Role::ComboBox, "Conflict Resolution Strategy", None),
+            (Role::ComboBox, "Theme", None),
+            (Role::MultilineTextInput, "Ignore Patterns (Glob)", Some(IGNORE_INFO)),
+            (Role::CheckBox, "Start Proton Drive when I log in", Some(AT_LOGIN_INFO)),
+            (Role::CheckBox, SWITCH, Some(DRIVE_INFO)),
+        ] {
+            let node = find(role, label);
+            assert_eq!(node.description(), info, "{label}'s description");
+            if role == Role::ComboBox {
+                assert_eq!(node.label(), None, "{label}: no empty name of its own over its label's");
+            }
+        }
+    }
+
+    // #277's first case: the switches show the keyboard's focus, and Space flips them as a click does
+    #[test]
+    fn a_switch_shows_the_keyboards_focus_and_space_flips_it() {
+        let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        tab_to(&mut h, "Enable Ubuntu desktop notifications");
+        let switch = h.nodes_named("Enable Ubuntu desktop notifications").into_iter().find(|n| n.role() == egui::accesskit::Role::CheckBox).unwrap();
+        let switch = node_rect(&switch);
+        assert!(focus_rings(&h).iter().any(|r| r.contains_rect(switch)), "a ring around the switch {switch:?}");
+        let was = h.app.edit_notifications;
+        press_key(&mut h, Key::Space);
+        assert_eq!(h.app.edit_notifications, !was, "Space flips it");
+        assert!(h.app.settings_dirty);
+        assert_eq!(h.sent(), Vec::<String>::new(), "it waits for Save, as a click does");
+    }
+
+    // R17: Activity's chips are toggles for screen readers, fill a shade darker under the pointer and show the
+    // keyboard's focus
+    #[test]
+    fn activity_chips_are_toggles_with_a_hover_and_a_focus_ring() {
+        use egui::accesskit::Toggled;
+        let mut h = Harness::new();
+        h.app.tab = NavTab::Activity;
+        h.frames(3);
+        let chip = |h: &Harness, label: &str| {
+            let nodes = h.nodes_named(label);
+            assert_eq!(nodes.len(), 1, "one {label:?} chip for screen readers");
+            nodes[0].clone()
+        };
+        assert_eq!(chip(&h, "All").toggled(), Some(Toggled::True));
+        assert_eq!(chip(&h, "Uploads").toggled(), Some(Toggled::False));
+        let uploads = h.text_at("Uploads").unwrap();
+        hover(&mut h, uploads);
+        assert_eq!(h.fill_under(uploads), Some(palette().border_weak), "a shade darker under the pointer");
+        tab_to(&mut h, "Uploads");
+        let rect = node_rect(&chip(&h, "Uploads"));
+        assert!(focus_rings(&h).iter().any(|r| r.contains_rect(rect)), "a ring around {rect:?}");
+        press_key(&mut h, Key::Space);
+        assert_eq!(h.app.activity_filter, activity::ActivityFilter::Uploads, "Space picks it");
+        assert_eq!(chip(&h, "Uploads").toggled(), Some(Toggled::True));
+    }
+
+    // R19 5 and 2(c): the short Web and Trash say their whole phrase to screen readers, and Trash says on hover that it
+    // opens the web
+    #[test]
+    fn web_and_trash_are_named_in_full() {
+        let mut h = settings_tall(None, None);
+        for (painted, name) in [("Web", home::OPEN_WEB), ("Trash", home::OPEN_TRASH)] {
+            let button = h.widget_at(name).unwrap_or_else(|| panic!("{name:?} for screen readers"));
+            let label = h.text_at(painted).unwrap();
+            assert!((button.y - label.y).abs() < 4.0 && (button.x - label.x).abs() < 30.0, "{name:?} is the button saying {painted:?}");
+            assert!(h.widget_at(painted).is_none(), "not named {painted:?}");
+        }
+        let trash = h.text_at("Trash").unwrap();
+        hover(&mut h, trash);
+        assert!(h.text_at(&home::trash_hover(&h.app.status.sync_dir)).is_some());
+        assert!(home::trash_hover("").starts_with("Open Proton Drive's trash on the web."));
+        let h = home_with(|_| {});
+        assert!(h.widget_at(home::OPEN_TRASH).is_some() && h.widget_at("Trash").is_none(), "Home's Trash too");
+    }
+
+    // R19 6: apps' process names, as `ps` shows them, in monospace
+    #[test]
+    fn blocked_apps_are_named_in_monospace() {
+        let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        h.app.status.settings.blocked_apps = vec!["rg".into()];
+        h.frames(2);
+        let rg = h.texts(|t| t.galley.text() == "rg");
+        assert_eq!(rg.len(), 1, "rg is listed");
+        assert_eq!(rg[0].galley.job.sections[0].format.font_id.family, FontFamily::Monospace);
+    }
+
+    // R19 4: the conflict choice, cut short in a narrow window, is whole on hover
+    #[test]
+    fn a_cut_short_choice_is_whole_on_hover() {
+        const CHOICE: &str = "Keep Both (Save conflict copy with timestamp)";
+        let mut h = Harness::settings(None, None);
+        h.resize_zoomed(Vec2::new(840.0, 2400.0), 1.0);
+        tooltips_at_once(&h);
+        let whole = |h: &Harness| h.texts(|t| t.galley.text() == CHOICE && !t.galley.elided).len();
+        assert_eq!(whole(&h), 0, "cut short at 840");
+        let shown = h.text_rect_starting("Keep Both (").expect("the picker shows the choice's start");
+        hover(&mut h, shown.center());
+        assert_eq!(whole(&h), 1, "whole on hover");
+    }
+
+    // R2(e): glyphs that only decorate are painted, with nothing of their own for screen readers to read out
+    #[test]
+    fn decorative_glyphs_say_nothing_to_screen_readers() {
+        let silent = |h: &Harness, glyph: &str| accesskit_nodes(h).iter().all(|(_, n)| says(n) != glyph);
+        let h = home_with(|_| {});
+        for glyph in [icons::CHECK, icons::FOLDER] {
+            assert!(h.text_at(glyph).is_some(), "{glyph:?} is painted");
+            assert!(silent(&h, glyph), "{glyph:?} is read out");
+        }
+        let mut h = shared_with_rows();
+        h.click(on_row(&h, "report.pdf", "Copy link"));
+        assert!(h.label_at("Link copied").is_some());
+        assert!(h.text_at(icons::CHECK).is_some() && silent(&h, icons::CHECK), "the copied check is read out");
+    }
+
+    // R17: Activity's rows show Phosphor's folder and file, as Shared's do
+    #[test]
+    fn activity_rows_show_phosphors_folder_and_file() {
+        let mut h = Harness::new();
+        h.app.tab = NavTab::Activity;
+        let record = |id: u64, action: &str, path: &str| ActivityRecord {
+            id: Some(id),
+            timestamp: 0,
+            action: action.into(),
+            local_rel_path: path.into(),
+            details: String::new(),
+        };
+        h.app.activities = vec![record(1, "mkdir", "Docs"), record(2, "upload", "Docs/a.pdf")];
+        h.frames(2);
+        let beside = |h: &Harness, name: &str, icon: &str| {
+            let name = h.text_rect(name).unwrap();
+            h.texts(|t| t.galley.text() == icon)
+                .into_iter()
+                .find(|t| (t.visual_bounding_rect().center().y - name.center().y).abs() < 4.0 && t.visual_bounding_rect().right() <= name.left())
+                .map(|t| t.galley.job.sections[0].format.color)
+        };
+        assert_eq!(beside(&h, "Docs", icons::FOLDER), Some(FOLDER_ICON()), "a folder, orange");
+        assert_eq!(beside(&h, "Docs/a.pdf", icons::FILE), Some(TEXT_MUTED()), "a file");
+    }
+
+    // #276, R19 3: at the smallest window, at 120% zoom (where the controls go under their labels) and at the
+    // screenshots' size, in a 540-tall window scrolled from top to bottom: no widget (its frame, as screen readers are
+    // told it) and no text runs out of its card, and no two texts run over each other
+    #[test]
+    fn settings_fits_its_cards_in_a_540_tall_window_scrolled_at_840_and_120_percent() {
+        use egui::accesskit::Role;
         let mut h = Harness::settings(Some(vfs("virtual", true, None)), Some(true));
         h.app.status.account = Some(gautam());
         h.app.status.settings.blocked_apps = vec!["rg".into(), "backup.sh".into()];
         h.event(WorkerEvent::HiddenLoaded(Ok(vec![hidden("Documents/Private", "hiding"), hidden("Music", "hidden")])));
         for (width, zoom) in [(840.0, 1.2), (840.0, 1.0), (1100.0, 1.0)] {
-            // Tall, to paint every card at once: only the width is tight
-            h.resize_zoomed(Vec2::new(width, 3600.0), zoom);
-            let texts: Vec<(String, egui::Rect)> = h
-                .texts(|t| !t.galley.text().trim().is_empty())
-                .iter()
-                .map(|t| (t.galley.text().to_string(), t.visual_bounding_rect()))
-                .filter(|(_, r)| r.left() > SIDEBAR_EDGE && r.top() > chrome::TOP_BAR_HEIGHT)
-                .collect();
-            assert!(texts.iter().any(|(t, _)| t == "Save Preferences"), "{width}@{zoom}: every card is painted");
-            // The section's margin (26), the scroll bar's gutter (12) and a card's own (18)
-            let card_inside = h.screen.x - 26.0 - 12.0 - 18.0;
-            for (text, rect) in &texts {
-                assert!(rect.right() <= card_inside + 0.5, "{width}@{zoom}: {text:?} runs out of its card: {rect:?}");
-            }
-            for (i, (a, ra)) in texts.iter().enumerate() {
-                for (b, rb) in &texts[i + 1..] {
-                    assert!(!ra.shrink(0.5).intersects(rb.shrink(0.5)), "{width}@{zoom}: {a:?} {ra:?} runs over {b:?} {rb:?}");
+            h.resize_zoomed(Vec2::new(width, 540.0), zoom);
+            let at = format!("{width}x540 at {zoom}");
+            let gutter = egui::pos2(h.screen.x - SECTION_MARGIN.rightf() - SCROLL_GUTTER.rightf() / 2.0, h.screen.y / 2.0);
+            h.scroll(gutter, -10_000.0);
+            let (mut widgets, mut seen_save) = (0, false);
+            for _ in 0..40 {
+                // The cards: the widest of what is filled in the cards' colour (an outlined button is too)
+                let frames = filled_rects(&h);
+                let widest = frames.iter().filter(|(_, _, f)| *f == BG_CARD()).map(|(r, _, _)| r.width()).fold(0.0, f32::max);
+                let cards: Vec<egui::Rect> = frames
+                    .iter()
+                    .filter(|(r, _, f)| *f == BG_CARD() && r.width() == widest)
+                    .map(|(r, _, _)| r.shrink2(Vec2::new(card_frame().inner_margin.leftf(), 0.0)))
+                    .collect();
+                let card_of = |r: egui::Rect| cards.iter().find(|c| c.y_range().contains(r.center().y)).copied();
+                let in_sight = |r: egui::Rect| r.left() > SIDEBAR_EDGE && r.top() >= chrome::TOP_BAR_HEIGHT && r.bottom() <= h.screen.y;
+                for (_, node) in accesskit_nodes(&h) {
+                    if matches!(node.role(), Role::Unknown | Role::Window) || node.bounds().is_none() || !in_sight(node_rect(&node)) {
+                        continue;
+                    }
+                    let r = node_rect(&node);
+                    let card = card_of(r).unwrap_or_else(|| panic!("{at}: {:?} {:?} {r:?} is in a card", node.role(), says(&node)));
+                    assert!(r.left() >= card.left() - 0.5 && r.right() <= card.right() + 0.5, "{at}: {:?} {:?} {r:?} runs out of its card {card:?}", node.role(), says(&node));
+                    widgets += 1;
                 }
+                let texts: Vec<(String, egui::Rect)> = h
+                    .texts(|t| !t.galley.text().trim().is_empty())
+                    .iter()
+                    .map(|t| (t.galley.text().to_string(), t.visual_bounding_rect()))
+                    .filter(|(_, r)| in_sight(*r))
+                    .collect();
+                seen_save |= texts.iter().any(|(t, _)| t == "Save Preferences");
+                for (text, r) in &texts {
+                    let card = card_of(*r).unwrap_or_else(|| panic!("{at}: {text:?} {r:?} is in a card"));
+                    assert!(r.right() <= card.right() + 0.5, "{at}: {text:?} runs out of its card: {r:?}");
+                }
+                for (i, (a, ra)) in texts.iter().enumerate() {
+                    for (b, rb) in &texts[i + 1..] {
+                        assert!(!ra.shrink(0.5).intersects(rb.shrink(0.5)), "{at}: {a:?} {ra:?} runs over {b:?} {rb:?}");
+                    }
+                }
+                h.scroll(gutter, 100.0);
             }
+            assert!(seen_save && widgets > 20, "{at}: scrolled to the end, past {widgets} widgets");
         }
     }
 

@@ -7,7 +7,7 @@ use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, Ri
 
 use crate::icons;
 use crate::{
-    action_button, action_button_if, card_frame, drive_status_line, files_safe_hint, format_bytes, offers_mount_again,
+    action_button, action_button_if, action_button_named, card_frame, decoration, drive_status_line, files_safe_hint, format_bytes, offers_mount_again,
     render_transfer_line, shown_folder, spawn_reaped, AccountInfo, ButtonKind, ConflictRecord, DaemonStatus,
     PendingConfirm, ProtonDriveNativeApp, VfsStatus, WorkerCommand, BG_CARD_ALT, BORDER_SUBTLE, DANGER_TEXT, PROTON_PURPLE,
     PROTON_PURPLE_TEXT, SCREENSHOT_MODE, SUCCESS_TEXT, TEXT_MUTED, TEXT_PRIMARY, WARNING_TEXT,
@@ -400,13 +400,21 @@ pub(crate) fn open_in_files(folder: &std::path::Path) {
 /// Proton Drive on the web, and its trash: where a delete through the drive puts what was deleted (#201)
 pub(crate) const PROTON_DRIVE_WEB_URL: &str = "https://drive.proton.me";
 pub(crate) const PROTON_DRIVE_TRASH_URL: &str = "https://drive.proton.me/trash";
+/// Proton Drive on the web: the account menu's item, and the name and hover of Settings' Web button
+pub(crate) const OPEN_WEB: &str = "Open Proton Drive on the web";
 /// What the trash's buttons say, on Home and in Settings' Account card; their hover says more (`trash_hover`)
 pub(crate) const TRASH_BUTTON: &str = "Trash";
+/// The trash's buttons' name for screen readers: the whole of what their short label stands for
+pub(crate) const OPEN_TRASH: &str = "Open Proton Drive Trash";
 
-/// What the trash button says on hover: deleted files wait there, and come back to the sync folder when restored
+/// What the trash button says on hover: it opens the web's trash, where deleted files wait, and from where they come
+/// back to the sync folder when restored
 pub(crate) fn trash_hover(sync_dir: &str) -> String {
     let folder = if sync_dir.is_empty() { "~/ProtonDrive".to_string() } else { shown_folder(sync_dir) };
-    format!("Deleted files stay here until you empty the trash or restore them. Restoring brings them back to {folder}.")
+    format!(
+        "Open Proton Drive's trash on the web. Deleted files stay there until you empty the trash or restore them. \
+         Restoring brings them back to {folder}."
+    )
 }
 
 /// Opens a page in the default browser; a screenshot opens nothing.
@@ -653,8 +661,9 @@ impl ProtonDriveNativeApp {
 
     /// The status's glyph, then its headline over what it says more.
     fn render_status_headline(&self, ui: &mut egui::Ui, summary: &StatusSummary, show_sign_in: bool) {
+        // The headline says it for screen readers: the glyph is only painted
         let (glyph, color) = status_icon(summary);
-        ui.label(RichText::new(glyph).font(icons::font(32.0)).color(color));
+        decoration(ui, glyph, 32.0, color);
         ui.add_space(4.0);
         ui.with_layout(Layout::top_down(Align::Min), |ui| {
             let headline = RichText::new(&summary.headline).font(crate::bold(18.0)).color(tone_color(summary.tone));
@@ -876,7 +885,8 @@ impl ProtonDriveNativeApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // The trash, on the right. Not before a folder is set up
                     if !sync_dir.is_empty() {
-                        if secondary_icon_button(ui, icons::TRASH, TRASH_BUTTON, 32.0).on_hover_text(trash_hover(&sync_dir)).clicked() {
+                        let trash = action_button_named(ui, ButtonKind::Secondary, Some(icons::TRASH), TRASH_BUTTON, OPEN_TRASH, 32.0);
+                        if trash.on_hover_text(trash_hover(&sync_dir)).clicked() {
                             open_in_browser(PROTON_DRIVE_TRASH_URL);
                         }
                         ui.add_space(8.0);
@@ -884,7 +894,7 @@ impl ProtonDriveNativeApp {
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
                         let shown = if sync_dir.is_empty() { "Not set up yet".to_string() } else { shown_folder(&sync_dir) };
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(icons::FOLDER).font(icons::font(18.0)).color(TEXT_MUTED()));
+                            decoration(ui, icons::FOLDER, 18.0, TEXT_MUTED());
                             elided(ui, RichText::new(&shown).font(crate::bold(14.0)).color(TEXT_PRIMARY()), &sync_dir);
                         });
                         ui.label(RichText::new(drive_kind(self.status.vfs.as_ref())).size(12.5).color(TEXT_MUTED()));
