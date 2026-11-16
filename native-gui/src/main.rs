@@ -2715,8 +2715,7 @@ impl ProtonDriveNativeApp {
                             } else {
                                 ButtonKind::Primary
                             };
-                            if action_button(ui, kind, None, button, 36.0).clicked()
-                            {
+                            if action_button(ui, kind, None, button, 36.0).clicked() {
                                 // Exhaustive on purpose: a new variant must say what it sends, not fall into availability
                                 match &confirm {
                                     PendingConfirm::VirtualDriveOff => {
@@ -2744,9 +2743,7 @@ impl ProtonDriveNativeApp {
 
                             ui.add_space(8.0);
 
-                            if action_button(ui, ButtonKind::Secondary, None, cancel, 36.0)
-                            .clicked()
-                            {
+                            if action_button(ui, ButtonKind::Secondary, None, cancel, 36.0).clicked() {
                                 self.pending_confirm = None;
                             }
                         });
@@ -2819,7 +2816,7 @@ impl ProtonDriveNativeApp {
                         chosen = Some(MissingChoice::KeepOnlineOnly);
                     }
                     ui.add_space(4.0);
-                    let delete = action_button(ui, ButtonKind::DangerOutline, Some(icons::TRASH), "Delete them from Proton Drive too", 32.0);
+                    let delete = action_button(ui, ButtonKind::DangerLabel, Some(icons::TRASH), "Delete them from Proton Drive too", 32.0);
                     if delete.on_hover_text("Asks first. While they are missing, nothing is deleted in Proton Drive.").clicked() {
                         chosen = Some(MissingChoice::DeleteInCloud);
                     }
@@ -3561,8 +3558,8 @@ pub(crate) enum ButtonKind {
     Secondary,
     /// Red, for a confirmation that deletes
     Danger,
-    /// A secondary button whose label is red: a choice that deletes, short of a confirmation
-    DangerOutline,
+    /// A secondary button (its outline neutral) whose label is red: a choice that deletes, short of a confirmation
+    DangerLabel,
 }
 
 /// A button as wide as its icon and label: the icon (one of `icons::*`) first, then the label, in `kind`'s colours.
@@ -3597,7 +3594,7 @@ fn button_with(ui: &mut egui::Ui, kind: ButtonKind, icon: Option<&str>, label: &
         ButtonKind::Primary => (PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE),
         ButtonKind::Secondary => (BG_CARD(), BG_CARD_ALT(), Some(Stroke::new(1.0_f32, BORDER_NORM())), TEXT_PRIMARY()),
         ButtonKind::Danger => (STATUS_DANGER, STATUS_DANGER_HOVER, None, Color32::WHITE),
-        ButtonKind::DangerOutline => (BG_CARD(), BG_CARD_ALT(), Some(Stroke::new(1.0_f32, BORDER_NORM())), DANGER_TEXT()),
+        ButtonKind::DangerLabel => (BG_CARD(), BG_CARD_ALT(), Some(Stroke::new(1.0_f32, BORDER_NORM())), DANGER_TEXT()),
     };
     let (rect, resp) = button_shell(ui, size, name, fill, hover_fill, stroke);
     let content = action_button_width(ui, icon, label) - 2.0 * BUTTON_PADDING;
@@ -3714,7 +3711,8 @@ const ACTIVITY_TABLE_MIN_HEIGHT: f32 = 200.0;
 /// problems too, not only among the latest few (#94)
 const ACTIVITY_FETCHED: usize = 200;
 const ACTIVITY_SHOWN: usize = 200;
-/// About the width of the Activity filter (All, Uploads, Downloads, Problems), kept free beside the search
+/// The Activity search field's width at its widest; narrower when its line has less room (the chips go to the next
+/// line when they don't fit beside it)
 const ACTIVITY_SEARCH_WIDTH: f32 = 260.0;
 
 /// The family bold text is laid out in: Inter SemiBold (#279).
@@ -3982,7 +3980,6 @@ fn text_width(painter: &egui::Painter, text: &str, font: &FontId) -> f32 {
         .x
 }
 
-/// Middle-truncate `s` so it fits within `max_width` pixels when drawn in `font`.
 /// `s` cut at its end to fit `max_width`, with an ellipsis: for a phrase, which reads from its start.
 fn truncate_end_to_width(painter: &egui::Painter, s: &str, font: &FontId, max_width: f32) -> String {
     if max_width <= 0.0 {
@@ -4007,6 +4004,7 @@ fn truncate_end_to_width(painter: &egui::Painter, s: &str, font: &FontId, max_wi
     if text_width(painter, &out, font) <= max_width { out } else { String::new() }
 }
 
+/// `s` cut in its middle, with an ellipsis, to fit `max_width` when drawn in `font`: for a path, whose end says most.
 fn truncate_middle_to_width(painter: &egui::Painter, s: &str, font: &FontId, max_width: f32) -> String {
     // No room at all (e.g. a collapsed column when zoomed in): draw nothing rather than overlap
     if max_width <= 0.0 {
@@ -5441,18 +5439,7 @@ mod tests {
 
         /// The fill of the topmost rectangle the last frame painted under a point (a button's background).
         fn fill_under(&self, pos: egui::Pos2) -> Option<Color32> {
-            fn rects(shape: &egui::Shape, out: &mut Vec<(egui::Rect, Color32)>) {
-                match shape {
-                    egui::Shape::Rect(r) => out.push((r.rect, r.fill)),
-                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| rects(s, out)),
-                    _ => {}
-                }
-            }
-            let mut all = Vec::new();
-            for clipped in &self.last.as_ref()?.shapes {
-                rects(&clipped.shape, &mut all);
-            }
-            all.into_iter().rev().find(|(rect, fill)| rect.contains(pos) && *fill != Color32::TRANSPARENT).map(|(_, fill)| fill)
+            self.rect_under(pos).map(|(_, fill)| fill)
         }
 
         /// The actions asked of the worker since the last call (reads, such as refreshes, are left out, except the Share
@@ -8109,11 +8096,16 @@ mod tests {
         for header in ["Name", "Location", "Sharing"] {
             assert!(h.text_at(header).is_some(), "{header:?} is shown");
         }
-        // Names too, shortened in the middle
+        // Names too, on their row's line: whole, or shortened in the middle, keeping their start and their end
         for item in shared_rows() {
+            let row = h.label_at(&item.name).unwrap_or_else(|| panic!("{:?}'s cell is there for screen readers", item.name));
             let (first, last) = (item.name.chars().next().unwrap(), item.name.chars().last().unwrap());
-            let shown = h.texts(|t| t.galley.text().starts_with(first) && t.galley.text().ends_with(last)).len();
-            assert!(shown > 0, "{:?} shows its start and its end", item.name);
+            let shown = h.texts(|t| {
+                let text = t.galley.text();
+                (t.visual_bounding_rect().center().y - row.y).abs() < SHARED_ROW_HALF
+                    && (text == item.name || text.contains('…') && text.starts_with(first) && text.ends_with(last))
+            });
+            assert!(!shown.is_empty(), "{:?} shows its start and its end on its row", item.name);
         }
     }
 
