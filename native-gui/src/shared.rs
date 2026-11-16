@@ -1,8 +1,9 @@
 //! The Shared page's model and wording: what the daemon's GET /share/list gives, and how a row says where the item is,
-//! what it exposes and what stopping the sharing costs.
+//! what it exposes (in words and in marks) and what stopping the sharing costs.
 
 use serde::Deserialize;
 
+use crate::icons;
 use crate::share::{self, date_text, local_day, Role, ShareLink};
 
 /// Where a shared item is, as the daemon words it.
@@ -51,6 +52,48 @@ pub fn folder_text(item: &SharedItem) -> String {
     match item.place {
         Place::Hidden => format!("{folder} · Hidden from this computer"),
         _ => folder.to_string(),
+    }
+}
+
+/// The Location column: the folder in My files, or where the item is instead. A hidden item's folder is in the hover
+/// text (`folder_text`).
+pub fn location_text(item: &SharedItem) -> String {
+    match item.place {
+        Place::MyFiles => folder_text(item),
+        Place::Hidden => "Hidden from this computer".to_string(),
+        Place::Elsewhere => "Not on this computer".to_string(),
+    }
+}
+
+/// The Sharing column's marks, in order: the link (broken once expired), its password, its expiry while it is ahead,
+/// and the people. An item whose sharing couldn't be read has none: the row says why instead.
+pub fn sharing_marks(item: &SharedItem, now_ms: i64) -> Vec<&'static str> {
+    let mut marks = Vec::new();
+    if item.unreadable.is_some() {
+        return marks;
+    }
+    if let Some(link) = &item.link {
+        let expired = link.expires_at.is_some_and(|at| at <= now_ms);
+        marks.push(if expired { icons::LINK_BROKEN } else { icons::LINK });
+        if link.has_password {
+            marks.push(icons::LOCK);
+        }
+        if link.expires_at.is_some() && !expired {
+            marks.push(icons::CLOCK);
+        }
+    }
+    if item.people > 0 {
+        marks.push(icons::PEOPLE);
+    }
+    marks
+}
+
+/// The icon before a name: the daemon doesn't say what is a folder, so a name without an extension is shown as one.
+pub fn name_icon(name: &str) -> &'static str {
+    if std::path::Path::new(name).extension().is_some() {
+        icons::FILE
+    } else {
+        icons::FOLDER
     }
 }
 
@@ -251,6 +294,45 @@ mod tests {
             stop_question(&item("old-notes.txt", Some("old-notes.txt"), Place::MyFiles, expired, 1), NOW),
             "Stop sharing old-notes.txt? The expired link is removed and 1 person loses access."
         );
+    }
+
+    #[test]
+    fn sharing_marks_for_each_kind() {
+        use crate::icons::{CLOCK, LINK, LINK_BROKEN, LOCK, PEOPLE};
+        let rows = fake_shared("list", NOW).unwrap().unwrap();
+        let marks = |name: &str| sharing_marks(rows.iter().find(|i| i.name == name).unwrap(), NOW);
+        assert_eq!(marks("report.pdf"), [LINK, LOCK, CLOCK, PEOPLE]);
+        assert_eq!(marks("Icons"), [PEOPLE]);
+        assert_eq!(marks("old-notes.txt"), [LINK_BROKEN, PEOPLE]);
+        assert_eq!(marks("Taxes"), [LINK]);
+        assert_eq!(marks("holiday.jpg"), [LINK]);
+        // Its sharing wasn't read: nothing to mark (the row says why instead)
+        assert_eq!(marks("Budget.xlsx"), Vec::<&str>::new());
+        let one = |l: Option<ShareLink>, people| sharing_marks(&item("a", Some("a"), Place::MyFiles, l, people), NOW);
+        assert_eq!(one(Some(link(true, Some(NOW - DAY), Role::Viewer)), 0), [LINK_BROKEN, LOCK], "an expired link keeps its password");
+        assert_eq!(one(Some(link(false, Some(NOW), Role::Viewer)), 0), [LINK_BROKEN], "it expires the moment it reaches its date");
+        assert_eq!(one(Some(link(false, Some(NOW + DAY), Role::Editor)), 3), [LINK, CLOCK, PEOPLE]);
+        assert_eq!(one(None, 0), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn location_text_for_each_place() {
+        let i = |path: Option<&str>, place| item("a.txt", path, place, None, 0);
+        assert_eq!(location_text(&i(Some("Documents/Work/a.txt"), Place::MyFiles)), "Documents/Work");
+        assert_eq!(location_text(&i(Some("Icons"), Place::MyFiles)), "(top level)");
+        assert_eq!(location_text(&i(Some("Documents/a.txt"), Place::Hidden)), "Hidden from this computer");
+        assert_eq!(location_text(&i(Some("a.txt"), Place::Hidden)), "Hidden from this computer");
+        assert_eq!(location_text(&i(None, Place::Elsewhere)), "Not on this computer");
+    }
+
+    // The daemon doesn't say which items are folders: a name without an extension is shown as one
+    #[test]
+    fn a_name_without_an_extension_is_shown_as_a_folder() {
+        use crate::icons::{FILE, FOLDER};
+        assert_eq!(name_icon("Icons"), FOLDER);
+        assert_eq!(name_icon("Tax returns 2026"), FOLDER);
+        assert_eq!(name_icon("report.pdf"), FILE);
+        assert_eq!(name_icon("archive.tar.gz"), FILE);
     }
 
     #[test]
