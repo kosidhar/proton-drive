@@ -39,7 +39,6 @@ const GEAR_SIZE: f32 = 28.0;
 const ACCOUNT_MENU_ID: &str = "account_menu";
 /// The account menu's rows' width
 const ACCOUNT_MENU_WIDTH: f32 = 280.0;
-const OPEN_WEB: &str = "Open Proton Drive on the web";
 const SIGN_OUT: &str = "Sign out";
 /// The mark's side, beside "Proton Drive"
 const LOGO_SIZE: f32 = 28.0;
@@ -378,7 +377,7 @@ impl ProtonDriveNativeApp {
                         }
                     });
                     ui.separator();
-                    if home::menu_item(ui, Some(icons::WEB), OPEN_WEB, ACCOUNT_MENU_WIDTH).clicked() {
+                    if home::menu_item(ui, Some(icons::WEB), home::OPEN_WEB, ACCOUNT_MENU_WIDTH).clicked() {
                         picked = Some(AccountAction::OpenWeb);
                     }
                     if home::menu_item(ui, Some(icons::SIGN_OUT), SIGN_OUT, ACCOUNT_MENU_WIDTH).clicked() {

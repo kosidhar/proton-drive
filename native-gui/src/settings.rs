@@ -1,25 +1,20 @@
 //! Settings' own cards: the account (who is signed in, their plan and storage, Sign out), what is hidden from this
 //! computer, with Unhide, and the theme; and the row every setting is laid out in, as Proton lays out its settings.
 
-use eframe::egui::{
-    self, Align, CornerRadius, FontFamily, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, Vec2,
-};
+use eframe::egui::{self, Align, CornerRadius, FontFamily, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, Vec2};
 
 use crate::home::{
-    card_title, elided, open_in_browser, primary_button, secondary_button, storage, trash_hover, PROTON_DRIVE_TRASH_URL,
-    PROTON_DRIVE_WEB_URL, TRASH_BUTTON,
+    card_title, elided, open_in_browser, primary_button, secondary_button, storage, trash_hover, OPEN_TRASH, OPEN_WEB,
+    PROTON_DRIVE_TRASH_URL, PROTON_DRIVE_WEB_URL, TRASH_BUTTON,
 };
 use crate::{
-    action_button, card_frame, icons, save_window_geometry, text_width, toggle_switch, ButtonKind,
-    ProtonDriveNativeApp, WorkerCommand, BG_INPUT, BORDER_NORM, BORDER_SUBTLE, HIDDEN_NEEDS_RESTART, PROTON_PURPLE,
-    DANGER_TEXT, PROTON_PURPLE_TEXT, TEXT_MUTED, TEXT_PRIMARY,
+    action_button_named, card_frame, focus_ring, icons, save_window_geometry, text_width, toggle_switch,
+    ButtonKind, ProtonDriveNativeApp, WorkerCommand, BG_INPUT, BORDER_NORM, BORDER_SUBTLE, DANGER_TEXT,
+    HIDDEN_NEEDS_RESTART, PROTON_PURPLE, PROTON_PURPLE_TEXT, TEXT_MUTED, TEXT_PRIMARY,
 };
 
 /// The themes the Appearance card offers: what is saved, and what the picker says.
 pub(crate) const THEME_CHOICES: [(&str, &str); 3] = [("system", "Follow the system"), ("light", "Light"), ("dark", "Dark")];
-
-/// What the Account card's Web button says on hover: where it goes
-const WEB_HOVER: &str = "Open Proton Drive on the web";
 
 /// A setting's label, and its hint under it
 const LABEL_SIZE: f32 = 13.5;
@@ -46,32 +41,72 @@ pub(crate) const STACKED_BELOW: f32 = 440.0;
 const STACKED_GAP: f32 = 6.0;
 
 /// A setting as Proton lays one out (#276): its label, and a one-line `hint` at most, on the left; the ⓘ after the label
-/// when there is more to say (`info`, on hover); and its `control` on the right, vertically centred. The control has
-/// the room the label leaves (but at least 40% of the row) and sizes itself to `ui.available_width()`, as one widget
-/// or one group; the label, then the hint, are cut to the room it leaves, whole on hover. In a row narrower than
-/// `STACKED_BELOW` (a small window, a large zoom), the control goes under its label instead, as on Proton's settings
-/// on a phone.
+/// when there is more to say (`info`, on hover or keyboard focus); and its `control` on the right, vertically centred.
+/// The control has the room the label leaves (but at least 40% of the row) and sizes itself to `ui.available_width()`,
+/// as one widget or one group; the label, then the hint, are cut to the room it leaves, whole on hover. In a row
+/// narrower than `STACKED_BELOW` (a small window, a large zoom), the control goes under its label instead, as on
+/// Proton's settings on a phone.
 ///
-/// Returns the label's response: a switch's label flips it, as a label does on the web (see `switch_row`).
+/// `control` returns its main widget, which screen readers then hear named by the label and described by `info`. The
+/// label is no stop for the Tab key. Returns the label's response.
 pub(crate) fn setting_row(
     ui: &mut egui::Ui,
     label: &str,
     hint: Option<&str>,
     info: Option<&str>,
-    control: impl FnOnce(&mut egui::Ui),
+    control: impl FnOnce(&mut egui::Ui) -> egui::Response,
+) -> egui::Response {
+    row(ui, label, RowLabel::Words, hint, info, control)
+}
+
+/// `setting_row` for a name typed as code, an app's process name, which its label shows in monospace.
+pub(crate) fn code_row(ui: &mut egui::Ui, name: &str, control: impl FnOnce(&mut egui::Ui) -> egui::Response) -> egui::Response {
+    row(ui, name, RowLabel::Code, None, None, control)
+}
+
+/// What a row's label is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowLabel {
+    /// Words, in the app's font
+    Words,
+    /// A name typed as code, in monospace
+    Code,
+    /// A switch's words, which flip it when clicked, as a label does on the web (but no stop for the Tab key: the
+    /// switch is)
+    Switch,
+}
+
+impl RowLabel {
+    fn font(self) -> FontId {
+        match self {
+            RowLabel::Code => FontId::monospace(LABEL_SIZE),
+            RowLabel::Words | RowLabel::Switch => FontId::proportional(LABEL_SIZE),
+        }
+    }
+}
+
+/// `setting_row`, with its label as `kind` says.
+fn row(
+    ui: &mut egui::Ui,
+    label: &str,
+    kind: RowLabel,
+    hint: Option<&str>,
+    info: Option<&str>,
+    control: impl FnOnce(&mut egui::Ui) -> egui::Response,
 ) -> egui::Response {
     let width = ui.available_width();
     if width < STACKED_BELOW {
         return ui
             .vertical(|ui| {
-                let label = label_column(ui, label, hint, info);
+                let label = label_column(ui, label, kind, hint, info);
                 ui.add_space(STACKED_GAP);
-                control(ui);
+                let control = control(ui);
+                name_control(ui, &control, &label, info);
                 label
             })
             .inner;
     }
-    let label_font = FontId::proportional(LABEL_SIZE);
+    let label_font = kind.font();
     let hint_font = FontId::proportional(HINT_SIZE);
     let label_need = text_width(ui.painter(), label, &label_font) + info_room(ui, info);
     let need = hint.map_or(label_need, |hint| label_need.max(text_width(ui.painter(), hint, &hint_font)));
@@ -83,13 +118,11 @@ pub(crate) fn setting_row(
     let control_room = (width - need - gap).max(width * CONTROL_SHARE);
     ui.allocate_ui_with_layout(Vec2::new(width, row_h), Layout::right_to_left(Align::Center), |ui| {
         ui.set_min_size(Vec2::new(width, row_h));
-        let control_rect = ui
-            .scope(|ui| {
-                ui.set_max_width(control_room);
-                control(ui);
-            })
-            .response
-            .rect;
+        let control = ui.scope(|ui| {
+            ui.set_max_width(control_room);
+            control(ui)
+        });
+        let control_rect = control.response.rect;
         ui.add_space(CONTROL_GAP);
         // The label level with the control's middle (a picker sits a little off the row's), or, beside a control
         // taller than the row (a text box), with its top line
@@ -102,12 +135,30 @@ pub(crate) fn setting_row(
             egui::pos2(ui.max_rect().left(), top),
             egui::pos2(ui.available_rect_before_wrap().right().max(ui.max_rect().left()), top + left_h),
         );
-        ui.scope_builder(egui::UiBuilder::new().max_rect(column).layout(Layout::top_down(Align::Min)), |ui| {
-            label_column(ui, label, hint, info)
-        })
-        .inner
+        let label = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(column).layout(Layout::top_down(Align::Min)), |ui| {
+                label_column(ui, label, kind, hint, info)
+            })
+            .inner;
+        name_control(ui, &control.inner, &label, info);
+        label
     })
     .inner
+}
+
+/// Screen readers hear the control named by its row's label (it is laid out first, from the row's right end, so it
+/// comes first in their order too), and described by what the row's ⓘ says.
+fn name_control(ui: &egui::Ui, control: &egui::Response, label: &egui::Response, info: Option<&str>) {
+    let _ = control.clone().labelled_by(label.id);
+    ui.ctx().accesskit_node_builder(control.id, |node| {
+        // A name of its own, even an empty one (egui's picker has one), is read instead of its label's
+        if node.label().is_some_and(str::is_empty) {
+            node.clear_label();
+        }
+        if let Some(info) = info {
+            node.set_description(info);
+        }
+    });
 }
 
 /// The room the ⓘ takes after a label, if there is one.
@@ -120,17 +171,19 @@ fn info_room(ui: &egui::Ui, info: Option<&str>) -> f32 {
 }
 
 /// A setting's label, cut to the room there is with its ⓘ after it, over its hint. The label's response.
-fn label_column(ui: &mut egui::Ui, label: &str, hint: Option<&str>, info: Option<&str>) -> egui::Response {
+fn label_column(ui: &mut egui::Ui, label: &str, kind: RowLabel, hint: Option<&str>, info: Option<&str>) -> egui::Response {
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = HINT_GAP;
         let label = ui
             .horizontal(|ui| {
                 let room = (ui.available_width() - info_room(ui, info)).max(0.0);
-                let text = RichText::new(label).font(FontId::proportional(LABEL_SIZE)).color(TEXT_PRIMARY());
+                let text = RichText::new(label).font(kind.font()).color(TEXT_PRIMARY());
                 let label = ui
                     .scope(|ui| {
                         ui.set_max_width(room);
-                        ui.add(egui::Label::new(text).truncate().sense(Sense::click()))
+                        let label = egui::Label::new(text).truncate();
+                        // A switch's label takes clicks, but not the keyboard's focus
+                        ui.add(if kind == RowLabel::Switch { label.sense(Sense::CLICK) } else { label })
                     })
                     .inner;
                 if let Some(info) = info {
@@ -152,7 +205,11 @@ fn label_column(ui: &mut egui::Ui, label: &str, hint: Option<&str>, info: Option
 /// clicked: the caller flips the setting.
 pub(crate) fn switch_row(ui: &mut egui::Ui, label: &str, hint: Option<&str>, info: Option<&str>, on: bool) -> bool {
     let mut switch = None;
-    let label_response = setting_row(ui, label, hint, info, |ui| switch = Some(toggle_switch(ui, on)));
+    let label_response = row(ui, label, RowLabel::Switch, hint, info, |ui| {
+        let response = toggle_switch(ui, on);
+        switch = Some(response.clone());
+        response
+    });
     if label_response.hovered() && ui.is_enabled() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -205,20 +262,33 @@ pub(crate) fn picker<R>(
         // sits a few points low)
         let text_h = ui.text_style_height(&egui::TextStyle::Button).max(ui.spacing().icon_width);
         let size = Vec2::new(width, text_h + 2.0 * PICKER_PADDING_Y);
-        ui.allocate_ui_with_layout(size, Layout::top_down(Align::Min), |ui| {
+        let shown = ui.allocate_ui_with_layout(size, Layout::top_down(Align::Min), |ui| {
             egui::ComboBox::from_id_salt(id_salt).selected_text(selected).width(width).truncate().show_ui(ui, choices)
-        })
-        .inner
+        });
+        // Cut short, the choice is whole on hover
+        let room = width - 2.0 * ui.spacing().button_padding.x - ui.spacing().icon_width - ui.spacing().icon_spacing;
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let mut shown = shown.inner;
+        if text_width(ui.painter(), selected, &font) > room {
+            shown.response = shown.response.on_hover_text(selected);
+        }
+        shown
     })
     .inner
 }
 
-/// An ⓘ that shows `info` on hover, greyed out or not, and hands it to screen readers.
+/// An ⓘ that shows `info` on hover, greyed out or not, and on the keyboard's focus (it is a stop for the Tab key, with a
+/// focus ring), and hands it to screen readers.
 fn info_glyph(ui: &mut egui::Ui, info: &str) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(INFO_SIZE), Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(INFO_SIZE), Sense::FOCUSABLE);
     let enabled = ui.is_enabled();
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, enabled, info));
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icons::INFO, icons::font(INFO_SIZE - 1.0), TEXT_MUTED());
+    focus_ring(ui, &response, INFO_SIZE / 2.0);
+    // Once: under the pointer, the hover shows it
+    if response.has_focus() && !response.hovered() {
+        response.show_tooltip_text(info);
+    }
     response.on_hover_text(info).on_disabled_hover_text(info)
 }
 
@@ -290,7 +360,7 @@ impl ProtonDriveNativeApp {
                 ui.separator();
                 ui.add_space(6.0);
                 setting_row(ui, "Proton storage", None, None, |ui| {
-                    ui.add(egui::Label::new(RichText::new(&s.text).size(LABEL_SIZE).color(TEXT_PRIMARY())).truncate());
+                    ui.add(egui::Label::new(RichText::new(&s.text).size(LABEL_SIZE).color(TEXT_PRIMARY())).truncate())
                 });
             }
             // Proton Drive on the web, and its trash, where a delete through the drive puts what was deleted (#201):
@@ -299,12 +369,13 @@ impl ProtonDriveNativeApp {
             if self.status.logged_in {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    let web = action_button(ui, ButtonKind::Secondary, Some(icons::WEB), "Web", 32.0);
-                    if web.on_hover_text(WEB_HOVER).clicked() {
+                    // Short labels, named in full for screen readers
+                    let web = action_button_named(ui, ButtonKind::Secondary, Some(icons::WEB), "Web", OPEN_WEB, 32.0);
+                    if web.on_hover_text(OPEN_WEB).clicked() {
                         open_in_browser(PROTON_DRIVE_WEB_URL);
                     }
                     ui.add_space(4.0);
-                    let trash = action_button(ui, ButtonKind::Secondary, Some(icons::TRASH), TRASH_BUTTON, 32.0);
+                    let trash = action_button_named(ui, ButtonKind::Secondary, Some(icons::TRASH), TRASH_BUTTON, OPEN_TRASH, 32.0);
                     if trash.on_hover_text(trash_hover(&self.status.sync_dir)).clicked() {
                         open_in_browser(PROTON_DRIVE_TRASH_URL);
                     }
@@ -363,9 +434,11 @@ impl ProtonDriveNativeApp {
                         let hiding = (item.state == "hiding").then_some("Hiding…");
                         setting_row(ui, &item.path, hiding, None, |ui| {
                             let label = if self.working.contains(&item.path) { "Unhiding…" } else { "Unhide" };
-                            if ui.add_enabled_ui(can, |ui| secondary_button(ui, label, 30.0)).inner.clicked() {
+                            let button = ui.add_enabled_ui(can, |ui| secondary_button(ui, label, 30.0)).inner;
+                            if button.clicked() {
                                 unhide = Some(item.path.clone());
                             }
+                            button
                         });
                         ui.add_space(ROW_GAP);
                     }
@@ -402,7 +475,8 @@ impl ProtonDriveNativeApp {
                             save_window_geometry(&self.window_geometry);
                         }
                     }
-                });
+                })
+                .response
             });
         });
     }
