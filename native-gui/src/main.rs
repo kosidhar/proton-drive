@@ -2363,11 +2363,14 @@ impl ProtonDriveNativeApp {
                 FontId::new(12.0, FontFamily::Proportional),
                 TEXT_MUTED(),
             );
+            // Details as far as Time leaves room, as the rows' details; none when zoomed in so far that it collapses
+            let header_font = FontId::new(12.0, FontFamily::Proportional);
+            let details_room = time_right_x - text_width(ui.painter(), "Time", &header_font) - 16.0 - details_col_x;
             ui.painter().text(
                 egui::pos2(details_col_x, hdr_y),
                 egui::Align2::LEFT_CENTER,
-                "Details",
-                FontId::new(12.0, FontFamily::Proportional),
+                truncate_end_to_width(ui.painter(), "Details", &header_font, details_room),
+                header_font,
                 TEXT_MUTED(),
             );
             ui.painter().text(
@@ -5940,6 +5943,14 @@ mod tests {
                 let header = h.text_rect("File / Folder").unwrap_or_else(|| panic!("{at}: the table is painted"));
                 let lowest = boxes.iter().map(|(_, r)| r.bottom()).fold(0.0, f32::max);
                 assert!(header.top() > lowest + 14.0, "{at}: the table's card {header:?} starts below the row, at {lowest}");
+                // The table's column names stay apart, and left of the window's edge (a column with no room shows none)
+                let time = h.text_rect("Time").unwrap_or_else(|| panic!("{at}: Time is a column"));
+                for name in ["Status", "File / Folder", "Details"] {
+                    if let Some(r) = h.text_rect_starting(&name[..2]).filter(|r| (r.center().y - time.center().y).abs() < 4.0) {
+                        assert!(r.right() < time.left(), "{at}: {name} {r:?} runs into Time {time:?}");
+                    }
+                }
+                assert!(time.right() <= h.screen.x - SECTION_MARGIN.rightf(), "{at}: Time {time:?} runs out of the table");
                 assert_eq!(h.text_at("Sign in to Proton Drive").is_some(), !logged_in, "{at}");
             }
         }
@@ -7295,6 +7306,26 @@ mod tests {
                 assert_eq!(checked, all, "{at}: every button came in sight");
             }
         }
+    }
+
+    // At 120% in the smallest window, Needs attention's list keeps its own height (up to 280 pt) rather than shrinking
+    // to what is left of the window: scrolled down, the page shows a whole item (the red box), not a sliver of it
+    #[test]
+    fn needs_attention_shows_a_whole_item_at_120_percent() {
+        let mut h = Harness::new();
+        held(&mut h);
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            let (red_box, clip, _) =
+                filled_rects(&h).into_iter().find(|(_, _, fill)| *fill == DANGER_SOFT()).expect("the red box is painted");
+            if clip.expand(0.5).contains_rect(red_box) {
+                return;
+            }
+            seen.push((red_box, clip));
+            h.scroll(egui::pos2(h.screen.x - SECTION_MARGIN.rightf() - 6.0, h.screen.y / 2.0), 40.0);
+        }
+        panic!("the red box is never whole in its list, scrolling down the page: {seen:?}");
     }
 
     // Narrow, the status's buttons go under its headline, Sync now first, and do what they do beside it
@@ -9154,7 +9185,7 @@ mod tests {
     fn settings_fits_its_cards_in_a_540_tall_window_scrolled_at_840_and_120_percent() {
         use egui::accesskit::Role;
         let mut h = Harness::settings(Some(vfs("virtual", true, None)), Some(true));
-        h.app.status.account = Some(gautam());
+        h.app.status.account = Some(AccountInfo { display_name: "Gautam Chauhan".into(), ..gautam() });
         h.app.status.settings.blocked_apps = vec!["rg".into(), "backup.sh".into()];
         h.event(WorkerEvent::HiddenLoaded(Ok(vec![hidden("Documents/Private", "hiding"), hidden("Music", "hidden")])));
         for (width, zoom) in [(840.0, 1.2), (840.0, 1.0), (1100.0, 1.0)] {
@@ -9174,6 +9205,7 @@ mod tests {
                     .collect();
                 let card_of = |r: egui::Rect| cards.iter().find(|c| c.y_range().contains(r.center().y)).copied();
                 let in_sight = |r: egui::Rect| r.left() > SIDEBAR_EDGE && r.top() >= chrome::TOP_BAR_HEIGHT && r.bottom() <= h.screen.y;
+                let mut buttons = Vec::new();
                 for (_, node) in accesskit_nodes(&h) {
                     if matches!(node.role(), Role::Unknown | Role::Window) || node.bounds().is_none() || !in_sight(node_rect(&node)) {
                         continue;
@@ -9181,6 +9213,9 @@ mod tests {
                     let r = node_rect(&node);
                     let card = card_of(r).unwrap_or_else(|| panic!("{at}: {:?} {:?} {r:?} is in a card", node.role(), says(&node)));
                     assert!(r.left() >= card.left() - 0.5 && r.right() <= card.right() + 0.5, "{at}: {:?} {:?} {r:?} runs out of its card {card:?}", node.role(), says(&node));
+                    if node.role() == Role::Button {
+                        buttons.push((says(&node), r));
+                    }
                     widgets += 1;
                 }
                 let texts: Vec<(String, egui::Rect)> = h
@@ -9197,6 +9232,10 @@ mod tests {
                 for (i, (a, ra)) in texts.iter().enumerate() {
                     for (b, rb) in &texts[i + 1..] {
                         assert!(!ra.shrink(0.5).intersects(rb.shrink(0.5)), "{at}: {a:?} {ra:?} runs over {b:?} {rb:?}");
+                    }
+                    // A text on a button is its own: inside it; any other keeps off it
+                    for (button, rb) in &buttons {
+                        assert!(!ra.shrink(0.5).intersects(*rb) || rb.expand(0.5).contains_rect(*ra), "{at}: {a:?} {ra:?} runs over the button {button:?} {rb:?}");
                     }
                 }
                 h.scroll(gutter, 100.0);

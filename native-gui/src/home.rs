@@ -519,6 +519,8 @@ pub(crate) fn primary_button(ui: &mut egui::Ui, label: &str, height: f32) -> egu
 }
 
 const PAUSE_CHOICES_ID: &str = "pause_choices";
+/// Needs attention's list at its tallest, before it scrolls
+const ATTENTION_LIST_HEIGHT: f32 = 280.0;
 
 /// Home's Pause choices (#205), in a small card under the Pause button (its right edges lined up), over an invisible
 /// shield so that a click outside only closes them. The choice clicked, if one was.
@@ -742,7 +744,8 @@ impl ProtonDriveNativeApp {
         });
     }
 
-    /// Needs attention: each problem with what can be done about it. Its list scrolls once taller than 280 px.
+    /// Needs attention: each problem with what can be done about it. Its list scrolls once taller than 280 pt, and is
+    /// that tall even when less of the window is left (a small window, a large zoom), the page scrolling to show it.
     fn render_attention(&mut self, ui: &mut egui::Ui) {
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -755,7 +758,8 @@ impl ProtonDriveNativeApp {
             ui.add_space(10.0);
             ScrollArea::vertical()
                 .id_salt("attention_scroll")
-                .max_height(280.0)
+                .max_height(ATTENTION_LIST_HEIGHT)
+                .min_scrolled_height(ATTENTION_LIST_HEIGHT)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for (i, item) in self.attention.clone().into_iter().enumerate() {

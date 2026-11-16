@@ -342,15 +342,25 @@ impl ProtonDriveNativeApp {
                     }
                     ui.add_space(8.0);
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                        // The plan beside the name when the whole name fits beside it, else under the email
+                        let plan = account.as_ref().filter(|a| a.max_space > 0).map(|a| plan_name(a.max_space));
+                        let name_w = text_width(ui.painter(), &name, &FontId::proportional(NAME_SIZE));
+                        let beside = plan.is_some_and(|plan| {
+                            name_w + 4.0 + 2.0 * ui.spacing().item_spacing.x + plan_pill_width(ui, plan) <= ui.available_width()
+                        });
                         ui.horizontal(|ui| {
-                            elided(ui, RichText::new(&name).size(14.5).strong().color(TEXT_PRIMARY()), &name);
-                            if let Some(a) = account.as_ref().filter(|a| a.max_space > 0) {
+                            elided(ui, RichText::new(&name).size(NAME_SIZE).strong().color(TEXT_PRIMARY()), &name);
+                            if let Some(plan) = plan.filter(|_| beside) {
                                 ui.add_space(4.0);
-                                plan_pill(ui, plan_name(a.max_space));
+                                plan_pill(ui, plan);
                             }
                         });
                         if !email.is_empty() {
                             elided(ui, RichText::new(&email).size(12.5).color(TEXT_MUTED()), &email);
+                        }
+                        if let Some(plan) = plan.filter(|_| !beside) {
+                            ui.add_space(2.0);
+                            plan_pill(ui, plan);
                         }
                     });
                 });
@@ -482,15 +492,26 @@ impl ProtonDriveNativeApp {
     }
 }
 
+/// The account's name in the Account card
+const NAME_SIZE: f32 = 14.5;
+/// The plan pill's words, and their room on each side
+const PLAN_SIZE: f32 = 11.0;
+const PLAN_PADDING: i8 = 7;
+
 /// The plan, in a small pill beside the name.
 pub(crate) fn plan_pill(ui: &mut egui::Ui, plan: &str) {
     Frame::NONE
         .fill(crate::PROTON_PURPLE_SOFT())
         .corner_radius(CornerRadius::same(5))
-        .inner_margin(Margin::symmetric(7, 2))
+        .inner_margin(Margin::symmetric(PLAN_PADDING, 2))
         .show(ui, |ui| {
-            ui.label(RichText::new(plan).size(11.0).color(PROTON_PURPLE_TEXT()));
+            ui.label(RichText::new(plan).size(PLAN_SIZE).color(PROTON_PURPLE_TEXT()));
         });
+}
+
+/// How wide `plan_pill` is for `plan`.
+fn plan_pill_width(ui: &egui::Ui, plan: &str) -> f32 {
+    text_width(ui.painter(), plan, &FontId::proportional(PLAN_SIZE)) + 2.0 * PLAN_PADDING as f32
 }
 
 #[cfg(test)]
