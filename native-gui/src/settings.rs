@@ -2,7 +2,7 @@
 //! computer, with Unhide, and the theme; and the row every setting is laid out in, as Proton lays out its settings.
 
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, FontFamily, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, Vec2,
+    self, Align, CornerRadius, FontFamily, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, Vec2,
 };
 
 use crate::home::{
@@ -10,7 +10,7 @@ use crate::home::{
     PROTON_DRIVE_WEB_URL, TRASH_BUTTON,
 };
 use crate::{
-    action_button, card_frame, icons, is_light_mode, save_window_geometry, text_width, toggle_switch, ButtonKind,
+    action_button, card_frame, icons, save_window_geometry, text_width, toggle_switch, ButtonKind,
     ProtonDriveNativeApp, WorkerCommand, BG_INPUT, BORDER_NORM, BORDER_SUBTLE, HIDDEN_NEEDS_RESTART, PROTON_PURPLE,
     DANGER_TEXT, PROTON_PURPLE_TEXT, TEXT_MUTED, TEXT_PRIMARY,
 };
@@ -253,8 +253,7 @@ impl ProtonDriveNativeApp {
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 let (avatar, _) = ui.allocate_exact_size(Vec2::new(44.0, 44.0), Sense::hover());
-                let fill = if is_light_mode() { Color32::from_rgb(235, 229, 255) } else { Color32::from_rgb(50, 41, 82) };
-                ui.painter().rect_filled(avatar, CornerRadius::same(10), fill);
+                ui.painter().rect_filled(avatar, CornerRadius::same(10), crate::PROTON_PURPLE_SOFT());
                 ui.painter().text(
                     avatar.center(),
                     egui::Align2::CENTER_CENTER,

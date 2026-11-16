@@ -98,6 +98,22 @@ pub(crate) struct Palette {
     pub(crate) folder: Color32,
     /// Red words: an error, an expired link. `STATUS_DANGER` stays for red fills and outlines
     pub(crate) danger_text: Color32,
+    /// Green words: up to date. `STATUS_SUCCESS` stays for green icons
+    pub(crate) success_text: Color32,
+    /// Amber words: paused, the drive's warning. `STATUS_WARNING` stays for amber icons
+    pub(crate) warning_text: Color32,
+    /// A box that holds something to act on before anything syncs (the files missing, another account), and its edge
+    pub(crate) danger_soft: Color32,
+    pub(crate) danger_line: Color32,
+    /// The notice under Home's status (how an availability request went), and its edge
+    pub(crate) warning_soft: Color32,
+    pub(crate) warning_line: Color32,
+    /// Activity's pills' words, each on its pill's tint: downloaded, moved to the cloud's trash, a conflict or failure
+    pub(crate) pill_success: Color32,
+    pub(crate) pill_warning: Color32,
+    pub(crate) pill_danger: Color32,
+    /// A switch's track while it is off
+    pub(crate) switch_off: Color32,
 }
 
 /// Proton's light theme, as drive.proton.me shows it (#276)
@@ -120,7 +136,18 @@ pub(crate) const LIGHT: Palette = Palette {
     purple_soft: Color32::from_rgb(0xEB, 0xE5, 0xFF),
     purple_text: Color32::from_rgb(0x5D, 0x38, 0xEB),
     folder: Color32::from_rgb(0xF5, 0xA4, 0x28),
-    danger_text: STATUS_DANGER, // 4.55:1 on white
+    danger_text: STATUS_DANGER_HOVER,                   // #C42B47: 5.55:1 on white, 5.05:1 on the weak background
+    success_text: Color32::from_rgb(0x0F, 0x7A, 0x60), // 5.29:1 on white, 4.81:1 on the weak background
+    warning_text: Color32::from_rgb(0xA8, 0x5A, 0x00), // 5.09:1 on white, 4.63:1 on the weak background
+    danger_soft: Color32::from_rgb(0xFF, 0xF5, 0xF6),  // red words 5.19:1 on it, weak ones 6.49:1
+    danger_line: Color32::from_rgb(0xF7, 0xB9, 0xC2),
+    warning_soft: Color32::from_rgb(0xFF, 0xF6, 0xE0),
+    warning_line: Color32::from_rgb(0xF2, 0xCF, 0x8C),
+    // The words on the pills' tints read in the same shades as elsewhere
+    pill_success: Color32::from_rgb(0x0F, 0x7A, 0x60),
+    pill_warning: Color32::from_rgb(0xA8, 0x5A, 0x00),
+    pill_danger: STATUS_DANGER_HOVER,
+    switch_off: Color32::from_rgb(0x85, 0x82, 0x7F), // 3.82:1 on white
 };
 
 /// Proton Carbon, the app's dark theme as it was. The colours it didn't have are taken from it.
@@ -137,13 +164,24 @@ pub(crate) const DARK: Palette = Palette {
     card_alt: Color32::from_rgb(42, 37, 56),         // #2A2538
     input: Color32::from_rgb(35, 31, 48),            // #231F30
     border_weak: Color32::from_rgb(48, 43, 64),      // #302B40
-    border_norm: Color32::from_rgb(74, 67, 96),      // #4A4360, as an off switch's track is
+    border_norm: Color32::from_rgb(74, 67, 96),      // #4A4360, as an off switch's track was
     text: Color32::from_rgb(247, 246, 252),          // #F7F6FC
     text_weak: Color32::from_rgb(162, 158, 178),     // #A29EB2
     purple_soft: Color32::from_rgb(44, 37, 69),      // #2C2545
     purple_text: Color32::from_rgb(214, 204, 255),   // #D6CCFF
     folder: Color32::from_rgb(0xF5, 0xA4, 0x28),
     danger_text: Color32::from_rgb(0xF5, 0x56, 0x6F), // #F5566F: STATUS_DANGER, lightened to read at 4.5:1 here
+    success_text: Color32::from_rgb(0x2B, 0xB5, 0x8F), // STATUS_SUCCESS, lightened: 6.35:1 on a card
+    warning_text: STATUS_WARNING,                       // 6.27:1 on a card
+    danger_soft: Color32::from_rgb(0x30, 0x1B, 0x26),   // red words 4.92:1 on it, weak ones 6.16:1
+    danger_line: Color32::from_rgb(0x8C, 0x34, 0x42),
+    warning_soft: Color32::from_rgb(0x30, 0x27, 0x1C),
+    warning_line: Color32::from_rgb(0x7A, 0x54, 0x18),
+    // The pills' tints are light in the dark: their words are pale shades of each colour
+    pill_success: Color32::from_rgb(0x8F, 0xE6, 0xCC),
+    pill_warning: Color32::from_rgb(0xFF, 0xD6, 0xA3),
+    pill_danger: Color32::from_rgb(0xFF, 0xBC, 0xC6),
+    switch_off: Color32::from_rgb(0x77, 0x70, 0x8F), // 3.52:1 on a card
 };
 
 /// The palette of the theme in use.
@@ -189,6 +227,13 @@ tokens! {
     STORAGE_TRACK => storage_track,
     FOLDER_ICON => folder,
     DANGER_TEXT => danger_text,
+    SUCCESS_TEXT => success_text,
+    WARNING_TEXT => warning_text,
+    DANGER_SOFT => danger_soft,
+    DANGER_LINE => danger_line,
+    WARNING_SOFT => warning_soft,
+    WARNING_LINE => warning_line,
+    SWITCH_OFF => switch_off,
 }
 
 /// The WCAG contrast ratio of two opaque colours, from 1 (the same) to 21 (black on white).
@@ -2419,7 +2464,7 @@ impl ProtonDriveNativeApp {
                             let r_time_right_x = row_rect.max.x - 16.0;
 
                             let pill_label = activity::kind_label(kind);
-                            let (pill_bg, pill_fg) = activity_pill_colors(kind);
+                            let (pill_bg, pill_fg) = activity_pill_colors(palette(), kind);
                             let pill_rect = egui::Rect::from_min_size(
                                 egui::pos2(row_rect.min.x + 12.0, cy - 11.0),
                                 Vec2::new(124.0, 22.0),
@@ -2586,8 +2631,8 @@ impl ProtonDriveNativeApp {
         };
         ui.add_space(10.0);
         Frame::NONE
-            .fill(Color32::from_rgba_unmultiplied(230, 138, 0, 32))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(230, 138, 0, 120)))
+            .fill(WARNING_SOFT())
+            .stroke(Stroke::new(1.0_f32, WARNING_LINE()))
             .corner_radius(CornerRadius::same(8))
             .inner_margin(Margin::symmetric(12, 8))
             .show(ui, |ui| {
@@ -2734,8 +2779,8 @@ impl ProtonDriveNativeApp {
         };
         let virtual_layout = self.status.vfs.as_ref().is_some_and(|v| v.mode == "virtual");
         Frame::NONE
-            .fill(Color32::from_rgba_unmultiplied(239, 68, 68, 26))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(239, 68, 68, 110)))
+            .fill(DANGER_SOFT())
+            .stroke(Stroke::new(1.0_f32, DANGER_LINE()))
             .corner_radius(CornerRadius::same(10))
             .inner_margin(Margin::symmetric(16, 12))
             .show(ui, |ui| {
@@ -2804,8 +2849,8 @@ impl ProtonDriveNativeApp {
             return;
         };
         Frame::NONE
-            .fill(Color32::from_rgba_unmultiplied(239, 68, 68, 26))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(239, 68, 68, 110)))
+            .fill(DANGER_SOFT())
+            .stroke(Stroke::new(1.0_f32, DANGER_LINE()))
             .corner_radius(CornerRadius::same(10))
             .inner_margin(Margin::symmetric(16, 12))
             .show(ui, |ui| {
@@ -2944,7 +2989,7 @@ impl ProtonDriveNativeApp {
                 ui.add_space(6.0);
                 ui.add(
                     egui::Label::new(
-                        RichText::new(drive_status_line(vfs, &self.status.sync_dir)).size(12.5).color(STATUS_WARNING),
+                        RichText::new(drive_status_line(vfs, &self.status.sync_dir)).size(12.5).color(WARNING_TEXT()),
                     )
                     .wrap(),
                 );
@@ -3633,11 +3678,10 @@ fn toggle_switch(ui: &mut egui::Ui, on: bool) -> egui::Response {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let radius = rect.height() / 2.0;
-    let track = match (on, is_light_mode()) {
-        (true, _) if resp.hovered() => PROTON_PURPLE_HOVER,
-        (true, _) => PROTON_PURPLE,
-        (false, true) => Color32::from_rgb(200, 195, 218),
-        (false, false) => Color32::from_rgb(74, 67, 96),
+    let track = match on {
+        true if resp.hovered() => PROTON_PURPLE_HOVER,
+        true => PROTON_PURPLE,
+        false => SWITCH_OFF(),
     };
     ui.painter().rect_filled(rect, CornerRadius::same(radius as u8), track);
     let knob_x = if on { rect.right() - radius } else { rect.left() + radius };
@@ -3714,11 +3758,7 @@ fn apply_proton_visuals(ctx: &egui::Context, light: bool) {
     };
     visuals.panel_fill = BG_CANVAS();
     visuals.window_fill = BG_CARD();
-    visuals.faint_bg_color = if light {
-        Color32::from_rgb(243, 241, 250)
-    } else {
-        Color32::from_rgb(28, 25, 38)
-    };
+    visuals.faint_bg_color = BG_CARD_ALT();
     visuals.extreme_bg_color = BG_INPUT();
     visuals.selection.bg_fill = PROTON_PURPLE;
     // Links in Proton's purple, not egui's blue; in the dark, its light purple, which reads at 4.5:1 there (R14)
@@ -3902,18 +3942,19 @@ struct ExpandedActivity {
     open: Option<std::path::PathBuf>,
 }
 
-/// An Activity pill's fill and text colours, by what the entry is
-fn activity_pill_colors(kind: activity::ActivityKind) -> (Color32, Color32) {
+/// An Activity pill's fill and text colours in `p`, by what the entry is: a tint of the status's colour, and words in a
+/// shade of it that reads on the tint
+fn activity_pill_colors(p: &Palette, kind: activity::ActivityKind) -> (Color32, Color32) {
     use activity::ActivityKind::*;
     match kind {
-        Downloaded => (Color32::from_rgba_unmultiplied(30, 168, 133, 34), STATUS_SUCCESS),
-        Uploaded => (Color32::from_rgba_unmultiplied(109, 74, 255, 42), PROTON_PURPLE_TEXT()),
-        FreedUp | Hidden => (Color32::from_rgba_unmultiplied(109, 74, 255, 26), PROTON_PURPLE_TEXT()),
-        Shared => (Color32::from_rgba_unmultiplied(109, 74, 255, 26), PROTON_PURPLE_TEXT()),
-        FolderCreated | Other => (BG_CARD_ALT(), TEXT_PRIMARY()),
-        RemovedLocally => (BG_CARD_ALT(), TEXT_MUTED()),
-        MovedToCloudTrash => (Color32::from_rgba_unmultiplied(245, 158, 11, 34), STATUS_WARNING),
-        Conflict | Failed => (Color32::from_rgba_unmultiplied(239, 68, 68, 38), DANGER_TEXT()),
+        Downloaded => (Color32::from_rgba_unmultiplied(30, 168, 133, 34), p.pill_success),
+        Uploaded => (Color32::from_rgba_unmultiplied(109, 74, 255, 42), p.purple_text),
+        FreedUp | Hidden => (Color32::from_rgba_unmultiplied(109, 74, 255, 26), p.purple_text),
+        Shared => (Color32::from_rgba_unmultiplied(109, 74, 255, 26), p.purple_text),
+        FolderCreated | Other => (p.card_alt, p.text),
+        RemovedLocally => (p.card_alt, p.text_weak),
+        MovedToCloudTrash => (Color32::from_rgba_unmultiplied(245, 158, 11, 34), p.pill_warning),
+        Conflict | Failed => (Color32::from_rgba_unmultiplied(239, 68, 68, 38), p.pill_danger),
     }
 }
 
@@ -6460,6 +6501,32 @@ mod tests {
         assert!(h.text_at(icons::RESUME).is_some() && h.text_at("Resume").is_some());
     }
 
+    // R22: each state's glyph and headline in one colour, its words' shade, which reads on the card (R21)
+    #[test]
+    fn each_status_paints_its_glyph_and_headline_in_one_colour() {
+        let states: [(&str, SetUp); 6] = [
+            ("Up to date", Box::new(|_| {})),
+            ("Checking for changes…", Box::new(|h| h.app.status.state = "syncing".into())),
+            ("Paused", Box::new(|h| h.app.status.settings.paused = true)),
+            ("Signed out", Box::new(|h| h.app.status.logged_in = false)),
+            ("1 problem needs you", Box::new(|h| h.app.status.stats.error_items = 1)),
+            ("Can't reach Proton Drive's background service", Box::new(|h| h.app.daemon_online = false)),
+        ];
+        for (headline, set_up) in states {
+            let mut h = home_with(|_| {});
+            set_up(&mut h);
+            h.app.refresh_attention();
+            h.frames(2);
+            let color = |t: &egui::epaint::TextShape| t.galley.job.sections.first().map(|s| s.format.color);
+            let words = h.texts(|t| t.galley.text() == headline).first().and_then(|t| color(t));
+            let glyph = h.texts(|t| t.galley.job.sections.first().is_some_and(|s| s.format.font_id == icons::font(32.0)));
+            let glyph = glyph.first().unwrap_or_else(|| panic!("{headline}: the status's glyph is painted"));
+            assert_eq!(color(glyph), words, "{headline}: the glyph and the headline");
+            let words = words.unwrap_or_else(|| panic!("{headline} is painted"));
+            assert!(contrast(words, BG_CARD()) >= 4.5, "{headline}: {:.2} on the card", contrast(words, BG_CARD()));
+        }
+    }
+
     #[test]
     fn the_trash_hover_says_where_restored_files_come_back() {
         assert_eq!(
@@ -6913,6 +6980,19 @@ mod tests {
             assert!(h.text_at(DELETE_TOO).is_none(), "{tab:?}");
             assert!(h.text_at("1").is_some(), "{tab:?}: Home's badge");
         }
+    }
+
+    // R21: the red box is a solid colour of the palette, on which its words read (see text_reads_at_4_5_to_1_…)
+    #[test]
+    fn the_red_boxes_are_solid_palette_colours() {
+        let mut h = Harness::new();
+        held(&mut h);
+        h.app.files_missing_error = Some("The daemon refused".into());
+        h.frames(2);
+        assert_eq!(h.fill_under(h.text_at(MISSING).unwrap()), Some(DANGER_SOFT()));
+        assert_eq!(h.text_color_at("The daemon refused"), Some(DANGER_TEXT()));
+        let h = home_with(|s| s.account_mismatch = Some(AccountMismatch { message: "Another account.".into() }));
+        assert_eq!(h.fill_under(h.text_at("Another account.").unwrap()), Some(DANGER_SOFT()));
     }
 
     // R12: deleting from Proton Drive keeps its danger signal: an outlined button with a red label
@@ -8537,6 +8617,8 @@ mod tests {
     fn why_the_drive_is_a_plain_folder_despite_the_switch_is_said_under_it() {
         let h = Harness::settings(Some(vfs("plain", false, Some("fuse-unavailable"))), Some(true));
         assert!(h.text_at("Plain folder: FUSE isn't available on this system").is_some());
+        // In amber words' shade, which reads on the card (R21)
+        assert_eq!(h.text_color_at("Plain folder: FUSE isn't available on this system"), Some(WARNING_TEXT()));
         // Switched off is the user's own choice: nothing to explain
         let h = Harness::settings(Some(vfs("plain", false, Some("switched-off"))), Some(false));
         assert!(h.text_at("Plain folder: virtual drive switched off").is_none());
@@ -9592,25 +9674,88 @@ mod tests {
         assert_ne!(DARK.danger_text, STATUS_DANGER);
     }
 
+    // Every pair of words and what they sit on that the pages use, in both themes (R15, R16, R21)
     #[test]
     fn text_reads_at_4_5_to_1_in_both_palettes() {
         for p in [&LIGHT, &DARK] {
+            let theme = if std::ptr::eq(p, &LIGHT) { "light" } else { "dark" };
             for (fg, bg, what) in [
                 (p.text, p.canvas, "text"),
-                (p.text_weak, p.canvas, "weak text"),
-                (p.text_weak, p.card_alt, "weak text on a hovered row"),
-                (p.text_weak, p.input, "weak text on an input"),
-                (p.purple_text, p.purple_soft, "the plan pill"),
                 (p.text, p.card, "text on cards"),
+                (p.text, p.card_alt, "text in a box on a card, or on a hovered row"),
+                (p.text, p.input, "text in a field"),
+                (p.text_weak, p.canvas, "weak text"),
+                (p.text_weak, p.card, "weak text on cards"),
+                (p.text_weak, p.card_alt, "weak text in a box, or on a hovered row"),
+                (p.text_weak, p.input, "weak text on an input, an unselected chip"),
+                (p.purple_text, p.canvas, "purple words"),
+                (p.purple_text, p.card, "purple words on cards: syncing, working"),
+                (p.purple_text, p.card_alt, "purple words in a box: working"),
+                (p.purple_text, p.purple_soft, "the plan pill, the working line"),
+                (p.danger_text, p.canvas, "red words"),
+                (p.danger_text, p.card, "red words on cards"),
+                (p.danger_text, p.card_alt, "red words in a box: the last error, a move's error"),
+                (p.danger_text, p.danger_soft, "red words in the red box: why a choice failed"),
+                (p.text, p.danger_soft, "the red box's title"),
+                (p.text_weak, p.danger_soft, "the red box's words"),
+                (p.warning_text, p.canvas, "amber words"),
+                (p.warning_text, p.card, "amber words on cards: paused, the drive's warning"),
+                (p.warning_text, p.card_alt, "amber words in a box"),
+                (p.success_text, p.card, "green words on cards: up to date"),
+                (p.success_text, p.card_alt, "green words in a box"),
+                (p.text, p.warning_soft, "the notice"),
+                (p.text_weak, p.warning_soft, "the notice's dismiss"),
                 (p.sidebar_text, p.sidebar, "sidebar"),
                 (p.sidebar_text, p.sidebar_selected, "selected section"),
+                (p.sidebar_text, p.sidebar_hover, "a section under the pointer"),
                 (p.sidebar_weak, p.sidebar, "sidebar weak"),
                 (Color32::WHITE, PROTON_PURPLE, "primary button"),
-                (p.danger_text, p.canvas, "red text"),
-                (p.danger_text, p.card, "red text on cards"),
+                (Color32::WHITE, PROTON_PURPLE_HOVER, "primary button, hovered"),
+                (Color32::WHITE, STATUS_DANGER, "danger button"),
+                (Color32::WHITE, STATUS_DANGER_HOVER, "danger button, hovered"),
             ] {
-                assert!(contrast(fg, bg) >= 4.5, "{what}: {:.2}", contrast(fg, bg));
+                assert!(contrast(fg, bg) >= 4.5, "{theme}: {what}: {:.2}", contrast(fg, bg));
             }
+        }
+    }
+
+    /// What a translucent `fill` shows as over `under`, as egui paints it: its premultiplied colour, plus what is under
+    /// it in the share it lets through, in gamma space.
+    fn over(fill: Color32, under: Color32) -> Color32 {
+        let through = |c: u8, u: u8| (c as f32 + u as f32 * (255 - fill.a()) as f32 / 255.0).round().min(255.0) as u8;
+        Color32::from_rgb(through(fill.r(), under.r()), through(fill.g(), under.g()), through(fill.b(), under.b()))
+    }
+
+    #[test]
+    fn over_is_what_the_screen_shows() {
+        // Measured in look/t6: a Failed pill on a dark card
+        assert_eq!(over(Color32::from_rgba_unmultiplied(239, 68, 68, 38), DARK.card), Color32::from_rgb(0x80, 0x30, 0x3C));
+        assert_eq!(over(Color32::WHITE, DARK.card), Color32::WHITE);
+    }
+
+    // R24: Activity's pills keep their tints; their words read on them, on a row at rest (the card) and hovered (an
+    // input's colour), in both themes
+    #[test]
+    fn activity_pills_read_at_4_5_to_1_on_their_tints() {
+        use activity::ActivityKind::*;
+        for p in [&LIGHT, &DARK] {
+            let theme = if std::ptr::eq(p, &LIGHT) { "light" } else { "dark" };
+            for kind in [Uploaded, Downloaded, FolderCreated, FreedUp, Hidden, RemovedLocally, MovedToCloudTrash, Shared, Conflict, Failed, Other] {
+                let (fill, text) = activity_pill_colors(p, kind);
+                for under in [p.card, p.input] {
+                    let shown = over(fill, under);
+                    assert!(contrast(text, shown) >= 4.5, "{theme}: {kind:?}: {:.2} on {shown:?}", contrast(text, shown));
+                }
+            }
+        }
+    }
+
+    // A switch that is off stands out from its card, and its knob from it (WCAG's 3:1 for what isn't text)
+    #[test]
+    fn an_off_switch_reads_at_3_to_1_in_both_palettes() {
+        for p in [&LIGHT, &DARK] {
+            assert!(contrast(p.switch_off, p.card) >= 3.0, "the track on its card: {:.2}", contrast(p.switch_off, p.card));
+            assert!(contrast(Color32::WHITE, p.switch_off) >= 3.0, "the knob on the track: {:.2}", contrast(Color32::WHITE, p.switch_off));
         }
     }
 
