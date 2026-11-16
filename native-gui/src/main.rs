@@ -9673,8 +9673,70 @@ mod tests {
         let info = info_after(&h, "Apps blocked from downloading");
         h.app.pending_confirm = Some(PendingConfirm::StartFresh);
         h.frames(2);
+        // A quick click: press and release in one frame, while every ⓘ is greyed out under the dialog
+        let button = |pressed| egui::Event::PointerButton {
+            pos: info,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        h.frame(vec![egui::Event::PointerMoved(info)]);
+        h.frame(vec![button(true), button(false)]);
+        h.frames(2);
+        assert!(h.app.pending_confirm.is_none(), "the click outside the dialog cancels it");
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "and opens nothing under it");
+    }
+
+    // An open ⓘ's words don't take egui's one tooltip: other widgets' still show on hover (the review of #318)
+    #[test]
+    fn while_an_info_is_open_other_tooltips_still_show() {
+        let mut h = settings_tall_timed();
+        tooltips_at_once(&h);
+        h.click(info_after(&h, "Apps blocked from downloading"));
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_some());
+        let hidden = info_after(&h, "Hidden from this computer");
+        hover(&mut h, hidden);
+        assert!(h.text_at(HIDDEN_EXPLAINED).is_some(), "another ⓘ's words show on hover");
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_some(), "while the open one stays");
+    }
+
+    #[test]
+    fn an_open_info_closes_when_scrolled_out_of_sight() {
+        let mut h = Harness::settings(Some(vfs("virtual", true, None)), Some(true));
+        h.resize_zoomed(Vec2::new(1440.0, 700.0), 1.0);
+        let info = info_after(&h, "Apps blocked from downloading");
         h.click(info);
-        assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "the dialog's shield takes the click");
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_some());
+        let page = egui::pos2(SIDEBAR_EDGE + 200.0, h.screen.y - 40.0);
+        h.scroll(page, 800.0);
+        let heading = h.text_rect("Apps blocked from downloading");
+        assert!(heading.is_none_or(|r| r.bottom() < chrome::TOP_BAR_HEIGHT), "scrolled away");
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "closed out of sight");
+        h.scroll(page, -800.0);
+        assert!(h.text_at("Apps blocked from downloading").is_some(), "back in sight");
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "and not open again");
+    }
+
+    #[test]
+    fn clicking_the_drive_switchs_info_leaves_the_switch_alone() {
+        const EXPLAINED: &str = "Files you haven't downloaded appear in Files and download when you open them.";
+        let mut h = settings_tall_timed();
+        h.click(info_after(&h, SWITCH));
+        assert!(h.text_at(EXPLAINED).is_some(), "its words");
+        assert_eq!(h.sent(), Vec::<String>::new(), "the switch next to it isn't flipped");
+    }
+
+    #[test]
+    fn a_greyed_out_info_scrolled_under_the_top_bar_takes_no_click() {
+        const EXPLAINED: &str = "Files you haven't downloaded appear in Files and download when you open them.";
+        let mut h = Harness::settings(Some(vfs("virtual", false, Some("moving"))), Some(true));
+        h.resize_zoomed(Vec2::new(1440.0, 700.0), 1.0);
+        let info = info_after(&h, SWITCH);
+        let under_top_bar = 30.0;
+        h.scroll(egui::pos2(SIDEBAR_EDGE + 200.0, h.screen.y - 40.0), info.y - under_top_bar);
+        assert!(h.text_at(SWITCH).is_none_or(|p| p.y < chrome::TOP_BAR_HEIGHT), "scrolled under the top bar");
+        h.click(egui::pos2(info.x, under_top_bar));
+        assert!(h.text_at(EXPLAINED).is_none(), "a click on the top bar there opens nothing");
     }
 
     #[test]
