@@ -641,23 +641,14 @@ fn socket_dir_problem(socket: &std::path::Path, uid: u32) -> Option<String> {
     None
 }
 
-/// One HTTP/1.1 request to the daemon's user-only control socket. Pin, free, hide and unhide go
-/// only through here, never through the TCP API.
-fn control_request(
-    method: &str,
-    path_and_query: &str,
-    body: Option<&serde_json::Value>,
-    read_timeout: Duration,
-) -> Result<serde_json::Value, String> {
-    control_request_at(&control_socket_path(), method, path_and_query, body, read_timeout)
-}
-
 /// Pin and free reply only once the work is done, which can take a long time on a big folder.
 const AVAILABILITY_READ_TIMEOUT: Duration = Duration::from_secs(600);
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// What a read timeout means: the daemon accepted the request and is still busy with it.
 const STILL_WORKING: &str = "Still working on it in the background. Refresh to see the result.";
 
+/// One HTTP/1.1 request to the daemon's user-only control socket. Pin, free, hide and unhide go only through here,
+/// never through the TCP API.
 fn control_request_at(
     socket: &std::path::Path,
     method: &str,
@@ -722,10 +713,40 @@ fn control_request_at(
         .unwrap_or_else(|| format!("The Proton Drive background service answered {status}")))
 }
 
-fn set_availability(path: &str, action: &str) -> Result<AvailabilityResult, String> {
-    let body = serde_json::json!({ "path": path, "action": action });
-    let reply = control_request("POST", "/availability", Some(&body), AVAILABILITY_READ_TIMEOUT)?;
+/// Pin, free, hide or unhide (POST /availability). `keep_pinned`, for a free, says whether what is marked Always keep
+/// below it stays (#296); None leaves it out, and the free is as it always was.
+fn set_availability(path: &str, action: &str, keep_pinned: Option<bool>) -> Result<AvailabilityResult, String> {
+    set_availability_at(&control_socket_path(), path, action, keep_pinned)
+}
+
+fn set_availability_at(
+    socket: &std::path::Path,
+    path: &str,
+    action: &str,
+    keep_pinned: Option<bool>,
+) -> Result<AvailabilityResult, String> {
+    let mut body = serde_json::json!({ "path": path, "action": action });
+    if let Some(keep) = keep_pinned {
+        body["keepPinned"] = serde_json::Value::Bool(keep);
+    }
+    let reply = control_request_at(socket, "POST", "/availability", Some(&body), AVAILABILITY_READ_TIMEOUT)?;
     serde_json::from_value(reply).map_err(|e| e.to_string())
+}
+
+/// Reading what is marked Always keep is quick: the daemon answers it from its database.
+const PINNED_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many items below the top level are marked Always keep, and whether the whole drive is (GET /availability/pinned
+/// on the control socket; it only reads), for the whole drive's Free up space (#296).
+fn pinned_summary_at(socket: &std::path::Path) -> Result<(u32, bool), String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Reply {
+        items: u32,
+        whole_drive: bool,
+    }
+    let reply = control_request_at(socket, "GET", "/availability/pinned", None, PINNED_READ_TIMEOUT)?;
+    serde_json::from_value::<Reply>(reply).map(|r| (r.items, r.whole_drive)).map_err(|e| e.to_string())
 }
 
 /// One item hidden from this computer, as GET /availability/hidden lists it.
@@ -1173,8 +1194,11 @@ impl SharedAction {
 #[derive(Clone, Debug, PartialEq)]
 enum PendingConfirm {
     /// Free up space for everything in a folder (`rel_path` is empty for the whole drive). Home only asks for the whole
-    /// drive; a folder's `rel_path` is kept for the tray or a later stage to free one folder.
-    FreeAll { rel_path: String },
+    /// drive; a folder's `rel_path` is kept for the tray or a later stage to free one folder. `also_pinned` is the
+    /// whole drive's choice to free the files marked Always keep too (#296): None while it isn't offered (nothing is
+    /// marked below the top level, the whole drive is marked, the daemon hasn't said or couldn't, or it's a folder),
+    /// else whether it is ticked.
+    FreeAll { rel_path: String, also_pinned: Option<bool> },
     /// Switching the virtual drive off moves the downloaded files back into a normal folder.
     VirtualDriveOff,
     /// The files missing from the folder were deleted on purpose: they go to the Proton Drive trash too. What the dialog
@@ -1184,6 +1208,21 @@ enum PendingConfirm {
     StartFresh,
     /// Stop all sharing of an item of the Shared page: `question` is what it asks, naming what is lost (#253)
     StopSharing { rel_path: String, uid: String, question: String },
+}
+
+/// What Free up space says of what stays: the marks go (a folder's, the whole drive's when the choice isn't offered, or
+/// when it is ticked)
+const FREE_DETAIL: &str = "Anything marked Always keep here stops being kept. Files that aren't fully synced, or that you've told Proton Drive to ignore, stay on this computer.";
+/// ... or the files marked Always keep stay, as the whole drive's free does with its choice left unticked (#296)
+const FREE_KEEPS_PINNED: &str = "Files marked Always keep stay on this computer, and so do files that aren't fully synced or that you've told Proton Drive to ignore.";
+/// The whole drive's Free up space's choice, unticked at first (#296)
+const FREE_ALSO_PINNED: &str = "Also free files marked Always keep on this device";
+
+/// Whether the free that Free up space confirms keeps what is marked Always keep (#296): the whole drive's does unless
+/// its choice to free those files too is ticked, so also before the daemon has said whether anything is marked, or when
+/// it couldn't; a folder's free doesn't say, and is as it always was.
+fn free_keeps_pinned(rel_path: &str, also_pinned: Option<bool>) -> Option<bool> {
+    rel_path.is_empty().then_some(also_pinned != Some(true))
 }
 
 /// What a confirmation dialog says, and what its button asks the daemon to do to which path.
@@ -1201,7 +1240,7 @@ struct ConfirmCopy {
 /// `virtual_drive`: whether the drive shows online-only files in Files (a plain folder doesn't).
 fn confirm_copy(confirm: &PendingConfirm, virtual_drive: bool) -> ConfirmCopy {
     match confirm {
-        PendingConfirm::FreeAll { rel_path } => {
+        PendingConfirm::FreeAll { rel_path, also_pinned } => {
             let (title, body) = if rel_path.is_empty() {
                 let stay = if virtual_drive {
                     "Your files stay in Proton Drive, and in Files as online-only: they download again when you open them. Nothing is deleted online."
@@ -1221,7 +1260,7 @@ fn confirm_copy(confirm: &PendingConfirm, virtual_drive: bool) -> ConfirmCopy {
             ConfirmCopy {
                 title,
                 body,
-                detail: "Anything marked Always keep here stops being kept. Files that aren't fully synced, or that you've told Proton Drive to ignore, stay on this computer.",
+                detail: if *also_pinned == Some(false) { FREE_KEEPS_PINNED } else { FREE_DETAIL },
                 button: "Free up space",
                 cancel: "Cancel",
                 rel_path: rel_path.clone(),
@@ -1307,7 +1346,10 @@ enum WorkerCommand {
     DriveMove { action: String, from: String, to: String },
     LoadConflicts,
     ResolveConflict { id: u64, choice: String },
-    SetAvailability { path: String, action: String },
+    /// keep_pinned: see `set_availability`
+    SetAvailability { path: String, action: String, keep_pinned: Option<bool> },
+    /// What is marked Always keep, for the whole drive's Free up space (a read, over the control socket, #296)
+    PinnedSummary,
     /// What is hidden from this computer, for Settings (a read, over the control socket)
     LoadHidden,
     /// What to do about the files missing from the folder, as shown (POST /sync/files-missing)
@@ -1438,6 +1480,9 @@ enum WorkerEvent {
     ConflictsLoaded(Vec<ConflictRecord>),
     ConflictResolved(Result<(), String>),
     AvailabilityDone { path: String, result: Result<AvailabilityResult, String> },
+    /// How many items below the top level are marked Always keep and whether the whole drive is, or why that couldn't
+    /// be read
+    PinnedSummary(Result<(u32, bool), String>),
     /// What is hidden from this computer, or why it couldn't be read
     HiddenLoaded(Result<Vec<HiddenItem>, String>),
     SettingsSaved(Result<SettingsReply, String>),
@@ -2107,6 +2152,7 @@ impl ProtonDriveNativeApp {
                 WorkerEvent::ShareLoaded(window, result) => self.share_loaded(window, result),
                 WorkerEvent::ShareDone(window, result) => self.share_done(window, result),
                 WorkerEvent::SharePassword(window, result) => self.share_password(window, result),
+                WorkerEvent::PinnedSummary(result) => self.pinned_summary_loaded(result),
                 WorkerEvent::AvailabilityDone { path, result } => {
                     if let Some(i) = self.working.iter().position(|w| w == &path) {
                         self.working.remove(i);
@@ -2601,10 +2647,32 @@ impl ProtonDriveNativeApp {
     }
 
     /// Asks the daemon, over the control socket and off the UI thread, to change availability.
-    fn send_availability(&mut self, rel_path: String, action: &str) {
+    fn send_availability(&mut self, rel_path: String, action: &str, keep_pinned: Option<bool>) {
         self.notice = None;
         self.working.push(rel_path.clone());
-        let _ = self.tx.send(WorkerCommand::SetAvailability { path: rel_path, action: action.to_string() });
+        let _ = self.tx.send(WorkerCommand::SetAvailability { path: rel_path, action: action.to_string(), keep_pinned });
+    }
+
+    /// Asks before freeing up space in `rel_path` ('' is the whole drive). For the whole drive it also reads, off the UI
+    /// thread, what is marked Always keep (#296): the dialog opens at once, without the choice to free those files too,
+    /// and keeps them until the answer offers it.
+    fn open_free_up_space(&mut self, rel_path: String) {
+        if rel_path.is_empty() {
+            let _ = self.tx.send(WorkerCommand::PinnedSummary);
+        }
+        self.pending_confirm = Some(PendingConfirm::FreeAll { rel_path, also_pinned: None });
+    }
+
+    /// The daemon's answer about the Always keep marks, for the whole drive's Free up space while it asks: the choice to
+    /// free those files too shows, unticked, when something below the top level is marked and the whole drive isn't
+    /// (freeing that unmarks it, as it always did). Any other answer, or none, leaves the dialog without the choice; an
+    /// answer after the choice showed, or after the dialog closed, changes nothing.
+    fn pinned_summary_loaded(&mut self, result: Result<(u32, bool), String>) {
+        if let Some(PendingConfirm::FreeAll { rel_path, also_pinned: also_pinned @ None }) = self.pending_confirm.as_mut() {
+            if rel_path.is_empty() && matches!(result, Ok((items, false)) if items > 0) {
+                *also_pinned = Some(false);
+            }
+        }
     }
 
     /// While an availability action runs, a line saying so; then a dismissible line with how it went.
@@ -2658,7 +2726,7 @@ impl ProtonDriveNativeApp {
 
     /// Confirmation for Free up space, switching the virtual drive off and deleting the missing files in Proton Drive.
     fn render_confirm_modal(&mut self, ctx: &egui::Context) {
-        let Some(confirm) = self.pending_confirm.clone() else {
+        let Some(mut confirm) = self.pending_confirm.clone() else {
             return;
         };
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -2676,14 +2744,17 @@ impl ProtonDriveNativeApp {
         );
 
         let modal_w = 436.0;
-        let modal_h = 236.0;
+        // Taller by its choice when it has one (the whole drive's Free up space, #296)
+        let choice = matches!(confirm, PendingConfirm::FreeAll { also_pinned: Some(_), .. });
+        let modal_h = if choice { 270.0 } else { 236.0 };
         let modal_pos = egui::pos2(
             screen_rect.center().x - modal_w * 0.5,
             screen_rect.center().y - modal_h * 0.5,
         );
 
-        let ConfirmCopy { title, body, detail, button, cancel, rel_path: action_path, action } =
-            confirm_copy(&confirm, self.status.vfs.as_ref().is_some_and(|v| v.mode == "virtual"));
+        let virtual_drive = self.status.vfs.as_ref().is_some_and(|v| v.mode == "virtual");
+        let ConfirmCopy { title, body, button, cancel, rel_path: action_path, action, .. } =
+            confirm_copy(&confirm, virtual_drive);
 
         let area_resp = egui::Area::new(egui::Id::new("confirm_dialog"))
             .order(egui::Order::Tooltip)
@@ -2707,7 +2778,17 @@ impl ProtonDriveNativeApp {
                         ui.label(RichText::new(title).size(16.5).strong().color(TEXT_PRIMARY()));
                         ui.add_space(10.0);
                         ui.label(RichText::new(body).size(13.0).color(TEXT_PRIMARY()));
+                        if let PendingConfirm::FreeAll { also_pinned: Some(ticked), .. } = &mut confirm {
+                            ui.add_space(14.0);
+                            if check_box(ui, *ticked, FREE_ALSO_PINNED) {
+                                *ticked = !*ticked;
+                                self.pending_confirm = Some(confirm.clone());
+                            }
+                            ui.add_space(4.0);
+                        }
                         ui.add_space(6.0);
+                        // What stays, as the choice has it now
+                        let detail = confirm_copy(&confirm, virtual_drive).detail;
                         ui.label(RichText::new(detail).size(12.5).color(TEXT_MUTED()));
 
                         ui.add_space(20.0);
@@ -2737,8 +2818,9 @@ impl ProtonDriveNativeApp {
                                         self.start_fresh_error = None;
                                         let _ = self.tx.send(WorkerCommand::StartFresh);
                                     }
-                                    PendingConfirm::FreeAll { .. } => {
-                                        self.send_availability(action_path.clone(), action);
+                                    PendingConfirm::FreeAll { rel_path, also_pinned } => {
+                                        let keep_pinned = free_keeps_pinned(rel_path, *also_pinned);
+                                        self.send_availability(action_path.clone(), action, keep_pinned);
                                     }
                                 }
                                 self.pending_confirm = None;
@@ -3688,6 +3770,42 @@ pub(crate) fn decoration(ui: &mut egui::Ui, icon: &str, size: f32, color: Color3
     response
 }
 
+/// A box that is ticked or not, with its label beside it: whether either was clicked, by the pointer or, on the box, by
+/// the keyboard (Space or Enter while it has the focus, which its ring shows). The caller flips the state.
+fn check_box(ui: &mut egui::Ui, ticked: bool, label: &str) -> bool {
+    ui.horizontal(|ui| {
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+        ui.add_space(8.0);
+        let text = RichText::new(label).size(13.0).color(TEXT_PRIMARY());
+        // The label takes clicks, but not the keyboard's focus: the box has it
+        let label_response = ui.add(egui::Label::new(text).sense(Sense::CLICK));
+        let hovered = response.hovered() || label_response.hovered();
+        if hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let corner = CornerRadius::same(4);
+        if ticked {
+            let fill = if hovered { PROTON_PURPLE_HOVER } else { PROTON_PURPLE };
+            ui.painter().rect_filled(rect, corner, fill);
+            // The tick, drawn as egui draws its own
+            let at = |x: f32, y: f32| rect.min + Vec2::new(x, y);
+            ui.painter().add(egui::Shape::line(
+                vec![at(4.5, 9.5), at(7.5, 12.5), at(13.5, 5.5)],
+                Stroke::new(2.0_f32, Color32::WHITE),
+            ));
+        } else {
+            let line = if hovered { PROTON_PURPLE } else { SWITCH_OFF() };
+            ui.painter().rect(rect, corner, BG_CARD(), Stroke::new(1.5_f32, line), egui::StrokeKind::Inside);
+        }
+        focus_ring(ui, &response, 4.0);
+        // Named by its label for screen readers, and ticked or not
+        let enabled = ui.is_enabled();
+        response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, ticked, label));
+        response.clicked() || label_response.clicked()
+    })
+    .inner
+}
+
 /// An on/off switch; the caller flips the state when it is clicked, by the pointer or by the keyboard (Space or Enter
 /// while it has the focus, which its ring shows).
 fn toggle_switch(ui: &mut egui::Ui, on: bool) -> egui::Response {
@@ -4177,14 +4295,18 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
             WorkerCommand::DriveMove { action, from, to } => off_thread(&tx, &ctx, move || {
                 WorkerEvent::DriveDone(drive_move_at(&control_socket_path(), &action, &from, &to))
             }),
-            WorkerCommand::SetAvailability { path, action } => {
+            WorkerCommand::SetAvailability { path, action, keep_pinned } => {
                 // Off-thread: Free and Hide can take a while on big folders
                 let tx_clone = tx.clone();
                 let ctx_clone = ctx.clone();
                 thread::spawn(move || {
-                    let _ = tx_clone.send(WorkerEvent::AvailabilityDone { result: set_availability(&path, &action), path });
+                    let _ = tx_clone
+                        .send(WorkerEvent::AvailabilityDone { result: set_availability(&path, &action, keep_pinned), path });
                     ctx_clone.request_repaint();
                 });
+            }
+            WorkerCommand::PinnedSummary => {
+                off_thread(&tx, &ctx, || WorkerEvent::PinnedSummary(pinned_summary_at(&control_socket_path())))
             }
             WorkerCommand::LoadHidden => {
                 off_thread(&tx, &ctx, || WorkerEvent::HiddenLoaded(hidden_items_at(&control_socket_path())))
@@ -4317,6 +4439,7 @@ OPTIONS:
   --search <QUERY>      pre-fill the activity search
   --share <PATH>        open the share window for the item at the absolute PATH (in a running app too)
   --confirm-free-all    with --screenshot: show the Free up space confirmation (for the whole drive)
+  --fake-pinned <N>     with --confirm-free-all: as if N items below the top level were marked Always keep
   --drive-status <S>    with --screenshot: show the virtual drive as S (mounted | ejected | plain | crashed | busy |
                         starting | moving | move-failed | different-disk | fuse-unavailable)
   --drive-move <KIND>   with --screenshot: add a move that stopped (relocation | layout)
@@ -4365,6 +4488,7 @@ fn main() -> eframe::Result {
     let mut cli_search: Option<String> = None;
     let mut cli_size: Option<[f32; 2]> = None;
     let mut cli_confirm_free_all = false;
+    let mut cli_fake_pinned: Option<u32> = None;
     let mut cli_drive_status: Option<String> = None;
     let mut cli_drive_move: Option<String> = None;
     let mut cli_drive_error: Option<String> = None;
@@ -4395,6 +4519,9 @@ fn main() -> eframe::Result {
             }
             "--confirm-free-all" => {
                 cli_confirm_free_all = true;
+            }
+            "--fake-pinned" => {
+                cli_fake_pinned = text(args.next()).and_then(|v| v.parse().ok());
             }
             "--drive-status" => {
                 cli_drive_status = text(args.next());
@@ -4506,10 +4633,11 @@ fn main() -> eframe::Result {
             || cli_fake_share.is_some()
             || cli_fake_shared.is_some()
             || cli_confirm_stop_sharing.is_some()
+            || cli_fake_pinned.is_some()
             || cli_zoom.is_some())
     {
         eprintln!(
-            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --account-menu, --fake-share, --fake-shared, --confirm-stop-sharing and --zoom only apply together with --screenshot; ignoring them"
+            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --account-menu, --fake-share, --fake-shared, --confirm-stop-sharing, --fake-pinned and --zoom only apply together with --screenshot; ignoring them"
         );
     }
     let fake_share = match cli_fake_share {
@@ -4663,8 +4791,12 @@ fn main() -> eframe::Result {
                     cc.egui_ctx.set_zoom_factor(zoom);
                 }
                 if cli_confirm_free_all {
-                    // Free up space for the whole drive, as Home offers it
-                    app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
+                    // Free up space for the whole drive, as Home offers it, and the daemon's answer about the Always
+                    // keep marks, which a screenshot never asks for (#296)
+                    app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: None });
+                    if let Some(n) = cli_fake_pinned {
+                        app.pinned_summary_loaded(Ok((n, false)));
+                    }
                 } else if cli_confirm_drive_off {
                     app.pending_confirm = Some(PendingConfirm::VirtualDriveOff);
                 }
@@ -5473,12 +5605,15 @@ mod tests {
         }
 
         /// The actions asked of the worker since the last call (reads, such as refreshes, are left out, except the Share
-        /// window's, which its tests follow).
+        /// window's and Free up space's, which their tests follow).
         fn sent(&self) -> Vec<String> {
             self.commands
                 .try_iter()
                 .filter_map(|c| match c {
-                    WorkerCommand::SetAvailability { path, action } => Some(format!("{action} {path:?}")),
+                    WorkerCommand::SetAvailability { path, action, keep_pinned } => {
+                        Some(format!("{action} {path:?}{}", if keep_pinned == Some(true) { " keep-pinned" } else { "" }))
+                    }
+                    WorkerCommand::PinnedSummary => Some("pinned summary".to_string()),
                     WorkerCommand::SaveSettings(changes) => Some(format!("save {changes}")),
                     WorkerCommand::SetVirtualDrive(on) => Some(format!("virtual drive {on}")),
                     WorkerCommand::SetBlockedApps(apps) => Some(format!("blocked apps {}", apps.join(","))),
@@ -5607,7 +5742,7 @@ mod tests {
         let activity = h.text_at("Activity").expect("the sidebar's Activity is painted");
         activity_nav_reacts_at(&mut h, activity);
 
-        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
+        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: None });
         h.frames(2);
         h.click(activity);
 
@@ -5624,7 +5759,7 @@ mod tests {
         activity_nav_reacts_at(&mut h, activity);
 
         // No frame has drawn the backdrop yet when the click arrives
-        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
+        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: None });
         let button = |pressed| egui::Event::PointerButton {
             pos: activity,
             button: egui::PointerButton::Primary,
@@ -5652,7 +5787,7 @@ mod tests {
 
     #[test]
     fn confirming_free_all_for_a_folder_sends_free_for_that_folder() {
-        let h = confirm_and_click(PendingConfirm::FreeAll { rel_path: "Docs".into() }, "Free up space");
+        let h = confirm_and_click(PendingConfirm::FreeAll { rel_path: "Docs".into(), also_pinned: None }, "Free up space");
         assert_eq!(h.sent(), vec![r#"free "Docs""#.to_string()]);
         assert_eq!(h.app.working, vec!["Docs".to_string()]);
     }
@@ -5698,18 +5833,116 @@ mod tests {
     #[test]
     fn the_free_up_space_dialogs_buttons_take_clicks() {
         let mut h = Harness::new();
-        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
+        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: None });
         h.frames(2);
         h.click(h.text_at("Cancel").expect("the dialog is painted"));
         assert_eq!(h.app.pending_confirm, None);
         assert_eq!(h.sent(), Vec::<String>::new());
 
-        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
+        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: None });
         h.frames(2);
         h.click(h.text_at("Free up space").expect("the dialog is painted"));
         assert_eq!(h.app.pending_confirm, None);
-        assert_eq!(h.sent(), vec![r#"free """#.to_string()]);
+        // Before anything is known of the Always keep marks, they are kept (#296)
+        assert_eq!(h.sent(), vec![r#"free "" keep-pinned"#.to_string()]);
         assert_eq!(h.app.working, vec![String::new()]);
+    }
+
+    /// Home's Free up space… opened, and the daemon's answer about the Always keep marks, if any, handed over (#296).
+    fn free_up_space_answered(answer: Option<Result<(u32, bool), String>>) -> Harness {
+        let mut h = home_with(|_| {});
+        h.click(h.text_at("Free up space…").expect("Free up space is offered"));
+        assert_eq!(h.sent(), vec!["pinned summary".to_string()]);
+        if let Some(answer) = answer {
+            h.event(WorkerEvent::PinnedSummary(answer));
+        }
+        h
+    }
+
+    #[test]
+    fn free_up_space_reads_the_always_keep_marks_and_offers_no_choice_until_it_knows() {
+        let h = free_up_space_answered(None);
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: None }));
+        assert!(h.text_at("Free up space on this computer?").is_some());
+        assert!(h.text_at(FREE_ALSO_PINNED).is_none());
+        assert!(h.widget_at(FREE_ALSO_PINNED).is_none());
+    }
+
+    #[test]
+    fn with_items_marked_always_keep_free_up_space_offers_to_free_them_too_unticked() {
+        let mut h = free_up_space_answered(Some(Ok((2, false))));
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: Some(false) }));
+        assert!(h.text_at(FREE_ALSO_PINNED).is_some());
+        // A checkbox for screen readers, named by its label, and not ticked
+        let node = h.nodes_named(FREE_ALSO_PINNED).into_iter().next().expect("the checkbox is named by its label");
+        assert_eq!(node.role(), egui::accesskit::Role::CheckBox);
+        assert_eq!(node.toggled(), Some(egui::accesskit::Toggled::False));
+        assert!(h.text_at(FREE_KEEPS_PINNED).is_some());
+        assert!(h.text_at(FREE_DETAIL).is_none());
+
+        h.click(*h.text_at_all("Free up space").last().expect("the dialog's button is painted"));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), vec![r#"free "" keep-pinned"#.to_string()]);
+    }
+
+    #[test]
+    fn ticking_also_free_says_the_marked_files_stop_being_kept_and_frees_them() {
+        let mut h = free_up_space_answered(Some(Ok((2, false))));
+        h.click(h.text_at(FREE_ALSO_PINNED).expect("the checkbox's label is painted"));
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: Some(true) }));
+        assert!(h.text_at(FREE_DETAIL).is_some());
+        assert!(h.text_at(FREE_KEEPS_PINNED).is_none());
+        assert_eq!(h.nodes_named(FREE_ALSO_PINNED)[0].toggled(), Some(egui::accesskit::Toggled::True));
+        // The box itself takes the click too, and unticks
+        h.click(h.widget_at(FREE_ALSO_PINNED).expect("the checkbox is painted"));
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: Some(false) }));
+        assert!(h.text_at(FREE_KEEPS_PINNED).is_some());
+        h.click(h.widget_at(FREE_ALSO_PINNED).expect("the checkbox is painted"));
+        // A late or second answer doesn't undo the choice
+        h.event(WorkerEvent::PinnedSummary(Ok((2, false))));
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: Some(true) }));
+        assert_eq!(h.sent(), Vec::<String>::new());
+
+        h.click(*h.text_at_all("Free up space").last().expect("the dialog's button is painted"));
+        assert_eq!(h.sent(), vec![r#"free """#.to_string()]);
+    }
+
+    #[test]
+    fn with_nothing_marked_the_whole_drive_marked_or_no_answer_free_up_space_offers_no_choice_and_keeps_marks() {
+        for answer in [Ok((0, false)), Ok((3, true)), Ok((0, true)), Err("Not found".to_string())] {
+            let mut h = free_up_space_answered(Some(answer.clone()));
+            assert_eq!(
+                h.app.pending_confirm,
+                Some(PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: None }),
+                "{answer:?}"
+            );
+            assert!(h.text_at(FREE_ALSO_PINNED).is_none(), "{answer:?}");
+            assert!(h.text_at(FREE_DETAIL).is_some(), "{answer:?}");
+            h.click(*h.text_at_all("Free up space").last().expect("the dialog's button is painted"));
+            assert_eq!(h.sent(), vec![r#"free "" keep-pinned"#.to_string()], "{answer:?}");
+        }
+    }
+
+    #[test]
+    fn an_answer_about_the_marks_after_the_dialog_closed_opens_nothing() {
+        let mut h = free_up_space_answered(None);
+        h.click(h.text_at("Cancel").expect("the dialog is painted"));
+        h.event(WorkerEvent::PinnedSummary(Ok((2, false))));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_folders_free_up_space_reads_no_marks_and_offers_no_choice() {
+        let mut h = Harness::new();
+        h.app.open_free_up_space("Docs".into());
+        assert_eq!(h.sent(), Vec::<String>::new());
+        h.event(WorkerEvent::PinnedSummary(Ok((2, false))));
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::FreeAll { rel_path: "Docs".into(), also_pinned: None }));
+        assert!(h.text_at(FREE_ALSO_PINNED).is_none());
+        assert!(h.text_at(FREE_DETAIL).is_some());
+        h.click(*h.text_at_all("Free up space").last().expect("the dialog's button is painted"));
+        assert_eq!(h.sent(), vec![r#"free "Docs""#.to_string()]);
     }
 
     #[test]
@@ -5988,6 +6221,40 @@ mod tests {
         assert_eq!(hidden_items_at(&sock).unwrap_err(), HIDDEN_NEEDS_RESTART);
         server.join().unwrap();
         let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn what_is_marked_always_keep_is_read_over_the_control_socket() {
+        let (sock, server) = serve_once(b"HTTP/1.1 200 OK\r\n\r\n{\"items\":2,\"wholeDrive\":false}");
+        assert_eq!(pinned_summary_at(&sock), Ok((2, false)));
+        assert!(server.join().unwrap().starts_with("GET /availability/pinned HTTP/1.1\r\n"));
+        let _ = std::fs::remove_file(&sock);
+        let (sock, server) = serve_once(b"HTTP/1.1 200 OK\r\n\r\n{\"items\":0,\"wholeDrive\":true}");
+        assert_eq!(pinned_summary_at(&sock), Ok((0, true)));
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+        // A daemon from before the route answers 404: no answer, so no choice
+        let (sock, server) = serve_once(b"HTTP/1.1 404 Not Found\r\n\r\n{\"error\":\"Not found\"}");
+        assert!(pinned_summary_at(&sock).is_err());
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn a_free_asks_to_keep_the_always_keep_marks_only_when_told_to() {
+        let reply: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n{\"state\":\"online-only\",\"kept\":[],\"refused\":null}";
+        for (keep_pinned, body) in [
+            (Some(true), r#"{"action":"free","keepPinned":true,"path":""}"#),
+            (Some(false), r#"{"action":"free","keepPinned":false,"path":""}"#),
+            (None, r#"{"action":"free","path":""}"#),
+        ] {
+            let (sock, server) = serve_once(reply);
+            assert_eq!(set_availability_at(&sock, "", "free", keep_pinned).unwrap().state, "online-only");
+            let request = server.join().unwrap();
+            assert!(request.starts_with("POST /availability HTTP/1.1\r\n"), "{request}");
+            assert!(request.ends_with(body), "{request}");
+            let _ = std::fs::remove_file(&sock);
+        }
     }
 
     #[test]
@@ -6563,8 +6830,9 @@ mod tests {
         assert!(h.text_at("On this computer").is_some());
         assert!(h.text_at("169.0 MB").is_some());
         h.click(h.text_at("Free up space…").expect("Free up space is offered"));
-        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::FreeAll { rel_path: String::new() }));
-        assert_eq!(h.sent(), Vec::<String>::new());
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: None }));
+        // It reads what is marked Always keep (#296), and changes nothing yet
+        assert_eq!(h.sent(), vec!["pinned summary".to_string()]);
 
         let h = home_with(|s| s.account = None);
         assert!(h.text_at("Plain folder").is_some());
@@ -6572,7 +6840,7 @@ mod tests {
 
     #[test]
     fn freeing_up_the_whole_drive_asks_in_plain_words() {
-        let copy = confirm_copy(&PendingConfirm::FreeAll { rel_path: String::new() }, true);
+        let copy = confirm_copy(&PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: None }, true);
         assert_eq!(copy.title, "Free up space on this computer?");
         assert!(copy.body.contains("stay in Proton Drive"), "{}", copy.body);
         assert!(copy.body.contains("in Files as online-only"), "{}", copy.body);
@@ -6581,13 +6849,25 @@ mod tests {
         }
         assert_eq!((copy.rel_path.as_str(), copy.action), ("", "free"));
         // A plain folder doesn't show online-only files in Files: the dialog never says it does
-        let plain = confirm_copy(&PendingConfirm::FreeAll { rel_path: String::new() }, false);
+        let plain = confirm_copy(&PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: None }, false);
         assert_eq!(plain.title, copy.title);
         assert!(plain.body.contains("stay in Proton Drive"), "{}", plain.body);
         assert!(!plain.body.contains("in Files as online-only"), "{}", plain.body);
         assert!(!plain.body.contains("download again when you open them"), "{}", plain.body);
         assert!(plain.body.contains("don't show in Files"), "{}", plain.body);
         assert_eq!((plain.rel_path.as_str(), plain.action), ("", "free"));
+        // What happens to the files marked Always keep (#296): today's sentence, unless the choice to free them too is
+        // offered and left unticked
+        assert_eq!(copy.detail, FREE_DETAIL);
+        assert!(FREE_DETAIL.starts_with("Anything marked Always keep here stops being kept."), "{FREE_DETAIL}");
+        let keeps = confirm_copy(&PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: Some(false) }, true);
+        assert_eq!(keeps.detail, FREE_KEEPS_PINNED);
+        assert!(FREE_KEEPS_PINNED.starts_with("Files marked Always keep stay on this computer"), "{FREE_KEEPS_PINNED}");
+        let frees = confirm_copy(&PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: Some(true) }, true);
+        assert_eq!(frees.detail, FREE_DETAIL);
+        for detail in [FREE_DETAIL, FREE_KEEPS_PINNED] {
+            assert!(detail.contains("aren't fully synced"), "{detail}");
+        }
     }
 
     fn vfs(mode: &str, mounted: bool, reason: Option<&str>) -> VfsStatus {
@@ -6930,10 +7210,12 @@ mod tests {
             WorkerCommand::MountAgain,
             WorkerCommand::DriveMove { action: "finish".into(), from: "a".into(), to: "b".into() },
             WorkerCommand::ResolveConflict { id: 1, choice: "keep-both".into() },
-            WorkerCommand::SetAvailability { path: "x".into(), action: "pin".into() },
-            WorkerCommand::SetAvailability { path: "Music".into(), action: "unhide".into() },
-            // A read, but over the control socket, which a screenshot never calls
+            WorkerCommand::SetAvailability { path: "x".into(), action: "pin".into(), keep_pinned: None },
+            WorkerCommand::SetAvailability { path: "Music".into(), action: "unhide".into(), keep_pinned: None },
+            WorkerCommand::SetAvailability { path: String::new(), action: "free".into(), keep_pinned: Some(true) },
+            // Reads, but over the control socket, which a screenshot never calls
             WorkerCommand::LoadHidden,
+            WorkerCommand::PinnedSummary,
             WorkerCommand::ResolveFilesMissing { choice: MissingChoice::DeleteInCloud, root: "/r".into(), names: vec!["Docs".into()] },
             WorkerCommand::ResolveFilesMissing { choice: MissingChoice::KeepOnlineOnly, root: "/r".into(), names: vec!["Docs".into()] },
             WorkerCommand::StartFresh,
@@ -8567,7 +8849,7 @@ mod tests {
         assert_eq!(h.fill_under(delete), Some(STATUS_DANGER));
         assert_ne!(h.fill_under(h.text_at("Keep waiting").unwrap()), Some(STATUS_DANGER));
         // The other confirmations keep the primary colour
-        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
+        h.app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: None });
         h.frames(10);
         assert_eq!(h.fill_under(h.text_at("Free up space").expect("free up space asks")), Some(PROTON_PURPLE));
     }
@@ -9104,6 +9386,20 @@ mod tests {
         assert_eq!(h.app.edit_notifications, !was, "Space flips it");
         assert!(h.app.settings_dirty);
         assert_eq!(h.sent(), Vec::<String>::new(), "it waits for Save, as a click does");
+    }
+
+    // #296: Free up space's choice shows the keyboard's focus on its box, and Space ticks it as a click does
+    #[test]
+    fn free_up_spaces_choice_shows_the_keyboards_focus_and_space_ticks_it() {
+        let mut h = free_up_space_answered(Some(Ok((2, false))));
+        tab_to(&mut h, FREE_ALSO_PINNED);
+        let node = h.nodes_named(FREE_ALSO_PINNED).into_iter().next().expect("the checkbox is named by its label");
+        let rect = node_rect(&node);
+        assert!(focus_rings(&h).iter().any(|r| r.contains_rect(rect)), "a ring around the box {rect:?}");
+        press_key(&mut h, Key::Space);
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::FreeAll { rel_path: String::new(), also_pinned: Some(true) }));
+        assert!(h.text_at(FREE_DETAIL).is_some());
+        assert_eq!(h.sent(), Vec::<String>::new(), "it only ticks");
     }
 
     // R17: Activity's chips are toggles for screen readers, fill a shade darker under the pointer and show the
