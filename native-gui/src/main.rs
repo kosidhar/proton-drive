@@ -2114,7 +2114,7 @@ impl ProtonDriveNativeApp {
     fn render_shared(&mut self, ui: &mut egui::Ui) {
         // A gutter for the scroll bar, as Settings has, so that it never draws over the actions; the toolbar keeps it
         // too, so that Refresh lines up with them
-        let gutter = Margin { left: 0, right: 12, top: 0, bottom: 0 };
+        let gutter = SCROLL_GUTTER;
         // The toolbar, which stays while the list scrolls: what was just done on the left, Refresh on the right, in
         // line with the rows' actions (the title is the top bar's)
         let toolbar = Margin { right: gutter.right + SHARED_ROW_END as i8, ..gutter };
@@ -2768,19 +2768,21 @@ impl ProtonDriveNativeApp {
                 ui.add_space(8.0);
                 let working = self.files_missing_working;
                 let mut chosen = None;
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!working, |ui| {
-                        let kind = if virtual_layout { ButtonKind::Primary } else { ButtonKind::Secondary };
-                        let keep = action_button(ui, kind, Some(icons::ONLINE_ONLY), "Keep them online-only", 32.0);
-                        if keep.on_hover_text("Nothing is deleted, on this computer or in Proton Drive").clicked() {
-                            chosen = Some(MissingChoice::KeepOnlineOnly);
-                        }
-                        ui.add_space(4.0);
-                        let delete = action_button(ui, ButtonKind::DangerOutline, Some(icons::TRASH), "Delete them from Proton Drive too", 32.0);
-                        if delete.on_hover_text("Asks first. While they are missing, nothing is deleted in Proton Drive.").clicked() {
-                            chosen = Some(MissingChoice::DeleteInCloud);
-                        }
-                    });
+                // A row that wraps: in a narrow window the second choice goes under the first
+                ui.horizontal_wrapped(|ui| {
+                    if working {
+                        ui.disable();
+                    }
+                    let kind = if virtual_layout { ButtonKind::Primary } else { ButtonKind::Secondary };
+                    let keep = action_button(ui, kind, Some(icons::ONLINE_ONLY), "Keep them online-only", 32.0);
+                    if keep.on_hover_text("Nothing is deleted, on this computer or in Proton Drive").clicked() {
+                        chosen = Some(MissingChoice::KeepOnlineOnly);
+                    }
+                    ui.add_space(4.0);
+                    let delete = action_button(ui, ButtonKind::DangerOutline, Some(icons::TRASH), "Delete them from Proton Drive too", 32.0);
+                    if delete.on_hover_text("Asks first. While they are missing, nothing is deleted in Proton Drive.").clicked() {
+                        chosen = Some(MissingChoice::DeleteInCloud);
+                    }
                 });
                 match chosen {
                     _ if working => {}
@@ -2822,18 +2824,20 @@ impl ProtonDriveNativeApp {
                 let working = self.start_fresh_working;
                 let mut start_fresh = false;
                 let mut sign_out = false;
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!working, |ui| {
-                        let fresh = action_button(ui, ButtonKind::Primary, Some(icons::RESTART), "Start fresh with this account", 32.0);
-                        if fresh.on_hover_text("Asks first. The files on this computer stay, and upload to this account.").clicked() {
-                            start_fresh = true;
-                        }
-                        ui.add_space(4.0);
-                        let out = action_button(ui, ButtonKind::Secondary, Some(icons::SIGN_OUT), "Sign out", 32.0);
-                        if out.on_hover_text("Then sign in to the account the files were synced with").clicked() {
-                            sign_out = true;
-                        }
-                    });
+                // A row that wraps, as the missing files' choices
+                ui.horizontal_wrapped(|ui| {
+                    if working {
+                        ui.disable();
+                    }
+                    let fresh = action_button(ui, ButtonKind::Primary, Some(icons::RESTART), "Start fresh with this account", 32.0);
+                    if fresh.on_hover_text("Asks first. The files on this computer stay, and upload to this account.").clicked() {
+                        start_fresh = true;
+                    }
+                    ui.add_space(4.0);
+                    let out = action_button(ui, ButtonKind::Secondary, Some(icons::SIGN_OUT), "Sign out", 32.0);
+                    if out.on_hover_text("Then sign in to the account the files were synced with").clicked() {
+                        sign_out = true;
+                    }
                 });
                 if !working && start_fresh {
                     self.pending_confirm = Some(PendingConfirm::StartFresh);
@@ -2862,7 +2866,7 @@ impl ProtonDriveNativeApp {
             .frame(
                 Frame::NONE
                     .fill(BG_CANVAS())
-                    .inner_margin(Margin::symmetric(26, 20)),
+                    .inner_margin(SECTION_MARGIN),
             )
             .show(ctx, |ui| {
                 // Nothing under the confirmation dialog or the Share window takes clicks or keys while it is open
@@ -2886,8 +2890,7 @@ impl ProtonDriveNativeApp {
             .id_salt("settings_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                // A gutter for the scroll bar, so that it never draws over the cards' edges
-                Frame::NONE.inner_margin(Margin { left: 0, right: 12, top: 0, bottom: 0 }).show(ui, |ui| {
+                Frame::NONE.inner_margin(SCROLL_GUTTER).show(ui, |ui| {
                     self.render_account_card(ui);
                     ui.add_space(14.0);
                     // A daemon before Stage 2 has no virtual drive to show
@@ -3432,6 +3435,11 @@ fn without_blocked_app(apps: &[String], name: &str) -> Vec<String> {
     apps.iter().filter(|a| *a != name).cloned().collect()
 }
 
+/// The room around a section, right of the sidebar and under the top bar.
+const SECTION_MARGIN: Margin = Margin::symmetric(26, 20);
+/// The room a section that scrolls keeps on its right for the scroll bar, so that the bar never draws over the cards.
+const SCROLL_GUTTER: Margin = Margin { left: 0, right: 12, top: 0, bottom: 0 };
+
 fn card_frame() -> Frame {
     Frame::NONE
         .fill(BG_CARD())
@@ -3557,6 +3565,20 @@ fn action_button_sized(ui: &mut egui::Ui, kind: ButtonKind, icon: Option<&str>, 
     let font = FontId::proportional(13.0);
     ui.painter().text(egui::pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, label, font, text_color);
     resp
+}
+
+/// `action_button`, greyed out and deaf to clicks unless `enabled`, in a room of exactly its size: in a row that wraps,
+/// it goes to the next line whole when it doesn't fit, where egui's `add_enabled_ui` would take the rest of the line
+/// and run past its end.
+fn action_button_if(ui: &mut egui::Ui, enabled: bool, kind: ButtonKind, icon: Option<&str>, label: &str, height: f32) -> egui::Response {
+    let size = Vec2::new(action_button_width(ui, icon, label), height);
+    ui.allocate_ui(size, |ui| {
+        if !enabled {
+            ui.disable();
+        }
+        action_button_sized(ui, kind, icon, label, size)
+    })
+    .inner
 }
 
 /// How wide `action_button` makes a button with this icon and label.
@@ -6218,6 +6240,71 @@ mod tests {
         assert_eq!(h.sent(), vec!["move-back /home/u/ProtonDrive -> /mnt/b/ProtonDrive".to_string()]);
     }
 
+    // The attention buttons: each with its icon before its label, and greyed out (and deaf) while its request runs
+    #[test]
+    fn attention_buttons_carry_their_icons_and_grey_out_while_working() {
+        let icon_before = |h: &Harness, label: &str, icon: &str| {
+            let at = h.text_rect(label).unwrap_or_else(|| panic!("{label} is offered"));
+            let glyph = h.text_rects_all(icon).into_iter().find(|g| (g.center().y - at.center().y).abs() < 4.0 && g.right() <= at.left() && at.left() - g.right() < 12.0);
+            assert!(glyph.is_some(), "{label}'s icon {icon:?} is painted before it");
+        };
+        let moved = VfsStatus {
+            drive_move: Some(drive_move("layout", Some("Disk full"), &["move-back", "finish", "retry"])),
+            ..vfs("plain", false, Some("move-failed"))
+        };
+        let mut h = home_with(|s| s.vfs = Some(moved));
+        // Finishing ends in the done state's check; trying again goes round again
+        for (label, icon) in [("Move files back", icons::MOVE_BACK), ("Finish moving files", icons::CHECK), ("Try again", icons::REFRESH)] {
+            icon_before(&h, label, icon);
+        }
+        assert_eq!(h.fill_under(h.text_at("Try again").unwrap()), Some(PROTON_PURPLE));
+        h.app.drive_working = true;
+        h.frames(2);
+        for label in ["Move files back", "Finish moving files", "Try again"] {
+            let at = h.text_at(label).unwrap();
+            assert_ne!(h.fill_under(at), Some(PROTON_PURPLE), "{label} is greyed out while the drive works");
+            assert_ne!(h.fill_under(at), Some(BG_CARD()), "{label} is greyed out while the drive works");
+            h.click(at);
+        }
+        assert_eq!(h.sent(), Vec::<String>::new(), "nothing is sent while the drive works");
+
+        let mut h = home_with(|s| s.vfs = Some(vfs("virtual", false, Some("ejected"))));
+        icon_before(&h, "Mount again", icons::MOUNT);
+        h.app.drive_working = true;
+        h.frames(2);
+        assert_ne!(h.fill_under(h.text_at("Mount again").unwrap()), Some(PROTON_PURPLE), "greyed out while the drive works");
+
+        let mut h = Harness::new();
+        held(&mut h);
+        icon_before(&h, KEEP, icons::ONLINE_ONLY);
+        icon_before(&h, DELETE_TOO, icons::TRASH);
+        h.app.files_missing_working = true;
+        h.frames(2);
+        for label in [KEEP, DELETE_TOO] {
+            let at = h.text_at(label).unwrap();
+            assert_ne!(h.fill_under(at), Some(BG_CARD()), "{label} is greyed out while the choice is sent");
+            h.click(at);
+        }
+        assert_eq!((h.sent(), h.app.pending_confirm.clone()), (Vec::<String>::new(), None), "nothing is asked or sent meanwhile");
+
+        let mut h = home_with(|s| s.account_mismatch = Some(AccountMismatch { message: "Another account.".into() }));
+        icon_before(&h, "Start fresh with this account", icons::RESTART);
+        icon_before(&h, "Sign out", icons::SIGN_OUT);
+        h.app.start_fresh_working = true;
+        h.frames(2);
+        assert_ne!(h.fill_under(h.text_at("Start fresh with this account").unwrap()), Some(PROTON_PURPLE), "greyed out while it starts fresh");
+        assert_ne!(h.fill_under(h.text_at("Sign out").unwrap()), Some(BG_CARD()), "greyed out while it starts fresh");
+
+        let mut h = home_with(|_| {});
+        h.event(WorkerEvent::ConflictsLoaded(vec![ConflictRecord { id: 7, local_rel_path: "docs/report.pdf".into(), ..Default::default() }]));
+        for (label, icon) in [("Show in Files", icons::FOLDER_OPEN), ("Keep Both", icons::KEEP_BOTH), ("Keep Local", icons::KEEP_LOCAL), ("Keep Remote", icons::KEEP_REMOTE)] {
+            icon_before(&h, label, icon);
+        }
+        h.app.daemon_online = false;
+        h.frames(2);
+        assert_ne!(h.fill_under(h.text_at("Keep Both").unwrap()), Some(PROTON_PURPLE), "greyed out without the daemon");
+    }
+
     #[test]
     fn a_stopped_move_is_on_home_while_the_drive_is_mounted_again() {
         let mounted = VfsStatus {
@@ -6998,6 +7085,167 @@ mod tests {
         assert!(activity.bottom() < meter.top(), "Activity {activity:?} is above the meter {meter:?}");
         assert!(meter.bottom() <= h.screen.y, "the meter {meter:?} is inside the window {:?}", h.screen);
         assert!(rect(env!("CARGO_PKG_VERSION")).right() <= SIDEBAR_EDGE, "the version stays in the sidebar");
+    }
+
+    /// Every button the last frame put in the section (not the sidebar's or the top bar's): its name and its frame.
+    fn section_buttons(h: &Harness) -> Vec<(String, egui::Rect)> {
+        let Some(update) = h.last.as_ref().and_then(|o| o.platform_output.accesskit_update.as_ref()) else {
+            return Vec::new();
+        };
+        update
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.role() == egui::accesskit::Role::Button)
+            .filter_map(|(_, n)| {
+                let b = n.bounds()?;
+                Some((n.label()?.to_string(), egui::Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32))))
+            })
+            .filter(|(_, r)| r.left() >= SIDEBAR_EDGE && r.top() >= chrome::TOP_BAR_HEIGHT)
+            .collect()
+    }
+
+    /// Every filled rectangle the last frame painted (the cards, the boxes in them, the buttons), each with the clip it
+    /// was painted in: what of it shows.
+    fn filled_rects(h: &Harness) -> Vec<(egui::Rect, egui::Rect)> {
+        fn rects(shape: &egui::Shape, clip: egui::Rect, out: &mut Vec<(egui::Rect, egui::Rect)>) {
+            match shape {
+                egui::Shape::Rect(r) if r.fill != Color32::TRANSPARENT => out.push((r.rect, clip)),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| rects(s, clip, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in h.last.iter().flat_map(|o| o.shapes.iter()) {
+            rects(&clipped.shape, clipped.clip_rect, &mut out);
+        }
+        out
+    }
+
+    /// Whether a text's lines break inside a word (egui breaks a word it has no room for anywhere).
+    fn breaks_a_word(galley: &egui::Galley) -> bool {
+        galley.rows.windows(2).any(|w| {
+            let end = w[0].glyphs.last().map(|g| g.chr);
+            let start = w[1].glyphs.first().map(|g| g.chr);
+            !w[0].ends_with_newline && !end.is_some_and(char::is_whitespace) && !start.is_some_and(char::is_whitespace)
+        })
+    }
+
+    /// What a test case changes in the app before it looks
+    type SetUp = Box<dyn Fn(&mut Harness)>;
+
+    // The anti-goal "nothing clipped or overlapping at 840×540 or at 120% zoom", on Home: each button stays inside its
+    // box, its card and the window, with each kind of thing that needs the user, and the status's headline breaks
+    // between words only
+    #[test]
+    fn home_fits_at_840_by_540_and_120_percent() {
+        let long = "Projects/2026/Quarterly planning/Very long folder name/report final version.pdf";
+        let cases: [(&str, SetUp); 8] = [
+            ("a conflict", Box::new(move |h| {
+                h.event(WorkerEvent::ConflictsLoaded(vec![ConflictRecord { id: 7, local_rel_path: long.into(), ..Default::default() }]));
+            })),
+            ("files missing", Box::new(held)),
+            ("files missing in the virtual layout", Box::new(|h| {
+                h.app.status.vfs = Some(vfs("virtual", true, None));
+                held(h);
+            })),
+            ("another account", Box::new(|h| {
+                h.app.status.account_mismatch = Some(AccountMismatch { message: "You signed in to a different Proton account.".into() });
+                h.app.status.state = "error".into();
+            })),
+            ("not mounted", Box::new(|h| h.app.status.vfs = Some(vfs("virtual", false, Some("ejected"))))),
+            ("stopped move", Box::new(|h| {
+                h.app.status.vfs = Some(VfsStatus {
+                    error: Some("Disk full".into()),
+                    drive_move: Some(drive_move("layout", None, &["move-back", "finish", "retry"])),
+                    ..vfs("plain", false, Some("move-failed"))
+                });
+            })),
+            ("signed out", Box::new(|h| h.app.status.logged_in = false)),
+            ("paused", Box::new(|h| h.app.status.settings.paused_until = Some(home::now_ms() + 30 * 60_000))),
+        ];
+        for (case, set_up) in &cases {
+            for zoom in [1.0, 1.2] {
+                let mut h = home_with(|s| s.stats.total_bytes = 169 * 1024 * 1024);
+                set_up(&mut h);
+                if *case == "paused" {
+                    h.app.status.settings.paused = true;
+                }
+                h.app.refresh_attention();
+                h.resize_zoomed(Vec2::new(840.0, 540.0), zoom);
+                let at = format!("{case} at {zoom}");
+                let summary = home::status_summary(&h.app.status, true, false, h.app.attention.len(), home::now_ms());
+                let headline = h.texts(|t| t.galley.text() == summary.headline);
+                let headline = headline.first().unwrap_or_else(|| panic!("{at}: the headline {:?} is painted", summary.headline));
+                assert!(!breaks_a_word(&headline.galley), "{at}: {:?} breaks inside a word", summary.headline);
+
+                // Down the section, a scroll at a time, and down Needs attention's own list: each button, once it is in
+                // sight, is inside the window across and inside every frame it is in
+                let (mut all, mut checked) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+                let section = |r: &egui::Rect| r.left() == SIDEBAR_EDGE && r.top() == chrome::TOP_BAR_HEIGHT;
+                for step in 0..24 {
+                    if step % 2 == 1 {
+                        // The list in Needs attention, by its left edge; then the section, in its scroll bar's gutter
+                        if let Some(list) = h.text_rect("Needs attention").map(|title| title.left_bottom() + Vec2::new(2.0, 24.0)) {
+                            h.scroll(list, 60.0);
+                        }
+                        h.scroll(egui::pos2(h.screen.x - 26.0 - 6.0, h.screen.y / 2.0), 60.0);
+                    }
+                    let frames = filled_rects(&h);
+                    for (name, b) in section_buttons(&h) {
+                        all.insert(name.clone());
+                        let own = |r: &egui::Rect| (r.min - b.min).length() < 0.5 && (r.max - b.max).length() < 0.5;
+                        let in_sight = frames.iter().any(|(r, clip)| own(r) && clip.top() <= b.top() + 0.5 && b.bottom() <= clip.bottom() + 0.5);
+                        if !in_sight {
+                            continue;
+                        }
+                        checked.insert(name.clone());
+                        assert!(b.left() >= SIDEBAR_EDGE && b.right() <= h.screen.x, "{at}: {name:?} {b:?} runs out of the window {:?}", h.screen);
+                        // Its box and its card hold the whole of it, and keep to the section's room (a card grown wider
+                        // than the window has room for runs into the scroll bar's gutter and on out of the window)
+                        let room = h.screen.x - SECTION_MARGIN.rightf() - SCROLL_GUTTER.rightf();
+                        for (frame, _) in frames.iter().filter(|(r, clip)| r.intersect(*clip).contains(b.center()) && !own(r) && !section(r)) {
+                            assert!(frame.expand(0.5).contains_rect(b), "{at}: {name:?} {b:?} runs out of the frame {frame:?}");
+                            assert!(frame.right() <= room + 0.5, "{at}: the frame {frame:?} of {name:?} runs past the section's room {room}");
+                        }
+                    }
+                }
+                assert!(all.len() >= 3, "{at}: buttons are on Home: {all:?}");
+                assert_eq!(checked, all, "{at}: every button came in sight");
+            }
+        }
+    }
+
+    // Narrow, the status's buttons go under its headline, Sync now first, and do what they do beside it
+    #[test]
+    fn the_status_buttons_go_under_the_headline_when_narrow_and_still_work() {
+        let mut h = home_with(|_| {});
+        let side_by_side = |h: &Harness| h.text_at("Sync now").unwrap().y - h.text_at("Up to date").unwrap().y;
+        assert!(side_by_side(&h).abs() < 20.0, "wide, beside the headline");
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
+        assert!(side_by_side(&h) > 20.0, "narrow, under the headline");
+        let (sync, pause) = (h.text_at("Sync now").unwrap(), h.text_at("Pause").unwrap());
+        assert!(sync.x < pause.x && (sync.y - pause.y).abs() < 4.0, "Sync now, then Pause: {sync:?} {pause:?}");
+        h.click(sync);
+        assert_eq!(h.sent(), vec!["sync now".to_string()]);
+        h.click(pause);
+        assert_eq!(h.sent(), Vec::<String>::new());
+        h.click(h.text_at("Until I resume").expect("Pause opens its choices"));
+        assert_eq!(h.sent(), vec!["paused true".to_string()]);
+        assert!(h.text_at("For 1 hour").is_none(), "a choice closes the choices");
+        h.click(pause);
+        h.frame(vec![egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]);
+        h.frames(2);
+        assert!(h.text_at("For 1 hour").is_none(), "Escape closes them");
+        assert_eq!(h.sent(), Vec::<String>::new());
+
+        let mut h = home_with(|s| s.settings.paused = true);
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
+        h.click(h.text_at("Resume").unwrap());
+        assert_eq!(h.sent(), vec!["paused false".to_string()]);
+        let mut h = home_with(|s| s.logged_in = false);
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
+        h.click(h.text_at("Sign in").unwrap());
+        assert_eq!(h.sent(), vec!["sign in".to_string()]);
     }
 
     #[test]
