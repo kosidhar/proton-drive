@@ -7156,11 +7156,49 @@ mod tests {
     }
 
     #[test]
-    fn home_no_longer_shows_proton_storage() {
-        let h = home_with(|s| s.account = Some(three_of_510()));
+    fn storage_line_says_used_and_free_of_the_quota() {
+        let line = home::storage_line(Some(&three_of_510())).expect("a quota");
+        assert_eq!(line, format!("{} used · {} free of {}", format_bytes(3 * GB), format_bytes(507 * GB), format_bytes(510 * GB)));
+        assert_eq!(line, "3.0 GB used · 507.0 GB free of 510.0 GB");
+        let over = AccountInfo { used_space: 12 * GB, max_space: 10 * GB, ..Default::default() };
+        assert_eq!(home::storage_line(Some(&over)).unwrap(), format!("{} used · 0 B free of {}", format_bytes(12 * GB), format_bytes(10 * GB)));
+        assert_eq!(home::storage_line(None), None);
+        assert_eq!(home::storage_line(Some(&AccountInfo::default())), None, "no quota");
+        assert_eq!(home::storage_hover(Some(&AccountInfo { used_drive_space: 2 * GB, ..three_of_510() })).unwrap(),
+            "Drive uses 2.0 GB of it; the rest is your other Proton apps");
+        assert_eq!(home::storage_hover(None), None);
+        assert_eq!(home::storage_hover(Some(&AccountInfo::default())), None);
+    }
+
+    #[test]
+    fn home_shows_proton_storage_used_and_free() {
+        let mut h = home_with(|s| s.account = Some(three_of_510()));
+        tooltips_at_once(&h);
+        let line = home::storage_line(h.app.status.account.as_ref()).unwrap();
+        let label = h.text_at("Proton storage").expect("the row's label");
+        let at = h.text_at(&line).expect("the row's line");
+        assert!(label.x > SIDEBAR_EDGE && at.x > SIDEBAR_EDGE, "{label:?} {at:?}");
+        assert!(h.text_at("Your drive").unwrap().y < label.y && label.y < h.text_at("On this computer").unwrap().y, "between the path and On this computer");
+        hover(&mut h, at);
+        let hover_text = home::storage_hover(h.app.status.account.as_ref()).unwrap();
+        assert!(h.text_at(&hover_text).is_some(), "the hover says how much is Drive's");
+
+        h.app.status.account = None;
+        h.frames(2);
         assert!(h.text_at("Proton storage").is_none());
-        assert!(h.text_at("3.0 GB of 510.0 GB").is_none());
-        assert!(h.text_at("Your drive").is_some());
+        assert!(h.text_at(&line).is_none());
+        assert!(h.text_at("On this computer").is_some());
+    }
+
+    #[test]
+    fn homes_storage_row_fits_at_840_by_540_zoomed() {
+        let mut h = home_with(|s| s.account = Some(three_of_510()));
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
+        let line = home::storage_line(h.app.status.account.as_ref()).unwrap();
+        let rect = h.text_rect(&line).expect("the row's line");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(840.0, 540.0) / 1.2);
+        assert!(screen.contains_rect(rect), "{rect:?} in {screen:?}");
+        assert!(rect.min.x >= SIDEBAR_EDGE, "{rect:?}");
     }
 
     #[test]
