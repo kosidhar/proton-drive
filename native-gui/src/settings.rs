@@ -41,7 +41,8 @@ pub(crate) const STACKED_BELOW: f32 = 440.0;
 const STACKED_GAP: f32 = 6.0;
 
 /// A setting as Proton lays one out (#276): its label, and a one-line `hint` at most, on the left; the ⓘ after the label
-/// when there is more to say (`info`, on hover or keyboard focus); and its `control` on the right, vertically centred.
+/// when there is more to say (`info`, on hover, a click or keyboard focus); and its `control` on the right, vertically
+/// centred.
 /// The control has the room the label leaves (but at least 40% of the row) and sizes itself to `ui.available_width()`,
 /// as one widget or one group; the label, then the hint, are cut to the room it leaves, whole on hover. In a row
 /// narrower than `STACKED_BELOW` (a small window, a large zoom), the control goes under its label instead, as on
@@ -220,8 +221,8 @@ pub(crate) fn switch_row(ui: &mut egui::Ui, label: &str, hint: Option<&str>, inf
     switch.clicked() || label_response.clicked()
 }
 
-/// A Settings card's heading, in bold, with the ⓘ after it when there is more to say (`info`, on hover), and a one-line
-/// `hint` under it.
+/// A Settings card's heading, in bold, with the ⓘ after it when there is more to say (`info`, on hover or a click),
+/// and a one-line `hint` under it.
 pub(crate) fn card_heading(ui: &mut egui::Ui, title: &str, hint: Option<&str>, info: Option<&str>) {
     ui.horizontal(|ui| {
         card_title(ui, title);
@@ -277,19 +278,117 @@ pub(crate) fn picker<R>(
     .inner
 }
 
-/// An ⓘ that shows `info` on hover, greyed out or not, and on the keyboard's focus (it is a stop for the Tab key, with a
-/// focus ring), and hands it to screen readers.
+/// The ⓘ a click (or Enter) opened (#318), and the pass it was last drawn in. One at a time; it closes on a click
+/// elsewhere, a second click on it, Escape, Tab (the focus moving on), a wheel turn, the focus coming to another ⓘ,
+/// or once it isn't drawn (another section open, or scrolled out of sight).
+#[derive(Clone, Copy)]
+struct OpenInfo {
+    id: egui::Id,
+    pass: u64,
+}
+
+const OPEN_INFO: &str = "settings_open_info";
+
+/// An ⓘ that shows `info` on hover, greyed out or not, on a click until a click elsewhere (egui hides a tooltip right
+/// after a click, #318), and on the keyboard's focus (it is a stop for the Tab key, with a focus ring); and hands it to
+/// screen readers.
 fn info_glyph(ui: &mut egui::Ui, info: &str) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(INFO_SIZE), Sense::FOCUSABLE);
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(INFO_SIZE), Sense::click());
     let enabled = ui.is_enabled();
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, enabled, info));
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icons::INFO, icons::font(INFO_SIZE - 1.0), TEXT_MUTED());
     focus_ring(ui, &response, INFO_SIZE / 2.0);
-    // Once: under the pointer, the hover shows it
-    if response.has_focus() && !response.hovered() {
-        response.show_tooltip_text(info);
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    response.on_hover_text(info).on_disabled_hover_text(info)
+
+    let ctx = ui.ctx().clone();
+    let key = egui::Id::new(OPEN_INFO);
+    let pass = ctx.cumulative_pass_nr();
+    let open = ctx.data(|d| d.get_temp::<OpenInfo>(key));
+    // Still open if it was this one, drawn in the last pass, and in sight
+    let mut is_open = open.is_some_and(|o| o.id == response.id && o.pass + 1 >= pass) && ui.is_rect_visible(rect);
+    // A greyed-out ⓘ takes no clicks as a widget, so the click is read off the pointer, where the ⓘ is in sight
+    // (not scrolled under the top bar); under a dialog, the dialog's shield is the layer under the pointer, and
+    // nothing opens
+    let clicked = if enabled {
+        response.clicked()
+    } else {
+        ctx.input(|i| i.pointer.primary_clicked()) && ui.rect_contains_pointer(rect)
+    };
+    if clicked {
+        is_open = !is_open;
+    } else if ctx.input(|i| {
+        let keys = i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Tab);
+        // A wheel turn too, as egui hides its tooltips on a scroll: over the box, which takes the pointer, the page
+        // wouldn't scroll while it is open
+        i.pointer.any_click() || keys || i.raw_scroll_delta != Vec2::ZERO
+    }) {
+        is_open = false;
+    }
+    // One at a time: the focus coming to this ⓘ (from a screen reader, say) closes another that is open. (Asked here:
+    // asking for the focus inside `data_mut` would lock the context twice.)
+    let focus_takes_over = response.has_focus() && open.is_some_and(|o| o.id != response.id);
+    ctx.data_mut(|d| {
+        if is_open {
+            d.insert_temp(key, OpenInfo { id: response.id, pass });
+        } else if open.is_some_and(|o| o.id == response.id) || focus_takes_over {
+            d.remove::<OpenInfo>(key);
+        }
+    });
+
+    // Open, or with the keyboard's focus (under the pointer too, so the words don't drop out while egui's hover delay
+    // runs), and in sight
+    if (is_open || response.has_focus()) && ui.is_rect_visible(rect) {
+        show_info_words(&ctx, response.id, rect, info);
+        response
+    } else {
+        let words = |ui: &mut egui::Ui| {
+            ui.set_max_width(ui.spacing().tooltip_width);
+            ui.add(egui::Label::new(info));
+        };
+        response.on_hover_ui(words).on_disabled_hover_ui(words)
+    }
+}
+
+/// An ⓘ's words in egui's tooltip box, where egui puts a tooltip (under the ⓘ, else above it, kept on the
+/// screen), in an area of their own rather than as a tooltip: egui shows one tooltip at a time, so a tooltip held
+/// open would keep every other widget's from showing on hover (#318). The box takes the clicks on it, which close
+/// it: a click never reaches the control it hides (in a narrow window, the drive's ⓘ's words cover its switch).
+fn show_info_words(ctx: &egui::Context, id: egui::Id, anchor: egui::Rect, info: &str) {
+    /// egui's gap between a widget and its tooltip
+    const GAP: f32 = 4.0;
+    let style = ctx.style();
+    let frame = Frame::popup(&style);
+    let width = style.spacing.tooltip_width;
+    // Its size, to put it where egui would: the words laid out as the label in it lays them out
+    let font = egui::TextStyle::Body.resolve(&style);
+    let words = ctx.fonts(|f| f.layout(info.to_owned(), font, style.visuals.text_color(), width)).size();
+    let size = words + frame.total_margin().sum();
+    let screen = ctx.screen_rect();
+    let fits_below = anchor.bottom() + GAP + size.y <= screen.bottom();
+    let top = if fits_below { anchor.bottom() + GAP } else { anchor.top() - GAP - size.y };
+    let outer = egui::Rect::from_min_size(egui::pos2(anchor.left(), top), size);
+    // Kept on the screen, as egui keeps an area: pushed left off the right edge, then onto the left and top edges
+    let outer = outer.translate(Vec2::new((screen.right() - outer.right()).min(0.0), 0.0));
+    let onto_screen = Vec2::new((screen.left() - outer.left()).max(0.0), (screen.top() - outer.top()).max(0.0));
+    let outer = outer.translate(onto_screen);
+    // Each ⓘ's box an area of its own, as a focused one may show while another's closes
+    egui::Area::new(egui::Id::new(OPEN_INFO).with(id))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(outer.min)
+        .sense(Sense::CLICK)
+        .show(ctx, |ui| {
+            frame.show(ui, |ui| {
+                ui.set_max_width(width);
+                ui.add(egui::Label::new(info).selectable(false));
+            });
+        });
+}
+
+/// Closes the ⓘ a click opened, if any: a dialog or the Share window is opening over Settings.
+pub(crate) fn close_open_info(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove::<OpenInfo>(egui::Id::new(OPEN_INFO)));
 }
 
 /// The plan, as the account's quota tells it.
