@@ -5,11 +5,13 @@ use std::sync::atomic::Ordering;
 
 use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, ScrollArea, Stroke, Vec2};
 
+use crate::icons;
 use crate::{
-    action_button, btn_secondary_hover_bg, card_frame, drive_status_line, files_safe_hint, format_bytes, offers_mount_again,
-    render_transfer_line, shown_folder, spawn_reaped, AccountInfo, ButtonKind, ConflictRecord, DaemonStatus,
-    PendingConfirm, ProtonDriveNativeApp, VfsStatus, WorkerCommand, BG_CARD_ALT, BORDER_SUBTLE, PROTON_PURPLE,
-    PROTON_PURPLE_TEXT, SCREENSHOT_MODE, STATUS_DANGER, STATUS_SUCCESS, STATUS_WARNING, TEXT_MUTED, TEXT_PRIMARY,
+    action_button, action_button_if, action_button_named, card_frame, decoration, drive_status_line, files_safe_hint,
+    format_bytes, offers_mount_again, render_transfer_line, shown_folder, spawn_reaped, AccountInfo, ButtonKind,
+    ConflictRecord, DaemonStatus, PendingConfirm, ProtonDriveNativeApp, VfsStatus, WorkerCommand, BG_CARD_ALT,
+    BORDER_SUBTLE, DANGER_TEXT, PROTON_PURPLE, PROTON_PURPLE_TEXT, SCREENSHOT_MODE, SUCCESS_TEXT, TEXT_MUTED, TEXT_PRIMARY,
+    WARNING_TEXT,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,6 +295,7 @@ pub fn conflict_title(rel_path: &str) -> String {
 
 /// One way to resolve a conflict: what it asks the daemon for, its button and what its hover text says it does.
 pub struct ConflictChoice {
+    pub icon: &'static str,
     pub choice: &'static str,
     pub label: &'static str,
     pub hint: &'static str,
@@ -301,16 +304,19 @@ pub struct ConflictChoice {
 /// The choices in the order shown: Keep Both first, as the main one, since it replaces nothing.
 pub const CONFLICT_CHOICES: [ConflictChoice; 3] = [
     ConflictChoice {
+        icon: icons::KEEP_BOTH,
         choice: "keep-both",
         label: "Keep Both",
         hint: "Keep both versions: this computer's is saved as a renamed copy next to the Proton Drive version",
     },
     ConflictChoice {
+        icon: icons::KEEP_LOCAL,
         choice: "keep-local",
         label: "Keep Local",
         hint: "Use this computer's version: replaces the one in Proton Drive",
     },
     ConflictChoice {
+        icon: icons::KEEP_REMOTE,
         choice: "keep-remote",
         label: "Keep Remote",
         hint: "Use the Proton Drive version: replaces the one on this computer",
@@ -363,15 +369,28 @@ pub(crate) fn usage_bar(ui: &mut egui::Ui, fraction: f32, fill: Color32, track: 
     resp
 }
 
-/// The headline's colour.
+/// A state's colour, for its glyph and its headline alike (R22): the spec's colour for the glyph (green, purple, amber,
+/// red, grey), in the shade words take, so that the headline reads on the card (R21).
 fn tone_color(tone: Tone) -> Color32 {
     match tone {
-        Tone::Ok => STATUS_SUCCESS,
+        Tone::Ok => SUCCESS_TEXT(),
         Tone::Busy => PROTON_PURPLE_TEXT(),
-        Tone::Paused => TEXT_MUTED(),
-        Tone::Attention => STATUS_WARNING,
-        Tone::Offline => STATUS_DANGER,
+        Tone::Paused => WARNING_TEXT(),
+        Tone::Attention => DANGER_TEXT(),
+        Tone::Offline => TEXT_MUTED(),
     }
+}
+
+/// The status card's glyph, one per state, in the headline's colour.
+pub fn status_icon(summary: &StatusSummary) -> (&'static str, Color32) {
+    let glyph = match summary.tone {
+        Tone::Ok => icons::CHECK,
+        Tone::Busy => icons::SYNC,
+        Tone::Paused => icons::PAUSE,
+        Tone::Attention => icons::WARNING,
+        Tone::Offline => icons::OFFLINE,
+    };
+    (glyph, tone_color(summary.tone))
 }
 
 /// Opens a folder in the file manager; a screenshot opens nothing.
@@ -382,12 +401,21 @@ pub(crate) fn open_in_files(folder: &std::path::Path) {
 /// Proton Drive on the web, and its trash: where a delete through the drive puts what was deleted (#201)
 pub(crate) const PROTON_DRIVE_WEB_URL: &str = "https://drive.proton.me";
 pub(crate) const PROTON_DRIVE_TRASH_URL: &str = "https://drive.proton.me/trash";
+/// Proton Drive on the web: the account menu's item, and the name and hover of Settings' Web button
+pub(crate) const OPEN_WEB: &str = "Open Proton Drive on the web";
+/// What the trash's buttons say, on Home and in Settings' Account card; their hover says more (`trash_hover`)
+pub(crate) const TRASH_BUTTON: &str = "Trash";
+/// The trash's buttons' name for screen readers: the whole of what their short label stands for
 pub(crate) const OPEN_TRASH: &str = "Open Proton Drive Trash";
 
-/// What the trash button says on hover: deleted files wait there, and come back to the sync folder when restored
+/// What the trash button says on hover: it opens the web's trash, where deleted files wait, and from where they come
+/// back to the sync folder when restored
 pub(crate) fn trash_hover(sync_dir: &str) -> String {
     let folder = if sync_dir.is_empty() { "~/ProtonDrive".to_string() } else { shown_folder(sync_dir) };
-    format!("Deleted files stay here until you empty the trash or restore them. Restoring brings them back to {folder}.")
+    format!(
+        "Open Proton Drive's trash on the web. Deleted files stay there until you empty the trash or restore them. \
+         Restoring brings them back to {folder}."
+    )
 }
 
 /// Opens a page in the default browser; a screenshot opens nothing.
@@ -476,11 +504,23 @@ pub(crate) fn secondary_button(ui: &mut egui::Ui, label: &str, height: f32) -> e
     action_button(ui, ButtonKind::Secondary, None, label, height)
 }
 
+/// A secondary button with `icon` (one of `icons::*`) before its label.
+pub(crate) fn secondary_icon_button(ui: &mut egui::Ui, icon: &str, label: &str, height: f32) -> egui::Response {
+    action_button(ui, ButtonKind::Secondary, Some(icon), label, height)
+}
+
+/// A primary button with `icon` before its label.
+pub(crate) fn primary_icon_button(ui: &mut egui::Ui, icon: &str, label: &str, height: f32) -> egui::Response {
+    action_button(ui, ButtonKind::Primary, Some(icon), label, height)
+}
+
 pub(crate) fn primary_button(ui: &mut egui::Ui, label: &str, height: f32) -> egui::Response {
     action_button(ui, ButtonKind::Primary, None, label, height)
 }
 
 const PAUSE_CHOICES_ID: &str = "pause_choices";
+/// Needs attention's list at its tallest, before it scrolls
+const ATTENTION_LIST_HEIGHT: f32 = 280.0;
 
 /// Home's Pause choices (#205), in a small card under the Pause button (its right edges lined up), over an invisible
 /// shield so that a click outside only closes them. The choice clicked, if one was.
@@ -527,7 +567,7 @@ pub(crate) fn menu_item(ui: &mut egui::Ui, icon: Option<&str>, label: &str, widt
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        ui.painter().rect_filled(rect, CornerRadius::same(6), btn_secondary_hover_bg());
+        ui.painter().rect_filled(rect, CornerRadius::same(6), BG_CARD_ALT());
     }
     let mut x = rect.left() + 10.0;
     if let Some(icon) = icon {
@@ -545,7 +585,7 @@ pub(crate) fn menu_item(ui: &mut egui::Ui, icon: Option<&str>, label: &str, widt
     resp
 }
 
-fn card_title(ui: &mut egui::Ui, title: &str) {
+pub(crate) fn card_title(ui: &mut egui::Ui, title: &str) {
     ui.label(RichText::new(title).font(crate::bold(15.5)).color(TEXT_PRIMARY()));
 }
 
@@ -567,8 +607,7 @@ impl ProtonDriveNativeApp {
             .id_salt("home_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                // A gutter for the scroll bar, so that it never draws over the cards' edges
-                Frame::NONE.inner_margin(Margin { left: 0, right: 12, top: 0, bottom: 0 }).show(ui, |ui| {
+                Frame::NONE.inner_margin(crate::SCROLL_GUTTER).show(ui, |ui| {
                     self.render_status_block(ui);
                     self.render_notice(ui);
                     if !self.attention.is_empty() {
@@ -585,78 +624,34 @@ impl ProtonDriveNativeApp {
             });
     }
 
-    /// The status in a sentence, with Pause and Sync now, or Sign in while signed out.
+    /// The status in a sentence, with Pause and Sync now, or Sign in while signed out. In a narrow card (a small window,
+    /// a large zoom) the buttons go under the headline, as a setting's control goes under its label (`setting_row`).
     fn render_status_block(&mut self, ui: &mut egui::Ui) {
         let summary = status_summary(&self.status, self.daemon_online, self.initial_connecting, self.attention.len(), now_ms());
-        let (pause_label, pause_to) = pause_button(&self.status);
         // Pause and Sync now mean nothing without an account: Sign in, as Settings › Account offers it
         let show_sign_in = self.daemon_online && signed_out(&self.status);
         let mut command = None;
         let mut sign_in = false;
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.horizontal_top(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                    if show_sign_in {
-                        sign_in = primary_button(ui, "Sign in", 34.0).clicked();
-                    } else {
-                        ui.add_enabled_ui(self.daemon_online, |ui| {
-                            // Pause looks like Sync now; Resume, while paused, is the filled one
-                            let button = if pause_button_is_primary(&self.status) {
-                                primary_button(ui, pause_label, 34.0)
-                            } else {
-                                secondary_button(ui, pause_label, 34.0)
-                            };
-                            if !pause_to {
-                                if button.clicked() {
-                                    command = Some(WorkerCommand::SetPaused { paused: false, until: None });
-                                }
-                            } else if self.pause_choices_open {
-                                // Over a shield that takes the click on Pause too: any click outside closes them
-                                if let Some(choice) = pause_choices(ui.ctx(), button.rect) {
-                                    command = Some(WorkerCommand::SetPaused {
-                                        paused: true,
-                                        until: choice.until(now_ms(), local_offset_secs),
-                                    });
-                                }
-                                // Read before ui.input: egui's context lock isn't re-entrant
-                                let choices = ui.ctx().memory(|m| m.area_rect(egui::Id::new(PAUSE_CHOICES_ID)));
-                                let outside = ui.input(|i| {
-                                    i.key_pressed(egui::Key::Escape)
-                                        || (i.pointer.primary_clicked() && !pause_choices_hit(choices, i.pointer.interact_pos()))
-                                });
-                                if command.is_some() || outside {
-                                    self.pause_choices_open = false;
-                                }
-                            } else if button.clicked() {
-                                self.pause_choices_open = true; // #205: For 1 hour, Until tomorrow, Until I resume
-                            }
-                            ui.add_space(4.0);
-                            if secondary_button(ui, "Sync now", 34.0).clicked() {
-                                command = Some(WorkerCommand::TriggerSync);
-                            }
+            if ui.available_width() < crate::settings::STACKED_BELOW {
+                ui.horizontal_top(|ui| self.render_status_headline(ui, &summary, show_sign_in));
+                ui.add_space(12.0);
+                ui.horizontal_wrapped(|ui| self.render_status_buttons(ui, false, show_sign_in, &mut command, &mut sign_in));
+            } else {
+                ui.horizontal_top(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        self.render_status_buttons(ui, true, show_sign_in, &mut command, &mut sign_in);
+                        ui.add_space(12.0);
+                        ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
+                            self.render_status_headline(ui, &summary, show_sign_in);
                         });
-                    }
-                    ui.add_space(12.0);
-                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                        let headline = RichText::new(&summary.headline).size(18.0).strong().color(tone_color(summary.tone));
-                        ui.add(egui::Label::new(headline).wrap());
-                        if let Some(detail) = &summary.detail {
-                            ui.add_space(2.0);
-                            ui.add(egui::Label::new(RichText::new(detail).size(12.5).color(TEXT_MUTED())).wrap());
-                        }
-                        // The sign-in page opening (why it failed is in the notice below)
-                        if show_sign_in && self.login_url.is_some() {
-                            ui.add_space(2.0);
-                            let text = "Opening the Proton sign-in page in your browser…";
-                            ui.add(egui::Label::new(RichText::new(text).size(12.0).color(PROTON_PURPLE_TEXT())).wrap());
-                        }
                     });
                 });
-            });
+            }
         });
         // Only while Pause is offered and can be used
-        if !self.daemon_online || show_sign_in || !pause_to {
+        if !self.daemon_online || show_sign_in || !pause_button(&self.status).1 {
             self.pause_choices_open = false;
         }
         if let Some(command) = command {
@@ -667,7 +662,90 @@ impl ProtonDriveNativeApp {
         }
     }
 
-    /// Needs attention: each problem with what can be done about it. Its list scrolls once taller than 280 px.
+    /// The status's glyph, then its headline over what it says more.
+    fn render_status_headline(&self, ui: &mut egui::Ui, summary: &StatusSummary, show_sign_in: bool) {
+        // The headline says it for screen readers: the glyph is only painted
+        let (glyph, color) = status_icon(summary);
+        decoration(ui, glyph, 32.0, color);
+        ui.add_space(4.0);
+        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+            let headline = RichText::new(&summary.headline).font(crate::bold(18.0)).color(tone_color(summary.tone));
+            ui.add(egui::Label::new(headline).wrap());
+            if let Some(detail) = &summary.detail {
+                ui.add_space(2.0);
+                ui.add(egui::Label::new(RichText::new(detail).size(12.5).color(TEXT_MUTED())).wrap());
+            }
+            // The sign-in page opening (why it failed is in the notice below)
+            if show_sign_in && self.login_url.is_some() {
+                ui.add_space(2.0);
+                let text = "Opening the Proton sign-in page in your browser…";
+                ui.add(egui::Label::new(RichText::new(text).size(12.0).color(PROTON_PURPLE_TEXT())).wrap());
+            }
+        });
+    }
+
+    /// Sync now and Pause (Resume while paused), Sync now on the left; Sign in alone while signed out. `right_to_left`:
+    /// the row is laid out from its right end. What they ask for lands in `command` and `sign_in`.
+    fn render_status_buttons(
+        &mut self,
+        ui: &mut egui::Ui,
+        right_to_left: bool,
+        show_sign_in: bool,
+        command: &mut Option<WorkerCommand>,
+        sign_in: &mut bool,
+    ) {
+        if show_sign_in {
+            *sign_in = primary_icon_button(ui, icons::SIGN_IN, "Sign in", 34.0).clicked();
+            return;
+        }
+        let (pause_label, pause_to) = pause_button(&self.status);
+        ui.add_enabled_ui(self.daemon_online, |ui| {
+            let order = if right_to_left { [false, true] } else { [true, false] };
+            for (i, sync_now) in order.into_iter().enumerate() {
+                if i > 0 {
+                    ui.add_space(4.0);
+                }
+                if sync_now {
+                    if secondary_icon_button(ui, icons::SYNC, "Sync now", 34.0).clicked() {
+                        *command = Some(WorkerCommand::TriggerSync);
+                    }
+                    continue;
+                }
+                // Pause looks like Sync now; Resume, while paused, is the filled one
+                let pause_icon = if pause_to { icons::PAUSE } else { icons::RESUME };
+                let button = if pause_button_is_primary(&self.status) {
+                    primary_icon_button(ui, pause_icon, pause_label, 34.0)
+                } else {
+                    secondary_icon_button(ui, pause_icon, pause_label, 34.0)
+                };
+                if !pause_to {
+                    if button.clicked() {
+                        *command = Some(WorkerCommand::SetPaused { paused: false, until: None });
+                    }
+                } else if self.pause_choices_open {
+                    // Over a shield that takes the click on Pause too: any click outside closes them
+                    let picked = pause_choices(ui.ctx(), button.rect);
+                    if let Some(choice) = picked {
+                        *command = Some(WorkerCommand::SetPaused { paused: true, until: choice.until(now_ms(), local_offset_secs) });
+                    }
+                    // Read before ui.input: egui's context lock isn't re-entrant
+                    let choices = ui.ctx().memory(|m| m.area_rect(egui::Id::new(PAUSE_CHOICES_ID)));
+                    let outside = ui.input(|i| {
+                        i.key_pressed(egui::Key::Escape)
+                            || (i.pointer.primary_clicked() && !pause_choices_hit(choices, i.pointer.interact_pos()))
+                    });
+                    if picked.is_some() || outside {
+                        self.pause_choices_open = false;
+                    }
+                } else if button.clicked() {
+                    self.pause_choices_open = true; // #205: For 1 hour, Until tomorrow, Until I resume
+                }
+            }
+        });
+    }
+
+    /// Needs attention: each problem with what can be done about it. Its list scrolls once taller than 280 pt, and is
+    /// that tall even when less of the window is left (a small window, a large zoom), the page scrolling to show it.
     fn render_attention(&mut self, ui: &mut egui::Ui) {
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -675,12 +753,13 @@ impl ProtonDriveNativeApp {
             // Why the last resolve of a conflict was refused, once for the list
             if let Some(error) = &self.conflict_error {
                 ui.add_space(4.0);
-                ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
+                ui.add(egui::Label::new(RichText::new(error).size(12.5).color(DANGER_TEXT())).wrap());
             }
             ui.add_space(10.0);
             ScrollArea::vertical()
                 .id_salt("attention_scroll")
-                .max_height(280.0)
+                .max_height(ATTENTION_LIST_HEIGHT)
+                .min_scrolled_height(ATTENTION_LIST_HEIGHT)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for (i, item) in self.attention.clone().into_iter().enumerate() {
@@ -702,25 +781,16 @@ impl ProtonDriveNativeApp {
                     elided(ui, RichText::new(conflict_title(&rel_path)).size(13.5).strong().color(TEXT_PRIMARY()), &rel_path);
                     ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
-                        if secondary_button(ui, "Show in Files", 30.0).clicked() {
+                        if secondary_icon_button(ui, icons::FOLDER_OPEN, "Show in Files", 30.0).clicked() {
                             open_in_files(&conflict_folder(&self.status.sync_dir, &rel_path));
                         }
                         ui.add_space(8.0);
                         // Resolving needs the daemon, as Pause and Sync now do
                         let online = self.daemon_online;
                         for (i, c) in CONFLICT_CHOICES.iter().enumerate() {
-                            let clicked = ui
-                                .add_enabled_ui(online, |ui| {
-                                    let button = if i == 0 {
-                                        primary_button(ui, c.label, 30.0)
-                                    } else {
-                                        secondary_button(ui, c.label, 30.0)
-                                    };
-                                    button.on_hover_text(c.hint).on_disabled_hover_text(c.hint)
-                                })
-                                .inner
-                                .clicked();
-                            if clicked {
+                            let kind = if i == 0 { ButtonKind::Primary } else { ButtonKind::Secondary };
+                            let button = action_button_if(ui, online, kind, Some(c.icon), c.label, 30.0);
+                            if button.on_hover_text(c.hint).on_disabled_hover_text(c.hint).clicked() {
                                 let _ = self.tx.send(WorkerCommand::ResolveConflict { id, choice: c.choice.to_string() });
                             }
                         }
@@ -736,7 +806,7 @@ impl ProtonDriveNativeApp {
                     }
                     if can_mount {
                         ui.add_space(8.0);
-                        let clicked = ui.add_enabled_ui(!self.drive_working, |ui| primary_button(ui, "Mount again", 32.0).clicked()).inner;
+                        let clicked = ui.add_enabled_ui(!self.drive_working, |ui| primary_icon_button(ui, icons::MOUNT, "Mount again", 32.0).clicked()).inner;
                         if clicked {
                             self.send_drive_command(WorkerCommand::MountAgain);
                         }
@@ -767,7 +837,7 @@ impl ProtonDriveNativeApp {
                 ui.label(RichText::new(failed_items_text(n)).size(13.5).strong().color(TEXT_PRIMARY()));
             }),
             Attention::LastError(text) => attention_row(ui, |ui| {
-                ui.add(egui::Label::new(RichText::new(text).size(13.0).color(STATUS_DANGER)).wrap());
+                ui.add(egui::Label::new(RichText::new(text).size(13.0).color(DANGER_TEXT())).wrap());
             }),
         }
     }
@@ -780,7 +850,7 @@ impl ProtonDriveNativeApp {
         }
         if let Some(error) = &self.drive_error {
             ui.add_space(8.0);
-            ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
+            ui.add(egui::Label::new(RichText::new(error).size(12.5).color(DANGER_TEXT())).wrap());
         }
     }
 
@@ -814,20 +884,24 @@ impl ProtonDriveNativeApp {
         let sync_dir = self.status.sync_dir.clone();
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            card_title(ui, "Your drive");
-            ui.add_space(10.0);
+            ui.label(RichText::new("Your drive").font(crate::bold(13.0)).color(TEXT_MUTED()));
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // The trash, on the right. Not before a folder is set up
                     if !sync_dir.is_empty() {
-                        if secondary_button(ui, OPEN_TRASH, 32.0).on_hover_text(trash_hover(&sync_dir)).clicked() {
+                        let trash = action_button_named(ui, ButtonKind::Secondary, Some(icons::TRASH), TRASH_BUTTON, OPEN_TRASH, 32.0);
+                        if trash.on_hover_text(trash_hover(&sync_dir)).clicked() {
                             open_in_browser(PROTON_DRIVE_TRASH_URL);
                         }
                         ui.add_space(8.0);
                     }
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
                         let shown = if sync_dir.is_empty() { "Not set up yet".to_string() } else { shown_folder(&sync_dir) };
-                        elided(ui, RichText::new(&shown).size(14.0).strong().color(TEXT_PRIMARY()), &sync_dir);
+                        ui.horizontal(|ui| {
+                            decoration(ui, icons::FOLDER, 18.0, TEXT_MUTED());
+                            elided(ui, RichText::new(&shown).font(crate::bold(14.0)).color(TEXT_PRIMARY()), &sync_dir);
+                        });
                         ui.label(RichText::new(drive_kind(self.status.vfs.as_ref())).size(12.5).color(TEXT_MUTED()));
                     });
                 });
@@ -846,7 +920,7 @@ impl ProtonDriveNativeApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // One free at a time, and only with the daemon there to do it
                     let can = self.daemon_online && self.working.is_empty();
-                    free = ui.add_enabled_ui(can, |ui| secondary_button(ui, "Free up space…", 32.0).clicked()).inner;
+                    free = ui.add_enabled_ui(can, |ui| secondary_icon_button(ui, icons::ONLINE_ONLY, "Free up space…", 32.0).clicked()).inner;
                 });
             });
             if free {
@@ -871,6 +945,7 @@ fn attention_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::icons;
     use crate::{ActiveTransfer, DaemonStatus};
 
     const NOW: i64 = 1_800_000_000_000;
@@ -1303,6 +1378,21 @@ mod tests {
         assert_eq!(pause_button(&status("syncing", vec![], false)), ("Pause", true));
         assert_eq!(pause_button(&status("paused", vec![], false)), ("Resume", false));
         assert_eq!(pause_button(&status("idle", vec![], true)), ("Resume", false));
+    }
+
+    #[test]
+    fn status_icon_matches_each_state() {
+        let icon = |status: &DaemonStatus, online: bool, attention: usize| {
+            status_icon(&status_summary(status, online, false, attention, 1_000_000))
+        };
+        // Green, purple, amber, red and grey, in the shades words take (R22)
+        assert_eq!(icon(&status("idle", vec![], false), true, 0), (icons::CHECK, SUCCESS_TEXT()));
+        assert_eq!(icon(&status("syncing", vec![transfer("upload", "a")], false), true, 0), (icons::SYNC, PROTON_PURPLE_TEXT()));
+        assert_eq!(icon(&status("paused", vec![], false), true, 0), (icons::PAUSE, WARNING_TEXT()));
+        assert_eq!(icon(&status("idle", vec![], true), true, 0), (icons::PAUSE, WARNING_TEXT()));
+        assert_eq!(icon(&status("idle", vec![], false), true, 2), (icons::WARNING, DANGER_TEXT()));
+        assert_eq!(icon(&status("error", vec![], false), true, 0), (icons::WARNING, DANGER_TEXT()));
+        assert_eq!(icon(&status("idle", vec![], false), false, 0), (icons::OFFLINE, TEXT_MUTED()));
     }
 
     #[test]
