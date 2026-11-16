@@ -9581,6 +9581,102 @@ mod tests {
         assert!(h.text_at("One glob pattern per line.").is_some());
     }
 
+    // #318: a click on an ⓘ shows its words at once (egui hides tooltips right after a click, so a hover alone showed
+    // nothing to someone who clicked), and keeps them until a click elsewhere, a second click on it, or Escape
+    const BLOCKED_EXPLAINED: &str =
+        "These apps can't download online-only files. Files they already have on this computer still open.";
+    const HIDDEN_EXPLAINED: &str = "Hidden items stay in Proton Drive, but aren't kept on this computer or shown in \
+                                    Files. To hide something, right-click it in Files.";
+
+    /// Settings with every card painted at once, keeping egui's own tooltip timing (unlike `settings_tall`).
+    fn settings_tall_timed() -> Harness {
+        let mut h = Harness::settings(Some(vfs("virtual", true, None)), Some(true));
+        h.resize_zoomed(Vec2::new(1440.0, 2400.0), 1.0);
+        h
+    }
+
+    #[test]
+    fn clicking_an_info_shows_its_words_until_a_click_elsewhere_a_second_click_or_escape() {
+        let mut h = settings_tall_timed();
+        let info = info_after(&h, "Apps blocked from downloading");
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "hidden until asked for");
+        // Right after a click egui shows no hover tooltip until the pointer moves again, so what shows now is the
+        // click's doing (before #318, nothing showed)
+        h.click(info);
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_some(), "a click shows it at once");
+        h.frames(40);
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_some(), "and keeps it");
+        // A click on the page's empty space, which does nothing else
+        let elsewhere = egui::pos2(SIDEBAR_EDGE + 8.0, h.screen.y - 8.0);
+        h.click(elsewhere);
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "a click elsewhere closes it");
+        h.click(info);
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_some());
+        h.click(info);
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "a second click on it closes it");
+        h.click(info);
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_some());
+        press_key(&mut h, egui::Key::Escape);
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "Escape closes it");
+        assert_eq!(h.sent(), Vec::<String>::new(), "nothing for the daemon");
+    }
+
+    // Tab moves on: an ⓘ opened by a click or Enter closes, so it never shows beside the next focused ⓘ's words
+    #[test]
+    fn an_open_info_closes_when_tab_moves_the_focus() {
+        let mut h = settings_tall_timed();
+        h.click(info_after(&h, "Hidden from this computer"));
+        assert!(h.text_at(HIDDEN_EXPLAINED).is_some());
+        press_key(&mut h, egui::Key::Tab);
+        assert!(h.text_at(HIDDEN_EXPLAINED).is_none(), "Tab closes it");
+    }
+
+    #[test]
+    fn one_info_is_open_at_a_time() {
+        let mut h = settings_tall_timed();
+        h.click(info_after(&h, "Apps blocked from downloading"));
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_some());
+        h.click(info_after(&h, "Hidden from this computer"));
+        assert!(h.text_at(HIDDEN_EXPLAINED).is_some(), "the other ⓘ's words");
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "the first closes");
+    }
+
+    #[test]
+    fn an_open_info_does_not_come_back_with_settings() {
+        let mut h = settings_tall_timed();
+        h.click(info_after(&h, "Apps blocked from downloading"));
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_some());
+        // Left without a click (the tray or a second launch asking for another section)
+        h.app.open_tab(NavTab::Home);
+        h.frames(3);
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_none());
+        h.app.open_tab(NavTab::Settings);
+        h.frames(3);
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "closed, not shown again on coming back");
+    }
+
+    #[test]
+    fn a_greyed_out_rows_info_opens_on_a_click_too() {
+        const EXPLAINED: &str = "Files you haven't downloaded appear in Files and download when you open them.";
+        // The switch waits while the drive moves files: its row is greyed out, its ⓘ still explains
+        let mut h = Harness::settings(Some(vfs("virtual", false, Some("moving"))), Some(true));
+        h.resize_zoomed(Vec2::new(1440.0, 2400.0), 1.0);
+        h.click(info_after(&h, SWITCH));
+        assert!(h.text_at(EXPLAINED).is_some(), "a click shows it");
+        h.click(egui::pos2(SIDEBAR_EDGE + 8.0, h.screen.y - 8.0));
+        assert!(h.text_at(EXPLAINED).is_none(), "a click elsewhere closes it");
+    }
+
+    #[test]
+    fn an_info_takes_no_click_under_a_dialog() {
+        let mut h = settings_tall_timed();
+        let info = info_after(&h, "Apps blocked from downloading");
+        h.app.pending_confirm = Some(PendingConfirm::StartFresh);
+        h.frames(2);
+        h.click(info);
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "the dialog's shield takes the click");
+    }
+
     #[test]
     fn the_save_group_says_it_applies_when_saved() {
         let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
