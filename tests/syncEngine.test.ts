@@ -1595,6 +1595,113 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(engine.availability.stateOf('Notes/a.txt')).toBe('online-only');
         });
 
+        test('free with keepPinned keeps the files marked Always keep with their marks, and frees the rest (#296)', async () => {
+            const { engine, calls, files } = await downloaded(
+                { 'Work/a.txt': 'a', 'Work/old.txt': 'old', 'Photos/b.jpg': 'b', 'Photos/keep.jpg': 'k', 'Notes/c.txt': 'c' },
+                'vol~root',
+            );
+            engine.availability.setPin('vol~Work', 'pinned', false);
+            engine.availability.setPin('vol~Work/old.txt', 'unpinned', false); // freed by hand inside the kept folder
+            engine.availability.setPin('vol~Photos/keep.jpg', 'pinned', false);
+            await files.writeLocal('Notes/new.txt', 'not uploaded yet');
+            await files.writeLocal('Work/draft.txt', 'not uploaded yet either');
+
+            const result = await engine.setAvailability('', 'free', { keepPinned: true });
+
+            // Marked Always keep: the files, their records and their marks stay
+            expect(await readFile(local('Work/a.txt'), 'utf8')).toBe('a');
+            expect(await readFile(local('Photos/keep.jpg'), 'utf8')).toBe('k');
+            expect(stateDb.getItemByPath('Work/a.txt')).not.toBeNull();
+            expect(stateDb.getItemByPath('Photos/keep.jpg')).not.toBeNull();
+            expect(engine.availability.isPinned('Work')).toBe(true);
+            expect(engine.availability.isPinned('Photos/keep.jpg')).toBe(true);
+            expect(engine.availability.stateOf('Work/a.txt')).toBe('pinned');
+            // The rest goes, the kept folder's explicitly freed file too, and the whole drive is no longer kept
+            expect(await files.exists('Work/old.txt')).toBe(false);
+            expect(await files.exists('Photos/b.jpg')).toBe(false);
+            expect(await files.exists('Notes/c.txt')).toBe(false);
+            expect(stateDb.getItemByPath('Photos/b.jpg')).toBeNull();
+            expect(engine.availability.isPinned('')).toBe(false);
+            expect(engine.availability.isPinned('Work/old.txt')).toBe(false);
+            // Not in Proton Drive yet: it stays, and it is all the user is told about (not the kept files, nor the
+            // folder holding one)
+            expect(await readFile(local('Notes/new.txt'), 'utf8')).toBe('not uploaded yet');
+            expect(await readFile(local('Work/draft.txt'), 'utf8')).toBe('not uploaded yet either'); // kept either way
+            expect([...result.kept].sort()).toEqual(['Notes', 'Notes/new.txt']);
+            expect(activity().filter((d) => d.includes('stayed on this computer'))).toEqual([
+                "1 item(s) in your Proton Drive folder stayed on this computer because they aren't in Proton Drive yet (e.g. Notes/new.txt)",
+            ]);
+            for (const dir of ['Work', 'Photos', 'Notes']) {
+                await files.expectNoRecordWithoutFile(dir);
+            }
+
+            // Freed, not deleted: nothing is trashed, and nothing comes down again
+            await engine.reconcileNow();
+            expect(calls.trashed).toEqual([]);
+            expect(calls.downloads).toHaveLength(5);
+            expect([...calls.uploads].sort()).toEqual(['Notes/new.txt', 'Work/draft.txt']);
+            expect(await readFile(local('Work/a.txt'), 'utf8')).toBe('a');
+        });
+
+        test('free with keepPinned on a folder unmarks the folder and keeps the marks inside it (#296)', async () => {
+            const { engine, files } = await downloaded({ 'Work/a.txt': 'a', 'Work/Keep/b.txt': 'b' }, 'vol~Work');
+            engine.availability.setPin('vol~Work/Keep', 'pinned', false);
+
+            const result = await engine.setAvailability('Work', 'free', { keepPinned: true });
+
+            expect(await files.exists('Work/a.txt')).toBe(false);
+            expect(await readFile(local('Work/Keep/b.txt'), 'utf8')).toBe('b');
+            expect(engine.availability.isPinned('Work')).toBe(false);
+            expect(engine.availability.isPinned('Work/Keep')).toBe(true);
+            expect(result.kept).toEqual([]);
+            await files.expectNoRecordWithoutFile('Work');
+        });
+
+        // Without keepPinned (or with it false) a free clears every mark below it and frees what they kept, as before
+        const freesTheMarkedFilesToo = async (opts?: { keepPinned?: boolean }) => {
+            const { engine, files } = await downloaded({ 'Work/a.txt': 'a', 'Notes/c.txt': 'c' }, 'vol~root');
+            engine.availability.setPin('vol~Work', 'pinned', false);
+
+            const result = await engine.setAvailability('', 'free', opts);
+
+            expect(await files.exists('Work/a.txt')).toBe(false);
+            expect(await files.exists('Notes/c.txt')).toBe(false);
+            expect(engine.availability.isPinned('Work')).toBe(false);
+            expect(engine.availability.isPinned('')).toBe(false);
+            expect(result.kept).toEqual([]);
+            await files.expectNoRecordWithoutFile('Work');
+        };
+
+        test('free without keepPinned frees the files marked Always keep too, as before (#296)', async () => {
+            await freesTheMarkedFilesToo();
+        });
+
+        test('free with keepPinned false frees the files marked Always keep too, as before (#296)', async () => {
+            await freesTheMarkedFilesToo({ keepPinned: false });
+        });
+
+        test('pinnedSummary counts the marks below the top level, and says whether the whole drive is kept (#296)', async () => {
+            const { engine, add, root } = setup();
+            add('Work/a.txt', 'a');
+            add('Photos/b.jpg', 'b');
+            // A fresh install before its first sync: the whole drive is to be kept
+            stateDb.setMeta(PIN_ROOT_ON_FIRST_SYNC, '1');
+            expect(engine.pinnedSummary()).toEqual({ items: 0, wholeDrive: true });
+            engine.remoteIndex.setRoot(root.uid);
+            expect(engine.pinnedSummary()).toEqual({ items: 0, wholeDrive: true });
+            await engine.reconcileNow(); // the first sync marks the root itself
+            expect(stateDb.getMeta(PIN_ROOT_ON_FIRST_SYNC)).toBeNull();
+            expect(engine.pinnedSummary()).toEqual({ items: 0, wholeDrive: true });
+
+            await engine.setAvailability('', 'free');
+            expect(engine.pinnedSummary()).toEqual({ items: 0, wholeDrive: false });
+            await engine.setAvailability('Work', 'pin');
+            await engine.setAvailability('Photos/b.jpg', 'pin');
+            expect(engine.pinnedSummary()).toEqual({ items: 2, wholeDrive: false });
+            await engine.setAvailability('Work', 'free');
+            expect(engine.pinnedSummary()).toEqual({ items: 1, wholeDrive: false });
+        });
+
         test('free during an in-flight download keeps the growing temp file and leaves no record without a file', async () => {
             const { engine, files } = await downloaded({ 'Docs/a.txt': 'a', 'Docs/b.txt': 'b' }, 'vol~Docs');
             const temp = 'Docs/.proton-drive-tmp-1-2-x';

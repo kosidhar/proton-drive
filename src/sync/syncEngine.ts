@@ -243,7 +243,8 @@ interface OnlineOnlyFolder {
 
 export interface AvailabilityResult {
     state: ItemAvailability;
-    // What Free up space left on this computer (things not in Proton Drive yet, or the folders holding them)
+    // What Free up space left on this computer (things not in Proton Drive yet, or the folders holding them); not what
+    // a free with keepPinned leaves because it is marked Always keep
     kept: string[];
     // Why a hide was refused, or null
     refused: string | null;
@@ -5885,7 +5886,12 @@ export class ProtonDriveSyncEngine {
     // changes run one at a time on availabilityRun, in the order asked; asking again about the same item supersedes
     // what is still waiting or running for it. A pin's download runs after its turn, so other changes and local change
     // handling don't wait for it. Rejects with `Not in Proton Drive: <path>` for a path the remote index doesn't hold.
-    async setAvailability(relPath: string, action: AvailabilityAction): Promise<AvailabilityResult> {
+    // keepPinned (a free only): what is marked Always keep below the item keeps its mark and its files (#296).
+    async setAvailability(
+        relPath: string,
+        action: AvailabilityAction,
+        opts: { keepPinned?: boolean } = {},
+    ): Promise<AvailabilityResult> {
         if (this.holding()) {
             throw new Error(BUSY_MOVING);
         }
@@ -5894,12 +5900,19 @@ export class ProtonDriveSyncEngine {
             throw new Error(BUSY_MOVING); // again: a move of the files may have begun while it looked
         }
         this.refuseWhileFilesGone();
-        return this.tracked(() => this.setAvailabilityNow(relPath, action));
+        return this.tracked(() => this.setAvailabilityNow(relPath, action, opts.keepPinned === true));
     }
 
-    private async setAvailabilityNow(relPath: string, action: AvailabilityAction): Promise<AvailabilityResult> {
+    private async setAvailabilityNow(
+        relPath: string,
+        action: AvailabilityAction,
+        keepPinned: boolean,
+    ): Promise<AvailabilityResult> {
         if (!AVAILABILITY_ACTIONS.includes(action)) {
             throw new Error(`Unknown availability action: ${action}`);
+        }
+        if (keepPinned && action !== 'free') {
+            throw new Error(`keepPinned goes only with free, not ${action}`);
         }
         if (relPath === '' && (action === 'hide' || action === 'unhide')) {
             throw new Error(`Can't ${action} the whole of Proton Drive: only pin and free apply to it`);
@@ -5928,7 +5941,7 @@ export class ProtonDriveSyncEngine {
                     pinned.stillAsked = current;
                     return this.availabilityResult(relPath);
                 case 'free':
-                    return this.freeUpSpace(relPath, entry.uid, current);
+                    return this.freeUpSpace(relPath, entry.uid, current, keepPinned);
                 case 'hide':
                     return this.hide(relPath, entry.uid, current, false);
                 case 'unhide':
@@ -5940,6 +5953,13 @@ export class ProtonDriveSyncEngine {
         }
         await this.downloadPinned(relPath);
         return this.availabilityResult(relPath);
+    }
+
+    // For the app's Free up space (#296): how many items below the top level are marked Always keep, and whether the
+    // whole drive is, by its own mark or by the one a fresh install's first sync is still to make. Reads only.
+    pinnedSummary(): { items: number; wholeDrive: boolean } {
+        const { items, wholeDrive } = this.policy.pinnedSummary();
+        return { items, wholeDrive: wholeDrive || this.stateDb.getMeta(PIN_ROOT_ON_FIRST_SYNC) === '1' };
     }
 
     // What is hidden from this computer, for the app's list with Unhide: each hidden item by its path, sorted, a hide
@@ -6105,13 +6125,19 @@ export class ProtonDriveSyncEngine {
 
     // Free up space: the item becomes online-only, and its local copies go where they are exactly what Proton Drive
     // holds. Anything else (ignored, not a regular file, new or edited, or changed while this runs) stays, with its
-    // record, and the user is told.
-    private async freeUpSpace(relPath: string, uid: string, current: () => boolean): Promise<AvailabilityResult> {
+    // record, and the user is told. Without keepPinned the marks below the item go too; with it (#296) they stay, and
+    // what they keep is left alone, untouched: a free inside a kept folder still frees there.
+    private async freeUpSpace(
+        relPath: string,
+        uid: string,
+        current: () => boolean,
+        keepPinned: boolean,
+    ): Promise<AvailabilityResult> {
         this.stateDb.connection.transaction(() => {
             if (relPath === '') {
                 this.stateDb.deleteMeta(PIN_ROOT_ON_FIRST_SYNC); // An explicit choice wins over the default
             }
-            this.policy.setPin(uid, 'unpinned', true);
+            this.policy.setPin(uid, 'unpinned', !keepPinned);
         })();
         const settings = this.stateDb.getSettings();
         const scan = await scanLocalCopies({
@@ -6124,19 +6150,38 @@ export class ProtonDriveSyncEngine {
         if (!current()) {
             return this.availabilityResult(relPath); // Asked again while it was being looked at: that ask decides
         }
-        const { kept } = await this.whileRemoving(async (records) => {
-            const removal = await removeScannedEntries({
+        // With keepPinned, what is still marked Always keep is left out of the removal, so nothing of it is touched, its
+        // records included. Leaving it out, rather than adding it to `keep`, matters: `keep` also keeps everything inside
+        // a kept folder, and a file freed by hand inside a kept folder is to go. The folders that hold something kept
+        // stay, as they aren't empty.
+        const entries = keepPinned ? scan.entries.filter((entry) => !this.policy.isPinned(entry.relPath)) : scan.entries;
+        const holdingKept = new Set<string>();
+        if (entries.length < scan.entries.length) {
+            const removing = new Set(entries.map((entry) => entry.relPath));
+            for (const { relPath: keptPath } of scan.entries) {
+                if (!removing.has(keptPath)) {
+                    for (let slash = keptPath.lastIndexOf('/'); slash > 0; slash = keptPath.lastIndexOf('/', slash - 1)) {
+                        holdingKept.add(keptPath.slice(0, slash));
+                    }
+                }
+            }
+        }
+        const removal = await this.whileRemoving(async (records) => {
+            const result = await removeScannedEntries({
                 syncDir: this.localRoot(),
-                entries: scan.entries,
+                entries,
                 keep: new Set(scan.localOnly.map((item) => item.relPath)),
                 mode: 'keep-changed',
                 dropRecord: records.drop,
                 shouldContinue: () => current() && !this.policy.isPinned(relPath),
             });
-            await records.putBack(removal.kept);
-            return removal;
+            await records.putBack(result.kept);
+            return result;
         });
-        if (scan.entries.length > kept.length) {
+        // A folder left because it holds something kept isn't what the user is told stayed: only what isn't in Proton
+        // Drive yet is
+        const kept = removal.kept.filter((p) => !holdingKept.has(p));
+        if (entries.length > removal.kept.length) {
             this.stateDb.logActivity({
                 action: 'free-up',
                 localRelPath: relPath || '/',
