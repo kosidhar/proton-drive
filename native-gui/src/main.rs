@@ -2305,11 +2305,17 @@ impl ProtonDriveNativeApp {
             }
             let width = ui.available_width().clamp(120.0, ACTIVITY_SEARCH_WIDTH);
             search_field(ui, &mut self.search_query, "Search activity", width);
-            for (filter, label) in activity::FILTERS.iter() {
-                if filter_chip(ui, label, self.activity_filter == *filter) {
-                    self.activity_filter = *filter;
+            // The chips as one group, in a room of its size: when they don't fit on the line, they go to the next one
+            // together
+            let gap = ui.spacing().item_spacing.x;
+            let chips_w = activity::FILTERS.iter().map(|(_, label)| chip_width(ui, label) + gap).sum::<f32>() - gap;
+            ui.allocate_ui_with_layout(Vec2::new(chips_w, CHIP_HEIGHT), Layout::left_to_right(Align::Center), |ui| {
+                for (filter, label) in activity::FILTERS.iter() {
+                    if filter_chip(ui, label, self.activity_filter == *filter) {
+                        self.activity_filter = *filter;
+                    }
                 }
-            }
+            });
         });
 
         if let Some(error) = &self.account_error {
@@ -5891,22 +5897,37 @@ mod tests {
         assert_eq!(h.fill_under(hint.center()), Some(palette().input));
     }
 
-    // #280: every chip and the search field stay inside the page at the smallest window and 120% zoom
+    // #280: every chip and the search field stay inside the page at the smallest window and 120% zoom, run over
+    // nothing, and leave the table's card below them; the chips wrap as one group, never split across lines
     #[test]
     fn activity_top_row_fits_at_the_smallest_window_and_120_percent_zoom() {
         for logged_in in [true, false] {
-            let mut h = Harness::new();
-            h.app.tab = NavTab::Activity;
-            h.app.status.logged_in = logged_in;
-            h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
-            let right_max = 840.0 / 1.2;
-            for label in ["All", "Uploads", "Downloads", "Problems", "Search activity"] {
-                let pos = h.text_at(label).unwrap_or_else(|| panic!("{label} is painted (logged in {logged_in})"));
-                let (rect, _) = h.rect_under(pos).unwrap_or_else(|| panic!("{label} has a box"));
-                assert!(rect.max.x <= right_max, "{label} runs past the right edge: {rect:?} (logged in {logged_in})");
-                assert!(rect.min.x >= SIDEBAR_EDGE, "{label} runs into the sidebar: {rect:?} (logged in {logged_in})");
+            for (width, zoom) in [(840.0, 1.2), (840.0, 1.0), (1100.0, 1.0)] {
+                let at = format!("{width} at {zoom}, logged in {logged_in}");
+                let mut h = Harness::new();
+                h.app.tab = NavTab::Activity;
+                h.app.status.logged_in = logged_in;
+                h.resize_zoomed(Vec2::new(width, 540.0), zoom);
+                let mut boxes = Vec::new();
+                for label in ["All", "Uploads", "Downloads", "Problems", "Search activity"] {
+                    let pos = h.text_at(label).unwrap_or_else(|| panic!("{at}: {label} is painted"));
+                    let (rect, _) = h.rect_under(pos).unwrap_or_else(|| panic!("{at}: {label} has a box"));
+                    assert!(rect.max.x <= h.screen.x, "{at}: {label} runs past the right edge: {rect:?}");
+                    assert!(rect.min.x >= SIDEBAR_EDGE, "{at}: {label} runs into the sidebar: {rect:?}");
+                    boxes.push((label, rect));
+                }
+                for (i, (a, ra)) in boxes.iter().enumerate() {
+                    for (b, rb) in &boxes[i + 1..] {
+                        assert!(!ra.intersects(*rb), "{at}: {a} {ra:?} runs over {b} {rb:?}");
+                    }
+                }
+                let chips = &boxes[..4];
+                assert!(chips.iter().all(|(_, r)| (r.center().y - chips[0].1.center().y).abs() < 0.5), "{at}: the chips on one line: {chips:?}");
+                let header = h.text_rect("File / Folder").unwrap_or_else(|| panic!("{at}: the table is painted"));
+                let lowest = boxes.iter().map(|(_, r)| r.bottom()).fold(0.0, f32::max);
+                assert!(header.top() > lowest + 14.0, "{at}: the table's card {header:?} starts below the row, at {lowest}");
+                assert_eq!(h.text_at("Sign in to Proton Drive").is_some(), !logged_in, "{at}");
             }
-            assert_eq!(h.text_at("Sign in to Proton Drive").is_some(), !logged_in);
         }
     }
 
