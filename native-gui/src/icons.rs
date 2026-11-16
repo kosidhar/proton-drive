@@ -81,16 +81,17 @@ pub const LOCK: &str = ph::LOCK;
 pub const CLOCK: &str = ph::CLOCK;
 /// The people a share is with
 pub const PEOPLE: &str = ph::USERS;
+pub const PERSON: &str = ph::USER;
 pub const INFO: &str = ph::INFO;
 pub const FOLDER: &str = ph::FOLDER;
 pub const FILE: &str = ph::FILE;
 
 /// Every icon, for the tests
 #[cfg(test)]
-pub const ALL: [&str; 35] = [
+pub const ALL: [&str; 36] = [
     HOME, SHARED, ACTIVITY, SETTINGS, FOLDER_OPEN, TRASH, SYNC, PAUSE, RESUME, CHECK, WARNING, OFFLINE, LINK,
     LINK_BROKEN, LOCK, CLOCK, PEOPLE, COPY, MANAGE, WEB, REFRESH, SEARCH, INFO, SIGN_OUT, SIGN_IN, REMOVE, FOLDER, FILE,
-    ONLINE_ONLY, MOUNT, RESTART, MOVE_BACK, KEEP_BOTH, KEEP_LOCAL, KEEP_REMOTE,
+    ONLINE_ONLY, MOUNT, RESTART, MOVE_BACK, KEEP_BOTH, KEEP_LOCAL, KEEP_REMOTE, PERSON,
 ];
 
 #[cfg(test)]
