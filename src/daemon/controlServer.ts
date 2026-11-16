@@ -43,6 +43,7 @@ export interface ControlServerOptions {
         | 'setAvailability'
         | 'availabilityOf'
         | 'hiddenItems'
+        | 'pinnedSummary'
         | 'vfsChildren'
         | 'hydrate'
         | 'renameItem'
@@ -437,6 +438,12 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
                 if (req.method !== 'GET') return jsonError('Method not allowed', 405);
                 return Response.json({ items: engine.hiddenItems() });
             }
+            // How many items are marked Always keep below the top level, and whether the whole drive is: whether the
+            // app's Free up space offers to keep them (#296). Reads only.
+            if (url.pathname === '/availability/pinned') {
+                if (req.method !== 'GET') return jsonError('Method not allowed', 405);
+                return Response.json(engine.pinnedSummary());
+            }
             if (url.pathname !== '/availability') {
                 return jsonError('Not found', 404);
             }
@@ -450,7 +457,7 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
                 }
             }
             if (req.method === 'POST') {
-                let body: { path?: unknown; action?: unknown };
+                let body: { path?: unknown; action?: unknown; keepPinned?: unknown };
                 try {
                     body = (await req.json()) as typeof body;
                 } catch {
@@ -460,8 +467,19 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
                 if (typeof body.action !== 'string' || !ACTIONS.includes(body.action)) {
                     return jsonError(`Unknown action: ${String(body.action)}`);
                 }
+                // A free may keep what is marked Always keep below it (#296); without it, the free is as before
+                const { keepPinned } = body;
+                if (keepPinned !== undefined) {
+                    if (typeof keepPinned !== 'boolean') return jsonError('keepPinned must be true or false');
+                    if (body.action !== 'free') return jsonError(`keepPinned goes only with free, not ${body.action}`);
+                }
                 try {
-                    return Response.json(await engine.setAvailability(body.path, body.action as AvailabilityAction));
+                    const action = body.action as AvailabilityAction;
+                    return Response.json(
+                        await (keepPinned === undefined
+                            ? engine.setAvailability(body.path, action)
+                            : engine.setAvailability(body.path, action, { keepPinned })),
+                    );
                 } catch (err) {
                     return jsonError(err instanceof Error ? err.message : String(err));
                 }

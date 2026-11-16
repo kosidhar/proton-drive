@@ -328,6 +328,25 @@ describe("AvailabilityPolicy", () => {
     expect(policy.hasPinnedBelow("")).toBe(false);
     expect(policy.isPinned("Docs/Deep/c.txt")).toBe(true);
   });
+
+  test("pinnedSummary counts the items marked Always keep below the top level, and says whether the top level is (#296)", () => {
+    expect(policy.pinnedSummary()).toEqual({ items: 0, wholeDrive: false });
+    policy.setPin("docs", "pinned", false);
+    policy.setPin("music", "pinned", false);
+    policy.setPin("deep", "unpinned", false); // freed inside a kept folder: not a mark
+    policy.setHide("photos", "hidden"); // nor is a hide
+    expect(policy.pinnedSummary()).toEqual({ items: 2, wholeDrive: false });
+
+    policy.setPin("root", "pinned", false);
+    expect(policy.pinnedSummary()).toEqual({ items: 2, wholeDrive: true });
+
+    // A mark on something no longer in Proton Drive isn't counted
+    index.replaceChildren("root", "", [folder("docs", "root", "Docs"), folder("photos", "root", "Photos")]);
+    expect(policy.pinnedSummary()).toEqual({ items: 1, wholeDrive: true });
+
+    policy.setPin("root", "unpinned", true);
+    expect(policy.pinnedSummary()).toEqual({ items: 0, wholeDrive: false });
+  });
 });
 
 describe("AvailabilityPolicy.childStates", () => {
