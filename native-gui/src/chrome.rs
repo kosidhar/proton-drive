@@ -1,5 +1,6 @@
 //! The window's frame around the sections, as Proton's apps have it (#276):
-//! - the sidebar: from the top, the logo, Open in Files, the sections (Settings last), and at its foot the storage meter and the version;
+//! - the sidebar: from the top, the logo, Open in Files, the sections (Settings last), and at its foot the storage
+//!   meter and the version;
 //! - the top bar over the section: its title and the account, which opens the account menu (#274).
 
 use std::path::Path;
@@ -247,7 +248,8 @@ impl ProtonDriveNativeApp {
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.label(RichText::new(tab_title(self.tab)).font(bold(17.0)).color(TEXT_PRIMARY()));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        // The name and email take what the title and the initials leave, up to 220 pt
+                        // The name and email take what the title and the initials leave, up to 220 pt. The second
+                        // `ACCOUNT_GAP` is the least room kept between the title and the account
                         let fixed = INITIALS_SIZE + 2.0 * ACCOUNT_PADDING + 2.0 * ACCOUNT_GAP;
                         let room = (ui.available_width() - fixed).clamp(0.0, ACCOUNT_TEXT_WIDTH);
                         self.account_block(ui, room).clicked()
