@@ -4,11 +4,11 @@
 use eframe::egui::{self, Align, CornerRadius, FontFamily, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, Vec2};
 
 use crate::home::{
-    card_title, elided, open_in_browser, primary_button, secondary_button, storage, trash_hover, OPEN_TRASH, OPEN_WEB,
-    PROTON_DRIVE_TRASH_URL, PROTON_DRIVE_WEB_URL, TRASH_BUTTON,
+    card_title, elided, open_in_browser, secondary_button, storage, trash_hover, OPEN_TRASH, OPEN_WEB, PROTON_DRIVE_TRASH_URL,
+    PROTON_DRIVE_WEB_URL, TRASH_BUTTON,
 };
 use crate::{
-    action_button_named, card_frame, focus_ring, icons, save_window_geometry, text_width, toggle_switch,
+    action_button, action_button_named, card_frame, focus_ring, icons, save_window_geometry, text_width, toggle_switch,
     ButtonKind, ProtonDriveNativeApp, WorkerCommand, BG_INPUT, BORDER_NORM, BORDER_SUBTLE, DANGER_TEXT,
     HIDDEN_NEEDS_RESTART, PROTON_PURPLE, PROTON_PURPLE_TEXT, TEXT_MUTED, TEXT_PRIMARY,
 };
@@ -334,10 +334,10 @@ impl ProtonDriveNativeApp {
                 ui.add_space(6.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if self.status.logged_in {
-                        if secondary_button(ui, "Sign out", 32.0).clicked() {
+                        if action_button(ui, ButtonKind::Secondary, Some(icons::SIGN_OUT), "Sign out", 32.0).clicked() {
                             self.send_account_command(WorkerCommand::Logout);
                         }
-                    } else if primary_button(ui, "Sign in", 32.0).clicked() {
+                    } else if action_button(ui, ButtonKind::Primary, Some(icons::SIGN_IN), "Sign in", 32.0).clicked() {
                         self.send_account_command(WorkerCommand::StartLogin);
                     }
                     ui.add_space(8.0);

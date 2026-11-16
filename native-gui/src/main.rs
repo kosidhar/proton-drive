@@ -2194,18 +2194,7 @@ impl ProtonDriveNativeApp {
                 if let Some(error) = self.shared.error.clone() {
                     ui.add(egui::Label::new(RichText::new(error).size(13.0).color(DANGER_TEXT())).wrap());
                     ui.add_space(10.0);
-                    if proton_button(
-                        ui,
-                        Vec2::new(button_width(ui, "Retry"), 34.0),
-                        "Retry",
-                        PROTON_PURPLE,
-                        PROTON_PURPLE_HOVER,
-                        None,
-                        Color32::WHITE,
-                        13.0,
-                    )
-                    .clicked()
-                    {
+                    if action_button(ui, ButtonKind::Primary, Some(icons::REFRESH), "Retry", 34.0).clicked() {
                         self.load_shared();
                     }
                     return;
@@ -2310,17 +2299,7 @@ impl ProtonDriveNativeApp {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
             if !self.status.logged_in
-                && proton_button(
-                    ui,
-                    Vec2::new(165.0, 34.0),
-                    "Sign in to Proton Drive",
-                    PROTON_PURPLE,
-                    PROTON_PURPLE_HOVER,
-                    None,
-                    Color32::WHITE,
-                    13.0,
-                )
-                .clicked()
+                && action_button(ui, ButtonKind::Primary, Some(icons::SIGN_IN), "Sign in to Proton Drive", 34.0).clicked()
             {
                 self.send_account_command(WorkerCommand::StartLogin);
             }
@@ -3205,7 +3184,7 @@ impl ProtonDriveNativeApp {
                 Some("Changing the sync location safely moves your existing synced files to the new folder, switches the real-time file watcher, and preserves all cloud files without re-uploading or deleting them."),
                 |ui| {
                     // The field and Browse... as one group, the field taking the room Browse... leaves
-                    let browse_w = action_button_width(ui, None, "Browse...");
+                    let browse_w = action_button_width(ui, Some(icons::FOLDER_OPEN), "Browse...");
                     let gap = 6.0 + ui.spacing().item_spacing.x;
                     let field_w = (ui.available_width() - browse_w - gap).clamp(0.0, settings::WIDE_CONTROL);
                     let group = Vec2::new(field_w + gap + browse_w, 32.0);
@@ -3216,7 +3195,7 @@ impl ProtonDriveNativeApp {
                             self.mark_settings_edited();
                         }
                         ui.add_space(6.0);
-                        browse = action_button(ui, ButtonKind::Secondary, None, "Browse...", 32.0).clicked();
+                        browse = action_button(ui, ButtonKind::Secondary, Some(icons::FOLDER_OPEN), "Browse...", 32.0).clicked();
                         field
                     })
                     .inner
@@ -3552,28 +3531,6 @@ fn button_shell(
             .rect_stroke(rect, CornerRadius::same(8), s, egui::StrokeKind::Inside);
     }
     (rect, resp)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn proton_button(
-    ui: &mut egui::Ui,
-    size: Vec2,
-    label: &str,
-    fill: Color32,
-    hover_fill: Color32,
-    stroke: Option<Stroke>,
-    text_color: Color32,
-    font_size: f32,
-) -> egui::Response {
-    let (rect, resp) = button_shell(ui, size, label, fill, hover_fill, stroke);
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        label,
-        FontId::new(font_size, FontFamily::Proportional),
-        text_color,
-    );
-    resp
 }
 
 /// The room on each side of a button's label.
@@ -9552,14 +9509,14 @@ mod tests {
         for email in ["alex@proton.me", "sam@proton.me", "jo@example.com"] {
             assert!(h.text_at(email).is_some(), "{email}");
         }
-        h.click(in_row(&h, "sam@proton.me", "×"));
+        h.click(h.widget_at("Remove sam@proton.me").expect("each person's remove"));
         assert!(h.text_at("Remove sam@proton.me?").is_some());
         assert_eq!(h.sent(), Vec::<String>::new());
         h.click(h.text_at("Cancel").unwrap());
         assert!(h.text_at("Remove sam@proton.me?").is_none());
         assert_eq!(h.sent(), Vec::<String>::new());
 
-        h.click(in_row(&h, "sam@proton.me", "×"));
+        h.click(h.widget_at("Remove sam@proton.me").unwrap());
         h.click(h.text_at("Remove access").expect("the confirmation's button"));
         assert_eq!(h.sent(), vec![format!("share remove {SHARED} sam@proton.me")]);
     }
@@ -9623,7 +9580,7 @@ mod tests {
         // Escape while someone's access is being removed
         let mut h = share_window(Some(with_people()));
         let second = shown(&h);
-        h.click(in_row(&h, "sam@proton.me", "×"));
+        h.click(h.widget_at("Remove sam@proton.me").unwrap());
         h.click(h.text_at("Remove access").unwrap());
         assert_eq!(h.sent(), vec![format!("share remove {SHARED} sam@proton.me")]);
         press_key(&mut h, egui::Key::Escape);
@@ -10117,13 +10074,70 @@ mod tests {
     }
 
     #[test]
-    fn a_proton_button_is_named_by_its_label() {
+    fn a_button_is_named_by_its_label_where_it_paints_it() {
         let h = Harness::widget(|ui| {
-            proton_button(ui, Vec2::new(90.0, 30.0), "Unblock", BG_CARD_ALT(), BG_INPUT(), None, TEXT_PRIMARY(), 12.5);
+            home::secondary_button(ui, "Unblock", 30.0);
         });
         let button = h.widget_at("Unblock").expect("named by its label");
         let label = h.text_at("Unblock").unwrap();
         assert!((button - label).length() < 3.0, "the button {button:?} is where its label {label:?} is painted");
+    }
+
+    /// Whether `icon` is painted just before the label `label`, on its line.
+    fn icon_before(h: &Harness, label: &str, icon: &str) -> bool {
+        let at = h.text_rect(label).unwrap_or_else(|| panic!("{label:?} is painted"));
+        h.text_rects_all(icon).into_iter().any(|g| (g.center().y - at.center().y).abs() < 4.0 && g.right() <= at.left() && at.left() - g.right() < 12.0)
+    }
+
+    // R23: the buttons that had no icon get one where a glyph means what they do, and all go through the button kinds
+    #[test]
+    fn retry_sign_in_sign_out_and_browse_carry_their_icons() {
+        // Shared's Retry, while the list couldn't be read: and it reads again
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared").unwrap());
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Err("Proton Drive is offline".into())));
+        assert!(icon_before(&h, "Retry", icons::REFRESH), "Retry's icon");
+        assert_eq!(h.fill_under(h.text_at("Retry").unwrap()), Some(PROTON_PURPLE), "a primary button");
+        let _ = h.sent();
+        h.click(h.text_at("Retry").unwrap());
+        assert_eq!(h.sent(), vec!["shared list".to_string()]);
+
+        // Settings' Account card: Sign out, and Sign in while signed out
+        let h = settings_tall(None, None);
+        assert!(icon_before(&h, "Sign out", icons::SIGN_OUT), "the Account card's Sign out");
+        assert!(icon_before(&h, "Browse...", icons::FOLDER_OPEN), "Browse...");
+        let mut h = Harness::settings(None, None);
+        h.app.status.logged_in = false;
+        h.frames(2);
+        assert!(icon_before(&h, "Sign in", icons::SIGN_IN), "the Account card's Sign in");
+
+        // Home's Sign in, and Activity's
+        let h = home_with(|s| s.logged_in = false);
+        assert!(icon_before(&h, "Sign in", icons::SIGN_IN), "Home's Sign in");
+        let mut h = Harness::new();
+        h.app.status.logged_in = false;
+        h.app.tab = NavTab::Activity;
+        h.frames(2);
+        assert!(icon_before(&h, "Sign in to Proton Drive", icons::SIGN_IN), "Activity's Sign in");
+        assert_eq!(h.fill_under(h.text_at("Sign in to Proton Drive").unwrap()), Some(PROTON_PURPLE));
+        h.click(h.text_at("Sign in to Proton Drive").unwrap());
+        assert_eq!(h.sent(), vec!["sign in".to_string()]);
+    }
+
+    // R23, final review minor 4: the Share window's remove is an icon button named for the person it removes
+    #[test]
+    fn removing_someone_is_an_icon_button_named_for_them() {
+        let mut h = share_window(Some(with_people()));
+        tooltips_at_once(&h);
+        assert!(h.text_at("×").is_none(), "no × painted as text");
+        let remove = h.widget_at("Remove sam@proton.me").expect("named for the person");
+        assert!((remove.y - h.text_at("sam@proton.me").unwrap().y).abs() < 8.0, "on their row");
+        assert!(h.text_at(icons::REMOVE).is_some(), "Phosphor's ×");
+        hover(&mut h, remove);
+        assert!(h.text_at("Remove sam@proton.me").is_some(), "its hover, as before");
+        h.click(remove);
+        assert!(h.text_at("Remove sam@proton.me?").is_some(), "asks first, as before");
+        assert_eq!(h.sent(), Vec::<String>::new());
     }
 
     #[test]
