@@ -9,8 +9,8 @@ use crate::icons;
 use crate::{
     action_button, action_button_if, card_frame, drive_status_line, files_safe_hint, format_bytes, offers_mount_again,
     render_transfer_line, shown_folder, spawn_reaped, AccountInfo, ButtonKind, ConflictRecord, DaemonStatus,
-    PendingConfirm, ProtonDriveNativeApp, VfsStatus, WorkerCommand, BG_CARD_ALT, BORDER_SUBTLE, PROTON_PURPLE,
-    DANGER_TEXT, PROTON_PURPLE_TEXT, SCREENSHOT_MODE, STATUS_DANGER, STATUS_SUCCESS, STATUS_WARNING, TEXT_MUTED, TEXT_PRIMARY,
+    PendingConfirm, ProtonDriveNativeApp, VfsStatus, WorkerCommand, BG_CARD_ALT, BORDER_SUBTLE, DANGER_TEXT, PROTON_PURPLE,
+    PROTON_PURPLE_TEXT, SCREENSHOT_MODE, SUCCESS_TEXT, TEXT_MUTED, TEXT_PRIMARY, WARNING_TEXT,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -368,26 +368,28 @@ pub(crate) fn usage_bar(ui: &mut egui::Ui, fraction: f32, fill: Color32, track: 
     resp
 }
 
-/// The headline's colour.
+/// A state's colour, for its glyph and its headline alike (R22): the spec's colour for the glyph (green, purple, amber,
+/// red, grey), in the shade words take, so that the headline reads on the card (R21).
 fn tone_color(tone: Tone) -> Color32 {
     match tone {
-        Tone::Ok => STATUS_SUCCESS,
+        Tone::Ok => SUCCESS_TEXT(),
         Tone::Busy => PROTON_PURPLE_TEXT(),
-        Tone::Paused => TEXT_MUTED(),
-        Tone::Attention => STATUS_WARNING,
-        Tone::Offline => DANGER_TEXT(),
+        Tone::Paused => WARNING_TEXT(),
+        Tone::Attention => DANGER_TEXT(),
+        Tone::Offline => TEXT_MUTED(),
     }
 }
 
-/// The status card's glyph: one per state, as the headline's.
+/// The status card's glyph, one per state, in the headline's colour.
 pub fn status_icon(summary: &StatusSummary) -> (&'static str, Color32) {
-    match summary.tone {
-        Tone::Ok => (icons::CHECK, STATUS_SUCCESS),
-        Tone::Busy => (icons::SYNC, PROTON_PURPLE),
-        Tone::Paused => (icons::PAUSE, STATUS_WARNING),
-        Tone::Attention => (icons::WARNING, STATUS_DANGER),
-        Tone::Offline => (icons::OFFLINE, TEXT_MUTED()),
-    }
+    let glyph = match summary.tone {
+        Tone::Ok => icons::CHECK,
+        Tone::Busy => icons::SYNC,
+        Tone::Paused => icons::PAUSE,
+        Tone::Attention => icons::WARNING,
+        Tone::Offline => icons::OFFLINE,
+    };
+    (glyph, tone_color(summary.tone))
 }
 
 /// Opens a folder in the file manager; a screenshot opens nothing.
@@ -1368,12 +1370,13 @@ mod tests {
         let icon = |status: &DaemonStatus, online: bool, attention: usize| {
             status_icon(&status_summary(status, online, false, attention, 1_000_000))
         };
-        assert_eq!(icon(&status("idle", vec![], false), true, 0), (icons::CHECK, STATUS_SUCCESS));
-        assert_eq!(icon(&status("syncing", vec![transfer("upload", "a")], false), true, 0), (icons::SYNC, PROTON_PURPLE));
-        assert_eq!(icon(&status("paused", vec![], false), true, 0), (icons::PAUSE, STATUS_WARNING));
-        assert_eq!(icon(&status("idle", vec![], true), true, 0), (icons::PAUSE, STATUS_WARNING));
-        assert_eq!(icon(&status("idle", vec![], false), true, 2), (icons::WARNING, STATUS_DANGER));
-        assert_eq!(icon(&status("error", vec![], false), true, 0), (icons::WARNING, STATUS_DANGER));
+        // Green, purple, amber, red and grey, in the shades words take (R22)
+        assert_eq!(icon(&status("idle", vec![], false), true, 0), (icons::CHECK, SUCCESS_TEXT()));
+        assert_eq!(icon(&status("syncing", vec![transfer("upload", "a")], false), true, 0), (icons::SYNC, PROTON_PURPLE_TEXT()));
+        assert_eq!(icon(&status("paused", vec![], false), true, 0), (icons::PAUSE, WARNING_TEXT()));
+        assert_eq!(icon(&status("idle", vec![], true), true, 0), (icons::PAUSE, WARNING_TEXT()));
+        assert_eq!(icon(&status("idle", vec![], false), true, 2), (icons::WARNING, DANGER_TEXT()));
+        assert_eq!(icon(&status("error", vec![], false), true, 0), (icons::WARNING, DANGER_TEXT()));
         assert_eq!(icon(&status("idle", vec![], false), false, 0), (icons::OFFLINE, TEXT_MUTED()));
     }
 
