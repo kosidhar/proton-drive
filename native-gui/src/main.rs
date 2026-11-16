@@ -3773,32 +3773,19 @@ const ICON_BUTTON_SIZE: f32 = 28.0;
 /// An icon-only button, 28×28, with no fill until hovered. `label`, what a button with words would have said, is its
 /// tooltip and its name for screen readers.
 fn icon_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
-    icon_button_drawn(ui, icon, label, None, TEXT_PRIMARY())
+    icon_button_drawn(ui, icon, label, TEXT_PRIMARY())
 }
 
 /// `icon_button` with its icon in `color`: a list row's actions, weak until their row is hovered.
 fn icon_button_colored(ui: &mut egui::Ui, icon: &str, label: &str, color: Color32) -> egui::Response {
-    icon_button_drawn(ui, icon, label, None, color)
+    icon_button_drawn(ui, icon, label, color)
 }
 
-/// `icon_button`, filled with the soft purple while `pressed`: the top bar's gear while Settings is open. Unlike the
-/// others, it is a toggle for screen readers.
-fn icon_button_pressed(ui: &mut egui::Ui, icon: &str, label: &str, pressed: bool) -> egui::Response {
-    icon_button_drawn(ui, icon, label, Some(pressed), if pressed { PROTON_PURPLE_TEXT() } else { TEXT_PRIMARY() })
-}
-
-/// An icon-only button; `pressed` is None for a plain push button, or whether a toggle is on.
-fn icon_button_drawn(ui: &mut egui::Ui, icon: &str, label: &str, pressed: Option<bool>, color: Color32) -> egui::Response {
-    let (fill, hover_fill) =
-        if pressed == Some(true) { (PROTON_PURPLE_SOFT(), PROTON_PURPLE_SOFT()) } else { (Color32::TRANSPARENT, BG_CARD_ALT()) };
-    let (rect, resp) = button_shell(ui, Vec2::splat(ICON_BUTTON_SIZE), label, fill, hover_fill, None);
-    // A toggle says whether it is pressed, as the sections say whether they are open; a push button only its name
-    // (egui marks any `selected` widget a toggle, pressed or not)
+/// An icon-only push button: it says only its name to screen readers.
+fn icon_button_drawn(ui: &mut egui::Ui, icon: &str, label: &str, color: Color32) -> egui::Response {
+    let (rect, resp) = button_shell(ui, Vec2::splat(ICON_BUTTON_SIZE), label, Color32::TRANSPARENT, BG_CARD_ALT(), None);
     let enabled = ui.is_enabled();
-    resp.widget_info(|| match pressed {
-        Some(pressed) => egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, pressed, label),
-        None => egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label),
-    });
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, icons::font(BUTTON_ICON_SIZE), color);
     // With no words of its own, it says what it is even while it waits (greyed out)
     resp.on_hover_text(label).on_disabled_hover_text(label)
@@ -6089,7 +6076,7 @@ mod tests {
             ..Default::default()
         });
         h.frames(2);
-        h.click(h.widget_at("Settings").expect("the top bar's gear"));
+        h.click(h.text_at("Settings").expect("the sidebar's Settings"));
         assert_eq!(h.app.tab, NavTab::Settings);
         // Settings starts with the account: name, email, plan, storage and Sign out (the top bar shows the name, email
         // and initials too)
@@ -7521,9 +7508,12 @@ mod tests {
 
     // #253: the Shared section
     #[test]
-    fn the_sidebar_lists_home_shared_activity_in_that_order() {
+    fn the_sidebar_lists_home_shared_activity_settings_in_that_order() {
         let h = Harness::new();
-        let ys: Vec<f32> = ["Home", "Shared", "Activity"].iter().map(|l| h.text_at(l).expect(l).y).collect();
+        let ys: Vec<f32> = ["Home", "Shared", "Activity", "Settings"]
+            .iter()
+            .map(|l| h.text_at_all(l).into_iter().find(|p| p.x < SIDEBAR_EDGE).expect(l).y)
+            .collect();
         assert!(ys.windows(2).all(|w| w[0] < w[1]), "{ys:?}");
     }
 
@@ -7549,20 +7539,51 @@ mod tests {
     }
 
     #[test]
-    fn the_sidebar_offers_home_shared_and_activity_and_no_settings() {
+    fn the_sidebar_offers_home_shared_activity_and_settings() {
         let h = Harness::new();
-        for (label, icon) in [("Home", icons::HOME), ("Shared", icons::SHARED), ("Activity", icons::ACTIVITY)] {
-            let at = h.text_at(label).expect(label);
-            assert!(at.x < SIDEBAR_EDGE, "{label} at {at:?}");
-            let glyph = h.text_at(icon).unwrap_or_else(|| panic!("{label}'s icon is painted"));
+        let in_sidebar = |text: &str| h.text_at_all(text).into_iter().find(|p| p.x < SIDEBAR_EDGE);
+        for (label, icon) in
+            [("Home", icons::HOME), ("Shared", icons::SHARED), ("Activity", icons::ACTIVITY), ("Settings", icons::SETTINGS)]
+        {
+            let at = in_sidebar(label).unwrap_or_else(|| panic!("{label} is in the sidebar"));
+            let glyph = in_sidebar(icon).unwrap_or_else(|| panic!("{label}'s icon is painted in the sidebar"));
             assert!(glyph.x < at.x && (glyph.y - at.y).abs() < 4.0, "{label}'s icon {glyph:?} is before its name {at:?}");
         }
-        let settings: Vec<_> = h.text_at_all("Settings").into_iter().filter(|p| p.x < SIDEBAR_EDGE).collect();
-        assert_eq!(settings, Vec::<egui::Pos2>::new(), "Settings leaves the sidebar (the top bar's gear opens it)");
         // Nor is the account at its foot any more (it moves to the top bar)
         for gone in ["Not signed in", "Proton Account", "PD"] {
             assert!(h.text_at_all(gone).iter().all(|p| p.x > SIDEBAR_EDGE), "{gone}");
         }
+    }
+
+    #[test]
+    fn the_sidebar_settings_opens_settings_and_stays_selected() {
+        use egui::accesskit::Toggled;
+        let sidebar_node = |h: &Harness, label: &str| {
+            h.nodes_named(label)
+                .into_iter()
+                .find(|n| n.bounds().is_some_and(|b| b.x0 < SIDEBAR_EDGE as f64))
+                .unwrap_or_else(|| panic!("the sidebar's {label} is named"))
+        };
+        let in_sidebar = |h: &Harness| h.text_at_all("Settings").into_iter().find(|p| p.x < SIDEBAR_EDGE).expect("in the sidebar");
+        let mut h = Harness::new();
+        let open = sidebar_node(&h, "Home").toggled();
+        assert_eq!(open, Some(Toggled::True), "Home is open");
+        assert_ne!(sidebar_node(&h, "Settings").toggled(), open, "Settings is not");
+        let at = in_sidebar(&h);
+        h.click(at);
+        assert_eq!(h.app.tab, NavTab::Settings);
+        let at = in_sidebar(&h);
+        assert_eq!(h.fill_under(at), Some(SIDEBAR_SELECTED()));
+        assert_eq!(sidebar_node(&h, "Settings").toggled(), open, "it says it is open, as Home did");
+        assert_ne!(sidebar_node(&h, "Home").toggled(), open, "and Home says it isn't");
+        h.click(h.text_at("Home").unwrap());
+        assert_eq!(h.app.tab, NavTab::Home);
+        assert_ne!(sidebar_node(&h, "Settings").toggled(), open, "closed again");
+        // Under a dialog, it opens nothing
+        h.app.pending_confirm = Some(PendingConfirm::StartFresh);
+        h.frames(2);
+        h.click(in_sidebar(&h));
+        assert_eq!(h.app.tab, NavTab::Home);
     }
 
     #[test]
@@ -7905,7 +7926,7 @@ mod tests {
         assert_eq!(img.get_pixel(64, 64)[3], 255, "the folder is there");
     }
 
-    // #274: the top bar: the section's title, the gear for Settings, and the account, which opens a menu (not Settings)
+    // #274: the top bar: the section's title and the account, which opens a menu (not Settings)
     fn gautam() -> AccountInfo {
         AccountInfo {
             display_name: "Gautam C".into(),
@@ -7943,23 +7964,32 @@ mod tests {
             assert_eq!(shown.len(), 1, "{tab:?}: {title:?} is shown once beside the sidebar, at {shown:?}");
             assert!(shown[0].y < chrome::TOP_BAR_HEIGHT, "{tab:?}: in the top bar, at {:?}", shown[0]);
         }
-        // In bold (the sidebar has no "Settings" to find first)
-        assert!(painted_bold(&h, "Settings", f32::MAX));
+        // In bold: the title right of the sidebar, not the sidebar's own row
+        let title = h.texts(|t| t.galley.text() == "Settings" && t.visual_bounding_rect().left() > SIDEBAR_EDGE);
+        assert_eq!(title.len(), 1);
+        let family = FontFamily::Name(BOLD_FAMILY.into());
+        assert!(title[0].galley.job.sections.iter().all(|s| s.format.font_id.family == family), "the title is bold");
     }
 
     #[test]
-    fn the_gear_opens_settings() {
+    fn the_top_bar_has_no_gear() {
         let mut h = Harness::new();
-        let gear = h.widget_at("Settings").expect("the gear, named Settings");
-        assert!(gear.x > SIDEBAR_EDGE && gear.y < chrome::TOP_BAR_HEIGHT, "in the top bar, at {gear:?}");
-        assert_eq!(in_top_bar(&h, icons::SETTINGS).len(), 1, "drawn as the gear");
-        h.click(gear);
-        assert_eq!(h.app.tab, NavTab::Settings);
-        assert_eq!(h.fill_under(gear), Some(PROTON_PURPLE_SOFT()), "it looks pressed while Settings is open");
-        h.click(h.text_at("Home").unwrap());
-        h.frame(vec![egui::Event::PointerMoved(egui::pos2(600.0, 400.0))]);
-        h.frames(2);
-        assert_ne!(h.fill_under(gear), Some(PROTON_PURPLE_SOFT()), "and not once it is closed");
+        assert_eq!(in_top_bar(&h, icons::SETTINGS), Vec::<egui::Pos2>::new(), "no gear in the top bar");
+        let named = h.widgets_at_all("Settings");
+        assert!(!named.is_empty() && named.iter().all(|p| p.x < SIDEBAR_EDGE), "only the sidebar's Settings: {named:?}");
+        h.app.open_tab(NavTab::Settings);
+        h.frames(3);
+        let title = in_top_bar(&h, "Settings");
+        assert_eq!(title.len(), 1, "the title, once: {title:?}");
+        let family = FontFamily::Name(BOLD_FAMILY.into());
+        let bold_titles = h.texts(|t| {
+            t.galley.text() == "Settings"
+                && t.visual_bounding_rect().left() > SIDEBAR_EDGE
+                && t.galley.job.sections.iter().all(|s| s.format.font_id.family == family)
+        });
+        assert_eq!(bold_titles.len(), 1, "in bold");
+        let in_bar = h.widgets_at_all("Settings").into_iter().filter(|p| p.x > SIDEBAR_EDGE && p.y < chrome::TOP_BAR_HEIGHT);
+        assert_eq!(in_bar.count(), 0, "no widget named Settings in the top bar");
     }
 
     #[test]
@@ -7971,8 +8001,6 @@ mod tests {
         let (name, email, initials) = (in_top_bar(&h, "Gautam C"), in_top_bar(&h, "gc@proton.me"), in_top_bar(&h, "GC"));
         assert!(name.len() == 1 && email.len() == 1 && initials.len() == 1, "{name:?} {email:?} {initials:?}");
         assert!(name[0].y < email[0].y && email[0].x < initials[0].x, "{name:?} {email:?} {initials:?}");
-        let gear = h.widget_at("Settings").unwrap();
-        assert!(gear.x < name[0].x, "the gear {gear:?} is left of the account {name:?}");
         assert!(h.text_at("Sign out").is_none());
 
         h.click(h.widget_at("Account").expect("the account is one button, named Account"));
@@ -8068,7 +8096,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_name_does_not_push_the_title_or_gear_off_at_840() {
+    fn a_long_name_does_not_push_the_title_off_at_840() {
         let mut h = Harness::new();
         let name = "Bartholomew ".repeat(5);
         let email = format!("{}@proton.me", "featherstonehaugh".repeat(3));
@@ -8083,16 +8111,12 @@ mod tests {
             h.frames(3);
             let title = chrome::tab_title(tab);
             let title = *h.text_rects_all(title).iter().find(|r| r.left() > SIDEBAR_EDGE).expect("the title is shown");
-            // On Settings the title is named Settings too: the gear is the one on the right
-            let gear = h.widgets_at_all("Settings").into_iter().max_by(|a, b| a.x.total_cmp(&b.x)).unwrap();
-            let gear = egui::Rect::from_center_size(gear, Vec2::splat(28.0));
             // (Settings' Account card shows them too)
             let initials: Vec<_> = h.text_rects_all("BB").into_iter().filter(|r| r.top() < chrome::TOP_BAR_HEIGHT).collect();
-            assert!(initials.len() == 1 && inside(&h, title) && inside(&h, gear) && inside(&h, initials[0]), "{tab:?}");
-            assert!(title.right() < gear.left(), "{tab:?}: the title {title:?} runs under the gear {gear:?}");
-            // The name is shortened to fit, between the gear and the initials
+            assert!(initials.len() == 1 && inside(&h, title) && inside(&h, initials[0]), "{tab:?}");
+            // The name is shortened to fit, between the title and the initials
             let shown = h.text_rect_starting("Bartholomew").expect("the name is painted, shortened");
-            assert!(gear.right() < shown.left() && shown.right() < initials[0].left(), "{tab:?}: {shown:?} {gear:?}");
+            assert!(title.right() < shown.left() && shown.right() < initials[0].left(), "{tab:?}: {shown:?} {title:?}");
             assert!(in_top_bar(&h, &name).is_empty(), "shortened");
         }
     }
@@ -8102,18 +8126,16 @@ mod tests {
         let mut h = Harness::new();
         h.app.status.account = Some(gautam());
         h.frames(2);
-        let (gear, account) = (h.widget_at("Settings").unwrap(), h.widget_at("Account").unwrap());
-        for at in [gear, account] {
-            h.app.pending_confirm = Some(PendingConfirm::StartFresh);
-            h.frames(2);
-            h.click(at);
-            assert_eq!(h.app.tab, NavTab::Home);
-            assert!(!h.app.account_menu_open);
-        }
+        let account = h.widget_at("Account").unwrap();
+        h.app.pending_confirm = Some(PendingConfirm::StartFresh);
+        h.frames(2);
+        h.click(account);
+        assert_eq!(h.app.tab, NavTab::Home);
+        assert!(!h.app.account_menu_open);
         assert_eq!(h.sent(), Vec::<String>::new());
     }
 
-    /// The top bar's last node named `label` (the gear, the account), as screen readers get it.
+    /// The top bar's last node named `label` (the account), as screen readers get it.
     fn top_bar_node(h: &Harness, label: &str) -> egui::accesskit::Node {
         h.nodes_named(label).pop().unwrap_or_else(|| panic!("{label} is named"))
     }
@@ -8123,35 +8145,25 @@ mod tests {
         let mut h = Harness::new();
         h.app.status.account = Some(gautam());
         h.frames(2);
-        for label in ["Settings", "Account"] {
-            assert!(!top_bar_node(&h, label).is_disabled(), "{label} works with no dialog");
-        }
+        assert!(!top_bar_node(&h, "Account").is_disabled(), "the account works with no dialog");
         h.app.pending_confirm = Some(PendingConfirm::StartFresh);
         h.frames(2);
-        for label in ["Settings", "Account"] {
-            assert!(top_bar_node(&h, label).is_disabled(), "{label} under the confirmation");
-        }
+        assert!(top_bar_node(&h, "Account").is_disabled(), "the account under the confirmation");
         h.app.pending_confirm = None;
         h.frames(2);
         h.app.open_share("/home/u/ProtonDrive/Docs/report.pdf");
         h.frames(3);
         assert!(h.app.share.is_some());
-        for label in ["Settings", "Account"] {
-            assert!(top_bar_node(&h, label).is_disabled(), "{label} under the Share window");
-        }
+        assert!(top_bar_node(&h, "Account").is_disabled(), "the account under the Share window");
     }
 
     #[test]
-    fn the_gear_and_the_account_say_whether_they_are_pressed() {
+    fn the_account_says_whether_its_menu_is_open() {
         use egui::accesskit::Toggled;
         let mut h = Harness::new();
         h.app.status.account = Some(gautam());
         h.frames(2);
-        assert_eq!(top_bar_node(&h, "Settings").toggled(), Some(Toggled::False), "Home is open");
         assert_eq!(top_bar_node(&h, "Account").toggled(), Some(Toggled::False), "no menu");
-        h.app.open_tab(NavTab::Settings);
-        h.frames(2);
-        assert_eq!(top_bar_node(&h, "Settings").toggled(), Some(Toggled::True), "Settings is open");
         h.click(h.widget_at("Account").unwrap());
         assert!(h.app.account_menu_open);
         assert_eq!(top_bar_node(&h, "Account").toggled(), Some(Toggled::True), "the menu is open");
@@ -8418,10 +8430,9 @@ mod tests {
         }
     }
 
-    // A Shared action and Refresh are push buttons for screen readers; only the gear, which stays pressed while
-    // Settings is open, is a toggle
+    // A Shared action and Refresh are push buttons for screen readers
     #[test]
-    fn shared_actions_and_refresh_are_push_buttons_and_the_gear_a_toggle() {
+    fn shared_actions_and_refresh_are_push_buttons() {
         let h = shared_with_rows();
         for label in ["Copy link", "Manage…", "Show in Files", "Stop sharing", "Manage on the web", "Refresh"] {
             let nodes = h.nodes_named(label);
@@ -8431,8 +8442,6 @@ mod tests {
                 assert_eq!(node.toggled(), None, "{label:?} is not a toggle");
             }
         }
-        let gear = h.nodes_named("Settings").into_iter().find(|n| n.role() == egui::accesskit::Role::Button).expect("the gear");
-        assert_eq!(gear.toggled(), Some(egui::accesskit::Toggled::False), "the gear says it isn't pressed");
     }
 
     // R13: phrases are cut at their end; paths (folders, names) in the middle, keeping their ends
