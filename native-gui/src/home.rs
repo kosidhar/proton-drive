@@ -692,7 +692,7 @@ impl ProtonDriveNativeApp {
         sign_in: &mut bool,
     ) {
         if show_sign_in {
-            *sign_in = primary_button(ui, "Sign in", 34.0).clicked();
+            *sign_in = primary_icon_button(ui, icons::SIGN_IN, "Sign in", 34.0).clicked();
             return;
         }
         let (pause_label, pause_to) = pause_button(&self.status);

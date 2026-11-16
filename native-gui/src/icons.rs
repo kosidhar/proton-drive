@@ -31,12 +31,12 @@ pub const ACTIVITY: &str = ph::CLOCK_COUNTER_CLOCKWISE;
 pub const SETTINGS: &str = ph::GEAR;
 
 // Actions
-/// Open in Files, Show in Files
+/// Open in Files, Show in Files, Browse... for a folder
 pub const FOLDER_OPEN: &str = ph::FOLDER_OPEN;
 pub const TRASH: &str = ph::TRASH;
 /// Sync now: send and fetch what changed
 pub const SYNC: &str = ph::ARROWS_CLOCKWISE;
-/// Load a list again
+/// Load again, try again: Shared's Refresh and Retry, a stopped move's Try again
 pub const REFRESH: &str = ph::ARROW_CLOCKWISE;
 pub const PAUSE: &str = ph::PAUSE;
 pub const RESUME: &str = ph::PLAY;
@@ -52,6 +52,9 @@ pub const MANAGE: &str = ph::USER_GEAR;
 pub const WEB: &str = ph::GLOBE;
 pub const SEARCH: &str = ph::MAGNIFYING_GLASS;
 pub const SIGN_OUT: &str = ph::SIGN_OUT;
+pub const SIGN_IN: &str = ph::SIGN_IN;
+/// Remove someone from a share
+pub const REMOVE: &str = ph::X;
 /// Free up space, Keep online-only: a file kept in Proton Drive alone
 pub const ONLINE_ONLY: &str = ph::CLOUD;
 /// Mount again: put the drive back
@@ -84,9 +87,9 @@ pub const FILE: &str = ph::FILE;
 
 /// Every icon, for the tests
 #[cfg(test)]
-pub const ALL: [&str; 33] = [
+pub const ALL: [&str; 35] = [
     HOME, SHARED, ACTIVITY, SETTINGS, FOLDER_OPEN, TRASH, SYNC, PAUSE, RESUME, CHECK, WARNING, OFFLINE, LINK,
-    LINK_BROKEN, LOCK, CLOCK, PEOPLE, COPY, MANAGE, WEB, REFRESH, SEARCH, INFO, SIGN_OUT, FOLDER, FILE,
+    LINK_BROKEN, LOCK, CLOCK, PEOPLE, COPY, MANAGE, WEB, REFRESH, SEARCH, INFO, SIGN_OUT, SIGN_IN, REMOVE, FOLDER, FILE,
     ONLINE_ONLY, MOUNT, RESTART, MOVE_BACK, KEEP_BOTH, KEEP_LOCAL, KEEP_REMOTE,
 ];
 

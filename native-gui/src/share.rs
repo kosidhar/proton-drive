@@ -18,8 +18,9 @@ use serde::Deserialize;
 use crate::home::{self, elided, primary_button, secondary_button};
 use crate::single_instance::PathProblem;
 use crate::{
-    action_button, action_button_sized, action_button_width, button_width, control_request_at, icons, proton_button, toggle_switch, ButtonKind, ProtonDriveNativeApp,
-    WorkerCommand, BG_CARD, BG_CARD_ALT, BG_INPUT, BORDER_NORM, BORDER_SUBTLE, DANGER_TEXT, TEXT_MUTED, TEXT_PRIMARY,
+    action_button, action_button_sized, action_button_width, button_width, control_request_at, icon_button, icons,
+    toggle_switch, ButtonKind, ProtonDriveNativeApp, WorkerCommand, BG_CARD, BG_CARD_ALT, BG_INPUT, BORDER_NORM,
+    BORDER_SUBTLE, DANGER_TEXT, TEXT_MUTED, TEXT_PRIMARY,
 };
 
 /// A share's role, for the link and for each person.
@@ -1372,17 +1373,8 @@ fn people_section(w: &mut ShareWindow, ui: &mut egui::Ui, people: &[SharePerson]
         ui.horizontal(|ui| {
             ui.set_min_height(PERSON_ROW_HEIGHT);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let remove = proton_button(
-                    ui,
-                    Vec2::new(28.0, 28.0),
-                    "×",
-                    BG_CARD(),
-                    BG_CARD_ALT(),
-                    Some(Stroke::new(1.0_f32, BORDER_NORM())),
-                    TEXT_PRIMARY(),
-                    16.0,
-                )
-                .on_hover_text(format!("Remove {}", person.email));
+                // Named, and saying on hover, whom it removes
+                let remove = icon_button(ui, icons::REMOVE, &format!("Remove {}", person.email));
                 if remove.clicked() {
                     actions.push(Action::AskRemove(person.email.clone()));
                 }
