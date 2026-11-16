@@ -6843,12 +6843,13 @@ mod tests {
     // and from Settings' account card; a screenshot opens nothing (nor does the sidebar's Open in Files)
     #[test]
     fn the_proton_drive_trash_opens_in_the_browser_from_home_and_settings() {
+        let sidebar_open = |h: &Harness| h.text_at_all("Open in Files").into_iter().find(|p| p.x < SIDEBAR_EDGE).expect("the sidebar's");
         let launched = || home::LAUNCHED.with(|l| std::mem::take(&mut *l.borrow_mut()));
         launched();
         let mut h = home_with(|s| s.sync_dir = "/srv/u/ProtonDrive".into());
         h.click(h.text_at("Trash").expect("the trash is offered on Home"));
         assert_eq!(launched(), vec!["https://drive.proton.me/trash".to_string()]);
-        h.click(h.text_at("Open in Files").unwrap());
+        h.click(sidebar_open(&h));
         assert_eq!(launched(), vec!["/srv/u/ProtonDrive".to_string()]);
         assert_eq!(h.sent(), Vec::<String>::new()); // nothing goes to the daemon
         // Not before a folder is set up
@@ -6872,7 +6873,7 @@ mod tests {
         home::AS_SCREENSHOT.with(|s| s.set(true));
         let mut h = home_with(|s| s.sync_dir = "/srv/u/ProtonDrive".into());
         h.click(h.text_at("Trash").unwrap());
-        h.click(h.text_at("Open in Files").unwrap());
+        h.click(sidebar_open(&h));
         home::AS_SCREENSHOT.with(|s| s.set(false));
         assert_eq!(launched(), Vec::<String>::new(), "a screenshot opens nothing");
     }
@@ -6886,6 +6887,90 @@ mod tests {
         tooltips_at_once(&h);
         hover(&mut h, label);
         assert!(h.text_at(&home::trash_hover("/srv/u/ProtonDrive")).is_some(), "hovering Trash says it opens the web, and where restored files go");
+    }
+
+    // #308: Home's drive row offers Open in Files beside Trash, the same kind of button
+    #[test]
+    fn home_offers_open_in_files_before_trash() {
+        let launched = || home::LAUNCHED.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        launched();
+        let mut h = home_with(|s| s.sync_dir = "/srv/u/ProtonDrive".into());
+        h.sent();
+        let on_page = |h: &Harness, text: &str| h.text_at_all(text).into_iter().filter(|p| p.x > SIDEBAR_EDGE).collect::<Vec<_>>();
+        let open = on_page(&h, chrome::OPEN_IN_FILES);
+        assert_eq!(open.len(), 1, "painted once on the page: {open:?}");
+        let trash = on_page(&h, "Trash");
+        assert_eq!(trash.len(), 1, "{trash:?}");
+        let (open, trash) = (open[0], trash[0]);
+        assert!(open.x < trash.x && (open.y - trash.y).abs() < 4.0, "Open in Files {open:?} is left of Trash {trash:?}, level");
+        let glyph = on_page(&h, icons::FOLDER_OPEN);
+        assert!(
+            glyph.iter().any(|g| g.x < open.x && (g.y - open.y).abs() < 4.0),
+            "the folder icon is painted just before it: {glyph:?} vs {open:?}"
+        );
+        assert_eq!(h.fill_under(open), h.fill_under(trash), "the same kind of button");
+        h.click(open);
+        assert_eq!(launched(), vec!["/srv/u/ProtonDrive".to_string()]);
+        assert_eq!(h.sent(), Vec::<String>::new(), "nothing goes to the daemon");
+        // A screenshot opens nothing
+        home::AS_SCREENSHOT.with(|s| s.set(true));
+        h.click(open);
+        home::AS_SCREENSHOT.with(|s| s.set(false));
+        assert_eq!(launched(), Vec::<String>::new());
+        // Not before a folder is set up
+        let h = home_with(|s| s.sync_dir = String::new());
+        assert!(on_page(&h, "Trash").is_empty());
+        assert!(on_page(&h, chrome::OPEN_IN_FILES).is_empty());
+    }
+
+    // #308: beside the name when they fit, under it (as the status block's buttons go) when they don't
+    #[test]
+    fn home_drive_buttons_fit_beside_or_under_the_name() {
+        let mut h = home_with(|s| s.sync_dir = "/srv/u/ProtonDrive".into());
+        let page = |h: &Harness, text: &str| {
+            h.text_rects_all(text).into_iter().find(|r| r.center().x > SIDEBAR_EDGE).unwrap_or_else(|| panic!("{text} on the page"))
+        };
+        // The buttons' frames (what a screen reader and a pointer see), not only their labels
+        let frame = |h: &Harness, name: &str| {
+            let nodes = h.nodes_named(name);
+            let node = nodes.iter().find(|n| n.bounds().is_some_and(|b| b.x0 as f32 > SIDEBAR_EDGE)).unwrap_or_else(|| panic!("{name} on the page"));
+            node_rect(node)
+        };
+        let kind = home::drive_kind(None);
+        let name = h.text_rect_starting("/srv").expect("the drive's name");
+        let kind_line = page(&h, kind);
+        let (open, trash) = (frame(&h, chrome::OPEN_IN_FILES), frame(&h, home::OPEN_TRASH));
+        assert!(h.nodes_named(chrome::OPEN_IN_FILES).iter().any(|n| n.bounds().is_some_and(|b| b.x0 as f32 > SIDEBAR_EDGE)), "named for screen readers");
+        assert!((trash.left() - open.right() - 12.0).abs() < 0.5, "12 between the buttons, as under the status: {open:?} {trash:?}");
+        for b in [open, trash] {
+            assert!((b.center().y - name.center().y).abs() < 12.0, "{b:?} is level with the name {name:?}");
+            assert!(b.left() > name.right() && b.left() > kind_line.right(), "{b:?} is right of {name:?} and {kind_line:?}");
+        }
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
+        let name = h.text_rect_starting("/srv").expect("the drive's name");
+        let kind_line = page(&h, kind);
+        let (open, trash) = (frame(&h, chrome::OPEN_IN_FILES), frame(&h, home::OPEN_TRASH));
+        assert!((trash.left() - open.right() - 12.0).abs() < 0.5, "12 between the buttons when stacked too: {open:?} {trash:?}");
+        for b in [open, trash] {
+            assert!(!b.intersects(name) && !b.intersects(kind_line), "{b:?} clear of {name:?} and {kind_line:?}");
+        }
+        for r in [name, kind_line, open, trash] {
+            assert!(r.left() >= SIDEBAR_EDGE && r.right() <= h.screen.x, "{r:?} within the page");
+        }
+        assert!(open.center().x < trash.center().x, "Open in Files stays left of Trash");
+        // Stacked: both under the name and the kind line
+        for b in [open, trash] {
+            assert!(b.top() > kind_line.bottom() && b.top() > name.bottom(), "{b:?} is under {name:?} and {kind_line:?}");
+        }
+        // And they work there
+        let launched = || home::LAUNCHED.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        launched();
+        h.sent();
+        h.click(open.center());
+        assert_eq!(launched(), vec!["/srv/u/ProtonDrive".to_string()]);
+        h.click(trash.center());
+        assert_eq!(launched(), vec!["https://drive.proton.me/trash".to_string()]);
+        assert_eq!(h.sent(), Vec::<String>::new(), "nothing goes to the daemon");
     }
 
     #[test]
@@ -7503,9 +7588,8 @@ mod tests {
         launched();
         let mut h = home_with(|s| s.sync_dir = "/home/u/ProtonDrive".into());
         h.sent();
-        let open = h.text_at_all(chrome::OPEN_IN_FILES);
-        assert_eq!(open.len(), 1, "offered once, in the sidebar, not on Home's card too: {open:?}");
-        assert!(open[0].x < SIDEBAR_EDGE, "{open:?}");
+        let open: Vec<_> = h.text_at_all(chrome::OPEN_IN_FILES).into_iter().filter(|p| p.x < SIDEBAR_EDGE).collect();
+        assert_eq!(open.len(), 1, "offered once in the sidebar: {open:?}");
         assert!(open[0].y < h.text_at("Home").unwrap().y, "above the sections");
         assert_eq!(h.fill_under(open[0]), Some(PROTON_PURPLE), "the primary button");
         h.click(open[0]);
@@ -7621,8 +7705,9 @@ mod tests {
         h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
         let text = chrome::storage_meter_text(h.app.status.account.as_ref()).unwrap();
         let rect = |label: &str| h.text_rect(label).unwrap_or_else(|| panic!("{label} is painted"));
+        let sidebar_open = h.text_rects_all(chrome::OPEN_IN_FILES).into_iter().find(|r| r.center().x < SIDEBAR_EDGE).expect("the sidebar's");
         let (name, open, home, activity, meter) =
-            (rect("Proton Drive"), rect(chrome::OPEN_IN_FILES), rect("Home"), rect("Activity"), rect(&text));
+            (rect("Proton Drive"), sidebar_open, rect("Home"), rect("Activity"), rect(&text));
         assert!(name.bottom() < open.top(), "the logo {name:?} is above Open in Files {open:?}");
         assert!(open.bottom() < home.top(), "Open in Files {open:?} is above Home {home:?}");
         assert!(activity.bottom() < meter.top(), "Activity {activity:?} is above the meter {meter:?}");
