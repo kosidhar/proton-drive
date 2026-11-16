@@ -44,6 +44,12 @@ pub struct DriveFs {
 
 impl DriveFs {
     pub fn new(backing: PathBuf, daemon: DaemonClient) -> Self {
+        let room = LocalRoom::of_disk(backing.clone());
+        DriveFs::with_room(backing, daemon, room)
+    }
+
+    /// A drive whose guard on the system disk is `room` (a test's, with its own reading of the disk).
+    fn with_room(backing: PathBuf, daemon: DaemonClient, room: LocalRoom) -> Self {
         let uid = unsafe { libc::getuid() };
         let (drops, dropped) = mpsc::channel();
         let state = Arc::new(State {
@@ -66,6 +72,7 @@ impl DriveFs {
             gid: unsafe { libc::getgid() },
             started: SystemTime::now(),
             space: Mutex::new(None),
+            room,
         });
         start_unlinker(Arc::downgrade(&state), dropped);
         DriveFs { state }
@@ -141,6 +148,8 @@ struct State {
     started: SystemTime,
     /// The account's storage, as the daemon said last; None until it has (statfs then reports the local disk)
     space: Mutex<Option<Space>>,
+    /// The guard that keeps the system disk from filling through the drive, whatever the account's storage (#295)
+    room: LocalRoom,
 }
 
 struct CachedListing {
@@ -302,15 +311,21 @@ enum Target<'a> {
     Path(&'a Path),
 }
 
-/// Applies a setattr to a backing file or folder.
-fn apply_change(target: Target, change: &AttrChange) -> std::io::Result<()> {
+/// Applies a setattr to a backing file or folder. A size that grows the file is the guard's to allow (#295), and one
+/// it refuses changes nothing: the size goes first.
+fn apply_change(target: Target, change: &AttrChange, room: &LocalRoom) -> std::io::Result<()> {
     if let Some(size) = change.size {
-        match target {
-            Target::File(file) => file.set_len(size)?,
+        let opened;
+        let file = match target {
+            Target::File(file) => file,
             Target::Path(path) => {
-                OpenOptions::new().write(true).custom_flags(libc::O_NOFOLLOW).open(path)?.set_len(size)?;
+                opened = OpenOptions::new().write(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
+                &opened
             }
-        }
+        };
+        let grows_by = growth(file.metadata()?.len(), 0, size);
+        room.allow(grows_by).map_err(|errno| std::io::Error::from_raw_os_error(errno.code()))?;
+        file.set_len(size)?;
     }
     if let Some(mode) = change.mode {
         let permissions = Permissions::from_mode(mode & 0o7777);
@@ -747,13 +762,13 @@ impl State {
     /// through the drive), through a file the app still has open under that number.
     fn reply_after_change(&self, ino: INodeNo, file: Option<&File>, change: &AttrChange, reply: ReplyAttr) {
         let meta = match (file, self.path_of(ino)) {
-            (Some(file), _) => apply_change(Target::File(file), change).and_then(|()| file.metadata()),
+            (Some(file), _) => apply_change(Target::File(file), change, &self.room).and_then(|()| file.metadata()),
             (None, Some(rel)) => {
                 let path = self.backing.join(rel);
-                apply_change(Target::Path(&path), change).and_then(|()| std::fs::symlink_metadata(&path))
+                apply_change(Target::Path(&path), change, &self.room).and_then(|()| std::fs::symlink_metadata(&path))
             }
             (None, None) => match self.open_file_of(ino.0) {
-                Some(file) => apply_change(Target::File(&file), change).and_then(|()| file.metadata()),
+                Some(file) => apply_change(Target::File(&file), change, &self.room).and_then(|()| file.metadata()),
                 None => return reply.error(Errno::ENOENT),
             },
         };
@@ -761,6 +776,34 @@ impl State {
             Ok(meta) => reply.attr(&TTL, &self.attr(ino.0, &Node::Local(meta))),
             Err(err) => reply.error(err.into()),
         }
+    }
+
+    /// A write through an app's open file. When it takes room on the disk (past the file's end, or into a hole), it
+    /// is the guard's to allow (#295), and one it refuses writes nothing. An overwrite in place is never refused.
+    fn write_at(&self, file: &File, offset: u64, data: &[u8]) -> Result<(), Errno> {
+        let meta = file.metadata()?;
+        let old_len = meta.len();
+        // A file opened to append takes every write at its end, whatever offset the kernel sent (pwrite(2) on Linux)
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        let at = if flags != -1 && flags & libc::O_APPEND != 0 { old_len } else { offset };
+        let end = at.saturating_add(data.len() as u64);
+        let holes = hole_bytes(&meta, at, end.min(old_len), seek_in(file));
+        self.room.allow(growth(old_len, at, data.len() as u64).saturating_add(holes))?;
+        Ok(file.write_all_at(data, offset)?)
+    }
+
+    /// A write through a deferred open: the file is put here first (that download isn't the guard's: a separate
+    /// issue), then written as through any open file. Never on a session thread.
+    fn write_deferred(
+        &self,
+        fh: FileHandle,
+        deferred: &Deferred,
+        tid: u32,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), Errno> {
+        let file = self.settle(fh, deferred, tid, false)?;
+        self.write_at(&file, offset, data)
     }
 
     /// Runs `work` on a thread of its own, for a call to the daemon that can take a while: never on a session thread.
@@ -1011,10 +1054,10 @@ fn reply_read(file: &File, offset: u64, size: u32, reply: ReplyData) {
     }
 }
 
-fn reply_write(file: &File, offset: u64, data: &[u8], reply: ReplyWrite) {
-    match file.write_all_at(data, offset) {
-        Ok(()) => reply.written(data.len() as u32),
-        Err(err) => reply.error(err.into()),
+fn reply_write(written: Result<(), Errno>, len: usize, reply: ReplyWrite) {
+    match written {
+        Ok(()) => reply.written(len as u32),
+        Err(errno) => reply.error(errno),
     }
 }
 
@@ -1461,17 +1504,15 @@ impl Filesystem for DriveFs {
         reply: ReplyWrite,
     ) {
         let s = &self.state;
+        // A write that grows a backing file is the guard's to allow (#295); a .trashinfo is held in memory, and never
+        // more than 64 KiB
         match s.handle(fh) {
-            Some(Handle::File(file)) => reply_write(&file, offset, data, reply),
-            Some(Handle::TrashInfo(id)) => match s.trash.write_info(id, offset, data) {
-                Ok(()) => reply.written(data.len() as u32),
-                Err(errno) => reply.error(errno),
-            },
+            Some(Handle::File(file)) => reply_write(s.write_at(&file, offset, data), data.len(), reply),
+            Some(Handle::TrashInfo(id)) => reply_write(s.trash.write_info(id, offset, data), data.len(), reply),
             Some(Handle::Deferred(deferred)) => {
                 let (tid, data) = (req.pid(), data.to_vec());
-                s.on_worker("download", move |s| match s.settle(fh, &deferred, tid, false) {
-                    Ok(file) => reply_write(&file, offset, &data, reply),
-                    Err(errno) => reply.error(errno),
+                s.on_worker("download", move |s| {
+                    reply_write(s.write_deferred(fh, &deferred, tid, offset, &data), data.len(), reply)
                 });
             }
             _ => reply.error(Errno::EBADF),
@@ -1562,13 +1603,10 @@ impl Filesystem for DriveFs {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        let Ok(path) = CString::new(self.state.backing.as_os_str().as_bytes()) else {
-            return reply.error(Errno::EIO);
+        let st = match statvfs(&self.state.backing) {
+            Ok(st) => st,
+            Err(err) => return reply.error(err.into()),
         };
-        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statvfs(path.as_ptr(), &mut st) } != 0 {
-            return reply.error(std::io::Error::last_os_error().into());
-        }
         let local = DiskSize { blocks: st.f_blocks, free: st.f_bfree, available: st.f_bavail, block: st.f_frsize };
         let size = drive_size(local, *lock(&self.state.space));
         reply.statfs(
@@ -1595,9 +1633,9 @@ struct DiskSize {
 }
 
 /// What the drive reports as its size (#181): the Proton account's storage, so that Disk Usage and df show it rather
-/// than the local disk the backing store is on. Anything written through the drive lands in the backing store first
-/// and uploads later, so what is available for writing is never more than the local disk has: a copy Files lets
-/// through on the drive's word must fit. Until the storage is known, the local disk's own numbers.
+/// than the local disk the backing store is on. Free and available are both the account's free space (#295), though
+/// what is written through the drive lands on this computer first: the guard (LocalRoom) keeps its disk from filling.
+/// Until the storage is known, the local disk's own numbers.
 fn drive_size(local: DiskSize, space: Option<Space>) -> DiskSize {
     let Some(space) = space else { return local };
     let block = local.block.max(1);
@@ -1606,8 +1644,169 @@ fn drive_size(local: DiskSize, space: Option<Space>) -> DiskSize {
         blocks: space.max / block,
         // Used (blocks - free) is what the account uses
         free: cloud_free,
-        available: cloud_free.min(local.available),
+        available: cloud_free,
         block,
+    }
+}
+
+/// statvfs(3) on a path.
+fn statvfs(path: &Path) -> std::io::Result<libc::statvfs> {
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
+/// What the system disk keeps free, however much is written through the drive (#295).
+const LOCAL_RESERVE: u64 = 5_000_000_000;
+/// How long a reading of the disk's free space serves the guard, and how much it grants on one reading before it
+/// reads again: never long enough for writes through the drive to overshoot the reserve.
+const ROOM_READING_TTL: Duration = Duration::from_millis(250);
+const ROOM_READING_GRANT: u64 = 1_000_000_000;
+/// How often at most the guard logs a refusal, so an app trying again and again can't fill the log.
+const REFUSAL_LOG_EVERY: Duration = Duration::from_secs(30);
+
+/// How many bytes a file of `old_len` grows by when `len` bytes land at `offset`: only what goes past its end, the
+/// hole before that included.
+fn growth(old_len: u64, offset: u64, len: u64) -> u64 {
+    offset.saturating_add(len).saturating_sub(old_len)
+}
+
+/// How many bytes of `start..end`, inside a file (`meta` is its fstat), are holes: a write there takes room on the
+/// disk though the file doesn't grow (a file sized ahead and filled later, as torrent clients do). A file system
+/// without holes has none. `seek` is lseek(2) on the file (see seek_in), giving the errno when it fails.
+///
+/// A file whose blocks cover its length has no holes, and isn't searched: a big file rewritten in place costs no walk
+/// through its extents (st_blocks counts what isn't written out yet too). A seek that fails other than with ENXIO
+/// counts no holes, so an overwrite in place is never refused.
+fn hole_bytes(meta: &Metadata, start: u64, end: u64, mut seek: impl FnMut(u64, i32) -> Result<u64, i32>) -> u64 {
+    if start >= end || meta.blocks().saturating_mul(512) >= meta.len() {
+        return 0;
+    }
+    let (mut at, mut holes) = (start, 0);
+    while at < end {
+        let hole = match seek(at, libc::SEEK_HOLE) {
+            Ok(hole) => hole,
+            // Past the end: the file was cut shorter meanwhile, and the rest of it grows the file
+            Err(libc::ENXIO) => return holes + (end - at),
+            Err(_) => return holes,
+        };
+        if hole >= end {
+            break;
+        }
+        let data = match seek(hole, libc::SEEK_DATA) {
+            Ok(data) => data.min(end),
+            // No data after it: a hole to the end
+            Err(libc::ENXIO) => end,
+            Err(_) => return holes,
+        };
+        holes += data.saturating_sub(hole);
+        at = data.max(hole + 1);
+    }
+    holes
+}
+
+/// lseek(2) on a file, for hole_bytes. It moves the file's offset, which nothing here reads or writes by.
+fn seek_in(file: &File) -> impl FnMut(u64, i32) -> Result<u64, i32> + '_ {
+    let fd = file.as_raw_fd();
+    move |at, whence| match unsafe { libc::lseek(fd, at as libc::off_t, whence) } {
+        to if to >= 0 => Ok(to as u64),
+        _ => Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)),
+    }
+}
+
+/// The guard that keeps the system disk from filling through the drive (#295). The drive reports Proton's free space,
+/// which may be far more than this computer has, and what apps write lands in the backing store before it uploads. A
+/// change that grows a file is refused with ENOSPC, before anything is written, when it would leave the disk with
+/// less than LOCAL_RESERVE available; one that doesn't grow a file is never refused. So a copy too big for this
+/// computer stops partway.
+struct LocalRoom {
+    /// What the disk has available, in bytes: statvfs on the backing store, or a test's reading
+    read: Box<dyn Fn() -> std::io::Result<u64> + Send + Sync>,
+    /// The last reading, while it is still to be used
+    last: Mutex<Option<RoomReading>>,
+    /// When a refusal was last logged
+    logged: Mutex<Option<Instant>>,
+}
+
+struct RoomReading {
+    at: Instant,
+    available: u64,
+    /// What the guard let files grow by since
+    granted: u64,
+}
+
+impl LocalRoom {
+    fn new(read: impl Fn() -> std::io::Result<u64> + Send + Sync + 'static) -> Self {
+        LocalRoom { read: Box::new(read), last: Mutex::new(None), logged: Mutex::new(None) }
+    }
+
+    /// The guard on the disk the backing store is on.
+    fn of_disk(backing: PathBuf) -> Self {
+        LocalRoom::new(move || statvfs(&backing).map(|st| st.f_bavail.saturating_mul(st.f_frsize)))
+    }
+
+    /// Whether a file may grow by `growth` bytes now; if so, they count against the disk's room until it is read
+    /// again, once the reading is older than ROOM_READING_TTL or more than ROOM_READING_GRANT was granted on it. A
+    /// refusal is logged, though at most once every REFUSAL_LOG_EVERY: the drive shows far more free space than this
+    /// computer has, and the log says why a save failed.
+    fn allow(&self, growth: u64) -> Result<(), Errno> {
+        if growth == 0 {
+            return Ok(());
+        }
+        let refusal = match self.grant(growth) {
+            Ok(()) => return Ok(()),
+            Err(refusal) => refusal,
+        };
+        if self.log_due() {
+            refusal.log();
+        }
+        Err(refusal.errno)
+    }
+
+    /// allow's check, under the reading's lock: a refusal comes with its line, for allow to log once it is let go.
+    fn grant(&self, growth: u64) -> Result<(), Failure> {
+        let mut last = lock(&self.last);
+        let mut reading = match last.take() {
+            Some(r) if r.at.elapsed() <= ROOM_READING_TTL && r.granted <= ROOM_READING_GRANT => r,
+            _ => match (self.read)() {
+                Ok(available) => RoomReading { at: Instant::now(), available, granted: 0 },
+                // No reading is no proof of room: nothing grows until the disk can be read again
+                Err(err) => {
+                    let line = format!(
+                        "protondrive-vfs: couldn't read the system disk's free space, so a write was refused: {err}"
+                    );
+                    return Err(Failure { errno: Errno::EIO, line: Some(line) });
+                }
+            },
+        };
+        let room = reading.available.saturating_sub(reading.granted);
+        let allowed = room.saturating_sub(growth) >= LOCAL_RESERVE;
+        if allowed {
+            reading.granted = reading.granted.saturating_add(growth);
+        }
+        *last = Some(reading);
+        if allowed {
+            return Ok(());
+        }
+        let line = format!(
+            "protondrive-vfs: refused a write that would leave the system disk with less than {} GB free \
+             ({growth} bytes asked, {room} available)",
+            LOCAL_RESERVE / 1_000_000_000
+        );
+        Err(Failure { errno: Errno::ENOSPC, line: Some(line) })
+    }
+
+    /// Whether a refusal's line is due: the first, then one at most every REFUSAL_LOG_EVERY.
+    fn log_due(&self) -> bool {
+        let mut logged = lock(&self.logged);
+        let due = logged.is_none_or(|at| at.elapsed() >= REFUSAL_LOG_EVERY);
+        if due {
+            *logged = Some(Instant::now());
+        }
+        due
     }
 }
 
@@ -1615,30 +1814,251 @@ fn drive_size(local: DiskSize, space: Option<Space>) -> DiskSize {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+    use std::sync::atomic::AtomicUsize;
+
+    const MB: u64 = 1_000_000;
+    const GB: u64 = 1_000_000_000;
 
     #[test]
-    fn the_drive_reports_the_accounts_storage_with_no_more_room_than_the_local_disk() {
-        const GB: u64 = 1_000_000_000;
+    fn the_drive_reports_protons_free_space() {
         let block = 4096;
         // The user's machine: 118.6 GB free of a 1 TB disk, 13.57 GB used of 510 GB in Proton Drive
         let local = DiskSize { blocks: 1000 * GB / block, free: 130 * GB / block, available: 1186 * GB / 10 / block, block };
         let space = Space { used: 1357 * GB / 100, max: 510 * GB };
         let size = drive_size(local, Some(space));
+        assert_eq!(size.blocks, 510 * GB / block);
+        // Free and available are both Proton's, though this computer has less room (#295): the guard keeps the disk
+        let cloud_free = (510 * GB - 1357 * GB / 100) / block;
+        assert_eq!((size.free, size.available), (cloud_free, cloud_free));
         let near = |bytes: u64, want: u64| bytes.abs_diff(want) < block; // to the block, rounded down
-        assert!(near(size.blocks * block, 510 * GB));
         assert!(near((size.blocks - size.free) * block, space.used)); // used: the account's
-        assert_eq!(size.available, local.available); // the local disk has less room than the cloud
-        // Plenty of room here, little left in the cloud: the cloud's
-        let roomy = DiskSize { available: 900 * GB / block, ..local };
-        let nearly_full = Space { used: 509 * GB, max: 510 * GB };
-        assert!(near(drive_size(roomy, Some(nearly_full)).available * block, GB));
         // Over quota: nothing free, never a wrap-around
         let over = drive_size(local, Some(Space { used: 600 * GB, max: 510 * GB }));
         assert_eq!((over.free, over.available), (0, 0));
         // Not known yet: the local disk's numbers as they are
         assert_eq!(drive_size(local, None), local);
     }
-    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn growth_counts_only_bytes_past_the_end() {
+        assert_eq!(growth(100, 0, 50), 0); // an overwrite in place
+        assert_eq!(growth(100, 80, 50), 30);
+        assert_eq!(growth(100, 200, 10), 110); // the hole counts too
+        assert_eq!(growth(100, u64::MAX, 10), u64::MAX - 100); // never a wrap-around
+    }
+
+    /// A guard whose disk has `available` bytes, and the number of times it read them.
+    fn room_of(available: u64) -> (LocalRoom, Arc<AtomicUsize>) {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = reads.clone();
+        let room = LocalRoom::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(available)
+        });
+        (room, reads)
+    }
+
+    #[test]
+    fn the_guard_keeps_five_gb_on_the_system_disk() {
+        let (room, _) = room_of(6 * GB);
+        assert_eq!(room.allow(500 * MB), Ok(()));
+        assert_eq!(room.allow(600 * MB), Err(Errno::ENOSPC)); // it would leave 4.9 GB
+        assert_eq!(room.allow(0), Ok(()));
+        // What it refused isn't counted: exactly 5 GB left is enough
+        assert_eq!(room.allow(500 * MB), Ok(()));
+        assert_eq!(room.allow(1), Err(Errno::ENOSPC));
+        // Already under the reserve: still nothing refused that doesn't grow a file
+        let (low, reads) = room_of(GB);
+        assert_eq!(low.allow(0), Ok(()));
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "no growth, no reading");
+        assert_eq!(low.allow(1), Err(Errno::ENOSPC));
+    }
+
+    #[test]
+    fn a_disk_that_cant_be_read_lets_nothing_grow() {
+        let room = LocalRoom::new(|| Err(std::io::Error::from_raw_os_error(libc::ENOENT)));
+        assert_eq!(room.allow(1), Err(Errno::EIO));
+        assert_eq!(room.allow(0), Ok(()));
+    }
+
+    #[test]
+    fn the_guard_rereads_after_a_while() {
+        let (room, reads) = room_of(100 * GB);
+        assert_eq!(room.allow(MB), Ok(()));
+        assert_eq!(room.allow(MB), Ok(()));
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "two quick writes, one reading");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(room.allow(MB), Ok(()));
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "read again once the reading is old");
+        // More than a GB granted on one reading: read again, however recent it is
+        assert_eq!(room.allow(600 * MB), Ok(()));
+        assert_eq!(room.allow(600 * MB), Ok(()));
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(room.allow(MB), Ok(()));
+        assert_eq!(reads.load(Ordering::SeqCst), 3, "read again after 1.2 GB granted");
+    }
+
+    /// A drive over a temp backing store whose system disk has `available` bytes, and a file there holding "hello".
+    fn guarded_drive(name: &str, available: u64) -> (DriveFs, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("protondrive-vfs-fs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let backing = root.join("backing");
+        std::fs::create_dir_all(&backing).unwrap();
+        std::fs::write(backing.join("a.txt"), b"hello").unwrap();
+        let drive = DriveFs::with_room(backing.clone(), DaemonClient::new(root.join("d.sock")), room_of(available).0);
+        (drive, root, backing.join("a.txt"))
+    }
+
+    #[test]
+    fn the_guard_applies_before_the_quota_is_known() {
+        let (drive, root, path) = guarded_drive("guard-quota", GB);
+        let s = &drive.state;
+        let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        assert!(lock(&s.space).is_none());
+        assert_eq!(s.write_at(&file, 5, b" world"), Err(Errno::ENOSPC));
+        // Proton's free space known, and plenty of it: the system disk's room is what counts all the same
+        *lock(&s.space) = Some(Space { used: 0, max: 510 * GB });
+        assert_eq!(s.write_at(&file, 5, b" world"), Err(Errno::ENOSPC));
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_refused_write_changes_nothing_and_an_overwrite_always_goes_through() {
+        // The system disk is already under the reserve
+        let (drive, root, path) = guarded_drive("guard-safety", GB);
+        let s = &drive.state;
+        let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let cut_to = |size: u64| AttrChange { mode: Some(0o600), size: Some(size), atime: None, mtime: None };
+        // Growth, by a write, a write past the end, or a bigger size: refused before anything is written
+        assert_eq!(s.write_at(&file, 3, b"lo!"), Err(Errno::ENOSPC));
+        assert_eq!(s.write_at(&file, 10 * GB, b"x"), Err(Errno::ENOSPC));
+        let resized = apply_change(Target::File(&file), &cut_to(10 * GB), &s.room);
+        assert_eq!(resized.map_err(|e| e.raw_os_error()), Err(Some(libc::ENOSPC)));
+        let resized = apply_change(Target::Path(&path), &cut_to(6), &s.room);
+        assert_eq!(resized.map_err(|e| e.raw_os_error()), Err(Some(libc::ENOSPC)));
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        assert_ne!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600, "a refused setattr changes nothing");
+        // An append lands at the end whatever offset the kernel sent: growth, though the offset is inside the file
+        let appending = OpenOptions::new().append(true).open(&path).unwrap();
+        assert_eq!(s.write_at(&appending, 0, b"!"), Err(Errno::ENOSPC));
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        // What doesn't grow the file always goes through
+        assert_eq!(s.write_at(&file, 0, b"HELLO"), Ok(()));
+        assert_eq!(s.write_at(&file, 2, b"y"), Ok(()));
+        apply_change(Target::File(&file), &cut_to(5), &s.room).unwrap();
+        apply_change(Target::Path(&path), &cut_to(4), &s.room).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"HEyL");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_write_into_a_hole_counts_as_growth() {
+        // Sized ahead and filled later, as torrent clients do: what lands in a hole takes room on the disk, though
+        // the file doesn't grow
+        let (drive, root, path) = guarded_drive("guard-holes", GB);
+        let s = &drive.state;
+        let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        file.set_len(10 * MB).unwrap(); // "hello", then a hole to 10 MB
+        let holes_in = |start, end| hole_bytes(&file.metadata().unwrap(), start, end, seek_in(&file));
+        assert_eq!(holes_in(0, 5), 0);
+        assert_eq!(holes_in(5 * MB, 5 * MB + 10), 10);
+        let holes = holes_in(0, 10 * MB);
+        assert!((9 * MB..10 * MB).contains(&holes), "{holes} bytes of holes");
+        assert_eq!(s.write_at(&file, 5 * MB, b"x"), Err(Errno::ENOSPC));
+        assert_eq!(s.write_at(&file, 2, b"y"), Ok(())); // its data, in place
+        let content = std::fs::read(&path).unwrap();
+        assert_eq!((&content[..5], content.len() as u64, content[5 * MB as usize]), (&b"heylo"[..], 10 * MB, 0));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_file_with_no_holes_is_never_searched_for_them() {
+        // Rewritten in place (a VM image, say): its blocks cover its length, so no walk through its extents
+        let (drive, root, path) = guarded_drive("guard-allocated", GB);
+        std::fs::write(&path, vec![1u8; MB as usize]).unwrap();
+        let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let seeks = AtomicUsize::new(0);
+        let counted = |at: u64, whence: i32| {
+            seeks.fetch_add(1, Ordering::SeqCst);
+            seek_in(&file)(at, whence)
+        };
+        assert_eq!(hole_bytes(&file.metadata().unwrap(), 0, MB, counted), 0);
+        assert_eq!(seeks.load(Ordering::SeqCst), 0, "searched for holes");
+        // Never refused, with the disk under the reserve
+        assert_eq!(drive.state.write_at(&file, MB / 2, &[2u8; 4096]), Ok(()));
+        // With a hole, it is searched
+        file.set_len(10 * MB).unwrap();
+        assert!(hole_bytes(&file.metadata().unwrap(), 0, 10 * MB, counted) > 0);
+        assert!(seeks.load(Ordering::SeqCst) > 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_enxio_means_holes_when_a_seek_fails() {
+        // A file with a hole, so it is searched; the seeks are the test's
+        let (_drive, root, path) = guarded_drive("guard-seek", GB);
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(10 * MB).unwrap();
+        let meta = file.metadata().unwrap();
+        let hole_then = |data: Result<u64, i32>| {
+            move |at: u64, whence: i32| if whence == libc::SEEK_HOLE { Ok(at + 10) } else { data }
+        };
+        // Not to be told: no holes, so an overwrite in place is never refused
+        assert_eq!(hole_bytes(&meta, 0, MB, |_, _| Err(libc::EINVAL)), 0);
+        assert_eq!(hole_bytes(&meta, 0, MB, hole_then(Err(libc::EIO))), 0);
+        // Cut shorter meanwhile (SEEK_HOLE past the end): the rest of it grows the file
+        assert_eq!(hole_bytes(&meta, 0, MB, |_, _| Err(libc::ENXIO)), MB);
+        // No data after the hole: a hole to the end
+        assert_eq!(hole_bytes(&meta, 0, MB, hole_then(Err(libc::ENXIO))), MB - 10);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_refusal_is_logged_at_most_every_30_seconds() {
+        let (room, _) = room_of(6 * GB);
+        assert_eq!(room.allow(500 * MB), Ok(()));
+        assert!(lock(&room.logged).is_none(), "nothing refused, nothing logged");
+        assert_eq!(room.allow(2 * GB), Err(Errno::ENOSPC));
+        let first = lock(&room.logged).expect("the first refusal is logged");
+        assert_eq!(room.allow(2 * GB), Err(Errno::ENOSPC));
+        assert_eq!(*lock(&room.logged), Some(first), "the next one, so soon after, isn't");
+        // 30 s on, one is again
+        if let Some(earlier) = first.checked_sub(Duration::from_secs(31)) {
+            *lock(&room.logged) = Some(earlier);
+            assert_eq!(room.allow(2 * GB), Err(Errno::ENOSPC));
+            assert!(lock(&room.logged).is_some_and(|at| at > earlier));
+        }
+        // A disk that can't be read: refused and logged the same way
+        let unreadable = LocalRoom::new(|| Err(std::io::Error::from_raw_os_error(libc::EIO)));
+        assert_eq!(unreadable.allow(1), Err(Errno::EIO));
+        assert!(lock(&unreadable.logged).is_some());
+    }
+
+    #[test]
+    fn a_write_through_a_deferred_open_is_guarded_once_the_file_is_here() {
+        let backing = std::env::temp_dir()
+            .join(format!("protondrive-vfs-fs-guard-deferred-{}", std::process::id()))
+            .join("backing");
+        // The system disk is under the reserve; the daemon downloads a file by writing it into the backing store
+        let g = scripted("guard-deferred", Some(room_of(GB).0), move |line, body| {
+            if line.starts_with("POST /vfs/hydrate") {
+                let _ = std::fs::write(backing.join(body["path"].as_str().unwrap_or("x")), b"downloaded");
+                return (200, r#"{"ok":true}"#.into());
+            }
+            (200, r#"{"entries":[]}"#.into())
+        });
+        let s = &g.drive.state;
+        let (ino, state) = (s.ino_of(Path::new("a.txt")), Mutex::new(Settling::Pending));
+        let deferred = Deferred { ino, flags: libc::O_WRONLY, state, settled: Condvar::new() };
+        let in_store = || std::fs::read(g.root.join("backing/a.txt")).unwrap();
+        // Downloaded (not the guard's), then refused past its end with nothing written
+        assert_eq!(s.write_deferred(FileHandle(0), &deferred, 0, 10, b"!"), Err(Errno::ENOSPC));
+        assert_eq!(in_store(), b"downloaded");
+        // Overwritten in place, through the file it settled on
+        assert_eq!(s.write_deferred(FileHandle(0), &deferred, 0, 0, b"D"), Ok(()));
+        assert_eq!(in_store(), b"Downloaded");
+    }
 
     #[test]
     fn a_blocked_app_is_refused_quietly_and_nothing_else_is() {
@@ -1900,6 +2320,7 @@ mod tests {
     // A daemon on a temp socket answering each request with `answer` (the request line and the JSON body)
     fn scripted(
         name: &str,
+        room: Option<LocalRoom>,
         answer: impl Fn(&str, &serde_json::Value) -> (u16, String) + Send + Sync + 'static,
     ) -> Gated {
         let root = std::env::temp_dir().join(format!("protondrive-vfs-fs-{name}-{}", std::process::id()));
@@ -1939,7 +2360,11 @@ mod tests {
         });
         let gate = Arc::new((Mutex::new(true), Condvar::new()));
         let none = || Arc::new(AtomicUsize::new(0));
-        let drive = DriveFs::new(root.join("backing"), DaemonClient::new(socket));
+        let (backing, daemon) = (root.join("backing"), DaemonClient::new(socket));
+        let drive = match room {
+            Some(room) => DriveFs::with_room(backing, daemon, room),
+            None => DriveFs::new(backing, daemon),
+        };
         Gated { drive, root, listings: none(), downloads: none(), gate }
     }
 
@@ -1951,7 +2376,7 @@ mod tests {
         let seen = calls.clone();
         let root = std::env::temp_dir().join(format!("protondrive-vfs-fs-exdev-{}", std::process::id()));
         let backing = root.join("backing");
-        let g = scripted("exdev", move |line, body| {
+        let g = scripted("exdev", None, move |line, body| {
             seen.lock().unwrap().push(line.split(' ').nth(1).unwrap_or("").to_string());
             if line.starts_with("GET /vfs/children") {
                 return (200, r#"{"entries":[]}"#.into());
