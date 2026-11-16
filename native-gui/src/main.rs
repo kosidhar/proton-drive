@@ -3773,19 +3773,12 @@ const ICON_BUTTON_SIZE: f32 = 28.0;
 /// An icon-only button, 28×28, with no fill until hovered. `label`, what a button with words would have said, is its
 /// tooltip and its name for screen readers.
 fn icon_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
-    icon_button_drawn(ui, icon, label, TEXT_PRIMARY())
+    icon_button_colored(ui, icon, label, TEXT_PRIMARY())
 }
 
 /// `icon_button` with its icon in `color`: a list row's actions, weak until their row is hovered.
 fn icon_button_colored(ui: &mut egui::Ui, icon: &str, label: &str, color: Color32) -> egui::Response {
-    icon_button_drawn(ui, icon, label, color)
-}
-
-/// An icon-only push button: it says only its name to screen readers.
-fn icon_button_drawn(ui: &mut egui::Ui, icon: &str, label: &str, color: Color32) -> egui::Response {
     let (rect, resp) = button_shell(ui, Vec2::splat(ICON_BUTTON_SIZE), label, Color32::TRANSPARENT, BG_CARD_ALT(), None);
-    let enabled = ui.is_enabled();
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, icons::font(BUTTON_ICON_SIZE), color);
     // With no words of its own, it says what it is even while it waits (greyed out)
     resp.on_hover_text(label).on_disabled_hover_text(label)
@@ -7568,17 +7561,17 @@ mod tests {
         let mut h = Harness::new();
         let open = sidebar_node(&h, "Home").toggled();
         assert_eq!(open, Some(Toggled::True), "Home is open");
-        assert_ne!(sidebar_node(&h, "Settings").toggled(), open, "Settings is not");
+        assert_eq!(sidebar_node(&h, "Settings").toggled(), Some(Toggled::False), "Settings is not");
         let at = in_sidebar(&h);
         h.click(at);
         assert_eq!(h.app.tab, NavTab::Settings);
         let at = in_sidebar(&h);
         assert_eq!(h.fill_under(at), Some(SIDEBAR_SELECTED()));
         assert_eq!(sidebar_node(&h, "Settings").toggled(), open, "it says it is open, as Home did");
-        assert_ne!(sidebar_node(&h, "Home").toggled(), open, "and Home says it isn't");
+        assert_eq!(sidebar_node(&h, "Home").toggled(), Some(Toggled::False), "and Home says it isn't");
         h.click(h.text_at("Home").unwrap());
         assert_eq!(h.app.tab, NavTab::Home);
-        assert_ne!(sidebar_node(&h, "Settings").toggled(), open, "closed again");
+        assert_eq!(sidebar_node(&h, "Settings").toggled(), Some(Toggled::False), "closed again");
         // Under a dialog, it opens nothing
         h.app.pending_confirm = Some(PendingConfirm::StartFresh);
         h.frames(2);
@@ -7727,11 +7720,11 @@ mod tests {
         let text = chrome::storage_meter_text(h.app.status.account.as_ref()).unwrap();
         let rect = |label: &str| h.text_rect(label).unwrap_or_else(|| panic!("{label} is painted"));
         let sidebar_open = h.text_rects_all(chrome::OPEN_IN_FILES).into_iter().find(|r| r.center().x < SIDEBAR_EDGE).expect("the sidebar's");
-        let (name, open, home, activity, meter) =
-            (rect("Proton Drive"), sidebar_open, rect("Home"), rect("Activity"), rect(&text));
+        let settings = h.text_rects_all("Settings").into_iter().find(|r| r.center().x < SIDEBAR_EDGE).expect("the sidebar's Settings");
+        let (name, open, home, meter) = (rect("Proton Drive"), sidebar_open, rect("Home"), rect(&text));
         assert!(name.bottom() < open.top(), "the logo {name:?} is above Open in Files {open:?}");
         assert!(open.bottom() < home.top(), "Open in Files {open:?} is above Home {home:?}");
-        assert!(activity.bottom() < meter.top(), "Activity {activity:?} is above the meter {meter:?}");
+        assert!(settings.bottom() < meter.top(), "Settings {settings:?}, the last section, is above the meter {meter:?}");
         assert!(meter.bottom() <= h.screen.y, "the meter {meter:?} is inside the window {:?}", h.screen);
         assert!(rect(env!("CARGO_PKG_VERSION")).right() <= SIDEBAR_EDGE, "the version stays in the sidebar");
     }
@@ -7953,6 +7946,13 @@ mod tests {
         h.text_at_all(text).into_iter().filter(|p| p.x > SIDEBAR_EDGE && p.y < chrome::TOP_BAR_HEIGHT).collect()
     }
 
+    /// Whether the title `text`, painted right of the sidebar (not the sidebar's own row of that name), is in bold.
+    fn title_is_bold(h: &Harness, text: &str) -> bool {
+        let shown = h.texts(|t| t.galley.text() == text && t.visual_bounding_rect().left() > SIDEBAR_EDGE);
+        assert_eq!(shown.len(), 1, "{text:?} is titled once");
+        shown[0].galley.job.sections.iter().all(|s| s.format.font_id.family == FontFamily::Name(BOLD_FAMILY.into()))
+    }
+
     #[test]
     fn the_top_bar_titles_each_section_once() {
         let mut h = Harness::new();
@@ -7965,10 +7965,7 @@ mod tests {
             assert!(shown[0].y < chrome::TOP_BAR_HEIGHT, "{tab:?}: in the top bar, at {:?}", shown[0]);
         }
         // In bold: the title right of the sidebar, not the sidebar's own row
-        let title = h.texts(|t| t.galley.text() == "Settings" && t.visual_bounding_rect().left() > SIDEBAR_EDGE);
-        assert_eq!(title.len(), 1);
-        let family = FontFamily::Name(BOLD_FAMILY.into());
-        assert!(title[0].galley.job.sections.iter().all(|s| s.format.font_id.family == family), "the title is bold");
+        assert!(title_is_bold(&h, "Settings"), "the title is bold");
     }
 
     #[test]
@@ -7981,13 +7978,7 @@ mod tests {
         h.frames(3);
         let title = in_top_bar(&h, "Settings");
         assert_eq!(title.len(), 1, "the title, once: {title:?}");
-        let family = FontFamily::Name(BOLD_FAMILY.into());
-        let bold_titles = h.texts(|t| {
-            t.galley.text() == "Settings"
-                && t.visual_bounding_rect().left() > SIDEBAR_EDGE
-                && t.galley.job.sections.iter().all(|s| s.format.font_id.family == family)
-        });
-        assert_eq!(bold_titles.len(), 1, "in bold");
+        assert!(title_is_bold(&h, "Settings"), "in bold");
         let in_bar = h.widgets_at_all("Settings").into_iter().filter(|p| p.x > SIDEBAR_EDGE && p.y < chrome::TOP_BAR_HEIGHT);
         assert_eq!(in_bar.count(), 0, "no widget named Settings in the top bar");
     }
