@@ -2927,63 +2927,43 @@ impl ProtonDriveNativeApp {
                     }
                     self.render_hidden_card(ui);
                     ui.add_space(14.0);
+                    self.render_appearance_card(ui);
+                    ui.add_space(14.0);
+                    // Last, with Save Preferences at its foot: the settings that wait for it
                     self.render_sync_settings_card(ui);
                 });
             });
     }
 
-    /// The drive: where it is, and the virtual drive switch. Its state, Mount again and a move that stopped are Home's.
+    /// The drive: where it is, and the virtual drive switch, which acts at once. Its state, Mount again and a move that
+    /// stopped are Home's.
     fn render_drive_card(&mut self, ui: &mut egui::Ui, vfs: &VfsStatus) {
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.label(RichText::new("Drive").size(16.0).strong().color(TEXT_PRIMARY()));
-            ui.add_space(12.0);
+            settings::card_heading(ui, "Drive", None, None);
+            ui.add_space(10.0);
 
-            ui.label(RichText::new("Location").size(13.0).color(TEXT_MUTED()));
-            ui.add_space(4.0);
             let sync_dir = &self.status.sync_dir;
             let shown = if sync_dir.is_empty() { "Not set up yet".to_string() } else { shown_folder(sync_dir) };
-            ui.add(egui::Label::new(RichText::new(&shown).size(14.0).strong().color(TEXT_PRIMARY())).truncate())
-                .on_hover_text(sync_dir);
-            ui.label(RichText::new(home::drive_kind(Some(vfs))).size(12.5).color(TEXT_MUTED()));
-            ui.add_space(14.0);
-            ui.separator();
-            ui.add_space(12.0);
+            settings::setting_row(ui, "Location", Some(home::drive_kind(Some(vfs))), None, |ui| {
+                ui.add(egui::Label::new(RichText::new(&shown).size(13.5).color(TEXT_PRIMARY())).truncate())
+                    .on_hover_text(sync_dir);
+            });
+            ui.add_space(settings::ROW_GAP);
 
             // On is what the user chose (the daemon's virtualDriveWanted); without FUSE the drive is a plain folder anyway
             let on = self.status.virtual_drive_wanted.unwrap_or(vfs.mode == "virtual");
             let clicked = ui
                 .add_enabled_ui(!self.drive_working && switch_wait_reason(vfs).is_none(), |ui| {
-                    ui.horizontal(|ui| {
-                        let switch = toggle_switch(ui, on);
-                        ui.add_space(4.0);
-                        let label = ui.add(
-                            egui::Label::new(
-                                RichText::new("Show online-only files in Files (virtual drive)")
-                                    .size(13.5)
-                                    .color(TEXT_PRIMARY()),
-                            )
-                            .sense(Sense::click()),
-                        );
-                        if label.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                        switch.clicked() || label.clicked()
-                    })
-                    .inner
+                    settings::switch_row(
+                        ui,
+                        "Show online-only files in Files (virtual drive)",
+                        None,
+                        Some("Files you haven't downloaded appear in Files and download when you open them."),
+                        on,
+                    )
                 })
                 .inner;
-            ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(
-                    RichText::new(
-                        "Files you haven't downloaded appear in Files and download when you open them.",
-                    )
-                    .size(12.0)
-                    .color(TEXT_MUTED()),
-                )
-                .wrap(),
-            );
             // Why the drive is a plain folder although the switch is on (switched off is the user's own choice)
             if on && matches!(vfs.reason.as_deref(), Some("fuse-unavailable" | "different-disk")) {
                 ui.add_space(6.0);
@@ -3086,39 +3066,29 @@ impl ProtonDriveNativeApp {
         let mut asked: Option<Result<Vec<String>, String>> = None;
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.label(RichText::new("Apps blocked from downloading").size(16.0).strong().color(TEXT_PRIMARY()));
-            ui.add_space(6.0);
-            ui.add(
-                egui::Label::new(
-                    RichText::new("These apps can't download online-only files. Files they already have on this computer still open.")
-                        .size(12.5)
-                        .color(TEXT_MUTED()),
-                )
-                .wrap(),
+            settings::card_heading(
+                ui,
+                "Apps blocked from downloading",
+                None,
+                Some("These apps can't download online-only files. Files they already have on this computer still open."),
             );
-            ui.add_space(12.0);
+            ui.add_space(10.0);
+            // Each change goes at once
             ui.add_enabled_ui(!self.blocklist_working, |ui| {
                 if apps.is_empty() {
                     ui.label(RichText::new("No apps are blocked.").size(13.0).color(TEXT_MUTED()));
                 }
                 for app in &apps {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(app).size(13.5).monospace().color(TEXT_PRIMARY()));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let size = Vec2::new(button_width(ui, "Unblock"), 28.0);
-                            let stroke = Some(Stroke::new(1.0_f32, BORDER_SUBTLE()));
-                            if proton_button(ui, size, "Unblock", BG_CARD_ALT(), btn_secondary_hover_bg(), stroke, TEXT_PRIMARY(), 12.5)
-                                .clicked()
-                            {
-                                asked = Some(Ok(without_blocked_app(&apps, app)));
-                            }
-                        });
+                    settings::setting_row(ui, app, None, None, |ui| {
+                        if home::secondary_button(ui, "Unblock", 30.0).clicked() {
+                            asked = Some(Ok(without_blocked_app(&apps, app)));
+                        }
                     });
-                    ui.add_space(4.0);
+                    ui.add_space(settings::ROW_GAP);
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    let button_w = button_width(ui, "Block");
+                    let button_w = action_button_width(ui, None, "Block");
                     let input_w = (ui.available_width() - button_w - 6.0 - ui.spacing().item_spacing.x).clamp(120.0, 320.0);
                     let field = ui.add_sized(
                         [input_w, 32.0],
@@ -3128,8 +3098,7 @@ impl ProtonDriveNativeApp {
                     );
                     let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.add_space(6.0);
-                    let clicked = proton_button(ui, Vec2::new(button_w, 32.0), "Block", PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE, 13.0)
-                        .clicked();
+                    let clicked = home::primary_button(ui, "Block", 32.0).clicked();
                     if (clicked || entered) && !self.block_app_input.trim().is_empty() {
                         asked = Some(with_blocked_app(&apps, &self.block_app_input));
                     }
@@ -3187,211 +3156,96 @@ impl ProtonDriveNativeApp {
         self.settings_notice = None;
     }
 
+    /// Synchronization: the settings that wait for Save Preferences, at the card's foot (the sync folder, the conflict
+    /// choice, notifications, start at login and the ignore patterns), and only those.
     fn render_sync_settings_card(&mut self, ui: &mut egui::Ui) {
+        let mut browse = false;
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.label(
-                RichText::new("Synchronization Settings")
-                    .size(16.0)
-                    .strong()
-                    .color(TEXT_PRIMARY()),
-            );
-            ui.add_space(16.0);
+            settings::card_heading(ui, "Synchronization Settings", Some("These apply when you save"), None);
+            ui.add_space(10.0);
 
-            ui.label(RichText::new("Local Sync Folder").size(13.0).color(TEXT_MUTED()));
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                // The row is the field, a 6 px gap and the 92 px button, with item spacing after the field
-                let input_w = (ui.available_width() - 6.0 - 92.0 - ui.spacing().item_spacing.x).max(240.0);
-                if ui
-                    .add_sized(
-                        [input_w, 34.0],
-                        egui::TextEdit::singleline(&mut self.edit_sync_dir)
-                            .vertical_align(Align::Center),
-                    )
-                    .changed()
-                {
-                    self.mark_settings_edited();
-                }
-                ui.add_space(6.0);
-                if proton_button(
-                    ui,
-                    Vec2::new(92.0, 34.0),
-                    "Browse...",
-                    BG_CARD_ALT(),
-                    btn_secondary_hover_bg(),
-                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                    TEXT_PRIMARY(),
-                    12.5,
-                )
-                .clicked()
-                {
-                    if let Ok(out) = Command::new("zenity")
-                        .args([
-                            "--file-selection",
-                            "--directory",
-                            "--title=Choose Proton Drive Local Sync Folder",
-                        ])
-                        .output()
-                    {
-                        if out.status.success() {
-                            let chosen = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                            if !chosen.is_empty() && chosen != self.edit_sync_dir {
-                                self.edit_sync_dir = chosen;
-                                self.mark_settings_edited();
-                            }
+            settings::setting_row(
+                ui,
+                "Local Sync Folder",
+                None,
+                Some("Changing the sync location safely moves your existing synced files to the new folder, switches the real-time file watcher, and preserves all cloud files without re-uploading or deleting them."),
+                |ui| {
+                    // The field and Browse... as one group, the field taking the room Browse... leaves
+                    let browse_w = action_button_width(ui, None, "Browse...");
+                    let gap = 6.0 + ui.spacing().item_spacing.x;
+                    let field_w = (ui.available_width() - browse_w - gap).clamp(0.0, settings::WIDE_CONTROL);
+                    let group = Vec2::new(field_w + gap + browse_w, 32.0);
+                    ui.allocate_ui_with_layout(group, Layout::left_to_right(Align::Center), |ui| {
+                        let field = egui::TextEdit::singleline(&mut self.edit_sync_dir).vertical_align(Align::Center);
+                        if ui.add_sized([field_w, 32.0], field).changed() {
+                            self.mark_settings_edited();
                         }
-                    }
-                }
-            });
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(
-                    "Changing the sync location safely moves your existing synced files to the new folder, switches the real-time file watcher, and preserves all cloud files without re-uploading or deleting them.",
-                )
-                .size(11.5)
-                .color(TEXT_MUTED()),
+                        ui.add_space(6.0);
+                        browse = action_button(ui, ButtonKind::Secondary, None, "Browse...", 32.0).clicked();
+                    });
+                },
             );
+            ui.add_space(settings::ROW_GAP);
 
-            ui.add_space(16.0);
-            ui.label(
-                RichText::new("Appearance Theme")
-                    .size(13.0)
-                    .color(TEXT_MUTED()),
-            );
-            ui.add_space(6.0);
-            egui::ComboBox::from_id_salt("appearance_theme_combo")
-                .selected_text(match self.window_geometry.theme_mode.as_str() {
-                    "light" => "Light (Proton Snow)",
-                    "dark" => "Dark (Proton Carbon)",
-                    _ => "Follow Ubuntu System Theme",
-                })
-                .width(360.0)
-                .show_ui(ui, |ui| {
-                    for (val, text) in [
-                        ("system", "Follow Ubuntu System Theme"),
-                        ("light", "Light (Proton Snow)"),
-                        ("dark", "Dark (Proton Carbon)"),
-                    ] {
-                        if ui
-                            .selectable_value(
-                                &mut self.window_geometry.theme_mode,
-                                val.to_string(),
-                                text,
-                            )
-                            .changed()
-                        {
-                            save_window_geometry(&self.window_geometry);
-                        }
-                    }
-                });
-
-            ui.add_space(16.0);
-            ui.label(
-                RichText::new("Conflict Resolution Strategy")
-                    .size(13.0)
-                    .color(TEXT_MUTED()),
-            );
-            ui.add_space(6.0);
-            egui::ComboBox::from_id_salt("conflict_strategy_combo")
+            settings::setting_row(ui, "Conflict Resolution Strategy", None, None, |ui| {
                 // Both versions are always kept (#91): at once, or once the user chose in Home's Needs attention
-                .selected_text(match self.edit_conflict_strategy.as_str() {
-                    "prompt" => "Ask me each time (in Home's Needs attention)",
-                    _ => "Keep Both (Save conflict copy with timestamp)",
-                })
-                .width(360.0)
-                .show_ui(ui, |ui| {
-                    for (val, text) in [
-                        ("keep-both", "Keep Both (Save conflict copy with timestamp)"),
-                        ("prompt", "Ask me each time (in Home's Needs attention)"),
-                    ] {
-                        if ui
-                            .selectable_value(
-                                &mut self.edit_conflict_strategy,
-                                val.to_string(),
-                                text,
-                            )
-                            .changed()
-                        {
+                let choices = [
+                    ("keep-both", "Keep Both (Save conflict copy with timestamp)"),
+                    ("prompt", "Ask me each time (in Home's Needs attention)"),
+                ];
+                let shown = if self.edit_conflict_strategy == "prompt" { choices[1].1 } else { choices[0].1 };
+                let width = ui.available_width().min(settings::WIDE_CONTROL);
+                settings::picker(ui, "conflict_strategy_combo", shown, width, |ui| {
+                    for (val, text) in choices {
+                        if ui.selectable_value(&mut self.edit_conflict_strategy, val.to_string(), text).changed() {
                             self.mark_settings_edited();
                         }
                     }
                 });
+            });
+            ui.add_space(settings::ROW_GAP);
 
-            ui.add_space(16.0);
-            if ui
-                .checkbox(
-                    &mut self.edit_notifications,
-                    RichText::new("Enable Ubuntu desktop notifications")
-                        .size(13.5)
-                        .color(TEXT_PRIMARY()),
-                )
-                .changed()
-            {
+            if settings::switch_row(ui, "Enable Ubuntu desktop notifications", None, None, self.edit_notifications) {
+                self.edit_notifications = !self.edit_notifications;
                 self.mark_settings_edited();
             }
+            ui.add_space(settings::ROW_GAP);
 
-            ui.add_space(10.0);
-            if ui
-                .checkbox(
-                    &mut self.edit_start_at_login,
-                    RichText::new("Start Proton Drive when I log in")
-                        .size(13.5)
-                        .color(TEXT_PRIMARY()),
-                )
-                .on_hover_text("Syncs and mounts the drive at login, with the tray icon, without opening this window")
-                .changed()
-            {
+            if settings::switch_row(
+                ui,
+                "Start Proton Drive when I log in",
+                None,
+                Some("Syncs and mounts the drive at login, with the tray icon, without opening this window"),
+                self.edit_start_at_login,
+            ) {
+                self.edit_start_at_login = !self.edit_start_at_login;
                 self.mark_settings_edited();
             }
+            ui.add_space(settings::ROW_GAP);
 
-            ui.add_space(20.0);
-            ui.separator();
-            ui.add_space(16.0);
-
-            ui.label(
-                RichText::new("Ignore Patterns (Glob)")
-                    .size(14.5)
-                    .strong()
-                    .color(TEXT_PRIMARY()),
-            );
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(
-                    "One glob pattern per line. Matching files or folders (e.g. .git, node_modules, *.part) are skipped during two-way sync.",
-                )
-                .size(12.0)
-                .color(TEXT_MUTED()),
-            );
-            ui.add_space(8.0);
-            if ui
-                .add(
-                    egui::TextEdit::multiline(&mut self.ignore_patterns_text)
+            settings::setting_row(
+                ui,
+                "Ignore Patterns (Glob)",
+                Some("One glob pattern per line."),
+                Some("Matching files or folders (e.g. .git, node_modules, *.part) are skipped during two-way sync."),
+                |ui| {
+                    let margin = Margin::symmetric(6, 4);
+                    let editor = egui::TextEdit::multiline(&mut self.ignore_patterns_text)
                         .desired_rows(8)
-                        .desired_width(f32::INFINITY)
-                        .font(FontId::new(13.0, FontFamily::Monospace)),
-                )
-                .changed()
-            {
-                self.mark_settings_edited();
-            }
+                        .margin(margin)
+                        .desired_width(ui.available_width().min(settings::WIDE_CONTROL) - margin.sum().x)
+                        .font(FontId::new(13.0, FontFamily::Monospace));
+                    if ui.add(editor).changed() {
+                        self.mark_settings_edited();
+                    }
+                },
+            );
 
             ui.add_space(18.0);
             let label = if self.settings_saving { "Saving…" } else { "Save Preferences" };
             let clicked = ui
-                .add_enabled_ui(!self.settings_saving, |ui| {
-                    proton_button(
-                        ui,
-                        Vec2::new(156.0, 36.0),
-                        label,
-                        PROTON_PURPLE,
-                        PROTON_PURPLE_HOVER,
-                        None,
-                        Color32::WHITE,
-                        13.5,
-                    )
-                    .clicked()
-                })
+                .add_enabled_ui(!self.settings_saving, |ui| action_button(ui, ButtonKind::Primary, None, label, 36.0).clicked())
                 .inner;
             if clicked {
                 self.save_preferences();
@@ -3402,6 +3256,26 @@ impl ProtonDriveNativeApp {
                 ui.add(egui::Label::new(RichText::new(&notice.text).size(12.5).color(color)).wrap());
             }
         });
+        if browse {
+            self.browse_for_sync_folder();
+        }
+    }
+
+    /// Browse...: the folder picker (zenity); a folder chosen goes in the field, to be saved with Save Preferences.
+    fn browse_for_sync_folder(&mut self) {
+        let Ok(out) = Command::new("zenity")
+            .args(["--file-selection", "--directory", "--title=Choose Proton Drive Local Sync Folder"])
+            .output()
+        else {
+            return;
+        };
+        if out.status.success() {
+            let chosen = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !chosen.is_empty() && chosen != self.edit_sync_dir {
+                self.edit_sync_dir = chosen;
+                self.mark_settings_edited();
+            }
+        }
     }
 }
 
@@ -6483,15 +6357,15 @@ mod tests {
         let mut h = Harness::settings(None, None);
         h.app.status.logged_in = true;
         h.frames(2);
-        h.click(h.text_at("Open Proton Drive Trash").expect("the trash is offered in Settings"));
+        h.click(h.text_at("Trash").expect("the trash is offered in Settings"));
         assert_eq!(launched(), vec!["https://drive.proton.me/trash".to_string()]);
-        h.click(h.text_at("Open Proton Drive on the web").expect("Proton Drive on the web is offered"));
+        h.click(h.text_at("Web").expect("Proton Drive on the web is offered"));
         assert_eq!(launched(), vec!["https://drive.proton.me".to_string()]);
         // Signed out, Sign in is the one thing to do
         h.app.status.logged_in = false;
         h.frames(2);
-        assert!(h.text_at("Open Proton Drive Trash").is_none());
-        assert!(h.text_at("Open Proton Drive on the web").is_none());
+        assert!(h.text_at("Trash").is_none());
+        assert!(h.text_at("Web").is_none());
 
         // A screenshot opens nothing, from the same buttons
         home::AS_SCREENSHOT.with(|s| s.set(true));
@@ -6506,7 +6380,6 @@ mod tests {
     fn home_offers_trash_with_its_old_hover() {
         let mut h = home_with(|s| s.sync_dir = "/srv/u/ProtonDrive".into());
         let label = h.text_at("Trash").expect("Home offers Trash");
-        assert!(h.text_at("Open Proton Drive Trash").is_none(), "the long name is Settings'");
         let glyph = h.text_at(icons::TRASH).expect("the trash icon is painted");
         assert!(glyph.x < label.x && (glyph.y - label.y).abs() < 4.0, "the icon {glyph:?} is before the label {label:?}");
         tooltips_at_once(&h);
@@ -8560,6 +8433,175 @@ mod tests {
         assert_eq!(h.app.edit_conflict_strategy, "prompt");
         assert!(h.app.settings_dirty && !h.app.settings_saving);
         assert_eq!(h.app.settings_notice, Some(Notice::error("conflictStrategy must be one of keep-both")));
+    }
+
+    // #276: Settings in Proton's rows. The ⓘ painted right after `label`, on its line.
+    fn info_after(h: &Harness, label: &str) -> egui::Pos2 {
+        let label = h.text_rect(label).unwrap_or_else(|| panic!("{label:?} is painted"));
+        h.text_at_all(icons::INFO)
+            .into_iter()
+            .find(|p| p.x > label.right() && p.x < label.right() + 40.0 && (p.y - label.center().y).abs() < 6.0)
+            .unwrap_or_else(|| panic!("an ⓘ right after {label:?}"))
+    }
+
+    /// Settings with every card painted at once (a window tall enough), tooltips at once.
+    fn settings_tall(vfs_status: Option<VfsStatus>, wanted: Option<bool>) -> Harness {
+        let mut h = Harness::settings(vfs_status, wanted);
+        h.resize_zoomed(Vec2::new(1440.0, 2400.0), 1.0);
+        tooltips_at_once(&h);
+        h
+    }
+
+    #[test]
+    fn the_theme_picker_reads_follow_the_system_light_dark() {
+        let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        let painted = |h: &Harness, word: &str| !h.texts(|t| t.galley.text().contains(word)).is_empty();
+        h.click(h.text_at("Follow the system").expect("the picker shows the theme in use"));
+        for choice in ["Follow the system", "Light", "Dark"] {
+            assert!(h.text_at(choice).is_some(), "the picker offers {choice:?}");
+        }
+        for old in ["Snow", "Carbon", "Ubuntu System Theme"] {
+            assert!(!painted(&h, old), "{old:?} is painted");
+        }
+        // A choice is taken at once, as before (and saved, which tests never do: see ui_prefs_path)
+        h.click(h.text_at_all("Dark").into_iter().last().unwrap());
+        assert_eq!(h.app.window_geometry.theme_mode, "dark");
+        assert!(h.text_at("Dark").is_some(), "the picker reads the choice");
+        assert_eq!(h.sent(), Vec::<String>::new(), "nothing for the daemon");
+        h.app.window_geometry.theme_mode = "light".into();
+        h.frames(2);
+        assert!(h.text_at("Light").is_some());
+        assert!(!painted(&h, "Snow") && !painted(&h, "Carbon"));
+    }
+
+    #[test]
+    fn the_virtual_drive_explanation_is_behind_info() {
+        const EXPLAINED: &str = "Files you haven't downloaded appear in Files and download when you open them.";
+        let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        assert!(h.text_at(EXPLAINED).is_none(), "not painted until its ⓘ is hovered");
+        let info = info_after(&h, SWITCH);
+        hover(&mut h, info);
+        assert!(h.text_at(EXPLAINED).is_some(), "hovering the ⓘ shows it");
+        // While the switch waits (the drive moving files), the ⓘ still explains
+        let mut h = settings_tall(Some(vfs("virtual", false, Some("moving"))), Some(true));
+        let info = info_after(&h, SWITCH);
+        hover(&mut h, info);
+        assert!(h.text_at(EXPLAINED).is_some(), "the greyed-out row's ⓘ shows it too");
+    }
+
+    #[test]
+    fn the_other_long_explanations_are_behind_info_too() {
+        let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        for (label, explained) in [
+            (
+                "Apps blocked from downloading",
+                "These apps can't download online-only files. Files they already have on this computer still open.",
+            ),
+            (
+                "Hidden from this computer",
+                "Hidden items stay in Proton Drive, but aren't kept on this computer or shown in Files. To hide something, right-click it in Files.",
+            ),
+            (
+                "Local Sync Folder",
+                "Changing the sync location safely moves your existing synced files to the new folder, switches the real-time file watcher, and preserves all cloud files without re-uploading or deleting them.",
+            ),
+            ("Start Proton Drive when I log in", "Syncs and mounts the drive at login, with the tray icon, without opening this window"),
+            (
+                "Ignore Patterns (Glob)",
+                "Matching files or folders (e.g. .git, node_modules, *.part) are skipped during two-way sync.",
+            ),
+        ] {
+            assert!(h.text_at(explained).is_none(), "{label}: not painted until its ⓘ is hovered");
+            let info = info_after(&h, label);
+            hover(&mut h, info);
+            assert!(h.text_at(explained).is_some(), "{label}: hovering its ⓘ shows {explained:?}");
+            let away = egui::pos2(SIDEBAR_EDGE + 4.0, h.screen.y - 4.0);
+            hover(&mut h, away);
+        }
+        // How to write the patterns stays in sight, as the row's one-line hint
+        assert!(h.text_at("One glob pattern per line.").is_some());
+    }
+
+    #[test]
+    fn the_save_group_says_it_applies_when_saved() {
+        let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        let y = |h: &Harness, text: &str| h.text_at(text).unwrap_or_else(|| panic!("{text:?} is painted")).y;
+        let (heading, hint, save) =
+            (y(&h, "Synchronization Settings"), y(&h, "These apply when you save"), y(&h, "Save Preferences"));
+        assert!(heading < hint && hint < save, "the hint under the heading, above Save Preferences");
+        // Exactly the settings Save Preferences sends are in the group; what acts at once is outside it
+        for row in [
+            "Local Sync Folder",
+            "Conflict Resolution Strategy",
+            "Enable Ubuntu desktop notifications",
+            "Start Proton Drive when I log in",
+            "Ignore Patterns (Glob)",
+        ] {
+            assert!((hint..save).contains(&y(&h, row)), "{row} is in the group");
+        }
+        for elsewhere in [SWITCH, "Follow the system", "Apps blocked from downloading", "Hidden from this computer"] {
+            assert!(!(heading..save).contains(&y(&h, elsewhere)), "{elsewhere} is outside the group");
+        }
+        // Its switches wait for Save, as its checkboxes did
+        h.click(h.text_at("Enable Ubuntu desktop notifications").unwrap());
+        assert!(!h.app.edit_notifications && h.app.settings_dirty);
+        assert_eq!(h.sent(), Vec::<String>::new(), "nothing is sent before Save");
+        h.click(h.text_at("Save Preferences").unwrap());
+        assert_eq!(h.sent(), vec![r#"save {"notificationsEnabled":false}"#.to_string()]);
+    }
+
+    #[test]
+    fn the_account_cards_web_and_trash_carry_icons_and_say_where_they_go_on_hover() {
+        let launched = || home::LAUNCHED.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        launched();
+        let mut h = settings_tall(None, None);
+        let trash_says = home::trash_hover(&h.app.status.sync_dir);
+        for (label, icon, says, opens) in [
+            ("Web", icons::WEB, "Open Proton Drive on the web", home::PROTON_DRIVE_WEB_URL),
+            ("Trash", icons::TRASH, trash_says.as_str(), home::PROTON_DRIVE_TRASH_URL),
+        ] {
+            let at = h.text_at(label).unwrap_or_else(|| panic!("{label} is offered"));
+            let glyph = h.text_at(icon).unwrap_or_else(|| panic!("{label}'s icon is painted"));
+            assert!(glyph.x < at.x && (glyph.y - at.y).abs() < 4.0, "{label}'s icon {glyph:?} is before it {at:?}");
+            assert_ne!(h.fill_under(at), Some(PROTON_PURPLE), "{label} is a secondary button");
+            hover(&mut h, at);
+            assert!(h.text_at(says).is_some(), "hovering {label} says {says:?}");
+            h.click(at);
+            assert_eq!(launched(), vec![opens.to_string()]);
+        }
+        assert!(h.text_at("Open Proton Drive Trash").is_none() && h.text_at("Open Proton Drive on the web").is_none());
+        assert!(h.text_at("Sign out").is_some(), "Sign out stays as it was");
+    }
+
+    // #276: at the smallest window, at 120% zoom too (where the controls go under their labels), and at the screenshots'
+    // size, no text of Settings runs out of its card or over another
+    #[test]
+    fn settings_rows_fit_at_840_by_540_and_120_percent() {
+        let mut h = Harness::settings(Some(vfs("virtual", true, None)), Some(true));
+        h.app.status.account = Some(gautam());
+        h.app.status.settings.blocked_apps = vec!["rg".into(), "backup.sh".into()];
+        h.event(WorkerEvent::HiddenLoaded(Ok(vec![hidden("Documents/Private", "hiding"), hidden("Music", "hidden")])));
+        for (width, zoom) in [(840.0, 1.2), (840.0, 1.0), (1100.0, 1.0)] {
+            // Tall, to paint every card at once: only the width is tight
+            h.resize_zoomed(Vec2::new(width, 3600.0), zoom);
+            let texts: Vec<(String, egui::Rect)> = h
+                .texts(|t| !t.galley.text().trim().is_empty())
+                .iter()
+                .map(|t| (t.galley.text().to_string(), t.visual_bounding_rect()))
+                .filter(|(_, r)| r.left() > SIDEBAR_EDGE && r.top() > chrome::TOP_BAR_HEIGHT)
+                .collect();
+            assert!(texts.iter().any(|(t, _)| t == "Save Preferences"), "{width}@{zoom}: every card is painted");
+            // The section's margin (26), the scroll bar's gutter (12) and a card's own (18)
+            let card_inside = h.screen.x - 26.0 - 12.0 - 18.0;
+            for (text, rect) in &texts {
+                assert!(rect.right() <= card_inside + 0.5, "{width}@{zoom}: {text:?} runs out of its card: {rect:?}");
+            }
+            for (i, (a, ra)) in texts.iter().enumerate() {
+                for (b, rb) in &texts[i + 1..] {
+                    assert!(!ra.shrink(0.5).intersects(rb.shrink(0.5)), "{width}@{zoom}: {a:?} {ra:?} runs over {b:?} {rb:?}");
+                }
+            }
+        }
     }
 
     #[test]
