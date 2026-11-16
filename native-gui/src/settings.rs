@@ -464,7 +464,7 @@ impl ProtonDriveNativeApp {
         if let Some(path) = unhide {
             self.unhide_notice = None;
             self.unhiding = Some(path.clone());
-            self.send_availability(path, "unhide");
+            self.send_availability(path, "unhide", None);
         }
     }
 

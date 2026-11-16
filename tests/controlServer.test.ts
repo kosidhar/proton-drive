@@ -15,12 +15,13 @@ afterEach(() => {
 });
 
 function makeFake(rejectWith?: string) {
-    const calls: Array<[string, AvailabilityAction]> = [];
+    // Options only when given: a call without them is exactly the one before the option existed (#296)
+    const calls: Array<[string, AvailabilityAction] | [string, AvailabilityAction, { keepPinned?: boolean }]> = [];
     const driveCalls: unknown[][] = [];
     const engine = {
         calls,
-        async setAvailability(relPath: string, action: AvailabilityAction): Promise<AvailabilityResult> {
-            calls.push([relPath, action]);
+        async setAvailability(relPath: string, action: AvailabilityAction, ...opts: [{ keepPinned?: boolean }?]): Promise<AvailabilityResult> {
+            calls.push(opts.length === 0 ? [relPath, action] : [relPath, action, opts[0]!]);
             if (rejectWith) throw new Error(rejectWith);
             return { state: action === 'free' ? 'online-only' : 'pinned', kept: ['a.txt'], refused: null };
         },
@@ -34,6 +35,11 @@ function makeFake(rejectWith?: string) {
         hidden: [] as Array<{ path: string; state: 'hidden' | 'hiding' }>,
         hiddenItems() {
             return this.hidden;
+        },
+        // How many items are marked Always keep below the top level, and whether the top level is (#296)
+        pinned: { items: 0, wholeDrive: false },
+        pinnedSummary() {
+            return this.pinned;
         },
         // The drive's routes: each call is noted; some paths fail as the engine fails them
         driveCalls,
@@ -176,6 +182,57 @@ describe('control socket', () => {
         );
         const res = await call(first.socketPath, '/availability?path=Docs');
         expect(res.status).toBe(200);
+    });
+
+    test('POST /availability passes keepPinned on a free, and nothing when it is left out (#296)', async () => {
+        const { socketPath, engine } = await start();
+        for (const keepPinned of [true, false]) {
+            const res = await call(socketPath, '/availability', {
+                method: 'POST',
+                body: JSON.stringify({ path: '', action: 'free', keepPinned }),
+            });
+            expect(res.status).toBe(200);
+        }
+        await call(socketPath, '/availability', { method: 'POST', body: JSON.stringify({ path: '', action: 'free' }) });
+        expect(engine.calls).toEqual([
+            ['', 'free', { keepPinned: true }],
+            ['', 'free', { keepPinned: false }],
+            ['', 'free'],
+        ]);
+    });
+
+    test('keepPinned must be true or false, and goes only with a free (#296)', async () => {
+        const { socketPath, engine } = await start();
+        for (const body of [
+            { path: '', action: 'free', keepPinned: 'yes' },
+            { path: '', action: 'free', keepPinned: null },
+            { path: '', action: 'free', keepPinned: 1 },
+            { path: 'Docs', action: 'pin', keepPinned: true },
+            { path: 'Docs', action: 'hide', keepPinned: false },
+        ]) {
+            const res = await call(socketPath, '/availability', { method: 'POST', body: JSON.stringify(body) });
+            expect(res.status).toBe(400);
+            expect(((await res.json()) as { error: string }).error).toContain('keepPinned');
+        }
+        expect(engine.calls).toEqual([]);
+    });
+
+    test('GET /availability/pinned answers how many items are marked Always keep, and whether the whole drive is (#296)', async () => {
+        const { socketPath, engine } = await start();
+        let res = await call(socketPath, '/availability/pinned');
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ items: 0, wholeDrive: false });
+
+        engine.pinned = { items: 3, wholeDrive: true };
+        res = await call(socketPath, '/availability/pinned');
+        expect(await res.json()).toEqual({ items: 3, wholeDrive: true });
+
+        // It only reads
+        for (const method of ['POST', 'PUT', 'DELETE']) {
+            res = await call(socketPath, '/availability/pinned', { method, body: JSON.stringify({ path: '', action: 'free' }) });
+            expect(res.status).toBe(405);
+        }
+        expect(engine.calls).toEqual([]);
     });
 
     test('bad action is 400', async () => {

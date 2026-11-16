@@ -9,7 +9,7 @@ use crate::icons;
 use crate::{
     action_button, action_button_if, action_button_named, card_frame, decoration, drive_status_line, files_safe_hint,
     format_bytes, offers_mount_again, render_transfer_line, shown_folder, spawn_reaped, AccountInfo, ButtonKind,
-    ConflictRecord, DaemonStatus, PendingConfirm, ProtonDriveNativeApp, VfsStatus, WorkerCommand, BG_CARD_ALT,
+    ConflictRecord, DaemonStatus, ProtonDriveNativeApp, VfsStatus, WorkerCommand, BG_CARD_ALT,
     BORDER_SUBTLE, DANGER_TEXT, PROTON_PURPLE, PROTON_PURPLE_TEXT, SCREENSHOT_MODE, SUCCESS_TEXT, TEXT_MUTED, TEXT_PRIMARY,
     WARNING_TEXT,
 };
@@ -971,7 +971,7 @@ impl ProtonDriveNativeApp {
                 });
             });
             if free {
-                self.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
+                self.open_free_up_space(String::new());
             }
         });
     }
