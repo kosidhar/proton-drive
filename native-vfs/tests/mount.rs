@@ -1,5 +1,7 @@
 // Real mounts of the built helper over temp dirs, with a fake daemon on a temp socket. They run only with
-// PROTONDRIVE_VFS_MOUNT_TESTS=1, and always unmount, even when an assertion fails.
+// PROTONDRIVE_VFS_MOUNT_TESTS=1, and always unmount, even when an assertion fails. They need more than 5 GB free
+// where TMPDIR points (/tmp by default): the drive refuses writes that would leave its backing store's disk with
+// less than that (#295).
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -733,6 +735,9 @@ fn a_write_that_would_leave_the_system_disk_under_5_gb_is_refused() {
     assert_eq!(errno(run_truncate(&h.path("a.txt"), local_free)), Some(libc::ENOSPC));
     assert_eq!(std::fs::read(h.backing.join("a.txt")).unwrap(), b"hello");
     assert_eq!(std::fs::metadata(h.path("a.txt")).unwrap().len(), 5);
+    // Logged, for whoever wonders why with so much free space shown, but not once per refusal
+    let logged = h.stderr().matches("refused a write that would leave the system disk").count();
+    assert_eq!(logged, 1, "{}", h.stderr());
     // An overwrite in place always goes through
     file.write_all_at(b"HELLO", 0).unwrap();
     assert_eq!(std::fs::read(h.backing.join("a.txt")).unwrap(), b"HELLO");
