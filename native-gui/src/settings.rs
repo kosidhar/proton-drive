@@ -12,7 +12,7 @@ use crate::home::{
 use crate::{
     action_button, card_frame, icons, is_light_mode, save_window_geometry, text_width, toggle_switch, ButtonKind,
     ProtonDriveNativeApp, WorkerCommand, BG_INPUT, BORDER_NORM, BORDER_SUBTLE, HIDDEN_NEEDS_RESTART, PROTON_PURPLE,
-    PROTON_PURPLE_TEXT, STATUS_DANGER, TEXT_MUTED, TEXT_PRIMARY,
+    DANGER_TEXT, PROTON_PURPLE_TEXT, TEXT_MUTED, TEXT_PRIMARY,
 };
 
 /// The themes the Appearance card offers: what is saved, and what the picker says.
@@ -314,7 +314,7 @@ impl ProtonDriveNativeApp {
             // How signing in or out went (the sign-in page opening, or why it failed)
             if let Some(error) = &self.account_error {
                 ui.add_space(8.0);
-                ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
+                ui.add(egui::Label::new(RichText::new(error).size(12.5).color(DANGER_TEXT())).wrap());
             } else if let Some(url) = &self.login_url {
                 let text = if url.is_empty() {
                     "Opening the Proton sign-in page in your browser…".to_string()
@@ -349,7 +349,7 @@ impl ProtonDriveNativeApp {
                 }
                 Some(Err(e)) => {
                     ui.add(
-                        egui::Label::new(RichText::new(format!("Couldn't load the list: {e}")).size(12.5).color(STATUS_DANGER))
+                        egui::Label::new(RichText::new(format!("Couldn't load the list: {e}")).size(12.5).color(DANGER_TEXT()))
                             .wrap(),
                     );
                 }
@@ -375,7 +375,7 @@ impl ProtonDriveNativeApp {
             // How the last Unhide went: the items it had to keep as information, a refusal or failure as an error
             if let Some(notice) = &self.unhide_notice {
                 ui.add_space(6.0);
-                let color = if notice.error { STATUS_DANGER } else { TEXT_MUTED() };
+                let color = if notice.error { DANGER_TEXT() } else { TEXT_MUTED() };
                 ui.add(egui::Label::new(RichText::new(&notice.text).size(12.5).color(color)).wrap());
             }
         });

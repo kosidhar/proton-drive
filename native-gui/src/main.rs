@@ -213,15 +213,6 @@ const STATUS_DANGER: Color32 = Color32::from_rgb(220, 50, 81); // #DC3251
 // Darker on hover, so the white label keeps a contrast of at least 4.5:1 (5.5:1; STATUS_DANGER has 4.5:1)
 const STATUS_DANGER_HOVER: Color32 = Color32::from_rgb(196, 43, 71); // #C42B47
 
-#[inline]
-fn btn_secondary_hover_bg() -> Color32 {
-    if is_light_mode() {
-        Color32::from_rgb(228, 224, 242)
-    } else {
-        Color32::from_rgb(54, 47, 72)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NavTab {
     Home,
@@ -2293,7 +2284,7 @@ impl ProtonDriveNativeApp {
 
         if let Some(error) = &self.account_error {
             ui.add_space(6.0);
-            ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
+            ui.add(egui::Label::new(RichText::new(error).size(12.5).color(DANGER_TEXT())).wrap());
         } else if let Some(url) = &self.login_url {
             let text = if url.is_empty() {
                 "Opening the Proton sign-in page in your browser…".to_string()
@@ -2678,23 +2669,16 @@ impl ProtonDriveNativeApp {
 
                         ui.add_space(20.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            // Deleting from Proton Drive is destructive: red, not the primary purple
-                            let (fill, hover) = if matches!(confirm, PendingConfirm::DeleteMissing { .. } | PendingConfirm::StopSharing { .. }) {
-                                (STATUS_DANGER, STATUS_DANGER_HOVER)
+                            // Taking something away is red, not the primary purple
+                            let kind = if matches!(
+                                confirm,
+                                PendingConfirm::DeleteMissing { .. } | PendingConfirm::StopSharing { .. } | PendingConfirm::VirtualDriveOff
+                            ) {
+                                ButtonKind::Danger
                             } else {
-                                (PROTON_PURPLE, PROTON_PURPLE_HOVER)
+                                ButtonKind::Primary
                             };
-                            if proton_button(
-                                ui,
-                                Vec2::new(if button.len() > 16 { 186.0 } else { 138.0 }, 36.0),
-                                button,
-                                fill,
-                                hover,
-                                None,
-                                Color32::WHITE,
-                                13.0,
-                            )
-                            .clicked()
+                            if action_button(ui, kind, None, button, 36.0).clicked()
                             {
                                 // Exhaustive on purpose: a new variant must say what it sends, not fall into availability
                                 match &confirm {
@@ -2723,16 +2707,7 @@ impl ProtonDriveNativeApp {
 
                             ui.add_space(8.0);
 
-                            if proton_button(
-                                ui,
-                                Vec2::new(if cancel == "Cancel" { 88.0 } else { 118.0 }, 36.0),
-                                cancel,
-                                BG_CARD_ALT(),
-                                btn_secondary_hover_bg(),
-                                Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
-                                TEXT_PRIMARY(),
-                                13.0,
-                            )
+                            if action_button(ui, ButtonKind::Secondary, None, cancel, 36.0)
                             .clicked()
                             {
                                 self.pending_confirm = None;
@@ -2791,7 +2766,7 @@ impl ProtonDriveNativeApp {
                 ui.add(egui::Label::new(RichText::new(keep_says).size(12.5).color(TEXT_MUTED())).wrap());
                 if let Some(error) = &self.files_missing_error {
                     ui.add_space(2.0);
-                    ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
+                    ui.add(egui::Label::new(RichText::new(error).size(12.5).color(DANGER_TEXT())).wrap());
                 }
                 ui.add_space(8.0);
                 let working = self.files_missing_working;
@@ -2844,7 +2819,7 @@ impl ProtonDriveNativeApp {
                 ui.add(egui::Label::new(RichText::new(&mismatch.message).size(12.5).color(TEXT_MUTED())).wrap());
                 if let Some(error) = &self.start_fresh_error {
                     ui.add_space(2.0);
-                    ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
+                    ui.add(egui::Label::new(RichText::new(error).size(12.5).color(DANGER_TEXT())).wrap());
                 }
                 ui.add_space(8.0);
                 let working = self.start_fresh_working;
@@ -2986,7 +2961,7 @@ impl ProtonDriveNativeApp {
             }
             if let Some(error) = &self.drive_error {
                 ui.add_space(10.0);
-                ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
+                ui.add(egui::Label::new(RichText::new(error).size(12.5).color(DANGER_TEXT())).wrap());
             }
             if clicked {
                 if on {
@@ -3032,7 +3007,7 @@ impl ProtonDriveNativeApp {
                     .flatten();
                 if let Some(error) = non_empty(&mv.error).filter(|e| Some(*e) != shown_above) {
                     ui.add_space(4.0);
-                    ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
+                    ui.add(egui::Label::new(RichText::new(error).size(12.5).color(DANGER_TEXT())).wrap());
                 }
                 if mv.actions.iter().any(|a| move_action_label(a).is_some()) {
                     ui.add_space(10.0);
@@ -3106,7 +3081,7 @@ impl ProtonDriveNativeApp {
             });
             if let Some(error) = &self.blocklist_error {
                 ui.add_space(8.0);
-                ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
+                ui.add(egui::Label::new(RichText::new(error).size(12.5).color(DANGER_TEXT())).wrap());
             }
         });
         match asked {
@@ -3252,7 +3227,7 @@ impl ProtonDriveNativeApp {
             }
             if let Some(notice) = &self.settings_notice {
                 ui.add_space(8.0);
-                let color = if notice.error { STATUS_DANGER } else { TEXT_MUTED() };
+                let color = if notice.error { DANGER_TEXT() } else { TEXT_MUTED() };
                 ui.add(egui::Label::new(RichText::new(&notice.text).size(12.5).color(color)).wrap());
             }
         });
@@ -3553,7 +3528,6 @@ pub(crate) enum ButtonKind {
     /// The card's colour with an outline, filled with the weak background on hover
     Secondary,
     /// Red, for a confirmation that deletes
-    #[cfg_attr(not(test), expect(dead_code, reason = "the dialogs don't use action_button yet"))]
     Danger,
     /// A secondary button whose label is red: a choice that deletes, short of a confirmation
     DangerOutline,
@@ -3920,7 +3894,7 @@ fn activity_pill_colors(kind: activity::ActivityKind) -> (Color32, Color32) {
         FolderCreated | Other => (BG_CARD_ALT(), TEXT_PRIMARY()),
         RemovedLocally => (BG_CARD_ALT(), TEXT_MUTED()),
         MovedToCloudTrash => (Color32::from_rgba_unmultiplied(245, 158, 11, 34), STATUS_WARNING),
-        Conflict | Failed => (Color32::from_rgba_unmultiplied(239, 68, 68, 38), STATUS_DANGER),
+        Conflict | Failed => (Color32::from_rgba_unmultiplied(239, 68, 68, 38), DANGER_TEXT()),
     }
 }
 
@@ -9325,6 +9299,43 @@ mod tests {
         // #767676 on white is the lightest grey that reads at 4.5:1
         let grey = Color32::from_rgb(0x76, 0x76, 0x76);
         assert!((contrast(grey, Color32::WHITE) - 4.54).abs() < 0.01, "{}", contrast(grey, Color32::WHITE));
+    }
+
+    #[test]
+    fn the_stop_sharing_confirm_button_is_danger() {
+        let mut h = Harness::new();
+        h.app.pending_confirm = Some(PendingConfirm::StopSharing {
+            rel_path: "Docs/report.pdf".into(),
+            uid: "u1".into(),
+            question: "Stop sharing report.pdf?".into(),
+        });
+        h.frames(10); // past the dialog's fade-in
+        let stop = h.text_at("Stop sharing").expect("the dialog is painted");
+        assert_eq!(h.fill_under(stop), Some(STATUS_DANGER));
+        assert_ne!(h.fill_under(h.text_at("Cancel").unwrap()), Some(STATUS_DANGER));
+        assert_eq!(h.fill_under(h.text_at("Cancel").unwrap()), Some(BG_CARD()), "Cancel is a secondary button");
+    }
+
+    #[test]
+    fn the_share_windows_copy_link_has_its_icon() {
+        let info = share::fake_share_info("link", 1_793_750_400_000, |_| 0).unwrap();
+        let h = share_window(Some(info));
+        let copy = h.text_rect("Copy link").expect("Copy link is painted");
+        let icon = h.text_rect(icons::COPY).expect("the copy glyph is painted");
+        assert!(icon.right() <= copy.left() && (icon.center().y - copy.center().y).abs() < 4.0, "{icon:?} left of {copy:?}");
+        let invite = h.text_rect("Invite").expect("Invite is painted");
+        let people = h.text_rect(icons::PEOPLE).expect("the people glyph is painted");
+        assert!(people.right() <= invite.left(), "{people:?} left of {invite:?}");
+    }
+
+    // R16: red words read in the dark
+    #[test]
+    fn a_red_error_line_reads_in_the_dark_palette() {
+        let mut h = share_window(None);
+        let refusal = "Not uploaded yet: Proton Drive can share it once it has uploaded";
+        h.event(WorkerEvent::ShareLoaded(shown(&h), Err(refusal.into())));
+        assert_eq!(h.text_color_at(refusal), Some(DARK.danger_text));
+        assert_ne!(DARK.danger_text, STATUS_DANGER);
     }
 
     #[test]

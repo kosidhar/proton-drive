@@ -18,9 +18,8 @@ use serde::Deserialize;
 use crate::home::{self, elided, primary_button, secondary_button};
 use crate::single_instance::PathProblem;
 use crate::{
-    button_width, control_request_at, proton_button, toggle_switch, ProtonDriveNativeApp, WorkerCommand, BG_CARD,
-    BG_INPUT, BORDER_SUBTLE, PROTON_PURPLE, PROTON_PURPLE_HOVER, STATUS_DANGER, STATUS_DANGER_HOVER, TEXT_MUTED,
-    TEXT_PRIMARY,
+    action_button, action_button_sized, action_button_width, button_width, control_request_at, icons, proton_button, toggle_switch, ButtonKind, ProtonDriveNativeApp,
+    WorkerCommand, BG_CARD, BG_CARD_ALT, BG_INPUT, BORDER_NORM, BORDER_SUBTLE, DANGER_TEXT, TEXT_MUTED, TEXT_PRIMARY,
 };
 
 /// A share's role, for the link and for each person.
@@ -1026,8 +1025,7 @@ impl ProtonDriveNativeApp {
                 ui.add_space(18.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // It takes access away: red, not the primary purple
-                    let size = Vec2::new(button_width(ui, button), 34.0);
-                    if proton_button(ui, size, button, STATUS_DANGER, STATUS_DANGER_HOVER, None, Color32::WHITE, 13.0).clicked() {
+                    if action_button(ui, ButtonKind::Danger, None, button, 34.0).clicked() {
                         answer = Some(Action::Confirm);
                     }
                     ui.add_space(4.0);
@@ -1055,6 +1053,18 @@ fn dialog_frame() -> Frame {
         .inner_margin(Margin::symmetric(22, 18))
 }
 
+/// `field` (a text field) with Proton's rounded corners (8 points) on its input colour.
+fn input_field(ui: &mut egui::Ui, field: impl FnOnce(&mut egui::Ui) -> egui::Response) -> egui::Response {
+    ui.scope(|ui| {
+        let widgets = &mut ui.visuals_mut().widgets;
+        for state in [&mut widgets.inactive, &mut widgets.hovered, &mut widgets.active, &mut widgets.open] {
+            state.corner_radius = CornerRadius::same(8);
+        }
+        field(ui)
+    })
+    .inner
+}
+
 fn section_title(ui: &mut egui::Ui, title: &str) {
     ui.label(RichText::new(title).size(14.5).strong().color(TEXT_PRIMARY()));
 }
@@ -1074,7 +1084,7 @@ fn field_label(ui: &mut egui::Ui, text: &str) {
 fn error_line(ui: &mut egui::Ui, w: &ShareWindow, section: Section) {
     if let Some((_, problem)) = w.error.as_ref().filter(|(s, _)| *s == section) {
         ui.add_space(2.0);
-        ui.add(egui::Label::new(RichText::new(problem).size(12.5).color(STATUS_DANGER)).wrap());
+        ui.add(egui::Label::new(RichText::new(problem).size(12.5).color(DANGER_TEXT())).wrap());
     }
 }
 
@@ -1088,13 +1098,13 @@ fn role_choice(ui: &mut egui::Ui, id: impl std::hash::Hash, role: &mut Role, hei
         ui.spacing_mut().button_padding = Vec2::new(10.0, 4.0);
         let widgets = &mut ui.visuals_mut().widgets;
         for (state, fill) in [
-            (&mut widgets.inactive, crate::BG_CARD_ALT()),
-            (&mut widgets.hovered, crate::btn_secondary_hover_bg()),
-            (&mut widgets.active, crate::btn_secondary_hover_bg()),
-            (&mut widgets.open, crate::btn_secondary_hover_bg()),
+            (&mut widgets.inactive, BG_CARD()),
+            (&mut widgets.hovered, BG_CARD_ALT()),
+            (&mut widgets.active, BG_CARD_ALT()),
+            (&mut widgets.open, BG_CARD_ALT()),
         ] {
             state.weak_bg_fill = fill;
-            state.bg_stroke = Stroke::new(1.0_f32, BORDER_SUBTLE());
+            state.bg_stroke = Stroke::new(1.0_f32, BORDER_NORM());
             state.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY());
             state.corner_radius = CornerRadius::same(8);
             state.expansion = 0.0;
@@ -1121,7 +1131,7 @@ fn share_body(w: &mut ShareWindow, ui: &mut egui::Ui, owner: &str, now: i64, act
             return;
         }
         Some(Err(problem)) => {
-            ui.add(egui::Label::new(RichText::new(problem).size(13.0).color(STATUS_DANGER)).wrap());
+            ui.add(egui::Label::new(RichText::new(problem).size(13.0).color(DANGER_TEXT())).wrap());
             if !w.rel_path.is_empty() {
                 ui.add_space(10.0);
                 if ui.add_enabled_ui(!w.loading, |ui| secondary_button(ui, "Try again", 30.0)).inner.clicked() {
@@ -1169,7 +1179,8 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
     let (expiry, expired) = expiry_text(link.expires_at, now, home::local_offset_secs);
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        let copy_w = button_width(ui, "Copy link");
+        let label = if w.copied && !expired { "Copied" } else { "Copy link" };
+        let copy_w = action_button_width(ui, Some(icons::COPY), "Copy link").max(action_button_width(ui, Some(icons::COPY), "Copied"));
         let field_w = (ui.available_width() - copy_w - ui.spacing().item_spacing.x).max(120.0);
         Frame::NONE
             .fill(BG_INPUT())
@@ -1181,9 +1192,8 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
                 elided(ui, RichText::new(&link.url).size(12.5).color(TEXT_PRIMARY()), &link.url);
             });
         // An expired link leads nowhere: it isn't copied (an older link, without its password in the URL, still is)
-        let label = if w.copied && !expired { "Copied" } else { "Copy link" };
         let copy = ui.add_enabled_ui(!expired, |ui| {
-            proton_button(ui, Vec2::new(copy_w, 34.0), label, PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE, 13.0)
+            action_button_sized(ui, ButtonKind::Primary, Some(icons::COPY), label, Vec2::new(copy_w, 34.0))
         });
         if copy.inner.clicked() {
             ui.ctx().copy_text(link.url.clone());
@@ -1244,10 +1254,12 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
         ui.horizontal(|ui| {
             field_label(ui, "");
             let buttons = button_width(ui, "Save") + button_width(ui, "Cancel") + 2.0 * ui.spacing().item_spacing.x;
-            let field = ui.add_sized(
-                [(ui.available_width() - buttons).max(100.0), ROW_HEIGHT],
-                egui::TextEdit::singleline(typed).password(true).hint_text("New password").vertical_align(Align::Center),
-            );
+            let field = input_field(ui, |ui| {
+                ui.add_sized(
+                    [(ui.available_width() - buttons).max(100.0), ROW_HEIGHT],
+                    egui::TextEdit::singleline(typed).password(true).hint_text("New password").vertical_align(Align::Center),
+                )
+            });
             if std::mem::take(&mut w.focus_field) {
                 field.request_focus();
             }
@@ -1264,7 +1276,7 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
     ui.horizontal(|ui| {
         field_label(ui, "Expires");
         let color = if expired {
-            STATUS_DANGER
+            DANGER_TEXT()
         } else if link.expires_at.is_none() {
             TEXT_MUTED()
         } else {
@@ -1295,10 +1307,12 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
         });
         ui.horizontal(|ui| {
             field_label(ui, "");
-            let field = ui.add_sized(
-                [118.0, ROW_HEIGHT],
-                egui::TextEdit::singleline(date).hint_text("YYYY-MM-DD").vertical_align(Align::Center),
-            );
+            let field = input_field(ui, |ui| {
+                ui.add_sized(
+                    [118.0, ROW_HEIGHT],
+                    egui::TextEdit::singleline(date).hint_text("YYYY-MM-DD").vertical_align(Align::Center),
+                )
+            });
             let entered = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             if primary_button(ui, "Set", ROW_HEIGHT).clicked() || entered {
                 actions.push(Action::SaveExpiry);
@@ -1320,12 +1334,14 @@ fn invite_section(w: &mut ShareWindow, ui: &mut egui::Ui, actions: &mut Vec<Acti
     section_title(ui, "Invite people");
     ui.horizontal(|ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let invite = primary_button(ui, "Invite", 32.0).clicked();
+            let invite = action_button(ui, ButtonKind::Primary, Some(icons::PEOPLE), "Invite", 32.0).clicked();
             role_choice(ui, "share_invite_role", &mut w.invite_role, 32.0);
-            let field = ui.add_sized(
-                [ui.available_width().max(140.0), 32.0],
-                egui::TextEdit::singleline(&mut w.invite_input).hint_text("email@example.com, …").vertical_align(Align::Center),
-            );
+            let field = input_field(ui, |ui| {
+                ui.add_sized(
+                    [ui.available_width().max(140.0), 32.0],
+                    egui::TextEdit::singleline(&mut w.invite_input).hint_text("email@example.com, …").vertical_align(Align::Center),
+                )
+            });
             let entered = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             if invite || entered {
                 actions.push(Action::Invite);
@@ -1360,9 +1376,9 @@ fn people_section(w: &mut ShareWindow, ui: &mut egui::Ui, people: &[SharePerson]
                     ui,
                     Vec2::new(28.0, 28.0),
                     "×",
-                    crate::BG_CARD_ALT(),
-                    crate::btn_secondary_hover_bg(),
-                    Some(Stroke::new(1.0_f32, BORDER_SUBTLE())),
+                    BG_CARD(),
+                    BG_CARD_ALT(),
+                    Some(Stroke::new(1.0_f32, BORDER_NORM())),
                     TEXT_PRIMARY(),
                     16.0,
                 )
