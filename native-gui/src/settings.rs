@@ -331,9 +331,10 @@ fn info_glyph(ui: &mut egui::Ui, info: &str) -> egui::Response {
         }
     });
 
-    // Open, or with the keyboard's focus and not under the pointer (under it, the hover shows it, once), and in sight
-    if (is_open || (response.has_focus() && !response.hovered())) && ui.is_rect_visible(rect) {
-        paint_info_words(&ctx, rect, info);
+    // Open, or with the keyboard's focus (under the pointer too, so the words don't drop out while egui's hover delay
+    // runs), and in sight
+    if (is_open || response.has_focus()) && ui.is_rect_visible(rect) {
+        show_info_words(&ctx, rect, info);
         response
     } else {
         let words = |ui: &mut egui::Ui| {
@@ -344,19 +345,20 @@ fn info_glyph(ui: &mut egui::Ui, info: &str) -> egui::Response {
     }
 }
 
-/// An ⓘ's words in egui's tooltip box, where egui puts a tooltip (under the ⓘ, else above it, kept on the screen),
-/// but painted on the tooltip layer rather than shown as a tooltip: egui shows one tooltip at a time, so a tooltip
-/// held open would keep every other widget's from showing on hover (#318); and a click on what the box covers
-/// reaches it.
-fn paint_info_words(ctx: &egui::Context, anchor: egui::Rect, info: &str) {
+/// An ⓘ's words in egui's tooltip box, where egui puts a tooltip (under the ⓘ, else above it, kept on the
+/// screen), in an area of their own rather than as a tooltip: egui shows one tooltip at a time, so a tooltip held
+/// open would keep every other widget's from showing on hover (#318). The box takes the clicks on it, which close
+/// it: a click never reaches the control it hides (in a narrow window, the drive's ⓘ's words cover its switch).
+fn show_info_words(ctx: &egui::Context, anchor: egui::Rect, info: &str) {
     /// egui's gap between a widget and its tooltip
     const GAP: f32 = 4.0;
     let style = ctx.style();
     let frame = Frame::popup(&style);
-    let color = style.visuals.text_color();
+    let width = style.spacing.tooltip_width;
+    // Its size, to put it where egui would: the words laid out as the label in it lays them out
     let font = egui::TextStyle::Body.resolve(&style);
-    let galley = ctx.fonts(|f| f.layout(info.to_owned(), font, color, style.spacing.tooltip_width));
-    let size = galley.size() + frame.total_margin().sum();
+    let words = ctx.fonts(|f| f.layout(info.to_owned(), font, style.visuals.text_color(), width)).size();
+    let size = words + frame.total_margin().sum();
     let screen = ctx.screen_rect();
     let fits_below = anchor.bottom() + GAP + size.y <= screen.bottom();
     let top = if fits_below { anchor.bottom() + GAP } else { anchor.top() - GAP - size.y };
@@ -365,10 +367,21 @@ fn paint_info_words(ctx: &egui::Context, anchor: egui::Rect, info: &str) {
     let outer = outer.translate(Vec2::new((screen.right() - outer.right()).min(0.0), 0.0));
     let onto_screen = Vec2::new((screen.left() - outer.left()).max(0.0), (screen.top() - outer.top()).max(0.0));
     let outer = outer.translate(onto_screen);
-    let content = outer - frame.total_margin();
-    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new(OPEN_INFO)));
-    painter.add(frame.paint(content));
-    painter.galley(content.min, galley, color);
+    egui::Area::new(egui::Id::new(OPEN_INFO))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(outer.min)
+        .sense(Sense::CLICK)
+        .show(ctx, |ui| {
+            frame.show(ui, |ui| {
+                ui.set_max_width(width);
+                ui.add(egui::Label::new(info).selectable(false));
+            });
+        });
+}
+
+/// Closes the ⓘ a click opened, if any: a dialog or the Share window is opening over Settings.
+pub(crate) fn close_open_info(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove::<OpenInfo>(egui::Id::new(OPEN_INFO)));
 }
 
 /// The plan, as the account's quota tells it.
