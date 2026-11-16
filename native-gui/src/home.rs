@@ -398,9 +398,8 @@ pub(crate) fn open_in_files(folder: &std::path::Path) {
 /// Proton Drive on the web, and its trash: where a delete through the drive puts what was deleted (#201)
 pub(crate) const PROTON_DRIVE_WEB_URL: &str = "https://drive.proton.me";
 pub(crate) const PROTON_DRIVE_TRASH_URL: &str = "https://drive.proton.me/trash";
-pub(crate) const OPEN_TRASH: &str = "Open Proton Drive Trash";
-/// What Home's button says: shorter, as it sits with the folder
-pub(crate) const HOME_TRASH: &str = "Trash";
+/// What the trash's buttons say, on Home and in Settings' Account card; their hover says more (`trash_hover`)
+pub(crate) const TRASH_BUTTON: &str = "Trash";
 
 /// What the trash button says on hover: deleted files wait there, and come back to the sync folder when restored
 pub(crate) fn trash_hover(sync_dir: &str) -> String {
@@ -573,7 +572,7 @@ pub(crate) fn menu_item(ui: &mut egui::Ui, icon: Option<&str>, label: &str, widt
     resp
 }
 
-fn card_title(ui: &mut egui::Ui, title: &str) {
+pub(crate) fn card_title(ui: &mut egui::Ui, title: &str) {
     ui.label(RichText::new(title).font(crate::bold(15.5)).color(TEXT_PRIMARY()));
 }
 
@@ -854,7 +853,7 @@ impl ProtonDriveNativeApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // The trash, on the right. Not before a folder is set up
                     if !sync_dir.is_empty() {
-                        if secondary_icon_button(ui, icons::TRASH, HOME_TRASH, 32.0).on_hover_text(trash_hover(&sync_dir)).clicked() {
+                        if secondary_icon_button(ui, icons::TRASH, TRASH_BUTTON, 32.0).on_hover_text(trash_hover(&sync_dir)).clicked() {
                             open_in_browser(PROTON_DRIVE_TRASH_URL);
                         }
                         ui.add_space(8.0);
