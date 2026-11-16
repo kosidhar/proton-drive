@@ -2277,6 +2277,7 @@ impl ProtonDriveNativeApp {
         });
         ui.add_space(8.0);
 
+        let viewport = ui.available_height();
         ScrollArea::vertical().id_salt("shared_scroll").auto_shrink([false, false]).show(ui, |ui| {
             Frame::NONE.inner_margin(gutter).show(ui, |ui| {
                 if let Some(error) = self.shared.error.clone() {
@@ -2295,9 +2296,7 @@ impl ProtonDriveNativeApp {
                 let Some(items) = &self.shared.items else { return };
                 if items.is_empty() {
                     if !loading {
-                        ui.add(egui::Label::new(RichText::new(shared::EMPTY).size(13.0).color(TEXT_MUTED())).wrap());
-                        ui.add_space(8.0);
-                        Self::shared_photos_note(ui, self.screenshot_target.is_some());
+                        self.render_shared_empty(ui, viewport);
                     }
                     return;
                 }
@@ -2314,6 +2313,42 @@ impl ProtonDriveNativeApp {
                 }
             });
         });
+    }
+
+    /// Nothing shared yet: a picture, a heading and the one way to share, a little above the middle of the page (the
+    /// height it is placed by is last frame's), and where Photos shares are.
+    fn render_shared_empty(&self, ui: &mut egui::Ui, viewport: f32) {
+        let id = egui::Id::new("shared_empty_h");
+        let last: f32 = ui.ctx().data_mut(|d| d.get_temp(id)).unwrap_or(0.0);
+        ui.add_space(((viewport - last) * 0.4).max(0.0));
+        let group = ui.with_layout(Layout::top_down(Align::Center), |ui| {
+            paint_share_picture(ui);
+            ui.add_space(20.0);
+            ui.label(RichText::new(shared::EMPTY_TITLE).font(bold(16.0)).color(TEXT_PRIMARY()));
+            ui.add_space(6.0);
+            ui.scope(|ui| {
+                ui.set_max_width(ui.available_width().min(420.0));
+                ui.add(egui::Label::new(RichText::new(shared::EMPTY_HOW).size(13.0).color(TEXT_MUTED())).wrap().halign(Align::Center));
+            });
+            ui.add_space(24.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                // Centred: the row is as wide as its two parts
+                let parts = ui.painter().layout_no_wrap(shared::EMPTY_PHOTOS.into(), FontId::proportional(12.0), TEXT_MUTED()).size().x
+                    + ui.painter().layout_no_wrap(shared::PHOTOS_LINK.into(), FontId::proportional(12.0), TEXT_MUTED()).size().x
+                    + 4.0;
+                ui.add_space(((ui.available_width() - parts) / 2.0).max(0.0));
+                ui.label(RichText::new(shared::EMPTY_PHOTOS).size(12.0).color(TEXT_MUTED()));
+                if ui.add(egui::Link::new(RichText::new(shared::PHOTOS_LINK).size(12.0))).clicked() {
+                    home::open_externally(std::ffi::OsStr::new(shared::WEB_SHARED_URL), self.screenshot_target.is_some());
+                }
+            });
+        });
+        let height = group.response.rect.height();
+        if (height - last).abs() > 0.5 {
+            ui.ctx().data_mut(|d| d.insert_temp(id, height));
+            ui.ctx().request_repaint();
+        }
     }
 
     /// The daemon never lists Photos shares, so the page says where to find them (#256).
@@ -3797,6 +3832,35 @@ pub(crate) fn decoration(ui: &mut egui::Ui, icon: &str, size: f32, color: Color3
     let galley = ui.painter().layout_no_wrap(icon.to_owned(), icons::font(size), color);
     let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
     ui.painter().galley(rect.min, galley, color);
+    response
+}
+
+/// The colours of the empty Shared page's picture, from one theme.
+struct SharePictureColors {
+    circle: Color32,
+    glyph: Color32,
+    badge: Color32,
+    badge_line: Color32,
+}
+
+fn share_picture_colors(p: &Palette) -> SharePictureColors {
+    SharePictureColors { circle: p.purple_soft, glyph: p.purple_text, badge: p.card, badge_line: p.border_weak }
+}
+
+/// The empty Shared page's picture, for looking at only (screen readers get the heading): a link in a soft circle with
+/// a person's badge at each side.
+fn paint_share_picture(ui: &mut egui::Ui) -> egui::Response {
+    let c = share_picture_colors(palette());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(128.0, 112.0), Sense::hover());
+    let painter = ui.painter();
+    let centre = rect.center();
+    painter.circle_filled(centre, 48.0, c.circle);
+    painter.text(centre, egui::Align2::CENTER_CENTER, icons::SHARED, icons::font(44.0), c.glyph);
+    for offset in [Vec2::new(-46.0, 26.0), Vec2::new(46.0, -26.0)] {
+        let at = centre + offset;
+        painter.circle(at, 16.0, c.badge, egui::Stroke::new(1.5_f32, c.badge_line));
+        painter.text(at, egui::Align2::CENTER_CENTER, icons::PERSON, icons::font(18.0), c.glyph);
+    }
     response
 }
 
@@ -5486,6 +5550,22 @@ mod tests {
             let mut out = Vec::new();
             for clipped in self.last.iter().flat_map(|o| o.shapes.iter()) {
                 rects(&clipped.shape, fill, &mut out);
+            }
+            out
+        }
+
+        /// The centre and radius of each circle the last frame painted with this fill.
+        fn circles_filled(&self, fill: Color32) -> Vec<(egui::Pos2, f32)> {
+            fn circles(shape: &egui::Shape, fill: Color32, out: &mut Vec<(egui::Pos2, f32)>) {
+                match shape {
+                    egui::Shape::Circle(c) if c.fill == fill => out.push((c.center, c.radius)),
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| circles(s, fill, out)),
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for clipped in self.last.iter().flat_map(|o| o.shapes.iter()) {
+                circles(&clipped.shape, fill, &mut out);
             }
             out
         }
@@ -8223,11 +8303,11 @@ mod tests {
         }
         h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(vec![])));
         h.frames(3);
-        assert!(h.text_at(shared::EMPTY).is_some());
+        assert!(h.text_at(shared::EMPTY_TITLE).is_some());
         let offline = "Proton Drive is offline: try again when you are connected";
         h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Err(offline.into())));
         h.frames(3);
-        assert!(h.text_at(shared::EMPTY).is_none());
+        assert!(h.text_at(shared::EMPTY_TITLE).is_none());
         let said = h.text_at(offline).expect("the daemon's message");
         assert_eq!(painted_color(&h, offline, said), Some(DANGER_TEXT()), "in the red that reads as text (R15)");
         assert!(h.widget_at("Refresh").is_none(), "Retry is the action here");
@@ -8271,7 +8351,7 @@ mod tests {
         h.event(WorkerEvent::SharedLoaded(old, Err("Proton Drive took too long to answer".into())));
         h.frames(3);
         assert!(h.text_at(&rows[0].name).is_some());
-        assert!(h.text_at(shared::EMPTY).is_none());
+        assert!(h.text_at(shared::EMPTY_TITLE).is_none());
         assert!(h.text_at("Proton Drive took too long to answer").is_none());
         assert!(!h.app.shared.loading);
         // An older answer doesn't end a newer read's loading either
@@ -8565,15 +8645,85 @@ mod tests {
     }
 
     #[test]
-    fn shared_notes_that_photos_may_be_missing_under_rows_and_under_the_empty_text() {
+    fn shared_notes_that_photos_may_be_missing_under_rows_and_under_the_empty_page() {
         let mut h = shared_with_rows();
         assert!(h.text_at(shared::PHOTOS_NOTE).is_some(), "under the list");
         assert!(h.text_at(shared::PHOTOS_LINK).is_some());
         h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(vec![])));
         h.frames(3);
-        assert!(h.text_at(shared::EMPTY).is_some());
-        assert!(h.text_at(shared::PHOTOS_NOTE).is_some(), "under the empty text");
-        assert!(h.text_at(shared::PHOTOS_LINK).is_some());
+        assert!(h.text_at(shared::EMPTY_TITLE).is_some());
+        assert!(h.text_at(shared::EMPTY_PHOTOS).is_some(), "the empty page's own lead-in");
+        assert!(h.text_at(shared::PHOTOS_NOTE).is_none(), "not the list's sentence");
+        h.click(h.text_at(shared::PHOTOS_LINK).expect("the link, on the empty page"));
+        assert!(home::LAUNCHED.with(|l| l.borrow().iter().any(|t| t == shared::WEB_SHARED_URL)));
+    }
+
+    fn empty_shared() -> Harness {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared").unwrap());
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(vec![])));
+        h.frames(3);
+        h
+    }
+
+    #[test]
+    fn shared_empty_is_a_picture_a_heading_and_one_line() {
+        let h = empty_shared();
+        let title = h.text_rect(shared::EMPTY_TITLE).expect("the heading");
+        assert!(painted_bold(&h, shared::EMPTY_TITLE, f32::MAX));
+        let how = h.text_at(shared::EMPTY_HOW).expect("the how line");
+        assert_eq!(painted_color(&h, shared::EMPTY_HOW, how), Some(TEXT_MUTED()));
+        let circles: Vec<_> = h.circles_filled(share_picture_colors(palette()).circle).into_iter().filter(|c| c.1 >= 40.0).collect();
+        assert_eq!(circles.len(), 1, "{circles:?}");
+        let (centre, radius) = circles[0];
+        assert!((centre.x - title.center().x).abs() < 2.0, "{centre:?} over {title:?}");
+        assert!((centre.x - (SIDEBAR_EDGE + h.screen.x) / 2.0).abs() < 30.0, "{centre:?} in the page");
+        assert!(centre.y + radius < title.top(), "above the title");
+        let link = h.text_at_all(icons::SHARED).into_iter().find(|p| p.x > SIDEBAR_EDGE).expect("the link glyph");
+        assert!(link.distance(centre) < radius, "inside the circle");
+        let people = h.text_at_all(icons::PERSON);
+        assert!(people.len() >= 2, "{people:?}");
+        for p in &people {
+            assert!(p.distance(centre) < radius + 20.0, "{p:?} by {centre:?}");
+        }
+        let top = h.widget_at("Refresh").expect("Refresh").y + 20.0;
+        let share = (centre.y - top) / (h.screen.y - top);
+        assert!((0.25..=0.60).contains(&share), "{share} of the way down");
+        assert!(h.nodes_named(icons::SHARED).is_empty() && h.nodes_named(icons::PERSON).is_empty(), "the picture isn't announced");
+    }
+
+    #[test]
+    fn the_share_picture_reads_in_both_palettes() {
+        for p in [&LIGHT, &DARK] {
+            let c = share_picture_colors(p);
+            assert_eq!((c.circle, c.glyph, c.badge, c.badge_line), (p.purple_soft, p.purple_text, p.card, p.border_weak));
+            assert!(contrast(c.glyph, c.circle) >= 3.0, "{}", contrast(c.glyph, c.circle));
+            assert!(contrast(c.glyph, c.badge) >= 3.0, "{}", contrast(c.glyph, c.badge));
+        }
+    }
+
+    #[test]
+    fn shared_empty_fits_a_small_zoomed_window() {
+        let mut h = empty_shared();
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
+        for t in [shared::EMPTY_TITLE, shared::EMPTY_HOW, shared::EMPTY_PHOTOS, shared::PHOTOS_LINK] {
+            let r = h.text_rect(t).unwrap_or_else(|| panic!("{t:?} is painted"));
+            assert!(r.left() >= SIDEBAR_EDGE && r.right() <= h.screen.x, "{t:?} {r:?} in the page");
+        }
+        // Too short for all of it: the group starts below the toolbar, in order, and the page scrolls to the rest
+        h.resize_zoomed(Vec2::new(840.0, 380.0), 1.2);
+        let toolbar = h.widget_at("Refresh").expect("Refresh").y + 20.0;
+        let picture = h.circles_filled(share_picture_colors(palette()).circle).into_iter().find(|c| c.1 >= 40.0).expect("the picture");
+        let title = h.text_rect(shared::EMPTY_TITLE).unwrap();
+        let how = h.text_rect(shared::EMPTY_HOW).unwrap();
+        assert!(picture.0.y - picture.1 >= toolbar, "nothing above the toolbar");
+        assert!(picture.0.y + picture.1 <= title.top() && title.bottom() <= how.top(), "in order, apart");
+        // The Photos line is below the fold until the page is scrolled to it, and then it is still under the how line
+        assert!(h.text_rect(shared::PHOTOS_LINK).is_none_or(|r| r.top() > how.bottom()));
+        h.scroll(egui::pos2(SIDEBAR_EDGE + 200.0, toolbar + 100.0), 400.0);
+        let photos = h.text_rect(shared::EMPTY_PHOTOS).expect("reachable by scrolling");
+        let link = h.text_rect(shared::PHOTOS_LINK).expect("reachable by scrolling");
+        assert!(photos.bottom() <= h.screen.y && link.bottom() <= h.screen.y && photos.top() >= toolbar, "{photos:?} {link:?}");
     }
 
     #[test]
@@ -8583,10 +8733,12 @@ mod tests {
         h.frames(3);
         assert!(h.text_at(shared::LOADING).is_some());
         assert!(h.text_at(shared::PHOTOS_NOTE).is_none(), "first load");
+        assert!(h.text_at(shared::EMPTY_PHOTOS).is_none(), "first load");
         h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Err("Proton Drive is offline".into())));
         h.frames(3);
         assert!(h.text_at("Retry").is_some());
         assert!(h.text_at(shared::PHOTOS_NOTE).is_none(), "error");
+        assert!(h.text_at(shared::EMPTY_PHOTOS).is_none(), "error");
         assert!(h.text_at(shared::PHOTOS_LINK).is_none());
     }
 

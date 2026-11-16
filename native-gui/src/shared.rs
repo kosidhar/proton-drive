@@ -35,10 +35,14 @@ pub struct SharedItem {
 
 pub const WEB_SHARED_URL: &str = "https://drive.proton.me/shared";
 pub const LOADING: &str = "Loading what you've shared…";
-/// Under the list and the empty text: the daemon never asks for Photos shares (#256)
+/// Under the list: the daemon never asks for Photos shares (#256)
 pub const PHOTOS_NOTE: &str = "Photos and albums you share from Photos may not be listed here.";
 pub const PHOTOS_LINK: &str = "See them on drive.proton.me";
-pub const EMPTY: &str = "Nothing shared yet. Right-click a file or folder in Files and choose Share… or Copy Link.";
+/// The empty page's heading, and the one line of how
+pub const EMPTY_TITLE: &str = "Nothing shared yet";
+pub const EMPTY_HOW: &str = "Right-click a file or folder in Files and choose Share…";
+/// The empty page's lead-in to `PHOTOS_LINK`
+pub const EMPTY_PHOTOS: &str = "Shared from Photos?";
 
 /// The folder an item is in, and whether it is hidden or not here.
 pub fn folder_text(item: &SharedItem) -> String {
