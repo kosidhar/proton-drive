@@ -2669,11 +2669,8 @@ impl ProtonDriveNativeApp {
 
                         ui.add_space(20.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            // Taking something away is red, not the primary purple
-                            let kind = if matches!(
-                                confirm,
-                                PendingConfirm::DeleteMissing { .. } | PendingConfirm::StopSharing { .. } | PendingConfirm::VirtualDriveOff
-                            ) {
+                            // Deleting from Proton Drive or ending a share is red; switching the drive off loses nothing, so it stays purple
+                            let kind = if matches!(confirm, PendingConfirm::DeleteMissing { .. } | PendingConfirm::StopSharing { .. }) {
                                 ButtonKind::Danger
                             } else {
                                 ButtonKind::Primary
@@ -9314,6 +9311,15 @@ mod tests {
         assert_eq!(h.fill_under(stop), Some(STATUS_DANGER));
         assert_ne!(h.fill_under(h.text_at("Cancel").unwrap()), Some(STATUS_DANGER));
         assert_eq!(h.fill_under(h.text_at("Cancel").unwrap()), Some(BG_CARD()), "Cancel is a secondary button");
+    }
+
+    #[test]
+    fn switching_the_virtual_drive_off_confirms_in_purple() {
+        let mut h = Harness::new();
+        h.app.pending_confirm = Some(PendingConfirm::VirtualDriveOff);
+        h.frames(10);
+        let off = h.text_at("Switch off").expect("the dialog is painted");
+        assert_eq!(h.fill_under(off), Some(PROTON_PURPLE));
     }
 
     #[test]
