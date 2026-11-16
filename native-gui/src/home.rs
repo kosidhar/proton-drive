@@ -357,6 +357,23 @@ pub fn storage(account: Option<&AccountInfo>) -> Option<Storage> {
     })
 }
 
+/// Home's storage row: "3.0 GB used · 507.0 GB free of 510.0 GB". None without a quota.
+pub fn storage_line(account: Option<&AccountInfo>) -> Option<String> {
+    let a = account.filter(|a| a.max_space > 0)?;
+    Some(format!(
+        "{} used · {} free of {}",
+        format_bytes(a.used_space),
+        format_bytes(a.max_space.saturating_sub(a.used_space)),
+        format_bytes(a.max_space)
+    ))
+}
+
+/// What the row says on hover: Drive's share, the rest being the account's other apps. None without a quota.
+pub fn storage_hover(account: Option<&AccountInfo>) -> Option<String> {
+    let a = account.filter(|a| a.max_space > 0)?;
+    Some(format!("Drive uses {} of it; the rest is your other Proton apps", format_bytes(a.used_drive_space)))
+}
+
 /// A usage bar, 4 pt high and as wide as there is room: its `track`, filled with `fraction` of it in `fill` (at least a
 /// dot, so that a little use still shows). The sidebar's meter and the account menu share it.
 pub(crate) fn usage_bar(ui: &mut egui::Ui, fraction: f32, fill: Color32, track: Color32) -> egui::Response {
@@ -879,9 +896,10 @@ impl ProtonDriveNativeApp {
     }
 
     /// Your drive: where it is and how it is shown, its trash, and what is on this computer. Open in Files is the
-    /// sidebar's, and the account's storage is at the sidebar's foot.
+    /// sidebar's, and the account's storage is here and at the sidebar's foot.
     fn render_your_drive(&mut self, ui: &mut egui::Ui) {
         let sync_dir = self.status.sync_dir.clone();
+        let account = self.status.account.clone();
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.label(RichText::new("Your drive").font(crate::bold(13.0)).color(TEXT_MUTED()));
@@ -906,6 +924,35 @@ impl ProtonDriveNativeApp {
                     });
                 });
             });
+
+            if let (Some(line), Some(hover), Some(st)) =
+                (storage_line(account.as_ref()), storage_hover(account.as_ref()), storage(account.as_ref()))
+            {
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(10.0);
+                let label = RichText::new("Proton storage").size(13.0).color(TEXT_PRIMARY());
+                let value = RichText::new(&line).size(13.0).color(TEXT_MUTED());
+                // Side by side when they fit, else the line wraps under the label rather than clipping
+                let width_of = |ui: &egui::Ui, t: &RichText| {
+                    let galley = egui::WidgetText::from(t.clone()).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
+                    galley.size().x
+                };
+                let fits = width_of(ui, &label) + width_of(ui, &value) + 16.0 <= ui.available_width();
+                if fits {
+                    ui.horizontal(|ui| {
+                        ui.label(label).on_hover_text(&hover);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(value).on_hover_text(&hover);
+                        });
+                    });
+                } else {
+                    ui.label(label).on_hover_text(&hover);
+                    ui.add(egui::Label::new(value).wrap()).on_hover_text(&hover);
+                }
+                ui.add_space(6.0);
+                usage_bar(ui, st.fraction, PROTON_PURPLE, BORDER_SUBTLE()).on_hover_text(&hover);
+            }
 
             ui.add_space(12.0);
             ui.separator();
