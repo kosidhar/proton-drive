@@ -10,7 +10,7 @@ use crate::{
     action_button, card_frame, drive_status_line, files_safe_hint, format_bytes, offers_mount_again,
     render_transfer_line, shown_folder, spawn_reaped, AccountInfo, ButtonKind, ConflictRecord, DaemonStatus,
     PendingConfirm, ProtonDriveNativeApp, VfsStatus, WorkerCommand, BG_CARD_ALT, BORDER_SUBTLE, PROTON_PURPLE,
-    PROTON_PURPLE_TEXT, SCREENSHOT_MODE, STATUS_DANGER, STATUS_SUCCESS, STATUS_WARNING, TEXT_MUTED, TEXT_PRIMARY,
+    DANGER_TEXT, PROTON_PURPLE_TEXT, SCREENSHOT_MODE, STATUS_DANGER, STATUS_SUCCESS, STATUS_WARNING, TEXT_MUTED, TEXT_PRIMARY,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -375,7 +375,7 @@ fn tone_color(tone: Tone) -> Color32 {
         Tone::Busy => PROTON_PURPLE_TEXT(),
         Tone::Paused => TEXT_MUTED(),
         Tone::Attention => STATUS_WARNING,
-        Tone::Offline => STATUS_DANGER,
+        Tone::Offline => DANGER_TEXT(),
     }
 }
 
@@ -708,7 +708,7 @@ impl ProtonDriveNativeApp {
             // Why the last resolve of a conflict was refused, once for the list
             if let Some(error) = &self.conflict_error {
                 ui.add_space(4.0);
-                ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
+                ui.add(egui::Label::new(RichText::new(error).size(12.5).color(DANGER_TEXT())).wrap());
             }
             ui.add_space(10.0);
             ScrollArea::vertical()
@@ -800,7 +800,7 @@ impl ProtonDriveNativeApp {
                 ui.label(RichText::new(failed_items_text(n)).size(13.5).strong().color(TEXT_PRIMARY()));
             }),
             Attention::LastError(text) => attention_row(ui, |ui| {
-                ui.add(egui::Label::new(RichText::new(text).size(13.0).color(STATUS_DANGER)).wrap());
+                ui.add(egui::Label::new(RichText::new(text).size(13.0).color(DANGER_TEXT())).wrap());
             }),
         }
     }
@@ -813,7 +813,7 @@ impl ProtonDriveNativeApp {
         }
         if let Some(error) = &self.drive_error {
             ui.add_space(8.0);
-            ui.add(egui::Label::new(RichText::new(error).size(12.5).color(STATUS_DANGER)).wrap());
+            ui.add(egui::Label::new(RichText::new(error).size(12.5).color(DANGER_TEXT())).wrap());
         }
     }
 
