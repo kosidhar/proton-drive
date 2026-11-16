@@ -6930,10 +6930,18 @@ mod tests {
         let page = |h: &Harness, text: &str| {
             h.text_rects_all(text).into_iter().find(|r| r.center().x > SIDEBAR_EDGE).unwrap_or_else(|| panic!("{text} on the page"))
         };
+        // The buttons' frames (what a screen reader and a pointer see), not only their labels
+        let frame = |h: &Harness, name: &str| {
+            let nodes = h.nodes_named(name);
+            let node = nodes.iter().find(|n| n.bounds().is_some_and(|b| b.x0 as f32 > SIDEBAR_EDGE)).unwrap_or_else(|| panic!("{name} on the page"));
+            node_rect(node)
+        };
         let kind = home::drive_kind(None);
         let name = h.text_rect_starting("/srv").expect("the drive's name");
         let kind_line = page(&h, kind);
-        let (open, trash) = (page(&h, chrome::OPEN_IN_FILES), page(&h, "Trash"));
+        let (open, trash) = (frame(&h, chrome::OPEN_IN_FILES), frame(&h, home::OPEN_TRASH));
+        assert!(h.nodes_named(chrome::OPEN_IN_FILES).iter().any(|n| n.bounds().is_some_and(|b| b.x0 as f32 > SIDEBAR_EDGE)), "named for screen readers");
+        assert!((trash.left() - open.right() - 12.0).abs() < 0.5, "12 between the buttons, as under the status: {open:?} {trash:?}");
         for b in [open, trash] {
             assert!((b.center().y - name.center().y).abs() < 12.0, "{b:?} is level with the name {name:?}");
             assert!(b.left() > name.right() && b.left() > kind_line.right(), "{b:?} is right of {name:?} and {kind_line:?}");
@@ -6941,7 +6949,8 @@ mod tests {
         h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
         let name = h.text_rect_starting("/srv").expect("the drive's name");
         let kind_line = page(&h, kind);
-        let (open, trash) = (page(&h, chrome::OPEN_IN_FILES), page(&h, "Trash"));
+        let (open, trash) = (frame(&h, chrome::OPEN_IN_FILES), frame(&h, home::OPEN_TRASH));
+        assert!((trash.left() - open.right() - 12.0).abs() < 0.5, "12 between the buttons when stacked too: {open:?} {trash:?}");
         for b in [open, trash] {
             assert!(!b.intersects(name) && !b.intersects(kind_line), "{b:?} clear of {name:?} and {kind_line:?}");
         }
@@ -7696,8 +7705,9 @@ mod tests {
         h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
         let text = chrome::storage_meter_text(h.app.status.account.as_ref()).unwrap();
         let rect = |label: &str| h.text_rect(label).unwrap_or_else(|| panic!("{label} is painted"));
+        let sidebar_open = h.text_rects_all(chrome::OPEN_IN_FILES).into_iter().find(|r| r.center().x < SIDEBAR_EDGE).expect("the sidebar's");
         let (name, open, home, activity, meter) =
-            (rect("Proton Drive"), rect(chrome::OPEN_IN_FILES), rect("Home"), rect("Activity"), rect(&text));
+            (rect("Proton Drive"), sidebar_open, rect("Home"), rect("Activity"), rect(&text));
         assert!(name.bottom() < open.top(), "the logo {name:?} is above Open in Files {open:?}");
         assert!(open.bottom() < home.top(), "Open in Files {open:?} is above Home {home:?}");
         assert!(activity.bottom() < meter.top(), "Activity {activity:?} is above the meter {meter:?}");
