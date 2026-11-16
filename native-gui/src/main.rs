@@ -3089,9 +3089,11 @@ impl ProtonDriveNativeApp {
                     .inner_margin(SECTION_MARGIN),
             )
             .show(ctx, |ui| {
-                // Nothing under the confirmation dialog or the Share window takes clicks or keys while it is open
+                // Nothing under the confirmation dialog or the Share window takes clicks or keys while it is open,
+                // and an ⓘ's words opened by a click close rather than sit over it
                 if self.dialog_open() {
                     ui.disable();
+                    settings::close_open_info(ctx);
                 }
                 match self.tab {
                     NavTab::Home => self.render_home(ui),
@@ -9717,13 +9719,88 @@ mod tests {
         assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "and not open again");
     }
 
+    const DRIVE_EXPLAINED: &str = "Files you haven't downloaded appear in Files and download when you open them.";
+
+    /// Settings with the virtual drive off, so that flipping its switch would send `virtual drive true` at once (on, a
+    /// flip only asks first).
+    fn settings_drive_off(size: Vec2, zoom: f32) -> Harness {
+        let mut h = Harness::settings(Some(vfs("plain", true, None)), Some(false));
+        h.resize_zoomed(size, zoom);
+        h
+    }
+
     #[test]
     fn clicking_the_drive_switchs_info_leaves_the_switch_alone() {
-        const EXPLAINED: &str = "Files you haven't downloaded appear in Files and download when you open them.";
-        let mut h = settings_tall_timed();
+        let mut h = settings_drive_off(Vec2::new(1440.0, 2400.0), 1.0);
         h.click(info_after(&h, SWITCH));
-        assert!(h.text_at(EXPLAINED).is_some(), "its words");
+        assert!(h.text_at(DRIVE_EXPLAINED).is_some(), "its words");
         assert_eq!(h.sent(), Vec::<String>::new(), "the switch next to it isn't flipped");
+        assert!(h.app.pending_confirm.is_none(), "nor asked about");
+    }
+
+    // A click on an open ⓘ's words is theirs: it closes them, and never reaches the control they hide (the review of
+    // #318: in a narrow window the drive's ⓘ's words cover its switch, which would turn the virtual drive on)
+    #[test]
+    fn a_click_on_open_words_does_not_reach_what_they_cover() {
+        let mut h = settings_drive_off(Vec2::new(840.0, 900.0), 1.2);
+        h.click(info_after(&h, SWITCH));
+        let words = h.text_rect(DRIVE_EXPLAINED).expect("the ⓘ's words");
+        let switch = h.widgets_at_all(SWITCH).into_iter().find(|p| words.expand(6.0).contains(*p));
+        let switch = switch.expect("in this narrow window the words cover the drive's switch");
+        h.click(switch);
+        assert_eq!(h.sent(), Vec::<String>::new(), "the hidden switch isn't flipped");
+        assert!(h.app.pending_confirm.is_none());
+        assert!(h.text_at(DRIVE_EXPLAINED).is_none(), "the click closes the words");
+    }
+
+    /// Presses Tab until the ⓘ saying `words` has the focus (its words then show), at most `limit` times.
+    fn tab_to_info(h: &mut Harness, words: &str, limit: usize) {
+        for _ in 0..limit {
+            if h.text_at(words).is_some() {
+                return;
+            }
+            press_key(h, egui::Key::Tab);
+        }
+        panic!("no ⓘ saying {words:?} took the focus in {limit} Tabs");
+    }
+
+    #[test]
+    fn a_focused_infos_words_stay_when_the_pointer_comes_onto_it() {
+        let mut h = settings_tall_timed();
+        // The pointer somewhere first, so that coming onto the ⓘ is a move egui times its tooltip delay from
+        let info = info_after(&h, "Apps blocked from downloading");
+        h.frame(vec![egui::Event::PointerMoved(egui::pos2(SIDEBAR_EDGE + 8.0, h.screen.y - 8.0))]);
+        tab_to_info(&mut h, BLOCKED_EXPLAINED, 40);
+        h.frame(vec![egui::Event::PointerMoved(info)]);
+        h.frames(3);
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_some(), "the words don't vanish while egui's hover delay runs");
+    }
+
+    #[test]
+    fn a_focused_info_out_of_sight_shows_nothing() {
+        let mut h = Harness::settings(Some(vfs("virtual", true, None)), Some(true));
+        h.resize_zoomed(Vec2::new(1440.0, 700.0), 1.0);
+        tab_to_info(&mut h, BLOCKED_EXPLAINED, 40);
+        // Scrolled away with the wheel, the focus staying on it
+        h.scroll(egui::pos2(SIDEBAR_EDGE + 200.0, h.screen.y - 40.0), 800.0);
+        let heading = h.text_rect("Apps blocked from downloading");
+        assert!(heading.is_none_or(|r| r.bottom() < chrome::TOP_BAR_HEIGHT), "scrolled away");
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "its words don't float detached from it");
+    }
+
+    #[test]
+    fn an_open_info_closes_when_the_share_window_opens() {
+        let mut h = settings_tall_timed();
+        h.click(info_after(&h, "Apps blocked from downloading"));
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_some());
+        // Files asks for the Share window while Settings is open
+        h.app.open_share("/home/u/ProtonDrive/Docs/report.pdf");
+        h.frames(3);
+        assert!(h.app.share.is_some());
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "the words don't sit over the Share window");
+        h.app.share = None;
+        h.frames(3);
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "nor come back when it closes");
     }
 
     #[test]
