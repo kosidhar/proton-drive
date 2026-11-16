@@ -101,6 +101,20 @@ export class AvailabilityPolicy {
     return row !== null;
   }
 
+  // How many items in Proton Drive below the top level carry their own Always keep mark, and whether the top level
+  // itself does (by its own flag: the engine adds the pin a fresh install's first sync is still to make). An item hidden
+  // or being hidden keeps its own pin row, but nothing of it is kept here, so it isn't counted; the top level is never
+  // hidden. Reads only.
+  pinnedSummary(): { items: number; wholeDrive: boolean } {
+    const row = this.db
+      .query(
+        `SELECT COUNT(*) AS items FROM availability a JOIN remote_nodes n ON n.uid = a.nodeUid
+                 WHERE a.pin = 'pinned' AND a.hide IS NULL AND n.relPath != ''`,
+      )
+      .get() as { items: number };
+    return { items: row.items, wholeDrive: this.isPinned("") };
+  }
+
   stateOf(relPath: string): ItemAvailability {
     const hidden = this.hiddenBy(relPath);
     if (hidden) {

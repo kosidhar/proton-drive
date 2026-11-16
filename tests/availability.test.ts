@@ -328,6 +328,44 @@ describe("AvailabilityPolicy", () => {
     expect(policy.hasPinnedBelow("")).toBe(false);
     expect(policy.isPinned("Docs/Deep/c.txt")).toBe(true);
   });
+
+  test("pinnedSummary counts the items marked Always keep below the top level, and says whether the top level is (#296)", () => {
+    expect(policy.pinnedSummary()).toEqual({ items: 0, wholeDrive: false });
+    policy.setPin("docs", "pinned", false);
+    policy.setPin("music", "pinned", false);
+    policy.setPin("deep", "unpinned", false); // freed inside a kept folder: not a mark
+    policy.setHide("photos", "hidden"); // nor is a hide
+    expect(policy.pinnedSummary()).toEqual({ items: 2, wholeDrive: false });
+
+    policy.setPin("root", "pinned", false);
+    expect(policy.pinnedSummary()).toEqual({ items: 2, wholeDrive: true });
+
+    // A mark on something no longer in Proton Drive isn't counted
+    index.replaceChildren("root", "", [folder("docs", "root", "Docs"), folder("photos", "root", "Photos")]);
+    expect(policy.pinnedSummary()).toEqual({ items: 1, wholeDrive: true });
+
+    policy.setPin("root", "unpinned", true);
+    expect(policy.pinnedSummary()).toEqual({ items: 0, wholeDrive: false });
+  });
+
+  test("pinnedSummary doesn't count a hidden item's old mark as Always keep (#296)", () => {
+    policy.setPin("docs", "pinned", false);
+    policy.setPin("music", "pinned", false);
+    expect(policy.pinnedSummary()).toEqual({ items: 2, wholeDrive: false });
+
+    // A hide keeps the item's own pin row, but nothing of it is kept on this computer
+    policy.setHide("docs", "hidden");
+    expect(policy.stateOf("Docs")).toBe("hidden");
+    expect(policy.pinnedSummary()).toEqual({ items: 1, wholeDrive: false });
+    // Nor is anything of an item being hidden
+    policy.setHide("music", "pending");
+    expect(policy.stateOf("Music")).toBe("hiding");
+    expect(policy.pinnedSummary()).toEqual({ items: 0, wholeDrive: false });
+
+    // Unhidden, its mark counts again
+    policy.setHide("docs", null);
+    expect(policy.pinnedSummary()).toEqual({ items: 1, wholeDrive: false });
+  });
 });
 
 describe("AvailabilityPolicy.childStates", () => {
