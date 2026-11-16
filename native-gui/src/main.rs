@@ -2331,23 +2331,32 @@ impl ProtonDriveNativeApp {
                 ui.add(egui::Label::new(RichText::new(shared::EMPTY_HOW).size(13.0).color(TEXT_MUTED())).wrap().halign(Align::Center));
             });
             ui.add_space(24.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                // Centred: the row is as wide as its two parts
-                let parts = ui.painter().layout_no_wrap(shared::EMPTY_PHOTOS.into(), FontId::proportional(12.0), TEXT_MUTED()).size().x
-                    + ui.painter().layout_no_wrap(shared::PHOTOS_LINK.into(), FontId::proportional(12.0), TEXT_MUTED()).size().x
-                    + 4.0;
-                ui.add_space(((ui.available_width() - parts) / 2.0).max(0.0));
-                ui.label(RichText::new(shared::EMPTY_PHOTOS).size(12.0).color(TEXT_MUTED()));
-                if ui.add(egui::Link::new(RichText::new(shared::PHOTOS_LINK).size(12.0))).clicked() {
-                    home::open_externally(std::ffi::OsStr::new(shared::WEB_SHARED_URL), self.screenshot_target.is_some());
+            // Centred in one row if both parts fit the page, else the lead-in above the link
+            let width_of = |ui: &egui::Ui, text: &str| ui.painter().layout_no_wrap(text.into(), FontId::proportional(PHOTOS_SIZE), TEXT_MUTED()).size().x;
+            let parts = width_of(ui, shared::EMPTY_PHOTOS) + PHOTOS_GAP + width_of(ui, shared::PHOTOS_LINK);
+            let lead_in = |ui: &mut egui::Ui| ui.label(RichText::new(shared::EMPTY_PHOTOS).size(PHOTOS_SIZE).color(TEXT_MUTED()));
+            let link = |ui: &mut egui::Ui| {
+                if ui.add(egui::Link::new(RichText::new(shared::PHOTOS_LINK).size(PHOTOS_SIZE))).clicked() {
+                    Self::open_shared_on_web(self.screenshot_target.is_some());
                 }
-            });
+            };
+            if parts <= ui.available_width() {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = PHOTOS_GAP;
+                    ui.add_space((ui.available_width() - parts) / 2.0);
+                    lead_in(ui);
+                    link(ui);
+                });
+            } else {
+                lead_in(ui);
+                link(ui);
+            }
         });
         let height = group.response.rect.height();
         if (height - last).abs() > 0.5 {
             ui.ctx().data_mut(|d| d.insert_temp(id, height));
-            ui.ctx().request_repaint();
+            // This frame placed the group by a stale height: draw it again with the new one
+            ui.ctx().request_discard("shared empty height");
         }
     }
 
@@ -2357,9 +2366,13 @@ impl ProtonDriveNativeApp {
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.label(RichText::new(shared::PHOTOS_NOTE).size(12.5).color(TEXT_MUTED()));
             if ui.add(egui::Link::new(RichText::new(shared::PHOTOS_LINK).size(12.5))).clicked() {
-                home::open_externally(std::ffi::OsStr::new(shared::WEB_SHARED_URL), screenshot);
+                Self::open_shared_on_web(screenshot);
             }
         });
+    }
+
+    fn open_shared_on_web(screenshot: bool) {
+        home::open_externally(std::ffi::OsStr::new(shared::WEB_SHARED_URL), screenshot);
     }
 
     /// What a button of the row at `i` does.
@@ -3846,6 +3859,10 @@ struct SharePictureColors {
 fn share_picture_colors(p: &Palette) -> SharePictureColors {
     SharePictureColors { circle: p.purple_soft, glyph: p.purple_text, badge: p.card, badge_line: p.border_weak }
 }
+
+/// The empty Shared page's Photos line: its text size, and the gap between the lead-in and the link
+const PHOTOS_SIZE: f32 = 12.0;
+const PHOTOS_GAP: f32 = 4.0;
 
 /// The empty Shared page's picture, for looking at only (screen readers get the heading): a link in a soft circle with
 /// a person's badge at each side.
@@ -8689,7 +8706,23 @@ mod tests {
         let top = h.widget_at("Refresh").expect("Refresh").y + 20.0;
         let share = (centre.y - top) / (h.screen.y - top);
         assert!((0.25..=0.60).contains(&share), "{share} of the way down");
+        // The group as a whole sits above the middle: that is what measuring its height gets (unmeasured, it is at 0.5)
+        let link = h.text_rect(shared::PHOTOS_LINK).expect("the Photos link");
+        let middle = ((centre.y - radius) + link.bottom()) / 2.0;
+        let whole = (middle - top) / (h.screen.y - top);
+        assert!(whole < 0.5, "the group's middle is {whole} of the way down");
         assert!(h.nodes_named(icons::SHARED).is_empty() && h.nodes_named(icons::PERSON).is_empty(), "the picture isn't announced");
+    }
+
+    #[test]
+    fn the_photos_line_stacks_when_the_page_is_too_narrow_for_one_row() {
+        let mut h = empty_shared();
+        h.resize_zoomed(Vec2::new(840.0, 760.0), 1.6);
+        let lead = h.text_rect(shared::EMPTY_PHOTOS).expect("the lead-in");
+        let link = h.text_rect(shared::PHOTOS_LINK).expect("the link, whole");
+        assert!(link.right() <= h.screen.x && link.left() >= SIDEBAR_EDGE, "{link:?} in the page");
+        assert!(lead.bottom() <= link.top(), "stacked: {lead:?} over {link:?}");
+        assert!((lead.center().x - link.center().x).abs() < 2.0, "each centred");
     }
 
     #[test]
@@ -8719,7 +8752,7 @@ mod tests {
         assert!(picture.0.y - picture.1 >= toolbar, "nothing above the toolbar");
         assert!(picture.0.y + picture.1 <= title.top() && title.bottom() <= how.top(), "in order, apart");
         // The Photos line is below the fold until the page is scrolled to it, and then it is still under the how line
-        assert!(h.text_rect(shared::PHOTOS_LINK).is_none_or(|r| r.top() > how.bottom()));
+        assert!(h.text_rect(shared::PHOTOS_LINK).is_none_or(|r| r.bottom() > h.screen.y), "scrolling is needed to reach the link");
         h.scroll(egui::pos2(SIDEBAR_EDGE + 200.0, toolbar + 100.0), 400.0);
         let photos = h.text_rect(shared::EMPTY_PHOTOS).expect("reachable by scrolling");
         let link = h.text_rect(shared::PHOTOS_LINK).expect("reachable by scrolling");
