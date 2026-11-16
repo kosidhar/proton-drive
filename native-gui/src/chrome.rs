@@ -1,14 +1,13 @@
 //! The window's frame around the sections, as Proton's apps have it (#276):
-//! - the sidebar: from the top, the logo, Open in Files, the sections, and at its foot the storage meter and the version;
-//! - the top bar over the section: its title, the gear for Settings, and the account, which opens the account menu
-//!   (#274).
+//! - the sidebar: from the top, the logo, Open in Files, the sections (Settings last), and at its foot the storage meter and the version;
+//! - the top bar over the section: its title and the account, which opens the account menu (#274).
 
 use std::path::Path;
 
 use eframe::egui::{self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, Vec2};
 
 use crate::{
-    action_button_sized, bold, format_bytes, home, icon_button_pressed, icons, settings, truncate_middle_to_width,
+    action_button_sized, bold, format_bytes, home, icons, settings, truncate_middle_to_width,
     AccountInfo, ButtonKind, NavTab, ProtonDriveNativeApp, WorkerCommand, BG_CANVAS, BG_CARD_ALT, BG_SIDEBAR,
     BORDER_NORM, BORDER_SUBTLE, PROTON_PURPLE, PROTON_PURPLE_SOFT, SIDEBAR_HOVER, SIDEBAR_SELECTED, SIDEBAR_TEXT,
     SIDEBAR_WEAK, STATUS_DANGER, STORAGE_FILL, STORAGE_TRACK, TEXT_MUTED, TEXT_PRIMARY,
@@ -34,8 +33,6 @@ const ACCOUNT_PADDING: f32 = 6.0;
 const ACCOUNT_GAP: f32 = 10.0;
 /// The most the account's name and email take on the top bar: longer ones are shortened in the middle
 const ACCOUNT_TEXT_WIDTH: f32 = 220.0;
-/// The gear's side, as `icon_button`'s
-const GEAR_SIZE: f32 = 28.0;
 const ACCOUNT_MENU_ID: &str = "account_menu";
 /// The account menu's rows' width
 const ACCOUNT_MENU_WIDTH: f32 = 280.0;
@@ -129,13 +126,14 @@ impl ProtonDriveNativeApp {
         }
     }
 
-    /// Home, Shared and Activity. Home counts what needs the user. Settings is behind the top bar's gear.
+    /// Home, Shared, Activity and Settings. Home counts what needs the user.
     fn render_sections(&mut self, ui: &mut egui::Ui) {
         let count = (!self.attention.is_empty()).then(|| self.attention.len().to_string());
         let sections = [
             (NavTab::Home, icons::HOME, "Home", count),
             (NavTab::Shared, icons::SHARED, "Shared", None),
             (NavTab::Activity, icons::ACTIVITY, "Activity", None),
+            (NavTab::Settings, icons::SETTINGS, "Settings", None),
         ];
         for (tab, icon, label, count) in sections {
             if section_row(ui, icon, label, self.tab == tab, count.as_deref()).clicked() {
@@ -224,15 +222,15 @@ enum AccountAction {
 }
 
 impl ProtonDriveNativeApp {
-    /// The top bar over the section: its title on the left; on the right, the gear (Settings), then the account, which
-    /// opens the account menu.
+    /// The top bar over the section: its title on the left; on the right, the account, which opens the account
+    /// menu.
     pub(crate) fn render_top_bar(&mut self, ctx: &egui::Context) {
         // Nothing under the confirmation dialog or the Share window takes clicks, and the menu doesn't stay over them
         let dialog = self.dialog_open();
         if dialog {
             self.account_menu_open = false;
         }
-        let (gear, account) = egui::TopBottomPanel::top("top_bar")
+        let account = egui::TopBottomPanel::top("top_bar")
             .exact_height(TOP_BAR_HEIGHT)
             // The bottom edge is egui's separator line, in BORDER_SUBTLE as the sidebar's
             .show_separator_line(true)
@@ -249,23 +247,16 @@ impl ProtonDriveNativeApp {
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.label(RichText::new(tab_title(self.tab)).font(bold(17.0)).color(TEXT_PRIMARY()));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        // The name and email take what the title, the gear and the initials leave, up to 220 pt
-                        let spacing = ui.spacing().item_spacing.x; // after the account, before the gap to the gear
-                        let fixed = INITIALS_SIZE + 2.0 * ACCOUNT_PADDING + 2.0 * ACCOUNT_GAP + GEAR_SIZE + spacing;
+                        // The name and email take what the title and the initials leave, up to 220 pt
+                        let fixed = INITIALS_SIZE + 2.0 * ACCOUNT_PADDING + 2.0 * ACCOUNT_GAP;
                         let room = (ui.available_width() - fixed).clamp(0.0, ACCOUNT_TEXT_WIDTH);
-                        let account = self.account_block(ui, room).clicked();
-                        ui.add_space(ACCOUNT_GAP);
-                        let gear = icon_button_pressed(ui, icons::SETTINGS, "Settings", self.tab == NavTab::Settings);
-                        (gear.clicked(), account)
+                        self.account_block(ui, room).clicked()
                     })
                     .inner
                 })
                 .inner
             })
             .inner;
-        if gear {
-            self.open_tab(NavTab::Settings);
-        }
         self.render_account_menu(ctx);
         // Shown from the next frame: in this one, the click that opened it would count as a click outside it
         if account {
