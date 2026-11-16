@@ -4335,9 +4335,15 @@ OPTIONS:
   --confirm-stop-sharing <NAME>  with --screenshot and --fake-shared list: show the Stop sharing confirmation for that row
   --fake-shared <S>     with --screenshot: show the Shared section (--tab shared) as S (list | empty | offline)
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
+  --zoom <F>            with --screenshot: render at zoom factor F (0.5 to 3, e.g. 1.2), as Ctrl+= would
   --version             print the version
   -h, --help            print this help
 ";
+
+/// Parses a `--zoom` value like "1.2": a zoom factor from 0.5 to 3.
+fn parse_zoom(s: &str) -> Option<f32> {
+    s.trim().parse::<f32>().ok().filter(|z| (0.5..=3.0).contains(z))
+}
 
 /// Parses a `--size` value like "1280x800", clamped to the window range the app supports
 /// (winit panics on zero/negative sizes under Wayland).
@@ -4374,6 +4380,7 @@ fn main() -> eframe::Result {
     let mut cli_fake_share: Option<String> = None;
     let mut cli_fake_shared: Option<String> = None;
     let mut cli_confirm_stop_sharing: Option<String> = None;
+    let mut cli_zoom: Option<f32> = None;
     // The arguments as the system gives them: one that isn't UTF-8 (a file's name can be anything) mustn't stop the app
     // (#216). --share's path is kept as it is; every other value is read as text, as near as it can be
     let text = |arg: Option<std::ffi::OsString>| arg.map(|a| a.to_string_lossy().into_owned());
@@ -4454,6 +4461,13 @@ fn main() -> eframe::Result {
             "--search" => {
                 cli_search = text(args.next());
             }
+            "--zoom" => {
+                let raw = text(args.next()).unwrap_or_default();
+                cli_zoom = parse_zoom(&raw);
+                if cli_zoom.is_none() {
+                    eprintln!("protondrive-gui: ignoring invalid --zoom {raw:?} (expected a factor from 0.5 to 3, e.g. 1.2)");
+                }
+            }
             "--share" => {
                 cli_share = args.next();
             }
@@ -4488,10 +4502,11 @@ fn main() -> eframe::Result {
             || cli_account_menu
             || cli_fake_share.is_some()
             || cli_fake_shared.is_some()
-            || cli_confirm_stop_sharing.is_some())
+            || cli_confirm_stop_sharing.is_some()
+            || cli_zoom.is_some())
     {
         eprintln!(
-            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --account-menu, --fake-share, --fake-shared and --confirm-stop-sharing only apply together with --screenshot; ignoring them"
+            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --account-menu, --fake-share, --fake-shared, --confirm-stop-sharing and --zoom only apply together with --screenshot; ignoring them"
         );
     }
     let fake_share = match cli_fake_share {
@@ -4641,6 +4656,9 @@ fn main() -> eframe::Result {
             }
             // Screenshot-only: these flags only draw the dialogs, nothing is sent
             if app.screenshot_target.is_some() {
+                if let Some(zoom) = cli_zoom {
+                    cc.egui_ctx.set_zoom_factor(zoom);
+                }
                 if cli_confirm_free_all {
                     // Free up space for the whole drive, as Home offers it
                     app.pending_confirm = Some(PendingConfirm::FreeAll { rel_path: String::new() });
@@ -4873,6 +4891,15 @@ mod tests {
             assert_eq!(parse_tab(old), NavTab::Home, "{old}");
         }
         assert_eq!(parse_tab("nonsense"), NavTab::Home);
+    }
+
+    #[test]
+    fn parse_zoom_accepts_a_factor_from_half_to_three() {
+        assert_eq!(parse_zoom("1.2"), Some(1.2));
+        assert_eq!(parse_zoom(" 2 "), Some(2.0));
+        for wrong in ["0", "0.4", "3.5", "-1", "big", "", "NaN"] {
+            assert_eq!(parse_zoom(wrong), None, "{wrong:?}");
+        }
     }
 
     #[test]
