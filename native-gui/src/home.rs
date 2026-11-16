@@ -7,7 +7,7 @@ use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, Ri
 
 use crate::icons;
 use crate::{
-    action_button, card_frame, drive_status_line, files_safe_hint, format_bytes, offers_mount_again,
+    action_button, action_button_if, card_frame, drive_status_line, files_safe_hint, format_bytes, offers_mount_again,
     render_transfer_line, shown_folder, spawn_reaped, AccountInfo, ButtonKind, ConflictRecord, DaemonStatus,
     PendingConfirm, ProtonDriveNativeApp, VfsStatus, WorkerCommand, BG_CARD_ALT, BORDER_SUBTLE, PROTON_PURPLE,
     DANGER_TEXT, PROTON_PURPLE_TEXT, SCREENSHOT_MODE, STATUS_DANGER, STATUS_SUCCESS, STATUS_WARNING, TEXT_MUTED, TEXT_PRIMARY,
@@ -594,8 +594,7 @@ impl ProtonDriveNativeApp {
             .id_salt("home_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                // A gutter for the scroll bar, so that it never draws over the cards' edges
-                Frame::NONE.inner_margin(Margin { left: 0, right: 12, top: 0, bottom: 0 }).show(ui, |ui| {
+                Frame::NONE.inner_margin(crate::SCROLL_GUTTER).show(ui, |ui| {
                     self.render_status_block(ui);
                     self.render_notice(ui);
                     if !self.attention.is_empty() {
@@ -612,84 +611,34 @@ impl ProtonDriveNativeApp {
             });
     }
 
-    /// The status in a sentence, with Pause and Sync now, or Sign in while signed out.
+    /// The status in a sentence, with Pause and Sync now, or Sign in while signed out. In a narrow card (a small window,
+    /// a large zoom) the buttons go under the headline, as a setting's control goes under its label (`setting_row`).
     fn render_status_block(&mut self, ui: &mut egui::Ui) {
         let summary = status_summary(&self.status, self.daemon_online, self.initial_connecting, self.attention.len(), now_ms());
-        let (pause_label, pause_to) = pause_button(&self.status);
         // Pause and Sync now mean nothing without an account: Sign in, as Settings › Account offers it
         let show_sign_in = self.daemon_online && signed_out(&self.status);
         let mut command = None;
         let mut sign_in = false;
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.horizontal_top(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                    if show_sign_in {
-                        sign_in = primary_button(ui, "Sign in", 34.0).clicked();
-                    } else {
-                        ui.add_enabled_ui(self.daemon_online, |ui| {
-                            // Pause looks like Sync now; Resume, while paused, is the filled one
-                            let pause_icon = if pause_to { icons::PAUSE } else { icons::RESUME };
-                            let button = if pause_button_is_primary(&self.status) {
-                                primary_icon_button(ui, pause_icon, pause_label, 34.0)
-                            } else {
-                                secondary_icon_button(ui, pause_icon, pause_label, 34.0)
-                            };
-                            if !pause_to {
-                                if button.clicked() {
-                                    command = Some(WorkerCommand::SetPaused { paused: false, until: None });
-                                }
-                            } else if self.pause_choices_open {
-                                // Over a shield that takes the click on Pause too: any click outside closes them
-                                if let Some(choice) = pause_choices(ui.ctx(), button.rect) {
-                                    command = Some(WorkerCommand::SetPaused {
-                                        paused: true,
-                                        until: choice.until(now_ms(), local_offset_secs),
-                                    });
-                                }
-                                // Read before ui.input: egui's context lock isn't re-entrant
-                                let choices = ui.ctx().memory(|m| m.area_rect(egui::Id::new(PAUSE_CHOICES_ID)));
-                                let outside = ui.input(|i| {
-                                    i.key_pressed(egui::Key::Escape)
-                                        || (i.pointer.primary_clicked() && !pause_choices_hit(choices, i.pointer.interact_pos()))
-                                });
-                                if command.is_some() || outside {
-                                    self.pause_choices_open = false;
-                                }
-                            } else if button.clicked() {
-                                self.pause_choices_open = true; // #205: For 1 hour, Until tomorrow, Until I resume
-                            }
-                            ui.add_space(4.0);
-                            if secondary_icon_button(ui, icons::SYNC, "Sync now", 34.0).clicked() {
-                                command = Some(WorkerCommand::TriggerSync);
-                            }
-                        });
-                    }
-                    ui.add_space(12.0);
-                    ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
-                        let (glyph, color) = status_icon(&summary);
-                        ui.label(RichText::new(glyph).font(icons::font(32.0)).color(color));
-                        ui.add_space(4.0);
-                        ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                            let headline = RichText::new(&summary.headline).font(crate::bold(18.0)).color(tone_color(summary.tone));
-                            ui.add(egui::Label::new(headline).wrap());
-                            if let Some(detail) = &summary.detail {
-                                ui.add_space(2.0);
-                                ui.add(egui::Label::new(RichText::new(detail).size(12.5).color(TEXT_MUTED())).wrap());
-                            }
-                            // The sign-in page opening (why it failed is in the notice below)
-                            if show_sign_in && self.login_url.is_some() {
-                                ui.add_space(2.0);
-                                let text = "Opening the Proton sign-in page in your browser…";
-                                ui.add(egui::Label::new(RichText::new(text).size(12.0).color(PROTON_PURPLE_TEXT())).wrap());
-                            }
+            if ui.available_width() < crate::settings::STACKED_BELOW {
+                ui.horizontal_top(|ui| self.render_status_headline(ui, &summary, show_sign_in));
+                ui.add_space(12.0);
+                ui.horizontal_wrapped(|ui| self.render_status_buttons(ui, false, show_sign_in, &mut command, &mut sign_in));
+            } else {
+                ui.horizontal_top(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        self.render_status_buttons(ui, true, show_sign_in, &mut command, &mut sign_in);
+                        ui.add_space(12.0);
+                        ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
+                            self.render_status_headline(ui, &summary, show_sign_in);
                         });
                     });
                 });
-            });
+            }
         });
         // Only while Pause is offered and can be used
-        if !self.daemon_online || show_sign_in || !pause_to {
+        if !self.daemon_online || show_sign_in || !pause_button(&self.status).1 {
             self.pause_choices_open = false;
         }
         if let Some(command) = command {
@@ -698,6 +647,87 @@ impl ProtonDriveNativeApp {
         if sign_in {
             self.send_account_command(WorkerCommand::StartLogin);
         }
+    }
+
+    /// The status's glyph, then its headline over what it says more.
+    fn render_status_headline(&self, ui: &mut egui::Ui, summary: &StatusSummary, show_sign_in: bool) {
+        let (glyph, color) = status_icon(summary);
+        ui.label(RichText::new(glyph).font(icons::font(32.0)).color(color));
+        ui.add_space(4.0);
+        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+            let headline = RichText::new(&summary.headline).font(crate::bold(18.0)).color(tone_color(summary.tone));
+            ui.add(egui::Label::new(headline).wrap());
+            if let Some(detail) = &summary.detail {
+                ui.add_space(2.0);
+                ui.add(egui::Label::new(RichText::new(detail).size(12.5).color(TEXT_MUTED())).wrap());
+            }
+            // The sign-in page opening (why it failed is in the notice below)
+            if show_sign_in && self.login_url.is_some() {
+                ui.add_space(2.0);
+                let text = "Opening the Proton sign-in page in your browser…";
+                ui.add(egui::Label::new(RichText::new(text).size(12.0).color(PROTON_PURPLE_TEXT())).wrap());
+            }
+        });
+    }
+
+    /// Sync now and Pause (Resume while paused), Sync now on the left; Sign in alone while signed out. `right_to_left`:
+    /// the row is laid out from its right end. What they ask for lands in `command` and `sign_in`.
+    fn render_status_buttons(
+        &mut self,
+        ui: &mut egui::Ui,
+        right_to_left: bool,
+        show_sign_in: bool,
+        command: &mut Option<WorkerCommand>,
+        sign_in: &mut bool,
+    ) {
+        if show_sign_in {
+            *sign_in = primary_button(ui, "Sign in", 34.0).clicked();
+            return;
+        }
+        let (pause_label, pause_to) = pause_button(&self.status);
+        ui.add_enabled_ui(self.daemon_online, |ui| {
+            let order = if right_to_left { [false, true] } else { [true, false] };
+            for (i, sync_now) in order.into_iter().enumerate() {
+                if i > 0 {
+                    ui.add_space(4.0);
+                }
+                if sync_now {
+                    if secondary_icon_button(ui, icons::SYNC, "Sync now", 34.0).clicked() {
+                        *command = Some(WorkerCommand::TriggerSync);
+                    }
+                    continue;
+                }
+                // Pause looks like Sync now; Resume, while paused, is the filled one
+                let pause_icon = if pause_to { icons::PAUSE } else { icons::RESUME };
+                let button = if pause_button_is_primary(&self.status) {
+                    primary_icon_button(ui, pause_icon, pause_label, 34.0)
+                } else {
+                    secondary_icon_button(ui, pause_icon, pause_label, 34.0)
+                };
+                if !pause_to {
+                    if button.clicked() {
+                        *command = Some(WorkerCommand::SetPaused { paused: false, until: None });
+                    }
+                } else if self.pause_choices_open {
+                    // Over a shield that takes the click on Pause too: any click outside closes them
+                    let picked = pause_choices(ui.ctx(), button.rect);
+                    if let Some(choice) = picked {
+                        *command = Some(WorkerCommand::SetPaused { paused: true, until: choice.until(now_ms(), local_offset_secs) });
+                    }
+                    // Read before ui.input: egui's context lock isn't re-entrant
+                    let choices = ui.ctx().memory(|m| m.area_rect(egui::Id::new(PAUSE_CHOICES_ID)));
+                    let outside = ui.input(|i| {
+                        i.key_pressed(egui::Key::Escape)
+                            || (i.pointer.primary_clicked() && !pause_choices_hit(choices, i.pointer.interact_pos()))
+                    });
+                    if picked.is_some() || outside {
+                        self.pause_choices_open = false;
+                    }
+                } else if button.clicked() {
+                    self.pause_choices_open = true; // #205: For 1 hour, Until tomorrow, Until I resume
+                }
+            }
+        });
     }
 
     /// Needs attention: each problem with what can be done about it. Its list scrolls once taller than 280 px.
@@ -742,18 +772,9 @@ impl ProtonDriveNativeApp {
                         // Resolving needs the daemon, as Pause and Sync now do
                         let online = self.daemon_online;
                         for (i, c) in CONFLICT_CHOICES.iter().enumerate() {
-                            let clicked = ui
-                                .add_enabled_ui(online, |ui| {
-                                    let button = if i == 0 {
-                                        primary_icon_button(ui, c.icon, c.label, 30.0)
-                                    } else {
-                                        secondary_icon_button(ui, c.icon, c.label, 30.0)
-                                    };
-                                    button.on_hover_text(c.hint).on_disabled_hover_text(c.hint)
-                                })
-                                .inner
-                                .clicked();
-                            if clicked {
+                            let kind = if i == 0 { ButtonKind::Primary } else { ButtonKind::Secondary };
+                            let button = action_button_if(ui, online, kind, Some(c.icon), c.label, 30.0);
+                            if button.on_hover_text(c.hint).on_disabled_hover_text(c.hint).clicked() {
                                 let _ = self.tx.send(WorkerCommand::ResolveConflict { id, choice: c.choice.to_string() });
                             }
                         }

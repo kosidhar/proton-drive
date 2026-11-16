@@ -41,7 +41,7 @@ const PICKER_PADDING_Y: f32 = 7.0;
 /// A wide control (a field, a picker, a text box) at its widest
 pub(crate) const WIDE_CONTROL: f32 = 360.0;
 /// A row narrower than this has its control under its label
-const STACKED_BELOW: f32 = 440.0;
+pub(crate) const STACKED_BELOW: f32 = 440.0;
 /// The room between a label and the control under it
 const STACKED_GAP: f32 = 6.0;
 
