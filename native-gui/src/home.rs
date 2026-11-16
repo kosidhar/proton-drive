@@ -895,8 +895,8 @@ impl ProtonDriveNativeApp {
         });
     }
 
-    /// Your drive: where it is and how it is shown, its folder in Files and its trash, and what is on this computer. Open in Files is
-    /// the sidebar's too, and the account's storage is here and at the sidebar's foot.
+    /// Your drive: where it is and how it is shown, its folder in Files and its trash, and what is on this computer.
+    /// Open in Files is the sidebar's too, and the account's storage is here and at the sidebar's foot.
     fn render_your_drive(&mut self, ui: &mut egui::Ui) {
         let sync_dir = self.status.sync_dir.clone();
         let account = self.status.account.clone();
@@ -926,12 +926,15 @@ impl ProtonDriveNativeApp {
                 }
             };
             if ui.available_width() < crate::settings::STACKED_BELOW {
-                // As under the status: the buttons go under the name when they would crowd it
+                // As under the status: the buttons go under the name when they would crowd it. The fixed width stands in
+                // for "the buttons fit beside the name" (#312 tracks stacking by the actual fit); a long name is
+                // shortened, whole on hover, rather than clipped
                 ui.vertical(name_and_kind);
                 if !sync_dir.is_empty() {
                     ui.add_space(10.0);
                     ui.horizontal_wrapped(|ui| {
                         open(ui);
+                        ui.add_space(4.0);
                         trash(ui);
                     });
                 }
@@ -940,7 +943,7 @@ impl ProtonDriveNativeApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if !sync_dir.is_empty() {
                             trash(ui);
-                            ui.add_space(8.0);
+                            ui.add_space(4.0);
                             open(ui);
                             ui.add_space(8.0);
                         }

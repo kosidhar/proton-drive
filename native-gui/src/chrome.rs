@@ -14,7 +14,7 @@ use crate::{
     SIDEBAR_WEAK, STATUS_DANGER, STORAGE_FILL, STORAGE_TRACK, TEXT_MUTED, TEXT_PRIMARY,
 };
 
-/// The sidebar's one button: the drive's folder in the file manager
+/// The button that opens the drive's folder in the file manager: the sidebar's, and Home's drive card's
 pub(crate) const OPEN_IN_FILES: &str = "Open in Files";
 /// Why Open in Files is greyed out
 pub(crate) const OPEN_IN_FILES_WAITS: &str = "Set up a folder in Settings first";
