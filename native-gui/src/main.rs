@@ -736,6 +736,16 @@ fn set_availability_at(
 /// Reading what is marked Always keep is quick: the daemon answers it from its database.
 const PINNED_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Why the marks couldn't be read when the daemon answers 404: it is from before the route, and so before keepPinned,
+/// which it ignores (#296)
+const PINNED_DAEMON_TOO_OLD: &str = "The Proton Drive background service is too old to keep the files marked Always keep";
+
+/// Whether a control socket request failed because the daemon has no such route: a 404 is its catch-all, with or
+/// without its {"error":"Not found"} body. An older daemon, not restarted since an update, answers this.
+fn route_not_found(error: &str) -> bool {
+    error == "Not found" || error.ends_with("answered 404")
+}
+
 /// How many items below the top level are marked Always keep, and whether the whole drive is (GET /availability/pinned
 /// on the control socket; it only reads), for the whole drive's Free up space (#296).
 fn pinned_summary_at(socket: &std::path::Path) -> Result<(u32, bool), String> {
@@ -745,7 +755,8 @@ fn pinned_summary_at(socket: &std::path::Path) -> Result<(u32, bool), String> {
         items: u32,
         whole_drive: bool,
     }
-    let reply = control_request_at(socket, "GET", "/availability/pinned", None, PINNED_READ_TIMEOUT)?;
+    let reply = control_request_at(socket, "GET", "/availability/pinned", None, PINNED_READ_TIMEOUT)
+        .map_err(|e| if route_not_found(&e) { PINNED_DAEMON_TOO_OLD.to_string() } else { e })?;
     serde_json::from_value::<Reply>(reply).map(|r| (r.items, r.whole_drive)).map_err(|e| e.to_string())
 }
 
@@ -771,9 +782,8 @@ fn hidden_items_at(socket: &std::path::Path) -> Result<Vec<HiddenItem>, String> 
     struct Reply {
         items: Vec<HiddenItem>,
     }
-    // A 404 is the daemon's catch-all for a route it doesn't have, with or without its {"error":"Not found"} body
     let reply = control_request_at(socket, "GET", "/availability/hidden", None, HIDDEN_READ_TIMEOUT).map_err(|e| {
-        if e == "Not found" || e.ends_with("answered 404") {
+        if route_not_found(&e) {
             HIDDEN_NEEDS_RESTART.to_string()
         } else {
             e
@@ -1220,6 +1230,8 @@ enum Marks {
     WholeDrive,
     /// Items below the top level are marked, and the whole drive isn't: the choice to free them too, ticked or not
     Below { also_free: bool },
+    /// The daemon is too old to keep them (it has no route to say what is marked): its free unmarks everything
+    OldDaemon,
 }
 
 /// What Free up space says of what stays, which is what it sends (#296): the marks go (a folder's free, the whole drive
@@ -1235,8 +1247,9 @@ const FREE_ALSO_PINNED: &str = "Also free files marked Always keep on this devic
 
 /// Whether the free that Free up space confirms keeps what is marked Always keep (#296), as its keepPinned: the whole
 /// drive's keeps them while they aren't known (not answered yet, or the read failed: the safe side), when nothing is
-/// marked (it changes nothing then), and when the choice to free them too is left unticked. With the whole drive marked
-/// it says nothing, and unmarks everything as it always did; so does a folder's free.
+/// marked (it changes nothing then), and when the choice to free them too is left unticked. With the whole drive marked,
+/// or a daemon too old for keepPinned, it says nothing, and unmarks everything as it always did; so does a folder's
+/// free.
 fn free_keeps_pinned(rel_path: &str, marks: Marks) -> Option<bool> {
     if !rel_path.is_empty() {
         return None;
@@ -1244,7 +1257,8 @@ fn free_keeps_pinned(rel_path: &str, marks: Marks) -> Option<bool> {
     match marks {
         Marks::Unknown | Marks::Nothing => Some(true),
         Marks::Below { also_free } => Some(!also_free),
-        Marks::WholeDrive => None,
+        // An old daemon ignores keepPinned: the free is sent as it is, and the dialog says so
+        Marks::WholeDrive | Marks::OldDaemon => None,
     }
 }
 
@@ -2693,17 +2707,21 @@ impl ProtonDriveNativeApp {
 
     /// The daemon's answer about the Always keep marks, for the whole drive's Free up space while it asks: the choice to
     /// free those files too shows, unticked, when something below the top level is marked and the whole drive isn't.
-    /// With the whole drive marked, freeing it unmarks everything, as it always did. A failed read leaves the marks
-    /// unknown (and kept); an answer once they are known, or after the dialog closed, changes nothing.
+    /// With the whole drive marked, freeing it unmarks everything, as it always did, and so does a daemon too old to say
+    /// what is marked. Any other failed read leaves the marks unknown (and kept); an answer once they are known, or
+    /// after the dialog closed, changes nothing.
     fn pinned_summary_loaded(&mut self, result: Result<(u32, bool), String>) {
         if let Some(PendingConfirm::FreeAll { rel_path, marks: marks @ Marks::Unknown }) = self.pending_confirm.as_mut() {
-            if let (true, Ok((items, whole_drive))) = (rel_path.is_empty(), result) {
-                *marks = match (items, whole_drive) {
-                    (_, true) => Marks::WholeDrive,
-                    (0, false) => Marks::Nothing,
-                    (_, false) => Marks::Below { also_free: false },
-                };
+            if !rel_path.is_empty() {
+                return;
             }
+            *marks = match result {
+                Ok((_, true)) => Marks::WholeDrive,
+                Ok((0, false)) => Marks::Nothing,
+                Ok((_, false)) => Marks::Below { also_free: false },
+                Err(e) if e == PINNED_DAEMON_TOO_OLD => Marks::OldDaemon,
+                Err(_) => Marks::Unknown,
+            };
         }
     }
 
@@ -5969,7 +5987,7 @@ mod tests {
     // ... while the marks aren't known (not answered yet, or the read failed), they are kept, and it says so
     #[test]
     fn without_an_answer_about_the_marks_free_up_space_says_they_stay_and_keeps_them() {
-        for answer in [None, Some(Err("Not found".to_string()))] {
+        for answer in [None, Some(Err("Can't reach the Proton Drive background service (timed out)".to_string()))] {
             let mut h = free_up_space_answered(answer.clone());
             assert_eq!(
                 h.app.pending_confirm,
@@ -5982,6 +6000,27 @@ mod tests {
             h.click(*h.text_at_all("Free up space").last().expect("the dialog's button is painted"));
             assert_eq!(h.sent(), vec![r#"free "" keep-pinned"#.to_string()], "{answer:?}");
         }
+    }
+
+    // ... a daemon too old for keepPinned (it answers 404) frees the marked files too, whatever it is sent: the dialog
+    // says so, and sends what such a daemon does anyway (R8)
+    #[test]
+    fn with_a_daemon_too_old_to_keep_the_marks_free_up_space_says_they_go_and_sends_no_keep_pinned() {
+        let mut h = free_up_space_answered(Some(Err(PINNED_DAEMON_TOO_OLD.to_string())));
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::FreeAll { rel_path: String::new(), marks: Marks::OldDaemon }));
+        assert!(h.text_at(FREE_ALSO_PINNED).is_none());
+        assert!(h.text_at(FREE_DETAIL).is_some());
+        assert!(h.text_at(FREE_KEEPS_PINNED).is_none());
+        h.click(*h.text_at_all("Free up space").last().expect("the dialog's button is painted"));
+        let sent: Vec<WorkerCommand> = h.commands.try_iter().collect();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [WorkerCommand::SetAvailability { path, action, keep_pinned: None }] if path.is_empty() && action == "free"
+            ),
+            "one free of the whole drive, without keepPinned ({} sent)",
+            sent.len()
+        );
     }
 
     // ... and with nothing marked, it says nothing of Always keep
@@ -6308,9 +6347,18 @@ mod tests {
         assert_eq!(pinned_summary_at(&sock), Ok((0, true)));
         server.join().unwrap();
         let _ = std::fs::remove_file(&sock);
-        // A daemon from before the route answers 404: no answer, so no choice
+        // A daemon from before the route answers 404, with or without its body: too old to keep anything (R8)
         let (sock, server) = serve_once(b"HTTP/1.1 404 Not Found\r\n\r\n{\"error\":\"Not found\"}");
-        assert!(pinned_summary_at(&sock).is_err());
+        assert_eq!(pinned_summary_at(&sock), Err(PINNED_DAEMON_TOO_OLD.to_string()));
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+        let (sock, server) = serve_once(b"HTTP/1.1 404 Not Found\r\n\r\n");
+        assert_eq!(pinned_summary_at(&sock), Err(PINNED_DAEMON_TOO_OLD.to_string()));
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+        // Any other failure is only that: the marks aren't known
+        let (sock, server) = serve_once(b"HTTP/1.1 500 Internal Server Error\r\n\r\n{\"error\":\"Database is locked\"}");
+        assert_eq!(pinned_summary_at(&sock), Err("Database is locked".to_string()));
         server.join().unwrap();
         let _ = std::fs::remove_file(&sock);
     }
@@ -6942,6 +6990,7 @@ mod tests {
         assert_eq!(free("", Marks::Unknown), (FREE_KEEPS_PINNED, Some(true)));
         assert_eq!(free("", Marks::Nothing), (FREE_NOTHING_MARKED, Some(true)));
         assert_eq!(free("", Marks::WholeDrive), (FREE_DETAIL, None));
+        assert_eq!(free("", Marks::OldDaemon), (FREE_DETAIL, None));
         assert_eq!(free("", Marks::Below { also_free: false }), (FREE_KEEPS_PINNED, Some(true)));
         assert_eq!(free("", Marks::Below { also_free: true }), (FREE_DETAIL, Some(false)));
         // A folder's free is as it always was: it clears the marks inside it, and says so
