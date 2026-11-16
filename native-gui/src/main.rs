@@ -3543,7 +3543,7 @@ fn action_button_sized(ui: &mut egui::Ui, kind: ButtonKind, icon: Option<&str>, 
         ButtonKind::Primary => (PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE),
         ButtonKind::Secondary => (BG_CARD(), BG_CARD_ALT(), Some(Stroke::new(1.0_f32, BORDER_NORM())), TEXT_PRIMARY()),
         ButtonKind::Danger => (STATUS_DANGER, STATUS_DANGER_HOVER, None, Color32::WHITE),
-        ButtonKind::DangerOutline => (BG_CARD(), BG_CARD_ALT(), Some(Stroke::new(1.0_f32, BORDER_NORM())), STATUS_DANGER),
+        ButtonKind::DangerOutline => (BG_CARD(), BG_CARD_ALT(), Some(Stroke::new(1.0_f32, BORDER_NORM())), DANGER_TEXT()),
     };
     let (rect, resp) = button_shell(ui, size, label, fill, hover_fill, stroke);
     let content = action_button_width(ui, icon, label) - 2.0 * BUTTON_PADDING;
@@ -6838,7 +6838,7 @@ mod tests {
             .iter()
             .flat_map(|t| t.galley.job.sections.iter().map(|s| s.format.color))
             .collect();
-        assert_eq!(colors, vec![STATUS_DANGER], "the label's painted colour");
+        assert_eq!(colors, vec![DARK.danger_text], "the label's painted colour");
         assert_eq!(h.fill_under(h.text_at(DELETE_TOO).unwrap()), Some(BG_CARD()), "outlined, not filled");
     }
 
