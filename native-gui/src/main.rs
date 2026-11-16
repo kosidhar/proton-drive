@@ -9788,6 +9788,38 @@ mod tests {
         assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "its words don't float detached from it");
     }
 
+    // A wheel turn closes an open ⓘ's words, as egui hides its tooltips on a scroll: over the box, which takes the
+    // pointer, the next turn scrolls the page (the review of #318)
+    #[test]
+    fn a_wheel_turn_closes_an_open_info_and_the_next_scrolls() {
+        let mut h = Harness::settings(Some(vfs("virtual", true, None)), Some(true));
+        h.resize_zoomed(Vec2::new(1440.0, 700.0), 1.0);
+        h.click(info_after(&h, "Apps blocked from downloading"));
+        let words = h.text_rect(BLOCKED_EXPLAINED).expect("open").center();
+        let before = h.text_rect("Apps blocked from downloading").unwrap().top();
+        h.scroll(words, 60.0);
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "a wheel turn closes it");
+        h.scroll(words, 60.0);
+        let after = h.text_rect("Apps blocked from downloading").map_or(f32::MIN, |r| r.top());
+        assert!(after < before, "the next turn scrolls the page: {before} → {after}");
+    }
+
+    // A screen reader moving the focus to another ⓘ closes the open one: one at a time
+    #[test]
+    fn focusing_another_info_closes_the_open_one() {
+        let mut h = settings_tall_timed();
+        h.click(info_after(&h, "Apps blocked from downloading"));
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_some());
+        let nodes = accesskit_nodes(&h);
+        let hidden = nodes.iter().find(|(_, n)| says(n) == HIDDEN_EXPLAINED);
+        let target = hidden.map(|(id, _)| *id).expect("the Hidden ⓘ");
+        let focus = egui::accesskit::ActionRequest { action: egui::accesskit::Action::Focus, target, data: None };
+        h.frame(vec![egui::Event::AccessKitActionRequest(focus)]);
+        h.frames(3);
+        assert!(h.text_at(HIDDEN_EXPLAINED).is_some(), "the focused ⓘ's words");
+        assert!(h.text_at(BLOCKED_EXPLAINED).is_none(), "the open one closes");
+    }
+
     #[test]
     fn an_open_info_closes_when_the_share_window_opens() {
         let mut h = settings_tall_timed();

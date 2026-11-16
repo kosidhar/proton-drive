@@ -279,8 +279,8 @@ pub(crate) fn picker<R>(
 }
 
 /// The ⓘ a click (or Enter) opened (#318), and the pass it was last drawn in. One at a time; it closes on a click
-/// elsewhere, a second click on it, Escape, Tab (the focus moving on), or once it isn't drawn (another section open, or
-/// scrolled out of sight).
+/// elsewhere, a second click on it, Escape, Tab (the focus moving on), a wheel turn, the focus coming to another ⓘ,
+/// or once it isn't drawn (another section open, or scrolled out of sight).
 #[derive(Clone, Copy)]
 struct OpenInfo {
     id: egui::Id,
@@ -319,14 +319,20 @@ fn info_glyph(ui: &mut egui::Ui, info: &str) -> egui::Response {
     if clicked {
         is_open = !is_open;
     } else if ctx.input(|i| {
-        i.pointer.any_click() || i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Tab)
+        let keys = i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Tab);
+        // A wheel turn too, as egui hides its tooltips on a scroll: over the box, which takes the pointer, the page
+        // wouldn't scroll while it is open
+        i.pointer.any_click() || keys || i.raw_scroll_delta != Vec2::ZERO
     }) {
         is_open = false;
     }
+    // One at a time: the focus coming to this ⓘ (from a screen reader, say) closes another that is open. (Asked here:
+    // asking for the focus inside `data_mut` would lock the context twice.)
+    let focus_takes_over = response.has_focus() && open.is_some_and(|o| o.id != response.id);
     ctx.data_mut(|d| {
         if is_open {
             d.insert_temp(key, OpenInfo { id: response.id, pass });
-        } else if open.is_some_and(|o| o.id == response.id) {
+        } else if open.is_some_and(|o| o.id == response.id) || focus_takes_over {
             d.remove::<OpenInfo>(key);
         }
     });
@@ -334,7 +340,7 @@ fn info_glyph(ui: &mut egui::Ui, info: &str) -> egui::Response {
     // Open, or with the keyboard's focus (under the pointer too, so the words don't drop out while egui's hover delay
     // runs), and in sight
     if (is_open || response.has_focus()) && ui.is_rect_visible(rect) {
-        show_info_words(&ctx, rect, info);
+        show_info_words(&ctx, response.id, rect, info);
         response
     } else {
         let words = |ui: &mut egui::Ui| {
@@ -349,7 +355,7 @@ fn info_glyph(ui: &mut egui::Ui, info: &str) -> egui::Response {
 /// screen), in an area of their own rather than as a tooltip: egui shows one tooltip at a time, so a tooltip held
 /// open would keep every other widget's from showing on hover (#318). The box takes the clicks on it, which close
 /// it: a click never reaches the control it hides (in a narrow window, the drive's ⓘ's words cover its switch).
-fn show_info_words(ctx: &egui::Context, anchor: egui::Rect, info: &str) {
+fn show_info_words(ctx: &egui::Context, id: egui::Id, anchor: egui::Rect, info: &str) {
     /// egui's gap between a widget and its tooltip
     const GAP: f32 = 4.0;
     let style = ctx.style();
@@ -367,7 +373,8 @@ fn show_info_words(ctx: &egui::Context, anchor: egui::Rect, info: &str) {
     let outer = outer.translate(Vec2::new((screen.right() - outer.right()).min(0.0), 0.0));
     let onto_screen = Vec2::new((screen.left() - outer.left()).max(0.0), (screen.top() - outer.top()).max(0.0));
     let outer = outer.translate(onto_screen);
-    egui::Area::new(egui::Id::new(OPEN_INFO))
+    // Each ⓘ's box an area of its own, as a focused one may show while another's closes
+    egui::Area::new(egui::Id::new(OPEN_INFO).with(id))
         .order(egui::Order::Tooltip)
         .fixed_pos(outer.min)
         .sense(Sense::CLICK)
