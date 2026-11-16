@@ -6949,6 +6949,19 @@ mod tests {
             assert!(r.left() >= SIDEBAR_EDGE && r.right() <= h.screen.x, "{r:?} within the page");
         }
         assert!(open.center().x < trash.center().x, "Open in Files stays left of Trash");
+        // Stacked: both under the name and the kind line
+        for b in [open, trash] {
+            assert!(b.top() > kind_line.bottom() && b.top() > name.bottom(), "{b:?} is under {name:?} and {kind_line:?}");
+        }
+        // And they work there
+        let launched = || home::LAUNCHED.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        launched();
+        h.sent();
+        h.click(open.center());
+        assert_eq!(launched(), vec!["/srv/u/ProtonDrive".to_string()]);
+        h.click(trash.center());
+        assert_eq!(launched(), vec!["https://drive.proton.me/trash".to_string()]);
+        assert_eq!(h.sent(), Vec::<String>::new(), "nothing goes to the daemon");
     }
 
     #[test]
