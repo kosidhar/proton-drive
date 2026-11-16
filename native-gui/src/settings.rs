@@ -277,19 +277,69 @@ pub(crate) fn picker<R>(
     .inner
 }
 
-/// An ⓘ that shows `info` on hover, greyed out or not, and on the keyboard's focus (it is a stop for the Tab key, with a
-/// focus ring), and hands it to screen readers.
+/// The ⓘ a click (or Enter) opened (#318), and the pass it was last drawn in. One at a time; it closes on a click
+/// elsewhere, a second click on it, Escape, Tab (the focus moving on), or once it isn't drawn (another section open, or
+/// scrolled out of sight).
+#[derive(Clone, Copy)]
+struct OpenInfo {
+    id: egui::Id,
+    pass: u64,
+}
+
+const OPEN_INFO: &str = "settings_open_info";
+
+/// An ⓘ that shows `info` on hover, greyed out or not, on a click until a click elsewhere (egui hides a tooltip right
+/// after a click, #318), and on the keyboard's focus (it is a stop for the Tab key, with a focus ring); and hands it to
+/// screen readers.
 fn info_glyph(ui: &mut egui::Ui, info: &str) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(INFO_SIZE), Sense::FOCUSABLE);
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(INFO_SIZE), Sense::click());
     let enabled = ui.is_enabled();
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, enabled, info));
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icons::INFO, icons::font(INFO_SIZE - 1.0), TEXT_MUTED());
     focus_ring(ui, &response, INFO_SIZE / 2.0);
-    // Once: under the pointer, the hover shows it
-    if response.has_focus() && !response.hovered() {
-        response.show_tooltip_text(info);
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    response.on_hover_text(info).on_disabled_hover_text(info)
+
+    let ctx = ui.ctx().clone();
+    let key = egui::Id::new(OPEN_INFO);
+    let pass = ctx.cumulative_pass_nr();
+    let open = ctx.data(|d| d.get_temp::<OpenInfo>(key));
+    // Still open if it was this one, drawn in the last pass, and in sight
+    let mut is_open = open.is_some_and(|o| o.id == response.id && o.pass + 1 >= pass) && ui.is_rect_visible(rect);
+    // A greyed-out ⓘ takes no clicks as a widget, so the click is read off the pointer; under a dialog, the dialog's
+    // shield is the layer under the pointer, and nothing opens
+    let clicked = if enabled {
+        response.clicked()
+    } else {
+        ctx.input(|i| i.pointer.primary_clicked()) && ctx.rect_contains_pointer(response.layer_id, rect)
+    };
+    if clicked {
+        is_open = !is_open;
+    } else if ctx.input(|i| {
+        i.pointer.any_click() || i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Tab)
+    }) {
+        is_open = false;
+    }
+    ctx.data_mut(|d| {
+        if is_open {
+            d.insert_temp(key, OpenInfo { id: response.id, pass });
+        } else if open.is_some_and(|o| o.id == response.id) {
+            d.remove::<OpenInfo>(key);
+        }
+    });
+
+    let words = |ui: &mut egui::Ui| {
+        ui.set_max_width(ui.spacing().tooltip_width);
+        ui.add(egui::Label::new(info));
+    };
+    // Open, or with the keyboard's focus and not under the pointer (under it, the hover shows it, once)
+    if is_open || (response.has_focus() && !response.hovered()) {
+        response.show_tooltip_ui(words);
+        response
+    } else {
+        response.on_hover_ui(words).on_disabled_hover_text(info)
+    }
 }
 
 /// The plan, as the account's quota tells it.
