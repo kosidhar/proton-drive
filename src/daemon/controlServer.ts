@@ -52,6 +52,9 @@ export interface ControlServerOptions {
         | 'driveWriting'
         | 'driveClosed'
         | 'clearDriveWriting'
+        | 'listCutShort'
+        | 'uploadCutShort'
+        | 'putBackCutShort'
     >;
     // What the file manager extension reads: where the drive is, the states of a folder's items, and what changes (see
     // fileManagerRoutes.ts)
@@ -259,6 +262,36 @@ const DRIVE_ROUTES: readonly string[] = [
     '/vfs/closed',
 ];
 
+// The files the drive's disk guard cut short, held from uploading until the user decides (#300): GET /cut-short lists
+// them, { items: [{ relPath, existing, size, detectedAt }] } (existing: an edit of an item Proton Drive has); POST
+// /cut-short/upload {paths} uploads each as it is (Upload this version); POST /cut-short/restore {paths} puts back
+// Proton Drive's version of each, keeping the file beside it (Put back). A path that isn't held is skipped. { ok: true };
+// 400 { error, code: 'EINVAL' } for a malformed request, or a file Proton Drive has no version of to put back, which
+// changes nothing; 500 { error, code } when it failed. Never reachable from the TCP API.
+async function cutShortRoute(req: Request, route: string, engine: DriveEngine): Promise<Response> {
+    const invalid = (message: string) => Response.json({ error: message, code: 'EINVAL' }, { status: 400 });
+    if (route === '/cut-short') {
+        if (req.method !== 'GET') return jsonError('Method not allowed', 405);
+        return Response.json({ items: engine.listCutShort() });
+    }
+    if (req.method !== 'POST') return jsonError('Method not allowed', 405);
+    const body = await jsonBody(req);
+    if (!body) return invalid('Invalid JSON body');
+    const { paths } = body;
+    if (!Array.isArray(paths) || !paths.every((p) => typeof p === 'string')) return invalid('paths must be a list of paths');
+    try {
+        await (route === '/cut-short/upload' ? engine.uploadCutShort(paths as string[]) : engine.putBackCutShort(paths as string[]));
+        return Response.json({ ok: true });
+    } catch (err) {
+        if (err instanceof DriveOpError && err.code === 'EINVAL') {
+            return invalid(err.message);
+        }
+        return Response.json({ error: messageOf(err), code: err instanceof DriveOpError ? err.code : 'EIO' }, { status: 500 });
+    }
+}
+
+const CUT_SHORT_ROUTES: readonly string[] = ['/cut-short', '/cut-short/upload', '/cut-short/restore'];
+
 // GET /vfs/space: the account's storage for the drive helper's statfs (#181), { space: { usedSpace, maxSpace } }, or
 // { space: null } while it isn't known; the helper then reports the local disk
 async function spaceRoute(req: Request, space: ControlServerOptions['space']): Promise<Response> {
@@ -435,6 +468,9 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
             }
             if (FM_ROUTES.includes(url.pathname)) {
                 return fileManagerRoute(req, url, opts.fileManager);
+            }
+            if (CUT_SHORT_ROUTES.includes(url.pathname)) {
+                return cutShortRoute(req, url.pathname, engine);
             }
             if (url.pathname === '/vfs/mount') {
                 return mountRoute(req, opts.mountAgain);

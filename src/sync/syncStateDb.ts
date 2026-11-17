@@ -40,6 +40,19 @@ export interface EditBaseline {
     createdAt: number;
 }
 
+// A file the virtual drive's disk guard cut short (#300): a write to it was refused for room, so it may hold only part
+// of what was being written. It isn't uploaded while held: until the user decides (upload it as it is, or put back
+// Proton Drive's version), or it is written again in full, goes away, or changes in Proton Drive. nodeUid is the node
+// it is an edit of (by its record or edit baseline when it was held), null for a new file. Kept in the database, so a
+// hold outlives a restart.
+export interface CutShortFile {
+    relPath: string;
+    nodeUid: string | null;
+    size: number;
+    mtimeMs: number;
+    detectedAt: number;
+}
+
 export interface ConflictRecord {
     id: number;
     localRelPath: string;
@@ -256,6 +269,16 @@ export class SyncStateDatabase {
                 mtimeMs INTEGER NOT NULL,
                 size INTEGER NOT NULL,
                 createdAt INTEGER NOT NULL
+            )
+        `);
+
+        this.db.run(`
+            CREATE TABLE IF NOT EXISTS cut_short_files (
+                relPath TEXT PRIMARY KEY,
+                nodeUid TEXT,
+                size INTEGER NOT NULL,
+                mtimeMs INTEGER NOT NULL,
+                detectedAt INTEGER NOT NULL
             )
         `);
     }
@@ -596,6 +619,76 @@ export class SyncStateDatabase {
         })();
     }
 
+    // Holds a file the drive's disk guard cut short (see CutShortFile), or holds it again, as it is now
+    holdCutShort(file: CutShortFile): void {
+        this.db
+            .query(
+                `INSERT OR REPLACE INTO cut_short_files (relPath, nodeUid, size, mtimeMs, detectedAt)
+                 VALUES ($relPath, $nodeUid, $size, $mtimeMs, $detectedAt)`,
+            )
+            .run({
+                $relPath: file.relPath,
+                $nodeUid: file.nodeUid,
+                $size: file.size,
+                $mtimeMs: Math.round(file.mtimeMs),
+                $detectedAt: Math.round(file.detectedAt),
+            });
+        this.onChange?.(file.relPath, false);
+    }
+
+    getCutShort(relPath: string): CutShortFile | null {
+        const row = this.db.query('SELECT * FROM cut_short_files WHERE relPath = $relPath').get({ $relPath: relPath });
+        return (row as CutShortFile | null) ?? null;
+    }
+
+    // In the order they were found, then by path
+    listCutShort(): CutShortFile[] {
+        return this.db.query('SELECT * FROM cut_short_files ORDER BY detectedAt ASC, relPath ASC').all() as CutShortFile[];
+    }
+
+    // The holds at a path and under it
+    dropCutShort(relPath: string): void {
+        const { changes } = this.db
+            .query(`DELETE FROM cut_short_files WHERE ${selfOrDescendantWhere('relPath')}`)
+            .run(selfOrDescendant(relPath));
+        if (changes > 0) {
+            this.onChange?.(relPath, true);
+        }
+    }
+
+    // The holds at a path and under it now go with what is at toRel; any that were there go, as that content is gone
+    moveCutShort(fromRel: string, toRel: string): void {
+        if (fromRel === toRel) {
+            return;
+        }
+        const changes = this.db.transaction(() => {
+            const dropped = this.db
+                .query(`DELETE FROM cut_short_files WHERE ${selfOrDescendantWhere('relPath')}`)
+                .run(selfOrDescendant(toRel)).changes;
+            const moved = this.db
+                .query(
+                    `UPDATE cut_short_files SET relPath = $toRel || substr(relPath, length($fromRel) + 1)
+                     WHERE ${selfOrDescendantWhere('relPath')}`,
+                )
+                .run({ $toRel: toRel, $fromRel: fromRel, ...selfOrDescendant(fromRel) }).changes;
+            return dropped + moved;
+        })();
+        if (changes > 0) {
+            this.onChange?.(fromRel, true);
+            this.onChange?.(toRel, true);
+        }
+    }
+
+    // Drops the holds of files that are gone (exists says whether a path still has its file)
+    dropStaleCutShort(exists: (relPath: string) => boolean): void {
+        for (const { relPath } of this.listCutShort()) {
+            if (!exists(relPath)) {
+                this.db.query('DELETE FROM cut_short_files WHERE relPath = $relPath').run({ $relPath: relPath });
+                this.onChange?.(relPath, false);
+            }
+        }
+    }
+
     hasItemsUnder(localRelPath: string): boolean {
         return (
             this.db
@@ -845,6 +938,8 @@ export class SyncStateDatabase {
         totalBytes: number;
         unresolvedConflicts: number;
         errorItems: number;
+        // Files the drive's disk guard cut short, held from uploading (#300)
+        cutShortFiles: number;
     } {
         const filesRow = this.db
             .query("SELECT COUNT(*) as count, COALESCE(SUM(size), 0) as bytes FROM synced_items WHERE type = 'file'")
@@ -858,6 +953,7 @@ export class SyncStateDatabase {
         const errorsRow = this.db
             .query("SELECT COUNT(*) as count FROM synced_items WHERE syncStatus = 'error'")
             .get() as { count: number };
+        const cutShortRow = this.db.query('SELECT COUNT(*) as count FROM cut_short_files').get() as { count: number };
 
         return {
             totalFiles: filesRow?.count ?? 0,
@@ -865,6 +961,7 @@ export class SyncStateDatabase {
             totalBytes: filesRow?.bytes ?? 0,
             unresolvedConflicts: conflictsRow?.count ?? 0,
             errorItems: errorsRow?.count ?? 0,
+            cutShortFiles: cutShortRow?.count ?? 0,
         };
     }
 
