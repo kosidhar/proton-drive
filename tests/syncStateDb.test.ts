@@ -286,3 +286,114 @@ describe('SyncStateDatabase content read time (#109)', () => {
         }
     });
 });
+
+// #300: files the drive's disk guard cut short, held from uploading until the user decides
+describe('SyncStateDatabase cut-short files (#300)', () => {
+    const held = (relPath: string, nodeUid: string | null = `uid-${relPath}`, detectedAt = 1000) => ({
+        relPath,
+        nodeUid,
+        size: 7,
+        mtimeMs: 1_700_000_000_123,
+        detectedAt,
+    });
+
+    test('a hold is kept, listed and dropped; each change is told for the emblems', async () => {
+        const tempDir = await mkdtemp(path.join(tmpdir(), 'proton-drive-statedb-test-'));
+        try {
+            const dbPath = path.join(tempDir, 'state.sqlite');
+            let stateDb = new SyncStateDatabase(dbPath);
+            const told: Array<[string, boolean]> = [];
+            stateDb.onChange = (relPath, subtree) => told.push([relPath, subtree]);
+            expect(stateDb.listCutShort()).toEqual([]);
+            expect(stateDb.getCutShort('a.txt')).toBeNull();
+            expect(stateDb.getSummaryStats().cutShortFiles).toBe(0);
+
+            stateDb.holdCutShort(held('Docs/b.txt', 'uid-b', 2000));
+            stateDb.holdCutShort(held('a.txt', null, 1000));
+            expect(stateDb.getCutShort('a.txt')).toEqual(held('a.txt', null, 1000));
+            expect(stateDb.listCutShort()).toEqual([held('a.txt', null, 1000), held('Docs/b.txt', 'uid-b', 2000)]);
+            expect(stateDb.getSummaryStats().cutShortFiles).toBe(2);
+            // Held again: replaced, not added
+            stateDb.holdCutShort({ ...held('a.txt', null, 1000), size: 9 });
+            expect(stateDb.listCutShort()).toHaveLength(2);
+            expect(stateDb.getCutShort('a.txt')?.size).toBe(9);
+
+            // Kept across a reopen: a hold outlives a restart
+            stateDb.close();
+            stateDb = new SyncStateDatabase(dbPath);
+            stateDb.onChange = (relPath, subtree) => told.push([relPath, subtree]);
+            expect(stateDb.getCutShort('Docs/b.txt')).toEqual(held('Docs/b.txt', 'uid-b', 2000));
+
+            // A path and what is under it; nothing named alike
+            stateDb.holdCutShort(held('Docs/c.txt'));
+            stateDb.holdCutShort(held('Docs2/d.txt'));
+            told.length = 0;
+            stateDb.dropCutShort('Docs');
+            // In the order they were found, then by path
+            expect(stateDb.listCutShort().map((r) => r.relPath)).toEqual(['Docs2/d.txt', 'a.txt']);
+            expect(told).toEqual([['Docs', true]]);
+            stateDb.dropCutShort('a.txt');
+            expect(stateDb.listCutShort().map((r) => r.relPath)).toEqual(['Docs2/d.txt']);
+            stateDb.close();
+        } finally {
+            await rm(tempDir, { recursive: true, force: true });
+        }
+    });
+
+    test('a move carries the holds at and under a path, and drops what was at the target', async () => {
+        const tempDir = await mkdtemp(path.join(tmpdir(), 'proton-drive-statedb-test-'));
+        try {
+            const stateDb = new SyncStateDatabase(path.join(tempDir, 'state.sqlite'));
+            stateDb.holdCutShort(held('a.txt', 'uid-a'));
+            stateDb.holdCutShort(held('b.txt', 'uid-b'));
+            stateDb.holdCutShort(held('Docs/x.txt', null));
+            stateDb.holdCutShort(held('Docs/Sub/y.txt', 'uid-y'));
+            stateDb.holdCutShort(held('Docs2/z.txt', 'uid-z'));
+            stateDb.holdCutShort(held('Papers/old.txt', 'uid-old'));
+            const told: Array<[string, boolean]> = [];
+            stateDb.onChange = (relPath, subtree) => told.push([relPath, subtree]);
+
+            stateDb.moveCutShort('a.txt', 'b.txt');
+            expect(stateDb.getCutShort('a.txt')).toBeNull();
+            expect(stateDb.getCutShort('b.txt')).toEqual(held('b.txt', 'uid-a'));
+            expect(told).toEqual([
+                ['a.txt', true],
+                ['b.txt', true],
+            ]);
+
+            stateDb.moveCutShort('Docs', 'Papers');
+            expect(stateDb.listCutShort().map((r) => [r.relPath, r.nodeUid])).toEqual([
+                ['Docs2/z.txt', 'uid-z'],
+                ['Papers/Sub/y.txt', 'uid-y'],
+                ['Papers/x.txt', null],
+                ['b.txt', 'uid-a'],
+            ]);
+            // Nothing at the source: what was at the target still goes
+            stateDb.moveCutShort('nothing.txt', 'b.txt');
+            expect(stateDb.getCutShort('b.txt')).toBeNull();
+            stateDb.moveCutShort('Docs2/z.txt', 'Docs2/z.txt');
+            expect(stateDb.getCutShort('Docs2/z.txt')).not.toBeNull();
+            stateDb.close();
+        } finally {
+            await rm(tempDir, { recursive: true, force: true });
+        }
+    });
+
+    test('the holds of files that are gone are dropped', async () => {
+        const tempDir = await mkdtemp(path.join(tmpdir(), 'proton-drive-statedb-test-'));
+        try {
+            const stateDb = new SyncStateDatabase(path.join(tempDir, 'state.sqlite'));
+            for (const rel of ['a.txt', 'gone.txt', 'Docs/gone.bin', 'Docs/here.bin']) {
+                stateDb.holdCutShort(held(rel));
+            }
+            const told: Array<[string, boolean]> = [];
+            stateDb.onChange = (relPath, subtree) => told.push([relPath, subtree]);
+            stateDb.dropStaleCutShort((rel) => !rel.includes('gone'));
+            expect(stateDb.listCutShort().map((r) => r.relPath)).toEqual(['Docs/here.bin', 'a.txt']);
+            expect(told.map(([rel]) => rel).sort()).toEqual(['Docs/gone.bin', 'gone.txt']);
+            stateDb.close();
+        } finally {
+            await rm(tempDir, { recursive: true, force: true });
+        }
+    });
+});
