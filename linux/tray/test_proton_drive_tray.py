@@ -521,6 +521,16 @@ class PauseChoicesTest(unittest.TestCase):
 class ProblemCountTest(unittest.TestCase):
     """Counted as the app's Needs attention lists them: one per conflict, one for failed files, one each for the rest."""
 
+    def test_problem_count_counts_up_to_three_cut_short_files_then_one(self):
+        # The app lists a file the disk guard cut short on its own row up to three, and one summary row above
+        for held, problems in ((0, 0), (1, 1), (2, 2), (3, 3), (4, 1), (214, 1)):
+            stats = {"unresolvedConflicts": 0, "errorItems": 0, "cutShortFiles": held}
+            self.assertEqual(tray.problem_count(status(stats=stats)), problems, held)
+        # Beside the others, and an older daemon sends none
+        stats = {"unresolvedConflicts": 1, "errorItems": 2, "cutShortFiles": 2}
+        self.assertEqual(tray.problem_count(status(stats=stats)), 4)
+        self.assertEqual(tray.problem_count(status(stats={"unresolvedConflicts": 1})), 1)
+
     def test_nothing_wrong(self):
         self.assertEqual(tray.problem_count(status()), 0)
 

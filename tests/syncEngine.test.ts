@@ -25,7 +25,7 @@ import { computeLocalFileSha1, detectMediaType, THIRD_PARTY_DISCLOSURE } from '.
 import { PIN_ROOT_ON_FIRST_SYNC } from '../src/sync/availabilityMigration';
 import { entryFromNode } from '../src/sync/remoteIndex';
 import { startControlServer } from '../src/daemon/controlServer';
-import { createLocalConflictCopy, formatConflictFileName } from '../src/sync/conflictResolver';
+import { createLocalConflictCopy, formatConflictFileName, formatNotFullyWrittenName } from '../src/sync/conflictResolver';
 import { DriveOpError } from '../src/sync/driveOps';
 import { matchesIgnorePatterns } from '../src/sync/localWatcher';
 import {
@@ -93,6 +93,26 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         await writeFile(origPath, 'local version');
         const copyPath = await createLocalConflictCopy(origPath);
         expect(await readFile(copyPath, 'utf8')).toBe('local version');
+    });
+
+    // #300: what Put back keeps a cut-short file under, beside Proton Drive's version
+    test('formats the name of a file not fully written as a conflict copy is named, within 255 bytes', () => {
+        const when = new Date(2026, 10, 16, 9, 5, 7);
+        expect(formatNotFullyWrittenName('report.pdf', when, 'my laptop!')).toBe('report (not fully written 2026-11-16 09-05-07 mylaptop).pdf');
+        expect(formatNotFullyWrittenName('report.pdf', when, 'host', 2)).toBe('report (not fully written 2026-11-16 09-05-07 host)-2.pdf');
+        expect(formatNotFullyWrittenName('.bashrc', when, 'host')).toBe('.bashrc (not fully written 2026-11-16 09-05-07 host)');
+        expect(formatNotFullyWrittenName('Makefile', when, 'host')).toBe('Makefile (not fully written 2026-11-16 09-05-07 host)');
+        // A name near the limit: its stem shortened, by whole characters, the mark and the extension kept
+        for (const long of [`${'a'.repeat(250)}.txt`, `${'é'.repeat(125)}.txt`, `${'😀'.repeat(62)}.txt`]) {
+            const name = formatNotFullyWrittenName(long, when, 'host', 12);
+            expect(Buffer.byteLength(name)).toBeLessThanOrEqual(255);
+            expect(name.endsWith(' (not fully written 2026-11-16 09-05-07 host)-12.txt')).toBe(true);
+            expect(long.startsWith(name.slice(0, name.indexOf(' (not fully')))).toBe(true);
+        }
+        // An extension too long to keep counts as part of the stem
+        const longExt = formatNotFullyWrittenName(`a.${'x'.repeat(240)}`, when, 'host');
+        expect(Buffer.byteLength(longExt)).toBeLessThanOrEqual(255);
+        expect(longExt.endsWith(' (not fully written 2026-11-16 09-05-07 host)')).toBe(true);
     });
 
     test('performs two-way sync: downloads remote files, uploads local files, and handles remote delete events', async () => {
@@ -4670,6 +4690,967 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             } finally {
                 server.stop();
             }
+        });
+    });
+
+    // #300: a file the drive's disk guard cut short (a write to it refused for room) isn't uploaded until the user
+    // decides: Upload this version, or Put back the Proton Drive version (keeping the cut-short file beside it)
+    describe('cut-short files (#300)', () => {
+        // trashWorks: the desktop Trash takes what is handed to it (into tempDir/Trash); otherwise it refuses
+        const setup = (opts: { trashWorks?: boolean } = {}) => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const backingDir = path.join(tempDir, 'files');
+            const trashDir = path.join(tempDir, 'Trash');
+            const drive = makeMockDrive();
+            let offset = 0;
+            const now = () => Date.now() + offset;
+            let looks: Array<{ at: number; run: () => Promise<void> }> = [];
+            // A new engine on the same database and drive is what a restart of the daemon gives
+            const make = () =>
+                new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                    backingDir,
+                    moveToDesktopTrash: async (fullPath: string) => {
+                        if (!opts.trashWorks) {
+                            return false;
+                        }
+                        await mkdir(trashDir, { recursive: true });
+                        await rename(fullPath, path.join(trashDir, path.basename(fullPath)));
+                        return true;
+                    },
+                    settle: {
+                        quietMs: 2000,
+                        maxQuietMs: 16_000,
+                        maxWaitMs: 120_000,
+                        now,
+                        schedule: (run, delayMs) => {
+                            const look = { at: now() + delayMs, run };
+                            looks.push(look);
+                            return () => {
+                                looks = looks.filter((l) => l !== look);
+                            };
+                        },
+                    },
+                });
+            let engine = make();
+            const local = (rel: string) => path.join(backingDir, rel);
+            const advance = async (ms: number) => {
+                offset += ms;
+                const due = looks.filter((l) => l.at <= now());
+                looks = looks.filter((l) => !due.includes(l));
+                await Promise.all(due.map((l) => l.run()));
+            };
+            return {
+                ...drive,
+                get engine() {
+                    return engine;
+                },
+                restart: async () => {
+                    await engine.stop();
+                    engine = make();
+                },
+                advance,
+                trashDir,
+                files: localFiles(stateDb, () => backingDir),
+                local,
+                changed: (rel: string): Promise<void> => (engine as any).handleLocalFileChange(rel), // the watcher's report
+                // Proton Drive's event that an item was deleted there
+                deletedInCloud: async (rel: string) => {
+                    const uid = drive.uid(rel);
+                    const parentNodeUid = drive.nodes.get(uid)!.parentUid!;
+                    drive.nodes.delete(uid);
+                    await (engine as any).handleRemoteDriveEvent({
+                        type: DriveEventType.NodeDeleted,
+                        nodeUid: uid,
+                        parentNodeUid,
+                        treeEventScopeId: 'scope-main',
+                        eventId: `evt-${uid}`,
+                    });
+                },
+                // Proton Drive's event that an item was moved to its trash
+                trashedInCloud: async (rel: string) => {
+                    const uid = drive.uid(rel);
+                    const node = drive.nodes.get(uid)!;
+                    drive.nodes.set(uid, { ...node, trashTime: new Date() });
+                    await (engine as any).handleRemoteDriveEvent({
+                        type: DriveEventType.NodeUpdated,
+                        nodeUid: uid,
+                        parentNodeUid: node.parentUid,
+                        isTrashed: true,
+                        isShared: false,
+                        treeEventScopeId: 'scope-main',
+                        eventId: `evt-trashed-${uid}`,
+                    });
+                },
+                journal: () => new RemoteOpsJournal(stateDb.connection).pending(),
+                // Another device's edit of a file in Proton Drive
+                cloudEdit: (rel: string, content: string) => {
+                    const node = drive.nodes.get(drive.uid(rel))!;
+                    drive.nodes.set(
+                        node.uid,
+                        makeMockNode({ uid: node.uid, parentUid: node.parentUid, nameStr: drive.nameOf(node), type: NodeType.File, content }),
+                    );
+                },
+                pendingLooks: () => looks.length,
+                // What is in a folder of the backing store, here
+                localNames: async (rel = '') => (await readdir(path.join(backingDir, rel)).catch(() => [] as string[])).sort(),
+            };
+        };
+        type Drive = ReturnType<typeof setup>;
+        // Nothing marked Always keep: a.txt, Kept.txt and Docs/b.txt opened through the drive (so downloaded and
+        // recorded), online.txt online-only. Kept.txt so that the folder never reads as missing its files (#45)
+        const started = async (opts: { trashWorks?: boolean } = {}) => {
+            const d = setup(opts);
+            d.add('Kept.txt', 'kept');
+            d.add('a.txt', 'the version from before');
+            d.add('online.txt', 'the online version');
+            d.add('Docs/b.txt', 'b from before');
+            await d.engine.reconcileNow();
+            for (const rel of ['Kept.txt', 'a.txt', 'Docs/b.txt']) {
+                await d.engine.hydrate(rel);
+            }
+            await d.engine.reconcileNow();
+            d.calls.uploads.length = 0;
+            d.calls.downloads.length = 0;
+            expect(stateDb.getItemByPath('a.txt')?.nodeUid).toBe(d.uid('a.txt'));
+            expect(await d.files.exists('online.txt')).toBe(false);
+            return d;
+        };
+        const refused = { refused: true, replaced: true };
+        // A copy over a file that the guard cut short: the file left shorter than what it was meant to be
+        const cutShort = async (d: Drive, rel: string, content: string) => {
+            d.engine.driveWriting(rel, true);
+            await d.files.writeLocal(rel, content);
+            await d.changed(rel);
+            await d.engine.driveClosed(rel, refused);
+        };
+        // Everything that would upload it: the watcher, its looks once settled, sync passes, and time
+        const everythingRuns = async (d: Drive, rel: string) => {
+            await d.changed(rel);
+            await d.advance(10 * 60_000);
+            await d.engine.reconcileNow();
+            await d.engine.replayRemoteOps();
+            await d.advance(10 * 60_000);
+            await d.changed(rel);
+            await d.engine.reconcileNow();
+        };
+        const notFullyWritten = /^a \(not fully written \d{4}-\d\d-\d\d \d\d-\d\d-\d\d [A-Za-z0-9_-]+\)\.txt$/;
+
+        describe('holding', () => {
+            test('a refused close holds an existing file: nothing uploads, and the status counts it', async () => {
+                const d = await started();
+                await cutShort(d, 'a.txt', 'the ver');
+                expect(stateDb.getCutShort('a.txt')).toMatchObject({ relPath: 'a.txt', nodeUid: d.uid('a.txt'), size: 7 });
+                await everythingRuns(d, 'a.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('the version from before');
+                expect(d.engine.getStatus().stats.cutShortFiles).toBe(1);
+                expect(await readFile(d.local('a.txt'), 'utf8')).toBe('the ver');
+                expect(stateDb.getCutShort('a.txt')).not.toBeNull();
+            });
+
+            // No settle wait: held by the time the close is answered, so even a look right then doesn't upload it
+            test('a refused close holds at once', async () => {
+                const d = await started();
+                d.engine.driveWriting('a.txt', true);
+                await d.files.writeLocal('a.txt', 'the ver');
+                const closing = d.engine.driveClosed('a.txt', refused);
+                expect(stateDb.getCutShort('a.txt')).not.toBeNull(); // before it has even answered
+                await closing;
+                await d.changed('a.txt');
+                await d.advance(2000);
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.pendingLooks()).toBe(0);
+            });
+
+            test('a copy over an online-only file counts as an existing item, by its edit baseline', async () => {
+                const d = await started();
+                await d.engine.truncateItem('online.txt'); // the copy's O_TRUNC open
+                await cutShort(d, 'online.txt', 'the onl');
+                expect(stateDb.getItemByPath('online.txt')).toBeNull();
+                expect(stateDb.getCutShort('online.txt')?.nodeUid).toBe(d.uid('online.txt'));
+                expect(d.engine.listCutShort()).toEqual([{ relPath: 'online.txt', existing: true, size: 7, detectedAt: expect.any(Number) }]);
+                await everythingRuns(d, 'online.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.nodes.get(d.uid('online.txt'))?.content).toBe('the online version');
+            });
+
+            test('a refused close holds a new file', async () => {
+                const d = await started();
+                await cutShort(d, 'Docs/new.bin', 'part of it');
+                expect(stateDb.getCutShort('Docs/new.bin')).toMatchObject({ nodeUid: null, size: 10 });
+                expect(d.engine.listCutShort()).toEqual([
+                    { relPath: 'Docs/new.bin', existing: false, size: 10, detectedAt: expect.any(Number) },
+                ]);
+                await everythingRuns(d, 'Docs/new.bin');
+                expect(d.calls.uploads).toEqual([]);
+            });
+
+            test("a file as Proton Drive has it isn't held, however its write was refused", async () => {
+                const d = await started();
+                // Opened, its write refused, nothing written
+                d.engine.driveWriting('a.txt', false);
+                await d.engine.driveClosed('a.txt', { refused: true, replaced: false });
+                // Written again with what it held (a new time, the same content)
+                d.engine.driveWriting('Docs/b.txt', true);
+                await d.files.writeLocal('Docs/b.txt', 'b from before');
+                await d.engine.driveClosed('Docs/b.txt', refused);
+                // An online-only file emptied by the drive and written again with what the drive showed
+                await d.engine.truncateItem('online.txt');
+                d.engine.driveWriting('online.txt', true);
+                await d.files.writeLocal('online.txt', 'the online version');
+                await d.engine.driveClosed('online.txt', refused);
+                await d.engine.waitForRunningLooks(); // their reads, which only then tell them from Proton Drive's version
+                expect(d.engine.listCutShort()).toEqual([]);
+                expect(stateDb.listActivity(500).filter((a) => a.details.startsWith('Not uploaded:'))).toEqual([]);
+                expect(d.engine.getStatus().stats.cutShortFiles).toBe(0);
+                await everythingRuns(d, 'a.txt');
+                expect(d.calls.uploads).toEqual([]);
+            });
+
+            test('the hold survives a restart of the daemon', async () => {
+                const d = await started();
+                await cutShort(d, 'a.txt', 'the ver');
+                await cutShort(d, 'Docs/new.bin', 'part of it');
+                await d.restart();
+                await everythingRuns(d, 'a.txt');
+                await everythingRuns(d, 'Docs/new.bin');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.engine.listCutShort().map((i) => i.relPath).sort()).toEqual(['Docs/new.bin', 'a.txt']);
+            });
+
+            test('the same refused close twice holds once, and keeps when it was found', async () => {
+                const d = await started();
+                await cutShort(d, 'a.txt', 'the ver');
+                const first = stateDb.getCutShort('a.txt')!;
+                await d.advance(5000);
+                await d.engine.driveClosed('a.txt', refused);
+                expect(d.engine.listCutShort()).toEqual([{ relPath: 'a.txt', existing: true, size: 7, detectedAt: first.detectedAt }]);
+            });
+
+            // The helper waits on its posts one at a time and gives up after 5 s, sending a refused close again: a close
+            // that waited for a whole large file to be read would hold up every notice behind it, the keepalives of
+            // files being copied in included (#64)
+            describe('a close that only reading the whole file can decide', () => {
+                const original = 'the version from before';
+                const answers = (closing: Promise<void>) =>
+                    Promise.race([closing.then(() => 'answered'), Bun.sleep(1000).then(() => 'still reading the file')]);
+                // Reads of a.txt wait until released, and then answer `sha1` (what a read gives), or read the file
+                const readsOfA = (sha1?: string) => {
+                    let release!: () => void;
+                    const released = new Promise<void>((resolve) => (release = resolve));
+                    const read = fileOpsModule.computeLocalFileSha1;
+                    const spy = spyOn(fileOpsModule, 'computeLocalFileSha1').mockImplementation(async (p: string) => {
+                        if (!p.endsWith('/a.txt')) return read(p);
+                        await released;
+                        return sha1 ?? read(p);
+                    });
+                    return { spy, release, count: () => spy.mock.calls.filter(([p]) => String(p).endsWith('/a.txt')).length };
+                };
+                const told = () => stateDb.listActivity(500).filter((a) => a.details.startsWith('Not uploaded:')).map((a) => a.localRelPath);
+
+                test('answers at once, held meanwhile, and the same close again reads nothing more', async () => {
+                    const d = await started();
+                    const reads = readsOfA();
+                    try {
+                        d.engine.driveWriting('a.txt', true);
+                        await d.files.writeLocal('a.txt', original.toUpperCase()); // as long as Proton Drive's, written since
+                        expect(await answers(d.engine.driveClosed('a.txt', refused))).toBe('answered');
+                        expect(stateDb.getCutShort('a.txt')).toMatchObject({ nodeUid: d.uid('a.txt'), size: original.length });
+                        // Sent again (the helper gave up waiting): answered at once each time
+                        for (let i = 0; i < 3; i++) {
+                            expect(await answers(d.engine.driveClosed('a.txt', refused))).toBe('answered');
+                        }
+                        // Held while it is read: nothing uploads it
+                        await d.changed('a.txt');
+                        await d.engine.reconcileNow();
+                        await d.advance(5000);
+                        expect(d.calls.uploads).toEqual([]);
+                        reads.release();
+                        await d.engine.waitForRunningLooks();
+                        expect(reads.count()).toBe(1); // one read, for all four closes
+                        expect(stateDb.getCutShort('a.txt')).not.toBeNull(); // not what Proton Drive has: held on
+                        expect(told()).toEqual(['a.txt']);
+                        await everythingRuns(d, 'a.txt');
+                        expect(d.calls.uploads).toEqual([]);
+                    } finally {
+                        reads.release();
+                        reads.spy.mockRestore();
+                    }
+                });
+
+                test("one that holds just Proton Drive's version is let go of once read, and told of nowhere", async () => {
+                    const d = await started();
+                    const reads = readsOfA();
+                    try {
+                        d.engine.driveWriting('a.txt', true);
+                        await d.files.writeLocal('a.txt', original); // written again, with what it held
+                        expect(await answers(d.engine.driveClosed('a.txt', refused))).toBe('answered');
+                        expect(stateDb.getCutShort('a.txt')).not.toBeNull();
+                        reads.release();
+                        await d.engine.waitForRunningLooks();
+                        expect(stateDb.getCutShort('a.txt')).toBeNull();
+                        expect(told()).toEqual([]);
+                        await everythingRuns(d, 'a.txt');
+                        expect(d.calls.uploads).toEqual([]);
+                    } finally {
+                        reads.release();
+                        reads.spy.mockRestore();
+                    }
+                });
+
+                test('one written again while it was read stays held, whatever the read found', async () => {
+                    const d = await started();
+                    const reads = readsOfA(stateDb.getItemByPath('a.txt')!.remoteSha1!); // the read saw Proton Drive's version
+                    try {
+                        d.engine.driveWriting('a.txt', true);
+                        await d.files.writeLocal('a.txt', original);
+                        expect(await answers(d.engine.driveClosed('a.txt', refused))).toBe('answered');
+                        // Meanwhile edited in place through the drive
+                        d.engine.driveWriting('a.txt', false);
+                        appendFileSync(d.local('a.txt'), ' and more');
+                        await d.engine.driveClosed('a.txt', { refused: false, replaced: false });
+                        reads.release();
+                        await d.engine.waitForRunningLooks();
+                        expect(stateDb.getCutShort('a.txt')).not.toBeNull();
+                        await everythingRuns(d, 'a.txt');
+                        expect(d.calls.uploads).toEqual([]);
+                    } finally {
+                        reads.release();
+                        reads.spy.mockRestore();
+                    }
+                });
+            });
+        });
+
+        describe('lifting the hold', () => {
+            test('a full rewrite lifts it: the file uploads once, whole', async () => {
+                const d = await started();
+                await cutShort(d, 'a.txt', 'the ver');
+                // The copy run again
+                d.engine.driveWriting('a.txt', true);
+                await d.files.writeLocal('a.txt', 'the version from now, whole');
+                await d.changed('a.txt');
+                await d.engine.driveClosed('a.txt', { refused: false, replaced: true });
+                expect(stateDb.getCutShort('a.txt')).toBeNull();
+                await d.advance(2000);
+                expect(d.calls.uploads).toEqual(['a.txt']);
+                expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('the version from now, whole');
+                await everythingRuns(d, 'a.txt');
+                expect(d.calls.uploads).toEqual(['a.txt']);
+            });
+
+            test("a close that didn't replace the file keeps the hold", async () => {
+                const d = await started();
+                await cutShort(d, 'a.txt', 'the ver');
+                d.engine.driveWriting('a.txt', false);
+                appendFileSync(d.local('a.txt'), 'sion');
+                await d.changed('a.txt');
+                await d.engine.driveClosed('a.txt', { refused: false, replaced: false });
+                expect(stateDb.getCutShort('a.txt')).not.toBeNull();
+                await everythingRuns(d, 'a.txt');
+                expect(d.calls.uploads).toEqual([]);
+            });
+
+            test('the file gone drops its hold: seen by the watcher, by a sync pass, or deleted through the drive', async () => {
+                const d = await started();
+                await cutShort(d, 'Docs/new.bin', 'part of it');
+                await cutShort(d, 'Docs/other.bin', 'part of that');
+                await cutShort(d, 'a.txt', 'the ver');
+                await rm(d.local('Docs/new.bin'));
+                await d.changed('Docs/new.bin');
+                expect(stateDb.getCutShort('Docs/new.bin')).toBeNull();
+                await rm(d.local('Docs/other.bin'));
+                await d.engine.reconcileNow();
+                expect(stateDb.getCutShort('Docs/other.bin')).toBeNull();
+                await d.engine.deleteItem('a.txt');
+                expect(stateDb.getCutShort('a.txt')).toBeNull();
+                expect(d.engine.listCutShort()).toEqual([]);
+                expect(d.calls.uploads).toEqual([]);
+            });
+
+            test('a folder deleted through the drive drops the holds in it', async () => {
+                const d = await started();
+                await cutShort(d, 'Docs/new.bin', 'part of it');
+                await cutShort(d, 'Docs/b.txt', 'b fr');
+                await d.engine.deleteItem('Docs');
+                expect(d.engine.listCutShort()).toEqual([]);
+            });
+
+            test('a drive rename carries the hold to the new name, and the file stays held there', async () => {
+                const d = await started();
+                await cutShort(d, 'a.txt', 'the ver');
+                await cutShort(d, 'Docs/new.bin', 'part of it');
+                await d.engine.renameItem('a.txt', 'Docs/a moved.txt');
+                await d.engine.renameItem('Docs', 'Papers');
+                expect(stateDb.getCutShort('a.txt')).toBeNull();
+                expect(stateDb.getCutShort('Papers/a moved.txt')).toMatchObject({ nodeUid: d.uid('a.txt'), size: 7 });
+                expect(stateDb.getCutShort('Papers/new.bin')).toMatchObject({ nodeUid: null, size: 10 });
+                await d.engine.replayRemoteOps();
+                await everythingRuns(d, 'Papers/a moved.txt');
+                await everythingRuns(d, 'Papers/new.bin');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('the version from before');
+            });
+
+            test("a rename over a held file drops its hold: that file's content is gone", async () => {
+                const d = await started();
+                await cutShort(d, 'a.txt', 'the ver');
+                // An editor's save through a temp file, renamed over it
+                await d.files.writeLocal('.a.txt.swp', 'saved whole');
+                await d.engine.renameItem('.a.txt.swp', 'a.txt');
+                expect(stateDb.getCutShort('a.txt')).toBeNull();
+                await d.changed('a.txt');
+                await d.advance(16_000);
+                await d.engine.reconcileNow();
+                await d.engine.replayRemoteOps();
+                expect(d.calls.uploads).toEqual(['a.txt']);
+                expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('saved whole');
+            });
+
+            test('a held file renamed over another takes its hold there, as an edit of the file it replaced', async () => {
+                const d = await started();
+                await cutShort(d, 'Docs/new.bin', 'part of it');
+                await d.engine.renameItem('Docs/new.bin', 'a.txt');
+                expect(stateDb.getCutShort('Docs/new.bin')).toBeNull();
+                expect(stateDb.getCutShort('a.txt')).toMatchObject({ nodeUid: d.uid('a.txt'), size: 10 });
+                await d.engine.replayRemoteOps();
+                await everythingRuns(d, 'a.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('the version from before');
+            });
+
+            test('a change to it in Proton Drive puts it back: the cloud version is at its path, the cut-short file beside it, held', async () => {
+                const d = await started();
+                await cutShort(d, 'a.txt', 'the ver');
+                d.cloudEdit('a.txt', 'the version from another device');
+                await d.engine.reconcileNow();
+                expect(await d.files.exists('a.txt')).toBe(false);
+                expect(stateDb.getItemByPath('a.txt')).toBeNull();
+                const listed = d.engine.vfsChildren('').find((e) => e.name === 'a.txt');
+                expect(listed).toMatchObject({ type: 'file', size: 'the version from another device'.length });
+                const copies = (await d.localNames()).filter((n) => notFullyWritten.test(n));
+                expect(copies).toHaveLength(1);
+                expect(await readFile(d.local(copies[0]!), 'utf8')).toBe('the ver');
+                expect(d.engine.listCutShort()).toEqual([{ relPath: copies[0], existing: false, size: 7, detectedAt: expect.any(Number) }]);
+                expect(stateDb.listConflicts(true)).toEqual([]);
+                await everythingRuns(d, copies[0]!);
+                await everythingRuns(d, 'a.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('the version from another device');
+            });
+
+            test('a held file moved in Proton Drive follows it there, still held, and never uploads', async () => {
+                const d = await started();
+                await cutShort(d, 'a.txt', 'the ver');
+                const node = d.nodes.get(d.uid('a.txt'))!;
+                d.nodes.set(node.uid, { ...node, parentUid: d.uid('Docs') }); // moved into Docs, on another device
+                await d.engine.reconcileNow();
+                await d.advance(2000); // just written: the pass moves it once it has settled
+                await d.engine.reconcileNow();
+                expect(await d.files.exists('a.txt')).toBe(false);
+                expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('the ver');
+                expect(stateDb.getItemByPath('Docs/a.txt')?.nodeUid).toBe(node.uid);
+                expect(d.engine.listCutShort()).toEqual([{ relPath: 'Docs/a.txt', existing: true, size: 7, detectedAt: expect.any(Number) }]);
+                await everythingRuns(d, 'Docs/a.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.nodes.get(node.uid)?.content).toBe('the version from before');
+            });
+
+            test('a held file deleted in Proton Drive goes to the desktop Trash, and its hold with it', async () => {
+                const d = await started({ trashWorks: true });
+                await cutShort(d, 'a.txt', 'the ver');
+                await d.deletedInCloud('a.txt');
+                expect(await d.files.exists('a.txt')).toBe(false);
+                expect(await readFile(path.join(d.trashDir, 'a.txt'), 'utf8')).toBe('the ver');
+                expect(stateDb.getItemByPath('a.txt')).toBeNull();
+                expect(d.engine.listCutShort()).toEqual([]);
+                expect(d.engine.getStatus().stats.cutShortFiles).toBe(0);
+                await everythingRuns(d, 'a.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test('a held file deleted in Proton Drive that the desktop Trash refuses stays here, held as a new file', async () => {
+                const d = await started();
+                await cutShort(d, 'a.txt', 'the ver');
+                await d.deletedInCloud('a.txt');
+                expect(await readFile(d.local('a.txt'), 'utf8')).toBe('the ver');
+                expect(stateDb.getItemByPath('a.txt')).toBeNull();
+                expect(d.engine.listCutShort()).toEqual([{ relPath: 'a.txt', existing: false, size: 7, detectedAt: expect.any(Number) }]);
+                // Not said to upload: it waits for the user
+                const said = stateDb.listActivity(500).find((a) => a.action === 'delete-local')!.details;
+                expect(said).toContain("The 1 file(s) there that weren't fully written stay on this computer until you choose");
+                expect(said).not.toContain('and will upload again');
+                await everythingRuns(d, 'a.txt');
+                await d.restart();
+                await everythingRuns(d, 'a.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+                expect(await readFile(d.local('a.txt'), 'utf8')).toBe('the ver');
+            });
+
+            // Move to Trash through the drive: what isn't in Proton Drive goes to the desktop Trash, and what that refuses
+            // stays here. A held file kept so must stay held, never upload as a new item
+            test('a folder moved to the Trash through the drive, which the desktop Trash refuses, keeps its held files held', async () => {
+                const d = await started();
+                await cutShort(d, 'Docs/b.txt', 'b fr');
+                await cutShort(d, 'Docs/new.bin', 'part of it');
+                await d.engine.deleteItem('Docs', { trash: true });
+                await d.engine.replayRemoteOps();
+                expect(d.calls.trashed).toEqual([[d.uid('Docs')]]); // the folder, in Proton Drive, as the user asked
+                expect(await readFile(d.local('Docs/b.txt'), 'utf8')).toBe('b fr');
+                expect(await readFile(d.local('Docs/new.bin'), 'utf8')).toBe('part of it');
+                expect(d.engine.listCutShort().map((i) => [i.relPath, i.existing]).sort()).toEqual([
+                    ['Docs/b.txt', false],
+                    ['Docs/new.bin', false],
+                ]);
+                const said = stateDb.listActivity(500).find((a) => a.action === 'delete-local')!.details;
+                expect(said).toContain("The 2 file(s) there that weren't fully written stay on this computer until you choose");
+                expect(said).not.toContain('and will upload again');
+                await everythingRuns(d, 'Docs/b.txt');
+                await everythingRuns(d, 'Docs/new.bin');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.engine.listCutShort()).toHaveLength(2);
+            });
+
+            test('a folder moved to the Trash through the drive takes its held files to the desktop Trash, and their holds', async () => {
+                const d = await started({ trashWorks: true });
+                await cutShort(d, 'Docs/b.txt', 'b fr');
+                await cutShort(d, 'Docs/new.bin', 'part of it');
+                await d.engine.deleteItem('Docs', { trash: true });
+                expect(await d.files.exists('Docs')).toBe(false);
+                expect(await readFile(path.join(d.trashDir, 'Docs', 'new.bin'), 'utf8')).toBe('part of it');
+                expect(d.engine.listCutShort()).toEqual([]);
+                await everythingRuns(d, 'Docs/b.txt');
+                expect(d.calls.uploads).toEqual([]);
+            });
+
+            test('a held copy over an online-only file whose item goes from Proton Drive is held on as a new file', async () => {
+                const d = await started();
+                d.add('Docs/elsewhere.txt', 'another online version');
+                await d.engine.reconcileNow();
+                for (const rel of ['online.txt', 'Docs/elsewhere.txt']) {
+                    await d.engine.truncateItem(rel); // copied over through the drive, and cut short
+                    await cutShort(d, rel, 'cut');
+                }
+                expect(d.engine.listCutShort().every((i) => i.existing)).toBe(true);
+                await d.deletedInCloud('online.txt');
+                await d.trashedInCloud('Docs/elsewhere.txt');
+                expect(d.engine.listCutShort().map((i) => [i.relPath, i.existing]).sort()).toEqual([
+                    ['Docs/elsewhere.txt', false],
+                    ['online.txt', false],
+                ]);
+                // Nothing to put back: only Upload it anyway is left
+                await expect(d.engine.putBackCutShort(['online.txt'])).rejects.toMatchObject({ code: 'EINVAL' });
+                for (const rel of ['online.txt', 'Docs/elsewhere.txt']) {
+                    expect(await readFile(d.local(rel), 'utf8')).toBe('cut');
+                }
+                await everythingRuns(d, 'online.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test('a drive rename whose move fails leaves the hold with the file, where it stayed', async () => {
+                const d = await started();
+                await cutShort(d, 'a.txt', 'the ver');
+                const spy = spyOn(localMoveModule, 'moveWithoutReplacing').mockImplementation(() => {
+                    throw Object.assign(new Error('EIO: i/o error, link'), { code: 'EIO' });
+                });
+                try {
+                    await expect(d.engine.renameItem('a.txt', 'b.txt')).rejects.toThrow();
+                } finally {
+                    spy.mockRestore();
+                }
+                expect(await readFile(d.local('a.txt'), 'utf8')).toBe('the ver');
+                expect(stateDb.getItemByPath('a.txt')?.nodeUid).toBe(d.uid('a.txt'));
+                expect(d.engine.listCutShort()).toEqual([{ relPath: 'a.txt', existing: true, size: 7, detectedAt: expect.any(Number) }]);
+                await everythingRuns(d, 'a.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test('a drive rename the daemon stopped in the middle of, and that can not be finished, leaves the hold with the file', async () => {
+                const d = await started();
+                await cutShort(d, 'a.txt', 'the ver');
+                // As the rename's transaction left it: records and holds at the new path, the file not moved yet (and its
+                // folder there gone since)
+                stateDb.renameItemPath('a.txt', 'Gone/a.txt');
+                stateDb.moveCutShort('a.txt', 'Gone/a.txt');
+                stateDb.setMeta(LOCAL_MOVE_IN_PROGRESS, JSON.stringify({ from: 'a.txt', to: 'Gone/a.txt', replace: false }));
+                await d.restart();
+                await d.engine.reconcileNow();
+                expect(stateDb.getMeta(LOCAL_MOVE_IN_PROGRESS)).toBeNull();
+                expect(await readFile(d.local('a.txt'), 'utf8')).toBe('the ver');
+                expect(d.engine.listCutShort().map((i) => i.relPath)).toEqual(['a.txt']);
+                await everythingRuns(d, 'a.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test('a cloud change to a held copy over an online-only file puts it back too', async () => {
+                const d = await started();
+                await d.engine.truncateItem('online.txt');
+                await cutShort(d, 'online.txt', 'the onl');
+                d.cloudEdit('online.txt', 'edited elsewhere');
+                await d.engine.reconcileNow();
+                expect(await d.files.exists('online.txt')).toBe(false);
+                expect(stateDb.getEditBaseline('online.txt')).toBeNull();
+                const copies = (await d.localNames()).filter((n) => n.startsWith('online (not fully written '));
+                expect(copies).toHaveLength(1);
+                await everythingRuns(d, 'online.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+                expect(stateDb.listConflicts(true)).toEqual([]);
+            });
+        });
+
+        describe("the user's choices", () => {
+            test('Upload this version uploads it once, as it is', async () => {
+                const d = await started();
+                await cutShort(d, 'a.txt', 'the ver');
+                await d.advance(10_000);
+                await d.engine.uploadCutShort(['a.txt', 'never held.txt']);
+                expect(stateDb.getCutShort('a.txt')).toBeNull();
+                await d.engine.waitForRunningLooks();
+                await d.advance(2000);
+                await d.engine.waitForRunningLooks();
+                expect(d.calls.uploads).toEqual(['a.txt']);
+                expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('the ver');
+                await everythingRuns(d, 'a.txt');
+                expect(d.calls.uploads).toEqual(['a.txt']);
+            });
+
+            test('Upload it anyway uploads a new file', async () => {
+                const d = await started();
+                await cutShort(d, 'Docs/new.bin', 'part of it');
+                await d.advance(10_000);
+                await d.engine.uploadCutShort(['Docs/new.bin']);
+                await d.engine.waitForRunningLooks();
+                await d.advance(2000);
+                await d.engine.waitForRunningLooks();
+                expect(d.calls.uploads).toEqual(['Docs/new.bin']);
+                expect(d.engine.listCutShort()).toEqual([]);
+            });
+
+            test('Put back keeps both and touches nothing in Proton Drive: the path online-only, the cut-short file beside it', async () => {
+                const d = await started();
+                await cutShort(d, 'a.txt', 'the ver');
+                await d.engine.truncateItem('online.txt');
+                await cutShort(d, 'online.txt', 'the onl');
+                const cloud = new Map([...d.nodes].map(([uid, node]) => [uid, node]));
+                await d.engine.putBackCutShort(['a.txt', 'online.txt', 'never held.txt']);
+
+                const names = await d.localNames();
+                const copyOfA = names.find((n) => notFullyWritten.test(n))!;
+                const copyOfOnline = names.find((n) => n.startsWith('online (not fully written '))!;
+                expect(copyOfA).toBeDefined();
+                expect(copyOfOnline).toBeDefined();
+                expect(await readFile(d.local(copyOfA), 'utf8')).toBe('the ver');
+                expect(await readFile(d.local(copyOfOnline), 'utf8')).toBe('the onl');
+                // The copies are held, as new files
+                expect(d.engine.listCutShort().sort((x, y) => x.relPath.localeCompare(y.relPath))).toEqual([
+                    { relPath: copyOfA, existing: false, size: 7, detectedAt: expect.any(Number) },
+                    { relPath: copyOfOnline, existing: false, size: 7, detectedAt: expect.any(Number) },
+                ]);
+                // Each path online-only again: no file here, no record, no baseline, listed as Proton Drive has it
+                for (const [rel, content] of [['a.txt', 'the version from before'], ['online.txt', 'the online version']] as const) {
+                    expect(await d.files.exists(rel)).toBe(false);
+                    expect(stateDb.getItemByPath(rel)).toBeNull();
+                    expect(stateDb.getEditBaseline(rel)).toBeNull();
+                    expect(stateDb.getCutShort(rel)).toBeNull();
+                    expect(d.engine.vfsChildren('').find((e) => e.name === rel)).toMatchObject({ type: 'file', size: content.length });
+                }
+                // Nothing downloaded, uploaded or trashed; every cloud node as it was
+                const untouched = () => {
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.calls.uploads).toEqual([]);
+                    expect(d.calls.downloads).toEqual([]);
+                    expect(d.calls.renamed).toEqual([]);
+                    expect(d.calls.moved).toEqual([]);
+                    expect(d.journal()).toEqual([]);
+                    expect(new Map(d.nodes)).toEqual(cloud);
+                    for (const [uid, node] of cloud) {
+                        expect(d.nodes.get(uid)).toBe(node);
+                    }
+                };
+                untouched();
+                // A watcher's report of each, sync passes, a restart and time: never read as a delete
+                for (const rel of ['a.txt', 'online.txt', copyOfA, copyOfOnline]) {
+                    await d.changed(rel);
+                }
+                await everythingRuns(d, 'a.txt');
+                await d.restart();
+                await everythingRuns(d, 'online.txt');
+                untouched();
+                expect(d.engine.listCutShort()).toHaveLength(2);
+                // Opened again, the path downloads Proton Drive's version
+                await d.engine.hydrate('a.txt');
+                expect(await readFile(d.local('a.txt'), 'utf8')).toBe('the version from before');
+                expect(await readFile(d.local(copyOfA), 'utf8')).toBe('the ver');
+            });
+
+            test('Put back of a file Proton Drive has no version of is refused, and changes nothing', async () => {
+                const d = await started();
+                await cutShort(d, 'Docs/new.bin', 'part of it');
+                await cutShort(d, 'a.txt', 'the ver');
+                for (const paths of [['Docs/new.bin'], ['a.txt', 'Docs/new.bin']]) {
+                    await expect(d.engine.putBackCutShort(paths)).rejects.toMatchObject({ code: 'EINVAL' });
+                }
+                expect(await readFile(d.local('Docs/new.bin'), 'utf8')).toBe('part of it');
+                expect(await readFile(d.local('a.txt'), 'utf8')).toBe('the ver');
+                expect(stateDb.getItemByPath('a.txt')).not.toBeNull();
+                expect(d.engine.listCutShort().map((i) => i.relPath).sort()).toEqual(['Docs/new.bin', 'a.txt']);
+            });
+
+            test('Put back next to a name already taken picks the next free one', async () => {
+                const d = await started();
+                await cutShort(d, 'a.txt', 'the ver');
+                const taken = new Date();
+                // Taken here, whatever second the put back lands on
+                for (let s = -1; s <= 3; s++) {
+                    await d.files.writeLocal(formatNotFullyWrittenName('a.txt', new Date(taken.getTime() + s * 1000)), 'someone else');
+                }
+                await d.engine.putBackCutShort(['a.txt']);
+                const copies = d.engine.listCutShort().map((i) => i.relPath);
+                expect(copies).toHaveLength(1);
+                expect(copies[0]).toMatch(/^a \(not fully written .*\)-\d+\.txt$/);
+                expect(await readFile(d.local(copies[0]!), 'utf8')).toBe('the ver');
+                for (const name of (await d.localNames()).filter((n) => notFullyWritten.test(n))) {
+                    expect(await readFile(d.local(name), 'utf8')).toBe('someone else');
+                }
+            });
+        });
+
+        describe('around the edges', () => {
+            // a.txt edited here and in Proton Drive while the setting is prompt: a conflict waits; then cut short
+            const inConflict = async () => {
+                const d = await started();
+                stateDb.updateSettings({ conflictStrategy: 'prompt' });
+                d.cloudEdit('a.txt', 'a cloud edit');
+                d.cloudEdit('Docs/b.txt', 'b cloud edit');
+                await d.files.writeLocal('a.txt', 'a local edit');
+                await d.files.writeLocal('Docs/b.txt', 'b local edit');
+                await d.changed('a.txt');
+                await d.changed('Docs/b.txt');
+                await d.advance(2000); // settled, each is looked at again: changed on both sides
+                const conflict = (rel: string) => stateDb.listConflicts().find((c) => c.localRelPath === rel)!;
+                expect(conflict('a.txt')).toBeDefined();
+                expect(conflict('Docs/b.txt')).toBeDefined();
+                d.calls.uploads.length = 0;
+                return { ...d, conflict };
+            };
+
+            test('Keep Local and Keep Both on a held file are refused, and upload nothing', async () => {
+                const d = await inConflict();
+                await cutShort(d, 'a.txt', 'a lo');
+                for (const choice of ['keep-local', 'keep-both'] as const) {
+                    const refusal = await d.engine.resolveConflictManually(d.conflict('a.txt').id, choice).catch((e: unknown) => e);
+                    expect(refusal).toMatchObject({ name: 'ConflictRefusedError', status: 409 });
+                    expect((refusal as Error).message).toMatch(/wasn't fully written/);
+                }
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.conflict('a.txt').resolved).toBe(0);
+                expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('a cloud edit');
+            });
+
+            // Held while Proton Drive was asked, after the first check: the check just before the upload refuses it
+            test('Keep Local and Keep Both on a file cut short while they ask Proton Drive are refused, and upload nothing', async () => {
+                const d = await inConflict();
+                const getNode = (d.sdk as any).getNode;
+                const cutWhileAsked = new Map([[d.uid('a.txt'), 'a.txt'], [d.uid('Docs/b.txt'), 'Docs/b.txt']]);
+                (d.sdk as any).getNode = async (uid: string) => {
+                    const rel = cutWhileAsked.get(uid);
+                    if (rel) {
+                        cutWhileAsked.delete(uid);
+                        await cutShort(d, rel, 'cut');
+                    }
+                    return getNode(uid);
+                };
+                for (const [rel, choice] of [['a.txt', 'keep-local'], ['Docs/b.txt', 'keep-both']] as const) {
+                    const refusal = await d.engine.resolveConflictManually(d.conflict(rel).id, choice).catch((e: unknown) => e);
+                    expect({ rel, refusal }).toMatchObject({ rel, refusal: { name: 'ConflictRefusedError', status: 409 } });
+                    expect((refusal as Error).message).toMatch(/wasn't fully written/);
+                    expect(d.conflict(rel).resolved).toBe(0);
+                }
+                expect(cutWhileAsked.size).toBe(0);
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('a cloud edit');
+            });
+
+            test('a look held up asking Proton Drive, as the file is cut short, never uploads it', async () => {
+                const d = await started();
+                await d.files.writeLocal('a.txt', 'a whole new version, longer than before');
+                await d.changed('a.txt'); // looked at again once settled
+                const getNode = (d.sdk as any).getNode;
+                let cut = false;
+                (d.sdk as any).getNode = async (uid: string) => {
+                    if (uid === d.uid('a.txt') && !cut) {
+                        cut = true;
+                        // After the look found it not held: rewritten through the drive, and cut short
+                        d.engine.driveWriting('a.txt', true);
+                        await d.files.writeLocal('a.txt', 'a who');
+                        await d.engine.driveClosed('a.txt', refused);
+                    }
+                    return getNode(uid);
+                };
+                await d.advance(2000);
+                await d.engine.waitForRunningLooks();
+                expect(cut).toBe(true);
+                expect(stateDb.getCutShort('a.txt')).not.toBeNull();
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.nodes.get(d.uid('a.txt'))?.content).toBe('the version from before');
+            });
+
+            test('Keep Local on a file still being written is refused, and uploads nothing', async () => {
+                const d = await inConflict();
+                d.engine.driveWriting('Docs/b.txt', true);
+                await d.files.writeLocal('Docs/b.txt', 'b lo');
+                const refusal = await d.engine.resolveConflictManually(d.conflict('Docs/b.txt').id, 'keep-local').catch((e: unknown) => e);
+                expect(refusal).toMatchObject({ name: 'ConflictRefusedError', status: 409 });
+                expect((refusal as Error).message).toMatch(/still being written/);
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.conflict('Docs/b.txt').resolved).toBe(0);
+                // Once closed, Keep Local goes ahead as ever
+                await d.engine.driveClosed('Docs/b.txt', { refused: false, replaced: true });
+                await d.engine.resolveConflictManually(d.conflict('Docs/b.txt').id, 'keep-local');
+                expect(d.nodes.get(d.uid('Docs/b.txt'))?.content).toBe('b lo');
+            });
+
+            test('Keep Remote on a held file puts the cloud version there, and its hold goes with what it held', async () => {
+                const d = await inConflict();
+                await cutShort(d, 'a.txt', 'a lo');
+                await d.engine.resolveConflictManually(d.conflict('a.txt').id, 'keep-remote');
+                expect(await readFile(d.local('a.txt'), 'utf8')).toBe('a cloud edit');
+                expect(stateDb.getCutShort('a.txt')).toBeNull();
+                expect(d.calls.uploads).toEqual([]);
+            });
+
+            test('a sync pass puts back a held file whose conflict waits, and closes the conflict, keeping both', async () => {
+                const d = await inConflict();
+                await cutShort(d, 'a.txt', 'a lo');
+                const id = d.conflict('a.txt').id;
+                await d.engine.reconcileNow();
+                const copy = (await d.localNames()).find((n) => notFullyWritten.test(n))!;
+                expect(await readFile(d.local(copy), 'utf8')).toBe('a lo');
+                expect(stateDb.getConflictById(id)).toMatchObject({ resolved: 1, resolution: 'keep-both', conflictCopyPath: copy });
+                expect(await d.files.exists('a.txt')).toBe(false);
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test('Free up space never frees a held file', async () => {
+                const d = await started();
+                await cutShort(d, 'a.txt', 'the ver');
+                const freed = await d.engine.setAvailability('a.txt', 'free');
+                expect(freed.kept).toEqual(['a.txt']);
+                await d.engine.setAvailability('', 'free');
+                expect(await readFile(d.local('a.txt'), 'utf8')).toBe('the ver');
+                expect(stateDb.getCutShort('a.txt')).not.toBeNull();
+                expect(d.calls.uploads).toEqual([]);
+            });
+
+            test('a held file shows the error emblem, and so do the folders holding it', async () => {
+                const d = await started();
+                await cutShort(d, 'Docs/b.txt', 'b fr');
+                await cutShort(d, 'Docs/new.bin', 'part of it');
+                await cutShort(d, 'Fresh/deep/new.bin', 'part');
+                const docs = d.engine.itemStates('Docs')!;
+                expect(docs.children['b.txt']?.transfer).toBe('error');
+                expect(docs.children['new.bin']).toEqual({ availability: 'downloaded', transfer: 'error' });
+                expect(docs.self?.transfer).toBe('error');
+                const top = d.engine.itemStates('')!;
+                expect(top.children.Docs?.transfer).toBe('error');
+                expect(top.children.Fresh).toEqual({ availability: 'downloaded', transfer: 'error' });
+                expect(top.children['a.txt']?.transfer).toBeNull();
+                const fresh = d.engine.itemStates('Fresh')!;
+                expect(fresh.self).toEqual({ availability: 'downloaded', transfer: 'error' });
+                expect(fresh.children.deep).toEqual({ availability: 'downloaded', transfer: 'error' });
+                expect(d.engine.itemStates('Fresh/deep')!.children['new.bin']).toEqual({ availability: 'downloaded', transfer: 'error' });
+                // A conflict still shows over it
+                stateDb.recordConflict({
+                    localRelPath: 'Docs/b.txt', nodeUid: d.uid('Docs/b.txt'), localSha1: null, remoteSha1: null, localMtimeMs: 0, remoteMtimeMs: 0,
+                });
+                expect(d.engine.itemStates('Docs')!.children['b.txt']?.transfer).toBe('conflict');
+            });
+
+            test('Activity logs the first cut-short file of a burst, and the next one a minute later', async () => {
+                const d = await started();
+                const told = () =>
+                    stateDb
+                        .listActivity(500)
+                        .filter((a) => a.details.startsWith('Not uploaded:'))
+                        .map((a) => [a.action, a.localRelPath, a.details])
+                        .reverse();
+                await cutShort(d, 'Docs/one.bin', 'part');
+                await d.advance(30_000);
+                await cutShort(d, 'Docs/two.bin', 'part');
+                await d.engine.driveClosed('Docs/one.bin', refused); // the same close again
+                expect(told()).toEqual([['error', 'Docs/one.bin', "Not uploaded: Docs/one.bin wasn't fully written (disk nearly full)"]]);
+                await d.advance(31_000);
+                await cutShort(d, 'Docs/three.bin', 'part');
+                expect(told()).toEqual([
+                    ['error', 'Docs/one.bin', "Not uploaded: Docs/one.bin wasn't fully written (disk nearly full)"],
+                    ['error', 'Docs/three.bin', "Not uploaded: Docs/three.bin wasn't fully written (disk nearly full)"],
+                ]);
+            });
+
+            test('starting fresh with another account keeps every hold, as new files', async () => {
+                const d = await started();
+                await cutShort(d, 'a.txt', 'the ver');
+                stateDb.setMeta('accountRoot', 'other~root');
+                await d.engine.reconcileNow();
+                await d.engine.startFreshForThisAccount();
+                expect(d.engine.listCutShort()).toEqual([{ relPath: 'a.txt', existing: false, size: 7, detectedAt: expect.any(Number) }]);
+                await d.engine.reconcileNow();
+                await d.advance(10 * 60_000);
+                await d.engine.reconcileNow();
+                expect(d.calls.uploads.filter((u) => u === 'a.txt')).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test('through the control socket: a refused close holds, then the list, Upload this version and Put back', async () => {
+                const d = await started();
+                const socketPath = path.join(tempDir, 'sock', 'control.sock');
+                const server = await startControlServer({ socketPath, engine: d.engine });
+                const call = (route: string, init: RequestInit = {}) =>
+                    fetch(`http://localhost${route}`, { unix: socketPath, ...init } as RequestInit);
+                const post = (route: string, body: unknown) => call(route, { method: 'POST', body: JSON.stringify(body) });
+                try {
+                    d.engine.driveWriting('a.txt', true);
+                    await d.files.writeLocal('a.txt', 'the ver');
+                    d.engine.driveWriting('Docs/b.txt', true);
+                    await d.files.writeLocal('Docs/b.txt', 'b fr');
+                    for (const rel of ['a.txt', 'Docs/b.txt', 'a.txt']) {
+                        const res = await post('/vfs/closed', { path: rel, refused: true, replaced: true });
+                        expect(res.status).toBe(200);
+                        // Held by the time it answers
+                        expect(stateDb.getCutShort(rel)).not.toBeNull();
+                    }
+                    const listed = await (await call('/cut-short')).json();
+                    expect(listed).toEqual({
+                        items: expect.arrayContaining([
+                            { relPath: 'a.txt', existing: true, size: 7, detectedAt: expect.any(Number) },
+                            { relPath: 'Docs/b.txt', existing: true, size: 4, detectedAt: expect.any(Number) },
+                        ]),
+                    });
+                    expect(await (await post('/cut-short/restore', { paths: ['a.txt'] })).json()).toEqual({ ok: true });
+                    expect(await d.files.exists('a.txt')).toBe(false);
+                    expect(await (await post('/cut-short/upload', { paths: ['Docs/b.txt'] })).json()).toEqual({ ok: true });
+                    await d.engine.waitForRunningLooks();
+                    await d.advance(16_000);
+                    await d.engine.waitForRunningLooks();
+                    expect(d.calls.uploads).toEqual(['Docs/b.txt']);
+                    const newFile = d.engine.listCutShort()[0]!.relPath;
+                    const refusedPutBack = await post('/cut-short/restore', { paths: [newFile] });
+                    expect(refusedPutBack.status).toBe(400);
+                    expect(await refusedPutBack.json()).toMatchObject({ code: 'EINVAL' });
+                } finally {
+                    server.stop();
+                }
+            });
         });
     });
 

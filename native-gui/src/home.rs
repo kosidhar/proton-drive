@@ -9,7 +9,7 @@ use crate::icons;
 use crate::{
     action_button, action_button_if, action_button_named, card_frame, decoration, drive_status_line, files_safe_hint,
     format_bytes, offers_mount_again, render_transfer_line, shown_folder, spawn_reaped, AccountInfo, ButtonKind,
-    ConflictRecord, DaemonStatus, ProtonDriveNativeApp, VfsStatus, WorkerCommand, BG_CARD_ALT,
+    ConflictRecord, CutShortItem, DaemonStatus, ProtonDriveNativeApp, VfsStatus, WorkerCommand, BG_CARD_ALT,
     BORDER_SUBTLE, DANGER_TEXT, PROTON_PURPLE, PROTON_PURPLE_TEXT, SCREENSHOT_MODE, SUCCESS_TEXT, TEXT_MUTED, TEXT_PRIMARY,
     WARNING_TEXT,
 };
@@ -119,6 +119,12 @@ pub enum Attention {
     /// Signed in to another Proton account than the records are of: nothing syncs until the user chooses (#35)
     AccountMismatch,
     Conflict { id: u64, rel_path: String },
+    /// A file the disk guard cut short, which the daemon holds back until the user decides (#300): one row each up to
+    /// `CUT_SHORT_ROWS`
+    CutShort(CutShortItem),
+    /// More than `CUT_SHORT_ROWS` of them: one row for all, which Show them opens into one row each
+    /// `count` is what the daemon's status says (the tray counts from it); `items` is what has been listed so far
+    CutShortMany { count: usize, items: Vec<CutShortItem> },
     FilesMissing,
     DriveNotMounted { message: String, can_mount: bool },
     StoppedMove,
@@ -133,7 +139,7 @@ pub enum Attention {
 /// A stopped move is listed whenever the daemon reports one with something to do or say about it, whatever the drive
 /// is doing now: it attaches the move to a drive mounted (or ejected) again since the move failed. An unmounted virtual
 /// drive is listed too unless the move explains it or it is still starting or moving files.
-pub fn attention_items(status: &DaemonStatus, conflicts: &[ConflictRecord]) -> Vec<Attention> {
+pub fn attention_items(status: &DaemonStatus, conflicts: &[ConflictRecord], cut_short: &[CutShortItem]) -> Vec<Attention> {
     let mut items = Vec::new();
     if status.account_mismatch.is_some() {
         items.push(Attention::AccountMismatch);
@@ -159,6 +165,13 @@ pub fn attention_items(status: &DaemonStatus, conflicts: &[ConflictRecord]) -> V
     let mut open: Vec<&ConflictRecord> = conflicts.iter().filter(|c| c.resolved == 0).collect();
     open.sort_by_key(|c| c.id);
     items.extend(open.into_iter().map(|c| Attention::Conflict { id: c.id, rel_path: c.local_rel_path.clone() }));
+    // How many are held is what the status says, as the tray counts them; the list says which
+    let held = usize::try_from(status.stats.cut_short_files).unwrap_or(usize::MAX);
+    if held > CUT_SHORT_ROWS {
+        items.push(Attention::CutShortMany { count: held, items: cut_short.to_vec() });
+    } else {
+        items.extend(cut_short.iter().take(held).cloned().map(Attention::CutShort));
+    }
     if status.stats.error_items > 0 {
         items.push(Attention::FailedItems(status.stats.error_items));
     }
@@ -168,6 +181,43 @@ pub fn attention_items(status: &DaemonStatus, conflicts: &[ConflictRecord]) -> V
         }
     }
     items
+}
+
+/// How many held files Needs attention lists one by one; more are one row for all of them.
+pub const CUT_SHORT_ROWS: usize = 3;
+
+/// Whether a status refresh asks for the held files again: when the daemon came back, when their count differs from
+/// what it was when they were last asked for, and on every refresh while they are few enough to have a row each (1 to
+/// CUT_SHORT_ROWS), as the conflicts are: a load that failed, or a file renamed or replaced by another at the same
+/// count, would otherwise leave those rows missing or stale. Above that, one summary row counts them by the status, and
+/// they are asked for once per count (asked for, not answered: a load that keeps failing is not retried on every
+/// refresh; a later change of the count, or a decision, asks again).
+pub fn should_reload_cut_short(was_offline: bool, count_when_last_asked: u64, new_count: u64) -> bool {
+    was_offline || count_when_last_asked != new_count || (1..=CUT_SHORT_ROWS as u64).contains(&new_count)
+}
+
+/// The first line of a held file's row: its name in bold, then why it is held.
+pub fn cut_short_title(name: &str) -> (String, &'static str) {
+    (name.to_string(), " wasn't fully written: your computer's disk was nearly full.")
+}
+
+/// The second line of a held file's row: what is true of the file in Proton Drive.
+pub fn cut_short_detail(existing: bool) -> &'static str {
+    if existing {
+        "Proton Drive still has the version from before."
+    } else {
+        "It hasn't been uploaded."
+    }
+}
+
+/// The summary row's words: how many, in bold, then why they are held.
+pub fn cut_short_summary(n: usize) -> (String, &'static str) {
+    (format!("{n} files"), " weren't fully written: your computer's disk was nearly full.")
+}
+
+/// Whether Put back all is offered: only an existing file has a Proton Drive version to put back.
+pub fn offers_put_back(items: &[CutShortItem]) -> bool {
+    items.iter().any(|i| i.existing)
 }
 
 /// Whether a status refresh asks for the conflicts again: when the daemon came back, when the count of unresolved
@@ -772,6 +822,10 @@ impl ProtonDriveNativeApp {
                 ui.add_space(4.0);
                 ui.add(egui::Label::new(RichText::new(error).size(12.5).color(DANGER_TEXT())).wrap());
             }
+            if let Some(error) = &self.cut_short_error {
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(RichText::new(error).size(12.5).color(DANGER_TEXT())).wrap());
+            }
             ui.add_space(10.0);
             ScrollArea::vertical()
                 .id_salt("attention_scroll")
@@ -814,6 +868,8 @@ impl ProtonDriveNativeApp {
                     });
                 });
             }
+            Attention::CutShort(item) => attention_row(ui, |ui| self.render_cut_short(ui, &item)),
+            Attention::CutShortMany { count, items } => self.render_cut_short_many(ui, count, &items),
             Attention::DriveNotMounted { message, can_mount } => {
                 attention_row(ui, |ui| {
                     ui.add(egui::Label::new(RichText::new(&message).size(13.5).strong().color(TEXT_PRIMARY())).wrap());
@@ -857,6 +913,72 @@ impl ProtonDriveNativeApp {
                 ui.add(egui::Label::new(RichText::new(text).size(13.0).color(DANGER_TEXT())).wrap());
             }),
         }
+    }
+
+    /// One held file: what happened to it, what Proton Drive has of it, and what can be done. The buttons wait for the
+    /// daemon, as the conflict row's do.
+    fn render_cut_short(&mut self, ui: &mut egui::Ui, item: &CutShortItem) {
+        let name = file_name(&item.rel_path);
+        let (bold_part, rest) = cut_short_title(name);
+        // Wrapped, as the summary row is: a long name never hides why it is held
+        ui.add(egui::Label::new(cut_short_line(&bold_part, rest)).wrap()).on_hover_text(&item.rel_path);
+        ui.add_space(2.0);
+        ui.add(egui::Label::new(RichText::new(cut_short_detail(item.existing)).size(12.5).color(TEXT_MUTED())).wrap());
+        ui.add_space(8.0);
+        let online = self.daemon_online;
+        ui.horizontal_wrapped(|ui| {
+            let paths = vec![item.rel_path.clone()];
+            let upload = if item.existing { "Upload this version" } else { "Upload it anyway" };
+            if action_button_if(ui, online, ButtonKind::Secondary, Some(icons::KEEP_LOCAL), upload, 30.0).clicked() {
+                self.resolve_cut_short(paths.clone(), false);
+            }
+            if item.existing {
+                ui.add_space(8.0);
+                let put_back = "Put back the Proton Drive version";
+                if action_button_if(ui, online, ButtonKind::Secondary, Some(icons::KEEP_REMOTE), put_back, 30.0).clicked() {
+                    self.resolve_cut_short(paths, true);
+                }
+            }
+        });
+    }
+
+    /// Many held files: one row for all of them, which Show them opens into one row each.
+    fn render_cut_short_many(&mut self, ui: &mut egui::Ui, count: usize, items: &[CutShortItem]) {
+        attention_row(ui, |ui| {
+            let (bold_part, rest) = cut_short_summary(count);
+            ui.add(egui::Label::new(cut_short_line(&bold_part, rest)).wrap());
+            ui.add_space(8.0);
+            // The bulk buttons act on the list, which may not have arrived yet
+            let online = self.daemon_online && !items.is_empty();
+            ui.horizontal_wrapped(|ui| {
+                if action_button_if(ui, online, ButtonKind::Secondary, Some(icons::KEEP_LOCAL), "Upload all anyway", 30.0).clicked() {
+                    self.resolve_cut_short(items.iter().map(|i| i.rel_path.clone()).collect(), false);
+                }
+                if items.is_empty() || offers_put_back(items) {
+                    ui.add_space(8.0);
+                    let clicked = action_button_if(ui, online, ButtonKind::Secondary, Some(icons::KEEP_REMOTE), "Put back all", 30.0).clicked();
+                    if clicked {
+                        // A new file has no Proton Drive version: the daemon refuses a batch that names one
+                        self.resolve_cut_short(items.iter().filter(|i| i.existing).map(|i| i.rel_path.clone()).collect(), true);
+                    }
+                }
+                ui.add_space(8.0);
+                let label = if self.cut_short_expanded { "Hide them" } else { "Show them" };
+                if action_button_if(ui, true, ButtonKind::Secondary, None, label, 30.0).clicked() {
+                    self.cut_short_expanded = !self.cut_short_expanded;
+                }
+            });
+        });
+        if self.cut_short_expanded {
+            for item in items {
+                ui.add_space(8.0);
+                attention_row(ui, |ui| self.render_cut_short(ui, item));
+            }
+        }
+    }
+
+    fn resolve_cut_short(&mut self, paths: Vec<String>, restore: bool) {
+        let _ = self.tx.send(WorkerCommand::ResolveCutShort { paths, restore });
     }
 
     /// While Mount again or a move action runs, and how it went.
@@ -1002,6 +1124,16 @@ impl ProtonDriveNativeApp {
             }
         });
     }
+}
+
+/// A held file's first line: the bold part (its name, or how many) then the rest, as Needs attention's other rows are
+/// strong.
+fn cut_short_line(bold_part: &str, rest: &str) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let format = |font_id: egui::FontId| egui::TextFormat { font_id, color: TEXT_PRIMARY(), ..Default::default() };
+    job.append(bold_part, 0.0, format(crate::bold(13.5)));
+    job.append(rest, 0.0, format(egui::FontId::proportional(13.5)));
+    job
 }
 
 /// One problem in Needs attention, in its own box.
@@ -1179,6 +1311,59 @@ mod tests {
         ConflictRecord { id, local_rel_path: path.to_string(), resolved, ..Default::default() }
     }
 
+    fn held(path: &str, existing: bool) -> CutShortItem {
+        CutShortItem { rel_path: path.to_string(), existing, size: 10, detected_at: 1 }
+    }
+
+    fn holding(n: u64) -> DaemonStatus {
+        let mut s = status("idle", vec![], false);
+        s.stats.cut_short_files = n;
+        s
+    }
+
+    #[test]
+    fn attention_lists_cut_short_files_one_each_up_to_three() {
+        assert!(attention_items(&holding(0), &[], &[]).is_empty());
+        let three = [held("a", true), held("b", false), held("c", true)];
+        assert_eq!(
+            attention_items(&holding(3), &[conflict(1, "x", 0)], &three),
+            vec![
+                Attention::Conflict { id: 1, rel_path: "x".into() },
+                Attention::CutShort(three[0].clone()),
+                Attention::CutShort(three[1].clone()),
+                Attention::CutShort(three[2].clone()),
+            ]
+        );
+    }
+
+    #[test]
+    fn more_than_three_cut_short_files_are_one_row() {
+        let four = vec![held("a", true), held("b", false), held("c", true), held("d", true)];
+        assert_eq!(attention_items(&holding(4), &[], &four), vec![Attention::CutShortMany { count: 4, items: four.clone() }]);
+        assert!(offers_put_back(&four));
+        assert!(!offers_put_back(&[held("a", false), held("b", false)]));
+        assert_eq!(cut_short_summary(214).0, "214 files");
+        // The status says how many, before the list is there
+        assert_eq!(
+            attention_items(&holding(5), &[], &[]),
+            vec![Attention::CutShortMany { count: 5, items: vec![] }]
+        );
+        // A stale list longer than the count is cut to it
+        assert_eq!(attention_items(&holding(1), &[], &four).len(), 1);
+    }
+
+    #[test]
+    fn held_files_are_reloaded_on_every_refresh_while_each_has_a_row_and_once_per_count_above() {
+        assert!(should_reload_cut_short(true, 0, 0), "the daemon came back");
+        assert!(should_reload_cut_short(false, 0, 2), "the count changed");
+        for n in 1..=CUT_SHORT_ROWS as u64 {
+            assert!(should_reload_cut_short(false, n, n), "{n} held: their rows are kept current");
+        }
+        assert!(!should_reload_cut_short(false, 0, 0), "none held, as before");
+        assert!(!should_reload_cut_short(false, 5, 5), "above 3, asked at this count already, answered or not");
+        assert!(should_reload_cut_short(false, 5, 6), "above 3, the count changed");
+    }
+
     fn vfs(mode: &str, mounted: bool, reason: Option<&str>) -> crate::VfsStatus {
         crate::VfsStatus { mode: mode.into(), mounted, reason: reason.map(String::from), ..Default::default() }
     }
@@ -1194,7 +1379,7 @@ mod tests {
         s.vfs = Some(vfs("virtual", false, Some("move-failed")));
         s.stats.error_items = 3;
         s.last_error = Some("boom".into());
-        let all = attention_items(&s, &[conflict(9, "b", 0), conflict(2, "a", 0)]);
+        let all = attention_items(&s, &[conflict(9, "b", 0), conflict(2, "a", 0)], &[]);
         assert_eq!(
             all,
             vec![
@@ -1207,7 +1392,7 @@ mod tests {
         );
         s.files_missing = None;
         s.vfs = Some(vfs("virtual", false, Some("ejected")));
-        let all = attention_items(&s, &[conflict(1, "a", 0)]);
+        let all = attention_items(&s, &[conflict(1, "a", 0)], &[]);
         assert_eq!(
             all,
             vec![
@@ -1221,29 +1406,29 @@ mod tests {
 
     #[test]
     fn no_attention_when_all_is_well() {
-        assert!(attention_items(&status("idle", vec![], false), &[]).is_empty());
+        assert!(attention_items(&status("idle", vec![], false), &[], &[]).is_empty());
         let mut s = status("idle", vec![], false);
         s.vfs = Some(vfs("virtual", true, None));
         s.last_error = Some("  ".into());
-        assert!(attention_items(&s, &[]).is_empty());
+        assert!(attention_items(&s, &[], &[]).is_empty());
     }
 
     #[test]
     fn resolved_conflicts_are_not_listed() {
         let s = status("idle", vec![], false);
-        assert!(attention_items(&s, &[conflict(1, "a", 1), conflict(2, "b", 2)]).is_empty());
+        assert!(attention_items(&s, &[conflict(1, "a", 1), conflict(2, "b", 2)], &[]).is_empty());
     }
 
     #[test]
     fn no_mount_attention_for_a_plain_folder_or_an_old_daemon() {
         let mut s = status("idle", vec![], false);
         s.vfs = None;
-        assert!(attention_items(&s, &[]).is_empty());
+        assert!(attention_items(&s, &[], &[]).is_empty());
         s.vfs = Some(vfs("plain", false, Some("switched-off")));
-        assert!(attention_items(&s, &[]).is_empty());
+        assert!(attention_items(&s, &[], &[]).is_empty());
         for r in ["starting", "moving"] {
             s.vfs = Some(vfs("virtual", false, Some(r)));
-            assert!(attention_items(&s, &[]).is_empty());
+            assert!(attention_items(&s, &[], &[]).is_empty());
         }
     }
 
@@ -1253,10 +1438,10 @@ mod tests {
         let mut v = vfs("virtual", false, Some("move-failed"));
         v.drive_move = Some(crate::DriveMove { actions: vec!["retry".into()], ..Default::default() });
         s.vfs = Some(v);
-        assert_eq!(attention_items(&s, &[]), vec![Attention::StoppedMove]);
+        assert_eq!(attention_items(&s, &[], &[]), vec![Attention::StoppedMove]);
         // In plain mode, and without the move's details
         s.vfs = Some(vfs("plain", false, Some("move-failed")));
-        assert_eq!(attention_items(&s, &[]), vec![Attention::StoppedMove]);
+        assert_eq!(attention_items(&s, &[], &[]), vec![Attention::StoppedMove]);
     }
 
     #[test]
@@ -1265,15 +1450,15 @@ mod tests {
         let mut v = vfs("virtual", true, None);
         v.drive_move = Some(crate::DriveMove { actions: vec!["retry".into()], ..Default::default() });
         s.vfs = Some(v.clone());
-        assert_eq!(attention_items(&s, &[]), vec![Attention::StoppedMove]);
+        assert_eq!(attention_items(&s, &[], &[]), vec![Attention::StoppedMove]);
         // With only its error, too
         v.drive_move = Some(crate::DriveMove { error: Some("Permission denied".into()), ..Default::default() });
         s.vfs = Some(v.clone());
-        assert_eq!(attention_items(&s, &[]), vec![Attention::StoppedMove]);
+        assert_eq!(attention_items(&s, &[], &[]), vec![Attention::StoppedMove]);
         // Neither actions nor an error: nothing to do about it
         v.drive_move = Some(crate::DriveMove::default());
         s.vfs = Some(v);
-        assert!(attention_items(&s, &[]).is_empty());
+        assert!(attention_items(&s, &[], &[]).is_empty());
     }
 
     #[test]
@@ -1283,7 +1468,7 @@ mod tests {
         v.drive_move = Some(crate::DriveMove { actions: vec!["retry".into()], ..Default::default() });
         s.vfs = Some(v);
         assert_eq!(
-            attention_items(&s, &[]),
+            attention_items(&s, &[], &[]),
             vec![
                 Attention::StoppedMove,
                 Attention::DriveNotMounted { message: "Virtual drive: ejected".into(), can_mount: true },
@@ -1296,7 +1481,7 @@ mod tests {
         let mut s = status("idle", vec![], false);
         s.vfs = Some(vfs("virtual", false, None));
         assert_eq!(
-            attention_items(&s, &[]),
+            attention_items(&s, &[], &[]),
             vec![Attention::DriveNotMounted { message: "Virtual drive: not mounted".into(), can_mount: false }]
         );
     }
@@ -1305,9 +1490,9 @@ mod tests {
     fn last_error_is_listed_only_when_files_are_not_missing() {
         let mut s = status("idle", vec![], false);
         s.last_error = Some("boom".into());
-        assert_eq!(attention_items(&s, &[]), vec![Attention::LastError("boom".into())]);
+        assert_eq!(attention_items(&s, &[], &[]), vec![Attention::LastError("boom".into())]);
         s.files_missing = Some(missing());
-        assert_eq!(attention_items(&s, &[]), vec![Attention::FilesMissing]);
+        assert_eq!(attention_items(&s, &[], &[]), vec![Attention::FilesMissing]);
     }
 
     fn mismatch() -> crate::AccountMismatch {
@@ -1320,13 +1505,13 @@ mod tests {
         let mut s = status("error", vec![], false);
         s.account_mismatch = Some(mismatch());
         s.last_error = Some("You signed in to a different Proton account.".into());
-        assert_eq!(attention_items(&s, &[]), vec![Attention::AccountMismatch]);
+        assert_eq!(attention_items(&s, &[], &[]), vec![Attention::AccountMismatch]);
 
         s.files_missing = Some(missing());
         s.vfs = Some(vfs("virtual", false, Some("ejected")));
         s.stats.error_items = 1;
         assert_eq!(
-            attention_items(&s, &[conflict(4, "a", 0)]),
+            attention_items(&s, &[conflict(4, "a", 0)], &[]),
             vec![
                 Attention::AccountMismatch,
                 Attention::FilesMissing,
@@ -1341,7 +1526,7 @@ mod tests {
     fn another_accounts_records_count_as_a_problem_in_the_status() {
         let mut s = status("error", vec![], false);
         s.account_mismatch = Some(mismatch());
-        let n = attention_items(&s, &[]).len();
+        let n = attention_items(&s, &[], &[]).len();
         let r = status_summary(&s, true, false, n, 0);
         assert_eq!(r.headline, "1 problem needs you");
         assert_eq!(r.tone, Tone::Attention);
@@ -1351,7 +1536,7 @@ mod tests {
     fn failed_items_come_from_stats() {
         let mut s = status("idle", vec![], false);
         s.stats.error_items = 2;
-        assert_eq!(attention_items(&s, &[]), vec![Attention::FailedItems(2)]);
+        assert_eq!(attention_items(&s, &[], &[]), vec![Attention::FailedItems(2)]);
     }
 
     #[test]

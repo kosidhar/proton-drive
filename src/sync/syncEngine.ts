@@ -37,7 +37,7 @@ import { problemWithBlockedApps } from './settingsRules';
 import { Slots } from './slots';
 import { StateEvents } from './stateEvents';
 import { PIN_ROOT_ON_FIRST_SYNC } from './availabilityMigration';
-import { createLocalConflictCopy, formatConflictFileName } from './conflictResolver';
+import { createLocalConflictCopy, formatConflictFileName, formatNotFullyWrittenName } from './conflictResolver';
 import { isTransient, permanentRefusal, unmappedApiCode } from './remoteErrors';
 import { homeTrash, type MoveToDesktopTrash } from './desktopTrash';
 import { readDriveLayout } from './driveMode';
@@ -49,7 +49,7 @@ import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
 import { pathsOverlap } from './mountPoint';
 import { entryFromNode, RemoteIndex, type RemoteIndexEntry } from './remoteIndex';
 import { type RemoteOp, RemoteOpsJournal } from './remoteOps';
-import type { ConflictRecord, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
+import type { ConflictRecord, CutShortFile, EditBaseline, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
 import { forgetFailedThumbnail } from './thumbnailCache';
 
 export { DriveOpError, type DriveOpErrorCode, type VfsEntry } from './driveOps';
@@ -113,6 +113,9 @@ const SETTLED_KEPT_MS = 60_000;
 // A file being replaced through the virtual drive is held as long as the drive helper says it is open (#64; see
 // writingMarks). The helper says it again every 30 s; a mark it hasn't said again for this long is gone (the helper died)
 const DRIVE_MARK_EXPIRES_MS = 90_000;
+// A file the drive's disk guard cut short is told of in Activity (#300), but no more than one in this long: a folder
+// copy cut short holds hundreds at once, which Home lists
+const CUT_SHORT_TOLD_EVERY_MS = 60_000;
 // Uid prefix of the remote index entries that stand for folders made here that Proton Drive doesn't have yet, holding
 // what a pending move puts in them (see applyPendingOpsToIndex). Never a node: never resolved, moved or trashed.
 const PROVISIONAL = 'provisional:';
@@ -216,6 +219,15 @@ function parseFilesHold(raw: string | null): { root: string; names: string[] } |
         // Unreadable: no hold to take up
     }
     return null;
+}
+
+// A file the drive's disk guard cut short, held from uploading until the user decides (#300; see CutShortFile): whether
+// it is an edit of an item Proton Drive has (which Put back can bring back), its size, and when it was found
+export interface CutShortItem {
+    relPath: string;
+    existing: boolean;
+    size: number;
+    detectedAt: number;
 }
 
 // A conflict that can't be resolved now: 404 when there is no such conflict, 409 when it is already resolved (or being
@@ -386,6 +398,11 @@ export class ProtonDriveSyncEngine {
     // helper's keepalives: a laptop asleep mid-copy wakes with the mark still on. In memory only: after a restart, the
     // helper's keepalives mark the files being replaced again.
     private readonly writingMarks = new Map<string, { replacing: boolean; at: number }>();
+    // When a file cut short was last told of in Activity, by the settle clock (see tellCutShort)
+    private cutShortToldAt: number | null = null;
+    // The read of a file just held as cut short that tells whether it holds what Proton Drive has, by path, while one
+    // runs (see checkCutShortLater)
+    private readonly cutShortChecks = new Map<string, Promise<void>>();
     // Cancels the timer that ends a timed pause (see setPaused), while one is set
     private cancelPauseTimer: (() => void) | null = null;
 
@@ -1255,7 +1272,10 @@ export class ProtonDriveSyncEngine {
                     this.stateDb.deleteMeta(PIN_ROOT_ON_FIRST_SYNC);
                 })();
             }
-            await this.inAvailabilityRun(async () => this.dropStaleEditBaselines());
+            await this.inAvailabilityRun(async () => {
+                this.dropStaleEditBaselines();
+                this.dropStaleCutShort();
+            });
             // Changes made through the drive reach Proton Drive before the pass looks at it
             await this.runReplay();
 
@@ -1356,6 +1376,21 @@ export class ProtonDriveSyncEngine {
         // Being hidden: its local changes (edits, new files, deletes) sync as for a visible item, so the hide can
         // finish, but nothing new comes down from the cloud
         const hiding = hiddenBy !== null;
+        // A file the drive's disk guard cut short is held until the user decides (#300): never uploaded, nor made a
+        // conflict of, so its wait to settle is no matter. A change in Proton Drive to what it is an edit of puts that
+        // version back at its path, the file kept beside it (see putBackNow), once nothing writes to it through the drive.
+        // One gone from Proton Drive goes on below: followed where its item moved (its hold with it), or else kept in the
+        // desktop Trash, as anything changed here is.
+        if (localInfo && !localInfo.isDirectory && this.stateDb.getCutShort(relPath) && (remoteNode || !dbRecord)) {
+            if (
+                remoteNode?.type === NodeType.File &&
+                this.liveWritingMark(relPath) === undefined &&
+                this.cloudMovedOnFromHeld(relPath, remoteNode, dbRecord)
+            ) {
+                await this.inAvailabilityRun(() => this.putBackNow(relPath, 'changed in Proton Drive'));
+            }
+            return;
+        }
         // A file still being written is left alone (not uploaded, nor downloaded over) until it stays as it is; one being
         // replaced through the drive until it is closed, even as its record says (#64)
         if (localInfo && !localInfo.isDirectory && (changedSinceRecord(localInfo, dbRecord) || this.beingReplaced(relPath))) {
@@ -2025,6 +2060,9 @@ export class ProtonDriveSyncEngine {
                 `${conflict.localRelPath} is being renamed, moved or deleted on this computer right now; try again in a moment`,
             );
         }
+        if (choice !== 'keep-remote') {
+            this.refuseUploadOfHeld(conflict.localRelPath);
+        }
         this.resolvingConflicts.add(conflictId);
         this.manualResolvingPaths.add(conflict.localRelPath);
         let ended!: () => void;
@@ -2061,6 +2099,8 @@ export class ProtonDriveSyncEngine {
                         `The folder holding ${conflict.localRelPath} is in the Proton Drive trash, or Proton Drive couldn't check: nothing was changed. Restore the folder there, or try again later`,
                     );
                 }
+                // Again, just before the upload: cut short, or opened to be replaced, while Proton Drive was asked
+                this.refuseUploadOfHeld(conflict.localRelPath);
                 if (remoteNode.trashTime || (await this.inTrashedFolder(remoteNode))) {
                     // In the Proton Drive trash: a revision would land there, and the next pass would take the file for
                     // deleted in the cloud and remove it here (#111). Kept as a new file at its place instead; a file
@@ -2098,8 +2138,11 @@ export class ProtonDriveSyncEngine {
                     );
                 }
                 this.stateDb.markConflictResolved(conflictId, 'keep-remote');
+                // What it held, as the user chose to replace it, is gone: so is a hold of it as cut short (#300)
+                this.stateDb.dropCutShort(conflict.localRelPath);
             } else {
                 const localSha1 = await computeLocalFileSha1(localFullPath);
+                this.refuseUploadOfHeld(conflict.localRelPath); // Again, as it was read: its copy uploads
                 const kept = await this.keepBoth(conflict.localRelPath, localFullPath, localSha1, remoteNode, remoteMap, since);
                 if (kept === null) {
                     throw new ConflictRefusedError(409, `${conflict.localRelPath} changed while both were being kept; try again`);
@@ -2206,6 +2249,11 @@ export class ProtonDriveSyncEngine {
         // Says whether a file that failed to upload is gone by the user's doing: the caller reports that, not a failure
         leftByTheUser?: () => Promise<boolean>,
     ): Promise<UploadResult> {
+        // Every look that would upload a file leaves one held as cut short alone (#300); this is for one held while that
+        // look waited on Proton Drive, after it checked
+        if (this.stateDb.getCutShort(relPath)) {
+            throw new Error(`Not uploading ${relPath}: it wasn't fully written, and waits for you to choose what to do with it`);
+        }
         const transferId = `ul:${relPath}`;
         // Before the upload reads the file: a write from then on (as it uploads, which can take minutes) is newer than
         // what the record says it holds, so the next look hashes the file (#109)
@@ -2941,6 +2989,10 @@ export class ProtonDriveSyncEngine {
 
             if (!st?.isFile()) {
                 this.forgetSettling(relPath);
+            } else if (this.stateDb.getCutShort(relPath)) {
+                // Cut short by the drive's disk guard (#300): held until the user decides, with no wait to settle, as it
+                // isn't uploaded either way; a sync pass sees a change in Proton Drive
+                return;
             } else if (
                 dbRecord?.type === 'file' &&
                 dbRecord.syncStatus === 'synced' &&
@@ -2962,8 +3014,10 @@ export class ProtonDriveSyncEngine {
                 if (this.filesGone() || this.heldBack(relPath)) {
                     return;
                 }
-                // Local item was deleted: an edit baseline there stands for nothing any more
+                // Local item was deleted: an edit baseline there stands for nothing any more, nor a hold of what was cut
+                // short (#300)
                 this.stateDb.dropEditBaselines(relPath);
+                this.stateDb.dropCutShort(relPath);
                 if (dbRecord) {
                     try {
                         const remoteNode = await this.sdk.getNode(dbRecord.nodeUid);
@@ -3301,6 +3355,7 @@ export class ProtonDriveSyncEngine {
         }
 
         if (event.type === DriveEventType.NodeDeleted) {
+            this.forgetHeldNodes(event.nodeUid);
             this.index.removeSubtree(event.nodeUid);
             const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
             // One with a rename or move through the drive on its way is left to its replay, which keeps its local copy
@@ -3312,6 +3367,7 @@ export class ProtonDriveSyncEngine {
 
         if (event.type === DriveEventType.NodeCreated || event.type === DriveEventType.NodeUpdated) {
             if (event.isTrashed) {
+                this.forgetHeldNodes(event.nodeUid);
                 this.index.removeSubtree(event.nodeUid);
                 const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
                 if (tracked && !this.awaitsRemoteOp(tracked.localRelPath, event.nodeUid)) {
@@ -3325,6 +3381,24 @@ export class ProtonDriveSyncEngine {
             }
             // Trigger incremental reconcile
             await this.reconcileNow();
+        }
+    }
+
+    // A node is gone from Proton Drive (deleted, or moved to its trash), with everything in it: a file cut short (#300) held
+    // as an edit of one of them that no record tracks (a copy over an online-only file has only an edit baseline) is held
+    // on as a new file, as Proton Drive has no version of it left to put back. One a record tracks is seen to by the
+    // removal that follows (see holdsAfterRemoval). Before the remote index forgets the node, which says what was in it.
+    private forgetHeldNodes(nodeUid: string): void {
+        const entry = this.index.getByUid(nodeUid);
+        const gone = new Set([nodeUid, ...(entry ? this.index.listSubtree(entry.relPath).map((e) => e.uid) : [])]);
+        for (const hold of this.stateDb.listCutShort()) {
+            if (
+                hold.nodeUid !== null &&
+                gone.has(hold.nodeUid) &&
+                this.stateDb.getItemByPath(hold.relPath)?.nodeUid !== hold.nodeUid
+            ) {
+                this.stateDb.holdCutShort({ ...hold, nodeUid: null });
+            }
         }
     }
 
@@ -3385,15 +3459,13 @@ export class ProtonDriveSyncEngine {
                 records.drop(entry.relPath);
             }
             return this.clearKeptAfterCloudDelete(root, relPath, scan.entries, kept);
-        });
+        }).finally(() => this.holdsAfterRemoval(relPath));
         const told: string[] = [];
         if (moved > 0) {
             told.push(`${moved} item(s) that existed only on this computer were moved to your Trash.`);
         }
         if (stayed > 0) {
-            // Where the user sees it, never the virtual drive's backing store
-            const where = path.join(settings.syncDir, relPath);
-            told.push(`${stayed} item(s) that existed only on this computer were kept at ${where} and will upload again.`);
+            told.push(this.keptHere(stayed, relPath));
         }
         if (told.length === 0) {
             this.stateDb.logActivity({
@@ -3414,6 +3486,32 @@ export class ProtonDriveSyncEngine {
             urgency: 'normal',
             enabled: settings.notificationsEnabled,
         });
+    }
+
+    // After a removal of what is at and under relPath (a cloud delete, a drive delete or Move to Trash), with its records
+    // and its item in Proton Drive gone: the holds of files cut short (#300) that went with the rest go too, and those of
+    // files that stayed here (the desktop Trash refused them, or the removal failed part-way) are held on, as new files,
+    // as nothing in Proton Drive is left for them to be an edit of. Run whether the removal finished or not.
+    private holdsAfterRemoval(relPath: string): void {
+        this.stateDb.dropStaleCutShort((rel) => !isWithin(rel, relPath) || this.localFileExists(rel));
+        for (const hold of this.stateDb.listCutShort()) {
+            if (isWithin(hold.relPath, relPath) && hold.nodeUid !== null) {
+                this.stateDb.holdCutShort({ ...hold, nodeUid: null });
+            }
+        }
+    }
+
+    // What the user is told of the items a removal kept at relPath (the desktop Trash refused them), where they see them
+    // (never the virtual drive's backing store): they upload again, as new items, except files cut short (#300), which
+    // stay held here until the user chooses on Home (see holdsAfterRemoval)
+    private keptHere(stayed: number, relPath: string): string {
+        const where = path.join(this.stateDb.getSettings().syncDir, relPath);
+        const held = this.stateDb.listCutShort().filter((hold) => isWithin(hold.relPath, relPath)).length;
+        return held === 0
+            ? `${stayed} item(s) that existed only on this computer were kept at ${where} and will upload again.`
+            : `${stayed} item(s) that existed only on this computer were kept at ${where}. The ${held} file(s) there that ` +
+                  "weren't fully written stay on this computer until you choose what to do with them on Home; anything " +
+                  'else kept will upload again.';
     }
 
     // Clears what a removal after a cloud delete left in relPath (see removeAfterCloudDelete), with its records already
@@ -3592,6 +3690,8 @@ export class ProtonDriveSyncEngine {
                     this.logger.warn(`Could not move ${fromRel} to ${toRel} to follow Proton Drive: ${error}`);
                     return false;
                 }
+                // A hold of a file cut short in it goes with it (#300): left behind, the file would upload from there
+                this.stateDb.moveCutShort(fromRel, toRel);
                 try {
                     this.stateDb.renameItemPath(fromRel, toRel, this.cloudParentOf(toRel));
                 } catch (error: unknown) {
@@ -3602,7 +3702,9 @@ export class ProtonDriveSyncEngine {
                     } catch {
                         // Counts as not back
                     }
-                    if (!back) {
+                    if (back) {
+                        this.stateDb.moveCutShort(toRel, fromRel);
+                    } else {
                         // Stuck at toRel: its records can't stay at fromRel without it, so it syncs from there as new
                         records.dropSubtree(fromRel);
                     }
@@ -3805,8 +3907,11 @@ export class ProtonDriveSyncEngine {
 
     // The drive helper says the last writer of a file closed it (#64): with refused, the drive refused a write to it for
     // room, so it may be cut short; with replaced, its writing replaced it. Its session is over: it settles as any other
-    // file (see settleClosed). Answers at once, never waiting for a look or an upload. Never refused: a path never
-    // marked, gone, or not one of My files is harmless.
+    // file (see settleClosed), unless it was cut short, which holds it (#300, see holdIfCutShort). A close that replaced
+    // it whole, nothing refused (the copy run again), lifts such a hold. Answers at once, never waiting for a look, an
+    // upload or a read of the file: the helper's other notices wait behind it; a hold is written before it answers.
+    // Never refused: a path never marked, gone, or not one of My files is harmless, and the same close twice is the same
+    // as once.
     async driveClosed(relPath: string, opts: { refused: boolean; replaced: boolean }): Promise<void> {
         const rel = drivePathOrNull(relPath);
         if (!rel) {
@@ -3814,12 +3919,292 @@ export class ProtonDriveSyncEngine {
         }
         this.writingMarks.delete(rel);
         if (opts.refused) {
-            // A write to it was refused for room, so it may be cut short (#300). For now it settles as any other close;
-            // the hold that keeps such a file from uploading until the user decides replaces this branch
-            await this.settleClosed(rel);
+            this.holdIfCutShort(rel);
             return;
         }
+        if (opts.replaced && this.stateDb.getCutShort(rel)) {
+            this.stateDb.dropCutShort(rel); // Written again in full: it uploads as any other file
+        }
         await this.settleClosed(rel);
+    }
+
+    // A file a write to which the drive refused for room (#300): what is here may be only part of what was being written
+    // (a copy that stopped once the disk was nearly full), so it is held from uploading (see CutShortFile) until the user
+    // decides, unless it holds just what Proton Drive has (an open whose write was refused before anything changed, say).
+    // An existing item (with a record, or an edit baseline: a copy over an online-only file) is held as an edit of its
+    // node, anything else as a new file; told of in Activity. Decided and written at once, with nothing waited on: so
+    // before the close is answered, and before any look at the file could upload it. Where only reading the whole file
+    // can tell it from Proton Drive's version, it is held all the same, and that read runs in the background (see
+    // checkCutShortLater), which lets it go again if they match. A file held already (the same close again, or another
+    // refused session) is held as it is now, at once, with no read: it keeps when it was found, and the hold stays.
+    private holdIfCutShort(rel: string): void {
+        this.forgetSettling(rel); // Held, not looked at once settled
+        const fullPath = path.join(this.localRoot(), rel);
+        let st: Stats | undefined;
+        try {
+            st = statSync(fullPath, { throwIfNoEntry: false });
+        } catch {
+            st = undefined; // Can't be looked at: nothing to hold (a look at it can't upload it either)
+        }
+        if (!st?.isFile() || matchesIgnorePatterns(rel, this.stateDb.getSettings().ignorePatterns)) {
+            return; // Gone, or never uploaded anyway
+        }
+        // Read before anything could upload it: an upload's record would consume the edit baseline
+        const record = this.stateDb.getItemByPath(rel) ?? null;
+        const edit = record ? null : this.stateDb.getEditBaseline(rel);
+        const earlier = this.stateDb.getCutShort(rel);
+        if (earlier) {
+            this.stateDb.holdCutShort({
+                ...earlier,
+                nodeUid: record?.nodeUid ?? edit?.nodeUid ?? earlier.nodeUid,
+                size: st.size,
+                mtimeMs: st.mtimeMs,
+            });
+            return;
+        }
+        const verdict = asProtonDriveHasIt(st, record, edit);
+        if (verdict === 'same') {
+            return;
+        }
+        this.stateDb.holdCutShort({
+            relPath: rel,
+            nodeUid: record?.nodeUid ?? edit?.nodeUid ?? null,
+            size: st.size,
+            mtimeMs: st.mtimeMs,
+            detectedAt: Date.now(),
+        });
+        if (verdict === 'hash') {
+            const held = record ? (record.remoteSha1 ?? record.localSha1) : (edit?.sha1 ?? null);
+            this.checkCutShortLater(rel, fullPath, held, this.stateDb.getCutShort(rel)!);
+            return;
+        }
+        this.tellCutShort(rel);
+    }
+
+    // Whether a file just held as cut short holds just what Proton Drive has after all (sha1 `held`), which only reading
+    // all of it can tell (see holdIfCutShort). In the background, so that the close is answered at once (the helper gives
+    // up on a post after 5 s and sends it again, and its other notices, the keepalives of files being copied in included,
+    // wait behind it). The hold stays meanwhile, so nothing uploads. It goes if the file matches and is still as it was
+    // held (not written, not held again or carried away since); otherwise the file stays held and is told of in Activity.
+    // One read at a time per path (a later one waits for the earlier), counted among the running looks, which the daemon
+    // waits for before it closes the database and a move of the files waits for. Never rejects.
+    private checkCutShortLater(rel: string, fullPath: string, held: string | null, written: CutShortFile): void {
+        const before = this.cutShortChecks.get(rel) ?? Promise.resolve();
+        const check = before.then(async () => {
+            const sha1 = held === null ? null : await computeLocalFileSha1(fullPath).catch(() => null);
+            const now = this.stateDb.getCutShort(rel);
+            if (!now) {
+                return; // Let go of meanwhile (written in full, uploaded, gone, moved away): that decided
+            }
+            let st: Stats | undefined;
+            try {
+                st = statSync(fullPath, { throwIfNoEntry: false });
+            } catch {
+                st = undefined;
+            }
+            const asHeld =
+                JSON.stringify(now) === JSON.stringify(written) &&
+                st?.isFile() === true &&
+                st.size === written.size &&
+                Math.round(st.mtimeMs) === written.mtimeMs;
+            if (asHeld && sha1 !== null && sha1 === held) {
+                this.stateDb.dropCutShort(rel); // Just what Proton Drive has: nothing was cut short of it
+                return;
+            }
+            this.tellCutShort(rel);
+        }).catch((error: unknown) => {
+            this.logger.warn(`Could not tell whether ${rel} holds what Proton Drive has; it stays held: ${error}`);
+        });
+        this.cutShortChecks.set(rel, check);
+        this.runningLooks.add(check);
+        void check.finally(() => {
+            this.runningLooks.delete(check);
+            if (this.cutShortChecks.get(rel) === check) {
+                this.cutShortChecks.delete(rel);
+            }
+        });
+    }
+
+    // Activity says a file was cut short (#300), for the first of a burst only: none for CUT_SHORT_TOLD_EVERY_MS after
+    // one, by the settle clock. Home lists them all.
+    private tellCutShort(rel: string): void {
+        const now = this.settleNow();
+        if (this.cutShortToldAt !== null && now - this.cutShortToldAt < CUT_SHORT_TOLD_EVERY_MS) {
+            return;
+        }
+        this.cutShortToldAt = now;
+        this.stateDb.logActivity({
+            action: 'error',
+            localRelPath: rel,
+            details: `Not uploaded: ${rel} wasn't fully written (disk nearly full)`,
+        });
+    }
+
+    // The files the drive's disk guard cut short, held from uploading until the user decides (#300), in the order they
+    // were found
+    listCutShort(): CutShortItem[] {
+        return this.stateDb
+            .listCutShort()
+            .map(({ relPath, nodeUid, size, detectedAt }) => ({ relPath, existing: nodeUid !== null, size, detectedAt }));
+    }
+
+    // Upload this version (#300): each file held as cut short is let go of and looked at as any change, which uploads it
+    // as it is once it has settled: a new revision of its item, or a new file (a change in Proton Drive since is a
+    // conflict, as ever, never uploaded over). Answers once each is let go of, not waiting for the uploads. A path that
+    // isn't held is skipped.
+    async uploadCutShort(paths: string[]): Promise<void> {
+        for (const relPath of paths) {
+            const rel = drivePathOrNull(relPath);
+            if (rel === null || !this.stateDb.getCutShort(rel)) {
+                continue;
+            }
+            this.stateDb.dropCutShort(rel);
+            void this.lookAgain(rel);
+        }
+    }
+
+    // Put back the Proton Drive version (#300) of each file held as cut short (see putBackNow), one after another.
+    // Refused before anything is done: with EINVAL, a file Proton Drive has no version of (a new file, or one an earlier
+    // put back kept), which only uploading can let go of; with EIO, one being written through the drive right now
+    // (moved now, its writer would go on writing the copy), and while the files move or the account isn't checked. A
+    // path that isn't held is skipped.
+    async putBackCutShort(paths: string[]): Promise<void> {
+        this.refuseWhileHeld();
+        this.refuseWhileFilesGone();
+        const held: string[] = [];
+        for (const relPath of paths) {
+            const rel = drivePathOrNull(relPath);
+            const hold = rel === null ? null : this.stateDb.getCutShort(rel);
+            if (rel === null || hold === null) {
+                continue;
+            }
+            if (hold.nodeUid === null) {
+                throw new DriveOpError('EINVAL', `Proton Drive has no version of ${rel} to put back: it can only be uploaded`);
+            }
+            if (this.liveWritingMark(rel) !== undefined) {
+                throw new DriveOpError('EIO', `${rel} is being written right now: try again once it is saved`);
+            }
+            held.push(rel);
+        }
+        await this.tracked(async () => {
+            for (const rel of held) {
+                await this.inAvailabilityRun(async () => {
+                    this.refuseWhileHeld(); // again: a move of the files may have begun while it waited
+                    await this.putBackNow(rel, 'asked');
+                });
+            }
+        });
+    }
+
+    // Puts back Proton Drive's version of a file held as cut short (#300), in its turn on availabilityRun: the file is
+    // kept beside its path, held there as a new file, under the name a conflict copy would have with "not fully written"
+    // in place of "conflict" (formatNotFullyWrittenName, with -<n> while that is taken), and its path is left online-only:
+    // listed as Proton Drive has it, downloaded when opened. Nothing is downloaded now (the disk is nearly full) or
+    // uploaded, and nothing in Proton Drive is touched. The path's record and edit baseline go, so the file gone from it
+    // never reads as a delete; a conflict waiting there is over, both versions kept. Records before files: the record
+    // goes, and the copy's hold is written, before the file moves, and the path's own hold goes once it has; a file that
+    // can't be moved keeps its record and its hold. Answers where the file went, or null when it was no longer held, or
+    // gone.
+    private async putBackNow(rel: string, why: 'asked' | 'changed in Proton Drive'): Promise<string | null> {
+        const hold = this.stateDb.getCutShort(rel);
+        const root = this.localRoot();
+        const fullPath = path.join(root, rel);
+        if (!hold || !lstatSync(fullPath, { throwIfNoEntry: false })?.isFile()) {
+            return null;
+        }
+        const when = new Date();
+        const copyRel = await this.whileRemoving(async (records) => {
+            for (let n = 0; n <= 10; n++) {
+                const candidate = joinRel(parentOf(rel), formatNotFullyWrittenName(path.posix.basename(rel), when, undefined, n));
+                if (
+                    this.localItemExists(candidate) ||
+                    this.index.getByPath(candidate) !== null ||
+                    this.stateDb.getItemByPath(candidate) ||
+                    this.stateDb.getCutShort(candidate) !== null
+                ) {
+                    continue;
+                }
+                this.watcher.suppressPath(rel);
+                this.watcher.suppressPath(candidate);
+                this.stateDb.connection.transaction(() => {
+                    records.drop(rel);
+                    this.stateDb.holdCutShort({ ...hold, relPath: candidate, nodeUid: null });
+                })();
+                let moved = false;
+                let failure: unknown = null;
+                try {
+                    moved = moveWithoutReplacing(fullPath, path.join(root, candidate));
+                } catch (error: unknown) {
+                    failure = error;
+                }
+                if (!moved) {
+                    this.stateDb.dropCutShort(candidate);
+                    if (failure === null) {
+                        continue; // Taken since the look: the next name
+                    }
+                    await records.putBack([rel]);
+                    throw failure;
+                }
+                this.stateDb.connection.transaction(() => {
+                    this.stateDb.dropEditBaselines(rel);
+                    this.stateDb.dropCutShort(rel);
+                    for (const conflict of this.unresolvedConflictsAt(rel)) {
+                        this.stateDb.markConflictResolved(conflict.id, 'keep-both', candidate);
+                    }
+                })();
+                return candidate;
+            }
+            await records.putBack([rel]);
+            return null;
+        });
+        if (copyRel === null) {
+            throw new Error(`No free name beside ${rel} to keep it under: nothing was changed`);
+        }
+        this.forgetSettling(rel);
+        this.keepBothCopies.delete(rel);
+        this.stateDb.logActivity({
+            action: 'sync',
+            localRelPath: rel,
+            details:
+                why === 'asked'
+                    ? `Put back the Proton Drive version; the file that wasn't fully written is kept as ${copyRel}`
+                    : `Changed in Proton Drive while it waited: that version is back, and the file that wasn't fully written is kept as ${copyRel}`,
+        });
+        return copyRel;
+    }
+
+    // Whether Proton Drive changed a file held as cut short (#300) since what the file is an edit of (its record, or its
+    // edit baseline), or has another node at its path: then its version is put back (see putBackNow), rather than the two
+    // made a conflict. A new file (neither) is an edit of nothing: never.
+    private cloudMovedOnFromHeld(relPath: string, remoteNode: NodeEntity, dbRecord: SyncedItemRecord | undefined): boolean {
+        const now = (sizeIfUnclaimed: number): CloudVersion => ({
+            sha1: remoteNode.activeRevision?.claimedDigests?.sha1 ?? null,
+            mtimeMs: (remoteNode.activeRevision?.claimedModificationTime ?? remoteNode.modificationTime).getTime(),
+            size: getClaimedSize(remoteNode) ?? sizeIfUnclaimed,
+        });
+        if (dbRecord) {
+            return (
+                dbRecord.nodeUid !== remoteNode.uid ||
+                cloudChangedSince({ sha1: dbRecord.remoteSha1, mtimeMs: dbRecord.remoteMtimeMs, size: dbRecord.size }, now(dbRecord.size))
+            );
+        }
+        const edit = this.stateDb.getEditBaseline(relPath);
+        return edit !== null && (edit.nodeUid !== remoteNode.uid || cloudChangedSince(edit, now(0)));
+    }
+
+    // Keep Local and Keep Both upload what is here (#300): refused, before anything is done, for a file held as cut short
+    // (which waits for the user's own choice about it: Upload this version, or Put back), and for one being replaced
+    // through the drive right now, which would upload half written (#64)
+    private refuseUploadOfHeld(relPath: string): void {
+        if (this.stateDb.getCutShort(relPath)) {
+            throw new ConflictRefusedError(
+                409,
+                `${relPath} wasn't fully written (your computer's disk was nearly full): choose Upload this version or Put back first`,
+            );
+        }
+        if (this.beingReplaced(relPath)) {
+            throw new ConflictRefusedError(409, `${relPath} is still being written: try again once it is saved`);
+        }
     }
 
     // The drive helper (re)started: no file is open for writing through it any more, and those that were settle as any
@@ -3984,6 +4369,9 @@ export class ProtonDriveSyncEngine {
                 for (const table of ['synced_items', 'conflicts', 'drive_edit_baselines', 'remote_nodes', 'remote_ops', 'availability']) {
                     this.stateDb.connection.run(`DELETE FROM ${table}`);
                 }
+                // Files cut short (#300) stay held, as new files: the nodes they were edits of are the other account's,
+                // and what is here is still only part of them
+                this.stateDb.connection.run('UPDATE cut_short_files SET nodeUid = NULL');
                 this.stateDb.setMeta(PIN_ROOT_ON_FIRST_SYNC, '1'); // syncs everything, as a fresh install does
                 this.stateDb.setMeta(ACCOUNT_ROOT, root.uid);
                 this.stateDb.deleteMeta(ACCOUNT_MISMATCH);
@@ -4040,6 +4428,22 @@ export class ProtonDriveSyncEngine {
                 throw new DriveOpError('EEXIST', `Already exists: ${rel}`, { cause: error });
             }
             throw error;
+        }
+    }
+
+    // A hold of a file cut short (#300) whose file has gone (deleted outside the drive, say, or moved there) holds nothing
+    // any more: a file put there later is another. Not one missing after a hold of the files, until a pass has looked at
+    // what is missing (see heldBack): it may yet come back. Takes its turn on availabilityRun, as Put back does.
+    private dropStaleCutShort(): void {
+        this.stateDb.dropStaleCutShort((rel) => this.heldBack(rel) || this.localFileExists(rel));
+    }
+
+    // Whether a path of the local root is a file. Any failure to look counts as not
+    private localFileExists(relPath: string): boolean {
+        try {
+            return lstatSync(path.join(this.localRoot(), relPath), { throwIfNoEntry: false })?.isFile() === true;
+        } catch {
+            return false;
         }
     }
 
@@ -4117,15 +4521,18 @@ export class ProtonDriveSyncEngine {
         const localNames = this.localChildNames(rel);
         const folder = this.liveIndexEntry(rel);
         if (!folder || folder.type !== 'folder') {
-            // A folder made here and not uploaded yet: everything in it waits to upload
+            // A folder made here and not uploaded yet: everything in it waits to upload, but what was cut short (#300)
             if (localNames === null || folder) {
                 return null;
             }
+            const held = this.transfersBelow(rel);
             const children: Record<string, ItemState | null> = {};
+            let below: Transfer = 'syncing';
             for (const name of localNames) {
-                children[name] = this.localOnlyState(childRel(rel, name), ignorePatterns);
+                children[name] = this.localOnlyState(childRel(rel, name), ignorePatterns, held.get(name));
+                below = worseTransfer(below, children[name]?.transfer ?? null);
             }
-            return { self: { availability: 'downloaded', transfer: 'syncing' }, children };
+            return { self: { availability: 'downloaded', transfer: below }, children };
         }
 
         const availability = this.policy.childStates(rel);
@@ -4148,8 +4555,9 @@ export class ProtonDriveSyncEngine {
         for (const name of localNames ?? []) {
             if (!(name in children) && !availability.has(name)) {
                 // Shown as syncing on itself only: what waits to upload is known by looking at the disk, which a folder's
-                // emblem can't do for everything below it, so folders sum up what the records say, the same from any view
-                children[name] = this.localOnlyState(childRel(rel, name), ignorePatterns);
+                // emblem can't do for everything below it, so folders sum up what the records say, the same from any view.
+                // What was cut short (#300) is recorded: an error, here and above
+                children[name] = this.localOnlyState(childRel(rel, name), ignorePatterns, transfers.get(name));
             }
         }
         let below: Transfer = null;
@@ -4171,12 +4579,14 @@ export class ProtonDriveSyncEngine {
         }
     }
 
-    private localOnlyState(rel: string, ignorePatterns: string[]): ItemState | null {
-        return matchesIgnorePatterns(rel, ignorePatterns) ? null : { availability: 'downloaded', transfer: 'syncing' };
+    // An item here only, as it waits to upload (syncing), or worse as recorded at or below it (below: see transfersBelow)
+    private localOnlyState(rel: string, ignorePatterns: string[], below: Transfer = null): ItemState | null {
+        return matchesIgnorePatterns(rel, ignorePatterns) ? null : { availability: 'downloaded', transfer: worseTransfer('syncing', below) };
     }
 
     // The worst transfer at or below each child of a folder, by the child's name: uploads and downloads under way and
-    // opens of online-only files (syncing), errors, and unresolved conflicts
+    // opens of online-only files (syncing), errors and files cut short by the drive's disk guard (#300), and unresolved
+    // conflicts
     private transfersBelow(folderRel: string): Map<string, Transfer> {
         const prefix = folderRel === '' ? '' : `${folderRel}/`;
         const below = (column: string) => (folderRel === '' ? `${column} != ''` : `(${column} >= $lo AND ${column} < $hi)`);
@@ -4193,7 +4603,10 @@ export class ProtonDriveSyncEngine {
                   WHERE syncStatus IN ('uploading', 'downloading', 'error') AND ${below('localRelPath')}
                  UNION ALL
                  SELECT ${firstSegment('localRelPath')} AS name, 'conflict' AS transfer
-                   FROM conflicts WHERE resolved = 0 AND ${below('localRelPath')}`,
+                   FROM conflicts WHERE resolved = 0 AND ${below('localRelPath')}
+                 UNION ALL
+                 SELECT ${firstSegment('relPath')} AS name, 'error' AS transfer
+                   FROM cut_short_files WHERE ${below('relPath')}`,
             )
             .all(params) as { name: string; transfer: Exclude<Transfer, null> }[];
         const out = new Map<string, Transfer>();
@@ -4780,6 +5193,14 @@ export class ProtonDriveSyncEngine {
                             }
                         }
                     }
+                    // A hold of a file cut short goes with it (#300), with its record, before it moves: never left behind
+                    // for the file to upload from its new path. One at what it replaces goes: that content is gone. A
+                    // file that now stands for the replaced one's node is an edit of it; a colliding one, of none
+                    this.stateDb.moveCutShort(fromRel, toRel);
+                    const carriedHold = keepsTarget || sourceCollides ? this.stateDb.getCutShort(toRel) : null;
+                    if (carriedHold) {
+                        this.stateDb.holdCutShort({ ...carriedHold, nodeUid: keepsTarget ? targetUid : null });
+                    }
                     if (source) {
                         this.stateDb.setMeta(LOCAL_MOVE_IN_PROGRESS, this.moveIntent(fromRel, toRel, replacing));
                     }
@@ -4882,6 +5303,7 @@ export class ProtonDriveSyncEngine {
                   })
                 : null;
         let kept = { moved: 0, stayed: 0 };
+        let removed = false; // its records gone, and its trash journalled: what is left of it here is seen to after
         await this.whileRemoving(
             async (records) => {
                 // Records first, in one transaction with the index and the journalled trash: a crash before the files
@@ -4890,6 +5312,8 @@ export class ProtonDriveSyncEngine {
                 this.stateDb.connection.transaction(() => {
                     this.stateDb.removeItemByPath(relPath);
                     this.stateDb.dropEditBaselines(relPath);
+                    // Not the holds of files cut short (#300): a Move to Trash keeps here what the desktop Trash refuses,
+                    // which must stay held. They are seen to once the files have gone (see holdsAfterRemoval)
                     if (collision) {
                         // Nothing is left of this computer's side: what stays is the cloud's version
                         this.endConflictsAsKeepRemote(collisions);
@@ -4908,6 +5332,7 @@ export class ProtonDriveSyncEngine {
                 // delete is there to see (#154). Nothing runs between the commit and this, which writes nothing (the
                 // records went in the transaction), so it can't fail after the delete committed
                 records.noteSubtree(relPath);
+                removed = true;
                 if (local && onlyIfEmpty) {
                     // Never what was put in it since the look above: that stays, and syncs as new, folder and all
                     await rmdir(path.join(root, relPath)).catch((error: NodeJS.ErrnoException) => {
@@ -4931,14 +5356,17 @@ export class ProtonDriveSyncEngine {
                 }
             },
             { from: relPath, to: null },
-        );
+        ).finally(() => {
+            if (removed) {
+                this.holdsAfterRemoval(relPath);
+            }
+        });
         const told: string[] = [];
         if (kept.moved > 0) {
             told.push(`${kept.moved} item(s) that existed only on this computer were moved to your Trash.`);
         }
         if (kept.stayed > 0) {
-            const where = path.join(this.stateDb.getSettings().syncDir, relPath);
-            told.push(`${kept.stayed} item(s) that existed only on this computer were kept at ${where} and will upload again.`);
+            told.push(this.keptHere(kept.stayed, relPath));
         }
         const deleted =
             toTrash.size > 0
@@ -5397,11 +5825,12 @@ export class ProtonDriveSyncEngine {
         }
     }
 
-    // What a local move or replacement can change in the state database (records at and under both paths, the journal,
-    // and the index entries of the moving node and at both paths), taken just before it, to put back exactly as it was if
-    // the file system step then fails.
+    // What a local move or replacement can change in the state database (records and holds of files cut short at and
+    // under both paths, the journal, and the index entries of the moving node and at both paths), taken just before it,
+    // to put back exactly as it was if the file system step then fails.
     private snapshotLocalStep(paths: string[], uids: string[]): LocalStepSnapshot {
         const records = paths.flatMap((p) => this.stateDb.getItemsUnder(p));
+        const cutShort = this.stateDb.listCutShort().filter((hold) => paths.some((p) => isSameOrUnder(hold.relPath, p)));
         const indexRoots: string[] = [];
         const index: RemoteIndexEntry[] = [];
         const keep = (entry: RemoteIndexEntry | null) => {
@@ -5416,7 +5845,7 @@ export class ProtonDriveSyncEngine {
         for (const p of paths) {
             keep(this.index.getByPath(p));
         }
-        return { paths, records, ops: this.journal.snapshot(), indexRoots, index };
+        return { paths, records, cutShort, ops: this.journal.snapshot(), indexRoots, index };
     }
 
     private restoreLocalStep(snapshot: LocalStepSnapshot): void {
@@ -5426,6 +5855,12 @@ export class ProtonDriveSyncEngine {
             }
             for (const record of snapshot.records) {
                 this.stateDb.upsertItem(record);
+            }
+            for (const p of snapshot.paths) {
+                this.stateDb.dropCutShort(p);
+            }
+            for (const hold of snapshot.cutShort) {
+                this.stateDb.holdCutShort(hold);
             }
             this.journal.restore(snapshot.ops);
             for (const uid of snapshot.indexRoots) {
@@ -5541,6 +5976,9 @@ export class ProtonDriveSyncEngine {
             const finished = exists(to);
             if (!finished) {
                 this.stateDb.removeItemByPath(intent.to);
+                if (exists(from)) {
+                    this.stateDb.moveCutShort(intent.to, intent.from); // Its holds went ahead of it (#300): back with it
+                }
             }
             this.stateDb.logActivity({
                 action: 'sync',
@@ -6939,6 +7377,7 @@ interface DriveChange {
 interface LocalStepSnapshot {
     paths: string[];
     records: SyncedItemRecord[];
+    cutShort: CutShortFile[];
     ops: unknown[];
     indexRoots: string[];
     index: RemoteIndexEntry[];
@@ -7100,6 +7539,29 @@ function cloudChangedSince(seen: CloudVersion, now: CloudVersion): boolean {
         return now.sha1 !== seen.sha1;
     }
     return now.sha1 !== seen.sha1 || now.mtimeMs !== seen.mtimeMs || now.size !== seen.size;
+}
+
+// Whether a local file holds what Proton Drive has of it, as far as can be told without reading it (#300): 'same',
+// 'differs', or 'hash' when only its content can tell. By its record (what Proton Drive held when the record was made),
+// else by its edit baseline (what the drive showed); a file with neither is new, of which Proton Drive has nothing. Any
+// doubt is 'differs': the file is then held, which loses nothing.
+function asProtonDriveHasIt(st: Stats, record: SyncedItemRecord | null, edit: EditBaseline | null): 'same' | 'differs' | 'hash' {
+    if (record) {
+        const held = record.remoteSha1 ?? record.localSha1;
+        if (record.type !== 'file' || st.size !== record.size || !held) {
+            return 'differs';
+        }
+        const unwritten =
+            record.syncStatus === 'synced' &&
+            Math.abs(st.mtimeMs - record.localMtimeMs) < 10 &&
+            notWrittenSince(st, record) &&
+            record.localSha1 === held;
+        return unwritten ? 'same' : 'hash';
+    }
+    if (edit) {
+        return st.size !== edit.size || !edit.sha1 ? 'differs' : 'hash';
+    }
+    return 'differs';
 }
 
 // A record for a file only the remote index knows (online-only), as replaced through the drive: its node, and what the
