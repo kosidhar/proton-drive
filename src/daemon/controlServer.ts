@@ -49,6 +49,9 @@ export interface ControlServerOptions {
         | 'renameItem'
         | 'deleteItem'
         | 'truncateItem'
+        | 'driveWriting'
+        | 'driveClosed'
+        | 'clearDriveWriting'
     >;
     // What the file manager extension reads: where the drive is, the states of a folder's items, and what changes (see
     // fileManagerRoutes.ts)
@@ -153,7 +156,8 @@ type DriveEngine = ControlServerOptions['engine'];
 // GET /vfs/children?path=, POST /vfs/hydrate {path, opener?} (opener: the name of the app that opened it), POST /vfs/rename {from, to, noReplace?}, POST /vfs/delete {path,
 // onlyIfEmpty?, trash?} (onlyIfEmpty is rmdir, trash a Move to Trash), POST /vfs/truncate {path} (an online-only file
 // made an empty local one); the last three also take deadlineMs. Paths are paths of My files, UTF-8 as they are ('' is
-// the top); each answers { entries } or { ok: true }, or 400 { error, code }.
+// the top); each answers { entries } or { ok: true }, or 400 { error, code }. The helper's notices of files open for
+// writing, POST /vfs/writing and /vfs/closed, answer as driveNotice says.
 async function driveRoute(req: Request, route: string, engine: DriveEngine): Promise<Response> {
     if (route === '/vfs/children') {
         if (req.method !== 'GET') return driveError(new Error('Method not allowed'), 405);
@@ -167,6 +171,7 @@ async function driveRoute(req: Request, route: string, engine: DriveEngine): Pro
     }
     if (req.method !== 'POST') return driveError(new Error('Method not allowed'), 405);
     const body = await jsonBody(req);
+    if (route === '/vfs/writing' || route === '/vfs/closed') return driveNotice(route, body, engine);
     if (!body) return driveError(new Error('Invalid JSON body'));
     // When the helper stops waiting (epoch ms): a change whose turn comes later is refused, not done behind its back
     if (route !== '/vfs/hydrate' && body.deadlineMs !== undefined && !Number.isFinite(body.deadlineMs)) {
@@ -217,7 +222,42 @@ async function driveRoute(req: Request, route: string, engine: DriveEngine): Pro
     }
 }
 
-const DRIVE_ROUTES: readonly string[] = ['/vfs/children', '/vfs/hydrate', '/vfs/rename', '/vfs/delete', '/vfs/truncate'];
+// The drive helper's notices of files open for writing through the drive (#64): POST /vfs/writing {path, replacing} at a
+// file's first writer, as its writing turns into a replace, and every 30 s while it replaces it; POST /vfs/closed {path,
+// refused, replaced} when its last writer closes it. Neither takes deadlineMs: a close answers once the file is being
+// looked at, never waiting for its upload. { ok: true } for any well-formed body, whatever the path (one never marked,
+// gone, or not of My files), as often as it comes: the helper drops a refused close that the daemon answers with a 4xx,
+// which would let a file cut short upload. So only a malformed body is 400 { error, code: 'EINVAL' }, and anything that
+// fails here is 500 { error, code: 'EIO' }, which the helper sends again.
+async function driveNotice(route: string, body: Record<string, unknown> | null, engine: DriveEngine): Promise<Response> {
+    const invalid = (message: string) => Response.json({ error: message, code: 'EINVAL' }, { status: 400 });
+    if (!body) return invalid('Invalid JSON body');
+    if (typeof body.path !== 'string') return invalid('path must be a string');
+    try {
+        if (route === '/vfs/writing') {
+            if (typeof body.replacing !== 'boolean') return invalid('replacing must be true or false');
+            engine.driveWriting(body.path, body.replacing);
+        } else {
+            if (typeof body.refused !== 'boolean' || typeof body.replaced !== 'boolean') {
+                return invalid('refused and replaced must be true or false');
+            }
+            await engine.driveClosed(body.path, { refused: body.refused, replaced: body.replaced });
+        }
+    } catch (err) {
+        return Response.json({ error: messageOf(err), code: 'EIO' }, { status: 500 });
+    }
+    return Response.json({ ok: true });
+}
+
+const DRIVE_ROUTES: readonly string[] = [
+    '/vfs/children',
+    '/vfs/hydrate',
+    '/vfs/rename',
+    '/vfs/delete',
+    '/vfs/truncate',
+    '/vfs/writing',
+    '/vfs/closed',
+];
 
 // GET /vfs/space: the account's storage for the drive helper's statfs (#181), { space: { usedSpace, maxSpace } }, or
 // { space: null } while it isn't known; the helper then reports the local disk
