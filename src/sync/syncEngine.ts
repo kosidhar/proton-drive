@@ -369,10 +369,11 @@ export class ProtonDriveSyncEngine {
             // Let through only because it had changed for SETTLE_MAX_WAIT_MS, not because it went quiet: still being
             // written, as far as anyone knows (see stillChangingWhenLetThrough)
             forced?: boolean;
-            // Only on a file held by a replacing mark (#64): when the run of changes it was in before that writing
-            // began started (by the settle clock), or null if it was in none. Its close goes on with that run (see
-            // settleClosed); the time it was held never counts as changing.
-            heldRun?: number | null;
+            // Only on a file held by a replacing mark (#64): how long the run of changes it was in had lasted when
+            // that writing began (by the settle clock), or null if it was in none. Its close goes on with that run from
+            // there (see settleClosed): the time it was held never counts as changing, however early the run began (a
+            // watcher's look can come before the helper's notice).
+            heldRunMs?: number | null;
             cancel: () => void;
         }
     >();
@@ -3096,10 +3097,11 @@ export class ProtonDriveSyncEngine {
             // keeps the run of changes it was in before this writing began (written in sessions more often than it
             // settles: see settleClosed)
             const held = this.settlingFiles.get(relPath);
-            const heldRun = !held || held.settled ? null : held.heldRun !== undefined ? held.heldRun : held.changingSince;
+            const heldRunMs =
+                !held || held.settled ? null : held.heldRunMs !== undefined ? held.heldRunMs : Math.max(now - held.changingSince, 0);
             this.forgetSettling(relPath);
             const cancel = this.scheduleLook(relPath, baseQuietMs > 0 ? baseQuietMs : SETTLE_QUIET_MS);
-            this.settlingFiles.set(relPath, { seen, since: now, quietMs: baseQuietMs, changingSince: now, settled: false, heldRun, cancel });
+            this.settlingFiles.set(relPath, { seen, since: now, quietMs: baseQuietMs, changingSince: now, settled: false, heldRunMs, cancel });
             return true;
         }
         if (baseQuietMs <= 0) {
@@ -3111,10 +3113,12 @@ export class ProtonDriveSyncEngine {
             }
         }
         let earlier = this.settlingFiles.get(relPath);
-        if (earlier?.heldRun !== undefined) {
+        if (earlier?.heldRunMs !== undefined) {
             // Held by a replacing mark that went without a close (it lapsed: the helper died; the helper started again;
-            // a rename replaced the file): it settles over from now, never let through for what it did while held,
-            // neither as quiet since then nor as changing for SETTLE_MAX_WAIT_MS
+            // a rename replaced the file): it settles over from now, by the settle clock, never let through as having
+            // changed for SETTLE_MAX_WAIT_MS, nor as quiet since a look while it was held. Its ctime still counts, by the
+            // system clock: a file not written for SETTLE_QUIET_MS is quiet at the first look (a helper that died
+            // mid-copy left it so: accepted, see the design)
             this.forgetSettling(relPath);
             earlier = undefined;
         }
@@ -3845,8 +3849,14 @@ export class ProtonDriveSyncEngine {
         const settle = this.options.settle ?? {};
         const quietMs = settle.quietMs ?? SETTLE_QUIET_MS;
         const maxWaitMs = settle.maxWaitMs ?? SETTLE_MAX_WAIT_MS;
-        const run = !earlier || earlier.settled ? null : earlier.heldRun !== undefined ? earlier.heldRun : earlier.changingSince;
-        const changingSince = run ?? now;
+        // The run it was in: as it began, if nothing held it since (an in-place session's writing counts); or resumed
+        // from now with what it had lasted when a replacing session began holding it
+        const changingSince =
+            !earlier || earlier.settled
+                ? now
+                : earlier.heldRunMs === undefined
+                  ? earlier.changingSince
+                  : now - (earlier.heldRunMs ?? 0);
         const entry = { seen: seenAs(st), since: now, quietMs, changingSince, settled: false, cancel: () => {} };
         entry.cancel = this.scheduleSettling(async () => {
             await this.lookAgain(rel);
@@ -4791,6 +4801,13 @@ export class ProtonDriveSyncEngine {
                     this.stateDb.moveEditBaselines(fromRel, toRel);
                 }
                 this.moveWritingMarks(fromRel, toRel);
+                // What was settling at the old path went with what the rename took away: a file made there next (a
+                // save through a temp file of a fixed name) starts afresh, never in the run of the one before (#64)
+                for (const rel of [...this.settlingFiles.keys()]) {
+                    if (isSameOrUnder(rel, fromRel)) {
+                        this.forgetSettling(rel);
+                    }
+                }
             },
             { from: fromRel, to: keepsTarget ? null : toRel },
         );

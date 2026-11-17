@@ -4366,8 +4366,10 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
 
         // A lapse says the helper is gone, not that the file is written: what happened while it was held never lets it
-        // through, however long ago the last look was (a daemon too busy to look, say)
-        test('a lapsed mark starts the wait over: never taken as quiet since before, nor forced through by the 2-minute rule', async () => {
+        // through, however long ago the last look was (a daemon too busy to look, say). By the settle clock only: the
+        // test clock doesn't move file times, so a file whose ctime is 2 s old by the system clock, quiet at the first
+        // look after a lapse (which the design accepts), isn't what this covers
+        test('a lapsed mark starts the wait over by the settle clock: never forced through by the 2-minute rule', async () => {
             const d = await started();
             await replacing(d, 'big.bin');
             await d.copying('big.bin', 60_000);
@@ -4450,6 +4452,52 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             atMostEvery2Minutes(uploadedAt);
             await d.advance(2000);
             expect(d.cloudContent('status.txt')).toBe('status 300');
+        });
+
+        // The helper's notices go out from a queue of their own: the watcher can report the new file before its
+        // /vfs/writing comes. That earlier look's run must not make the time the copy held it count
+        test("a watcher's look before the helper's notice doesn't make a long temp-file save's time count", async () => {
+            const d = await started();
+            await d.files.writeLocal('.goutputstream-LATE', 'part 0;');
+            await d.changed('.goutputstream-LATE');
+            d.engine.driveWriting('.goutputstream-LATE', true);
+            await d.copying('.goutputstream-LATE', 3 * 60_000);
+            await d.engine.driveClosed('.goutputstream-LATE', closed);
+            await d.advance(100); // the rename comes a moment after the close: what is due by then has run
+            await d.engine.renameItem('.goutputstream-LATE', 'Kept.txt');
+            await d.changed('Kept.txt');
+            await d.advance(5000);
+            await d.engine.reconcileNow();
+            await d.engine.replayRemoteOps();
+            expect(d.calls.uploads).toEqual(['Kept.txt']);
+            expect(d.calls.trashed).toEqual([]);
+        });
+
+        // A save through a temp file of a fixed name (Kept.txt.tmp), every second, each taking half a second: what was
+        // settling at the temp name went with the file the rename took away, and isn't the next temp file's
+        test('a save through a fixed temp name every second never uploads the temp file', async () => {
+            const d = await started();
+            const settlingAt = (rel: string) => (d.engine as any).settlingFiles.has(rel) as boolean;
+            for (let t = 1; t <= 240; t++) {
+                d.engine.driveWriting('Kept.txt.tmp', true);
+                await d.files.writeLocal('Kept.txt.tmp', `v${t}`);
+                await d.changed('Kept.txt.tmp');
+                await d.advance(500); // the save takes half a second
+                await d.engine.driveClosed('Kept.txt.tmp', closed);
+                await d.advance(100); // the rename a moment after the close
+                await d.engine.waitForRunningLooks();
+                await d.engine.renameItem('Kept.txt.tmp', 'Kept.txt');
+                expect(settlingAt('Kept.txt.tmp')).toBe(false);
+                await d.changed('Kept.txt');
+                await d.advance(400);
+            }
+            await d.advance(16_000);
+            await d.engine.reconcileNow();
+            await d.engine.replayRemoteOps();
+            expect(d.calls.uploads.filter((u) => u !== 'Kept.txt')).toEqual([]);
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.calls.uploads.length).toBeGreaterThanOrEqual(2); // by the 2-minute rule, and once quiet
+            expect(d.nodes.get(d.uid('Kept.txt'))?.content).toBe('v240');
         });
 
         test('a copy longer than 2 minutes, closed, still waits to settle: the time it was held is not a run of changes', async () => {
