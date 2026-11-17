@@ -963,7 +963,56 @@ fn a_refused_download_reaches_the_app_as_enoent_eacces_or_eio() {
 
     assert_eq!(errno_of_open(&h.path("gone.txt"), libc::O_RDONLY), Some(libc::ENOENT));
     assert_eq!(errno_of_open(&h.path("hidden.txt"), libc::O_RDONLY), Some(libc::EACCES));
-    assert_eq!(errno_of_open(&h.path("odd.txt"), libc::O_RDONLY), Some(libc::EIO), "only ENOENT, EACCES and EIO pass");
+    assert_eq!(
+        errno_of_open(&h.path("odd.txt"), libc::O_RDONLY),
+        Some(libc::EIO),
+        "only ENOENT, EACCES, ENOSPC and EIO pass"
+    );
+}
+
+// #301: the daemon refuses to download a file for an open that would leave the system disk with less than the reserve.
+// The app gets ENOSPC ("No space left on device"): as it opens the file to read, or at its first write or size change
+// when it opens it write-only (that download waits for them). It isn't an error, so the helper doesn't log it
+#[test]
+fn an_open_refused_for_room_reaches_the_app_as_enospc_and_isnt_logged() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    h.start_fake(
+        Fake::new(HashMap::from([("", vec![file("big.iso", 5), file("odd.txt", 5)])]))
+            .refusing("big.iso", "ENOSPC")
+            .refusing("odd.txt", "EXDEV"),
+    );
+    h.mount();
+
+    // To read, or to read and write: refused as it opens
+    assert_eq!(errno_of_open(&h.path("big.iso"), libc::O_RDONLY), Some(libc::ENOSPC));
+    assert_eq!(errno_of_open(&h.path("big.iso"), libc::O_RDWR), Some(libc::ENOSPC));
+    // Write-only: it opens, and its first write is refused
+    let fd = unsafe { libc::open(c_path(&h.path("big.iso")).as_ptr(), libc::O_WRONLY) };
+    assert!(fd >= 0, "a write-only open downloads nothing yet: {}", std::io::Error::last_os_error());
+    let wrote = errno_of(unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) } as i32);
+    unsafe { libc::close(fd) };
+    assert_eq!(wrote, Some(libc::ENOSPC));
+    // Its close says it was refused for room, as one whose write the guard refused does. Waited for before the next
+    // open: the kernel releases an open after close(2) returns, and an open before that would join its session
+    until("the close reaching the daemon", || !h.daemon().closes().is_empty());
+    let refused = json!({ "path": "big.iso", "refused": true, "replaced": false });
+    assert_eq!(h.daemon().closes(), std::slice::from_ref(&refused));
+    // Or at its first size change: truncate(1) opens it write-only, then ftruncates
+    let cut = run(Command::new("truncate").args(["-s", "4"]).arg(h.path("big.iso")));
+    assert!(!cut.status.success());
+    assert!(String::from_utf8_lossy(&cut.stderr).contains("No space left on device"), "{cut:?}");
+    until("the second close reaching the daemon", || h.daemon().closes().len() == 2);
+    assert_eq!(h.daemon().closes(), [refused.clone(), refused]);
+    assert_eq!(h.daemon().hydrate_calls(), 4);
+    assert!(!h.backing.join("big.iso").exists(), "nothing came down");
+    // A download that failed is logged as before: once its line is there, a line for the refusals would be too
+    assert_eq!(errno_of_open(&h.path("odd.txt"), libc::O_RDONLY), Some(libc::EIO));
+    until("the failed download's line", || h.stderr().contains("couldn't download \"odd.txt\""));
+    let log = h.stderr();
+    assert!(!log.contains("big.iso"), "{log}");
 }
 
 /// Runs a shell script with the paths as $1, $2, ...
