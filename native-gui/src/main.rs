@@ -290,6 +290,9 @@ struct SummaryStats {
     total_bytes: u64,
     unresolved_conflicts: u64,
     error_items: u64,
+    /// How many files the daemon holds back because the disk guard cut them short (#300); older daemons don't say
+    #[serde(default)]
+    cut_short_files: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
@@ -900,6 +903,26 @@ fn resolve_conflict_at(socket: &std::path::Path, id: u64, choice: &str) -> Resul
     control_request_at(socket, "POST", "/conflicts/resolve", Some(&body), RESOLVE_READ_TIMEOUT).map(|_| ())
 }
 
+/// How long the daemon takes to list the held files: it answers from its database.
+const CUT_SHORT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// GET /cut-short on the control socket: the files held because the disk guard cut them short (#300).
+fn cut_short_at(socket: &std::path::Path) -> Result<Vec<CutShortItem>, String> {
+    #[derive(Deserialize)]
+    struct Reply {
+        items: Vec<CutShortItem>,
+    }
+    let reply = control_request_at(socket, "GET", "/cut-short", None, CUT_SHORT_READ_TIMEOUT)?;
+    serde_json::from_value::<Reply>(reply).map(|r| r.items).map_err(|e| e.to_string())
+}
+
+/// POST /cut-short/upload or /cut-short/restore {paths}: what the user decided about held files.
+fn resolve_cut_short_at(socket: &std::path::Path, paths: &[String], restore: bool) -> Result<(), String> {
+    let route = if restore { "/cut-short/restore" } else { "/cut-short/upload" };
+    let body = serde_json::json!({ "paths": paths });
+    control_request_at(socket, "POST", route, Some(&body), RESOLVE_READ_TIMEOUT).map(|_| ())
+}
+
 /// What the user does about the files missing from the folder, besides waiting for them (the action of POST
 /// /sync/files-missing).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1369,6 +1392,18 @@ struct ConflictRecord {
     resolved: u8,
 }
 
+/// One file the daemon holds because the disk guard cut it short, as GET /cut-short lists it (#300).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct CutShortItem {
+    /// Relative to the sync folder
+    pub rel_path: String,
+    /// Whether Proton Drive has a version of it from before
+    pub existing: bool,
+    pub size: u64,
+    pub detected_at: i64,
+}
+
 enum WorkerCommand {
     RefreshAll,
     /// Home's Sync now
@@ -1388,6 +1423,11 @@ enum WorkerCommand {
     DriveMove { action: String, from: String, to: String },
     LoadConflicts,
     ResolveConflict { id: u64, choice: String },
+    /// The files held because the disk guard cut them short (a read, over the control socket, #300)
+    LoadCutShort,
+    /// Upload these held files as they are, or (restore) put the Proton Drive version back; only existing files can be
+    /// put back
+    ResolveCutShort { paths: Vec<String>, restore: bool },
     /// keep_pinned: see `set_availability`
     SetAvailability { path: String, action: String, keep_pinned: Option<bool> },
     /// What is marked Always keep, for the whole drive's Free up space (a read, over the control socket, #296)
@@ -1444,7 +1484,7 @@ fn pause_request(paused: bool, until: Option<i64>) -> serde_json::Value {
 
 /// What screenshot mode may ask the worker for: reads only.
 fn allowed_in_screenshot_mode(cmd: &WorkerCommand) -> bool {
-    matches!(cmd, WorkerCommand::RefreshAll | WorkerCommand::LoadConflicts)
+    matches!(cmd, WorkerCommand::RefreshAll | WorkerCommand::LoadConflicts | WorkerCommand::LoadCutShort)
 }
 
 /// Screenshot-only: `--fake-attention N`: N conflicts named report.pdf, notes.txt and a 120-character name in turn, and
@@ -1457,6 +1497,21 @@ fn fake_attention_items(n: usize) -> Vec<home::Attention> {
         .collect();
     items.push(home::Attention::FailedItems(2));
     items
+}
+
+/// Screenshot-only: `--fake-cut-short one | many`: one existing file held, or 214 held, one in three of them new.
+fn fake_cut_short_items(state: &str) -> Option<Vec<CutShortItem>> {
+    let item = |i: usize, existing: bool| CutShortItem {
+        rel_path: format!("Photos/Holiday/IMG_{:04}.jpg", i + 1),
+        existing,
+        size: 4_000_000 + i as u64,
+        detected_at: 1_800_000_000_000,
+    };
+    match state {
+        "one" => Some(vec![CutShortItem { rel_path: "Documents/report.pdf".into(), ..item(0, true) }]),
+        "many" => Some((0..214).map(|i| item(i, i % 3 != 0)).collect()),
+        _ => None,
+    }
 }
 
 /// Screenshot-only: `--fake-transfers N`: N uploads, each 40% of 10 MB done.
@@ -1521,6 +1576,8 @@ enum WorkerEvent {
     LoggedOut(Result<(), String>),
     ConflictsLoaded(Vec<ConflictRecord>),
     ConflictResolved(Result<(), String>),
+    CutShortLoaded(Result<Vec<CutShortItem>, String>),
+    CutShortResolved(Result<(), String>),
     AvailabilityDone { path: String, result: Result<AvailabilityResult, String> },
     /// How many items below the top level are marked Always keep and whether the whole drive is, or why that couldn't
     /// be read
@@ -1744,6 +1801,14 @@ struct ProtonDriveNativeApp {
     attention: Vec<home::Attention>,
     /// Why the last conflict resolution was refused or failed
     conflict_error: Option<String>,
+    /// The files the daemon holds because the disk guard cut them short (#300)
+    cut_short: Vec<CutShortItem>,
+    /// Whether the summary row of many held files is opened into one row each
+    cut_short_expanded: bool,
+    /// Why the last decision about held files was refused or failed
+    cut_short_error: Option<String>,
+    /// Screenshot-only: `--fake-cut-short`, in place of what the daemon lists
+    fake_cut_short: Option<Vec<CutShortItem>>,
 
     // Settings edits
     edit_sync_dir: String,
@@ -1844,7 +1909,7 @@ impl ProtonDriveNativeApp {
         let edit_start_at_login = initial_status.settings.start_at_login;
         let ignore_patterns_text = initial_status.settings.ignore_patterns.join("\n");
         let loaded_settings = initial_status.settings.clone();
-        let attention = home::attention_items(&initial_status, &[]);
+        let attention = home::attention_items(&initial_status, &[], &[]);
 
         Self {
             tab: initial_tab,
@@ -1884,6 +1949,10 @@ impl ProtonDriveNativeApp {
             conflicts: Vec::new(),
             attention,
             conflict_error: None,
+            cut_short: Vec::new(),
+            cut_short_expanded: false,
+            cut_short_error: None,
+            fake_cut_short: None,
             edit_sync_dir,
             edit_conflict_strategy,
             edit_notifications,
@@ -2029,7 +2098,10 @@ impl ProtonDriveNativeApp {
     fn refresh_attention(&mut self) {
         self.attention = match self.fake_attention {
             Some(n) => fake_attention_items(n),
-            None => home::attention_items(&self.status, &self.conflicts),
+            None => {
+                let held = self.fake_cut_short.as_ref().unwrap_or(&self.cut_short);
+                home::attention_items(&self.status, &self.conflicts, held)
+            }
         };
     }
 
@@ -2071,6 +2143,14 @@ impl ProtonDriveNativeApp {
                             listed_open,
                         ) {
                             let _ = self.tx.send(WorkerCommand::LoadConflicts);
+                        }
+                        if home::should_reload_cut_short(
+                            was_offline,
+                            self.status.stats.cut_short_files,
+                            s.stats.cut_short_files,
+                            self.cut_short.len(),
+                        ) {
+                            let _ = self.tx.send(WorkerCommand::LoadCutShort);
                         }
                         self.status = s;
                         self.activities = activity;
@@ -2165,6 +2245,17 @@ impl ProtonDriveNativeApp {
                 }
                 WorkerEvent::ConflictsLoaded(conflicts) => {
                     self.conflicts = conflicts;
+                }
+                // A daemon that doesn't list them (older, or not answering) leaves what was listed as it was
+                WorkerEvent::CutShortLoaded(result) => {
+                    if let Ok(items) = result {
+                        self.cut_short = items;
+                    }
+                }
+                WorkerEvent::CutShortResolved(result) => {
+                    self.cut_short_error = result.err();
+                    let _ = self.tx.send(WorkerCommand::LoadCutShort);
+                    let _ = self.tx.send(WorkerCommand::RefreshAll);
                 }
                 WorkerEvent::SharedLoaded(seq, result) => self.shared.loaded(seq, result),
                 WorkerEvent::SharedStopped(rel_path, result) => {
@@ -4435,6 +4526,12 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
             WorkerCommand::ResolveConflict { id, choice } => off_thread(&tx, &ctx, move || {
                 WorkerEvent::ConflictResolved(resolve_conflict_at(&control_socket_path(), id, &choice))
             }),
+            WorkerCommand::LoadCutShort => {
+                off_thread(&tx, &ctx, || WorkerEvent::CutShortLoaded(cut_short_at(&control_socket_path())))
+            }
+            WorkerCommand::ResolveCutShort { paths, restore } => off_thread(&tx, &ctx, move || {
+                WorkerEvent::CutShortResolved(resolve_cut_short_at(&control_socket_path(), &paths, restore))
+            }),
             WorkerCommand::ResolveFilesMissing { choice, root, names } => off_thread(&tx, &ctx, move || {
                 WorkerEvent::FilesMissingDone(files_missing_resolve_at(&control_socket_path(), choice, &root, &names))
             }),
@@ -4572,6 +4669,7 @@ OPTIONS:
   --fake-share <S>      with --screenshot: show the Share window (for --share's item, else Docs/report.pdf in the
                         drive) as S (none | link | link-password | link-expired | people)
   --confirm-stop-sharing <NAME>  with --screenshot and --fake-shared list: show the Stop sharing confirmation for that row
+  --fake-cut-short <S>  with --screenshot: list files held because the disk guard cut them short (one | many)
   --fake-shared <S>     with --screenshot: show the Shared section (--tab shared) as S (list | empty | offline)
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --zoom <F>            with --screenshot: render at zoom factor F (0.5 to 3, e.g. 1.2), as Ctrl+= would
@@ -4619,6 +4717,7 @@ fn main() -> eframe::Result {
     let mut cli_account_menu = false;
     let mut cli_fake_share: Option<String> = None;
     let mut cli_fake_shared: Option<String> = None;
+    let mut cli_fake_cut_short: Option<String> = None;
     let mut cli_confirm_stop_sharing: Option<String> = None;
     let mut cli_zoom: Option<f32> = None;
     // The arguments as the system gives them: one that isn't UTF-8 (a file's name can be anything) mustn't stop the app
@@ -4681,6 +4780,9 @@ fn main() -> eframe::Result {
             }
             "--fake-share" => {
                 cli_fake_share = text(args.next());
+            }
+            "--fake-cut-short" => {
+                cli_fake_cut_short = text(args.next());
             }
             "--fake-shared" => {
                 cli_fake_shared = text(args.next());
@@ -4745,12 +4847,13 @@ fn main() -> eframe::Result {
             || cli_account_menu
             || cli_fake_share.is_some()
             || cli_fake_shared.is_some()
+            || cli_fake_cut_short.is_some()
             || cli_confirm_stop_sharing.is_some()
             || cli_fake_pinned.is_some()
             || cli_zoom.is_some())
     {
         eprintln!(
-            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --account-menu, --fake-share, --fake-shared, --confirm-stop-sharing, --fake-pinned and --zoom only apply together with --screenshot; ignoring them"
+            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --account-menu, --fake-share, --fake-shared, --fake-cut-short, --confirm-stop-sharing, --fake-pinned and --zoom only apply together with --screenshot; ignoring them"
         );
     }
     let fake_share = match cli_fake_share {
@@ -4767,6 +4870,16 @@ fn main() -> eframe::Result {
         eprintln!("protondrive-gui: --fake-shared and --confirm-stop-sharing only show with --tab shared; ignoring them");
         cli_confirm_stop_sharing = None;
     }
+    let fake_cut_short = match cli_fake_cut_short {
+        Some(state) if screenshot_target.is_some() => {
+            let list = fake_cut_short_items(&state);
+            if list.is_none() {
+                eprintln!("protondrive-gui: ignoring unknown --fake-cut-short {state:?} (one | many)");
+            }
+            list
+        }
+        _ => None,
+    };
     let fake_shared = match cli_fake_shared {
         Some(state) if screenshot_target.is_some() => {
             let list = shared::fake_shared(&state, home::now_ms());
@@ -4916,6 +5029,7 @@ fn main() -> eframe::Result {
                 app.fake_drive = fake_drive;
                 app.fake_files_missing = cli_files_missing;
                 app.fake_attention = cli_fake_attention;
+                app.fake_cut_short = fake_cut_short;
                 app.fake_transfers = cli_fake_transfers;
                 app.fake_signed_out = cli_signed_out;
                 app.fake_account_mismatch = cli_account_mismatch;
@@ -5471,6 +5585,10 @@ mod tests {
                 conflicts: Vec::new(),
                 attention: Vec::new(),
                 conflict_error: None,
+                cut_short: Vec::new(),
+                cut_short_expanded: false,
+                cut_short_error: None,
+                fake_cut_short: None,
                 edit_sync_dir: String::new(),
                 edit_conflict_strategy: "keep-both".into(),
                 edit_notifications: false,
@@ -5755,6 +5873,9 @@ mod tests {
                     WorkerCommand::SetPaused { paused, until: None } => Some(format!("paused {paused}")),
                     WorkerCommand::SetPaused { paused, until: Some(until) } => Some(format!("paused {paused} until {until}")),
                     WorkerCommand::ResolveConflict { id, choice } => Some(format!("resolve {id} {choice}")),
+                    WorkerCommand::ResolveCutShort { paths, restore } => {
+                        Some(format!("cut short {} {}", if restore { "restore" } else { "upload" }, paths.join(",")))
+                    }
                     WorkerCommand::StartLogin => Some("sign in".to_string()),
                     WorkerCommand::StartFresh => Some("start fresh".to_string()),
                     WorkerCommand::SharedLoad { .. } => Some("shared list".to_string()),
@@ -6713,6 +6834,134 @@ mod tests {
         // A refused resolve is shown in the card
         h.event(WorkerEvent::ConflictResolved(Err("The file changed again".into())));
         assert!(h.text_at("The file changed again").is_some());
+    }
+
+    fn held_file(path: &str, existing: bool) -> CutShortItem {
+        CutShortItem { rel_path: path.to_string(), existing, size: 10, detected_at: 1 }
+    }
+
+    const CUT_SHORT_WHY: &str = " wasn't fully written: your computer's disk was nearly full.";
+
+    #[test]
+    fn a_held_existing_file_offers_upload_and_put_back() {
+        let mut h = home_with(|_| {});
+        h.event(WorkerEvent::CutShortLoaded(Ok(vec![held_file("docs/report.pdf", true)])));
+        assert!(h.text_at("Needs attention").is_some());
+        assert!(h.text_at(&format!("report.pdf{CUT_SHORT_WHY}")).is_some());
+        assert!(h.text_at("Proton Drive still has the version from before.").is_some());
+        assert!(h.text_at("It hasn't been uploaded.").is_none());
+        assert!(h.text_at("Upload it anyway").is_none());
+        // The name is bold, the rest regular
+        let line = h.texts(|t| t.galley.text() == format!("report.pdf{CUT_SHORT_WHY}"));
+        let fonts: Vec<_> = line[0].galley.job.sections.iter().map(|s| s.format.font_id.family.clone()).collect();
+        assert_eq!(fonts, vec![FontFamily::Name(BOLD_FAMILY.into()), FontFamily::Proportional]);
+        let upload = h.text_at("Upload this version").expect("offered");
+        let put_back = h.text_at("Put back the Proton Drive version").expect("offered");
+        assert!(upload.x < put_back.x);
+        h.click(upload);
+        assert_eq!(h.sent(), vec!["cut short upload docs/report.pdf".to_string()]);
+        h.click(put_back);
+        assert_eq!(h.sent(), vec!["cut short restore docs/report.pdf".to_string()]);
+        // They wait for the daemon
+        h.app.daemon_online = false;
+        h.frames(2);
+        h.click(h.text_at("Upload this version").unwrap());
+        h.click(h.text_at("Put back the Proton Drive version").unwrap());
+        assert_eq!(h.sent(), Vec::<String>::new());
+        // A refused decision is shown in the card
+        h.event(WorkerEvent::CutShortResolved(Err("Not held any more".into())));
+        assert!(h.text_at("Not held any more").is_some());
+        assert!(h.commands.try_iter().any(|c| matches!(c, WorkerCommand::LoadCutShort)));
+    }
+
+    #[test]
+    fn a_held_new_file_offers_only_upload_it_anyway() {
+        let mut h = home_with(|_| {});
+        h.event(WorkerEvent::CutShortLoaded(Ok(vec![held_file("new.txt", false)])));
+        assert!(h.text_at(&format!("new.txt{CUT_SHORT_WHY}")).is_some());
+        assert!(h.text_at("It hasn't been uploaded.").is_some());
+        assert!(h.text_at("Proton Drive still has the version from before.").is_none());
+        for absent in ["Upload this version", "Put back the Proton Drive version"] {
+            assert!(h.text_at(absent).is_none(), "{absent}");
+        }
+        h.click(h.text_at("Upload it anyway").expect("offered"));
+        assert_eq!(h.sent(), vec!["cut short upload new.txt".to_string()]);
+    }
+
+    #[test]
+    fn more_than_three_held_files_are_one_summary_row_that_shows_them_on_request() {
+        let mut h = home_with(|_| {});
+        let items = vec![held_file("a.txt", true), held_file("b.txt", false), held_file("c.txt", true), held_file("d.txt", true)];
+        h.event(WorkerEvent::CutShortLoaded(Ok(items)));
+        assert!(h.text_at("4 files weren't fully written: your computer's disk was nearly full.").is_some());
+        assert!(h.text_at(&format!("a.txt{CUT_SHORT_WHY}")).is_none(), "one row, not four");
+        h.click(h.text_at("Put back all").expect("some are existing"));
+        assert_eq!(h.sent(), vec!["cut short restore a.txt,c.txt,d.txt".to_string()], "a new file is never in a put back");
+        h.click(h.text_at("Upload all anyway").unwrap());
+        assert_eq!(h.sent(), vec!["cut short upload a.txt,b.txt,c.txt,d.txt".to_string()]);
+        h.click(h.text_at("Show them").unwrap());
+        h.resize_zoomed(Vec2::new(1000.0, 2400.0), 1.0);
+        // The list scrolls: the first rows are in view
+        for name in ["a.txt", "b.txt"] {
+            assert!(h.text_at(&format!("{name}{CUT_SHORT_WHY}")).is_some(), "{name} has its row");
+        }
+        assert!(h.text_at("4 files weren't fully written: your computer's disk was nearly full.").is_some(), "the summary stays");
+        h.click(h.text_at("Upload it anyway").expect("the new file's own button"));
+        assert_eq!(h.sent(), vec!["cut short upload b.txt".to_string()]);
+        h.click(h.text_at("Hide them").unwrap());
+        h.frames(2);
+        assert!(h.text_at(&format!("a.txt{CUT_SHORT_WHY}")).is_none());
+        // Only new files: nothing to put back
+        h.event(WorkerEvent::CutShortLoaded(Ok((0..4).map(|i| held_file(&format!("n{i}"), false)).collect())));
+        assert!(h.text_at("Put back all").is_none());
+        assert!(h.text_at("Upload all anyway").is_some());
+    }
+
+    #[test]
+    fn held_files_count_as_problems_and_reload_with_their_count() {
+        let mut h = home_with(|_| {});
+        h.event(WorkerEvent::CutShortLoaded(Ok((0..5).map(|i| held_file(&format!("f{i}"), true)).collect())));
+        assert_eq!(h.app.attention.len(), 1, "five held files are one problem");
+        h.event(WorkerEvent::CutShortLoaded(Ok(vec![held_file("a", true), held_file("b", true)])));
+        assert_eq!(h.app.attention.len(), 2);
+        let _ = h.commands.try_iter().count();
+        let mut status = h.app.status.clone();
+        status.stats.cut_short_files = 2;
+        h.event(WorkerEvent::StatusAndActivity { status: Box::new(Ok(status.clone())), activity: Vec::new() });
+        assert!(h.commands.try_iter().any(|c| matches!(c, WorkerCommand::LoadCutShort)), "the count changed");
+        // A daemon that can't list them leaves the list as it was
+        h.event(WorkerEvent::CutShortLoaded(Err("Not found".into())));
+        assert_eq!(h.app.cut_short.len(), 2);
+    }
+
+    #[test]
+    fn an_old_daemon_without_cut_short_files_still_parses() {
+        let old: SummaryStats = serde_json::from_str(
+            r#"{"totalFiles":1,"totalFolders":0,"totalBytes":2,"unresolvedConflicts":0,"errorItems":0}"#,
+        )
+        .unwrap();
+        assert_eq!(old.cut_short_files, 0);
+        let new: SummaryStats = serde_json::from_str(
+            r#"{"totalFiles":1,"totalFolders":0,"totalBytes":2,"unresolvedConflicts":0,"errorItems":0,"cutShortFiles":4}"#,
+        )
+        .unwrap();
+        assert_eq!(new.cut_short_files, 4);
+    }
+
+    #[test]
+    fn held_files_are_listed_and_decided_over_the_control_socket() {
+        let (sock, server) = serve_once(
+            b"HTTP/1.1 200 OK\r\n\r\n{\"items\":[{\"relPath\":\"a/b.txt\",\"existing\":true,\"size\":5,\"detectedAt\":9}]}",
+        );
+        assert_eq!(cut_short_at(&sock).unwrap(), vec![CutShortItem { rel_path: "a/b.txt".into(), existing: true, size: 5, detected_at: 9 }]);
+        assert!(server.join().unwrap().starts_with("GET /cut-short HTTP/1.1\r\n"));
+        for (restore, route) in [(false, "/cut-short/upload"), (true, "/cut-short/restore")] {
+            let (sock, server) = serve_once(b"HTTP/1.1 200 OK\r\n\r\n{\"ok\":true}  ");
+            resolve_cut_short_at(&sock, &["a/b.txt".to_string()], restore).unwrap();
+            let request = server.join().unwrap();
+            assert!(request.starts_with(&format!("POST {route} HTTP/1.1\r\n")), "{request}");
+            assert_eq!(request_body(&request), serde_json::json!({ "paths": ["a/b.txt"] }));
+        }
     }
 
     #[test]
