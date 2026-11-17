@@ -171,6 +171,7 @@ function harness(opts: {
     paths?: (root: string) => { mountpoint?: string; backing?: string; appDir?: string };
     runGate?: Promise<void>; // fusermount3 doesn't return until this settles
     nudge?: FakeNudge; // the supervisor nudges (#49), with this fake helper for it
+    helperStarts?: boolean; // the supervisor is given onHelperStart, which counts in helperStarts
 } = {}) {
     const root = tempRoot();
     const custom = opts.paths?.(root) ?? {};
@@ -196,6 +197,8 @@ function harness(opts: {
     const spawns: SpawnCall[] = [];
     const merged: Array<{ path: string; mountsThen: number }> = [];
     const logs: string[] = [];
+    // Each onHelperStart, with how many helpers had been spawned then (#64)
+    const helperStarts: number[] = [];
     const ours = (line: string) => line.includes(' - fuse.protondrive ');
     const at = (line: string) => line.split(' ')[4] === target.replace(/ /g, '\\040');
     // The nudge (#49): a hidden folder beside the control socket, holding the nudge's mount point and empty store
@@ -274,6 +277,7 @@ function harness(opts: {
         stat: opts.stat ? (p: string) => opts.stat!(p, runs) : undefined,
         timing: { ...FAST, ...opts.timing },
         nudge: opts.nudge !== undefined,
+        ...(opts.helperStarts ? { onHelperStart: () => helperStarts.push(procs.length) } : {}),
     });
     cleanups.push(() => supervisor.stop());
     // The user ejects the drive in Files: the kernel ends the session, the helper exits 0
@@ -339,6 +343,7 @@ function harness(opts: {
         spawns,
         merged,
         logs,
+        helperStarts,
         supervisor,
         eject,
         crash,
@@ -794,6 +799,34 @@ describe('VfsSupervisor: the helper session', () => {
         await until(() => h.supervisor.status().mounted);
         expect(h.spawns).toHaveLength(3);
         expect(modeOf(h.mountpoint)).toBe(0o700);
+    });
+
+    // #64: a new helper has no file open for writing, so the daemon forgets what the last one said was
+    test('onHelperStart is called once for each helper started: at start, after a crash, and on Mount again', async () => {
+        const h = harness({ helperStarts: true });
+        await h.supervisor.start();
+        expect(h.helperStarts).toEqual([1]); // as soon as it is spawned, before it mounts
+        await until(() => h.supervisor.status().mounted);
+        h.crash(null, 'SIGKILL');
+        await until(() => h.spawns.length === 2);
+        expect(h.helperStarts).toEqual([1, 2]);
+        await until(() => h.supervisor.status().mounted);
+        h.eject();
+        await until(() => h.supervisor.status().reason === 'ejected');
+        await h.supervisor.mountAgain();
+        expect(h.helperStarts).toEqual([1, 2, 3]);
+        await until(() => h.supervisor.status().mounted);
+        await h.supervisor.mountAgain(); // mounted already: starts nothing
+        expect(h.helperStarts).toEqual([1, 2, 3]);
+    });
+
+    test('onHelperStart is not called for a helper that could not be started', async () => {
+        const h = harness({ helperStarts: true, spawnThrows: 2 });
+        await h.supervisor.start();
+        expect(h.helperStarts).toEqual([]);
+        await until(() => h.supervisor.status().mounted);
+        expect(h.spawns).toHaveLength(3);
+        expect(h.helperStarts).toEqual([1]);
     });
 });
 

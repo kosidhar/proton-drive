@@ -4109,6 +4109,353 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         }
     });
 
+    // #64: through the virtual drive, a file being replaced (a copy over it, a save, a new file) uploads when the last app
+    // writing it closes it, and never while it is open, however long that takes; a file edited in place (a log, a
+    // database) keeps the 2-minute rule of #51. The drive helper says so (POST /vfs/writing and /vfs/closed: driveWriting
+    // and driveClosed), repeating a replacing file's mark every 30 s. The settle clock is moved on as in #51.
+    describe('upload on the last close (#64)', () => {
+        const setup = () => {
+            stateDb.setMeta('driveLayout', 'virtual');
+            const backingDir = path.join(tempDir, 'files');
+            const drive = makeMockDrive();
+            let offset = 0;
+            const now = () => Date.now() + offset;
+            let looks: Array<{ at: number; run: () => Promise<void> }> = [];
+            // A new engine on the same database and drive is what a restart of the daemon gives
+            const make = () =>
+                new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                    backingDir,
+                    moveToDesktopTrash: async () => false,
+                    settle: {
+                        quietMs: 2000,
+                        maxQuietMs: 16_000,
+                        maxWaitMs: 120_000,
+                        now,
+                        schedule: (run, delayMs) => {
+                            const look = { at: now() + delayMs, run };
+                            looks.push(look);
+                            return () => {
+                                looks = looks.filter((l) => l !== look);
+                            };
+                        },
+                    },
+                });
+            let engine = make();
+            const local = (rel: string) => path.join(backingDir, rel);
+            const changed = (rel: string): Promise<void> => (engine as any).handleLocalFileChange(rel);
+            const advance = async (ms: number) => {
+                offset += ms;
+                const due = looks.filter((l) => l.at <= now());
+                looks = looks.filter((l) => !due.includes(l));
+                await Promise.all(due.map((l) => l.run()));
+            };
+            return {
+                ...drive,
+                get engine() {
+                    return engine;
+                },
+                restart: async () => {
+                    await engine.stop();
+                    engine = make();
+                },
+                advance,
+                files: localFiles(stateDb, () => backingDir),
+                local,
+                changed, // the watcher's report of a change
+                pendingLooks: () => looks.length,
+                cloudContent: (name: string) =>
+                    [...drive.nodes.values()].find((n) => n.parentUid === drive.root.uid && drive.nameOf(n) === name)?.content,
+                // A copy through the drive that goes on for ms: a write every 5 s, the helper's keepalive every 30 s
+                // (unless it has died), and a sync pass every minute
+                copying: async (rel: string, ms: number, opts: { keepalive?: boolean } = {}) => {
+                    for (let t = 5000; t <= ms; t += 5000) {
+                        await advance(5000);
+                        appendFileSync(local(rel), ` part ${t};`);
+                        await changed(rel);
+                        if (t % 30_000 === 0 && opts.keepalive !== false) engine.driveWriting(rel, true);
+                        if (t % 60_000 === 0) await engine.reconcileNow();
+                    }
+                },
+            };
+        };
+        // Something on Proton Drive already, so that the folder never reads as missing its files (#45)
+        const started = async () => {
+            const d = setup();
+            d.add('Kept.txt', 'kept');
+            d.engine.availability.setPin(d.root.uid, 'pinned', false);
+            await d.engine.reconcileNow();
+            d.calls.uploads.length = 0;
+            return d;
+        };
+        // The helper's post for a file's first writer, opened to replace it, and the first write
+        const replacing = async (d: Awaited<ReturnType<typeof started>>, rel: string) => {
+            d.engine.driveWriting(rel, true);
+            await d.files.writeLocal(rel, 'part 0;');
+            await d.changed(rel);
+        };
+        const closed = { refused: false, replaced: true };
+
+        test('a file being replaced never uploads while it is open: not when it goes quiet, nor after 2 minutes, nor in a pass', async () => {
+            const d = await started();
+            await replacing(d, 'big.bin');
+            await d.copying('big.bin', 10 * 60_000);
+            expect(d.calls.uploads).toEqual([]);
+            // Stalled, its keepalives still coming: still held, however quiet
+            for (let i = 0; i < 3; i++) {
+                await d.advance(30_000);
+                d.engine.driveWriting('big.bin', true);
+            }
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toEqual([]);
+        });
+
+        test('its last close uploads it at once, whole, without waiting for it to settle, and only once', async () => {
+            const d = await started();
+            await replacing(d, 'big.bin');
+            await d.copying('big.bin', 3 * 60_000);
+            appendFileSync(d.local('big.bin'), ' the end.'); // the last write, just before the close
+            await d.changed('big.bin');
+            expect(d.calls.uploads).toEqual([]);
+
+            await d.engine.driveClosed('big.bin', closed);
+            await d.engine.waitForRunningLooks();
+            expect(d.calls.uploads).toEqual(['big.bin']);
+            expect(d.cloudContent('big.bin')).toBe(await readFile(d.local('big.bin'), 'utf8'));
+            expect(d.pendingLooks()).toBe(0);
+            // The same close again (the helper may post it twice), a late watcher report, and a pass: nothing more
+            await d.engine.driveClosed('big.bin', closed);
+            await d.changed('big.bin');
+            await d.engine.reconcileNow();
+            await d.engine.waitForRunningLooks();
+            expect(d.calls.uploads).toEqual(['big.bin']);
+        });
+
+        // cp -p puts the old mtime back once it has written, before it closes: same size and time as the record
+        test('a file being replaced stays held while its size and mtime are as recorded', async () => {
+            const d = await started();
+            const record = stateDb.getItemByPath('Kept.txt')!;
+            d.engine.driveWriting('Kept.txt', true);
+            await d.files.writeLocal('Kept.txt', 'KEPT');
+            const mtime = new Date(record.localMtimeMs);
+            await utimes(d.local('Kept.txt'), mtime, mtime);
+            await d.changed('Kept.txt');
+            await d.engine.reconcileNow();
+            await d.advance(5000);
+            expect(d.calls.uploads).toEqual([]);
+            await d.engine.driveClosed('Kept.txt', closed);
+            await d.engine.waitForRunningLooks();
+            expect(d.calls.uploads).toEqual(['Kept.txt']);
+            expect(d.nodes.get(d.uid('Kept.txt'))?.content).toBe('KEPT');
+        });
+
+        test('the close answers before the upload it starts is done', async () => {
+            const d = await started();
+            await replacing(d, 'a.bin');
+            const sdk = d.sdk as any;
+            const real = sdk.getFileUploader.bind(sdk);
+            let release!: () => void;
+            const held = new Promise<void>((resolve) => (release = resolve));
+            sdk.getFileUploader = async (...args: unknown[]) => {
+                await held;
+                return real(...args);
+            };
+            const answer = await Promise.race([
+                d.engine.driveClosed('a.bin', closed).then(() => 'answered'),
+                Bun.sleep(1000).then(() => 'still waiting'),
+            ]);
+            expect(answer).toBe('answered');
+            expect(d.calls.uploads).toEqual([]);
+            release();
+            await d.engine.waitForRunningLooks();
+            expect(d.calls.uploads).toEqual(['a.bin']);
+        });
+
+        test('a file edited in place keeps the 2-minute rule: quiet spells never let it through, 2 minutes of changes do', async () => {
+            const d = await started();
+            d.engine.driveWriting('db.sqlite', false);
+            await d.files.writeLocal('db.sqlite', 'v0;');
+            await d.changed('db.sqlite');
+            // Quiet for 5 s between writes: unmarked, it would upload 2 s after the first
+            for (let t = 5000; t < 120_000; t += 5000) {
+                await d.advance(5000);
+                expect(d.calls.uploads).toEqual([]);
+                appendFileSync(d.local('db.sqlite'), `v${t};`);
+                await d.changed('db.sqlite');
+            }
+            await d.advance(5000);
+            expect(d.calls.uploads).toEqual(['db.sqlite']);
+            // Its close uploads what was written since, at once
+            appendFileSync(d.local('db.sqlite'), 'last;');
+            await d.changed('db.sqlite');
+            await d.engine.driveClosed('db.sqlite', { refused: false, replaced: false });
+            await d.engine.waitForRunningLooks();
+            expect(d.calls.uploads).toEqual(['db.sqlite', 'db.sqlite']);
+            expect(d.cloudContent('db.sqlite')).toBe(await readFile(d.local('db.sqlite'), 'utf8'));
+        });
+
+        test('a replacing mark not repeated for 90 s is gone (the helper died): the file then settles as any other', async () => {
+            const d = await started();
+            await replacing(d, 'kept.bin');
+            await replacing(d, 'lapsed.bin');
+            await d.advance(60_000);
+            d.engine.driveWriting('kept.bin', true); // its keepalive; lapsed.bin's helper went quiet
+            await d.advance(29_000);
+            expect(d.calls.uploads).toEqual([]); // 89 s: both still held
+            await d.advance(2000); // 91 s
+            expect(d.calls.uploads).toEqual(['lapsed.bin']);
+            // A change to it settles as any other's does
+            appendFileSync(d.local('lapsed.bin'), ' more;');
+            await d.changed('lapsed.bin');
+            expect(d.calls.uploads).toEqual(['lapsed.bin']);
+            await d.advance(2000);
+            expect(d.calls.uploads).toEqual(['lapsed.bin', 'lapsed.bin']);
+            d.engine.driveWriting('kept.bin', true);
+            await d.advance(60_000);
+            expect(d.calls.uploads).toEqual(['lapsed.bin', 'lapsed.bin']);
+        });
+
+        test("after a daemon restart, the helper's next keepalive marks the file again", async () => {
+            const d = await started();
+            await replacing(d, 'big.bin');
+            await d.copying('big.bin', 20_000);
+            await d.restart();
+            d.engine.driveWriting('big.bin', true); // within 30 s of the restart
+            await d.engine.reconcileNow(); // the pass at the start
+            await d.changed('big.bin');
+            await d.copying('big.bin', 5 * 60_000);
+            expect(d.calls.uploads).toEqual([]);
+            await d.engine.driveClosed('big.bin', closed);
+            await d.engine.waitForRunningLooks();
+            expect(d.calls.uploads).toEqual(['big.bin']);
+        });
+
+        test('a rename through the drive moves the mark: held under its new name, it uploads at its close there', async () => {
+            const d = await started();
+            await replacing(d, 'draft.bin');
+            await d.engine.renameItem('draft.bin', 'final.bin');
+            await d.changed('draft.bin');
+            await d.changed('final.bin');
+            await d.copying('final.bin', 3 * 60_000);
+            expect(d.calls.uploads).toEqual([]);
+            await d.engine.driveClosed('final.bin', closed);
+            await d.engine.waitForRunningLooks();
+            expect(d.calls.uploads).toEqual(['final.bin']);
+            expect(d.cloudContent('draft.bin')).toBeUndefined();
+        });
+
+        test("a save renamed over a file takes its mark there, and drops the replaced file's own", async () => {
+            const d = await started();
+            // An editor's save: a temp file written, then renamed over the file, which stays held until the close
+            await replacing(d, '.Kept.txt.save');
+            await d.engine.renameItem('.Kept.txt.save', 'Kept.txt');
+            await d.changed('Kept.txt');
+            await d.copying('Kept.txt', 3 * 60_000);
+            expect(d.calls.uploads).toEqual([]);
+            await d.engine.driveClosed('Kept.txt', closed);
+            await d.engine.waitForRunningLooks();
+            expect(d.calls.uploads).toEqual(['Kept.txt']);
+
+            // An app writing over the file, which a save of another renamed over it meanwhile: what replaced it isn't
+            // being written, and settles as any other
+            await replacing(d, 'Kept.txt');
+            await d.files.writeLocal('other.tmp', 'saved whole');
+            await d.engine.renameItem('other.tmp', 'Kept.txt');
+            await d.changed('Kept.txt');
+            await d.advance(16_000);
+            expect(d.calls.uploads).toEqual(['Kept.txt', 'Kept.txt']);
+            expect(d.nodes.get(d.uid('Kept.txt'))?.content).toBe('saved whole');
+        });
+
+        test('a helper (re)start drops every mark: those files settle as any other', async () => {
+            const d = await started();
+            await replacing(d, 'a.bin');
+            d.engine.driveWriting('b.log', false);
+            await d.files.writeLocal('b.log', 'line 0;');
+            await d.changed('b.log');
+            await d.advance(10_000);
+            expect(d.calls.uploads).toEqual([]);
+
+            d.engine.clearDriveWriting();
+            appendFileSync(d.local('a.bin'), ' more;');
+            appendFileSync(d.local('b.log'), ' line 1;');
+            await d.changed('a.bin');
+            await d.changed('b.log');
+            await d.advance(16_000);
+            expect(d.calls.uploads.sort()).toEqual(['a.bin', 'b.log']);
+        });
+
+        test('a close for a path never marked, gone, or not in My files does nothing harmful', async () => {
+            const d = await started();
+            d.add('Docs/a.txt', 'a');
+            await d.engine.reconcileNow();
+            await d.engine.reconcileNow();
+            expect(d.calls.uploads).toEqual([]);
+
+            // Never marked, and as synced: nothing to upload
+            await d.engine.driveClosed('Kept.txt', { refused: false, replaced: false });
+            await d.engine.waitForRunningLooks();
+            expect(d.calls.uploads).toEqual([]);
+            // Never marked, and new: looked at as any change, settled, so at once
+            await d.files.writeLocal('note.txt', 'new');
+            await d.engine.driveClosed('note.txt', closed);
+            await d.engine.waitForRunningLooks();
+            expect(d.calls.uploads).toEqual(['note.txt']);
+
+            // Gone with the folder holding it: never read as a delete
+            await rm(d.local('Docs'), { recursive: true });
+            await d.engine.driveClosed('Docs/a.txt', closed);
+            await d.engine.driveClosed('Docs/a.txt', { refused: true, replaced: true });
+            // Never anywhere, and paths that aren't in My files
+            for (const rel of ['nowhere.txt', 'No/such/folder.txt', '', '/', '../outside.txt', 'a/../../b', 'nul\0.txt']) {
+                await d.engine.driveClosed(rel, closed);
+                d.engine.driveWriting(rel, true);
+            }
+            await d.engine.waitForRunningLooks();
+            expect(d.calls.uploads).toEqual(['note.txt']);
+            expect(d.calls.trashed).toEqual([]);
+            expect(stateDb.getItemByPath('Docs/a.txt')).not.toBeNull();
+            expect(d.pendingLooks()).toBe(0);
+        });
+
+        // The helper drops a close the daemon answers with a 4xx: the routes answer ok for any well-formed body
+        test('through the control socket, both routes answer ok for any path, and a close uploads', async () => {
+            const d = await started();
+            const socketPath = path.join(tempDir, 'sock', 'control.sock');
+            const server = await startControlServer({ socketPath, engine: d.engine });
+            const post = (route: string, body: unknown) =>
+                fetch(`http://localhost${route}`, { unix: socketPath, method: 'POST', body: JSON.stringify(body) } as RequestInit);
+            try {
+                for (const rel of ['never/seen.txt', '', '../outside.txt', 'nul\0.txt']) {
+                    for (const [route, body] of [
+                        ['/vfs/writing', { path: rel, replacing: true }],
+                        ['/vfs/writing', { path: rel, replacing: false }],
+                        ['/vfs/closed', { path: rel, refused: false, replaced: true }],
+                        ['/vfs/closed', { path: rel, refused: true, replaced: false }],
+                        ['/vfs/closed', { path: rel, refused: true, replaced: false }],
+                    ] as const) {
+                        const res = await post(route, body);
+                        expect({ route, rel, status: res.status, body: await res.json() }).toEqual({
+                            route,
+                            rel,
+                            status: 200,
+                            body: { ok: true },
+                        });
+                    }
+                }
+                expect((await post('/vfs/writing', { path: 'new.bin', replacing: true })).status).toBe(200);
+                await d.files.writeLocal('new.bin', 'whole');
+                await d.changed('new.bin');
+                await d.advance(10_000);
+                expect(d.calls.uploads).toEqual([]);
+                expect((await post('/vfs/closed', { path: 'new.bin', refused: false, replaced: true })).status).toBe(200);
+                await d.engine.waitForRunningLooks();
+                expect(d.calls.uploads).toEqual(['new.bin']);
+            } finally {
+                server.stop();
+            }
+        });
+    });
+
     // Projects is deleted or trashed in the cloud (on the web, or on another device) while this computer holds things
     // in it that exist nowhere else: they must survive, in the desktop Trash or where they are (issue #16)
     describe('cloud-side deletes', () => {

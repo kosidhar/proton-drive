@@ -99,6 +99,9 @@ export interface VfsSupervisorOptions {
     logPath: string; // the helper's stdout and stderr: <appDir>/vfs.log
     logger: Logger;
     mergeStray(fullPath: string): Promise<void>;
+    // Called as each helper starts (a restart after a crash, and Mount again, included): a new helper has no file open
+    // for writing, so the daemon forgets the files the last one said were (#64; see ProtonDriveSyncEngine.driveWriting)
+    onHelperStart?: () => void;
     spawn?: typeof Bun.spawn;
     // Runs a command (fusermount3) and answers its exit code; it warns of a failure itself unless asked to be quiet
     run?: (cmd: string[], opts?: { quiet?: boolean }) => Promise<number>;
@@ -460,6 +463,11 @@ export class VfsSupervisor {
             this.restoreReadOnly();
             this.scheduleRestart();
             return null;
+        }
+        try {
+            this.opts.onHelperStart?.();
+        } catch (err) {
+            this.logger.warn(`Could not forget the files open for writing through the last drive helper: ${messageOf(err)}`);
         }
         const proc = this.proc;
         void proc.exited

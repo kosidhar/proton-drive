@@ -110,6 +110,9 @@ const SETTLE_MAX_QUIET_MS = 16_000;
 const SETTLE_MAX_WAIT_MS = 2 * 60_000;
 // How long a file let through is remembered as it was then (see stillBeingWritten)
 const SETTLED_KEPT_MS = 60_000;
+// A file being replaced through the virtual drive is held as long as the drive helper says it is open (#64; see
+// writingMarks). The helper says it again every 30 s; a mark it hasn't said again for this long is gone (the helper died)
+const DRIVE_MARK_EXPIRES_MS = 90_000;
 // Uid prefix of the remote index entries that stand for folders made here that Proton Drive doesn't have yet, holding
 // what a pending move puts in them (see applyPendingOpsToIndex). Never a node: never resolved, moved or trashed.
 const PROVISIONAL = 'provisional:';
@@ -371,6 +374,11 @@ export class ProtonDriveSyncEngine {
     >();
     // Looks again at settling files that are running now (stop() waits for them)
     private readonly runningLooks = new Set<Promise<void>>();
+    // Files open for writing through the virtual drive, by path, as the drive helper says (#64; driveWriting,
+    // driveClosed): whether the writing replaces the file (a copy over it, a save, a new file: held until its last close)
+    // or edits it in place (a log, a database: the 2-minute rule), and when the helper last said so, by the settle clock
+    // (see stillBeingWritten). In memory only: after a restart, the helper's keepalives mark the files being replaced again.
+    private readonly writingMarks = new Map<string, { replacing: boolean; at: number }>();
     // Cancels the timer that ends a timed pause (see setPaused), while one is set
     private cancelPauseTimer: (() => void) | null = null;
 
@@ -1338,8 +1346,9 @@ export class ProtonDriveSyncEngine {
         // Being hidden: its local changes (edits, new files, deletes) sync as for a visible item, so the hide can
         // finish, but nothing new comes down from the cloud
         const hiding = hiddenBy !== null;
-        // A file still being written is left alone (not uploaded, nor downloaded over) until it stays as it is
-        if (localInfo && !localInfo.isDirectory && changedSinceRecord(localInfo, dbRecord)) {
+        // A file still being written is left alone (not uploaded, nor downloaded over) until it stays as it is; one being
+        // replaced through the drive until it is closed, even as its record says (#64)
+        if (localInfo && !localInfo.isDirectory && (changedSinceRecord(localInfo, dbRecord) || this.beingReplaced(relPath))) {
             const st = await stat(localFullPath).catch(() => null);
             if (st?.isFile() && this.stillBeingWritten(relPath, st)) {
                 return;
@@ -2933,8 +2942,8 @@ export class ProtonDriveSyncEngine {
                 // is the system's, set by every write, so an edit that keeps the size and puts the old mtime back (a
                 // container, cp -p, touch -r) still goes on to be hashed and uploaded
                 return;
-            } else if (changedSinceRecord(st, dbRecord) && this.stillBeingWritten(relPath, st)) {
-                return; // Looked at again once it has stayed as it is
+            } else if ((changedSinceRecord(st, dbRecord) || this.beingReplaced(relPath)) && this.stillBeingWritten(relPath, st)) {
+                return; // Looked at again once it has stayed as it is (one being replaced through the drive, once closed)
             }
 
             if (!st) {
@@ -3062,19 +3071,33 @@ export class ProtonDriveSyncEngine {
     // SETTLE_MAX_WAIT_MS, and then at most that often: it uploads as it is (a change during the upload uploads again),
     // and its path is never kept from syncing for long. A file let through stays so while it is as it was then, so the
     // look after the one that settled it (as handling it goes on) never waits again.
+    // Through the virtual drive, the drive helper says which files are open for writing (#64; see writingMarks). One
+    // being replaced is held until its last writer closes it (driveClosed), however long that takes: no 2-minute
+    // exception, since a copy cut short after that must not have replaced what Proton Drive has. One edited in place
+    // waits as above, except that going quiet doesn't let it through, its close does: until then it uploads only once it
+    // has changed for SETTLE_MAX_WAIT_MS, and then at most that often.
     private stillBeingWritten(relPath: string, st: Stats): boolean {
         const settle = this.options.settle ?? {};
         const baseQuietMs = settle.quietMs ?? SETTLE_QUIET_MS;
+        const now = this.settleNow();
+        const seen = seenAs(st);
+        const mark = this.liveWritingMark(relPath, now);
+        if (mark?.replacing) {
+            // Looked at again meanwhile, so that it settles as any other once the mark is gone (the helper died, or
+            // started again), and starts over then: what it was seen as before the mark is of no use
+            this.forgetSettling(relPath);
+            const cancel = this.scheduleLook(relPath, baseQuietMs > 0 ? baseQuietMs : SETTLE_QUIET_MS);
+            this.settlingFiles.set(relPath, { seen, since: now, quietMs: baseQuietMs, changingSince: now, settled: false, cancel });
+            return true;
+        }
         if (baseQuietMs <= 0) {
             return false;
         }
-        const now = (settle.now ?? Date.now)();
         for (const [rel, entry] of this.settlingFiles) {
             if (entry.settled && now - entry.since > SETTLED_KEPT_MS) {
                 this.settlingFiles.delete(rel); // Long settled: its ctime says so by now
             }
         }
-        const seen = `${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
         const earlier = this.settlingFiles.get(relPath);
         if (earlier?.settled && earlier.seen === seen) {
             if (earlier.forced && (now - earlier.since >= earlier.quietMs || Date.now() - st.ctimeMs >= earlier.quietMs)) {
@@ -3096,31 +3119,61 @@ export class ProtonDriveSyncEngine {
         const maxWaitMs = settle.maxWaitMs ?? SETTLE_MAX_WAIT_MS;
         // ctime is by the system clock: so is Date.now(), whatever clock the looks are timed by
         const quiet = now - since >= quietMs || Date.now() - st.ctimeMs >= quietMs;
-        if (quiet || now - changingSince >= maxWaitMs) {
+        // Open for writing in place through the drive (mark, not replacing): quiet doesn't let it through
+        const inPlace = mark !== undefined;
+        if ((quiet && !inPlace) || now - changingSince >= maxWaitMs) {
             this.settlingFiles.set(relPath, { seen, since: now, quietMs, changingSince: now, settled: true, forced: !quiet, cancel: () => {} });
             return false;
         }
+        const lookAt = inPlace ? changingSince + maxWaitMs : Math.min(since + quietMs, changingSince + maxWaitMs);
+        const cancel = this.scheduleLook(relPath, lookAt - now);
+        this.settlingFiles.set(relPath, { seen, since, quietMs, changingSince, settled: false, cancel });
+        return true;
+    }
+
+    // The clock the waits of files still being written are timed by (see stillBeingWritten; tests move it on)
+    private settleNow(): number {
+        return (this.options.settle?.now ?? Date.now)();
+    }
+
+    // Looks at a local file again after delayMs by the settle clock (see stillBeingWritten); answers what calls it off
+    private scheduleLook(relPath: string, delayMs: number): () => void {
         const schedule =
-            settle.schedule ??
+            this.options.settle?.schedule ??
             ((run: () => Promise<void>, delayMs: number) => {
                 const timer = setTimeout(() => void run(), delayMs);
                 timer.unref?.(); // Never what keeps a one-off run (the CLI's sync) going
                 return () => clearTimeout(timer);
             });
-        const lookAgain = async () => {
-            const look = this.handleLocalFileChange(relPath).catch((error: unknown) => {
-                this.logger.warn(`Could not look at ${relPath} again once written: ${error}`);
-            });
-            this.runningLooks.add(look);
-            try {
-                await look;
-            } finally {
-                this.runningLooks.delete(look);
-            }
-        };
-        const cancel = schedule(lookAgain, Math.min(since + quietMs, changingSince + maxWaitMs) - now);
-        this.settlingFiles.set(relPath, { seen, since, quietMs, changingSince, settled: false, cancel });
-        return true;
+        return schedule(() => this.lookAgain(relPath), delayMs);
+    }
+
+    // Looks at a local file again, once written, counted among the running looks (which waitForRunningLooks and
+    // holdForMove wait for). The promise never rejects.
+    private lookAgain(relPath: string): Promise<void> {
+        const look = this.handleLocalFileChange(relPath).catch((error: unknown) => {
+            this.logger.warn(`Could not look at ${relPath} again once written: ${error}`);
+        });
+        this.runningLooks.add(look);
+        return look.finally(() => {
+            this.runningLooks.delete(look);
+        });
+    }
+
+    // A file's mark as open for writing through the drive (see writingMarks), if it has a live one: a replacing mark the
+    // helper hasn't said again for DRIVE_MARK_EXPIRES_MS is gone
+    private liveWritingMark(relPath: string, now: number): { replacing: boolean; at: number } | undefined {
+        const mark = this.writingMarks.get(relPath);
+        if (mark?.replacing && now - mark.at > DRIVE_MARK_EXPIRES_MS) {
+            this.writingMarks.delete(relPath);
+            return undefined;
+        }
+        return mark;
+    }
+
+    // Whether a file is being replaced through the drive right now: never uploaded while it is (see stillBeingWritten)
+    private beingReplaced(relPath: string): boolean {
+        return this.liveWritingMark(relPath, this.settleNow())?.replacing === true;
     }
 
     // For a one-off sync (the CLI's): waits, up to timeoutMs, for the files still being written to settle and be looked
@@ -3702,6 +3755,56 @@ export class ProtonDriveSyncEngine {
             this.inTime(opts.deadlineMs, rel);
             return this.truncateLocally(rel);
         });
+    }
+
+    // The drive helper says a file is open for writing through the drive (#64): at its first writer, as its writing
+    // turns into a replace (cut to nothing), and every 30 s while it replaces it. A file being replaced isn't uploaded
+    // until its last writer closes it (driveClosed); one edited in place keeps the 2-minute rule (see stillBeingWritten).
+    // Never refused, and never waits: a path that isn't one of My files changes nothing.
+    driveWriting(relPath: string, replacing: boolean): void {
+        const rel = drivePathOrNull(relPath);
+        if (rel) {
+            this.writingMarks.set(rel, { replacing, at: this.settleNow() });
+        }
+    }
+
+    // The drive helper says the last writer of a file closed it (#64): with refused, the drive refused a write to it for
+    // room, so it may be cut short; with replaced, its writing replaced it. Answers once the file is being looked at,
+    // never waiting for its upload. Never refused: a path never marked, gone, or not one of My files is harmless.
+    async driveClosed(relPath: string, opts: { refused: boolean; replaced: boolean }): Promise<void> {
+        const rel = drivePathOrNull(relPath);
+        if (!rel) {
+            return;
+        }
+        this.writingMarks.delete(rel);
+        if (opts.refused) {
+            // A write to it was refused for room, so it may be cut short (#300). For now looked at as any other close;
+            // the hold that keeps such a file from uploading until the user decides replaces this branch
+            await this.lookAtClosed(rel);
+            return;
+        }
+        await this.lookAtClosed(rel);
+    }
+
+    // The drive helper (re)started: no file is open for writing through it any more, and those that were settle as any
+    // other (see stillBeingWritten)
+    clearDriveWriting(): void {
+        this.writingMarks.clear();
+    }
+
+    // A file whose last writer closed it is as written: it is let through as settled (no wait for it to stay as it is),
+    // and looked at now, uploading if it changed. The look runs on after this returns. A file that isn't there isn't
+    // looked at: a close is never what reads as a delete (the watcher's report of it going, and the sync pass, decide).
+    private async lookAtClosed(rel: string): Promise<void> {
+        const st = await stat(path.join(this.localRoot(), rel)).catch(() => null);
+        this.forgetSettling(rel); // its wait, and one that a report began meanwhile
+        if (!st?.isFile()) {
+            return;
+        }
+        const now = this.settleNow();
+        const quietMs = this.options.settle?.quietMs ?? SETTLE_QUIET_MS;
+        this.settlingFiles.set(rel, { seen: seenAs(st), since: now, quietMs, changingSince: now, settled: true, forced: false, cancel: () => {} });
+        void this.lookAgain(rel);
     }
 
     // Drive changes and availability changes made while the files move would touch a half-moved tree
@@ -4635,6 +4738,7 @@ export class ProtonDriveSyncEngine {
                 } else {
                     this.stateDb.moveEditBaselines(fromRel, toRel);
                 }
+                this.moveWritingMarks(fromRel, toRel);
             },
             { from: fromRel, to: keepsTarget ? null : toRel },
         );
@@ -4645,6 +4749,24 @@ export class ProtonDriveSyncEngine {
             localRelPath: toRel,
             details: keepsTarget ? `Replaced on this computer by ${fromRel}` : `Renamed on this computer: ${fromRel} → ${toRel}`,
         });
+    }
+
+    // A drive rename of a file open for writing through the drive, or of a folder holding some (#64): each keeps its mark
+    // under its new path, which its close names. A mark at what it replaced goes: that file is gone, and its writers'
+    // close is never said.
+    private moveWritingMarks(fromRel: string, toRel: string): void {
+        const moved: Array<[string, { replacing: boolean; at: number }]> = [];
+        for (const [rel, mark] of this.writingMarks) {
+            if (isSameOrUnder(rel, toRel)) {
+                this.writingMarks.delete(rel);
+            } else if (isSameOrUnder(rel, fromRel)) {
+                this.writingMarks.delete(rel);
+                moved.push([toRel + rel.slice(fromRel.length), mark]);
+            }
+        }
+        for (const [rel, mark] of moved) {
+            this.writingMarks.set(rel, mark);
+        }
     }
 
     private async deleteLocally(relPath: string, onlyIfEmpty: boolean, trash: boolean): Promise<void> {
@@ -6801,6 +6923,15 @@ function normalizeDrivePath(relPath: string): string {
     return trimmed;
 }
 
+// A drive path of an item of My files, or null for the top or a path that isn't one (see normalizeDrivePath)
+function drivePathOrNull(relPath: string): string | null {
+    try {
+        return normalizeDrivePath(relPath) || null;
+    } catch {
+        return null;
+    }
+}
+
 function isProvisional(uid: string): boolean {
     return uid.startsWith(PROVISIONAL);
 }
@@ -6850,6 +6981,11 @@ const PLACED_CTIME_EPSILON_MS = 0.001;
 // is what it would come to
 function changedSinceRecord(local: { size: number; mtimeMs: number }, record: SyncedItemRecord | null | undefined): boolean {
     return !record || local.size !== record.size || Math.abs(local.mtimeMs - record.localMtimeMs) >= 10;
+}
+
+// What a file still being written was seen as at a look (see stillBeingWritten): its size and times
+function seenAs(st: Stats): string {
+    return `${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
 }
 
 // The node an index entry stands for; none for a provisional one
