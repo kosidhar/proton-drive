@@ -1,6 +1,6 @@
 # Proton Drive for Linux
 
-A fast, native Linux desktop application and two-way background folder synchronization client for **Proton Drive**, built on top of the official **Proton Drive SDK (`@protontech/drive-sdk`)** and a native Rust **`eframe` / `egui`** desktop GUI (modeled on the cross-distro architecture of [`wordcraft`](https://github.com/storytold/wordcraft)).
+A fast, native Linux desktop application and two-way background folder synchronization client for **Proton Drive**, built on top of the official **Proton Drive SDK (`@protontech/drive-sdk`)** and a native Rust **`eframe` / `egui`** desktop GUI.
 
 ---
 
