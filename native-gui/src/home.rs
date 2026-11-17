@@ -1,7 +1,8 @@
 //! Home: the sync's status in plain words, what needs the user, what is moving, and the drive.
 
 use std::process::Command;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, ScrollArea, Stroke, Vec2};
 
@@ -448,6 +449,64 @@ fn tone_color(tone: Tone) -> Color32 {
     }
 }
 
+/// The status card's arrows, while the sync is busy, turn once in this many seconds (#345)
+pub(crate) const TURN_SECONDS: f64 = 1.5;
+/// How often the app draws while the arrows turn: about 30 frames a second, smooth enough for a slow turn
+pub(crate) const TURN_FRAME: Duration = Duration::from_millis(33);
+
+/// Whether the desktop lets apps move things: GNOME's Reduce animation (`enable-animations` false) keeps the arrows
+/// still. Read when the app starts and with each refresh, as the theme is.
+static MOTION_ALLOWED: AtomicBool = AtomicBool::new(true);
+
+/// Reads the desktop's Reduce animation into `MOTION_ALLOWED`.
+pub(crate) fn detect_motion_allowed() {
+    let out = Command::new("gsettings").args(["get", "org.gnome.desktop.interface", "enable-animations"]).output();
+    let answer = out.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    MOTION_ALLOWED.store(motion_allowed_from(answer.as_deref()), Ordering::Relaxed);
+}
+
+/// Whether gsettings' answer for `enable-animations` lets apps move things: only "false" stops them, so a desktop
+/// without the setting moves, as GNOME does by default.
+fn motion_allowed_from(answer: Option<&str>) -> bool {
+    answer.is_none_or(|a| a.trim() != "false")
+}
+
+/// Whether the status card's glyph turns: the sync's arrows, whenever the sync is busy (every state that shows them).
+pub fn status_glyph_turns(summary: &StatusSummary) -> bool {
+    summary.tone == Tone::Busy
+}
+
+/// Whether anything may move: not in a screenshot, which should look the same each time, nor with Reduce animation.
+fn glyph_may_turn() -> bool {
+    #[cfg(test)]
+    if NO_MOTION.with(|s| s.get()) {
+        return false;
+    }
+    MOTION_ALLOWED.load(Ordering::Relaxed) && !screenshot()
+}
+
+/// How far the arrows have turned `time` seconds into the app's run, in radians clockwise, within one turn.
+pub fn turn_angle(time: f64) -> f32 {
+    ((time / TURN_SECONDS).fract() * std::f64::consts::TAU) as f32
+}
+
+/// Where to paint a text that the renderer turns `angle` radians around its top left corner, for the point `centre`
+/// (from that corner) to stay at `min + centre`, where it is when not turned.
+fn turned_pos(min: egui::Pos2, centre: Vec2, angle: f32) -> egui::Pos2 {
+    min + centre - egui::emath::Rot2::from_angle(angle) * centre
+}
+
+/// `decoration`, turned `angle` radians clockwise around the glyph's own middle, in the same place and size, so that
+/// it turns without wobbling.
+fn turning_decoration(ui: &mut egui::Ui, icon: &str, size: f32, color: Color32, angle: f32) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(icon.to_owned(), icons::font(size), color);
+    let (rect, response) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+    // The middle of the glyph's own shape, which needn't be the middle of its line's box
+    let pos = turned_pos(rect.min, galley.mesh_bounds.center().to_vec2(), angle);
+    ui.painter().add(egui::epaint::TextShape::new(pos, galley, color).with_angle(angle));
+    response
+}
+
 /// The status card's glyph, one per state, in the headline's colour.
 pub fn status_icon(summary: &StatusSummary) -> (&'static str, Color32) {
     let glyph = match summary.tone {
@@ -564,6 +623,8 @@ thread_local! {
     pub(crate) static LAUNCHED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
     /// This test's thread renders as a screenshot does (see screenshot)
     pub(crate) static AS_SCREENSHOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// This test's thread renders as with the desktop's Reduce animation on (see glyph_may_turn)
+    pub(crate) static NO_MOTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A secondary (outlined) button, as wide as its label.
@@ -768,7 +829,15 @@ impl ProtonDriveNativeApp {
     fn render_status_headline(&self, ui: &mut egui::Ui, summary: &StatusSummary, show_sign_in: bool) {
         // The headline says it for screen readers: the glyph is only painted
         let (glyph, color) = status_icon(summary);
-        decoration(ui, glyph, 32.0, color);
+        if status_glyph_turns(summary) && glyph_may_turn() {
+            turning_decoration(ui, glyph, 32.0, color, turn_angle(ui.input(|i| i.time)));
+            // The next turn's frame, unless no one can see it
+            if !ui.ctx().input(|i| i.viewport().minimized == Some(true)) {
+                ui.ctx().request_repaint_after(TURN_FRAME);
+            }
+        } else {
+            decoration(ui, glyph, 32.0, color);
+        }
         ui.add_space(4.0);
         ui.with_layout(Layout::top_down(Align::Min), |ui| {
             let headline = RichText::new(&summary.headline).font(crate::bold(18.0)).color(tone_color(summary.tone));
@@ -1687,6 +1756,63 @@ mod tests {
         assert_eq!(icon(&status("idle", vec![], false), true, 2), (icons::WARNING, DANGER_TEXT()));
         assert_eq!(icon(&status("error", vec![], false), true, 0), (icons::WARNING, DANGER_TEXT()));
         assert_eq!(icon(&status("idle", vec![], false), false, 0), (icons::OFFLINE, TEXT_MUTED()));
+    }
+
+    // #345: the arrows turn whenever the sync is busy, and only then
+    #[test]
+    fn the_sync_glyph_turns_only_while_the_sync_is_busy() {
+        let turns = |status: &DaemonStatus, online: bool, connecting: bool, attention: usize| {
+            status_glyph_turns(&status_summary(status, online, connecting, attention, NOW))
+        };
+        let mut moving = status("idle", vec![], false);
+        moving.vfs = Some(vfs("plain", false, Some("moving")));
+        assert!(turns(&status("syncing", vec![], false), true, false, 0), "Checking for changes…");
+        assert!(turns(&status("syncing", vec![transfer("upload", "a")], false), true, false, 0), "Uploading a");
+        assert!(turns(&moving, true, false, 0), "Moving files…");
+        assert!(turns(&status("idle", vec![], false), false, true, 0), "Connecting…");
+        assert!(!turns(&status("idle", vec![], false), true, false, 0), "Up to date");
+        assert!(!turns(&status("idle", vec![], true), true, false, 0), "paused");
+        assert!(!turns(&status("idle", vec![], false), true, false, 2), "problems need you");
+        assert!(!turns(&status("idle", vec![], false), false, false, 0), "can't reach the service");
+    }
+
+    #[test]
+    fn the_sync_glyph_turns_once_a_period_clockwise() {
+        use std::f32::consts::TAU;
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        assert!(close(turn_angle(0.0), 0.0));
+        assert!(close(turn_angle(TURN_SECONDS / 4.0), TAU / 4.0));
+        assert!(close(turn_angle(TURN_SECONDS / 2.0), TAU / 2.0));
+        // A whole turn later it is where it began, however long the app has run
+        assert!(close(turn_angle(TURN_SECONDS * 1001.25), TAU / 4.0));
+        for i in 0..100 {
+            let a = turn_angle(i as f64 * 0.137);
+            assert!((0.0..TAU).contains(&a), "{a} is within one turn");
+        }
+    }
+
+    #[test]
+    fn a_turned_glyph_keeps_its_centre_in_place() {
+        use eframe::egui::{emath::Rot2, pos2, vec2};
+        let min = pos2(100.0, 40.0);
+        let centre = vec2(16.0, 19.0);
+        for angle in [0.0_f32, 0.3, 1.5, 3.1, 5.9] {
+            let pos = turned_pos(min, centre, angle);
+            // The renderer turns the text around `pos`: the glyph's centre lands where it is when not turned
+            let painted = pos + Rot2::from_angle(angle) * centre;
+            assert!((painted - (min + centre)).length() < 1e-3, "at {angle} the centre moved to {painted:?}");
+        }
+        assert_eq!(turned_pos(min, centre, 0.0), min);
+    }
+
+    #[test]
+    fn reduce_animation_in_the_desktop_keeps_the_app_still() {
+        assert!(!motion_allowed_from(Some("false\n")));
+        assert!(motion_allowed_from(Some("true\n")));
+        // No answer, or one it can't read: the desktop's default, which moves
+        assert!(motion_allowed_from(None));
+        assert!(motion_allowed_from(Some("")));
+        assert!(motion_allowed_from(Some("No such key “enable-animations”\n")));
     }
 
     #[test]

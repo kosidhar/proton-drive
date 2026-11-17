@@ -1878,6 +1878,7 @@ impl ProtonDriveNativeApp {
     ) -> Self {
         let sys_light = detect_system_light_mode();
         SYSTEM_LIGHT_MODE.store(sys_light, AtomicOrdering::Relaxed);
+        home::detect_motion_allowed();
         let initial_light = match window_geometry.theme_mode.as_str() {
             "light" => true,
             "dark" => false,
@@ -4475,6 +4476,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
         match cmd {
             WorkerCommand::RefreshAll => {
                 SYSTEM_LIGHT_MODE.store(detect_system_light_mode(), AtomicOrdering::Relaxed);
+                home::detect_motion_allowed();
                 let mut status = fetch_status();
                 if status.is_err() {
                     try_autostart_daemon();
@@ -7358,6 +7360,59 @@ mod tests {
         h.click(sidebar_open(&h));
         home::AS_SCREENSHOT.with(|s| s.set(false));
         assert_eq!(launched(), Vec::<String>::new(), "a screenshot opens nothing");
+    }
+
+    /// How far each of the status card's glyphs (`glyph` at the card's 32 points) the last frame painted is turned.
+    fn status_glyph_angles(h: &Harness, glyph: &str) -> Vec<f32> {
+        h.texts(|t| t.galley.job.text == glyph && t.galley.job.sections.iter().all(|s| s.format.font_id.size == 32.0))
+            .iter()
+            .map(|t| t.angle)
+            .collect()
+    }
+
+    /// How soon the last frame asked to be drawn again.
+    fn repaint_in(h: &Harness) -> Duration {
+        h.last.as_ref().expect("a frame was drawn").viewport_output[&egui::ViewportId::ROOT].repaint_delay
+    }
+
+    // #345: while the sync is busy, Home's arrows turn, and the app draws again soon enough for the turn to look smooth
+    #[test]
+    fn home_turns_the_sync_glyph_while_the_sync_is_busy() {
+        let mut h = home_with(|s| s.state = "syncing".into());
+        assert!(h.text_at("Checking for changes…").is_some());
+        let first = status_glyph_angles(&h, icons::SYNC);
+        assert_eq!(first.len(), 1, "one status glyph");
+        assert!(first[0] > 0.0, "turned by the time the app has run");
+        assert!(repaint_in(&h) <= home::TURN_FRAME, "the next frame comes soon enough to turn it");
+        h.frames(5);
+        let later = status_glyph_angles(&h, icons::SYNC);
+        assert!(later[0] > first[0], "it keeps turning: {first:?} then {later:?}");
+        // Sync now's arrows are a button's, and stay still
+        let buttons = h.texts(|t| t.galley.job.text == icons::SYNC && t.galley.job.sections.iter().all(|s| s.format.font_id.size != 32.0));
+        assert!(!buttons.is_empty() && buttons.iter().all(|t| t.angle == 0.0), "Sync now's glyph doesn't turn");
+
+        // Up to date: a still check mark, and nothing asks for frames sooner than the app's own pace
+        h.app.status.state = "idle".into();
+        h.frames(3);
+        assert!(status_glyph_angles(&h, icons::SYNC).is_empty());
+        assert_eq!(status_glyph_angles(&h, icons::CHECK), vec![0.0]);
+        assert!(repaint_in(&h) > home::TURN_FRAME, "no fast frames while nothing turns");
+    }
+
+    // #345: a screenshot, and a desktop set to Reduce animation, show the arrows still
+    #[test]
+    fn home_keeps_the_sync_glyph_still_in_a_screenshot_and_with_reduce_animation() {
+        home::AS_SCREENSHOT.with(|s| s.set(true));
+        let h = home_with(|s| s.state = "syncing".into());
+        home::AS_SCREENSHOT.with(|s| s.set(false));
+        assert_eq!(status_glyph_angles(&h, icons::SYNC), vec![0.0], "a screenshot");
+        assert!(repaint_in(&h) > home::TURN_FRAME);
+
+        home::NO_MOTION.with(|s| s.set(true));
+        let h = home_with(|s| s.state = "syncing".into());
+        home::NO_MOTION.with(|s| s.set(false));
+        assert_eq!(status_glyph_angles(&h, icons::SYNC), vec![0.0], "Reduce animation");
+        assert!(repaint_in(&h) > home::TURN_FRAME);
     }
 
     #[test]
