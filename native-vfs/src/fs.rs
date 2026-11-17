@@ -566,8 +566,10 @@ impl State {
         drop(sessions);
         for ino in replacing {
             let Some(path) = self.notice_path(ino) else { continue };
-            // Unless its session ended meanwhile, and the daemon heard so
-            if lock(&self.sessions).get(&ino).is_some_and(|session| session.replacing) {
+            // Unless its session ended meanwhile, and the daemon heard so: queued under the lock, so never after the
+            // session's close (a guard in an `if`'s condition would be let go before its body)
+            let sessions = lock(&self.sessions);
+            if sessions.get(&ino).is_some_and(|session| session.replacing) {
                 self.notices.send(Notice::Writing { path, replacing: true });
             }
         }
@@ -2243,7 +2245,8 @@ mod tests {
 
     #[test]
     fn a_blocked_app_is_refused_quietly_and_nothing_else_is() {
-        let err = |errno: i32, message: &str| DaemonError { errno, message: message.into(), stuck: false };
+        let err =
+            |errno: i32, message: &str| DaemonError { errno, message: message.into(), stuck: false, status: None };
         let blocked = blocked_refusal(&err(libc::EACCES, "Blocked: rg")).expect("a blocked app is refused");
         assert_eq!(blocked.errno, Errno::EACCES);
         assert!(blocked.line.is_none());
@@ -2812,6 +2815,24 @@ mod tests {
         release(s, volume);
         assert_eq!(g.sent(), []);
         assert!(nothing_held(s));
+    }
+
+    // Review: a keepalive is queued under the sessions' lock, so it never follows the session's close
+    #[test]
+    fn a_keepalive_after_the_last_close_sends_nothing() {
+        let g = writable("session-keepalive-closed", 100 * GB);
+        let s = &g.drive.state;
+        let (ino, copy, _) = open_as(&g, "new.txt", &created(), Some(true));
+        release(s, copy);
+        s.keepalive_tick();
+        assert_eq!(g.sent(), [writing("new.txt", true), closed("new.txt", false, true)]);
+        // A writer since, in place: not replacing, so not kept alive either
+        let (again, edit, _) = open_as(&g, "new.txt", &read_write(), Some(false));
+        assert_eq!(again, ino);
+        s.keepalive_tick();
+        release(s, edit);
+        s.keepalive_tick();
+        assert_eq!(g.sent(), [writing("new.txt", false), closed("new.txt", false, false)]);
     }
 
     #[test]
