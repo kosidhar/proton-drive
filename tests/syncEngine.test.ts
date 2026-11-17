@@ -45,7 +45,10 @@ import { APICodeError, APIHTTPError } from '@protontech/drive-sdk/internal/apiSe
 import { localFiles } from './helpers/localFiles';
 import { makeMockDrive } from './helpers/mockDrive';
 import { makeMockNode } from './helpers/mockNodes';
-import { uploadAtOnce } from './helpers/engineOptions';
+import { roomyDisk, uploadAtOnce } from './helpers/engineOptions';
+
+// What an engine can be given beyond its SDK, events, auth, database and logger
+type EngineOptions = NonNullable<ConstructorParameters<typeof ProtonDriveSyncEngine>[5]>;
 
 describe('Proton Drive Ubuntu Sync Suite', () => {
     let tempDir: string;
@@ -2670,6 +2673,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const restart = () =>
                 new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
                     ...uploadAtOnce,
+                    ...roomyDisk,
                     backingDir,
                     filesMissingCacheMs: opts.cacheMs ?? 0,
                 });
@@ -3690,6 +3694,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const localRoot = layout === 'virtual' ? backingDir : stateDb.getSettings().syncDir;
             const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
                 ...uploadAtOnce,
+                ...roomyDisk,
                 backingDir,
             });
             return { ...drive, engine, localRoot, files: localFiles(stateDb, () => localRoot), local: (rel: string) => path.join(localRoot, rel) };
@@ -4710,6 +4715,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             // A new engine on the same database and drive is what a restart of the daemon gives
             const make = () =>
                 new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                    ...roomyDisk,
                     backingDir,
                     moveToDesktopTrash: async (fullPath: string) => {
                         if (!opts.trashWorks) {
@@ -8888,7 +8894,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
     });
     describe('the virtual drive', () => {
-        const setup = (mock: { slashFreeUids?: boolean } = {}) => {
+        // engine: options of the engine's own, over these (a disk of its own, a settle clock)
+        const setup = (mock: { slashFreeUids?: boolean } = {}, engine: EngineOptions = {}) => {
             stateDb.setMeta('driveLayout', 'virtual');
             const drive = makeMockDrive(mock);
             const backingDir = path.join(tempDir, 'files');
@@ -8897,11 +8904,13 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const start = () =>
                 new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
                     ...uploadAtOnce,
+                    ...roomyDisk,
                     backingDir,
                     moveToDesktopTrash: async () => false,
                     forgetFailedThumbnail: async (mountFullPath: string) => {
                         forgotten.push(mountFullPath);
                     },
+                    ...engine,
                 });
             return {
                 ...drive,
@@ -9102,6 +9111,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 const d = setup();
                 const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
                     ...uploadAtOnce,
+                    ...roomyDisk,
                     backingDir: path.join(tempDir, 'files'),
                     moveToDesktopTrash: async () => false,
                     askWithActions: (n) => {
@@ -9139,6 +9149,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 let asked = 0;
                 const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
                     ...uploadAtOnce,
+                    ...roomyDisk,
                     backingDir: path.join(tempDir, 'files'),
                     moveToDesktopTrash: async () => false,
                     askWithActions: async () => {
@@ -9525,6 +9536,309 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.engine.stop();
 
                 expect(await d.tempFilesIn('')).toEqual([]);
+            });
+        });
+
+        // #301: an app opening an online-only file has the daemon download it, outside the drive's write path that the
+        // drive's guard covers (#295): the download is refused with ENOSPC when it would leave this computer's disk with
+        // less than the reserve, counting the downloads for opens already running, and that counts as a refusal for the
+        // disk-full notice (#299)
+        describe('an open that would fill the disk (#301)', () => {
+            const T0 = 1_800_000_000_000;
+            const GB = 1_000_000_000;
+            const noRoom = { code: 'ENOSPC', message: "Not enough room on this computer's disk", driveOpError: true };
+            // The store's disk as the engine reads it (its free bytes, or null when it can't be read), how often it was
+            // read, and the settle clock, which the disk-full notice is timed by
+            const roomSetup = (free: number | null) => {
+                let t = T0;
+                const disk = { free, reads: 0 };
+                const d = setup(
+                    {},
+                    {
+                        settle: { quietMs: 0, now: () => t },
+                        diskFree: async () => {
+                            disk.reads += 1;
+                            if (disk.free === null) throw new Error('EIO: statfs failed');
+                            return disk.free;
+                        },
+                    },
+                );
+                return {
+                    ...d,
+                    disk,
+                    advance: (ms: number) => {
+                        t += ms;
+                    },
+                    // A status read once the disk has been read again (by the read before it, if one is due)
+                    readThenPoll: async () => {
+                        d.engine.getStatus();
+                        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+                        return d.engine.getStatus().diskFull;
+                    },
+                };
+            };
+            // A file Proton Drive says is `size` bytes, whatever its content here
+            const claimed = (d: ReturnType<typeof setup>, rel: string, size: number) => {
+                const node = d.add(rel, 'content');
+                d.nodes.set(node.uid, { ...node, activeRevision: { ...node.activeRevision!, claimedSize: size } });
+            };
+            // A file Proton Drive stores as `storageSize` bytes (encrypted) without claiming a size for it, which the
+            // index then has as 0 bytes
+            const unclaimed = (d: ReturnType<typeof setup>, rel: string, storageSize: number) => {
+                const node = d.add(rel, 'content');
+                d.nodes.set(node.uid, { ...node, activeRevision: { ...node.activeRevision!, claimedSize: undefined, storageSize } });
+            };
+            // The engine's lines about opens refused for room, from now on
+            const refusalLines = (d: ReturnType<typeof setup>) => {
+                const lines: string[] = [];
+                Object.assign(d.logger, { info: (line: string) => lines.push(line) });
+                return () => lines.filter((line) => line.startsWith('Not enough room to download'));
+            };
+
+            test('an open that would leave less than the reserve is refused with ENOSPC', async () => {
+                const d = roomSetup(LOCAL_RESERVE_BYTES + 100);
+                d.add('Docs/a.txt', 'x'.repeat(1000));
+                await d.engine.reconcileNow();
+                const notify = spyOn(notifications, 'sendDesktopNotification');
+                try {
+                    expect(await failure(d.engine.hydrate('Docs/a.txt'))).toEqual(noRoom);
+                    // Not a failed download: nothing said of it, nothing came down, and nothing was made for it
+                    expect(notify).not.toHaveBeenCalled();
+                } finally {
+                    notify.mockRestore();
+                }
+                expect(d.calls.downloads).toEqual([]);
+                expect(await d.files.exists('Docs')).toBe(false);
+                expect(await d.tempFilesIn('')).toEqual([]);
+                expect(stateDb.listActivity(50).filter((a) => a.action === 'error')).toEqual([]);
+                expect(d.engine.availability.stateOf('Docs/a.txt')).toBe('online-only');
+                // Home says the disk is almost full, at once
+                expect(d.engine.getStatus().diskFull).toEqual({ refusedAt: T0 });
+            });
+
+            test('an open that fits downloads, down to exactly the reserve left', async () => {
+                const d = roomSetup(LOCAL_RESERVE_BYTES + 1000);
+                d.add('Docs/a.txt', 'x'.repeat(1000));
+                await d.engine.reconcileNow();
+                await d.engine.hydrate('Docs/a.txt');
+                expect(d.calls.downloads).toEqual(['Docs/a.txt']);
+                expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('x'.repeat(1000));
+                expect(d.disk.reads).toBe(1);
+                expect(d.engine.getStatus().diskFull).toBeNull();
+            });
+
+            test('two opens at once count each other', async () => {
+                // Room for one of them above the reserve, not both
+                const d = roomSetup(LOCAL_RESERVE_BYTES + 1000);
+                d.add('Docs/a.txt', 'a'.repeat(600));
+                d.add('Docs/b.txt', 'b'.repeat(600));
+                await d.engine.reconcileNow();
+                const slow = slowDownloads(d);
+                try {
+                    const first = d.engine.hydrate('Docs/a.txt');
+                    await until(() => slow.started() === 1);
+                    // The disk as read doesn't have a's 600 bytes yet: its download counts all the same
+                    expect(await failure(d.engine.hydrate('Docs/b.txt'))).toEqual(noRoom);
+                    slow.release();
+                    await first;
+                } finally {
+                    slow.restore();
+                }
+                expect(d.calls.downloads).toEqual(['Docs/a.txt']);
+                // a's download is over (the disk as read has room for b again): b downloads
+                await d.engine.hydrate('Docs/b.txt');
+                expect(d.calls.downloads).toEqual(['Docs/a.txt', 'Docs/b.txt']);
+            });
+
+            // The download is the first open's: the second doesn't count it against itself
+            test('two opens of the same file at once, with room for one, both open it', async () => {
+                const d = roomSetup(LOCAL_RESERVE_BYTES + 1000);
+                d.add('Docs/a.txt', 'a'.repeat(600));
+                await d.engine.reconcileNow();
+                const slow = slowDownloads(d);
+                try {
+                    const first = d.engine.hydrate('Docs/a.txt');
+                    await until(() => slow.started() === 1);
+                    const second = d.engine.hydrate('Docs/a.txt');
+                    slow.release();
+                    await Promise.all([first, second]);
+                } finally {
+                    slow.restore();
+                }
+                expect(d.calls.downloads).toEqual(['Docs/a.txt']);
+                expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('a'.repeat(600));
+            });
+
+            test("a file whose size Proton Drive doesn't claim is checked by its stored size, once its node is read", async () => {
+                const d = roomSetup(LOCAL_RESERVE_BYTES + 1000);
+                unclaimed(d, 'Docs/big.bin', 5000);
+                unclaimed(d, 'Docs/small.bin', 600);
+                d.add('Docs/c.txt', 'c'.repeat(600));
+                d.add('Docs/all.txt', 'x'.repeat(1000));
+                await d.engine.reconcileNow();
+                expect(d.engine.remoteIndex.getByPath('Docs/big.bin')?.size).toBe(0);
+                expect(await failure(d.engine.hydrate('Docs/big.bin'))).toEqual(noRoom);
+                expect(d.calls.downloads).toEqual([]);
+                expect(d.engine.getStatus().diskFull).toEqual({ refusedAt: T0 });
+                // One that fits counts its stored size while it downloads
+                const slow = slowDownloads(d);
+                try {
+                    const small = d.engine.hydrate('Docs/small.bin');
+                    await until(() => slow.started() === 1);
+                    expect(await failure(d.engine.hydrate('Docs/c.txt'))).toEqual(noRoom);
+                    slow.release();
+                    await small;
+                } finally {
+                    slow.restore();
+                }
+                // Neither counts any more: one that takes all the room downloads
+                await d.engine.hydrate('Docs/all.txt');
+                expect(d.calls.downloads).toEqual(['Docs/small.bin', 'Docs/all.txt']);
+            });
+
+            test('a file grown in the cloud since the index had it is checked by its new size', async () => {
+                const d = roomSetup(LOCAL_RESERVE_BYTES + 1000);
+                d.add('Docs/a.txt', 'a'.repeat(100));
+                d.add('Docs/b.txt', 'b'.repeat(1000));
+                await d.engine.reconcileNow();
+                const node = d.nodes.get(d.uid('Docs/a.txt'))!;
+                d.nodes.set(node.uid, { ...node, activeRevision: { ...node.activeRevision!, claimedSize: 4 * GB } });
+                expect(d.engine.remoteIndex.getByPath('Docs/a.txt')?.size).toBe(100);
+                expect(await failure(d.engine.hydrate('Docs/a.txt'))).toEqual(noRoom);
+                expect(d.calls.downloads).toEqual([]);
+                // Its count went with the refusal: one that takes all the room downloads
+                await d.engine.hydrate('Docs/b.txt');
+                expect(d.calls.downloads).toEqual(['Docs/b.txt']);
+                // Home's notice stays until there is room for the size it was refused at
+                d.advance(2 * 60_000);
+                d.disk.free = LOCAL_RESERVE_BYTES + 4 * GB - 1;
+                expect(await d.readThenPoll()).toEqual({ refusedAt: T0 });
+                d.disk.free = LOCAL_RESERVE_BYTES + 4 * GB;
+                expect(await d.readThenPoll()).toBeNull();
+            });
+
+            // As the drive helper's guard never refuses what doesn't grow a file
+            test('an empty file opens on a disk already under the reserve, with no look at the disk', async () => {
+                const d = roomSetup(LOCAL_RESERVE_BYTES - 1);
+                d.add('Docs/empty.txt', '');
+                await d.engine.reconcileNow();
+                await d.engine.hydrate('Docs/empty.txt');
+                expect(d.calls.downloads).toEqual(['Docs/empty.txt']);
+                expect(await readFile(d.local('Docs/empty.txt'), 'utf8')).toBe('');
+                expect(d.disk.reads).toBe(0);
+                expect(d.engine.getStatus().diskFull).toBeNull();
+            });
+
+            test('a refused open is logged, with what it asked and what the disk had, no more than once every 30 s', async () => {
+                const d = roomSetup(LOCAL_RESERVE_BYTES + 100);
+                const lines = refusalLines(d);
+                d.add('Docs/a.txt', 'a'.repeat(1000));
+                d.add('Docs/b.txt', 'b'.repeat(2000));
+                await d.engine.reconcileNow();
+                const line = (rel: string, asked: number) =>
+                    `Not enough room to download ${rel} for an app to open it: Proton Drive keeps 5 GB free on this computer's disk (${asked} bytes asked, ${LOCAL_RESERVE_BYTES + 100} available)`;
+                expect(await failure(d.engine.hydrate('Docs/a.txt'))).toEqual(noRoom);
+                expect(await failure(d.engine.hydrate('Docs/b.txt'))).toEqual(noRoom);
+                expect(lines()).toEqual([line('Docs/a.txt', 1000)]);
+                d.advance(30_000 - 1);
+                expect(await failure(d.engine.hydrate('Docs/a.txt'))).toEqual(noRoom);
+                expect(lines()).toEqual([line('Docs/a.txt', 1000)]);
+                d.advance(1);
+                expect(await failure(d.engine.hydrate('Docs/b.txt'))).toEqual(noRoom);
+                expect(lines()).toEqual([line('Docs/a.txt', 1000), line('Docs/b.txt', 2000)]);
+            });
+
+            test("a download's room is given back however it ends", async () => {
+                const d = roomSetup(LOCAL_RESERVE_BYTES + 1000);
+                d.add('Docs/a.txt', 'a'.repeat(600));
+                d.add('Docs/b.txt', 'b'.repeat(600));
+                d.add('Docs/c.txt', 'c'.repeat(600));
+                await d.engine.reconcileNow();
+                // Failed before the download (Proton Drive unreachable), and during it
+                d.failNext('getNode');
+                expect(await failure(d.engine.hydrate('Docs/a.txt'))).toMatchObject({ code: 'EIO' });
+                d.failNext('getFileRevisionDownloader');
+                expect(await failure(d.engine.hydrate('Docs/b.txt'))).toMatchObject({ code: 'EIO' });
+                // Refused for room
+                d.disk.free = LOCAL_RESERVE_BYTES + 100;
+                expect(await failure(d.engine.hydrate('Docs/c.txt'))).toEqual(noRoom);
+                // None of them counts any more
+                d.disk.free = LOCAL_RESERVE_BYTES + 600;
+                await d.engine.hydrate('Docs/c.txt');
+                expect(d.calls.downloads).toEqual(['Docs/c.txt']);
+            });
+
+            test('a file already here opens with no look at the disk', async () => {
+                const d = roomSetup(LOCAL_RESERVE_BYTES + GB);
+                d.add('Docs/a.txt', 'hello');
+                await d.engine.reconcileNow();
+                await d.engine.hydrate('Docs/a.txt');
+                const reads = d.disk.reads;
+                d.disk.free = 0;
+                await d.engine.hydrate('Docs/a.txt');
+                expect(d.disk.reads).toBe(reads);
+                expect(d.engine.getStatus().diskFull).toBeNull();
+            });
+
+            test('the refusals before it come first, with no look at the disk', async () => {
+                const d = roomSetup(0);
+                d.add('Private/secret.txt', 's');
+                d.add('Docs/a.txt', 'a');
+                d.add('Docs/folder/f.txt', 'f');
+                await d.engine.reconcileNow();
+                await d.engine.setAvailability('Private', 'hide');
+                stateDb.updateSettings({ blockedApps: ['rg'] });
+                expect(await failure(d.engine.hydrate('Docs/a.txt', { opener: 'rg' }))).toMatchObject({ code: 'EACCES' });
+                expect(await failure(d.engine.hydrate('Private/secret.txt'))).toMatchObject({ code: 'EACCES' });
+                expect(await failure(d.engine.hydrate('Docs/nope.txt'))).toMatchObject({ code: 'ENOENT' });
+                expect(await failure(d.engine.hydrate('Docs/folder'))).toMatchObject({ code: 'EIO' });
+                expect(d.disk.reads).toBe(0);
+                expect(d.engine.getStatus().diskFull).toBeNull();
+            });
+
+            test("a disk that can't be read refuses nothing, and is logged once", async () => {
+                const d = roomSetup(null);
+                for (const name of ['a', 'b', 'c', 'd']) d.add(`Docs/${name}.txt`, name);
+                await d.engine.reconcileNow();
+                await d.engine.hydrate('Docs/a.txt');
+                await d.engine.hydrate('Docs/b.txt');
+                expect(d.calls.downloads).toEqual(['Docs/a.txt', 'Docs/b.txt']);
+                const unread = () => d.warnings.filter((w) => w.startsWith("Couldn't read the free space"));
+                expect(unread()).toHaveLength(1);
+                expect(d.engine.getStatus().diskFull).toBeNull();
+                // Read once more, then not: logged again
+                d.disk.free = LOCAL_RESERVE_BYTES + GB;
+                await d.engine.hydrate('Docs/c.txt');
+                d.disk.free = null;
+                await d.engine.hydrate('Docs/d.txt');
+                expect(d.calls.downloads).toEqual(['Docs/a.txt', 'Docs/b.txt', 'Docs/c.txt', 'Docs/d.txt']);
+                expect(unread()).toHaveLength(2);
+            });
+
+            // A big file refused with more than the reserve and 1 GB free: the notice must still show, and stay until
+            // there is room for it (#299's rule)
+            test('a 4 GB file refused with the reserve and 3.5 GB free shows at once, for 2 minutes at least, and until it fits', async () => {
+                const d = roomSetup(LOCAL_RESERVE_BYTES + 3_500_000_000);
+                claimed(d, 'Videos/film.mkv', 4 * GB);
+                await d.engine.reconcileNow();
+                expect(d.engine.remoteIndex.getByPath('Videos/film.mkv')?.size).toBe(4 * GB);
+                expect(await failure(d.engine.hydrate('Videos/film.mkv'))).toEqual(noRoom);
+                expect(d.calls.downloads).toEqual([]);
+                expect(d.engine.getStatus().diskFull).toEqual({ refusedAt: T0 });
+                // Room for it at once (files deleted): not 2 minutes on yet
+                d.disk.free = LOCAL_RESERVE_BYTES + 4 * GB;
+                expect(await d.readThenPoll()).toEqual({ refusedAt: T0 });
+                d.advance(2 * 60_000 - 1);
+                expect(await d.readThenPoll()).toEqual({ refusedAt: T0 });
+                // 2 minutes on, with the reserve and 1 GB free (and more): not room for it
+                d.disk.free = LOCAL_RESERVE_BYTES + 4 * GB - 1;
+                d.advance(1);
+                expect(await d.readThenPoll()).toEqual({ refusedAt: T0 });
+                d.advance(60_000);
+                expect(await d.readThenPoll()).toEqual({ refusedAt: T0 });
+                // Room for it: the notice goes
+                d.disk.free = LOCAL_RESERVE_BYTES + 4 * GB;
+                expect(await d.readThenPoll()).toBeNull();
             });
         });
 
@@ -14102,6 +14416,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             stateDb.setMeta('driveLayout', 'virtual');
             const d = makeMockDrive();
             const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                ...roomyDisk,
                 backingDir: path.join(tempDir, 'files'),
                 moveToDesktopTrash: async () => false,
                 settle: { quietMs: 0 },

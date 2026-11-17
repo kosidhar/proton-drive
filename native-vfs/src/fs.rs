@@ -289,6 +289,12 @@ fn blocked_refusal(err: &DaemonError) -> Option<Failure> {
     (err.errno == libc::EACCES && err.message.starts_with("Blocked:")).then_some(Failure { errno: Errno::EACCES, line: None })
 }
 
+/// The daemon's refusal of a download that would leave the system disk with less than the reserve (#301): ENOSPC, as
+/// the guard gives a write that would (#295), and no log line, since it isn't an error (Home says the disk is full).
+fn room_refusal(err: &DaemonError) -> Option<Failure> {
+    (err.errno == libc::ENOSPC).then_some(Failure { errno: Errno::ENOSPC, line: None })
+}
+
 impl Failure {
     fn log(&self) {
         if let Some(line) = &self.line {
@@ -739,7 +745,7 @@ impl State {
         let Some(rel_str) = rel.to_str() else { return Err(Failure { errno: Errno::EIO, line: None }) };
         let opener = if tid == 0 { None } else { process_comm(tid) };
         if let Err(err) = self.daemon.hydrate(rel_str, opener.as_deref(), &|| opener_interrupted(tid)) {
-            if let Some(failure) = blocked_refusal(&err) {
+            if let Some(failure) = blocked_refusal(&err).or_else(|| room_refusal(&err)) {
                 return Err(failure);
             }
             if err.errno == libc::EINTR {
@@ -963,8 +969,10 @@ impl State {
         Ok(file.write_all_at(data, offset)?)
     }
 
-    /// A write through a deferred open: the file is put here first (that download isn't the guard's: a separate
-    /// issue), then written as through any open file. Never on a session thread.
+    /// A write through a deferred open: the file is put here first (that download isn't the guard's: the daemon
+    /// refuses one that would leave the disk under the reserve, #301), then written as through any open file. A
+    /// download refused for room is marked in the file's write session, as a write refused for room is. Never on a
+    /// session thread.
     fn write_deferred(
         &self,
         fh: FileHandle,
@@ -975,6 +983,19 @@ impl State {
     ) -> Result<(), Errno> {
         let file = self.noting_refusal(deferred.ino, self.settle(fh, deferred, tid, false))?;
         self.write_at(deferred.ino, &file, offset, data)
+    }
+
+    /// A setattr through a deferred open (ftruncate, fchmod): the file is put here first, made empty when the change
+    /// cuts it to nothing, then changed as through any open file. A download refused for room is marked in the file's
+    /// write session, as for a write (see write_deferred). Never on a session thread.
+    fn settle_to_change(
+        &self,
+        fh: FileHandle,
+        deferred: &Deferred,
+        tid: u32,
+        size: Option<u64>,
+    ) -> Result<Arc<File>, Errno> {
+        self.noting_refusal(deferred.ino, self.settle(fh, deferred, tid, size == Some(0)))
     }
 
     /// Runs `work` on a thread of its own, for a call to the daemon that can take a while: never on a session thread.
@@ -1294,7 +1315,7 @@ impl Filesystem for DriveFs {
             Some((_, Some(Handle::File(file)))) => return s.reply_after_change(ino, Some(&file), &change, reply),
             Some((fh, Some(Handle::Deferred(deferred)))) => {
                 let tid = req.pid();
-                return s.on_worker("download", move |s| match s.settle(fh, &deferred, tid, size == Some(0)) {
+                return s.on_worker("download", move |s| match s.settle_to_change(fh, &deferred, tid, size) {
                     Ok(file) => s.reply_after_change(ino, Some(&file), &change, reply),
                     Err(errno) => reply.error(errno),
                 });
@@ -2364,6 +2385,25 @@ mod tests {
         assert!(blocked_refusal(&err(libc::EIO, "Blocked: rg")).is_none());
     }
 
+    /// A daemon that refuses every download for room, as it does an open that would leave the system disk with less
+    /// than the reserve (#301), and takes anything else.
+    fn refusing_room(name: &str) -> Gated {
+        scripted(name, Some(room_of(100 * GB).0), |line, _| {
+            if line.starts_with("POST /vfs/hydrate") {
+                return (400, r#"{"error":"Not enough room on this computer's disk","code":"ENOSPC"}"#.into());
+            }
+            (200, r#"{"ok":true}"#.into())
+        })
+    }
+
+    #[test]
+    fn a_download_refused_for_room_is_enospc_and_isnt_logged() {
+        let g = refusing_room("hydrate-room");
+        let Err(failure) = g.drive.state.hydrate_unlogged(0, Path::new("big.iso")) else { panic!("downloaded") };
+        assert_eq!(failure.errno, Errno::ENOSPC);
+        assert_eq!(failure.line, None, "it isn't an error");
+    }
+
     /// Notices that record what the drive tells the daemon, in order, and that record.
     fn recording() -> (Arc<Notices>, Arc<Mutex<Vec<Notice>>>) {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -2884,6 +2924,25 @@ mod tests {
             release(s, fh);
             assert_eq!(g.sent(), [writing("a.txt", false), closed("a.txt", true, false)], "{through_file}");
         }
+    }
+
+    #[test]
+    fn a_deferred_open_whose_download_is_refused_for_room_marks_the_close_refused() {
+        // One rule for a refusal for room, the daemon's of the download too (#301): at a write through the open, or at
+        // a size set through it (ftruncate). It holds nothing: the file isn't here
+        let g = refusing_room("session-deferred-room");
+        let s = &g.drive.state;
+        let deferred = g.deferred("b.txt");
+        let fh = s.add_open(deferred.ino, Handle::Deferred(deferred.clone()), Some(false));
+        assert_eq!(s.write_deferred(fh, &deferred, 0, 0, b"x"), Err(Errno::ENOSPC));
+        release(s, fh);
+        assert_eq!(g.sent(), [writing("b.txt", false), closed("b.txt", true, false)]);
+        let deferred = g.deferred("c.txt");
+        let fh = s.add_open(deferred.ino, Handle::Deferred(deferred.clone()), Some(false));
+        assert_eq!(s.settle_to_change(fh, &deferred, 0, Some(10)).err(), Some(Errno::ENOSPC));
+        release(s, fh);
+        assert_eq!(g.sent(), [writing("c.txt", false), closed("c.txt", true, false)]);
+        assert!(!g.root.join("backing/b.txt").exists() && !g.root.join("backing/c.txt").exists());
     }
 
     #[test]
