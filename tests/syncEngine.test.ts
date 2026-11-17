@@ -4209,7 +4209,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.calls.uploads).toEqual([]);
         });
 
-        test('its last close uploads it at once, whole, without waiting for it to settle, and only once', async () => {
+        // Not at once: an editor's temp file, renamed away right after its close, must be gone by the look (see below)
+        test('its last close uploads it once it has stayed so for the settle wait: whole, and only once', async () => {
             const d = await started();
             await replacing(d, 'big.bin');
             await d.copying('big.bin', 3 * 60_000);
@@ -4217,8 +4218,18 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await d.changed('big.bin');
             expect(d.calls.uploads).toEqual([]);
 
+            // The looks at it from now on (a file written long before its close is quiet by its ctime at any look: only
+            // the look's own wait keeps an editor's temp file from uploading before its rename)
+            const looked: string[] = [];
+            const look = (d.engine as any).handleLocalFileChange.bind(d.engine);
+            (d.engine as any).handleLocalFileChange = (rel: string) => (looked.push(rel), look(rel));
             await d.engine.driveClosed('big.bin', closed);
             await d.engine.waitForRunningLooks();
+            await d.advance(1500); // (the settle clock runs on with the real one: a margin)
+            expect(looked).toEqual([]);
+            expect(d.calls.uploads).toEqual([]);
+            await d.advance(500);
+            expect(looked).toEqual(['big.bin']);
             expect(d.calls.uploads).toEqual(['big.bin']);
             expect(d.cloudContent('big.bin')).toBe(await readFile(d.local('big.bin'), 'utf8'));
             expect(d.pendingLooks()).toBe(0);
@@ -4226,8 +4237,29 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await d.engine.driveClosed('big.bin', closed);
             await d.changed('big.bin');
             await d.engine.reconcileNow();
-            await d.engine.waitForRunningLooks();
+            await d.advance(2000);
             expect(d.calls.uploads).toEqual(['big.bin']);
+            expect(d.pendingLooks()).toBe(0);
+        });
+
+        // An editor's save through a temp file (gedit's, through GIO): the temp file is written and closed, then renamed
+        // over the file, a moment later
+        test('a temp file renamed over the file right after its close never uploads: only the file does, once', async () => {
+            const d = await started();
+            await replacing(d, '.goutputstream-ABC123');
+            await d.engine.driveClosed('.goutputstream-ABC123', closed);
+            await d.engine.waitForRunningLooks(); // whatever the close started has run when the rename comes
+            await d.engine.renameItem('.goutputstream-ABC123', 'Kept.txt');
+            await d.changed('.goutputstream-ABC123');
+            await d.changed('Kept.txt');
+            await d.advance(5000);
+            await d.engine.reconcileNow();
+            await d.engine.replayRemoteOps();
+            expect(d.calls.uploads).toEqual(['Kept.txt']);
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.nodes.get(d.uid('Kept.txt'))?.content).toBe('part 0;');
+            expect(d.cloudContent('.goutputstream-ABC123')).toBeUndefined();
+            expect(d.pendingLooks()).toBe(0);
         });
 
         // cp -p puts the old mtime back once it has written, before it closes: same size and time as the record
@@ -4243,12 +4275,12 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await d.advance(5000);
             expect(d.calls.uploads).toEqual([]);
             await d.engine.driveClosed('Kept.txt', closed);
-            await d.engine.waitForRunningLooks();
+            await d.advance(2000);
             expect(d.calls.uploads).toEqual(['Kept.txt']);
             expect(d.nodes.get(d.uid('Kept.txt'))?.content).toBe('KEPT');
         });
 
-        test('the close answers before the upload it starts is done', async () => {
+        test('the close answers at once, never waiting for the look or the upload it leads to', async () => {
             const d = await started();
             await replacing(d, 'a.bin');
             const sdk = d.sdk as any;
@@ -4264,9 +4296,11 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 Bun.sleep(1000).then(() => 'still waiting'),
             ]);
             expect(answer).toBe('answered');
-            expect(d.calls.uploads).toEqual([]);
+            const looking = d.advance(2000);
+            await Bun.sleep(20);
+            expect(d.calls.uploads).toEqual([]); // its upload, waiting
             release();
-            await d.engine.waitForRunningLooks();
+            await looking;
             expect(d.calls.uploads).toEqual(['a.bin']);
         });
 
@@ -4284,11 +4318,11 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             }
             await d.advance(5000);
             expect(d.calls.uploads).toEqual(['db.sqlite']);
-            // Its close uploads what was written since, at once
+            // Once closed, what was written since uploads after the settle wait, not 2 minutes after
             appendFileSync(d.local('db.sqlite'), 'last;');
             await d.changed('db.sqlite');
             await d.engine.driveClosed('db.sqlite', { refused: false, replaced: false });
-            await d.engine.waitForRunningLooks();
+            await d.advance(2000);
             expect(d.calls.uploads).toEqual(['db.sqlite', 'db.sqlite']);
             expect(d.cloudContent('db.sqlite')).toBe(await readFile(d.local('db.sqlite'), 'utf8'));
         });
@@ -4325,7 +4359,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await d.copying('big.bin', 5 * 60_000);
             expect(d.calls.uploads).toEqual([]);
             await d.engine.driveClosed('big.bin', closed);
-            await d.engine.waitForRunningLooks();
+            await d.advance(2000);
             expect(d.calls.uploads).toEqual(['big.bin']);
         });
 
@@ -4338,7 +4372,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await d.copying('final.bin', 3 * 60_000);
             expect(d.calls.uploads).toEqual([]);
             await d.engine.driveClosed('final.bin', closed);
-            await d.engine.waitForRunningLooks();
+            await d.advance(2000);
             expect(d.calls.uploads).toEqual(['final.bin']);
             expect(d.cloudContent('draft.bin')).toBeUndefined();
         });
@@ -4352,7 +4386,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await d.copying('Kept.txt', 3 * 60_000);
             expect(d.calls.uploads).toEqual([]);
             await d.engine.driveClosed('Kept.txt', closed);
-            await d.engine.waitForRunningLooks();
+            await d.advance(2000);
             expect(d.calls.uploads).toEqual(['Kept.txt']);
 
             // An app writing over the file, which a save of another renamed over it meanwhile: what replaced it isn't
@@ -4393,15 +4427,17 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
             // Never marked, and as synced: nothing to upload
             await d.engine.driveClosed('Kept.txt', { refused: false, replaced: false });
-            await d.engine.waitForRunningLooks();
+            await d.advance(2000);
             expect(d.calls.uploads).toEqual([]);
-            // Never marked, and new: looked at as any change, settled, so at once
+            // Never marked, and new: looked at as any change, once settled
             await d.files.writeLocal('note.txt', 'new');
             await d.engine.driveClosed('note.txt', closed);
-            await d.engine.waitForRunningLooks();
+            expect(d.calls.uploads).toEqual([]);
+            await d.advance(2000);
             expect(d.calls.uploads).toEqual(['note.txt']);
+            expect(d.pendingLooks()).toBe(0);
 
-            // Gone with the folder holding it: never read as a delete
+            // Gone with the folder holding it: never read as a delete, and not even looked at
             await rm(d.local('Docs'), { recursive: true });
             await d.engine.driveClosed('Docs/a.txt', closed);
             await d.engine.driveClosed('Docs/a.txt', { refused: true, replaced: true });
@@ -4410,11 +4446,26 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.engine.driveClosed(rel, closed);
                 d.engine.driveWriting(rel, true);
             }
+            expect(d.pendingLooks()).toBe(0);
             await d.engine.waitForRunningLooks();
+            await d.advance(5000);
             expect(d.calls.uploads).toEqual(['note.txt']);
             expect(d.calls.trashed).toEqual([]);
             expect(stateDb.getItemByPath('Docs/a.txt')).not.toBeNull();
-            expect(d.pendingLooks()).toBe(0);
+        });
+
+        // An app opening a file read-write and writing nothing: its close leaves nothing that counts later
+        test('a close of a file as it is recorded leaves nothing behind: a later change still waits to settle', async () => {
+            const d = await started();
+            await d.engine.driveClosed('Kept.txt', { refused: false, replaced: false });
+            await d.advance(2000);
+            await d.advance(3 * 60_000);
+            // Written outside a session the drive told of (a notice lost), and to another size than recorded
+            await d.files.writeLocal('Kept.txt', 'half written');
+            await d.changed('Kept.txt');
+            expect(d.calls.uploads).toEqual([]); // not let through as changing for 2 minutes since the close
+            await d.advance(2000);
+            expect(d.calls.uploads).toEqual(['Kept.txt']);
         });
 
         // The helper drops a close the daemon answers with a 4xx: the routes answer ok for any well-formed body
@@ -4448,7 +4499,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.advance(10_000);
                 expect(d.calls.uploads).toEqual([]);
                 expect((await post('/vfs/closed', { path: 'new.bin', refused: false, replaced: true })).status).toBe(200);
-                await d.engine.waitForRunningLooks();
+                expect(d.calls.uploads).toEqual([]);
+                await d.advance(2000);
                 expect(d.calls.uploads).toEqual(['new.bin']);
             } finally {
                 server.stop();

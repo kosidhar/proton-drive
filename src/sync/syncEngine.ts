@@ -3074,8 +3074,8 @@ export class ProtonDriveSyncEngine {
     // Through the virtual drive, the drive helper says which files are open for writing (#64; see writingMarks). One
     // being replaced is held until its last writer closes it (driveClosed), however long that takes: no 2-minute
     // exception, since a copy cut short after that must not have replaced what Proton Drive has. One edited in place
-    // waits as above, except that going quiet doesn't let it through, its close does: until then it uploads only once it
-    // has changed for SETTLE_MAX_WAIT_MS, and then at most that often.
+    // waits as above, except that going quiet doesn't let it through: until it is closed it uploads only once it has
+    // changed for SETTLE_MAX_WAIT_MS, and then at most that often. Once closed, either settles as any other file.
     private stillBeingWritten(relPath: string, st: Stats): boolean {
         const settle = this.options.settle ?? {};
         const baseQuietMs = settle.quietMs ?? SETTLE_QUIET_MS;
@@ -3138,6 +3138,11 @@ export class ProtonDriveSyncEngine {
 
     // Looks at a local file again after delayMs by the settle clock (see stillBeingWritten); answers what calls it off
     private scheduleLook(relPath: string, delayMs: number): () => void {
+        return this.scheduleSettling(() => this.lookAgain(relPath), delayMs);
+    }
+
+    // Runs a look at a settling file after delayMs by the settle clock; answers what calls it off
+    private scheduleSettling(run: () => Promise<void>, delayMs: number): () => void {
         const schedule =
             this.options.settle?.schedule ??
             ((run: () => Promise<void>, delayMs: number) => {
@@ -3145,7 +3150,7 @@ export class ProtonDriveSyncEngine {
                 timer.unref?.(); // Never what keeps a one-off run (the CLI's sync) going
                 return () => clearTimeout(timer);
             });
-        return schedule(() => this.lookAgain(relPath), delayMs);
+        return schedule(run, delayMs);
     }
 
     // Looks at a local file again, once written, counted among the running looks (which waitForRunningLooks and
@@ -3769,8 +3774,9 @@ export class ProtonDriveSyncEngine {
     }
 
     // The drive helper says the last writer of a file closed it (#64): with refused, the drive refused a write to it for
-    // room, so it may be cut short; with replaced, its writing replaced it. Answers once the file is being looked at,
-    // never waiting for its upload. Never refused: a path never marked, gone, or not one of My files is harmless.
+    // room, so it may be cut short; with replaced, its writing replaced it. Its session is over: it settles as any other
+    // file (see settleClosed). Answers at once, never waiting for a look or an upload. Never refused: a path never
+    // marked, gone, or not one of My files is harmless.
     async driveClosed(relPath: string, opts: { refused: boolean; replaced: boolean }): Promise<void> {
         const rel = drivePathOrNull(relPath);
         if (!rel) {
@@ -3778,12 +3784,12 @@ export class ProtonDriveSyncEngine {
         }
         this.writingMarks.delete(rel);
         if (opts.refused) {
-            // A write to it was refused for room, so it may be cut short (#300). For now looked at as any other close;
+            // A write to it was refused for room, so it may be cut short (#300). For now it settles as any other close;
             // the hold that keeps such a file from uploading until the user decides replaces this branch
-            await this.lookAtClosed(rel);
+            await this.settleClosed(rel);
             return;
         }
-        await this.lookAtClosed(rel);
+        await this.settleClosed(rel);
     }
 
     // The drive helper (re)started: no file is open for writing through it any more, and those that were settle as any
@@ -3792,10 +3798,12 @@ export class ProtonDriveSyncEngine {
         this.writingMarks.clear();
     }
 
-    // A file whose last writer closed it is as written: it is let through as settled (no wait for it to stay as it is),
-    // and looked at now, uploading if it changed. The look runs on after this returns. A file that isn't there isn't
-    // looked at: a close is never what reads as a delete (the watcher's report of it going, and the sync pass, decide).
-    private async lookAtClosed(rel: string): Promise<void> {
+    // A file whose last writer closed it settles as any other (see stillBeingWritten), from what it is at the close: it
+    // is looked at once it should have settled (SETTLE_QUIET_MS), and uploads then if it has stayed so and changed. Not
+    // at once: an editor saving through a temp file renames it over the file right after closing it, and the temp file,
+    // gone by that look, never uploads (only the file does, once). A file that isn't there isn't looked at: a close is
+    // never what reads as a delete (the watcher's report of it going, and the sync pass, decide).
+    private async settleClosed(rel: string): Promise<void> {
         const st = await stat(path.join(this.localRoot(), rel)).catch(() => null);
         this.forgetSettling(rel); // its wait, and one that a report began meanwhile
         if (!st?.isFile()) {
@@ -3803,8 +3811,16 @@ export class ProtonDriveSyncEngine {
         }
         const now = this.settleNow();
         const quietMs = this.options.settle?.quietMs ?? SETTLE_QUIET_MS;
-        this.settlingFiles.set(rel, { seen: seenAs(st), since: now, quietMs, changingSince: now, settled: true, forced: false, cancel: () => {} });
-        void this.lookAgain(rel);
+        const entry = { seen: seenAs(st), since: now, quietMs, changingSince: now, settled: false, cancel: () => {} };
+        entry.cancel = this.scheduleSettling(async () => {
+            await this.lookAgain(rel);
+            // A look that never weighed it (the file as recorded, or gone) leaves nothing settling: kept, it would count
+            // as changing since the close at a later change, and let that through as having changed for 2 minutes
+            if (this.settlingFiles.get(rel) === entry) {
+                this.settlingFiles.delete(rel);
+            }
+        }, Math.max(quietMs, 0));
+        this.settlingFiles.set(rel, entry);
     }
 
     // Drive changes and availability changes made while the files move would touch a half-moved tree
