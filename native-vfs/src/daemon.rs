@@ -1,7 +1,8 @@
 // The daemon's drive routes, over HTTP/1.1 on its user-only control socket (the same client shape as the GUI's
 // control_request): GET /vfs/children for listings, POST /vfs/hydrate to download a file an app opened, POST
 // /vfs/truncate to make an online-only file an empty local one, and POST /vfs/rename and /vfs/delete for renames and
-// deletes through the drive, which the daemon carries out whole.
+// deletes through the drive, which the daemon carries out whole. POST /vfs/writing and /vfs/closed tell it of files
+// open for writing through the drive (see notices.rs).
 
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -32,6 +33,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often a waiting request asks whether to give up (a hydrate: whether its opener did).
 const INTERRUPT_CHECK: Duration = Duration::from_millis(500);
+/// A notice of the drive's writes (see notices.rs) is a small post the daemon answers at once: one it hasn't answered
+/// in this long counts as failed.
+pub const NOTICE_TIMEOUT: Duration = Duration::from_secs(5);
 /// After a listing finds the daemon stuck, listings go without it this long.
 const LISTING_BACKOFF: Duration = Duration::from_secs(5);
 /// Listing problems go to stderr at most this often.
@@ -61,15 +65,17 @@ pub struct DaemonError {
     pub message: String,
     /// The daemon is there but didn't take or answer the request in time, as opposed to gone or refusing
     pub stuck: bool,
+    /// The HTTP status the daemon answered with; None when it didn't answer (gone, stuck, or no readable reply)
+    pub status: Option<u16>,
 }
 
 impl DaemonError {
     fn eio(message: impl Into<String>) -> Self {
-        DaemonError { errno: libc::EIO, message: message.into(), stuck: false }
+        DaemonError { errno: libc::EIO, message: message.into(), stuck: false, status: None }
     }
 
     fn stuck(message: impl Into<String>) -> Self {
-        DaemonError { errno: libc::EIO, message: message.into(), stuck: true }
+        DaemonError { errno: libc::EIO, message: message.into(), stuck: true, status: None }
     }
 }
 
@@ -92,6 +98,12 @@ impl DaemonClient {
             listing_backoff_until: Mutex::new(None),
             last_logged: Mutex::new(None),
         }
+    }
+
+    /// A client of its own on the same socket, with none of this one's listing backoff: for a thread that posts
+    /// alongside the drive's requests (see notices.rs).
+    pub fn on_same_socket(&self) -> DaemonClient {
+        DaemonClient::new(self.socket.clone())
     }
 
     #[cfg(test)]
@@ -173,6 +185,17 @@ impl DaemonClient {
         self.change("/vfs/truncate", serde_json::json!({ "path": rel }))
     }
 
+    /// Tells the daemon what apps do through the drive (see notices.rs): a post with no deadline, since it changes
+    /// nothing the app waits on, and it fails once NOTICE_TIMEOUT passes. Any 2xx is taken, whatever its body says:
+    /// the daemon has heard it.
+    pub fn notify(&self, route: &str, body: serde_json::Value) -> Result<(), DaemonError> {
+        let raw = self.exchange("POST", route, Some(&body), NOTICE_TIMEOUT, &|| false)?;
+        match parse_answer(&raw)? {
+            (status, _) if (200..300).contains(&status) => Ok(()),
+            (status, json) => Err(refusal_of(status, json)),
+        }
+    }
+
     /// The account's storage, or None when the daemon doesn't know it (signed out, or not asked yet).
     pub fn space(&self) -> Result<Option<Space>, DaemonError> {
         parse_space(self.request("GET", "/vfs/space", None, SPACE_TIMEOUT, &|| false)?)
@@ -186,6 +209,18 @@ impl DaemonClient {
         timeout: Duration,
         interrupted: &dyn Fn() -> bool,
     ) -> Result<serde_json::Value, DaemonError> {
+        parse_reply(&self.exchange(method, target, body, timeout, interrupted)?)
+    }
+
+    /// One request, and the daemon's whole answer as it came.
+    fn exchange(
+        &self,
+        method: &str,
+        target: &str,
+        body: Option<&serde_json::Value>,
+        timeout: Duration,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>, DaemonError> {
         let deadline = Instant::now() + timeout;
         let unreachable = |e: std::io::Error| DaemonError::eio(format!("can't reach the daemon ({e})"));
         let mut stream = match connect_within(&self.socket, CONNECT_TIMEOUT.min(timeout)) {
@@ -226,7 +261,7 @@ impl DaemonClient {
                 Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
                     if interrupted() {
                         let message = "the opener stopped waiting".to_string();
-                        return Err(DaemonError { errno: libc::EINTR, message, stuck: false });
+                        return Err(DaemonError { errno: libc::EINTR, message, stuck: false, status: None });
                     }
                     continue;
                 }
@@ -242,7 +277,7 @@ impl DaemonClient {
         if raw.is_empty() {
             return Err(DaemonError::eio("the daemon closed the connection without answering"));
         }
-        parse_reply(&raw)
+        Ok(raw)
     }
 }
 
@@ -377,6 +412,15 @@ fn content_length(head: &str) -> Option<usize> {
 }
 
 fn parse_reply(raw: &[u8]) -> Result<serde_json::Value, DaemonError> {
+    let (status, json) = parse_answer(raw)?;
+    if (200..300).contains(&status) {
+        return json.ok_or_else(|| DaemonError::eio("unreadable reply from the daemon"));
+    }
+    Err(refusal_of(status, json))
+}
+
+/// An answer's status, and its body when that is JSON.
+fn parse_answer(raw: &[u8]) -> Result<(u16, Option<serde_json::Value>), DaemonError> {
     const MALFORMED: &str = "malformed reply from the daemon";
     let split = find_head_end(raw).ok_or_else(|| DaemonError::eio(MALFORMED))?;
     let head = String::from_utf8_lossy(&raw[..split]);
@@ -390,16 +434,18 @@ fn parse_reply(raw: &[u8]) -> Result<serde_json::Value, DaemonError> {
     if let Some(len) = content_length(&head).filter(|len| *len <= body.len()) {
         body = &body[..len];
     }
-    let json: Option<serde_json::Value> = serde_json::from_slice(body).ok();
-    if (200..300).contains(&status) {
-        return json.ok_or_else(|| DaemonError::eio("unreadable reply from the daemon"));
-    }
+    Ok((status, serde_json::from_slice(body).ok()))
+}
+
+/// The daemon's answer `status` (not a 2xx), with its JSON body `{error, code}` when it has one.
+fn refusal_of(status: u16, json: Option<serde_json::Value>) -> DaemonError {
     let field = |name: &str| json.as_ref().and_then(|j| j.get(name)).and_then(|v| v.as_str());
-    Err(DaemonError {
+    DaemonError {
         errno: errno_of_code(field("code")),
         message: field("error").map(String::from).unwrap_or_else(|| format!("the daemon answered {status}")),
         stuck: false,
-    })
+        status: Some(status),
+    }
 }
 
 #[cfg(test)]
@@ -502,7 +548,8 @@ mod tests {
         let ok = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}trailing";
         assert_eq!(parse_reply(ok).unwrap(), serde_json::json!({ "ok": true }));
         let refused = b"HTTP/1.1 400 Bad Request\r\n\r\n{\"error\":\"Hidden: a\",\"code\":\"EACCES\"}";
-        let hidden = DaemonError { errno: libc::EACCES, message: "Hidden: a".into(), stuck: false };
+        let message = "Hidden: a".into();
+        let hidden = DaemonError { errno: libc::EACCES, message, stuck: false, status: Some(400) };
         assert_eq!(parse_reply(refused).unwrap_err(), hidden);
         assert_eq!(parse_reply(b"HTTP/1.1 500 Oops\r\n\r\nnot json").unwrap_err().errno, libc::EIO);
         assert_eq!(parse_reply(b"HTTP/1.1 200 OK\r\n\r\nnot json").unwrap_err().errno, libc::EIO);
@@ -548,7 +595,8 @@ mod tests {
         let started = Instant::now();
         let reply = client.request("GET", "/vfs/children?path=", None, Duration::from_millis(300), &|| false);
         let _ = std::fs::remove_file(&client.socket);
-        assert_eq!(reply.unwrap_err().errno, libc::EIO);
+        let err = reply.unwrap_err();
+        assert_eq!((err.errno, err.stuck, err.status), (libc::EIO, true, None), "stuck: no answer");
         assert!(started.elapsed() >= Duration::from_millis(300) && started.elapsed() < Duration::from_secs(2));
         drop(tx);
     }
@@ -634,6 +682,78 @@ mod tests {
                 serde_json::json!({ "path": "Docs/a.txt" }),
             ]
         );
+    }
+
+    #[test]
+    fn a_notice_is_posted_as_it_is_with_no_deadline() {
+        let (client, bodies) = serve_recording("notice", "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}");
+        // On a client of its own, as the drive's sender has: none of the listings' backoff
+        let sender = client.on_same_socket();
+        assert_eq!(sender.socket, client.socket);
+        let body = serde_json::json!({ "path": "Docs/a b.txt", "refused": true, "replaced": false });
+        assert_eq!(sender.notify("/vfs/closed", body.clone()), Ok(()));
+        let _ = std::fs::remove_file(&client.socket);
+        assert_eq!(bodies.try_iter().collect::<Vec<_>>(), [body]);
+        assert_eq!(NOTICE_TIMEOUT, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_notice_the_daemon_took_succeeds_whatever_its_answer_says() {
+        let answers = [
+            ("notice-204", "HTTP/1.1 204 No Content\r\n\r\n"),
+            ("notice-empty", "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
+            ("notice-text", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"),
+        ];
+        for (name, reply) in answers {
+            let (client, _) = serve_recording(name, reply);
+            let body = serde_json::json!({ "path": "a", "refused": true, "replaced": false });
+            let sent = client.notify("/vfs/closed", body);
+            let _ = std::fs::remove_file(&client.socket);
+            assert_eq!(sent, Ok(()), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_notice_that_fails_says_whether_the_daemon_answered() {
+        // A daemon from before the route (404), one that refuses the body (400), or one failing on its side (500)
+        for (status, body) in [(404, r#"{"error":"Not found"}"#), (400, r#"{"error":"Bad path"}"#), (500, "")] {
+            let reply: &'static str =
+                format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{body}", body.len()).leak();
+            let (client, _) = serve_recording(&format!("notice-{status}"), reply);
+            let failed = client.notify("/vfs/writing", serde_json::json!({ "path": "a", "replacing": true }));
+            let _ = std::fs::remove_file(&client.socket);
+            assert_eq!(failed.map_err(|e| e.status), Err(Some(status)));
+        }
+        // No daemon there: no answer
+        let gone = DaemonClient::new(std::env::temp_dir().join("protondrive-vfs-no-such.sock"));
+        let failed = gone.notify("/vfs/writing", serde_json::json!({ "path": "a", "replacing": true }));
+        assert_eq!(failed.map_err(|e| e.status), Err(None));
+    }
+
+    #[test]
+    fn a_refused_close_the_daemon_took_is_sent_once() {
+        use crate::notices::{Notice, Notices};
+        let answers = [
+            ("notice-once-204", "HTTP/1.1 204 No Content\r\n\r\n"),
+            ("notice-once-empty", "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
+        ];
+        for (name, reply) in answers {
+            let (client, bodies) = serve_recording(name, reply);
+            let sender = client.on_same_socket();
+            let retry = Duration::from_millis(10);
+            let notices = Notices::start_retrying_every(retry, move |n| sender.notify(n.route(), n.body()));
+            let close = Notice::Closed { path: "cut.bin".into(), refused: true, replaced: false };
+            let next = Notice::Writing { path: "next".into(), replacing: false };
+            notices.send(close.clone());
+            notices.send(next.clone());
+            let got: Vec<serde_json::Value> =
+                (0..2).filter_map(|_| bodies.recv_timeout(Duration::from_secs(5)).ok()).collect();
+            let again = bodies.recv_timeout(Duration::from_millis(200));
+            drop(notices);
+            let _ = std::fs::remove_file(&client.socket);
+            assert_eq!(got, [close.body(), next.body()], "{name}");
+            assert!(again.is_err(), "{name}: sent again: {again:?}");
+        }
     }
 
     #[test]

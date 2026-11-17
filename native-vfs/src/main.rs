@@ -17,6 +17,7 @@ mod daemon;
 mod fs;
 mod inodes;
 mod listing;
+mod notices;
 mod readers;
 mod trash;
 mod unlinker;
@@ -143,6 +144,7 @@ fn run() -> i32 {
     config.n_threads = Some(4);
     let drive = fs::DriveFs::new(args.backing, daemon::DaemonClient::new(args.socket));
     drive.start_space_refresh();
+    drive.start_keepalive();
     // Started before the session opens /dev/fuse, so that the child never holds it
     match unlinker::Unlinker::start() {
         Ok(unlinker) => drive.use_unlinker(unlinker),

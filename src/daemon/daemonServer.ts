@@ -138,6 +138,8 @@ export async function startSyncDaemon(options: {
                         runtime.logger.warn(`A stray in ${mountpoint} took a name already in the drive; kept it as ${renamed}`);
                     }
                 },
+                // A new helper has no file open for writing (#64)
+                onHelperStart: () => engine.clearDriveWriting(),
             }),
     });
 
