@@ -24,6 +24,7 @@ use fuser::{
 use crate::daemon::{DaemonClient, DaemonError, Removal, Space};
 use crate::inodes::{Inodes, ROOT_INO};
 use crate::listing::{self, Entry, Kind, VOLUME_INFO_CONTENT, VOLUME_INFO_NAME};
+use crate::notices::{Notice, Notices};
 use crate::readers::{classify_open, opener_interrupted, process_comm, Reader};
 use crate::trash::{TrashArea, TrashNode};
 use crate::unlinker::Unlinker;
@@ -37,6 +38,8 @@ const SPACE_REFRESH: Duration = Duration::from_secs(120);
 const SPACE_RETRY: Duration = Duration::from_secs(10);
 /// How often a use of a deferred open that waits for another asks whether its own app gave up.
 const SETTLE_CHECK: Duration = Duration::from_millis(500);
+/// How often the daemon hears again of each file being replaced through the drive (#64).
+const KEEPALIVE_EVERY: Duration = Duration::from_secs(30);
 
 pub struct DriveFs {
     state: Arc<State>,
@@ -45,11 +48,15 @@ pub struct DriveFs {
 impl DriveFs {
     pub fn new(backing: PathBuf, daemon: DaemonClient) -> Self {
         let room = LocalRoom::of_disk(backing.clone());
-        DriveFs::with_room(backing, daemon, room)
+        // Posted on a client of their own: nothing of the listings' backoff applies to them
+        let poster = daemon.on_same_socket();
+        let notices = Notices::start(move |notice| poster.notify(notice.route(), notice.body()));
+        DriveFs::with_room(backing, daemon, room, notices)
     }
 
-    /// A drive whose guard on the system disk is `room` (a test's, with its own reading of the disk).
-    fn with_room(backing: PathBuf, daemon: DaemonClient, room: LocalRoom) -> Self {
+    /// A drive whose guard on the system disk is `room`, and which tells the daemon of writes through `notices` (a
+    /// test's, with its own reading of the disk and its own record of the notices).
+    fn with_room(backing: PathBuf, daemon: DaemonClient, room: LocalRoom, notices: Arc<Notices>) -> Self {
         let uid = unsafe { libc::getuid() };
         let (drops, dropped) = mpsc::channel();
         let state = Arc::new(State {
@@ -73,6 +80,9 @@ impl DriveFs {
             started: SystemTime::now(),
             space: Mutex::new(None),
             room,
+            sessions: Mutex::new(HashMap::new()),
+            writing_fhs: Mutex::new(HashSet::new()),
+            notices,
         });
         start_unlinker(Arc::downgrade(&state), dropped);
         DriveFs { state }
@@ -94,6 +104,18 @@ impl DriveFs {
             };
             drop(state);
             std::thread::sleep(wait);
+        });
+    }
+
+    /// Tells the daemon again, every KEEPALIVE_EVERY, of each file being replaced through the drive (#64), on a thread
+    /// of its own: a daemon that restarted meanwhile learns of them again, and one that hears nothing more of a file
+    /// (a helper that died) stops waiting for it.
+    pub fn start_keepalive(&self) {
+        let state = Arc::downgrade(&self.state);
+        let _ = std::thread::Builder::new().name("keepalive".into()).spawn(move || loop {
+            std::thread::sleep(KEEPALIVE_EVERY);
+            let Some(state) = state.upgrade() else { return };
+            state.keepalive_tick();
         });
     }
 
@@ -150,6 +172,24 @@ struct State {
     space: Mutex<Option<Space>>,
     /// The guard that keeps the system disk from filling through the drive, whatever the account's storage (#295)
     room: LocalRoom,
+    /// Each file open for writing through the drive, by inode number, while it is (#64)
+    sessions: Mutex<HashMap<u64, WriteSession>>,
+    /// The opens that write, each part of its file's session
+    writing_fhs: Mutex<HashSet<u64>>,
+    /// What the daemon is told of the sessions, sent on a thread of their own
+    notices: Arc<Notices>,
+}
+
+/// A file's write session: from the first open that writes to it to the last one's release. The daemon hears of both
+/// (see notices.rs), and doesn't upload a file being replaced until it is closed (#64).
+struct WriteSession {
+    /// How many opens write to it
+    handles: u32,
+    /// Whether the session replaces the file: it was created in it, opened with O_TRUNC, or cut to nothing through it.
+    /// A copy over a file does; a log or a database written in place doesn't
+    replacing: bool,
+    /// Whether a write or growth was refused for room (the guard's, #295, or the disk's own): the file may be cut short
+    refused: bool,
 }
 
 struct CachedListing {
@@ -432,6 +472,107 @@ impl State {
         self.trash.is_trash_path(&rel.to_string_lossy())
     }
 
+    /// A new open's handle. An open that writes to a file (opened for writing, or created) is part of the file's write
+    /// session (see begin_writing): `writing` says whether it replaces the file, and is None for one that doesn't
+    /// write. Made before the open is answered, so its writes and release come after. Only a file's opens are: a
+    /// .trashinfo is held in memory, and the volume info can't be written.
+    fn add_open(&self, ino: u64, handle: Handle, writing: Option<bool>) -> FileHandle {
+        let of_a_file = matches!(handle, Handle::File(_) | Handle::Deferred(_));
+        let fh = self.add_handle(ino, handle);
+        if let (true, Some(replacing)) = (of_a_file, writing) {
+            self.begin_writing(ino, fh.0, replacing);
+        }
+        fh
+    }
+
+    /// The path the daemon knows the file numbered `ino` by: none once it was deleted or replaced through the drive, or
+    /// when it isn't UTF-8 (the daemon can't sync it).
+    fn notice_path(&self, ino: u64) -> Option<String> {
+        self.path_of(INodeNo(ino)).and_then(|rel| rel.to_str().map(String::from))
+    }
+
+    // Write sessions (#64). The daemon hears of a file's first writer, of its session turning replacing, and of its
+    // last writer's close; it uploads a file being replaced only once it is closed. Each notice is queued under the
+    // sessions' lock, so the daemon hears of a session's start and end in the order they happened; the path is read
+    // before that lock is taken, so `sessions` is never held with `inodes` (nor `handles` or `writing_fhs`). Queueing a
+    // notice never waits (see notices.rs).
+
+    /// Open `fh` writes to the file numbered `ino`: it starts its session, or joins it.
+    fn begin_writing(&self, ino: u64, fh: u64, replacing: bool) {
+        lock(&self.writing_fhs).insert(fh);
+        let path = self.notice_path(ino);
+        let mut sessions = lock(&self.sessions);
+        let session = sessions.entry(ino).or_insert(WriteSession { handles: 0, replacing: false, refused: false });
+        let news = session.handles == 0 || (replacing && !session.replacing);
+        session.handles += 1;
+        session.replacing |= replacing;
+        if let (true, Some(path)) = (news, path) {
+            self.notices.send(Notice::Writing { path, replacing: session.replacing });
+        }
+    }
+
+    /// The file numbered `ino` was cut to nothing: a session writing to it now replaces it.
+    fn mark_replacing(&self, ino: u64) {
+        let path = self.notice_path(ino);
+        let mut sessions = lock(&self.sessions);
+        let Some(session) = sessions.get_mut(&ino).filter(|session| !session.replacing) else { return };
+        session.replacing = true;
+        if let Some(path) = path {
+            self.notices.send(Notice::Writing { path, replacing: true });
+        }
+    }
+
+    /// A write or growth to the file numbered `ino` was refused for room: a session writing to it may leave it cut
+    /// short.
+    fn mark_refused(&self, ino: u64) {
+        if let Some(session) = lock(&self.sessions).get_mut(&ino) {
+            session.refused = true;
+        }
+    }
+
+    /// The result of a write or growth to the file numbered `ino`, as it is, with a refusal for room marked (see
+    /// mark_refused): the guard's ENOSPC (#295), or the disk's own.
+    fn noting_refusal<T>(&self, ino: u64, outcome: Result<T, Errno>) -> Result<T, Errno> {
+        if matches!(outcome, Err(errno) if errno == Errno::ENOSPC) {
+            self.mark_refused(ino);
+        }
+        outcome
+    }
+
+    /// Open `fh` of the file numbered `ino` was released; if it was its session's last writer, the session ends, and
+    /// the daemon hears of it under the path the file has now. A file deleted or replaced through the drive meanwhile
+    /// has none: nothing is said of it.
+    fn end_writing(&self, ino: u64, fh: u64) {
+        if !lock(&self.writing_fhs).remove(&fh) {
+            return;
+        }
+        let path = self.notice_path(ino);
+        let mut sessions = lock(&self.sessions);
+        let Some(session) = sessions.get_mut(&ino) else { return };
+        session.handles = session.handles.saturating_sub(1);
+        if session.handles > 0 {
+            return;
+        }
+        let Some(ended) = sessions.remove(&ino) else { return };
+        if let Some(path) = path {
+            self.notices.send(Notice::Closed { path, refused: ended.refused, replaced: ended.replacing });
+        }
+    }
+
+    /// Tells the daemon again of each file being replaced (see DriveFs::start_keepalive).
+    fn keepalive_tick(&self) {
+        let sessions = lock(&self.sessions);
+        let replacing: Vec<u64> = sessions.iter().filter(|(_, s)| s.replacing).map(|(&ino, _)| ino).collect();
+        drop(sessions);
+        for ino in replacing {
+            let Some(path) = self.notice_path(ino) else { continue };
+            // Unless its session ended meanwhile, and the daemon heard so
+            if lock(&self.sessions).get(&ino).is_some_and(|session| session.replacing) {
+                self.notices.send(Notice::Writing { path, replacing: true });
+            }
+        }
+    }
+
     /// The folder's merged listing: backing entries plus the daemon's, cached for a second. One fetch per folder at a
     /// time: other lookups there wait for its result rather than asking the daemon again.
     fn listing(&self, rel: &Path) -> Arc<Listing> {
@@ -622,16 +763,17 @@ impl State {
     }
 
     /// Runs on its own thread: waits for the daemon's download, then opens the file it placed in the backing store as
-    /// the app asked (read-only, or read-write).
+    /// the app asked (read-only, or read-write: a write session, see add_open).
     fn hydrate_and_open(&self, ino: u64, tid: u32, rel: PathBuf, flags: i32, reply: ReplyOpen) {
         if let Err(failure) = self.hydrate_unlogged(tid, &rel) {
             reply.error(failure.errno);
             return failure.log();
         }
+        let writing = (flags & libc::O_ACCMODE != libc::O_RDONLY).then_some(flags & libc::O_TRUNC != 0);
         match open_backing(&self.backing.join(&rel), flags) {
             Ok(file) => {
                 self.refresh_size(ino);
-                reply.opened(self.add_handle(ino, Handle::File(Arc::new(file))), FopenFlags::empty())
+                reply.opened(self.add_open(ino, Handle::File(Arc::new(file)), writing), FopenFlags::empty())
             }
             Err(err) => {
                 reply.error(Errno::EIO);
@@ -761,7 +903,32 @@ impl State {
     /// file when the kernel names one, otherwise by path; and once the path has gone (the item deleted or replaced
     /// through the drive), through a file the app still has open under that number.
     fn reply_after_change(&self, ino: INodeNo, file: Option<&File>, change: &AttrChange, reply: ReplyAttr) {
-        let meta = match (file, self.path_of(ino)) {
+        match self.apply_setattr(ino, file, change) {
+            Ok(meta) => reply.attr(&TTL, &self.attr(ino.0, &Node::Local(meta))),
+            Err(err) => reply.error(err.into()),
+        }
+    }
+
+    /// reply_after_change's change, and the attributes that result. A size it sets is part of the file's write
+    /// session, if it has one: cut to nothing, the file is being replaced; a growth refused for room may leave it cut
+    /// short (#64).
+    fn apply_setattr(&self, ino: INodeNo, file: Option<&File>, change: &AttrChange) -> std::io::Result<Metadata> {
+        let changed = self.apply_setattr_unnoted(ino, file, change);
+        match &changed {
+            Err(err) if err.raw_os_error() == Some(libc::ENOSPC) => self.mark_refused(ino.0),
+            Ok(_) if change.size == Some(0) => self.mark_replacing(ino.0),
+            _ => {}
+        }
+        changed
+    }
+
+    fn apply_setattr_unnoted(
+        &self,
+        ino: INodeNo,
+        file: Option<&File>,
+        change: &AttrChange,
+    ) -> std::io::Result<Metadata> {
+        match (file, self.path_of(ino)) {
             (Some(file), _) => apply_change(Target::File(file), change, &self.room).and_then(|()| file.metadata()),
             (None, Some(rel)) => {
                 let path = self.backing.join(rel);
@@ -769,18 +936,19 @@ impl State {
             }
             (None, None) => match self.open_file_of(ino.0) {
                 Some(file) => apply_change(Target::File(&file), change, &self.room).and_then(|()| file.metadata()),
-                None => return reply.error(Errno::ENOENT),
+                None => Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
             },
-        };
-        match meta {
-            Ok(meta) => reply.attr(&TTL, &self.attr(ino.0, &Node::Local(meta))),
-            Err(err) => reply.error(err.into()),
         }
     }
 
-    /// A write through an app's open file. When it takes room on the disk (past the file's end, or into a hole), it
-    /// is the guard's to allow (#295), and one it refuses writes nothing. An overwrite in place is never refused.
-    fn write_at(&self, file: &File, offset: u64, data: &[u8]) -> Result<(), Errno> {
+    /// A write through an app's open file of the file numbered `ino`. When it takes room on the disk (past the file's
+    /// end, or into a hole), it is the guard's to allow (#295), and one it refuses writes nothing. An overwrite in
+    /// place is never refused. A refusal for room, the guard's or the disk's, is marked in the file's write session.
+    fn write_at(&self, ino: u64, file: &File, offset: u64, data: &[u8]) -> Result<(), Errno> {
+        self.noting_refusal(ino, self.write_within_room(file, offset, data))
+    }
+
+    fn write_within_room(&self, file: &File, offset: u64, data: &[u8]) -> Result<(), Errno> {
         let meta = file.metadata()?;
         let old_len = meta.len();
         // A file opened to append takes every write at its end, whatever offset the kernel sent (pwrite(2) on Linux)
@@ -802,8 +970,8 @@ impl State {
         offset: u64,
         data: &[u8],
     ) -> Result<(), Errno> {
-        let file = self.settle(fh, deferred, tid, false)?;
-        self.write_at(&file, offset, data)
+        let file = self.noting_refusal(deferred.ino, self.settle(fh, deferred, tid, false))?;
+        self.write_at(deferred.ino, &file, offset, data)
     }
 
     /// Runs `work` on a thread of its own, for a call to the daemon that can take a while: never on a session thread.
@@ -1326,6 +1494,8 @@ impl Filesystem for DriveFs {
         let Some(rel) = s.path_of(ino) else { return reply.error(Errno::ENOENT) };
         let writing = flags.acc_mode() != OpenAccMode::O_RDONLY;
         let truncate = flags.0 & libc::O_TRUNC != 0;
+        // An open for writing is part of the file's write session, which O_TRUNC makes a replacing one (#64)
+        let session = writing.then_some(truncate);
         if s.is_trash_path(&rel) {
             return match s.trash.node(&rel) {
                 Some(TrashNode::InfoFile { id, .. }) => {
@@ -1347,7 +1517,9 @@ impl Filesystem for DriveFs {
         let path = s.backing.join(&rel);
         // Whatever the listing said a moment ago, a backing file opens as it is
         match open_backing(&path, flags.0) {
-            Ok(file) => return reply.opened(s.add_handle(ino.0, Handle::File(Arc::new(file))), FopenFlags::empty()),
+            Ok(file) => {
+                return reply.opened(s.add_open(ino.0, Handle::File(Arc::new(file)), session), FopenFlags::empty())
+            }
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => return reply.error(err.into()),
             Err(_) => {}
         }
@@ -1360,7 +1532,9 @@ impl Filesystem for DriveFs {
             }
             return s.on_worker("truncate", move |s| {
                 match s.make_empty(&rel).and_then(|()| open_backing(&path, flags.0).map_err(Errno::from)) {
-                    Ok(file) => reply.opened(s.add_handle(ino.0, Handle::File(Arc::new(file))), FopenFlags::empty()),
+                    Ok(file) => {
+                        reply.opened(s.add_open(ino.0, Handle::File(Arc::new(file)), session), FopenFlags::empty())
+                    }
                     Err(errno) => reply.error(errno),
                 }
             });
@@ -1389,7 +1563,8 @@ impl Filesystem for DriveFs {
                         state: Mutex::new(Settling::Pending),
                         settled: Condvar::new(),
                     };
-                    return reply.opened(s.add_handle(ino.0, Handle::Deferred(Arc::new(deferred))), FopenFlags::empty());
+                    let fh = s.add_open(ino.0, Handle::Deferred(Arc::new(deferred)), session);
+                    return reply.opened(fh, FopenFlags::empty());
                 }
                 // Read-only or read-write, it is downloaded as it opens, so the first read sees all of it. Never on a
                 // session thread: the download can take minutes. If the thread can't start, the dropped reply answers
@@ -1459,7 +1634,8 @@ impl Filesystem for DriveFs {
                 s.forget_listing(&parent_rel);
                 let ino = s.ino_of(&rel);
                 let attr = s.attr(ino, &Node::Local(meta));
-                let fh = s.add_handle(ino, Handle::File(Arc::new(file)));
+                // Whatever its access mode, a file made here is the session's to write, and replaces what was there
+                let fh = s.add_open(ino, Handle::File(Arc::new(file)), Some(true));
                 reply.created(&TTL, &attr, Generation(0), fh, FopenFlags::empty())
             }
             Err(err) => reply.error(err.into()),
@@ -1494,7 +1670,7 @@ impl Filesystem for DriveFs {
     fn write(
         &self,
         req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         data: &[u8],
@@ -1507,7 +1683,7 @@ impl Filesystem for DriveFs {
         // A write that grows a backing file is the guard's to allow (#295); a .trashinfo is held in memory, and never
         // more than 64 KiB
         match s.handle(fh) {
-            Some(Handle::File(file)) => reply_write(s.write_at(&file, offset, data), data.len(), reply),
+            Some(Handle::File(file)) => reply_write(s.write_at(ino.0, &file, offset, data), data.len(), reply),
             Some(Handle::TrashInfo(id)) => reply_write(s.trash.write_info(id, offset, data), data.len(), reply),
             Some(Handle::Deferred(deferred)) => {
                 let (tid, data) = (req.pid(), data.to_vec());
@@ -1547,13 +1723,17 @@ impl Filesystem for DriveFs {
     ) {
         let s = &self.state;
         let closed = lock(&s.handles).remove(&fh.0);
-        let dropped = match closed {
-            Some((_, Handle::TrashInfo(id))) => s.trash.close_info(id),
+        let dropped = match &closed {
+            Some((_, Handle::TrashInfo(id))) => s.trash.close_info(*id),
             _ => None,
         };
         reply.ok();
         if let Some(info) = dropped {
             s.info_dropped(info);
+        }
+        // The last writer's close ends the file's write session, once the app has its answer (#64)
+        if let Some((ino, _)) = closed {
+            s.end_writing(ino, fh.0);
         }
     }
 
@@ -1905,7 +2085,8 @@ mod tests {
         let backing = root.join("backing");
         std::fs::create_dir_all(&backing).unwrap();
         std::fs::write(backing.join("a.txt"), b"hello").unwrap();
-        let drive = DriveFs::with_room(backing.clone(), DaemonClient::new(root.join("d.sock")), room_of(available).0);
+        let (daemon, room) = (DaemonClient::new(root.join("d.sock")), room_of(available).0);
+        let drive = DriveFs::with_room(backing.clone(), daemon, room, recording().0);
         (drive, root, backing.join("a.txt"))
     }
 
@@ -1915,10 +2096,10 @@ mod tests {
         let s = &drive.state;
         let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
         assert!(lock(&s.space).is_none());
-        assert_eq!(s.write_at(&file, 5, b" world"), Err(Errno::ENOSPC));
+        assert_eq!(s.write_at(0, &file, 5, b" world"), Err(Errno::ENOSPC));
         // Proton's free space known, and plenty of it: the system disk's room is what counts all the same
         *lock(&s.space) = Some(Space { used: 0, max: 510 * GB });
-        assert_eq!(s.write_at(&file, 5, b" world"), Err(Errno::ENOSPC));
+        assert_eq!(s.write_at(0, &file, 5, b" world"), Err(Errno::ENOSPC));
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1931,8 +2112,8 @@ mod tests {
         let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
         let cut_to = |size: u64| AttrChange { mode: Some(0o600), size: Some(size), atime: None, mtime: None };
         // Growth, by a write, a write past the end, or a bigger size: refused before anything is written
-        assert_eq!(s.write_at(&file, 3, b"lo!"), Err(Errno::ENOSPC));
-        assert_eq!(s.write_at(&file, 10 * GB, b"x"), Err(Errno::ENOSPC));
+        assert_eq!(s.write_at(0, &file, 3, b"lo!"), Err(Errno::ENOSPC));
+        assert_eq!(s.write_at(0, &file, 10 * GB, b"x"), Err(Errno::ENOSPC));
         let resized = apply_change(Target::File(&file), &cut_to(10 * GB), &s.room);
         assert_eq!(resized.map_err(|e| e.raw_os_error()), Err(Some(libc::ENOSPC)));
         let resized = apply_change(Target::Path(&path), &cut_to(6), &s.room);
@@ -1941,11 +2122,11 @@ mod tests {
         assert_ne!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600, "a refused setattr changes nothing");
         // An append lands at the end whatever offset the kernel sent: growth, though the offset is inside the file
         let appending = OpenOptions::new().append(true).open(&path).unwrap();
-        assert_eq!(s.write_at(&appending, 0, b"!"), Err(Errno::ENOSPC));
+        assert_eq!(s.write_at(0, &appending, 0, b"!"), Err(Errno::ENOSPC));
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
         // What doesn't grow the file always goes through
-        assert_eq!(s.write_at(&file, 0, b"HELLO"), Ok(()));
-        assert_eq!(s.write_at(&file, 2, b"y"), Ok(()));
+        assert_eq!(s.write_at(0, &file, 0, b"HELLO"), Ok(()));
+        assert_eq!(s.write_at(0, &file, 2, b"y"), Ok(()));
         apply_change(Target::File(&file), &cut_to(5), &s.room).unwrap();
         apply_change(Target::Path(&path), &cut_to(4), &s.room).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"HEyL");
@@ -1965,8 +2146,8 @@ mod tests {
         assert_eq!(holes_in(5 * MB, 5 * MB + 10), 10);
         let holes = holes_in(0, 10 * MB);
         assert!((9 * MB..10 * MB).contains(&holes), "{holes} bytes of holes");
-        assert_eq!(s.write_at(&file, 5 * MB, b"x"), Err(Errno::ENOSPC));
-        assert_eq!(s.write_at(&file, 2, b"y"), Ok(())); // its data, in place
+        assert_eq!(s.write_at(0, &file, 5 * MB, b"x"), Err(Errno::ENOSPC));
+        assert_eq!(s.write_at(0, &file, 2, b"y"), Ok(())); // its data, in place
         let content = std::fs::read(&path).unwrap();
         assert_eq!((&content[..5], content.len() as u64, content[5 * MB as usize]), (&b"heylo"[..], 10 * MB, 0));
         let _ = std::fs::remove_dir_all(root);
@@ -1986,7 +2167,7 @@ mod tests {
         assert_eq!(hole_bytes(&file.metadata().unwrap(), 0, MB, counted), 0);
         assert_eq!(seeks.load(Ordering::SeqCst), 0, "searched for holes");
         // Never refused, with the disk under the reserve
-        assert_eq!(drive.state.write_at(&file, MB / 2, &[2u8; 4096]), Ok(()));
+        assert_eq!(drive.state.write_at(0, &file, MB / 2, &[2u8; 4096]), Ok(()));
         // With a hole, it is searched
         file.set_len(10 * MB).unwrap();
         assert!(hole_bytes(&file.metadata().unwrap(), 0, 10 * MB, counted) > 0);
@@ -2070,14 +2251,27 @@ mod tests {
         assert!(blocked_refusal(&err(libc::EIO, "Blocked: rg")).is_none());
     }
 
+    /// Notices that record what the drive tells the daemon, in order, and that record.
+    fn recording() -> (Arc<Notices>, Arc<Mutex<Vec<Notice>>>) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let recorded = sent.clone();
+        let notices = Notices::start(move |notice| {
+            recorded.lock().unwrap().push(notice.clone());
+            Ok(())
+        });
+        (notices, sent)
+    }
+
     /// A daemon on a temp socket that holds every request until the gate opens, then lists `a.txt` in any folder, or
-    /// downloads a file by writing it into the backing store. It counts listings and downloads.
+    /// downloads a file by writing it into the backing store. It counts listings and downloads. What the drive tells
+    /// it of writes is recorded instead (see sent).
     struct Gated {
         drive: DriveFs,
         root: PathBuf,
         listings: Arc<AtomicUsize>,
         downloads: Arc<AtomicUsize>,
         gate: Arc<(Mutex<bool>, Condvar)>,
+        notices: Arc<Mutex<Vec<Notice>>>,
     }
 
     impl Gated {
@@ -2133,7 +2327,27 @@ mod tests {
                     });
                 }
             });
-            Gated { drive: DriveFs::new(backing, DaemonClient::new(socket)), root, listings, downloads, gate }
+            let (room, (notices, sent)) = (LocalRoom::of_disk(backing.clone()), recording());
+            let drive = DriveFs::with_room(backing, DaemonClient::new(socket), room, notices);
+            Gated { drive, root, listings, downloads, gate, notices: sent }
+        }
+
+        /// What the drive told the daemon of writes since last asked: all of it, once a marker sent after it is out.
+        fn sent(&self) -> Vec<Notice> {
+            let marker = Notice::Refused { needed: u64::MAX, available: u64::MAX };
+            self.drive.state.notices.send(marker.clone());
+            let started = Instant::now();
+            loop {
+                let mut sent = self.notices.lock().unwrap();
+                if let Some(at) = sent.iter().position(|n| *n == marker) {
+                    let mut before: Vec<Notice> = sent.drain(..=at).collect();
+                    before.pop();
+                    return before;
+                }
+                drop(sent);
+                assert!(started.elapsed() < Duration::from_secs(5), "the notices never went out");
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
 
         fn open(&self) {
@@ -2360,12 +2574,264 @@ mod tests {
         });
         let gate = Arc::new((Mutex::new(true), Condvar::new()));
         let none = || Arc::new(AtomicUsize::new(0));
-        let (backing, daemon) = (root.join("backing"), DaemonClient::new(socket));
-        let drive = match room {
-            Some(room) => DriveFs::with_room(backing, daemon, room),
-            None => DriveFs::new(backing, daemon),
-        };
-        Gated { drive, root, listings: none(), downloads: none(), gate }
+        let (backing, daemon, (notices, sent)) = (root.join("backing"), DaemonClient::new(socket), recording());
+        let room = room.unwrap_or_else(|| LocalRoom::of_disk(backing.clone()));
+        let drive = DriveFs::with_room(backing, daemon, room, notices);
+        Gated { drive, root, listings: none(), downloads: none(), gate, notices: sent }
+    }
+
+    // #64: write sessions. A daemon that takes anything, over a backing store holding a.txt ("hello"), with a guard
+    // whose disk has `room` bytes available
+    fn writable(name: &str, room: u64) -> Gated {
+        let g = scripted(name, Some(room_of(room).0), |line, _| {
+            let reply = if line.starts_with("GET /vfs/children") { r#"{"entries":[]}"# } else { r#"{"ok":true}"# };
+            (200, reply.into())
+        });
+        std::fs::write(g.root.join("backing/a.txt"), b"hello").unwrap();
+        g
+    }
+
+    /// Opens `rel` in the backing store with `options`, as open and create do, for writing (and whether that replaces
+    /// it) or not (None): its number, the open, and the file.
+    fn open_as(g: &Gated, rel: &str, options: &OpenOptions, writing: Option<bool>) -> (u64, FileHandle, Arc<File>) {
+        let s = &g.drive.state;
+        let file = Arc::new(options.open(g.root.join("backing").join(rel)).unwrap());
+        let ino = s.ino_of(Path::new(rel));
+        (ino, s.add_open(ino, Handle::File(file.clone()), writing), file)
+    }
+
+    /// What release does with an open, but answer it.
+    fn release(s: &State, fh: FileHandle) {
+        if let Some((ino, _)) = lock(&s.handles).remove(&fh.0) {
+            s.end_writing(ino, fh.0);
+        }
+    }
+
+    fn read_write() -> OpenOptions {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        options
+    }
+
+    fn created() -> OpenOptions {
+        let mut options = read_write();
+        options.create_new(true);
+        options
+    }
+
+    fn writing(path: &str, replacing: bool) -> Notice {
+        Notice::Writing { path: path.into(), replacing }
+    }
+
+    fn closed(path: &str, refused: bool, replaced: bool) -> Notice {
+        Notice::Closed { path: path.into(), refused, replaced }
+    }
+
+    fn sized(size: u64) -> AttrChange {
+        AttrChange { mode: None, size: Some(size), atime: None, mtime: None }
+    }
+
+    fn nothing_held(s: &State) -> bool {
+        lock(&s.sessions).is_empty() && lock(&s.writing_fhs).is_empty()
+    }
+
+    #[test]
+    fn a_new_file_is_a_replacing_session_closed_on_its_last_release() {
+        let g = writable("session-new", 100 * GB);
+        let s = &g.drive.state;
+        let (ino, fh, file) = open_as(&g, "new.txt", &created(), Some(true));
+        assert_eq!(s.write_at(ino, &file, 0, b"hi"), Ok(()));
+        release(s, fh);
+        assert_eq!(g.sent(), [writing("new.txt", true), closed("new.txt", false, true)]);
+        assert!(nothing_held(s));
+    }
+
+    #[test]
+    fn an_open_without_trunc_is_not_replacing() {
+        let g = writable("session-in-place", 100 * GB);
+        let s = &g.drive.state;
+        let (ino, fh, file) = open_as(&g, "a.txt", &read_write(), Some(false));
+        assert_eq!(s.write_at(ino, &file, 5, b"!"), Ok(()));
+        release(s, fh);
+        assert_eq!(g.sent(), [writing("a.txt", false), closed("a.txt", false, false)]);
+    }
+
+    #[test]
+    fn a_truncate_to_zero_turns_a_session_replacing() {
+        let g = writable("session-truncated", 100 * GB);
+        let s = &g.drive.state;
+        let (ino, fh, file) = open_as(&g, "a.txt", &read_write(), Some(false));
+        // Cut short of nothing, it is still the file, edited
+        s.apply_setattr(INodeNo(ino), Some(&file), &sized(3)).unwrap();
+        assert_eq!(g.sent(), [writing("a.txt", false)]);
+        s.apply_setattr(INodeNo(ino), Some(&file), &sized(0)).unwrap();
+        assert_eq!(g.sent(), [writing("a.txt", true)]);
+        // Replacing already: cut again by its path (truncate(1)), or opened again with O_TRUNC, nothing new to say
+        s.apply_setattr(INodeNo(ino), None, &sized(0)).unwrap();
+        let (_, again, _) = open_as(&g, "a.txt", read_write().truncate(true), Some(true));
+        release(s, again);
+        release(s, fh);
+        assert_eq!(g.sent(), [closed("a.txt", false, true)]);
+        // An open with O_TRUNC joining a session turns it replacing, as a cut by its path does
+        let (ino, edit, _) = open_as(&g, "a.txt", &read_write(), Some(false));
+        let (_, copy, _) = open_as(&g, "a.txt", read_write().truncate(true), Some(true));
+        release(s, copy);
+        release(s, edit);
+        let (_, by_path, _) = open_as(&g, "a.txt", &read_write(), Some(false));
+        s.apply_setattr(INodeNo(ino), None, &sized(0)).unwrap();
+        release(s, by_path);
+        let replaced = [writing("a.txt", false), writing("a.txt", true), closed("a.txt", false, true)];
+        assert_eq!(g.sent(), [replaced.clone(), replaced].concat());
+    }
+
+    #[test]
+    fn closed_is_posted_after_the_last_writing_handle() {
+        let g = writable("session-two-writers", 100 * GB);
+        let s = &g.drive.state;
+        let (_, first, _) = open_as(&g, "a.txt", &read_write(), Some(false));
+        let (_, second, _) = open_as(&g, "a.txt", &read_write(), Some(false));
+        let (_, reader, _) = open_as(&g, "a.txt", OpenOptions::new().read(true), None);
+        release(s, first);
+        release(s, reader); // a reader's close ends nothing
+        assert_eq!(g.sent(), [writing("a.txt", false)], "one session, still open");
+        release(s, second);
+        assert_eq!(g.sent(), [closed("a.txt", false, false)]);
+        // The next writer starts a session of its own
+        let (_, third, _) = open_as(&g, "a.txt", &read_write(), Some(false));
+        release(s, third);
+        assert_eq!(g.sent(), [writing("a.txt", false), closed("a.txt", false, false)]);
+        assert!(nothing_held(s));
+    }
+
+    #[test]
+    fn a_read_only_open_sends_nothing() {
+        let g = writable("session-reader", 100 * GB);
+        let s = &g.drive.state;
+        let (_, fh, _) = open_as(&g, "a.txt", OpenOptions::new().read(true), None);
+        s.keepalive_tick();
+        release(s, fh);
+        assert_eq!(g.sent(), []);
+        assert!(nothing_held(s));
+    }
+
+    #[test]
+    fn a_refused_write_marks_the_close_refused() {
+        // A room of 0: whatever grows a file is refused
+        let g = writable("session-refused", 0);
+        let s = &g.drive.state;
+        let (ino, fh, file) = open_as(&g, "a.txt", &read_write(), Some(false));
+        assert_eq!(s.write_at(ino, &file, 5, b" world"), Err(Errno::ENOSPC));
+        assert_eq!(s.write_at(ino, &file, 0, b"H"), Ok(()), "an overwrite in place goes through");
+        release(s, fh);
+        assert_eq!(g.sent(), [writing("a.txt", false), closed("a.txt", true, false)]);
+        // The next session starts afresh
+        let (_, fh, _) = open_as(&g, "a.txt", &read_write(), Some(false));
+        release(s, fh);
+        assert_eq!(g.sent(), [writing("a.txt", false), closed("a.txt", false, false)]);
+
+        // The disk itself full, with room to spare for the guard (/dev/full stands in for it): cut short all the same
+        let g = writable("session-disk-full", 100 * GB);
+        let s = &g.drive.state;
+        if let Ok(full) = OpenOptions::new().write(true).open("/dev/full") {
+            let (ino, full) = (s.ino_of(Path::new("a.txt")), Arc::new(full));
+            let fh = s.add_open(ino, Handle::File(full.clone()), Some(true));
+            assert_eq!(s.write_at(ino, &full, 0, b"x"), Err(Errno::ENOSPC));
+            release(s, fh);
+            assert_eq!(g.sent(), [writing("a.txt", true), closed("a.txt", true, true)]);
+        }
+
+        // Through a deferred open: refused once the file is downloaded
+        let backing = std::env::temp_dir().join(format!("protondrive-vfs-fs-session-deferred-{}", std::process::id()));
+        let backing = backing.join("backing");
+        let g = scripted("session-deferred", Some(room_of(0).0), move |line, body| {
+            if line.starts_with("POST /vfs/hydrate") {
+                let _ = std::fs::write(backing.join(body["path"].as_str().unwrap_or("x")), b"downloaded");
+            }
+            (200, r#"{"ok":true}"#.into())
+        });
+        let s = &g.drive.state;
+        let deferred = g.deferred("b.txt");
+        let fh = s.add_open(deferred.ino, Handle::Deferred(deferred.clone()), Some(false));
+        assert_eq!(s.write_deferred(fh, &deferred, 0, 10, b"!"), Err(Errno::ENOSPC));
+        release(s, fh);
+        assert_eq!(g.sent(), [writing("b.txt", false), closed("b.txt", true, false)]);
+    }
+
+    #[test]
+    fn a_refused_growth_by_setattr_marks_the_close_refused() {
+        let g = writable("session-refused-size", 0);
+        let s = &g.drive.state;
+        let refused = |grown: std::io::Result<Metadata>| grown.err().and_then(|e| e.raw_os_error());
+        // Through the open file (ftruncate), or by its path (truncate(2))
+        for through_file in [true, false] {
+            let (ino, fh, file) = open_as(&g, "a.txt", &read_write(), Some(false));
+            let file = through_file.then_some(&*file);
+            assert_eq!(refused(s.apply_setattr(INodeNo(ino), file, &sized(10))), Some(libc::ENOSPC));
+            assert!(s.apply_setattr(INodeNo(ino), file, &sized(4)).is_ok(), "a cut always goes through");
+            release(s, fh);
+            assert_eq!(g.sent(), [writing("a.txt", false), closed("a.txt", true, false)], "{through_file}");
+        }
+    }
+
+    #[test]
+    fn a_file_deleted_while_open_sends_no_close() {
+        let g = writable("session-deleted", 100 * GB);
+        let s = &g.drive.state;
+        let (_, deleted, _) = open_as(&g, "new.txt", &created(), Some(true));
+        s.removed(Path::new("new.txt")); // as a delete through the drive leaves it
+        // Replaced by a rename through the drive: its number goes stale too
+        let (_, replaced, _) = open_as(&g, "a.txt", &read_write(), Some(true));
+        s.moved(Path::new("b.txt"), Path::new("a.txt"));
+        s.keepalive_tick(); // nothing for a file with no path
+        release(s, deleted);
+        release(s, replaced);
+        assert_eq!(g.sent(), [writing("new.txt", true), writing("a.txt", true)]);
+        assert!(nothing_held(s), "nothing kept for either");
+    }
+
+    #[test]
+    fn a_renamed_open_file_closes_under_its_new_name() {
+        let g = writable("session-renamed", 100 * GB);
+        let s = &g.drive.state;
+        let (_, fh, _) = open_as(&g, "a.txt", &read_write(), Some(false));
+        s.moved(Path::new("a.txt"), Path::new("Docs/b.txt")); // as a rename through the drive leaves it
+        release(s, fh);
+        assert_eq!(g.sent(), [writing("a.txt", false), closed("Docs/b.txt", false, false)]);
+    }
+
+    #[test]
+    fn trash_info_and_volume_info_handles_send_nothing() {
+        let g = writable("session-virtual", 100 * GB);
+        let s = &g.drive.state;
+        let info = s.trash_info_dir().join("a.trashinfo");
+        let id = s.trash.create_info(OsStr::new("a.trashinfo"), true, false).unwrap();
+        let info = s.add_open(s.ino_of(&info), Handle::TrashInfo(id), Some(true));
+        let volume = s.add_open(s.ino_of(Path::new(VOLUME_INFO_NAME)), Handle::VolumeInfo, Some(false));
+        s.keepalive_tick();
+        release(s, info);
+        release(s, volume);
+        assert_eq!(g.sent(), []);
+        assert!(nothing_held(s));
+    }
+
+    #[test]
+    fn a_replacing_session_is_kept_alive_every_30_s() {
+        assert_eq!(KEEPALIVE_EVERY, Duration::from_secs(30));
+        let g = writable("session-keepalive", 100 * GB);
+        let s = &g.drive.state;
+        let (_, copy, _) = open_as(&g, "new.txt", &created(), Some(true));
+        let (_, edit, _) = open_as(&g, "a.txt", &read_write(), Some(false));
+        assert_eq!(g.sent(), [writing("new.txt", true), writing("a.txt", false)]);
+        s.keepalive_tick();
+        assert_eq!(g.sent(), [writing("new.txt", true)], "the replacing session only");
+        // Wherever it is now
+        s.moved(Path::new("new.txt"), Path::new("Docs/new.txt"));
+        s.keepalive_tick();
+        assert_eq!(g.sent(), [writing("Docs/new.txt", true)]);
+        release(s, copy);
+        s.keepalive_tick();
+        release(s, edit);
+        assert_eq!(g.sent(), [closed("Docs/new.txt", false, true), closed("a.txt", false, false)]);
     }
 
     // Review N3: an EXDEV is tried with the download whatever the helper's own listing says (here: nothing at all, as

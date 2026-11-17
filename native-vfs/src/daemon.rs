@@ -1,7 +1,8 @@
 // The daemon's drive routes, over HTTP/1.1 on its user-only control socket (the same client shape as the GUI's
 // control_request): GET /vfs/children for listings, POST /vfs/hydrate to download a file an app opened, POST
 // /vfs/truncate to make an online-only file an empty local one, and POST /vfs/rename and /vfs/delete for renames and
-// deletes through the drive, which the daemon carries out whole.
+// deletes through the drive, which the daemon carries out whole. POST /vfs/writing and /vfs/closed tell it of files
+// open for writing through the drive (see notices.rs).
 
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -32,6 +33,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often a waiting request asks whether to give up (a hydrate: whether its opener did).
 const INTERRUPT_CHECK: Duration = Duration::from_millis(500);
+/// A notice of the drive's writes (see notices.rs) is a small post the daemon answers at once: one it hasn't answered
+/// in this long counts as failed.
+pub const NOTICE_TIMEOUT: Duration = Duration::from_secs(5);
 /// After a listing finds the daemon stuck, listings go without it this long.
 const LISTING_BACKOFF: Duration = Duration::from_secs(5);
 /// Listing problems go to stderr at most this often.
@@ -92,6 +96,12 @@ impl DaemonClient {
             listing_backoff_until: Mutex::new(None),
             last_logged: Mutex::new(None),
         }
+    }
+
+    /// A client of its own on the same socket, with none of this one's listing backoff: for a thread that posts
+    /// alongside the drive's requests (see notices.rs).
+    pub fn on_same_socket(&self) -> DaemonClient {
+        DaemonClient::new(self.socket.clone())
     }
 
     #[cfg(test)]
@@ -171,6 +181,12 @@ impl DaemonClient {
     /// of it as what its new content is an edit of. EEXIST when it is on this computer already.
     pub fn truncate(&self, rel: &str) -> Result<(), DaemonError> {
         self.change("/vfs/truncate", serde_json::json!({ "path": rel }))
+    }
+
+    /// Tells the daemon what apps do through the drive (see notices.rs): a post with no deadline, since it changes
+    /// nothing the app waits on, and it fails once NOTICE_TIMEOUT passes.
+    pub fn notify(&self, route: &str, body: serde_json::Value) -> Result<(), DaemonError> {
+        self.request("POST", route, Some(&body), NOTICE_TIMEOUT, &|| false).map(|_| ())
     }
 
     /// The account's storage, or None when the daemon doesn't know it (signed out, or not asked yet).
@@ -634,6 +650,29 @@ mod tests {
                 serde_json::json!({ "path": "Docs/a.txt" }),
             ]
         );
+    }
+
+    #[test]
+    fn a_notice_is_posted_as_it_is_with_no_deadline() {
+        let (client, bodies) = serve_recording("notice", "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}");
+        // On a client of its own, as the drive's sender has: none of the listings' backoff
+        let sender = client.on_same_socket();
+        assert_eq!(sender.socket, client.socket);
+        let body = serde_json::json!({ "path": "Docs/a b.txt", "refused": true, "replaced": false });
+        assert_eq!(sender.notify("/vfs/closed", body.clone()), Ok(()));
+        let _ = std::fs::remove_file(&client.socket);
+        assert_eq!(bodies.try_iter().collect::<Vec<_>>(), [body]);
+        assert_eq!(NOTICE_TIMEOUT, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_notice_the_daemon_doesnt_know_fails() {
+        // A daemon from before the route: 404, which the sender takes as a failed post
+        let reply = "HTTP/1.1 404 X\r\nContent-Length: 21\r\n\r\n{\"error\":\"Not found\"}";
+        let (client, _) = serve_recording("notice-404", reply);
+        let failed = client.notify("/vfs/writing", serde_json::json!({ "path": "a", "replacing": true }));
+        let _ = std::fs::remove_file(&client.socket);
+        assert_eq!(failed.unwrap_err().errno, libc::EIO);
     }
 
     #[test]
