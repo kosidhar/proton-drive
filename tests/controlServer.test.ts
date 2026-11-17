@@ -71,6 +71,17 @@ function makeFake(rejectWith?: string) {
             driveCalls.push(opts?.deadlineMs === undefined ? ['truncate', relPath] : ['truncate', relPath, opts]);
             if (relPath === 'local.txt') throw new DriveOpError('EEXIST', `Already exists: ${relPath}`);
         },
+        // What the drive helper tells of files open for writing through it (#64)
+        driveWriting(relPath: string, replacing: boolean): void {
+            driveCalls.push(['writing', relPath, replacing]);
+        },
+        async driveClosed(relPath: string, opts: { refused: boolean; replaced: boolean }): Promise<void> {
+            driveCalls.push(['closed', relPath, opts]);
+            if (relPath === 'broken.bin') throw new Error('database is locked');
+        },
+        clearDriveWriting(): void {
+            driveCalls.push(['clear']);
+        },
     };
     return engine;
 }
@@ -399,6 +410,77 @@ describe('drive routes', () => {
         expect((await call(socketPath, '/vfs/truncate')).status).toBe(405);
         expect((await call(socketPath, '/vfs/elsewhere')).status).toBe(404);
         expect(engine.driveCalls).toEqual([]);
+    });
+
+    // #64: the helper's notices of files open for writing through the drive, and of their last close
+    test('POST /vfs/writing and /vfs/closed pass the path and flags through, as they are, and answer ok', async () => {
+        const { socketPath, engine } = await start();
+        const answers = [
+            await post(socketPath, '/vfs/writing', { path: 'Docs/été/a b.bin', replacing: true }),
+            await post(socketPath, '/vfs/writing', { path: 'db.sqlite', replacing: false }),
+            await post(socketPath, '/vfs/closed', { path: 'Docs/été/a b.bin', refused: false, replaced: true }),
+            await post(socketPath, '/vfs/closed', { path: 'cut.bin', refused: true, replaced: false }),
+        ];
+        for (const res of answers) {
+            expect(res.status).toBe(200);
+            expect(await res.json()).toEqual({ ok: true });
+        }
+        expect(engine.driveCalls).toEqual([
+            ['writing', 'Docs/été/a b.bin', true],
+            ['writing', 'db.sqlite', false],
+            ['closed', 'Docs/été/a b.bin', { refused: false, replaced: true }],
+            ['closed', 'cut.bin', { refused: true, replaced: false }],
+        ]);
+    });
+
+    // The helper drops a refused close the daemon answers with a 4xx, which would let a file cut short upload: any
+    // well-formed body is ok (an unknown path, one never marked or gone, the same post twice, a deadline it never sends)
+    test('POST /vfs/writing and /vfs/closed answer ok for any well-formed body, whatever the path, however often', async () => {
+        const { socketPath, engine } = await start();
+        const posts: Array<[string, Record<string, unknown>]> = [];
+        for (const rel of ['never/seen.txt', '', '../outside.txt']) {
+            posts.push(['/vfs/writing', { path: rel, replacing: true }]);
+            posts.push(['/vfs/closed', { path: rel, refused: true, replaced: false }]);
+            posts.push(['/vfs/closed', { path: rel, refused: true, replaced: false }]);
+        }
+        posts.push(['/vfs/closed', { path: 'a.bin', refused: false, replaced: true, deadlineMs: 'whenever', extra: 1 }]);
+        posts.push(['/vfs/writing', { path: 'a.bin', replacing: false, deadlineMs: null }]);
+        for (const [route, body] of posts) {
+            const res = await post(socketPath, route, body);
+            expect({ route, body, status: res.status, answer: await res.json() }).toEqual({ route, body, status: 200, answer: { ok: true } });
+        }
+        expect(engine.driveCalls).toHaveLength(posts.length);
+    });
+
+    test('a malformed notice is 400 EINVAL and reaches nothing; a GET is 405; a failure is 500, never a 4xx', async () => {
+        const { socketPath, engine } = await start();
+        const bad = [
+            await post(socketPath, '/vfs/writing', '{nope'),
+            await post(socketPath, '/vfs/writing', '[]'),
+            await post(socketPath, '/vfs/writing', {}),
+            await post(socketPath, '/vfs/writing', { path: 7, replacing: true }),
+            await post(socketPath, '/vfs/writing', { path: 'a.bin' }),
+            await post(socketPath, '/vfs/writing', { path: 'a.bin', replacing: 'yes' }),
+            await post(socketPath, '/vfs/closed', '{nope'),
+            await post(socketPath, '/vfs/closed', { refused: true, replaced: true }),
+            await post(socketPath, '/vfs/closed', { path: null, refused: true, replaced: true }),
+            await post(socketPath, '/vfs/closed', { path: 'a.bin', replaced: true }),
+            await post(socketPath, '/vfs/closed', { path: 'a.bin', refused: 1, replaced: true }),
+            await post(socketPath, '/vfs/closed', { path: 'a.bin', refused: true }),
+            await post(socketPath, '/vfs/closed', { path: 'a.bin', refused: true, replaced: 'no' }),
+        ];
+        for (const res of bad) {
+            expect(res.status).toBe(400);
+            expect(((await res.json()) as { code: string }).code).toBe('EINVAL');
+        }
+        expect((await call(socketPath, '/vfs/writing')).status).toBe(405);
+        expect((await call(socketPath, '/vfs/closed')).status).toBe(405);
+        expect(engine.driveCalls).toEqual([]);
+
+        // The helper sends a refused close again on a 5xx, never on a 4xx
+        const failed = await post(socketPath, '/vfs/closed', { path: 'broken.bin', refused: true, replaced: true });
+        expect(failed.status).toBe(500);
+        expect(await failed.json()).toEqual({ error: 'database is locked', code: 'EIO' });
     });
 
     // Bun closes a connection that has been idle for 10 s by default, a hydrate waiting on a download included (and
