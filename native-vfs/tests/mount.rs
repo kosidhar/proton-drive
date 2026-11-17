@@ -1,7 +1,8 @@
 // Real mounts of the built helper over temp dirs, with a fake daemon on a temp socket. They run only with
 // PROTONDRIVE_VFS_MOUNT_TESTS=1, and always unmount, even when an assertion fails. They need more than 5 GB free
 // where TMPDIR points (/tmp by default): the drive refuses writes that would leave its backing store's disk with
-// less than that (#295).
+// less than that (#295). The two tests that depend on that room skip, with a message on stderr, rather than fail
+// when the disk has less (#302).
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -23,6 +24,20 @@ const LIMIT: Duration = Duration::from_secs(20);
 
 fn enabled() -> bool {
     std::env::var("PROTONDRIVE_VFS_MOUNT_TESTS").as_deref() == Ok("1")
+}
+
+/// The drive's 5 GB reserve plus the 100 MB the disk-dependent tests write.
+const LOCAL_RESERVE_BYTES_FOR_TESTS: u64 = 5_000_000_000 + 100_000_000;
+
+/// Whether the disk TMPDIR points at has `needed` bytes available; says so on stderr when it hasn't.
+fn has_room(needed: u64) -> bool {
+    let st = statvfs(&std::env::temp_dir());
+    let block = if st.f_frsize == 0 { st.f_bsize } else { st.f_frsize };
+    if st.f_bavail.saturating_mul(block) >= needed {
+        return true;
+    }
+    eprintln!("skipped: needs {needed} bytes free where TMPDIR points");
+    false
 }
 
 fn file(name: &str, size: u64) -> Value {
@@ -683,7 +698,7 @@ fn mounts_as_protondrive_with_the_drives_options() {
 // computer has less room (the guard keeps its disk from filling)
 #[test]
 fn the_drive_reports_the_accounts_storage() {
-    if !enabled() {
+    if !enabled() || !has_room(LOCAL_RESERVE_BYTES_FOR_TESTS) {
         return;
     }
     let mut h = Harness::new();
@@ -706,9 +721,10 @@ fn the_drive_reports_the_accounts_storage() {
     };
     let near = |bytes: u64, want: u64| bytes.abs_diff(want) < block * 2;
     assert!(near(drive.f_blocks * block, max), "total {}", drive.f_blocks * block);
-    assert!(near((drive.f_blocks - drive.f_bfree) * block, used), "used {}", (drive.f_blocks - drive.f_bfree) * block);
+    let used_bytes = drive.f_blocks.saturating_sub(drive.f_bfree) * block;
+    assert!(near(used_bytes, used), "used {used_bytes}");
     let (free, available) = (drive.f_bfree * block, drive.f_bavail * block);
-    assert!(near(free, max - used) && near(available, max - used), "free {free}, available {available}");
+    assert!(near(free, max.saturating_sub(used)) && near(available, max.saturating_sub(used)), "free {free}, available {available}");
     assert!(available > local_free, "available {available}: the cloud's, not this computer's {local_free}");
 }
 
@@ -717,7 +733,7 @@ fn the_drive_reports_the_accounts_storage() {
 // that was there is touched
 #[test]
 fn a_write_that_would_leave_the_system_disk_under_5_gb_is_refused() {
-    if !enabled() {
+    if !enabled() || !has_room(LOCAL_RESERVE_BYTES_FOR_TESTS) {
         return;
     }
     let mut h = Harness::new();
