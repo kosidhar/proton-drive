@@ -224,11 +224,11 @@ async function driveRoute(req: Request, route: string, engine: DriveEngine): Pro
 
 // The drive helper's notices of files open for writing through the drive (#64): POST /vfs/writing {path, replacing} at a
 // file's first writer, as its writing turns into a replace, and every 30 s while it replaces it; POST /vfs/closed {path,
-// refused, replaced} when its last writer closes it. Neither takes deadlineMs: a close answers once the file is being
-// looked at, never waiting for its upload. { ok: true } for any well-formed body, whatever the path (one never marked,
-// gone, or not of My files), as often as it comes: the helper drops a refused close that the daemon answers with a 4xx,
-// which would let a file cut short upload. So only a malformed body is 400 { error, code: 'EINVAL' }, and anything that
-// fails here is 500 { error, code: 'EIO' }, which the helper sends again.
+// refused, replaced} when its last writer closes it. Neither takes deadlineMs: a close answers at once (the file is
+// looked at once it has settled), never waiting for that look or its upload. { ok: true } for any well-formed body,
+// whatever the path (one never marked, gone, or not of My files), as often as it comes: the helper drops a refused
+// close that the daemon answers with a 4xx, which would let a file cut short upload. So only a malformed body is 400
+// { error, code: 'EINVAL' }, and anything that fails here is 500 { error, code: 'EIO' }, which the helper sends again.
 async function driveNotice(route: string, body: Record<string, unknown> | null, engine: DriveEngine): Promise<Response> {
     const invalid = (message: string) => Response.json({ error: message, code: 'EINVAL' }, { status: 400 });
     if (!body) return invalid('Invalid JSON body');
