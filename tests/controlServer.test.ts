@@ -82,6 +82,24 @@ function makeFake(rejectWith?: string) {
         clearDriveWriting(): void {
             driveCalls.push(['clear']);
         },
+        // The files the drive's disk guard cut short (#300), and the user's choices about them
+        cutShort: [
+            { relPath: 'report.pdf', existing: true, size: 1200, detectedAt: 1_800_000_000_000 },
+            { relPath: 'Docs/new é.bin', existing: false, size: 7, detectedAt: 1_800_000_000_500 },
+        ],
+        listCutShort() {
+            driveCalls.push(['cut-short']);
+            return this.cutShort;
+        },
+        async uploadCutShort(paths: string[]): Promise<void> {
+            driveCalls.push(['cut-short upload', paths]);
+            if (paths.includes('broken.bin')) throw new Error('database is locked');
+        },
+        async putBackCutShort(paths: string[]): Promise<void> {
+            driveCalls.push(['cut-short restore', paths]);
+            if (paths.includes('Docs/new é.bin')) throw new DriveOpError('EINVAL', 'Proton Drive has no version of Docs/new é.bin to put back');
+            if (paths.includes('busy.bin')) throw new DriveOpError('EIO', 'Proton Drive is busy moving files');
+        },
     };
     return engine;
 }
@@ -494,6 +512,73 @@ describe('drive routes', () => {
         } finally {
             serve.mockRestore();
         }
+    });
+});
+
+// #300: the files the drive's disk guard cut short, held from uploading until the user decides
+describe('/cut-short routes', () => {
+    const post = (socketPath: string, route: string, body: unknown) =>
+        call(socketPath, route, { method: 'POST', body: typeof body === 'string' ? body : JSON.stringify(body) });
+
+    test('GET /cut-short lists them', async () => {
+        const { socketPath, engine } = await start();
+        const res = await call(socketPath, '/cut-short');
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ items: engine.cutShort });
+    });
+
+    test('POST /cut-short/upload and /cut-short/restore pass the paths through, as they are, and answer ok', async () => {
+        const { socketPath, engine } = await start();
+        for (const [route, paths] of [
+            ['/cut-short/upload', ['report.pdf', 'Docs/new é.bin']],
+            ['/cut-short/restore', ['report.pdf']],
+            ['/cut-short/upload', []],
+        ] as const) {
+            const res = await post(socketPath, route, { paths });
+            expect(res.status).toBe(200);
+            expect(await res.json()).toEqual({ ok: true });
+        }
+        expect(engine.driveCalls).toEqual([
+            ['cut-short upload', ['report.pdf', 'Docs/new é.bin']],
+            ['cut-short restore', ['report.pdf']],
+            ['cut-short upload', []],
+        ]);
+    });
+
+    test('a put back refused for a new file is 400 EINVAL; any other failure is 500 with its code', async () => {
+        const { socketPath } = await start();
+        const refused = await post(socketPath, '/cut-short/restore', { paths: ['Docs/new é.bin'] });
+        expect(refused.status).toBe(400);
+        expect(await refused.json()).toEqual({ error: 'Proton Drive has no version of Docs/new é.bin to put back', code: 'EINVAL' });
+        const busy = await post(socketPath, '/cut-short/restore', { paths: ['busy.bin'] });
+        expect(busy.status).toBe(500);
+        expect(await busy.json()).toEqual({ error: 'Proton Drive is busy moving files', code: 'EIO' });
+        const failed = await post(socketPath, '/cut-short/upload', { paths: ['broken.bin'] });
+        expect(failed.status).toBe(500);
+        expect(await failed.json()).toEqual({ error: 'database is locked', code: 'EIO' });
+    });
+
+    test('a malformed body is 400 EINVAL and reaches nothing; a wrong method is 405; an unknown route 404', async () => {
+        const { socketPath, engine } = await start();
+        const bad = [
+            await post(socketPath, '/cut-short/upload', '{nope'),
+            await post(socketPath, '/cut-short/upload', '[]'),
+            await post(socketPath, '/cut-short/upload', {}),
+            await post(socketPath, '/cut-short/upload', { paths: 'report.pdf' }),
+            await post(socketPath, '/cut-short/upload', { paths: ['report.pdf', 7] }),
+            await post(socketPath, '/cut-short/restore', { paths: null }),
+            await post(socketPath, '/cut-short/restore', { path: 'report.pdf' }),
+            await post(socketPath, '/cut-short/restore', { paths: [['report.pdf']] }),
+        ];
+        for (const res of bad) {
+            expect(res.status).toBe(400);
+            expect(((await res.json()) as { code: string }).code).toBe('EINVAL');
+        }
+        expect((await post(socketPath, '/cut-short', {})).status).toBe(405);
+        expect((await call(socketPath, '/cut-short/upload')).status).toBe(405);
+        expect((await call(socketPath, '/cut-short/restore')).status).toBe(405);
+        expect((await call(socketPath, '/cut-short/elsewhere')).status).toBe(404);
+        expect(engine.driveCalls).toEqual([]);
     });
 });
 

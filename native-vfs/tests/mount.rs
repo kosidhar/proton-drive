@@ -1775,6 +1775,31 @@ fn cp_over_a_file_posts_writing_then_closed_replaced() {
     assert_eq!((h.daemon().writings().len(), h.daemon().closes().len()), (1, 1));
 }
 
+// #300's main case: a copy over an online-only file, which the drive empties without a download (an O_TRUNC open)
+// before the copy writes it. Its session replaces the file from the start, as the daemon hears at the first writer,
+// and its close says so: a later close like it is what lifts a hold on a file the guard cut short
+#[test]
+fn cp_over_an_online_only_file_posts_writing_replacing_then_closed_replaced() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    let outside = h.root.join("outside.txt");
+    std::fs::write(&outside, b"the new version").unwrap();
+    h.start_daemon(HashMap::from([("", vec![file("a.txt", FIXTURE.len() as u64)])]));
+    h.mount();
+
+    assert_ok(&run(Command::new("cp").arg(&outside).arg(h.path("a.txt"))), "cp");
+    until("the close reaching the daemon", || !h.daemon().closes().is_empty());
+    assert_eq!(h.daemon().truncates(), ["a.txt"]);
+    assert_eq!(h.daemon().hydrate_calls(), 0);
+    assert_eq!(h.daemon().writings(), [json!({ "path": "a.txt", "replacing": true })]);
+    assert_eq!(h.daemon().closes(), [json!({ "path": "a.txt", "refused": false, "replaced": true })]);
+    assert_eq!(std::fs::read(h.backing.join("a.txt")).unwrap(), b"the new version");
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!((h.daemon().writings().len(), h.daemon().closes().len()), (1, 1));
+}
+
 // #64: an append edits the file in place, local or online-only (downloaded by its first write)
 #[test]
 fn an_append_posts_a_close_that_isnt_replacing() {
