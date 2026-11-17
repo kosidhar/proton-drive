@@ -1805,6 +1805,8 @@ struct ProtonDriveNativeApp {
     cut_short: Vec<CutShortItem>,
     /// Whether the summary row of many held files is opened into one row each
     cut_short_expanded: bool,
+    /// What `stats.cut_short_files` was when the held files were last asked for (answered or not)
+    cut_short_asked_at: u64,
     /// Why the last decision about held files was refused or failed
     cut_short_error: Option<String>,
     /// Screenshot-only: `--fake-cut-short`, in place of what the daemon lists
@@ -1951,6 +1953,7 @@ impl ProtonDriveNativeApp {
             conflict_error: None,
             cut_short: Vec::new(),
             cut_short_expanded: false,
+            cut_short_asked_at: 0,
             cut_short_error: None,
             fake_cut_short: None,
             edit_sync_dir,
@@ -2122,6 +2125,9 @@ impl ProtonDriveNativeApp {
                         self.apply_fake_signed_out(&mut s);
                         self.apply_fake_account_mismatch(&mut s);
                         self.apply_fake_paused(&mut s);
+                        if let Some(fake) = &self.fake_cut_short {
+                            s.stats.cut_short_files = fake.len() as u64;
+                        }
                         // Edits being made or saved stay as they are; Save compares them with what they were loaded from
                         if !self.settings_dirty && !self.settings_saving {
                             self.load_settings_form(&s.settings);
@@ -2144,12 +2150,8 @@ impl ProtonDriveNativeApp {
                         ) {
                             let _ = self.tx.send(WorkerCommand::LoadConflicts);
                         }
-                        if home::should_reload_cut_short(
-                            was_offline,
-                            self.status.stats.cut_short_files,
-                            s.stats.cut_short_files,
-                            self.cut_short.len(),
-                        ) {
+                        if home::should_reload_cut_short(was_offline, self.cut_short_asked_at, s.stats.cut_short_files) {
+                            self.cut_short_asked_at = s.stats.cut_short_files;
                             let _ = self.tx.send(WorkerCommand::LoadCutShort);
                         }
                         self.status = s;
@@ -5587,6 +5589,7 @@ mod tests {
                 conflict_error: None,
                 cut_short: Vec::new(),
                 cut_short_expanded: false,
+                cut_short_asked_at: 0,
                 cut_short_error: None,
                 fake_cut_short: None,
                 edit_sync_dir: String::new(),
@@ -6840,12 +6843,18 @@ mod tests {
         CutShortItem { rel_path: path.to_string(), existing, size: 10, detected_at: 1 }
     }
 
+    /// The daemon's status counts the held files, and its list names them
+    fn load_held(h: &mut Harness, items: Vec<CutShortItem>) {
+        h.app.status.stats.cut_short_files = items.len() as u64;
+        h.event(WorkerEvent::CutShortLoaded(Ok(items)));
+    }
+
     const CUT_SHORT_WHY: &str = " wasn't fully written: your computer's disk was nearly full.";
 
     #[test]
     fn a_held_existing_file_offers_upload_and_put_back() {
         let mut h = home_with(|_| {});
-        h.event(WorkerEvent::CutShortLoaded(Ok(vec![held_file("docs/report.pdf", true)])));
+        load_held(&mut h, vec![held_file("docs/report.pdf", true)]);
         assert!(h.text_at("Needs attention").is_some());
         assert!(h.text_at(&format!("report.pdf{CUT_SHORT_WHY}")).is_some());
         assert!(h.text_at("Proton Drive still has the version from before.").is_some());
@@ -6877,7 +6886,7 @@ mod tests {
     #[test]
     fn a_held_new_file_offers_only_upload_it_anyway() {
         let mut h = home_with(|_| {});
-        h.event(WorkerEvent::CutShortLoaded(Ok(vec![held_file("new.txt", false)])));
+        load_held(&mut h, vec![held_file("new.txt", false)]);
         assert!(h.text_at(&format!("new.txt{CUT_SHORT_WHY}")).is_some());
         assert!(h.text_at("It hasn't been uploaded.").is_some());
         assert!(h.text_at("Proton Drive still has the version from before.").is_none());
@@ -6892,7 +6901,7 @@ mod tests {
     fn more_than_three_held_files_are_one_summary_row_that_shows_them_on_request() {
         let mut h = home_with(|_| {});
         let items = vec![held_file("a.txt", true), held_file("b.txt", false), held_file("c.txt", true), held_file("d.txt", true)];
-        h.event(WorkerEvent::CutShortLoaded(Ok(items)));
+        load_held(&mut h, items);
         assert!(h.text_at("4 files weren't fully written: your computer's disk was nearly full.").is_some());
         assert!(h.text_at(&format!("a.txt{CUT_SHORT_WHY}")).is_none(), "one row, not four");
         h.click(h.text_at("Put back all").expect("some are existing"));
@@ -6912,26 +6921,61 @@ mod tests {
         h.frames(2);
         assert!(h.text_at(&format!("a.txt{CUT_SHORT_WHY}")).is_none());
         // Only new files: nothing to put back
-        h.event(WorkerEvent::CutShortLoaded(Ok((0..4).map(|i| held_file(&format!("n{i}"), false)).collect())));
+        load_held(&mut h, (0..4).map(|i| held_file(&format!("n{i}"), false)).collect());
         assert!(h.text_at("Put back all").is_none());
         assert!(h.text_at("Upload all anyway").is_some());
     }
 
     #[test]
-    fn held_files_count_as_problems_and_reload_with_their_count() {
+    fn held_files_count_as_problems_as_the_status_says_and_reload_with_their_count() {
         let mut h = home_with(|_| {});
-        h.event(WorkerEvent::CutShortLoaded(Ok((0..5).map(|i| held_file(&format!("f{i}"), true)).collect())));
+        load_held(&mut h, (0..5).map(|i| held_file(&format!("f{i}"), true)).collect());
         assert_eq!(h.app.attention.len(), 1, "five held files are one problem");
-        h.event(WorkerEvent::CutShortLoaded(Ok(vec![held_file("a", true), held_file("b", true)])));
+        load_held(&mut h, vec![held_file("a", true), held_file("b", true)]);
         assert_eq!(h.app.attention.len(), 2);
-        let _ = h.commands.try_iter().count();
-        let mut status = h.app.status.clone();
-        status.stats.cut_short_files = 2;
-        h.event(WorkerEvent::StatusAndActivity { status: Box::new(Ok(status.clone())), activity: Vec::new() });
-        assert!(h.commands.try_iter().any(|c| matches!(c, WorkerCommand::LoadCutShort)), "the count changed");
         // A daemon that can't list them leaves the list as it was
         h.event(WorkerEvent::CutShortLoaded(Err("Not found".into())));
         assert_eq!(h.app.cut_short.len(), 2);
+    }
+
+    #[test]
+    fn held_files_are_asked_for_once_per_count_even_when_the_load_fails() {
+        let mut h = home_with(|_| {});
+        let loads = |h: &Harness| h.commands.try_iter().filter(|c| matches!(c, WorkerCommand::LoadCutShort)).count();
+        let poll = |h: &mut Harness, n: u64| {
+            let mut status = h.app.status.clone();
+            status.stats.cut_short_files = n;
+            h.event(WorkerEvent::StatusAndActivity { status: Box::new(Ok(status)), activity: Vec::new() });
+        };
+        let _ = loads(&h);
+        poll(&mut h, 2);
+        assert_eq!(loads(&h), 1, "the count changed");
+        h.event(WorkerEvent::CutShortLoaded(Err("Can't reach".into())));
+        poll(&mut h, 2);
+        poll(&mut h, 2);
+        assert_eq!(loads(&h), 0, "a failed load is not asked again while the count is the same");
+        poll(&mut h, 3);
+        assert_eq!(loads(&h), 1, "the count changed again");
+        // A decision asks again
+        h.event(WorkerEvent::CutShortResolved(Ok(())));
+        assert_eq!(loads(&h), 1);
+    }
+
+    #[test]
+    fn the_status_count_makes_the_summary_row_before_the_list_arrives() {
+        let mut h = home_with(|s| s.stats.cut_short_files = 5);
+        assert_eq!(h.app.attention.len(), 1, "one problem, as the tray counts it");
+        assert!(h.text_at("5 files weren't fully written: your computer's disk was nearly full.").is_some());
+        assert!(h.text_at("1 problem needs you").is_some());
+        for label in ["Upload all anyway", "Put back all"] {
+            let at = h.text_at(label).expect(label);
+            assert_ne!(h.fill_under(at), Some(BG_CARD()), "{label} is greyed out until the list is there");
+            h.click(at);
+        }
+        assert_eq!(h.sent(), Vec::<String>::new());
+        h.event(WorkerEvent::CutShortLoaded(Ok((0..5).map(|i| held_file(&format!("f{i}"), true)).collect())));
+        h.click(h.text_at("Upload all anyway").unwrap());
+        assert_eq!(h.sent().len(), 1);
     }
 
     #[test]
