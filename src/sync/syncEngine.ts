@@ -126,6 +126,9 @@ export const LOCAL_RESERVE_BYTES = 5_000_000_000;
 const DISK_FULL_SHOWN_MS = 10 * 60_000;
 const DISK_FULL_KEPT_MS = 2 * 60_000;
 const DISK_FULL_ROOM_BYTES = 1_000_000_000;
+// An open refused for room is logged no more than once in this long (#301; see roomToDownload), as the drive helper logs
+// the writes its guard refuses: an app retrying, or walking a folder, would otherwise write a line for every try
+const ROOM_REFUSAL_LOGGED_EVERY_MS = 30_000;
 // Uid prefix of the remote index entries that stand for folders made here that Proton Drive doesn't have yet, holding
 // what a pending move puts in them (see applyPendingOpsToIndex). Never a node: never resolved, moved or trashed.
 const PROVISIONAL = 'provisional:';
@@ -335,6 +338,8 @@ export class ProtonDriveSyncEngine {
     private readonly hydrationSizes = new Map<string, number>();
     // A reading of the store's disk for an open failed, and was logged, with none working since (see roomToDownload)
     private hydrateDiskUnreadLogged = false;
+    // When an open refused for room was last logged, by the settle clock (see roomToDownload)
+    private roomRefusalLoggedAt: number | null = null;
     // Local changes handled at once, and the look of each path waiting for its turn (see handleLocalFileChange)
     private readonly localChangeSlots: Slots;
     private readonly localWaiting = new Map<string, Promise<void>>();
@@ -4855,8 +4860,9 @@ export class ProtonDriveSyncEngine {
     // opens and local change handling all go on meanwhile. Only placing it takes a turn there, for a moment, and whatever
     // happened meanwhile wins: a rename, delete or hide, a cloud move followed here, or a file written at the path (never
     // replaced). The staging file goes whatever happens. A download that wouldn't leave the disk its reserve is refused
-    // before anything is asked of Proton Drive (see roomToDownload). Returns whether it placed the file (false when a
-    // local copy is there instead, which is what opens).
+    // before anything is asked of Proton Drive, by the size the index has, and again once the node is read if Proton
+    // Drive says it is bigger (see roomToDownload). Returns whether it placed the file (false when a local copy is there
+    // instead, which is what opens).
     private async hydrateFile(rel: string, since: number, downloadStarted: () => void): Promise<boolean> {
         if (await this.existsLocally(rel)) {
             return false;
@@ -4875,12 +4881,20 @@ export class ProtonDriveSyncEngine {
 
     // Whether this computer's disk has room for a download for an open (#301): the store's disk, as read now, must keep
     // the drive's reserve (LOCAL_RESERVE_BYTES, as the helper's guard does for writes, #295) once `size` bytes, and the
-    // whole of each download for an open already under way, are on it. If not, it is refused with ENOSPC (the app is told
-    // "No space left on device"), as a refusal for room the status tells of (see driveRefused). If it has room, the
-    // download is counted (hydrationSizes) until it ends, for the next check. A disk that can't be read refuses nothing,
-    // as before the check: that is logged, once until a reading works again. Nothing runs between the reading and the
+    // whole of each other download for an open under way, are on it. If not, it is refused with ENOSPC (the app is told
+    // "No space left on device"), as a refusal for room the status tells of (see driveRefused), and logged, no more than
+    // once every ROOM_REFUSAL_LOGGED_EVERY_MS. If it has room, the download counts as `size` (hydrationSizes) until it
+    // ends, for the next check. Checked again with a bigger size (Proton Drive's, once the node is read), with the bytes
+    // it already counts as `counted`, the count goes up to it, or the download is refused. A size of 0 has nothing to
+    // make room for, as the guard never refuses what doesn't grow a file: it isn't checked (a file whose size the index
+    // doesn't have, which it says is 0, is checked once the node is read). A disk that can't be read refuses nothing, as
+    // before the check: that is logged, once until a reading works again. Nothing runs between the reading and the
     // count, so two opens at once can't both squeeze into the room of one.
-    private async roomToDownload(rel: string, size: number): Promise<void> {
+    private async roomToDownload(rel: string, size: number, counted = 0): Promise<void> {
+        if (size === 0) {
+            this.hydrationSizes.set(rel, 0);
+            return;
+        }
         let available: number | null;
         try {
             available = await this.diskFreeNow();
@@ -4892,15 +4906,32 @@ export class ProtonDriveSyncEngine {
                 this.logger.warn(`Couldn't read the free space of this computer's disk before downloading ${rel}: ${messageOf(error)}`);
             }
         }
-        let underWay = 0;
+        let underWay = -counted;
         for (const bytes of this.hydrationSizes.values()) {
             underWay += bytes;
         }
         if (available !== null && available - (size + underWay) < LOCAL_RESERVE_BYTES) {
             this.driveRefused(size, available);
+            this.logRoomRefusal(rel, size, available);
             throw new DriveOpError('ENOSPC', "Not enough room on this computer's disk");
         }
         this.hydrationSizes.set(rel, size);
+    }
+
+    // The log's line for an open refused for room (see roomToDownload), unless one was written in the last
+    // ROOM_REFUSAL_LOGGED_EVERY_MS: the status says the disk is almost full, and this is where the user finds which
+    // file, and how much it asked for
+    private logRoomRefusal(rel: string, size: number, available: number): void {
+        const now = this.settleNow();
+        const last = this.roomRefusalLoggedAt;
+        if (last !== null && now >= last && now - last < ROOM_REFUSAL_LOGGED_EVERY_MS) {
+            return;
+        }
+        this.roomRefusalLoggedAt = now;
+        const reserve = `${LOCAL_RESERVE_BYTES / 1_000_000_000} GB`;
+        this.logger.info(
+            `Not enough room to download ${rel} for an app to open it: Proton Drive keeps ${reserve} free on this computer's disk (${size} bytes asked, ${available} available)`,
+        );
     }
 
     // hydrateFile's download, once there is room for it
@@ -4919,6 +4950,13 @@ export class ProtonDriveSyncEngine {
         }
         if (node.type !== NodeType.File || isUnsupportedRemoteNode(node)) {
             throw new DriveOpError('EIO', `Not a file: ${rel}`);
+        }
+        // Proton Drive's own size, which the index may not have had: a file whose size it doesn't claim (0 in the
+        // index), or a newer version, bigger. Without a claimed size, the stored size (encrypted, so never less) stands in.
+        const size = node.activeRevision?.claimedSize ?? node.activeRevision?.storageSize ?? 0;
+        const counted = this.hydrationSizes.get(rel) ?? 0;
+        if (size > counted) {
+            await this.roomToDownload(rel, size, counted);
         }
         const staging = path.join(this.localRoot(), `${HYDRATE_STAGING_PREFIX}${randomUUID()}`);
         const transferId = `dl:${rel}`;
