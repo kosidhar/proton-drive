@@ -373,6 +373,18 @@ struct DaemonStatus {
     /// When the last sync pass finished, epoch milliseconds; absent before the first one
     #[serde(default)]
     last_sync_at: Option<i64>,
+    /// While the computer's disk is almost full and the drive refused to save a file for it (#299); the daemon
+    /// clears it itself. Older daemons send none.
+    #[serde(default)]
+    disk_full: Option<DiskFull>,
+}
+
+/// `diskFull` in /api/status: when the drive last refused a write for the disk's sake, epoch milliseconds.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiskFull {
+    #[allow(dead_code)] // Home only shows the notice while it is there; the daemon decides when it ends
+    refused_at: i64,
 }
 
 /// What is missing while the daemon holds because the files are missing from the folder (`filesMissing` in
@@ -1830,6 +1842,8 @@ struct ProtonDriveNativeApp {
     fake_signed_out: bool,
     /// Screenshot-only: `--account-mismatch`, the daemon holding another account's records, laid over every status
     fake_account_mismatch: bool,
+    /// Screenshot-only: `--fake-disk-full`
+    fake_disk_full: bool,
     /// Screenshot-only: `--paused-until-min N`, paused until N minutes from the start (0: until resumed)
     fake_paused_until: Option<i64>,
     /// Home's Pause choices are open (#205)
@@ -1966,6 +1980,7 @@ impl ProtonDriveNativeApp {
             fake_transfers: None,
             fake_signed_out: false,
             fake_account_mismatch: false,
+            fake_disk_full: false,
             fake_paused_until: None,
             pause_choices_open: false,
             account_menu_open: false,
@@ -2018,6 +2033,13 @@ impl ProtonDriveNativeApp {
         status.state = "error".into();
         status.last_error = Some(message.to_string());
         status.account_mismatch = Some(AccountMismatch { message: message.to_string() });
+    }
+
+    /// Screenshot-only: lays `--fake-disk-full` over a status from the daemon (#299).
+    fn apply_fake_disk_full(&self, status: &mut DaemonStatus) {
+        if self.fake_disk_full {
+            status.disk_full = Some(DiskFull { refused_at: home::now_ms() });
+        }
     }
 
     /// Screenshot-only: lays `--files-missing` over a status from the daemon.
@@ -2124,6 +2146,7 @@ impl ProtonDriveNativeApp {
                         self.apply_fake_transfers(&mut s);
                         self.apply_fake_signed_out(&mut s);
                         self.apply_fake_account_mismatch(&mut s);
+                        self.apply_fake_disk_full(&mut s);
                         self.apply_fake_paused(&mut s);
                         if let Some(fake) = &self.fake_cut_short {
                             s.stats.cut_short_files = fake.len() as u64;
@@ -4672,6 +4695,7 @@ OPTIONS:
                         drive) as S (none | link | link-password | link-expired | people)
   --confirm-stop-sharing <NAME>  with --screenshot and --fake-shared list: show the Stop sharing confirmation for that row
   --fake-cut-short <S>  with --screenshot: list files held because the disk guard cut them short (one | many)
+  --fake-disk-full      with --screenshot: show Home's notice that the computer's disk is almost full
   --fake-shared <S>     with --screenshot: show the Shared section (--tab shared) as S (list | empty | offline)
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --zoom <F>            with --screenshot: render at zoom factor F (0.5 to 3, e.g. 1.2), as Ctrl+= would
@@ -4720,6 +4744,7 @@ fn main() -> eframe::Result {
     let mut cli_fake_share: Option<String> = None;
     let mut cli_fake_shared: Option<String> = None;
     let mut cli_fake_cut_short: Option<String> = None;
+    let mut cli_fake_disk_full = false;
     let mut cli_confirm_stop_sharing: Option<String> = None;
     let mut cli_zoom: Option<f32> = None;
     // The arguments as the system gives them: one that isn't UTF-8 (a file's name can be anything) mustn't stop the app
@@ -4786,6 +4811,9 @@ fn main() -> eframe::Result {
             "--fake-cut-short" => {
                 cli_fake_cut_short = text(args.next());
             }
+            "--fake-disk-full" => {
+                cli_fake_disk_full = true;
+            }
             "--fake-shared" => {
                 cli_fake_shared = text(args.next());
             }
@@ -4850,12 +4878,13 @@ fn main() -> eframe::Result {
             || cli_fake_share.is_some()
             || cli_fake_shared.is_some()
             || cli_fake_cut_short.is_some()
+            || cli_fake_disk_full
             || cli_confirm_stop_sharing.is_some()
             || cli_fake_pinned.is_some()
             || cli_zoom.is_some())
     {
         eprintln!(
-            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --account-menu, --fake-share, --fake-shared, --fake-cut-short, --confirm-stop-sharing, --fake-pinned and --zoom only apply together with --screenshot; ignoring them"
+            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --account-menu, --fake-share, --fake-shared, --fake-cut-short, --fake-disk-full, --confirm-stop-sharing, --fake-pinned and --zoom only apply together with --screenshot; ignoring them"
         );
     }
     let fake_share = match cli_fake_share {
@@ -5035,6 +5064,7 @@ fn main() -> eframe::Result {
                 app.fake_transfers = cli_fake_transfers;
                 app.fake_signed_out = cli_signed_out;
                 app.fake_account_mismatch = cli_account_mismatch;
+                app.fake_disk_full = cli_fake_disk_full;
                 // Epoch ms from the minutes asked for (0: paused until resumed)
                 app.fake_paused_until = cli_paused_until_min.map(|min| if min > 0 { home::now_ms() + min * 60_000 } else { 0 });
                 app.pause_choices_open = cli_pause_choices;
@@ -5045,6 +5075,7 @@ fn main() -> eframe::Result {
                 app.apply_fake_transfers(&mut status);
                 app.apply_fake_signed_out(&mut status);
                 app.apply_fake_account_mismatch(&mut status);
+                app.apply_fake_disk_full(&mut status);
                 app.apply_fake_paused(&mut status);
                 app.status = status;
                 app.refresh_attention();
@@ -5602,6 +5633,7 @@ mod tests {
                 fake_transfers: None,
                 fake_signed_out: false,
                 fake_account_mismatch: false,
+                fake_disk_full: false,
                 fake_paused_until: None,
                 pause_choices_open: false,
                 account_menu_open: false,
@@ -7005,6 +7037,55 @@ mod tests {
         h.event(WorkerEvent::CutShortLoaded(Ok((0..5).map(|i| held_file(&format!("f{i}"), true)).collect())));
         h.click(h.text_at("Upload all anyway").unwrap());
         assert_eq!(h.sent().len(), 1);
+    }
+
+    // "5 GB" never wraps between the number and its unit (a no-break space)
+    const DISK_FULL_NOTICE: &str = "Your computer's disk is almost full. Proton Drive keeps 5\u{a0}GB free on it, so new files can't be saved to the drive.";
+
+    /// The notice's Free up space… button: the first of the two Home paints (the other is under Your drive).
+    fn disk_full_button(h: &Harness) -> egui::Pos2 {
+        let buttons = h.text_at_all("Free up space…");
+        assert_eq!(buttons.len(), 2, "the notice's and Your drive's");
+        let notice = h.text_rect(DISK_FULL_NOTICE).expect("the notice is shown");
+        assert!(buttons[0].y > notice.bottom() && buttons[0].y < buttons[1].y, "the first is right under the notice");
+        buttons[0]
+    }
+
+    #[test]
+    fn the_disk_full_notice_shows_and_offers_free_up_space() {
+        let mut h = home_with(|s| s.disk_full = Some(DiskFull { refused_at: 1_700_000_000_000 }));
+        h.click(disk_full_button(&h));
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::FreeAll { rel_path: String::new(), marks: Marks::Unknown }));
+    }
+
+    #[test]
+    fn the_disk_full_notices_button_waits_for_the_daemon_and_for_work_under_way() {
+        let full = |s: &mut DaemonStatus| s.disk_full = Some(DiskFull { refused_at: 1_700_000_000_000 });
+        let mut h = home_with(full);
+        h.app.daemon_online = false;
+        h.frames(2);
+        h.click(disk_full_button(&h));
+        assert_eq!(h.app.pending_confirm, None, "the daemon is offline");
+        let mut h = home_with(full);
+        h.app.working.push("Docs".into());
+        h.frames(2);
+        h.click(disk_full_button(&h));
+        assert_eq!(h.app.pending_confirm, None, "something is being freed or kept already");
+    }
+
+    #[test]
+    fn no_notice_without_disk_full() {
+        let h = home_with(|_| {});
+        assert!(h.text_at(DISK_FULL_NOTICE).is_none());
+    }
+
+    #[test]
+    fn the_disk_full_status_parses_and_an_old_daemons_has_none() {
+        let base = r#"{"state":"idle","loggedIn":true,"syncDir":"/x","activeTransfers":[],"stats":{"totalFiles":0,"totalFolders":0,"totalBytes":0,"unresolvedConflicts":0,"errorItems":0},"settings":{}"#;
+        let old: Result<DaemonStatus, _> = serde_json::from_str(&format!("{base}}}"));
+        let new: Result<DaemonStatus, _> = serde_json::from_str(&format!(r#"{base},"diskFull":{{"refusedAt":5}}}}"#));
+        assert_eq!(old.unwrap().disk_full, None);
+        assert_eq!(new.unwrap().disk_full, Some(DiskFull { refused_at: 5 }));
     }
 
     #[test]

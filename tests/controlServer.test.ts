@@ -82,6 +82,11 @@ function makeFake(rejectWith?: string) {
         clearDriveWriting(): void {
             driveCalls.push(['clear']);
         },
+        // What the drive helper tells of a write its disk guard refused for lack of room (#299)
+        driveRefused(needed: number, available: number): void {
+            driveCalls.push(['refused', needed, available]);
+            if (needed === 666) throw new Error('database is locked');
+        },
         // The files the drive's disk guard cut short (#300), and the user's choices about them
         cutShort: [
             { relPath: 'report.pdf', existing: true, size: 1200, detectedAt: 1_800_000_000_000 },
@@ -497,6 +502,52 @@ describe('drive routes', () => {
 
         // The helper sends a refused close again on a 5xx, never on a 4xx
         const failed = await post(socketPath, '/vfs/closed', { path: 'broken.bin', refused: true, replaced: true });
+        expect(failed.status).toBe(500);
+        expect(await failed.json()).toEqual({ error: 'database is locked', code: 'EIO' });
+    });
+
+    // #299: the helper's report of a write its disk guard refused for lack of room on this computer's disk (one every
+    // 30 s at most): as for the other notices, any well-formed body is ok, only a malformed one is 400 EINVAL
+    test('POST /vfs/refused passes the sizes to the engine and answers ok', async () => {
+        const { socketPath, engine } = await start();
+        const answers = [
+            await post(socketPath, '/vfs/refused', { needed: 131_072, available: 4_900_000_000 }),
+            await post(socketPath, '/vfs/refused', { needed: 0, available: 0, deadlineMs: 'whenever', extra: 1 }),
+            // A u64 as large as the helper can send: past 2^53, a number all the same
+            await post(socketPath, '/vfs/refused', '{"needed":18446744073709551615,"available":5000000000}'),
+        ];
+        for (const res of answers) {
+            expect(res.status).toBe(200);
+            expect(await res.json()).toEqual({ ok: true });
+        }
+        expect(engine.driveCalls).toEqual([
+            ['refused', 131_072, 4_900_000_000],
+            ['refused', 0, 0],
+            ['refused', 18446744073709551615, 5_000_000_000],
+        ]);
+    });
+
+    test('a malformed refusal is 400 EINVAL and reaches nothing; a GET is 405; a failure is 500', async () => {
+        const { socketPath, engine } = await start();
+        const bad = [
+            await post(socketPath, '/vfs/refused', '{nope'),
+            await post(socketPath, '/vfs/refused', '[]'),
+            await post(socketPath, '/vfs/refused', {}),
+            await post(socketPath, '/vfs/refused', { needed: 131_072 }),
+            await post(socketPath, '/vfs/refused', { available: 131_072 }),
+            await post(socketPath, '/vfs/refused', { needed: '131072', available: 4_900_000_000 }),
+            await post(socketPath, '/vfs/refused', { needed: 131_072, available: null }),
+            await post(socketPath, '/vfs/refused', { needed: -1, available: 4_900_000_000 }),
+            await post(socketPath, '/vfs/refused', { needed: 131_072, available: 1.5 }),
+        ];
+        for (const res of bad) {
+            expect(res.status).toBe(400);
+            expect(((await res.json()) as { code: string }).code).toBe('EINVAL');
+        }
+        expect((await call(socketPath, '/vfs/refused')).status).toBe(405);
+        expect(engine.driveCalls).toEqual([]);
+
+        const failed = await post(socketPath, '/vfs/refused', { needed: 666, available: 0 });
         expect(failed.status).toBe(500);
         expect(await failed.json()).toEqual({ error: 'database is locked', code: 'EIO' });
     });

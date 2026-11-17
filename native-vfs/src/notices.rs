@@ -31,8 +31,8 @@ pub enum Notice {
     /// The file's last writer closed it: `refused` when a write or growth to it was refused for room (so it may be cut
     /// short), `replaced` when the session replaced it
     Closed { path: String, refused: bool, replaced: bool },
-    /// The guard refused a write for lack of room on the system disk (#299)
-    #[allow(dead_code)] // sent once the guard reports its refusals (#299)
+    /// The guard refused a write for lack of room on the system disk (#299): at most one every 30 s, as it logs them
+    /// (see fs.rs's LocalRoom::report_to)
     Refused { needed: u64, available: u64 },
 }
 

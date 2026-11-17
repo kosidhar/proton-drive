@@ -51,6 +51,7 @@ impl DriveFs {
         // Posted on a client of their own: nothing of the listings' backoff applies to them
         let poster = daemon.on_same_socket();
         let notices = Notices::start(move |notice| poster.notify(notice.route(), notice.body()));
+        report_refusals(&room, &notices);
         DriveFs::with_room(backing, daemon, room, notices)
     }
 
@@ -1911,6 +1912,39 @@ struct LocalRoom {
     last: Mutex<Option<RoomReading>>,
     /// When a refusal was last logged
     logged: Mutex<Option<Instant>>,
+    /// Who hears of the refusals for lack of room that are logged (see report_to): the daemon, once set
+    report: OnceLock<Box<dyn Fn(u64, u64) + Send + Sync>>,
+}
+
+/// Why the guard refused a change that grows a file.
+enum Refusal {
+    /// It would leave the disk under the reserve: `needed` bytes asked, with `available` on the disk
+    NoRoom { needed: u64, available: u64 },
+    /// The disk's free space couldn't be read
+    Unreadable(std::io::Error),
+}
+
+impl Refusal {
+    /// What the app is told: ENOSPC for lack of room, EIO when the disk couldn't be read.
+    fn errno(&self) -> Errno {
+        match self {
+            Refusal::NoRoom { .. } => Errno::ENOSPC,
+            Refusal::Unreadable(_) => Errno::EIO,
+        }
+    }
+
+    fn log(&self) {
+        match self {
+            Refusal::NoRoom { needed, available } => log!(
+                "protondrive-vfs: refused a write that would leave the system disk with less than {} GB free \
+                 ({needed} bytes asked, {available} available)",
+                LOCAL_RESERVE / 1_000_000_000
+            ),
+            Refusal::Unreadable(err) => {
+                log!("protondrive-vfs: couldn't read the system disk's free space, so a write was refused: {err}")
+            }
+        }
+    }
 }
 
 struct RoomReading {
@@ -1922,7 +1956,15 @@ struct RoomReading {
 
 impl LocalRoom {
     fn new(read: impl Fn() -> std::io::Result<u64> + Send + Sync + 'static) -> Self {
-        LocalRoom { read: Box::new(read), last: Mutex::new(None), logged: Mutex::new(None) }
+        LocalRoom { read: Box::new(read), last: Mutex::new(None), logged: Mutex::new(None), report: OnceLock::new() }
+    }
+
+    /// Has `report` hear of the refusals for lack of room, with the bytes asked and what the disk had (#299): those
+    /// that are logged, so one at most every REFUSAL_LOG_EVERY. One because the disk couldn't be read isn't one of
+    /// them: it says nothing of the disk being full. Called from allow, with no lock held. Set once: a later `report`
+    /// is ignored.
+    fn report_to(&self, report: impl Fn(u64, u64) + Send + Sync + 'static) {
+        let _ = self.report.set(Box::new(report));
     }
 
     /// The guard on the disk the backing store is on.
@@ -1933,7 +1975,8 @@ impl LocalRoom {
     /// Whether a file may grow by `growth` bytes now; if so, they count against the disk's room until it is read
     /// again, once the reading is older than ROOM_READING_TTL or more than ROOM_READING_GRANT was granted on it. A
     /// refusal is logged, though at most once every REFUSAL_LOG_EVERY: the drive shows far more free space than this
-    /// computer has, and the log says why a save failed.
+    /// computer has, and the log says why a save failed. The refusals for lack of room that are logged are reported
+    /// too (see report_to).
     fn allow(&self, growth: u64) -> Result<(), Errno> {
         if growth == 0 {
             return Ok(());
@@ -1944,24 +1987,22 @@ impl LocalRoom {
         };
         if self.log_due() {
             refusal.log();
+            if let (Refusal::NoRoom { needed, available }, Some(report)) = (&refusal, self.report.get()) {
+                report(*needed, *available);
+            }
         }
-        Err(refusal.errno)
+        Err(refusal.errno())
     }
 
-    /// allow's check, under the reading's lock: a refusal comes with its line, for allow to log once it is let go.
-    fn grant(&self, growth: u64) -> Result<(), Failure> {
+    /// allow's check, under the reading's lock: a refusal says why, for allow to log and report once it is let go.
+    fn grant(&self, growth: u64) -> Result<(), Refusal> {
         let mut last = lock(&self.last);
         let mut reading = match last.take() {
             Some(r) if r.at.elapsed() <= ROOM_READING_TTL && r.granted <= ROOM_READING_GRANT => r,
             _ => match (self.read)() {
                 Ok(available) => RoomReading { at: Instant::now(), available, granted: 0 },
                 // No reading is no proof of room: nothing grows until the disk can be read again
-                Err(err) => {
-                    let line = format!(
-                        "protondrive-vfs: couldn't read the system disk's free space, so a write was refused: {err}"
-                    );
-                    return Err(Failure { errno: Errno::EIO, line: Some(line) });
-                }
+                Err(err) => return Err(Refusal::Unreadable(err)),
             },
         };
         let room = reading.available.saturating_sub(reading.granted);
@@ -1973,12 +2014,7 @@ impl LocalRoom {
         if allowed {
             return Ok(());
         }
-        let line = format!(
-            "protondrive-vfs: refused a write that would leave the system disk with less than {} GB free \
-             ({growth} bytes asked, {room} available)",
-            LOCAL_RESERVE / 1_000_000_000
-        );
-        Err(Failure { errno: Errno::ENOSPC, line: Some(line) })
+        Err(Refusal::NoRoom { needed: growth, available: room })
     }
 
     /// Whether a refusal's line is due: the first, then one at most every REFUSAL_LOG_EVERY.
@@ -1990,6 +2026,13 @@ impl LocalRoom {
         }
         due
     }
+}
+
+/// The guard's refusals for lack of room, told to the daemon as they are logged (#299): it says in its status that
+/// this computer's disk is almost full. Through `notices`, so the guard never waits on the daemon.
+fn report_refusals(room: &LocalRoom, notices: &Arc<Notices>) {
+    let notices = notices.clone();
+    room.report_to(move |needed, available| notices.send(Notice::Refused { needed, available }));
 }
 
 #[cfg(test)]
@@ -2216,6 +2259,73 @@ mod tests {
         let unreadable = LocalRoom::new(|| Err(std::io::Error::from_raw_os_error(libc::EIO)));
         assert_eq!(unreadable.allow(1), Err(Errno::EIO));
         assert!(lock(&unreadable.logged).is_some());
+    }
+
+    /// What `room` reports of its refusals (#299), as (needed, available), in order.
+    fn reports_of(room: &LocalRoom) -> Arc<Mutex<Vec<(u64, u64)>>> {
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let into = reported.clone();
+        room.report_to(move |needed, available| into.lock().unwrap().push((needed, available)));
+        reported
+    }
+
+    #[test]
+    fn a_due_refusal_is_reported_with_its_sizes() {
+        let (room, _) = room_of(6 * GB);
+        let reported = reports_of(&room);
+        assert_eq!(room.allow(MB), Ok(()));
+        assert_eq!(*reported.lock().unwrap(), [], "nothing refused, nothing reported");
+        // What was asked, and what the disk had: as the log line says
+        let (big, _) = room_of(6 * GB);
+        let reported = reports_of(&big);
+        assert_eq!(big.allow(2 * GB), Err(Errno::ENOSPC));
+        assert_eq!(*reported.lock().unwrap(), [(2 * GB, 6 * GB)]);
+        // Set once: a second reporter changes nothing
+        let other = reports_of(&big);
+        *lock(&big.logged) = None;
+        assert_eq!(big.allow(3 * GB), Err(Errno::ENOSPC));
+        assert_eq!(*reported.lock().unwrap(), [(2 * GB, 6 * GB), (3 * GB, 6 * GB)]);
+        assert_eq!(*other.lock().unwrap(), []);
+    }
+
+    #[test]
+    fn refusals_within_30_s_are_reported_once() {
+        let (room, _) = room_of(6 * GB);
+        let reported = reports_of(&room);
+        assert_eq!(room.allow(2 * GB), Err(Errno::ENOSPC));
+        assert_eq!(room.allow(3 * GB), Err(Errno::ENOSPC));
+        assert_eq!(room.allow(2 * GB), Err(Errno::ENOSPC));
+        assert_eq!(*reported.lock().unwrap(), [(2 * GB, 6 * GB)], "the next ones, so soon after, aren't");
+        // 30 s on, one is again
+        let first = lock(&room.logged).expect("the first refusal is logged");
+        if let Some(earlier) = first.checked_sub(Duration::from_secs(31)) {
+            *lock(&room.logged) = Some(earlier);
+            assert_eq!(room.allow(3 * GB), Err(Errno::ENOSPC));
+            assert_eq!(*reported.lock().unwrap(), [(2 * GB, 6 * GB), (3 * GB, 6 * GB)]);
+        }
+    }
+
+    #[test]
+    fn an_unreadable_disk_isnt_reported() {
+        // Refused (EIO) and logged, but it says nothing of the disk being full
+        let room = LocalRoom::new(|| Err(std::io::Error::from_raw_os_error(libc::EIO)));
+        let reported = reports_of(&room);
+        assert_eq!(room.allow(1), Err(Errno::EIO));
+        assert!(lock(&room.logged).is_some(), "logged all the same");
+        assert_eq!(*reported.lock().unwrap(), []);
+    }
+
+    #[test]
+    fn a_reported_refusal_reaches_the_daemon_as_a_notice() {
+        let ((room, _), (notices, sent)) = (room_of(6 * GB), recording());
+        report_refusals(&room, &notices);
+        assert_eq!(room.allow(2 * GB), Err(Errno::ENOSPC));
+        let started = Instant::now();
+        while sent.lock().unwrap().is_empty() {
+            assert!(started.elapsed() < Duration::from_secs(5), "the notice never went out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(*sent.lock().unwrap(), [Notice::Refused { needed: 2 * GB, available: 6 * GB }]);
     }
 
     #[test]

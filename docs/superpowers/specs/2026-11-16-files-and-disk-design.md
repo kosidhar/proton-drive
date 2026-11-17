@@ -167,9 +167,15 @@ choices below (how the drive tells the daemon, where cut-short files are kept) w
   keeps 5 GB free on it, so new files can't be saved to the drive." It has a **Free up space…** button, which opens
   the existing whole-drive Free up space dialog.
 - **The tray:** its status line says "Disk almost full" while the notice shows.
-- **When it goes away:** 10 minutes after the last refusal, or sooner once the store's disk has 1 GB more than the
-  reserve free again (checked when status is read; my call). An open the daemon refuses for space (#301) counts as a
-  refusal too.
+- **When it goes away** (changed after the final review: going away as soon as the disk had 1 GB more than the reserve
+  free hid the notice when a big growth or open was refused with that much free, and when an app deleted its partial
+  file at once): 10 minutes after the last refusal. Sooner only when both hold:
+  - at least 2 minutes have passed since the last refusal;
+  - the store's disk has the reserve free plus 1 GB, or plus the most any refusal asked for since these 10 minutes
+    began, if that is more. These 10 minutes begin at a refusal that comes once the last ones are over.
+
+  The disk is read only while the 10 minutes run, at each refusal and when status is read, one reading at a time.
+  An open the daemon refuses for space (#301) counts as a refusal too.
 
 ### #301: an open that would fill the disk
 - **The check:** before downloading a file for an open (`hydrate`), the daemon reads the store's disk free space
