@@ -123,7 +123,8 @@ pub enum Attention {
     /// `CUT_SHORT_ROWS`
     CutShort(CutShortItem),
     /// More than `CUT_SHORT_ROWS` of them: one row for all, which Show them opens into one row each
-    CutShortMany(Vec<CutShortItem>),
+    /// `count` is what the daemon's status says (the tray counts from it); `items` is what has been listed so far
+    CutShortMany { count: usize, items: Vec<CutShortItem> },
     FilesMissing,
     DriveNotMounted { message: String, can_mount: bool },
     StoppedMove,
@@ -164,10 +165,12 @@ pub fn attention_items(status: &DaemonStatus, conflicts: &[ConflictRecord], cut_
     let mut open: Vec<&ConflictRecord> = conflicts.iter().filter(|c| c.resolved == 0).collect();
     open.sort_by_key(|c| c.id);
     items.extend(open.into_iter().map(|c| Attention::Conflict { id: c.id, rel_path: c.local_rel_path.clone() }));
-    if cut_short.len() > CUT_SHORT_ROWS {
-        items.push(Attention::CutShortMany(cut_short.to_vec()));
+    // How many are held is what the status says, as the tray counts them; the list says which
+    let held = usize::try_from(status.stats.cut_short_files).unwrap_or(usize::MAX);
+    if held > CUT_SHORT_ROWS {
+        items.push(Attention::CutShortMany { count: held, items: cut_short.to_vec() });
     } else {
-        items.extend(cut_short.iter().cloned().map(Attention::CutShort));
+        items.extend(cut_short.iter().take(held).cloned().map(Attention::CutShort));
     }
     if status.stats.error_items > 0 {
         items.push(Attention::FailedItems(status.stats.error_items));
@@ -183,10 +186,11 @@ pub fn attention_items(status: &DaemonStatus, conflicts: &[ConflictRecord], cut_
 /// How many held files Needs attention lists one by one; more are one row for all of them.
 pub const CUT_SHORT_ROWS: usize = 3;
 
-/// Whether a status refresh asks for the held files again: when the daemon came back, when their count changed, and
-/// when the list shown is not as long as the count says.
-pub fn should_reload_cut_short(was_offline: bool, old_count: u64, new_count: u64, listed: usize) -> bool {
-    was_offline || old_count != new_count || listed as u64 != new_count
+/// Whether a status refresh asks for the held files again: when the daemon came back, and when their count differs
+/// from what it was when they were last asked for (asked for, not answered: a load that keeps failing is not retried
+/// on every refresh; a later change of the count, or a decision, asks again).
+pub fn should_reload_cut_short(was_offline: bool, count_when_last_asked: u64, new_count: u64) -> bool {
+    was_offline || count_when_last_asked != new_count
 }
 
 /// The first line of a held file's row: its name in bold, then why it is held.
@@ -862,7 +866,7 @@ impl ProtonDriveNativeApp {
                 });
             }
             Attention::CutShort(item) => attention_row(ui, |ui| self.render_cut_short(ui, &item)),
-            Attention::CutShortMany(items) => self.render_cut_short_many(ui, &items),
+            Attention::CutShortMany { count, items } => self.render_cut_short_many(ui, count, &items),
             Attention::DriveNotMounted { message, can_mount } => {
                 attention_row(ui, |ui| {
                     ui.add(egui::Label::new(RichText::new(&message).size(13.5).strong().color(TEXT_PRIMARY())).wrap());
@@ -935,17 +939,18 @@ impl ProtonDriveNativeApp {
     }
 
     /// Many held files: one row for all of them, which Show them opens into one row each.
-    fn render_cut_short_many(&mut self, ui: &mut egui::Ui, items: &[CutShortItem]) {
+    fn render_cut_short_many(&mut self, ui: &mut egui::Ui, count: usize, items: &[CutShortItem]) {
         attention_row(ui, |ui| {
-            let (bold_part, rest) = cut_short_summary(items.len());
+            let (bold_part, rest) = cut_short_summary(count);
             ui.add(egui::Label::new(cut_short_line(&bold_part, rest)).wrap());
             ui.add_space(8.0);
-            let online = self.daemon_online;
+            // The bulk buttons act on the list, which may not have arrived yet
+            let online = self.daemon_online && !items.is_empty();
             ui.horizontal_wrapped(|ui| {
                 if action_button_if(ui, online, ButtonKind::Secondary, Some(icons::KEEP_LOCAL), "Upload all anyway", 30.0).clicked() {
                     self.resolve_cut_short(items.iter().map(|i| i.rel_path.clone()).collect(), false);
                 }
-                if offers_put_back(items) {
+                if items.is_empty() || offers_put_back(items) {
                     ui.add_space(8.0);
                     let clicked = action_button_if(ui, online, ButtonKind::Secondary, Some(icons::KEEP_REMOTE), "Put back all", 30.0).clicked();
                     if clicked {
@@ -1306,13 +1311,18 @@ mod tests {
         CutShortItem { rel_path: path.to_string(), existing, size: 10, detected_at: 1 }
     }
 
+    fn holding(n: u64) -> DaemonStatus {
+        let mut s = status("idle", vec![], false);
+        s.stats.cut_short_files = n;
+        s
+    }
+
     #[test]
     fn attention_lists_cut_short_files_one_each_up_to_three() {
-        let s = status("idle", vec![], false);
-        assert!(attention_items(&s, &[], &[]).is_empty());
+        assert!(attention_items(&holding(0), &[], &[]).is_empty());
         let three = [held("a", true), held("b", false), held("c", true)];
         assert_eq!(
-            attention_items(&s, &[conflict(1, "x", 0)], &three),
+            attention_items(&holding(3), &[conflict(1, "x", 0)], &three),
             vec![
                 Attention::Conflict { id: 1, rel_path: "x".into() },
                 Attention::CutShort(three[0].clone()),
@@ -1324,21 +1334,25 @@ mod tests {
 
     #[test]
     fn more_than_three_cut_short_files_are_one_row() {
-        let s = status("idle", vec![], false);
         let four = vec![held("a", true), held("b", false), held("c", true), held("d", true)];
-        assert_eq!(attention_items(&s, &[], &four), vec![Attention::CutShortMany(four.clone())]);
+        assert_eq!(attention_items(&holding(4), &[], &four), vec![Attention::CutShortMany { count: 4, items: four.clone() }]);
         assert!(offers_put_back(&four));
         assert!(!offers_put_back(&[held("a", false), held("b", false)]));
         assert_eq!(cut_short_summary(214).0, "214 files");
+        // The status says how many, before the list is there
+        assert_eq!(
+            attention_items(&holding(5), &[], &[]),
+            vec![Attention::CutShortMany { count: 5, items: vec![] }]
+        );
+        // A stale list longer than the count is cut to it
+        assert_eq!(attention_items(&holding(1), &[], &four).len(), 1);
     }
 
     #[test]
-    fn held_files_are_reloaded_when_their_count_changes_or_the_list_is_short() {
-        assert!(should_reload_cut_short(true, 0, 0, 0), "the daemon came back");
-        assert!(should_reload_cut_short(false, 0, 2, 0), "the count changed");
-        assert!(should_reload_cut_short(false, 2, 2, 1), "the list is short");
-        assert!(!should_reload_cut_short(false, 2, 2, 2));
-        assert!(!should_reload_cut_short(false, 0, 0, 0));
+    fn held_files_are_reloaded_when_the_count_differs_from_the_last_ask() {
+        assert!(should_reload_cut_short(true, 0, 0), "the daemon came back");
+        assert!(should_reload_cut_short(false, 0, 2), "the count changed");
+        assert!(!should_reload_cut_short(false, 2, 2), "asked at this count already, answered or not");
     }
 
     fn vfs(mode: &str, mounted: bool, reason: Option<&str>) -> crate::VfsStatus {
