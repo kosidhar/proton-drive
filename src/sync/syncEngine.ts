@@ -369,6 +369,10 @@ export class ProtonDriveSyncEngine {
             // Let through only because it had changed for SETTLE_MAX_WAIT_MS, not because it went quiet: still being
             // written, as far as anyone knows (see stillChangingWhenLetThrough)
             forced?: boolean;
+            // Only on a file held by a replacing mark (#64): when the run of changes it was in before that writing
+            // began started (by the settle clock), or null if it was in none. Its close goes on with that run (see
+            // settleClosed); the time it was held never counts as changing.
+            heldRun?: number | null;
             cancel: () => void;
         }
     >();
@@ -376,8 +380,10 @@ export class ProtonDriveSyncEngine {
     private readonly runningLooks = new Set<Promise<void>>();
     // Files open for writing through the virtual drive, by path, as the drive helper says (#64; driveWriting,
     // driveClosed): whether the writing replaces the file (a copy over it, a save, a new file: held until its last close)
-    // or edits it in place (a log, a database: the 2-minute rule), and when the helper last said so, by the settle clock
-    // (see stillBeingWritten). In memory only: after a restart, the helper's keepalives mark the files being replaced again.
+    // or edits it in place (a log, a database: the 2-minute rule), and when the helper last said so (see
+    // stillBeingWritten). Timed by the monotonic clock (markNow), which a suspend doesn't move, as it doesn't move the
+    // helper's keepalives: a laptop asleep mid-copy wakes with the mark still on. In memory only: after a restart, the
+    // helper's keepalives mark the files being replaced again.
     private readonly writingMarks = new Map<string, { replacing: boolean; at: number }>();
     // Cancels the timer that ends a timed pause (see setPaused), while one is set
     private cancelPauseTimer: (() => void) | null = null;
@@ -404,11 +410,14 @@ export class ProtonDriveSyncEngine {
             filesMissingCacheMs?: number;
             // How long a changed file must stay as it is before it uploads (see stillBeingWritten); quietMs 0 uploads
             // at once. For tests: the clock it is timed by, and how the look once it should have settled is scheduled.
+            // markNow: the clock the drive's marks of files open for writing are timed by (see writingMarks); by
+            // default now, if given, else the monotonic clock, as the drive helper's keepalives are.
             settle?: {
                 quietMs?: number;
                 maxQuietMs?: number;
                 maxWaitMs?: number;
                 now?: () => number;
+                markNow?: () => number;
                 schedule?: (run: () => Promise<void>, delayMs: number) => () => void;
             };
             // For tests: the clock a timed pause is timed by, and how its end is scheduled (see setPaused)
@@ -3081,13 +3090,16 @@ export class ProtonDriveSyncEngine {
         const baseQuietMs = settle.quietMs ?? SETTLE_QUIET_MS;
         const now = this.settleNow();
         const seen = seenAs(st);
-        const mark = this.liveWritingMark(relPath, now);
+        const mark = this.liveWritingMark(relPath);
         if (mark?.replacing) {
-            // Looked at again meanwhile, so that it settles as any other once the mark is gone (the helper died, or
-            // started again), and starts over then: what it was seen as before the mark is of no use
+            // Looked at again meanwhile, so that it settles as any other once the mark is gone without a close. It
+            // keeps the run of changes it was in before this writing began (written in sessions more often than it
+            // settles: see settleClosed)
+            const held = this.settlingFiles.get(relPath);
+            const heldRun = !held || held.settled ? null : held.heldRun !== undefined ? held.heldRun : held.changingSince;
             this.forgetSettling(relPath);
             const cancel = this.scheduleLook(relPath, baseQuietMs > 0 ? baseQuietMs : SETTLE_QUIET_MS);
-            this.settlingFiles.set(relPath, { seen, since: now, quietMs: baseQuietMs, changingSince: now, settled: false, cancel });
+            this.settlingFiles.set(relPath, { seen, since: now, quietMs: baseQuietMs, changingSince: now, settled: false, heldRun, cancel });
             return true;
         }
         if (baseQuietMs <= 0) {
@@ -3098,7 +3110,14 @@ export class ProtonDriveSyncEngine {
                 this.settlingFiles.delete(rel); // Long settled: its ctime says so by now
             }
         }
-        const earlier = this.settlingFiles.get(relPath);
+        let earlier = this.settlingFiles.get(relPath);
+        if (earlier?.heldRun !== undefined) {
+            // Held by a replacing mark that went without a close (it lapsed: the helper died; the helper started again;
+            // a rename replaced the file): it settles over from now, never let through for what it did while held,
+            // neither as quiet since then nor as changing for SETTLE_MAX_WAIT_MS
+            this.forgetSettling(relPath);
+            earlier = undefined;
+        }
         if (earlier?.settled && earlier.seen === seen) {
             if (earlier.forced && (now - earlier.since >= earlier.quietMs || Date.now() - st.ctimeMs >= earlier.quietMs)) {
                 earlier.forced = false; // Let through while it changed, and quiet since: settled after all
@@ -3165,11 +3184,18 @@ export class ProtonDriveSyncEngine {
         });
     }
 
+    // The clock the drive's marks are timed by (see writingMarks): the monotonic one, which a suspend doesn't move (as
+    // performance.now() is in Bun: CLOCK_MONOTONIC); tests move it on
+    private markNow(): number {
+        const settle = this.options.settle;
+        return (settle?.markNow ?? settle?.now ?? (() => performance.now()))();
+    }
+
     // A file's mark as open for writing through the drive (see writingMarks), if it has a live one: a replacing mark the
-    // helper hasn't said again for DRIVE_MARK_EXPIRES_MS is gone
-    private liveWritingMark(relPath: string, now: number): { replacing: boolean; at: number } | undefined {
+    // helper hasn't said again for DRIVE_MARK_EXPIRES_MS (by the mark clock) is gone
+    private liveWritingMark(relPath: string): { replacing: boolean; at: number } | undefined {
         const mark = this.writingMarks.get(relPath);
-        if (mark?.replacing && now - mark.at > DRIVE_MARK_EXPIRES_MS) {
+        if (mark?.replacing && this.markNow() - mark.at > DRIVE_MARK_EXPIRES_MS) {
             this.writingMarks.delete(relPath);
             return undefined;
         }
@@ -3178,7 +3204,7 @@ export class ProtonDriveSyncEngine {
 
     // Whether a file is being replaced through the drive right now: never uploaded while it is (see stillBeingWritten)
     private beingReplaced(relPath: string): boolean {
-        return this.liveWritingMark(relPath, this.settleNow())?.replacing === true;
+        return this.liveWritingMark(relPath)?.replacing === true;
     }
 
     // For a one-off sync (the CLI's): waits, up to timeoutMs, for the files still being written to settle and be looked
@@ -3769,7 +3795,7 @@ export class ProtonDriveSyncEngine {
     driveWriting(relPath: string, replacing: boolean): void {
         const rel = drivePathOrNull(relPath);
         if (rel) {
-            this.writingMarks.set(rel, { replacing, at: this.settleNow() });
+            this.writingMarks.set(rel, { replacing, at: this.markNow() });
         }
     }
 
@@ -3803,15 +3829,25 @@ export class ProtonDriveSyncEngine {
     // at once: an editor saving through a temp file renames it over the file right after closing it, and the temp file,
     // gone by that look, never uploads (only the file does, once). A file that isn't there isn't looked at: a close is
     // never what reads as a delete (the watcher's report of it going, and the sync pass, decide).
+    // A file written again before it settled (in sessions more often than every SETTLE_QUIET_MS: a status file rewritten
+    // every second, a log opened for each line) goes on with the run of changes it was in, so that it uploads once it
+    // has changed for SETTLE_MAX_WAIT_MS, as any file that never stops changing does: looked at as soon as that is due,
+    // between two sessions, never while one replaces it. The time a replacing session held it isn't part of a run: a
+    // copy that took 10 minutes starts its run at its close.
     private async settleClosed(rel: string): Promise<void> {
         const st = await stat(path.join(this.localRoot(), rel)).catch(() => null);
+        const earlier = this.settlingFiles.get(rel);
         this.forgetSettling(rel); // its wait, and one that a report began meanwhile
         if (!st?.isFile()) {
             return;
         }
         const now = this.settleNow();
-        const quietMs = this.options.settle?.quietMs ?? SETTLE_QUIET_MS;
-        const entry = { seen: seenAs(st), since: now, quietMs, changingSince: now, settled: false, cancel: () => {} };
+        const settle = this.options.settle ?? {};
+        const quietMs = settle.quietMs ?? SETTLE_QUIET_MS;
+        const maxWaitMs = settle.maxWaitMs ?? SETTLE_MAX_WAIT_MS;
+        const run = !earlier || earlier.settled ? null : earlier.heldRun !== undefined ? earlier.heldRun : earlier.changingSince;
+        const changingSince = run ?? now;
+        const entry = { seen: seenAs(st), since: now, quietMs, changingSince, settled: false, cancel: () => {} };
         entry.cancel = this.scheduleSettling(async () => {
             await this.lookAgain(rel);
             // A look that never weighed it (the file as recorded, or gone) leaves nothing settling: kept, it would count
@@ -3819,7 +3855,7 @@ export class ProtonDriveSyncEngine {
             if (this.settlingFiles.get(rel) === entry) {
                 this.settlingFiles.delete(rel);
             }
-        }, Math.max(quietMs, 0));
+        }, Math.max(Math.min(quietMs, changingSince + maxWaitMs - now), 0));
         this.settlingFiles.set(rel, entry);
     }
 
