@@ -53,7 +53,7 @@ of main 3f39a7d.
   | Keepalive for a replacing session | every 30 s |
   | Expiry of a replacing mark | 90 s |
   | `diskFull` window | 10 minutes after the last refusal |
-  | Early clear of `diskFull` | the store's disk has `LOCAL_RESERVE_BYTES + 1_000_000_000` available |
+  | Early clear of `diskFull` | at least 2 minutes after the last refusal, and the store's disk has `LOCAL_RESERVE_BYTES + max(1_000_000_000, the largest needed since the window opened)` available (changed after #299's final review; see the spec) |
   | Summary row | above 3 held files |
   | Activity | one line per burst; another only after 60 s |
   | Settle constants | unchanged: `SETTLE_QUIET_MS` 2000, `SETTLE_MAX_WAIT_MS` 120 000 |
