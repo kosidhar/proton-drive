@@ -316,6 +316,14 @@ class StatusLineTest(unittest.TestCase):
         self.assertEqual(tray.status_line(status(state="paused", diskFull={"refusedAt": 1}))[0], "Paused")
         self.assertEqual(tray.status_line(status(loggedIn=False, diskFull={"refusedAt": 1}))[0], "Signed out")
 
+    def test_disk_full_wins_over_moving_files_and_what_follows(self):
+        full = {"refusedAt": 1}
+        moving = {"mode": "virtual", "mounted": False, "reason": "moving"}
+        self.assertEqual(tray.status_line(status(diskFull=full, vfs=moving))[0], "Disk almost full")
+        self.assertEqual(tray.status_line(status(diskFull=full, state="syncing"))[0], "Disk almost full")
+        problems = {"unresolvedConflicts": 1, "errorItems": 0}
+        self.assertEqual(tray.status_line(status(diskFull=full, stats=problems))[0], "Disk almost full")
+
     def test_what_moves(self):
         syncing = lambda transfers: tray.status_line(status(state="syncing", activeTransfers=transfers))  # noqa: E731
         self.assertEqual(syncing([]), ("Checking for changes…", "protondrive-tray-syncing"))

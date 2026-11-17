@@ -7039,14 +7039,38 @@ mod tests {
         assert_eq!(h.sent().len(), 1);
     }
 
-    const DISK_FULL_NOTICE: &str = "Your computer's disk is almost full. Proton Drive keeps 5 GB free on it, so new files can't be saved to the drive.";
+    // "5 GB" never wraps between the number and its unit (a no-break space)
+    const DISK_FULL_NOTICE: &str = "Your computer's disk is almost full. Proton Drive keeps 5\u{a0}GB free on it, so new files can't be saved to the drive.";
+
+    /// The notice's Free up space… button: the first of the two Home paints (the other is under Your drive).
+    fn disk_full_button(h: &Harness) -> egui::Pos2 {
+        let buttons = h.text_at_all("Free up space…");
+        assert_eq!(buttons.len(), 2, "the notice's and Your drive's");
+        let notice = h.text_rect(DISK_FULL_NOTICE).expect("the notice is shown");
+        assert!(buttons[0].y > notice.bottom() && buttons[0].y < buttons[1].y, "the first is right under the notice");
+        buttons[0]
+    }
 
     #[test]
     fn the_disk_full_notice_shows_and_offers_free_up_space() {
         let mut h = home_with(|s| s.disk_full = Some(DiskFull { refused_at: 1_700_000_000_000 }));
-        assert!(h.text_at(DISK_FULL_NOTICE).is_some());
-        h.click(h.text_at("Free up space…").expect("the notice offers Free up space"));
+        h.click(disk_full_button(&h));
         assert_eq!(h.app.pending_confirm, Some(PendingConfirm::FreeAll { rel_path: String::new(), marks: Marks::Unknown }));
+    }
+
+    #[test]
+    fn the_disk_full_notices_button_waits_for_the_daemon_and_for_work_under_way() {
+        let full = |s: &mut DaemonStatus| s.disk_full = Some(DiskFull { refused_at: 1_700_000_000_000 });
+        let mut h = home_with(full);
+        h.app.daemon_online = false;
+        h.frames(2);
+        h.click(disk_full_button(&h));
+        assert_eq!(h.app.pending_confirm, None, "the daemon is offline");
+        let mut h = home_with(full);
+        h.app.working.push("Docs".into());
+        h.frames(2);
+        h.click(disk_full_button(&h));
+        assert_eq!(h.app.pending_confirm, None, "something is being freed or kept already");
     }
 
     #[test]
