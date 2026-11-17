@@ -51,7 +51,7 @@ fn folder(name: &str) -> Value {
 /// What the fake daemon answers: listings from a map, and hydrate copying FIXTURE into the backing store after a
 /// delay (200 ms unless told otherwise), through a staging file as the daemon does, or refusing with a code. Renames
 /// and deletes are recorded with their bodies and, unless refused, applied to the map and the backing store as the
-/// daemon would.
+/// daemon would. What the drive says of files open for writing (#64) is recorded as it is.
 struct Fake {
     children: Mutex<HashMap<String, Vec<Value>>>,
     hydrate_delay: Duration,
@@ -118,6 +118,8 @@ struct Calls {
     renames: Mutex<Vec<Value>>,
     deletes: Mutex<Vec<Value>>,
     truncates: Mutex<Vec<String>>,
+    writings: Mutex<Vec<Value>>,
+    closes: Mutex<Vec<Value>>,
 }
 
 struct FakeDaemon {
@@ -164,6 +166,14 @@ impl FakeDaemon {
 
     fn truncates(&self) -> Vec<String> {
         self.calls.truncates.lock().unwrap().clone()
+    }
+
+    fn writings(&self) -> Vec<Value> {
+        self.calls.writings.lock().unwrap().clone()
+    }
+
+    fn closes(&self) -> Vec<Value> {
+        self.calls.closes.lock().unwrap().clone()
     }
 }
 
@@ -253,6 +263,12 @@ fn serve(mut stream: UnixStream, backing: &Path, fake: &Fake, calls: &Calls) {
                 Ok(()) => (200, json!({ "ok": true })),
                 Err(code) => (400, json!({ "error": "Refused", "code": code })),
             }
+        }
+        // Notices: no deadline, since they change nothing
+        ("POST", None) if target == "/vfs/writing" || target == "/vfs/closed" => {
+            let notices = if target == "/vfs/writing" { &calls.writings } else { &calls.closes };
+            notices.lock().unwrap().push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+            (200, json!({ "ok": true }))
         }
         ("POST", None) if target == "/vfs/hydrate" => {
             let n = calls.hydrates.fetch_add(1, Ordering::SeqCst);
@@ -757,6 +773,12 @@ fn a_write_that_would_leave_the_system_disk_under_5_gb_is_refused() {
     // An overwrite in place always goes through
     file.write_all_at(b"HELLO", 0).unwrap();
     assert_eq!(std::fs::read(h.backing.join("a.txt")).unwrap(), b"HELLO");
+    // As each writer closes it, the daemon hears (#64): the first made it, so replaced it; the second's growths were
+    // refused, so it may be cut short
+    drop(file);
+    until("the second close reaching the daemon", || h.daemon().closes().len() == 2);
+    let closed = |refused: bool, replaced: bool| json!({ "path": "a.txt", "refused": refused, "replaced": replaced });
+    assert_eq!(h.daemon().closes(), [closed(false, true), closed(true, false)]);
 }
 
 /// truncate(2) by path, as truncate(1) without an open file does.
@@ -1718,4 +1740,60 @@ fn an_open_file_deleted_or_replaced_through_the_drive_still_changes_through_its_
     replaced.set_len(3).expect("ftruncate on a replaced file");
     assert_eq!(replaced.metadata().unwrap().len(), 3);
     assert_eq!(std::fs::read(h.backing.join("replaced.txt")).unwrap(), b"new");
+}
+
+/// Until `done` says so: the drive's notices go out on a thread of its own, after the app's close has returned.
+fn until(what: &str, done: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !done() {
+        assert!(started.elapsed() < LIMIT, "{what} never happened");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// #64: a copy over a file replaces it, which the daemon hears of as the copy opens it, and again as it closes it
+#[test]
+fn cp_over_a_file_posts_writing_then_closed_replaced() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    std::fs::write(h.backing.join("a.txt"), b"the version from before").unwrap();
+    let outside = h.root.join("outside.txt");
+    std::fs::write(&outside, b"the new version").unwrap();
+    h.start_daemon(HashMap::new());
+    h.mount();
+
+    assert_ok(&run(Command::new("cp").arg(&outside).arg(h.path("a.txt"))), "cp");
+    until("the close reaching the daemon", || !h.daemon().closes().is_empty());
+    assert_eq!(h.daemon().writings(), [json!({ "path": "a.txt", "replacing": true })]);
+    assert_eq!(h.daemon().closes(), [json!({ "path": "a.txt", "refused": false, "replaced": true })]);
+    assert_eq!(std::fs::read(h.backing.join("a.txt")).unwrap(), b"the new version");
+    // Reading it says nothing
+    assert_eq!(run(Command::new("cat").arg(h.path("a.txt"))).stdout, b"the new version");
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!((h.daemon().writings().len(), h.daemon().closes().len()), (1, 1));
+}
+
+// #64: an append edits the file in place, local or online-only (downloaded by its first write)
+#[test]
+fn an_append_posts_a_close_that_isnt_replacing() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    std::fs::write(h.backing.join("log.txt"), b"one\n").unwrap();
+    h.start_daemon(HashMap::from([("", vec![file("online.txt", FIXTURE.len() as u64)])]));
+    h.mount();
+
+    for name in ["log.txt", "online.txt"] {
+        assert_ok(&sh("echo more >> \"$1\"", &[&h.path(name)]), "append");
+    }
+    until("both closes reaching the daemon", || h.daemon().closes().len() == 2);
+    let notice = |path: &str| json!({ "path": path, "replacing": false });
+    assert_eq!(h.daemon().writings(), [notice("log.txt"), notice("online.txt")]);
+    let closed = |path: &str| json!({ "path": path, "refused": false, "replaced": false });
+    assert_eq!(h.daemon().closes(), [closed("log.txt"), closed("online.txt")]);
+    assert_eq!(std::fs::read(h.backing.join("log.txt")).unwrap(), b"one\nmore\n");
+    assert_eq!(std::fs::read(h.backing.join("online.txt")).unwrap(), [FIXTURE, b"more\n"].concat());
 }
