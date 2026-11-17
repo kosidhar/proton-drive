@@ -6939,7 +6939,7 @@ mod tests {
     }
 
     #[test]
-    fn held_files_are_asked_for_once_per_count_even_when_the_load_fails() {
+    fn held_files_are_asked_for_on_every_status_while_each_has_a_row_and_once_per_count_above() {
         let mut h = home_with(|_| {});
         let loads = |h: &Harness| h.commands.try_iter().filter(|c| matches!(c, WorkerCommand::LoadCutShort)).count();
         let poll = |h: &mut Harness, n: u64| {
@@ -6948,17 +6948,46 @@ mod tests {
             h.event(WorkerEvent::StatusAndActivity { status: Box::new(Ok(status)), activity: Vec::new() });
         };
         let _ = loads(&h);
+        // 1 to 3 held, a row each: asked for at every status, so a failed load or a renamed file is never left shown
         poll(&mut h, 2);
         assert_eq!(loads(&h), 1, "the count changed");
         h.event(WorkerEvent::CutShortLoaded(Err("Can't reach".into())));
         poll(&mut h, 2);
         poll(&mut h, 2);
+        assert_eq!(loads(&h), 2, "asked again at each status, after a failed load too");
+        h.event(WorkerEvent::CutShortLoaded(Ok(vec![held_file("a.txt", true), held_file("b.txt", true)])));
+        assert_eq!(h.app.attention.len(), 2, "the rows are back");
+        poll(&mut h, 2);
+        h.event(WorkerEvent::CutShortLoaded(Ok(vec![held_file("a.txt", true), held_file("renamed.txt", true)])));
+        assert!(h.text_at(&format!("renamed.txt{CUT_SHORT_WHY}")).is_some(), "a rename at the same count shows");
+        assert_eq!(loads(&h), 1);
+        // More than 3: one summary row, by the status's count; the list is asked for once per count
+        poll(&mut h, 5);
+        assert_eq!(loads(&h), 1, "the count changed");
+        h.event(WorkerEvent::CutShortLoaded(Err("Can't reach".into())));
+        poll(&mut h, 5);
+        poll(&mut h, 5);
         assert_eq!(loads(&h), 0, "a failed load is not asked again while the count is the same");
-        poll(&mut h, 3);
+        poll(&mut h, 6);
         assert_eq!(loads(&h), 1, "the count changed again");
         // A decision asks again
         h.event(WorkerEvent::CutShortResolved(Ok(())));
         assert_eq!(loads(&h), 1);
+    }
+
+    // At the window's smallest, zoomed: a held file's line wraps, its name bold, so why it is held is never cut off
+    #[test]
+    fn a_held_files_row_wraps_at_the_smallest_window() {
+        for name in ["report.pdf", "Quarterly report for the board, final version with every appendix.pdf"] {
+            let mut h = home_with(|_| {});
+            load_held(&mut h, vec![held_file(&format!("docs/{name}"), true)]);
+            h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
+            let line = h.texts(|t| t.galley.text() == format!("{name}{CUT_SHORT_WHY}"));
+            assert_eq!(line.len(), 1, "{name}: the row's line is shown");
+            assert!(!line[0].galley.elided, "{name}: nothing of it is cut off");
+            let fonts: Vec<_> = line[0].galley.job.sections.iter().map(|s| s.format.font_id.family.clone()).collect();
+            assert_eq!(fonts, vec![FontFamily::Name(BOLD_FAMILY.into()), FontFamily::Proportional], "{name}: the name bold");
+        }
     }
 
     #[test]

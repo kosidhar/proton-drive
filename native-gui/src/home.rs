@@ -186,11 +186,14 @@ pub fn attention_items(status: &DaemonStatus, conflicts: &[ConflictRecord], cut_
 /// How many held files Needs attention lists one by one; more are one row for all of them.
 pub const CUT_SHORT_ROWS: usize = 3;
 
-/// Whether a status refresh asks for the held files again: when the daemon came back, and when their count differs
-/// from what it was when they were last asked for (asked for, not answered: a load that keeps failing is not retried
-/// on every refresh; a later change of the count, or a decision, asks again).
+/// Whether a status refresh asks for the held files again: when the daemon came back, when their count differs from
+/// what it was when they were last asked for, and on every refresh while they are few enough to have a row each (1 to
+/// CUT_SHORT_ROWS), as the conflicts are: a load that failed, or a file renamed or replaced by another at the same
+/// count, would otherwise leave those rows missing or stale. Above that, one summary row counts them by the status, and
+/// they are asked for once per count (asked for, not answered: a load that keeps failing is not retried on every
+/// refresh; a later change of the count, or a decision, asks again).
 pub fn should_reload_cut_short(was_offline: bool, count_when_last_asked: u64, new_count: u64) -> bool {
-    was_offline || count_when_last_asked != new_count
+    was_offline || count_when_last_asked != new_count || (1..=CUT_SHORT_ROWS as u64).contains(&new_count)
 }
 
 /// The first line of a held file's row: its name in bold, then why it is held.
@@ -917,7 +920,8 @@ impl ProtonDriveNativeApp {
     fn render_cut_short(&mut self, ui: &mut egui::Ui, item: &CutShortItem) {
         let name = file_name(&item.rel_path);
         let (bold_part, rest) = cut_short_title(name);
-        ui.add(egui::Label::new(cut_short_line(&bold_part, rest)).truncate()).on_hover_text(&item.rel_path);
+        // Wrapped, as the summary row is: a long name never hides why it is held
+        ui.add(egui::Label::new(cut_short_line(&bold_part, rest)).wrap()).on_hover_text(&item.rel_path);
         ui.add_space(2.0);
         ui.add(egui::Label::new(RichText::new(cut_short_detail(item.existing)).size(12.5).color(TEXT_MUTED())).wrap());
         ui.add_space(8.0);
@@ -1349,10 +1353,15 @@ mod tests {
     }
 
     #[test]
-    fn held_files_are_reloaded_when_the_count_differs_from_the_last_ask() {
+    fn held_files_are_reloaded_on_every_refresh_while_each_has_a_row_and_once_per_count_above() {
         assert!(should_reload_cut_short(true, 0, 0), "the daemon came back");
         assert!(should_reload_cut_short(false, 0, 2), "the count changed");
-        assert!(!should_reload_cut_short(false, 2, 2), "asked at this count already, answered or not");
+        for n in 1..=CUT_SHORT_ROWS as u64 {
+            assert!(should_reload_cut_short(false, n, n), "{n} held: their rows are kept current");
+        }
+        assert!(!should_reload_cut_short(false, 0, 0), "none held, as before");
+        assert!(!should_reload_cut_short(false, 5, 5), "above 3, asked at this count already, answered or not");
+        assert!(should_reload_cut_short(false, 5, 6), "above 3, the count changed");
     }
 
     fn vfs(mode: &str, mounted: bool, reason: Option<&str>) -> crate::VfsStatus {

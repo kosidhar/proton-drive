@@ -3355,6 +3355,7 @@ export class ProtonDriveSyncEngine {
         }
 
         if (event.type === DriveEventType.NodeDeleted) {
+            this.forgetHeldNodes(event.nodeUid);
             this.index.removeSubtree(event.nodeUid);
             const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
             // One with a rename or move through the drive on its way is left to its replay, which keeps its local copy
@@ -3366,6 +3367,7 @@ export class ProtonDriveSyncEngine {
 
         if (event.type === DriveEventType.NodeCreated || event.type === DriveEventType.NodeUpdated) {
             if (event.isTrashed) {
+                this.forgetHeldNodes(event.nodeUid);
                 this.index.removeSubtree(event.nodeUid);
                 const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
                 if (tracked && !this.awaitsRemoteOp(tracked.localRelPath, event.nodeUid)) {
@@ -3379,6 +3381,24 @@ export class ProtonDriveSyncEngine {
             }
             // Trigger incremental reconcile
             await this.reconcileNow();
+        }
+    }
+
+    // A node is gone from Proton Drive (deleted, or moved to its trash), with everything in it: a file cut short (#300) held
+    // as an edit of one of them that no record tracks (a copy over an online-only file has only an edit baseline) is held
+    // on as a new file, as Proton Drive has no version of it left to put back. One a record tracks is seen to by the
+    // removal that follows (see holdsAfterRemoval). Before the remote index forgets the node, which says what was in it.
+    private forgetHeldNodes(nodeUid: string): void {
+        const entry = this.index.getByUid(nodeUid);
+        const gone = new Set([nodeUid, ...(entry ? this.index.listSubtree(entry.relPath).map((e) => e.uid) : [])]);
+        for (const hold of this.stateDb.listCutShort()) {
+            if (
+                hold.nodeUid !== null &&
+                gone.has(hold.nodeUid) &&
+                this.stateDb.getItemByPath(hold.relPath)?.nodeUid !== hold.nodeUid
+            ) {
+                this.stateDb.holdCutShort({ ...hold, nodeUid: null });
+            }
         }
     }
 
@@ -3439,23 +3459,13 @@ export class ProtonDriveSyncEngine {
                 records.drop(entry.relPath);
             }
             return this.clearKeptAfterCloudDelete(root, relPath, scan.entries, kept);
-        });
-        // A file cut short that went to the desktop Trash with the rest is no longer here to hold (#300); one that stayed
-        // here is held on, as a new file: what it was an edit of is gone from Proton Drive, and so is its record
-        this.stateDb.dropStaleCutShort((rel) => !isWithin(rel, relPath) || this.localFileExists(rel));
-        for (const hold of this.stateDb.listCutShort()) {
-            if (isWithin(hold.relPath, relPath) && hold.nodeUid !== null) {
-                this.stateDb.holdCutShort({ ...hold, nodeUid: null });
-            }
-        }
+        }).finally(() => this.holdsAfterRemoval(relPath));
         const told: string[] = [];
         if (moved > 0) {
             told.push(`${moved} item(s) that existed only on this computer were moved to your Trash.`);
         }
         if (stayed > 0) {
-            // Where the user sees it, never the virtual drive's backing store
-            const where = path.join(settings.syncDir, relPath);
-            told.push(`${stayed} item(s) that existed only on this computer were kept at ${where} and will upload again.`);
+            told.push(this.keptHere(stayed, relPath));
         }
         if (told.length === 0) {
             this.stateDb.logActivity({
@@ -3476,6 +3486,32 @@ export class ProtonDriveSyncEngine {
             urgency: 'normal',
             enabled: settings.notificationsEnabled,
         });
+    }
+
+    // After a removal of what is at and under relPath (a cloud delete, a drive delete or Move to Trash), with its records
+    // and its item in Proton Drive gone: the holds of files cut short (#300) that went with the rest go too, and those of
+    // files that stayed here (the desktop Trash refused them, or the removal failed part-way) are held on, as new files,
+    // as nothing in Proton Drive is left for them to be an edit of. Run whether the removal finished or not.
+    private holdsAfterRemoval(relPath: string): void {
+        this.stateDb.dropStaleCutShort((rel) => !isWithin(rel, relPath) || this.localFileExists(rel));
+        for (const hold of this.stateDb.listCutShort()) {
+            if (isWithin(hold.relPath, relPath) && hold.nodeUid !== null) {
+                this.stateDb.holdCutShort({ ...hold, nodeUid: null });
+            }
+        }
+    }
+
+    // What the user is told of the items a removal kept at relPath (the desktop Trash refused them), where they see them
+    // (never the virtual drive's backing store): they upload again, as new items, except files cut short (#300), which
+    // stay held here until the user chooses on Home (see holdsAfterRemoval)
+    private keptHere(stayed: number, relPath: string): string {
+        const where = path.join(this.stateDb.getSettings().syncDir, relPath);
+        const held = this.stateDb.listCutShort().filter((hold) => isWithin(hold.relPath, relPath)).length;
+        return held === 0
+            ? `${stayed} item(s) that existed only on this computer were kept at ${where} and will upload again.`
+            : `${stayed} item(s) that existed only on this computer were kept at ${where}. The ${held} file(s) there that ` +
+                  "weren't fully written stay on this computer until you choose what to do with them on Home; anything " +
+                  'else kept will upload again.';
     }
 
     // Clears what a removal after a cloud delete left in relPath (see removeAfterCloudDelete), with its records already
@@ -5267,6 +5303,7 @@ export class ProtonDriveSyncEngine {
                   })
                 : null;
         let kept = { moved: 0, stayed: 0 };
+        let removed = false; // its records gone, and its trash journalled: what is left of it here is seen to after
         await this.whileRemoving(
             async (records) => {
                 // Records first, in one transaction with the index and the journalled trash: a crash before the files
@@ -5275,7 +5312,8 @@ export class ProtonDriveSyncEngine {
                 this.stateDb.connection.transaction(() => {
                     this.stateDb.removeItemByPath(relPath);
                     this.stateDb.dropEditBaselines(relPath);
-                    this.stateDb.dropCutShort(relPath); // What was cut short there is deleted too, as the user asked (#300)
+                    // Not the holds of files cut short (#300): a Move to Trash keeps here what the desktop Trash refuses,
+                    // which must stay held. They are seen to once the files have gone (see holdsAfterRemoval)
                     if (collision) {
                         // Nothing is left of this computer's side: what stays is the cloud's version
                         this.endConflictsAsKeepRemote(collisions);
@@ -5294,6 +5332,7 @@ export class ProtonDriveSyncEngine {
                 // delete is there to see (#154). Nothing runs between the commit and this, which writes nothing (the
                 // records went in the transaction), so it can't fail after the delete committed
                 records.noteSubtree(relPath);
+                removed = true;
                 if (local && onlyIfEmpty) {
                     // Never what was put in it since the look above: that stays, and syncs as new, folder and all
                     await rmdir(path.join(root, relPath)).catch((error: NodeJS.ErrnoException) => {
@@ -5317,14 +5356,17 @@ export class ProtonDriveSyncEngine {
                 }
             },
             { from: relPath, to: null },
-        );
+        ).finally(() => {
+            if (removed) {
+                this.holdsAfterRemoval(relPath);
+            }
+        });
         const told: string[] = [];
         if (kept.moved > 0) {
             told.push(`${kept.moved} item(s) that existed only on this computer were moved to your Trash.`);
         }
         if (kept.stayed > 0) {
-            const where = path.join(this.stateDb.getSettings().syncDir, relPath);
-            told.push(`${kept.stayed} item(s) that existed only on this computer were kept at ${where} and will upload again.`);
+            told.push(this.keptHere(kept.stayed, relPath));
         }
         const deleted =
             toTrash.size > 0
