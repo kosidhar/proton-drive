@@ -4118,8 +4118,12 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             stateDb.setMeta('driveLayout', 'virtual');
             const backingDir = path.join(tempDir, 'files');
             const drive = makeMockDrive();
+            // The settle clock (the wall clock, which counts a suspend), and the marks' clock (the monotonic one, which
+            // doesn't): advance() moves both, suspend() only the first
             let offset = 0;
+            let markOffset = 0;
             const now = () => Date.now() + offset;
+            const markNow = () => Date.now() + markOffset;
             let looks: Array<{ at: number; run: () => Promise<void> }> = [];
             // A new engine on the same database and drive is what a restart of the daemon gives
             const make = () =>
@@ -4131,6 +4135,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                         maxQuietMs: 16_000,
                         maxWaitMs: 120_000,
                         now,
+                        markNow,
                         schedule: (run, delayMs) => {
                             const look = { at: now() + delayMs, run };
                             looks.push(look);
@@ -4143,11 +4148,15 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             let engine = make();
             const local = (rel: string) => path.join(backingDir, rel);
             const changed = (rel: string): Promise<void> => (engine as any).handleLocalFileChange(rel);
-            const advance = async (ms: number) => {
-                offset += ms;
+            const runDue = async () => {
                 const due = looks.filter((l) => l.at <= now());
                 looks = looks.filter((l) => !due.includes(l));
                 await Promise.all(due.map((l) => l.run()));
+            };
+            const advance = async (ms: number) => {
+                offset += ms;
+                markOffset += ms;
+                await runDue();
             };
             return {
                 ...drive,
@@ -4159,6 +4168,11 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     engine = make();
                 },
                 advance,
+                // The laptop asleep for ms: the wall clock jumps, the monotonic one doesn't, and the looks due run on waking
+                suspend: async (ms: number) => {
+                    offset += ms;
+                    await runDue();
+                },
                 files: localFiles(stateDb, () => backingDir),
                 local,
                 changed, // the watcher's report of a change
@@ -4248,7 +4262,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const d = await started();
             await replacing(d, '.goutputstream-ABC123');
             await d.engine.driveClosed('.goutputstream-ABC123', closed);
-            await d.engine.waitForRunningLooks(); // whatever the close started has run when the rename comes
+            await d.advance(100); // the rename comes a moment after the close: what is due by then has run
+            await d.engine.waitForRunningLooks();
             await d.engine.renameItem('.goutputstream-ABC123', 'Kept.txt');
             await d.changed('.goutputstream-ABC123');
             await d.changed('Kept.txt');
@@ -4327,7 +4342,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.cloudContent('db.sqlite')).toBe(await readFile(d.local('db.sqlite'), 'utf8'));
         });
 
-        test('a replacing mark not repeated for 90 s is gone (the helper died): the file then settles as any other', async () => {
+        test('a replacing mark not repeated for 90 s is gone (the helper died): the file then settles over, from then', async () => {
             const d = await started();
             await replacing(d, 'kept.bin');
             await replacing(d, 'lapsed.bin');
@@ -4335,7 +4350,9 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             d.engine.driveWriting('kept.bin', true); // its keepalive; lapsed.bin's helper went quiet
             await d.advance(29_000);
             expect(d.calls.uploads).toEqual([]); // 89 s: both still held
-            await d.advance(2000); // 91 s
+            await d.advance(2000); // 91 s: lapsed.bin's mark is gone, and its wait starts now
+            expect(d.calls.uploads).toEqual([]);
+            await d.advance(2000);
             expect(d.calls.uploads).toEqual(['lapsed.bin']);
             // A change to it settles as any other's does
             appendFileSync(d.local('lapsed.bin'), ' more;');
@@ -4346,6 +4363,106 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             d.engine.driveWriting('kept.bin', true);
             await d.advance(60_000);
             expect(d.calls.uploads).toEqual(['lapsed.bin', 'lapsed.bin']);
+        });
+
+        // A lapse says the helper is gone, not that the file is written: what happened while it was held never lets it
+        // through, however long ago the last look was (a daemon too busy to look, say)
+        test('a lapsed mark starts the wait over: never taken as quiet since before, nor forced through by the 2-minute rule', async () => {
+            const d = await started();
+            await replacing(d, 'big.bin');
+            await d.copying('big.bin', 60_000);
+            appendFileSync(d.local('big.bin'), ' a last part;'); // written before the next look, which comes late
+            await d.advance(150_000); // no keepalive: the mark lapsed long ago
+            expect(d.calls.uploads).toEqual([]);
+            // Written every second from then on: never quiet, and not changing for 2 minutes yet
+            for (let t = 1; t <= 60; t++) {
+                appendFileSync(d.local('big.bin'), ` more ${t};`);
+                await d.changed('big.bin');
+                await d.advance(1000);
+            }
+            expect(d.calls.uploads).toEqual([]);
+            await d.advance(16_000);
+            expect(d.calls.uploads).toEqual(['big.bin']);
+        });
+
+        // R9: the marks are timed by the monotonic clock, as the helper's keepalives are: the first look on waking must
+        // not find a mark that a suspend alone made look 90 s old
+        test('a laptop asleep mid-copy wakes with the file still held: nothing uploads until its close', async () => {
+            const d = await started();
+            await replacing(d, 'big.bin');
+            await d.copying('big.bin', 60_000);
+            await d.suspend(300_000);
+            expect(d.calls.uploads).toEqual([]);
+            await d.copying('big.bin', 60_000); // the copy goes on, and the helper's keepalives with it
+            await d.suspend(30 * 60_000);
+            appendFileSync(d.local('big.bin'), ' the end.');
+            await d.changed('big.bin');
+            expect(d.calls.uploads).toEqual([]);
+            await d.engine.driveClosed('big.bin', closed);
+            await d.advance(2000);
+            expect(d.calls.uploads).toEqual(['big.bin']);
+            expect(d.cloudContent('big.bin')).toBe(await readFile(d.local('big.bin'), 'utf8'));
+        });
+
+        // The 2-minute rule for files written in sessions more often than they settle: a log opened for each line, a
+        // status file rewritten every second. Each close's wait is cut short by the next session; the run of changes
+        // goes on across them
+        const sessionsEverySecond = async (d: Awaited<ReturnType<typeof started>>, rel: string, replacingThem: boolean) => {
+            const uploadedAt: number[] = [];
+            await d.files.writeLocal(rel, 'start;');
+            for (let t = 1; t <= 300; t++) {
+                const before = d.calls.uploads.length;
+                d.engine.driveWriting(rel, replacingThem);
+                if (replacingThem) {
+                    await d.files.writeLocal(rel, `status ${t}`);
+                } else {
+                    appendFileSync(d.local(rel), `line ${t};`);
+                }
+                await d.changed(rel);
+                if (replacingThem) {
+                    expect(d.calls.uploads.length).toBe(before); // never while it is being replaced
+                }
+                await d.engine.driveClosed(rel, { refused: false, replaced: replacingThem });
+                await d.advance(1000);
+                if (d.calls.uploads.length > before) uploadedAt.push(t);
+            }
+            return uploadedAt;
+        };
+        const atMostEvery2Minutes = (uploadedAt: number[]) => {
+            expect(uploadedAt.length).toBeGreaterThanOrEqual(2); // 5 minutes of it
+            expect(uploadedAt[0]!).toBeLessThanOrEqual(123); // 2 minutes and the settle wait
+            for (let i = 1; i < uploadedAt.length; i++) {
+                expect(uploadedAt[i]! - uploadedAt[i - 1]!).toBeGreaterThanOrEqual(119);
+            }
+        };
+
+        test('a file written in short sessions more often than it settles uploads by the 2-minute rule, at most that often', async () => {
+            const d = await started();
+            const uploadedAt = await sessionsEverySecond(d, 'app.log', false);
+            atMostEvery2Minutes(uploadedAt);
+            await d.advance(2000); // the sessions stop: the last close settles
+            expect(d.cloudContent('app.log')).toBe(await readFile(d.local('app.log'), 'utf8'));
+        });
+
+        test('a file replaced every second uploads by the 2-minute rule between two sessions, never during one', async () => {
+            const d = await started();
+            const uploadedAt = await sessionsEverySecond(d, 'status.txt', true);
+            atMostEvery2Minutes(uploadedAt);
+            await d.advance(2000);
+            expect(d.cloudContent('status.txt')).toBe('status 300');
+        });
+
+        test('a copy longer than 2 minutes, closed, still waits to settle: the time it was held is not a run of changes', async () => {
+            const d = await started();
+            await replacing(d, '.goutputstream-BIG');
+            await d.copying('.goutputstream-BIG', 5 * 60_000);
+            await d.engine.driveClosed('.goutputstream-BIG', closed);
+            await d.advance(100); // the rename comes a moment after the close: what is due by then has run
+            await d.engine.renameItem('.goutputstream-BIG', 'Kept.txt'); // a big save through a temp file
+            await d.changed('Kept.txt');
+            await d.advance(5000);
+            expect(d.calls.uploads).toEqual(['Kept.txt']);
+            expect(d.calls.trashed).toEqual([]);
         });
 
         test("after a daemon restart, the helper's next keepalive marks the file again", async () => {
