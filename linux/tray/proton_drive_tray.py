@@ -257,9 +257,9 @@ def _transfers_line(transfers) -> str:
 
 def problem_count(status: dict) -> int:
     """How many things need the user, counted as the app's Needs attention lists them: another account's records,
-    files missing, a stopped move, the drive not mounted, each unresolved conflict, each file the disk guard cut short (a summary line as one problem above three), failed
-    files (one line), and the
-    last error when neither another account nor missing files explains it."""
+    files missing, a stopped move, the drive not mounted, each unresolved conflict, each file the disk guard cut short
+    (one problem for all of them above three, as the app's summary row is), failed files (one line), and the last error
+    when neither another account nor missing files explains it."""
     count = 0
     if status.get("accountMismatch"):
         count += 1

@@ -4766,6 +4766,21 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                         eventId: `evt-${uid}`,
                     });
                 },
+                // Proton Drive's event that an item was moved to its trash
+                trashedInCloud: async (rel: string) => {
+                    const uid = drive.uid(rel);
+                    const node = drive.nodes.get(uid)!;
+                    drive.nodes.set(uid, { ...node, trashTime: new Date() });
+                    await (engine as any).handleRemoteDriveEvent({
+                        type: DriveEventType.NodeUpdated,
+                        nodeUid: uid,
+                        parentNodeUid: node.parentUid,
+                        isTrashed: true,
+                        isShared: false,
+                        treeEventScopeId: 'scope-main',
+                        eventId: `evt-trashed-${uid}`,
+                    });
+                },
                 journal: () => new RemoteOpsJournal(stateDb.connection).pending(),
                 // Another device's edit of a file in Proton Drive
                 cloudEdit: (rel: string, content: string) => {
@@ -5165,12 +5180,77 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(await readFile(d.local('a.txt'), 'utf8')).toBe('the ver');
                 expect(stateDb.getItemByPath('a.txt')).toBeNull();
                 expect(d.engine.listCutShort()).toEqual([{ relPath: 'a.txt', existing: false, size: 7, detectedAt: expect.any(Number) }]);
+                // Not said to upload: it waits for the user
+                const said = stateDb.listActivity(500).find((a) => a.action === 'delete-local')!.details;
+                expect(said).toContain("The 1 file(s) there that weren't fully written stay on this computer until you choose");
+                expect(said).not.toContain('and will upload again');
                 await everythingRuns(d, 'a.txt');
                 await d.restart();
                 await everythingRuns(d, 'a.txt');
                 expect(d.calls.uploads).toEqual([]);
                 expect(d.calls.trashed).toEqual([]);
                 expect(await readFile(d.local('a.txt'), 'utf8')).toBe('the ver');
+            });
+
+            // Move to Trash through the drive: what isn't in Proton Drive goes to the desktop Trash, and what that refuses
+            // stays here. A held file kept so must stay held, never upload as a new item
+            test('a folder moved to the Trash through the drive, which the desktop Trash refuses, keeps its held files held', async () => {
+                const d = await started();
+                await cutShort(d, 'Docs/b.txt', 'b fr');
+                await cutShort(d, 'Docs/new.bin', 'part of it');
+                await d.engine.deleteItem('Docs', { trash: true });
+                await d.engine.replayRemoteOps();
+                expect(d.calls.trashed).toEqual([[d.uid('Docs')]]); // the folder, in Proton Drive, as the user asked
+                expect(await readFile(d.local('Docs/b.txt'), 'utf8')).toBe('b fr');
+                expect(await readFile(d.local('Docs/new.bin'), 'utf8')).toBe('part of it');
+                expect(d.engine.listCutShort().map((i) => [i.relPath, i.existing]).sort()).toEqual([
+                    ['Docs/b.txt', false],
+                    ['Docs/new.bin', false],
+                ]);
+                const said = stateDb.listActivity(500).find((a) => a.action === 'delete-local')!.details;
+                expect(said).toContain("The 2 file(s) there that weren't fully written stay on this computer until you choose");
+                expect(said).not.toContain('and will upload again');
+                await everythingRuns(d, 'Docs/b.txt');
+                await everythingRuns(d, 'Docs/new.bin');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.engine.listCutShort()).toHaveLength(2);
+            });
+
+            test('a folder moved to the Trash through the drive takes its held files to the desktop Trash, and their holds', async () => {
+                const d = await started({ trashWorks: true });
+                await cutShort(d, 'Docs/b.txt', 'b fr');
+                await cutShort(d, 'Docs/new.bin', 'part of it');
+                await d.engine.deleteItem('Docs', { trash: true });
+                expect(await d.files.exists('Docs')).toBe(false);
+                expect(await readFile(path.join(d.trashDir, 'Docs', 'new.bin'), 'utf8')).toBe('part of it');
+                expect(d.engine.listCutShort()).toEqual([]);
+                await everythingRuns(d, 'Docs/b.txt');
+                expect(d.calls.uploads).toEqual([]);
+            });
+
+            test('a held copy over an online-only file whose item goes from Proton Drive is held on as a new file', async () => {
+                const d = await started();
+                d.add('Docs/elsewhere.txt', 'another online version');
+                await d.engine.reconcileNow();
+                for (const rel of ['online.txt', 'Docs/elsewhere.txt']) {
+                    await d.engine.truncateItem(rel); // copied over through the drive, and cut short
+                    await cutShort(d, rel, 'cut');
+                }
+                expect(d.engine.listCutShort().every((i) => i.existing)).toBe(true);
+                await d.deletedInCloud('online.txt');
+                await d.trashedInCloud('Docs/elsewhere.txt');
+                expect(d.engine.listCutShort().map((i) => [i.relPath, i.existing]).sort()).toEqual([
+                    ['Docs/elsewhere.txt', false],
+                    ['online.txt', false],
+                ]);
+                // Nothing to put back: only Upload it anyway is left
+                await expect(d.engine.putBackCutShort(['online.txt'])).rejects.toMatchObject({ code: 'EINVAL' });
+                for (const rel of ['online.txt', 'Docs/elsewhere.txt']) {
+                    expect(await readFile(d.local(rel), 'utf8')).toBe('cut');
+                }
+                await everythingRuns(d, 'online.txt');
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
             });
 
             test('a drive rename whose move fails leaves the hold with the file, where it stayed', async () => {
