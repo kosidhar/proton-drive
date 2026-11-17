@@ -286,8 +286,10 @@ def problem_count(status: dict) -> int:
 
 
 def status_line(status: dict, now=None):
-    """The tray's status line and icon, in the app's words (native-gui/src/home.rs status_summary): signed out, paused,
-    moving files, what moves, problems, sync stopped, up to date. Never the engine's own action text."""
+    """The tray's status line and icon, the first that applies of: signed out, paused, disk almost full, moving files,
+    what moves, problems, sync stopped, up to date. In the app's words (native-gui/src/home.rs status_summary), except
+    "Disk almost full", which the app says in a notice on Home rather than in its headline (#299). Never the engine's
+    own action text."""
     if signed_out(status):
         return "Signed out", "protondrive-tray-error"
     settings = status.get("settings") or {}

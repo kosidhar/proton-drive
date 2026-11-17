@@ -119,10 +119,12 @@ const CUT_SHORT_TOLD_EVERY_MS = 60_000;
 // What the drive helper's guard keeps free on this computer's disk: a write through the drive that would leave less is
 // refused (#295). Must stay equal to LOCAL_RESERVE in native-vfs/src/fs.rs.
 export const LOCAL_RESERVE_BYTES = 5_000_000_000;
-// How long the status says this computer's disk is almost full after the last refusal for room (#299), and what the
-// store's disk must have free for it to stop saying so sooner: 1 GB more than the reserve
+// How long the status says this computer's disk is almost full after the last refusal for room (#299). It stops sooner
+// only once DISK_FULL_KEPT_MS have passed since the last refusal and the store's disk has the reserve free plus
+// DISK_FULL_ROOM_BYTES, or plus the most any refusal of these 10 minutes asked for, if that is more (see diskFull)
 const DISK_FULL_SHOWN_MS = 10 * 60_000;
-const DISK_FULL_CLEARS_AT_BYTES = LOCAL_RESERVE_BYTES + 1_000_000_000;
+const DISK_FULL_KEPT_MS = 2 * 60_000;
+const DISK_FULL_ROOM_BYTES = 1_000_000_000;
 // Uid prefix of the remote index entries that stand for folders made here that Proton Drive doesn't have yet, holding
 // what a pending move puts in them (see applyPendingOpsToIndex). Never a node: never resolved, moved or trashed.
 const PROVISIONAL = 'provisional:';
@@ -138,7 +140,8 @@ function isSameOrUnder(relPath: string, base: string): boolean {
     return relPath === base || relPath.startsWith(`${base}/`);
 }
 // The bytes an app (not root) can still write on the disk that holds dir: statfs(2)'s available blocks, by its block
-// size. What the engine reads of the store's disk unless a test gives its own (see diskFull).
+// size. What the engine reads of the store's disk unless a test gives its own (see diskFull). The drive helper's guard
+// reads f_bavail * f_frsize instead, the same on Linux file systems unless one says otherwise: Bun's StatFs has no frsize.
 export async function diskFreeAt(dir: string): Promise<number> {
     const st = await statfs(dir);
     return st.bavail * st.bsize;
@@ -419,15 +422,18 @@ export class ProtonDriveSyncEngine {
     private readonly cutShortChecks = new Map<string, Promise<void>>();
     // Cancels the timer that ends a timed pause (see setPaused), while one is set
     private cancelPauseTimer: (() => void) | null = null;
-    // When the drive last refused a write for lack of room on this computer's disk, by the settle clock (#299; see
-    // driveRefused, diskFull)
+    // When the drive last refused a write for lack of room on this computer's disk, by the settle clock, and the most
+    // any refusal asked for since the 10 minutes it began were last over (#299; see driveRefused, diskFull)
     private lastRefusalAt: number | null = null;
+    private mostRefusedBytes = 0;
     // The free bytes of the store's disk by the newest reading (see readDiskFree): null when it failed, or none has
     // answered since the last refusal. Readings are numbered as they start: diskReadsStarted is the last one's number,
-    // diskReadKept the number of the one kept, or of the last one started before the last refusal (see driveRefused).
+    // diskReadKept the number of the one kept, or of the last one started before the last refusal (see driveRefused);
+    // diskReadRunning that of the one started since the last refusal that hasn't answered, if any.
     private diskFreeBytes: number | null = null;
     private diskReadsStarted = 0;
     private diskReadKept = 0;
+    private diskReadRunning: number | null = null;
 
     constructor(
         private readonly sdk: ProtonDriveClient,
@@ -560,35 +566,55 @@ export class ProtonDriveSyncEngine {
     }
 
     // Whether the status says this computer's disk is almost full (#299): for DISK_FULL_SHOWN_MS after the drive's last
-    // refusal for room, unless the newest reading of the store's disk since then has DISK_FULL_CLEARS_AT_BYTES free.
-    // With no such reading, only the time applies. Read from what is known, never waiting: each call starts a reading
-    // of the disk, which a later one goes by.
+    // refusal for room. It stops sooner only when both hold: DISK_FULL_KEPT_MS have passed since the last refusal (an app
+    // that deletes what it wrote once refused gives the room back at once, and the notice must still be seen), and the
+    // newest reading of the store's disk since then has the reserve free plus DISK_FULL_ROOM_BYTES, or plus the most a
+    // refusal of these 10 minutes asked for if that is more (a big file grown at once, or an open, refused with more than
+    // that free). With no reading, only the 10 minutes apply. Read from what is known, never waiting: while the 10
+    // minutes run, each call starts a reading of the disk unless one is running, and a later call goes by it.
     private diskFull(): { refusedAt: number } | null {
-        this.readDiskFree();
         const refusedAt = this.lastRefusalAt;
-        if (refusedAt === null || this.settleNow() - refusedAt >= DISK_FULL_SHOWN_MS) {
+        if (refusedAt === null) {
             return null;
         }
+        const since = this.settleNow() - refusedAt;
+        if (since >= DISK_FULL_SHOWN_MS) {
+            return null;
+        }
+        this.readDiskFree();
         const free = this.diskFreeBytes;
-        return free !== null && free >= DISK_FULL_CLEARS_AT_BYTES ? null : { refusedAt };
+        const room = LOCAL_RESERVE_BYTES + Math.max(DISK_FULL_ROOM_BYTES, this.mostRefusedBytes);
+        return since >= DISK_FULL_KEPT_MS && free !== null && free >= room ? null : { refusedAt };
     }
 
-    // Starts a reading of the free bytes of the store's disk (options.diskFree, diskFreeAt by default), not waited on.
-    // It is kept unless a later one has answered first, or it began before the last refusal (see driveRefused); one
-    // that fails leaves no reading, which is no proof of room.
+    // The free bytes of the store's disk now (options.diskFree, diskFreeAt by default); rejects when they can't be read.
+    private diskFreeNow(): Promise<number> {
+        try {
+            return (this.options.diskFree ?? diskFreeAt)(this.localRoot());
+        } catch (error: unknown) {
+            return Promise.reject(error);
+        }
+    }
+
+    // Starts a reading of the free bytes of the store's disk (see diskFreeNow), not waited on, unless one started since
+    // the last refusal is still running: a disk that doesn't answer never piles them up. It is kept unless it began
+    // before the last refusal (see driveRefused); one that fails leaves no reading, which is no proof of room.
     private readDiskFree(): void {
+        if (this.diskReadRunning !== null) {
+            return;
+        }
         const reading = ++this.diskReadsStarted;
+        this.diskReadRunning = reading;
         const answered = (bytes: number | null) => {
+            if (this.diskReadRunning === reading) {
+                this.diskReadRunning = null;
+            }
             if (reading > this.diskReadKept) {
                 this.diskReadKept = reading;
                 this.diskFreeBytes = bytes;
             }
         };
-        try {
-            (this.options.diskFree ?? diskFreeAt)(this.localRoot()).then(answered, () => answered(null));
-        } catch {
-            answered(null);
-        }
+        this.diskFreeNow().then(answered, () => answered(null));
     }
 
     async start(options: { backgroundInitialReconcile?: boolean } = {}): Promise<void> {
@@ -4267,13 +4293,17 @@ export class ProtonDriveSyncEngine {
 
     // The drive's guard refused a write for lack of room on this computer's disk (#299; the helper says so at most every
     // 30 s, with the bytes asked and what the disk had): the status says the disk is almost full, for DISK_FULL_SHOWN_MS
-    // (see diskFull). What the disk was read to have before is no proof of room now: the readings under way are no news,
-    // and a new one starts, not waited on. An open refused for room (#301) is to be recorded here too. Never
-    // refused, and never waits.
-    driveRefused(_needed: number, _available: number): void {
-        this.lastRefusalAt = this.settleNow();
+    // (see diskFull), with the most a refusal asked for since those 10 minutes were last over. What the disk was read
+    // to have before is no proof of room now: the readings under way are no news, and a new one starts, not waited on.
+    // An open refused for room (#301) is to be recorded here too. Never refused, and never waits.
+    driveRefused(needed: number, _available: number): void {
+        const now = this.settleNow();
+        const stillRunning = this.lastRefusalAt !== null && now - this.lastRefusalAt < DISK_FULL_SHOWN_MS;
+        this.mostRefusedBytes = stillRunning ? Math.max(this.mostRefusedBytes, needed) : needed;
+        this.lastRefusalAt = now;
         this.diskFreeBytes = null;
         this.diskReadKept = this.diskReadsStarted;
+        this.diskReadRunning = null;
         this.readDiskFree();
     }
 

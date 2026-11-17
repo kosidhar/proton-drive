@@ -710,7 +710,7 @@ impl ProtonDriveNativeApp {
                 ui.add(
                     egui::Label::new(
                         RichText::new(
-                            "Your computer's disk is almost full. Proton Drive keeps 5 GB free on it, so new files can't be saved to the drive.",
+                            "Your computer's disk is almost full. Proton Drive keeps 5\u{a0}GB free on it, so new files can't be saved to the drive.",
                         )
                         .size(12.5)
                         .color(TEXT_PRIMARY()),

@@ -5699,8 +5699,15 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     await new Promise<void>((resolve) => setTimeout(resolve, 0));
                 },
                 diskFull: () => engine.getStatus().diskFull,
+                // A status read once the disk has been read again (by the read before it, if one is due)
+                readThenPoll: async () => {
+                    engine.getStatus();
+                    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+                    return engine.getStatus().diskFull;
+                },
             };
         };
+        // A write refused near the reserve, as a copy's are: one chunk asked for
         const refused = (d: ReturnType<typeof setup>) => d.engine.driveRefused(131_072, 4_900_000_000);
 
         test('a refusal sets diskFull for 10 minutes', async () => {
@@ -5725,14 +5732,14 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.diskFull()).toBeNull();
         });
 
-        test('diskFull clears early once there is room', async () => {
-            // A byte short of the reserve and 1 GB: not room enough
+        test('diskFull clears early once there is room again, 2 minutes on from the last refusal', async () => {
+            // A byte short of the reserve and 1 GB: not room enough, however long
             const d = setup(LOCAL_RESERVE_BYTES + GB - 1);
             refused(d);
             await d.read();
             expect(d.diskFull()).toEqual({ refusedAt: T0 });
-            await d.read();
-            expect(d.diskFull()).toEqual({ refusedAt: T0 });
+            d.advance(3 * 60_000);
+            expect(await d.readThenPoll()).toEqual({ refusedAt: T0 });
             // Files deleted meanwhile: a status read gives the last reading, and starts the one the next read gives
             d.disk.free = LOCAL_RESERVE_BYTES + GB;
             expect(d.diskFull()).toEqual({ refusedAt: T0 });
@@ -5742,34 +5749,87 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             d.advance(60_000);
             d.disk.free = 4_900_000_000;
             refused(d);
-            expect(d.diskFull()).toEqual({ refusedAt: T0 + 60_000 });
-            await d.read();
-            expect(d.diskFull()).toEqual({ refusedAt: T0 + 60_000 });
+            expect(d.diskFull()).toEqual({ refusedAt: T0 + 4 * 60_000 });
+            d.advance(3 * 60_000);
+            expect(await d.readThenPoll()).toEqual({ refusedAt: T0 + 4 * 60_000 });
         });
 
-        test('a reading from before the last refusal, or older than one already answered, never clears it', async () => {
+        // Probe A: a file grown by 10 GB at once (ftruncate, a write far past its end) with 8 GB free
+        test('a growth refused with more than the reserve and 1 GB free still shows, until there is room for it', async () => {
+            const d = setup(8 * GB);
+            d.engine.driveRefused(10 * GB, 8 * GB);
+            await d.read();
+            expect(d.diskFull()).toEqual({ refusedAt: T0 }); // the app's next poll
+            d.advance(2 * 60_000);
+            expect(await d.readThenPoll()).toEqual({ refusedAt: T0 }); // 8 GB: not the reserve and 10 GB
+            d.disk.free = LOCAL_RESERVE_BYTES + 10 * GB;
+            expect(await d.readThenPoll()).toBeNull();
+        });
+
+        // Probe B: an open of a 4 GB online-only file refused with 8.5 GB free (#301's rule)
+        test('a refusal of 4 GB with 8.5 GB free clears only 2 minutes on, and with 9 GB free', async () => {
+            const d = setup(8_500_000_000);
+            d.engine.driveRefused(4 * GB, 8_500_000_000);
+            await d.read();
+            expect(d.diskFull()).toEqual({ refusedAt: T0 });
+            // Room for it at once: not 2 minutes on yet
+            d.disk.free = 9 * GB;
+            expect(await d.readThenPoll()).toEqual({ refusedAt: T0 });
+            d.advance(2 * 60_000 - 1);
+            expect(await d.readThenPoll()).toEqual({ refusedAt: T0 });
+            // 2 minutes on, a byte short
+            d.disk.free = 9 * GB - 1;
+            d.advance(1);
+            expect(await d.readThenPoll()).toEqual({ refusedAt: T0 });
+            d.disk.free = 9 * GB;
+            expect(await d.readThenPoll()).toBeNull();
+        });
+
+        // A save or copy whose app deletes what it wrote once a write is refused: the room comes back at once
+        test('an app that cleans up after a refusal leaves the notice on for 2 minutes', async () => {
+            const d = setup(5_050_000_000);
+            refused(d);
+            d.disk.free = 7 * GB;
+            expect(await d.readThenPoll()).toEqual({ refusedAt: T0 });
+            d.advance(2 * 60_000 - 1);
+            expect(await d.readThenPoll()).toEqual({ refusedAt: T0 });
+            d.advance(1);
+            expect(await d.readThenPoll()).toBeNull();
+        });
+
+        test('the most a refusal asked for counts until its 10 minutes are over', async () => {
+            const d = setup(7 * GB);
+            d.engine.driveRefused(10 * GB, 7 * GB);
+            d.advance(3 * 60_000);
+            refused(d); // a small one after it: the 10 GB still counts
+            d.advance(3 * 60_000);
+            expect(await d.readThenPoll()).toEqual({ refusedAt: T0 + 3 * 60_000 });
+            d.advance(7 * 60_000);
+            expect(d.diskFull()).toBeNull();
+            // New 10 minutes: only what is asked in them counts
+            refused(d);
+            d.advance(2 * 60_000);
+            expect(await d.readThenPoll()).toBeNull();
+        });
+
+        test('a reading from before the last refusal never clears it', async () => {
             const d = setup(7 * GB);
             d.disk.slow = true;
-            expect(d.diskFull()).toBeNull(); // reading 0: room
+            refused(d); // reading 0: room
+            d.advance(2 * 60_000);
             d.disk.free = 4_900_000_000;
-            refused(d); // reading 1: none
-            // Reading 0 answers: room, but read before the refusal
+            refused(d); // reading 1: none, though reading 0 hasn't answered
+            const refusedAt = T0 + 2 * 60_000;
+            // Reading 0 answers, room, but it was read before the last refusal
             await d.answerRead(0);
-            expect(d.diskFull()).toEqual({ refusedAt: T0 }); // reading 2: none
-            // Two more, the earlier with room, the later without, answering in the other order: the earlier is no news
+            d.advance(2 * 60_000);
+            expect(d.diskFull()).toEqual({ refusedAt }); // reading 1 still running: no new one
+            await d.answerRead(1);
             d.disk.free = 7 * GB;
-            d.diskFull(); // reading 3
-            d.disk.free = 4_900_000_000;
-            d.diskFull(); // reading 4
-            await d.answerRead(4);
-            await d.answerRead(3);
-            expect(d.diskFull()).toEqual({ refusedAt: T0 }); // reading 5
-            // Room again, and a reading newer than all the others says so
-            d.disk.free = 7 * GB;
-            d.diskFull(); // reading 6
-            await d.answerRead(6);
+            expect(d.diskFull()).toEqual({ refusedAt }); // reading 2: room
+            await d.answerRead(2);
             expect(d.diskFull()).toBeNull();
-            expect(d.disk.reads).toHaveLength(8);
+            expect(d.disk.reads).toHaveLength(4);
         });
 
         test('with no reading of the disk, only the 10 minutes apply', async () => {
@@ -5778,28 +5838,42 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await d.read();
             expect(d.diskFull()).toEqual({ refusedAt: T0 });
             d.advance(10 * 60_000 - 1);
-            await d.read();
-            expect(d.diskFull()).toEqual({ refusedAt: T0 });
+            expect(await d.readThenPoll()).toEqual({ refusedAt: T0 });
             d.advance(1);
             expect(d.diskFull()).toBeNull();
             // A disk that could be read and no longer can: what it said then is no proof of room now
             const e = setup(7 * GB);
-            expect(e.diskFull()).toBeNull();
-            await e.read();
-            e.disk.free = null;
             refused(e);
             await e.read();
-            expect(e.diskFull()).toEqual({ refusedAt: T0 });
+            e.disk.free = null;
+            e.advance(2 * 60_000);
+            expect(await e.readThenPoll()).toEqual({ refusedAt: T0 });
         });
 
-        test("the store's disk is read on each refusal and each status read, which never waits for it", async () => {
+        test("the store's disk is read only within the 10 minutes, one reading at a time, never waited on", async () => {
             const d = setup(4_900_000_000);
-            d.disk.slow = true; // never answered
+            d.disk.slow = true; // answered only when the test says
+            // No refusal: never read, however often the status is
+            for (let i = 0; i < 100; i++) expect(d.engine.getStatus().diskFull).toBeNull();
+            expect(d.disk.reads).toEqual([]);
             refused(d);
             expect(d.disk.reads).toEqual([d.backingDir]);
-            const status = d.engine.getStatus();
-            expect(status.diskFull).toEqual({ refusedAt: T0 });
-            expect(d.disk.reads).toEqual([d.backingDir, d.backingDir]);
+            // A disk that doesn't answer: one reading, however often the status is read
+            for (let i = 0; i < 100; i++) expect(d.engine.getStatus().diskFull).toEqual({ refusedAt: T0 });
+            expect(d.disk.reads).toHaveLength(1);
+            // The next once it has answered
+            await d.answerRead(0);
+            d.engine.getStatus();
+            expect(d.disk.reads).toHaveLength(2);
+            // A refusal doesn't wait for one begun before it
+            refused(d);
+            expect(d.disk.reads).toHaveLength(3);
+            // The 10 minutes over: none
+            d.advance(10 * 60_000);
+            await d.answerRead(1);
+            await d.answerRead(2);
+            for (let i = 0; i < 100; i++) expect(d.engine.getStatus().diskFull).toBeNull();
+            expect(d.disk.reads).toHaveLength(3);
         });
 
         test("by default the disk is read with statfs: the bytes it has available, as df says", async () => {
