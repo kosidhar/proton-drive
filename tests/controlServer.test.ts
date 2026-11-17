@@ -56,6 +56,7 @@ function makeFake(rejectWith?: string) {
             if (relPath === 'offline.txt') throw new DriveOpError('EIO', 'Network unreachable');
             if (relPath === 'gone.txt') throw new DriveOpError('ENOENT', `Not in Proton Drive: ${relPath}`);
             if (relPath === 'odd.txt') throw new Error('Something unexpected');
+            if (relPath === 'full.txt') throw new DriveOpError('ENOSPC', "Not enough room on this computer's disk");
         },
         async renameItem(fromRel: string, toRel: string, opts?: { noReplace?: boolean }): Promise<void> {
             driveCalls.push(['rename', fromRel, toRel, opts]);
@@ -392,6 +393,8 @@ describe('drive routes', () => {
         await expectError(await post(socketPath, '/vfs/hydrate', { path: 'offline.txt' }), 'Network unreachable', 'EIO');
         await expectError(await post(socketPath, '/vfs/hydrate', { path: 'gone.txt' }), 'Not in Proton Drive: gone.txt', 'ENOENT');
         await expectError(await post(socketPath, '/vfs/hydrate', { path: 'odd.txt' }), 'Something unexpected', 'EIO');
+        // An open that would fill this computer's disk (#301): the helper gives the app ENOSPC
+        await expectError(await post(socketPath, '/vfs/hydrate', { path: 'full.txt' }), "Not enough room on this computer's disk", 'ENOSPC');
         await expectError(
             await post(socketPath, '/vfs/rename', { from: 'a.txt', to: 'taken.txt', noReplace: true }),
             'Already exists: taken.txt',

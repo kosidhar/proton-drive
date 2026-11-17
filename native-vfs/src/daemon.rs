@@ -302,6 +302,7 @@ fn errno_of_code(code: Option<&str>) -> i32 {
         Some("EACCES") => libc::EACCES,
         Some("EXDEV") => libc::EXDEV,
         Some("ENOTEMPTY") => libc::ENOTEMPTY,
+        Some("ENOSPC") => libc::ENOSPC,
         _ => libc::EIO,
     }
 }
@@ -539,6 +540,8 @@ mod tests {
         assert_eq!(errno_of_code(Some("EIO")), libc::EIO);
         assert_eq!(errno_of_code(Some("EXDEV")), libc::EXDEV);
         assert_eq!(errno_of_code(Some("ENOTEMPTY")), libc::ENOTEMPTY);
+        // A download for an open that would leave the system disk under the reserve (#301)
+        assert_eq!(errno_of_code(Some("ENOSPC")), libc::ENOSPC);
         assert_eq!(errno_of_code(Some("EWHAT")), libc::EIO);
         assert_eq!(errno_of_code(None), libc::EIO);
     }
