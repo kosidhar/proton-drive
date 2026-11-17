@@ -4,8 +4,10 @@
 //
 // They are best effort: a full queue drops the oldest, and one the daemon fails isn't sent again. The daemon falls back
 // on watching the backing store, as for anything written there directly. A close that says a write was refused is
-// the exception: the file may be cut short, and the daemon mustn't upload it as it is (#300). That one is never
-// dropped, and is sent again until the daemon takes it, with what came after it waiting behind it.
+// the exception: the file may be cut short, and the daemon mustn't upload it as it is (#300). A full queue never drops
+// that one, and while the daemon can't take it (not there, stuck, or failing on its side with a 5xx) it is sent
+// again, with what came after it waiting behind it. A daemon that answers it with a 4xx understood it and said no,
+// and would say no again: it is dropped then, and logged, so it can't hold up every notice after it.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -15,8 +17,10 @@ use crate::daemon::DaemonError;
 
 /// How many best-effort notices wait at most; past that, the oldest one goes.
 pub const NOTICE_QUEUE_MAX: usize = 1024;
-/// How soon a refused close the daemon didn't take is sent again.
+/// How soon a refused close the daemon couldn't take is sent again.
 pub const NOTICE_RETRY: Duration = Duration::from_secs(2);
+/// How often at most the sender logs that a refused close still can't reach the daemon.
+const NOTICE_STUCK_LOG_EVERY: Duration = Duration::from_secs(60);
 
 /// One post to the daemon. Paths are relative to the drive's top, as in /vfs/rename.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,6 +74,32 @@ struct Queue {
     ended: bool,
 }
 
+/// When the sender logs a refused close the daemon can't take yet: at its first failed try, then at most every
+/// NOTICE_STUCK_LOG_EVERY, with how many tries it has taken so far.
+#[derive(Default)]
+struct StuckLog {
+    tries: u32,
+    logged: Option<Instant>,
+}
+
+impl StuckLog {
+    /// Another try failed, at `now`: the tries so far, when a line is due.
+    fn failed(&mut self, now: Instant) -> Option<u32> {
+        self.tries = self.tries.saturating_add(1);
+        let due = self.logged.is_none_or(|at| now.saturating_duration_since(at) >= NOTICE_STUCK_LOG_EVERY);
+        if due {
+            self.logged = Some(now);
+        }
+        due.then_some(self.tries)
+    }
+}
+
+/// Whether a refused close the daemon didn't take is worth sending again: it wasn't reached, didn't answer in time,
+/// or failed on its side (5xx). A 4xx is the daemon declining it, which it would do again.
+fn worth_retrying(err: &DaemonError) -> bool {
+    err.status.is_none_or(|status| status >= 500)
+}
+
 /// The queue, shared by Notices and its sender's thread, and the signal that it changed.
 struct Shared {
     queue: Mutex<Queue>,
@@ -88,7 +118,7 @@ impl Notices {
     }
 
     /// start, with refused closes sent again every `retry` (a test's, shorter than NOTICE_RETRY).
-    fn start_retrying_every(
+    pub(crate) fn start_retrying_every(
         retry: Duration,
         send: impl Fn(&Notice) -> Result<(), DaemonError> + Send + 'static,
     ) -> Arc<Notices> {
@@ -129,27 +159,42 @@ impl Drop for Notices {
 }
 
 impl Shared {
-    /// The sender's thread: each notice in turn, until the last Notices goes. A refused close the daemon didn't take
-    /// goes back to the head of the queue, and is sent again after `retry`.
+    /// The sender's thread: each notice in turn, until the last Notices goes. A refused close the daemon couldn't
+    /// take goes back to the head of the queue, and is sent again after `retry`.
     fn run(&self, retry: Duration, send: impl Fn(&Notice) -> Result<(), DaemonError>) {
-        // Whether the refused close at the head has failed before: logged the first time, not at every try
-        let mut retrying = false;
+        // How the refused close at the head keeps failing, for the log
+        let mut stuck = StuckLog::default();
         while let Some(notice) = self.next() {
             // Sent without the queue's lock: queueing never waits on the daemon
-            match send(&notice) {
-                Ok(()) => retrying = false,
-                Err(_) if !notice.never_dropped() => {}
-                Err(err) => {
-                    if let (false, Notice::Closed { path, .. }) = (retrying, &notice) {
-                        let message = err.message;
-                        log!("protondrive-vfs: couldn't tell the daemon a write to {path:?} was refused: {message}");
-                    }
-                    retrying = true;
-                    self.put_back(notice);
-                    if !self.wait(retry) {
-                        return;
-                    }
-                }
+            let Err(err) = send(&notice) else {
+                stuck = StuckLog::default();
+                continue;
+            };
+            // Best effort: dropped
+            if !notice.never_dropped() {
+                continue;
+            }
+            let Notice::Closed { path, .. } = &notice else { continue };
+            if !worth_retrying(&err) {
+                let status = err.status.unwrap_or_default();
+                log!(
+                    "protondrive-vfs: the daemon declined to hear that a write to {path:?} was refused ({status}: {}): \
+                     it may upload the file as it is",
+                    err.message
+                );
+                stuck = StuckLog::default();
+                continue;
+            }
+            if let Some(tries) = stuck.failed(Instant::now()) {
+                log!(
+                    "protondrive-vfs: couldn't tell the daemon a write to {path:?} was refused (try {tries}, trying \
+                     again every {retry:?}): {}",
+                    err.message
+                );
+            }
+            self.put_back(notice);
+            if !self.wait(retry) {
+                return;
             }
         }
     }
@@ -210,7 +255,34 @@ mod tests {
     }
 
     fn failed() -> DaemonError {
-        DaemonError { errno: libc::EIO, message: "can't reach the daemon".into(), stuck: false }
+        DaemonError { errno: libc::EIO, message: "can't reach the daemon".into(), stuck: false, status: None }
+    }
+
+    fn answered(status: u16) -> DaemonError {
+        let message = format!("the daemon answered {status}");
+        DaemonError { errno: libc::EIO, message, stuck: false, status: Some(status) }
+    }
+
+    fn stuck() -> DaemonError {
+        let message = "the daemon didn't answer within 5s".into();
+        DaemonError { errno: libc::EIO, message, stuck: true, status: None }
+    }
+
+    /// Notices whose daemon fails the first try of the refused close of "cut.bin" with `err`, and takes everything
+    /// else; what was delivered, and what was tried, in order.
+    fn failing_once(err: DaemonError) -> (Arc<Notices>, Delivered, Delivered) {
+        let (sent, tries) = (Delivered::default(), Delivered::default());
+        let (recorded, tried) = (sent.clone(), tries.clone());
+        let notices = Notices::start_retrying_every(Duration::from_millis(10), move |notice| {
+            let mut tried = tried.lock().unwrap();
+            tried.push(notice.clone());
+            if *notice == refused_close("cut.bin") && tried.len() == 1 {
+                return Err(DaemonError { message: err.message.clone(), ..err });
+            }
+            recorded.lock().unwrap().push(notice.clone());
+            Ok(())
+        });
+        (notices, sent, tries)
     }
 
     /// Until `done` says so, at most 10 s.
@@ -415,6 +487,51 @@ mod tests {
         let best_effort = delivered(&sent).len() - 2000;
         assert_eq!(best_effort, 1 + NOTICE_QUEUE_MAX, "the held one, and a full queue");
         assert!(!delivered(&sent).contains(&writing("0")), "the oldest went");
+    }
+
+    #[test]
+    fn a_refused_close_the_daemon_declines_is_dropped_and_the_next_one_goes_out() {
+        // A 4xx: the daemon understood it and said no, and will say no again
+        for status in [400, 404] {
+            let (notices, sent, tries) = failing_once(answered(status));
+            notices.send(refused_close("cut.bin"));
+            notices.send(writing("next"));
+            until("the next notice going out", || delivered(&sent) == [writing("next")]);
+            assert_eq!(delivered(&tries), [refused_close("cut.bin"), writing("next")], "{status}: tried once");
+        }
+    }
+
+    #[test]
+    fn a_refused_close_is_retried_while_the_daemon_cant_take_it() {
+        // Not reached, not answering in time, or failing on its side (5xx)
+        for err in [failed(), stuck(), answered(500), answered(503)] {
+            let what = format!("{err:?}");
+            let (notices, sent, tries) = failing_once(err);
+            notices.send(refused_close("cut.bin"));
+            notices.send(writing("next"));
+            until("both going out", || delivered(&sent).len() == 2);
+            assert_eq!(delivered(&sent), [refused_close("cut.bin"), writing("next")], "{what}");
+            let cut = refused_close("cut.bin");
+            assert_eq!(delivered(&tries), [cut.clone(), cut, writing("next")], "{what}: tried again");
+        }
+    }
+
+    #[test]
+    fn a_refused_close_that_keeps_failing_is_logged_at_most_once_a_minute() {
+        assert_eq!(NOTICE_STUCK_LOG_EVERY, Duration::from_secs(60));
+        let (start, s) = (Instant::now(), Duration::from_secs);
+        let mut log = StuckLog::default();
+        // The first failure, then a line a minute, with the tries so far
+        assert_eq!(log.failed(start), Some(1));
+        for t in (2..60).step_by(2) {
+            assert_eq!(log.failed(start + s(t)), None, "{t} s on");
+        }
+        assert_eq!(log.failed(start + s(60)), Some(31));
+        assert_eq!(log.failed(start + s(62)), None);
+        assert_eq!(log.failed(start + s(120)), Some(33));
+        // Once it got through, the next one that fails is logged at once
+        let mut log = StuckLog::default();
+        assert_eq!(log.failed(start + s(122)), Some(1));
     }
 
     #[test]
