@@ -11,7 +11,7 @@ use crate::{
     format_bytes, offers_mount_again, render_transfer_line, shown_folder, spawn_reaped, AccountInfo, ButtonKind,
     ConflictRecord, CutShortItem, DaemonStatus, ProtonDriveNativeApp, VfsStatus, WorkerCommand, BG_CARD_ALT,
     BORDER_SUBTLE, DANGER_TEXT, PROTON_PURPLE, PROTON_PURPLE_TEXT, SCREENSHOT_MODE, SUCCESS_TEXT, TEXT_MUTED, TEXT_PRIMARY,
-    WARNING_TEXT,
+    WARNING_LINE, WARNING_SOFT, WARNING_TEXT,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -676,6 +676,7 @@ impl ProtonDriveNativeApp {
             .show(ui, |ui| {
                 Frame::NONE.inner_margin(crate::SCROLL_GUTTER).show(ui, |ui| {
                     self.render_status_block(ui);
+                    self.render_disk_full_notice(ui);
                     self.render_notice(ui);
                     if !self.attention.is_empty() {
                         ui.add_space(14.0);
@@ -689,6 +690,40 @@ impl ProtonDriveNativeApp {
                     self.render_your_drive(ui);
                 });
             });
+    }
+
+    /// While the daemon says the computer's disk is almost full (#299): why new files aren't being saved, and the way
+    /// to make room. It has no close button: the daemon takes `diskFull` away itself, after a while or once there is room.
+    fn render_disk_full_notice(&mut self, ui: &mut egui::Ui) {
+        if self.status.disk_full.is_none() {
+            return;
+        }
+        ui.add_space(10.0);
+        let mut free = false;
+        Frame::NONE
+            .fill(WARNING_SOFT())
+            .stroke(Stroke::new(1.0_f32, WARNING_LINE()))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "Your computer's disk is almost full. Proton Drive keeps 5 GB free on it, so new files can't be saved to the drive.",
+                        )
+                        .size(12.5)
+                        .color(TEXT_PRIMARY()),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(8.0);
+                let can = self.daemon_online && self.working.is_empty();
+                free = ui.add_enabled_ui(can, |ui| secondary_button(ui, "Free up space…", 32.0).clicked()).inner;
+            });
+        if free {
+            self.open_free_up_space(String::new());
+        }
     }
 
     /// The status in a sentence, with Pause and Sync now, or Sign in while signed out. In a narrow card (a small window,

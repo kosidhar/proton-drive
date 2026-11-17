@@ -293,6 +293,8 @@ def status_line(status: dict, now=None):
     settings = status.get("settings") or {}
     if status.get("state") == "paused" or settings.get("paused"):
         return paused_line(settings.get("pausedUntil"), now or datetime.datetime.now()), "protondrive-tray-paused"
+    if status.get("diskFull"):
+        return "Disk almost full", "protondrive-tray-error"
     vfs = status.get("vfs")
     if isinstance(vfs, dict) and vfs.get("reason") == "moving":
         return "Moving files…", "protondrive-tray-syncing"
