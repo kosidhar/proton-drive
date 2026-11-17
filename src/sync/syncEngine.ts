@@ -400,6 +400,9 @@ export class ProtonDriveSyncEngine {
     private readonly writingMarks = new Map<string, { replacing: boolean; at: number }>();
     // When a file cut short was last told of in Activity, by the settle clock (see tellCutShort)
     private cutShortToldAt: number | null = null;
+    // The read of a file just held as cut short that tells whether it holds what Proton Drive has, by path, while one
+    // runs (see checkCutShortLater)
+    private readonly cutShortChecks = new Map<string, Promise<void>>();
     // Cancels the timer that ends a timed pause (see setPaused), while one is set
     private cancelPauseTimer: (() => void) | null = null;
 
@@ -3437,8 +3440,14 @@ export class ProtonDriveSyncEngine {
             }
             return this.clearKeptAfterCloudDelete(root, relPath, scan.entries, kept);
         });
-        // A file cut short that went to the desktop Trash with the rest is no longer here to hold (#300)
+        // A file cut short that went to the desktop Trash with the rest is no longer here to hold (#300); one that stayed
+        // here is held on, as a new file: what it was an edit of is gone from Proton Drive, and so is its record
         this.stateDb.dropStaleCutShort((rel) => !isWithin(rel, relPath) || this.localFileExists(rel));
+        for (const hold of this.stateDb.listCutShort()) {
+            if (isWithin(hold.relPath, relPath) && hold.nodeUid !== null) {
+                this.stateDb.holdCutShort({ ...hold, nodeUid: null });
+            }
+        }
         const told: string[] = [];
         if (moved > 0) {
             told.push(`${moved} item(s) that existed only on this computer were moved to your Trash.`);
@@ -3863,9 +3872,10 @@ export class ProtonDriveSyncEngine {
     // The drive helper says the last writer of a file closed it (#64): with refused, the drive refused a write to it for
     // room, so it may be cut short; with replaced, its writing replaced it. Its session is over: it settles as any other
     // file (see settleClosed), unless it was cut short, which holds it (#300, see holdIfCutShort). A close that replaced
-    // it whole, nothing refused (the copy run again), lifts such a hold. Answers at once, never waiting for a look or an
-    // upload; a hold is written before it answers. Never refused: a path never marked, gone, or not one of My files is
-    // harmless, and the same close twice is the same as once.
+    // it whole, nothing refused (the copy run again), lifts such a hold. Answers at once, never waiting for a look, an
+    // upload or a read of the file: the helper's other notices wait behind it; a hold is written before it answers.
+    // Never refused: a path never marked, gone, or not one of My files is harmless, and the same close twice is the same
+    // as once.
     async driveClosed(relPath: string, opts: { refused: boolean; replaced: boolean }): Promise<void> {
         const rel = drivePathOrNull(relPath);
         if (!rel) {
@@ -3873,7 +3883,7 @@ export class ProtonDriveSyncEngine {
         }
         this.writingMarks.delete(rel);
         if (opts.refused) {
-            await this.holdIfCutShort(rel);
+            this.holdIfCutShort(rel);
             return;
         }
         if (opts.replaced && this.stateDb.getCutShort(rel)) {
@@ -3886,11 +3896,12 @@ export class ProtonDriveSyncEngine {
     // (a copy that stopped once the disk was nearly full), so it is held from uploading (see CutShortFile) until the user
     // decides, unless it holds just what Proton Drive has (an open whose write was refused before anything changed, say).
     // An existing item (with a record, or an edit baseline: a copy over an online-only file) is held as an edit of its
-    // node, anything else as a new file; told of in Activity. The hold is written at once, before anything here waits:
-    // so before the close is answered, and before any look at the file could upload it. Only where telling it from
-    // Proton Drive's version takes reading the whole file does that come after, and the hold go again if they match.
-    // Held again (the same close twice), it keeps when it was found.
-    private async holdIfCutShort(rel: string): Promise<void> {
+    // node, anything else as a new file; told of in Activity. Decided and written at once, with nothing waited on: so
+    // before the close is answered, and before any look at the file could upload it. Where only reading the whole file
+    // can tell it from Proton Drive's version, it is held all the same, and that read runs in the background (see
+    // checkCutShortLater), which lets it go again if they match. A file held already (the same close again, or another
+    // refused session) is held as it is now, at once, with no read: it keeps when it was found, and the hold stays.
+    private holdIfCutShort(rel: string): void {
         this.forgetSettling(rel); // Held, not looked at once settled
         const fullPath = path.join(this.localRoot(), rel);
         let st: Stats | undefined;
@@ -3905,34 +3916,77 @@ export class ProtonDriveSyncEngine {
         // Read before anything could upload it: an upload's record would consume the edit baseline
         const record = this.stateDb.getItemByPath(rel) ?? null;
         const edit = record ? null : this.stateDb.getEditBaseline(rel);
+        const earlier = this.stateDb.getCutShort(rel);
+        if (earlier) {
+            this.stateDb.holdCutShort({
+                ...earlier,
+                nodeUid: record?.nodeUid ?? edit?.nodeUid ?? earlier.nodeUid,
+                size: st.size,
+                mtimeMs: st.mtimeMs,
+            });
+            return;
+        }
         const verdict = asProtonDriveHasIt(st, record, edit);
         if (verdict === 'same') {
             return;
         }
-        const earlier = this.stateDb.getCutShort(rel);
         this.stateDb.holdCutShort({
             relPath: rel,
-            nodeUid: record?.nodeUid ?? edit?.nodeUid ?? earlier?.nodeUid ?? null,
+            nodeUid: record?.nodeUid ?? edit?.nodeUid ?? null,
             size: st.size,
             mtimeMs: st.mtimeMs,
-            detectedAt: earlier?.detectedAt ?? Date.now(),
+            detectedAt: Date.now(),
         });
-        const held = this.stateDb.getCutShort(rel);
         if (verdict === 'hash') {
-            const sha1 = await computeLocalFileSha1(fullPath).catch(() => null);
-            if (sha1 !== null && sha1 === (record ? (record.remoteSha1 ?? record.localSha1) : edit?.sha1)) {
-                // Just what Proton Drive has: nothing to hold. Only the hold written here goes, not one a rename has
-                // carried here since
-                const now = this.stateDb.getCutShort(rel);
-                if (now && held && JSON.stringify(now) === JSON.stringify(held)) {
-                    this.stateDb.dropCutShort(rel);
-                }
+            const held = record ? (record.remoteSha1 ?? record.localSha1) : (edit?.sha1 ?? null);
+            this.checkCutShortLater(rel, fullPath, held, this.stateDb.getCutShort(rel)!);
+            return;
+        }
+        this.tellCutShort(rel);
+    }
+
+    // Whether a file just held as cut short holds just what Proton Drive has after all (sha1 `held`), which only reading
+    // all of it can tell (see holdIfCutShort). In the background, so that the close is answered at once (the helper gives
+    // up on a post after 5 s and sends it again, and its other notices, the keepalives of files being copied in included,
+    // wait behind it). The hold stays meanwhile, so nothing uploads. It goes if the file matches and is still as it was
+    // held (not written, not held again or carried away since); otherwise the file stays held and is told of in Activity.
+    // One read at a time per path (a later one waits for the earlier), counted among the running looks, which the daemon
+    // waits for before it closes the database and a move of the files waits for. Never rejects.
+    private checkCutShortLater(rel: string, fullPath: string, held: string | null, written: CutShortFile): void {
+        const before = this.cutShortChecks.get(rel) ?? Promise.resolve();
+        const check = before.then(async () => {
+            const sha1 = held === null ? null : await computeLocalFileSha1(fullPath).catch(() => null);
+            const now = this.stateDb.getCutShort(rel);
+            if (!now) {
+                return; // Let go of meanwhile (written in full, uploaded, gone, moved away): that decided
+            }
+            let st: Stats | undefined;
+            try {
+                st = statSync(fullPath, { throwIfNoEntry: false });
+            } catch {
+                st = undefined;
+            }
+            const asHeld =
+                JSON.stringify(now) === JSON.stringify(written) &&
+                st?.isFile() === true &&
+                st.size === written.size &&
+                Math.round(st.mtimeMs) === written.mtimeMs;
+            if (asHeld && sha1 !== null && sha1 === held) {
+                this.stateDb.dropCutShort(rel); // Just what Proton Drive has: nothing was cut short of it
                 return;
             }
-        }
-        if (!earlier) {
             this.tellCutShort(rel);
-        }
+        }).catch((error: unknown) => {
+            this.logger.warn(`Could not tell whether ${rel} holds what Proton Drive has; it stays held: ${error}`);
+        });
+        this.cutShortChecks.set(rel, check);
+        this.runningLooks.add(check);
+        void check.finally(() => {
+            this.runningLooks.delete(check);
+            if (this.cutShortChecks.get(rel) === check) {
+                this.cutShortChecks.delete(rel);
+            }
+        });
     }
 
     // Activity says a file was cut short (#300), for the first of a burst only: none for CUT_SHORT_TOLD_EVERY_MS after
