@@ -4075,7 +4075,7 @@ pub(crate) fn bold(size: f32) -> FontId {
 }
 
 fn configure_proton_theme(ctx: &egui::Context) {
-    // Embed Inter & JetBrains Mono fonts (matching Proton Carbon Design System & WordCraft)
+    // Embed Inter & JetBrains Mono fonts (matching Proton Carbon Design System)
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         "Inter".to_owned(),
@@ -5017,7 +5017,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    // Match wordcraft: use XWayland when DISPLAY is set so window icon and WM_CLASS work reliably across Linux desktop environments
+    // Use XWayland when DISPLAY is set so window icon and WM_CLASS work reliably across Linux desktop environments
     if std::env::var_os("DISPLAY").is_some() && std::env::var_os("PROTONDRIVE_WAYLAND").is_none() {
         options.event_loop_builder = Some(Box::new(|b| {
             use winit::platform::x11::EventLoopBuilderExtX11;
