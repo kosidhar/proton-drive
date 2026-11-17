@@ -120,6 +120,7 @@ struct Calls {
     truncates: Mutex<Vec<String>>,
     writings: Mutex<Vec<Value>>,
     closes: Mutex<Vec<Value>>,
+    refused_writes: Mutex<Vec<Value>>,
 }
 
 struct FakeDaemon {
@@ -174,6 +175,10 @@ impl FakeDaemon {
 
     fn closes(&self) -> Vec<Value> {
         self.calls.closes.lock().unwrap().clone()
+    }
+
+    fn refused_writes(&self) -> Vec<Value> {
+        self.calls.refused_writes.lock().unwrap().clone()
     }
 }
 
@@ -265,8 +270,12 @@ fn serve(mut stream: UnixStream, backing: &Path, fake: &Fake, calls: &Calls) {
             }
         }
         // Notices: no deadline, since they change nothing
-        ("POST", None) if target == "/vfs/writing" || target == "/vfs/closed" => {
-            let notices = if target == "/vfs/writing" { &calls.writings } else { &calls.closes };
+        ("POST", None) if ["/vfs/writing", "/vfs/closed", "/vfs/refused"].contains(&target) => {
+            let notices = match target {
+                "/vfs/writing" => &calls.writings,
+                "/vfs/closed" => &calls.closes,
+                _ => &calls.refused_writes,
+            };
             notices.lock().unwrap().push(serde_json::from_slice(&body).unwrap_or(Value::Null));
             (200, json!({ "ok": true }))
         }
@@ -770,6 +779,15 @@ fn a_write_that_would_leave_the_system_disk_under_5_gb_is_refused() {
     // Logged, for whoever wonders why with so much free space shown, but not once per refusal
     let logged = h.stderr().matches("refused a write that would leave the system disk").count();
     assert_eq!(logged, 1, "{}", h.stderr());
+    // And the daemon hears of it as the log does, once, with what was asked and what the disk had (#299): the first
+    // refusal, by ftruncate, asked for all but the file's 5 bytes
+    until("the refusal reaching the daemon", || !h.daemon().refused_writes().is_empty());
+    let refused = h.daemon().refused_writes();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    let (needed, available) = (refused[0]["needed"].as_u64(), refused[0]["available"].as_u64());
+    assert_eq!(needed, Some(local_free - 5), "{refused:?}");
+    // Refused, so what it had was short of the asked bytes and the reserve
+    assert!(available.is_some_and(|available| available < local_free - 5 + 5_000_000_000), "{refused:?}");
     // An overwrite in place always goes through
     file.write_all_at(b"HELLO", 0).unwrap();
     assert_eq!(std::fs::read(h.backing.join("a.txt")).unwrap(), b"HELLO");

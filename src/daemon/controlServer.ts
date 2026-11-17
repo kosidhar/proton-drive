@@ -51,6 +51,7 @@ export interface ControlServerOptions {
         | 'truncateItem'
         | 'driveWriting'
         | 'driveClosed'
+        | 'driveRefused'
         | 'clearDriveWriting'
         | 'listCutShort'
         | 'uploadCutShort'
@@ -160,7 +161,8 @@ type DriveEngine = ControlServerOptions['engine'];
 // onlyIfEmpty?, trash?} (onlyIfEmpty is rmdir, trash a Move to Trash), POST /vfs/truncate {path} (an online-only file
 // made an empty local one); the last three also take deadlineMs. Paths are paths of My files, UTF-8 as they are ('' is
 // the top); each answers { entries } or { ok: true }, or 400 { error, code }. The helper's notices of files open for
-// writing, POST /vfs/writing and /vfs/closed, answer as driveNotice says.
+// writing, POST /vfs/writing and /vfs/closed, and of writes refused for room, POST /vfs/refused, answer as driveNotice
+// says.
 async function driveRoute(req: Request, route: string, engine: DriveEngine): Promise<Response> {
     if (route === '/vfs/children') {
         if (req.method !== 'GET') return driveError(new Error('Method not allowed'), 405);
@@ -174,7 +176,7 @@ async function driveRoute(req: Request, route: string, engine: DriveEngine): Pro
     }
     if (req.method !== 'POST') return driveError(new Error('Method not allowed'), 405);
     const body = await jsonBody(req);
-    if (route === '/vfs/writing' || route === '/vfs/closed') return driveNotice(route, body, engine);
+    if (route === '/vfs/writing' || route === '/vfs/closed' || route === '/vfs/refused') return driveNotice(route, body, engine);
     if (!body) return driveError(new Error('Invalid JSON body'));
     // When the helper stops waiting (epoch ms): a change whose turn comes later is refused, not done behind its back
     if (route !== '/vfs/hydrate' && body.deadlineMs !== undefined && !Number.isFinite(body.deadlineMs)) {
@@ -225,19 +227,32 @@ async function driveRoute(req: Request, route: string, engine: DriveEngine): Pro
     }
 }
 
+// A size in bytes, as the helper sends a u64 (one past 2^53 is a number all the same, if not an exact one)
+function isByteCount(value: unknown): value is number {
+    return Number.isInteger(value) && (value as number) >= 0;
+}
+
 // The drive helper's notices of files open for writing through the drive (#64): POST /vfs/writing {path, replacing} at a
 // file's first writer, as its writing turns into a replace, and every 30 s while it replaces it; POST /vfs/closed {path,
-// refused, replaced} when its last writer closes it. Neither takes deadlineMs: a close answers at once (the file is
-// looked at once it has settled), never waiting for that look or its upload. { ok: true } for any well-formed body,
-// whatever the path (one never marked, gone, or not of My files), as often as it comes: the helper drops a refused
-// close that the daemon answers with a 4xx, which would let a file cut short upload. So only a malformed body is 400
-// { error, code: 'EINVAL' }, and anything that fails here is 500 { error, code: 'EIO' }, which the helper sends again.
+// refused, replaced} when its last writer closes it. And of a write its disk guard refused for lack of room on this
+// computer's disk (#299), at most every 30 s: POST /vfs/refused {needed, available} (bytes asked, and what the disk
+// had). None takes deadlineMs: a close answers at once (the file is looked at once it has settled), never waiting for
+// that look or its upload. { ok: true } for any well-formed body, whatever the path (one never marked, gone, or not of
+// My files), as often as it comes: the helper drops a refused close that the daemon answers with a 4xx, which would let
+// a file cut short upload. So only a malformed body is 400 { error, code: 'EINVAL' }, and anything that fails here is
+// 500 { error, code: 'EIO' }, which the helper sends again.
 async function driveNotice(route: string, body: Record<string, unknown> | null, engine: DriveEngine): Promise<Response> {
     const invalid = (message: string) => Response.json({ error: message, code: 'EINVAL' }, { status: 400 });
     if (!body) return invalid('Invalid JSON body');
-    if (typeof body.path !== 'string') return invalid('path must be a string');
     try {
-        if (route === '/vfs/writing') {
+        if (route === '/vfs/refused') {
+            if (!isByteCount(body.needed) || !isByteCount(body.available)) {
+                return invalid('needed and available must be numbers of bytes');
+            }
+            engine.driveRefused(body.needed, body.available);
+        } else if (typeof body.path !== 'string') {
+            return invalid('path must be a string');
+        } else if (route === '/vfs/writing') {
             if (typeof body.replacing !== 'boolean') return invalid('replacing must be true or false');
             engine.driveWriting(body.path, body.replacing);
         } else {
@@ -260,6 +275,7 @@ const DRIVE_ROUTES: readonly string[] = [
     '/vfs/truncate',
     '/vfs/writing',
     '/vfs/closed',
+    '/vfs/refused',
 ];
 
 // The files the drive's disk guard cut short, held from uploading until the user decides (#300): GET /cut-short lists
