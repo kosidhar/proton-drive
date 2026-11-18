@@ -187,6 +187,14 @@ pub fn attention_items(status: &DaemonStatus, conflicts: &[ConflictRecord], cut_
 /// How many held files Needs attention lists one by one; more are one row for all of them.
 pub const CUT_SHORT_ROWS: usize = 3;
 
+/// How many held files Show them lays out at once before capping with "and N more" (#333).
+pub const CUT_SHORT_EXPANDED_SHOWN: usize = 50;
+
+/// "and N more" under the expanded cut-short list when there are more than `CUT_SHORT_EXPANDED_SHOWN`.
+pub fn more_cut_short(total: usize) -> Option<String> {
+    (total > CUT_SHORT_EXPANDED_SHOWN).then(|| format!("and {} more", total - CUT_SHORT_EXPANDED_SHOWN))
+}
+
 /// Whether a status refresh asks for the held files again: when the daemon came back, when their count differs from
 /// what it was when they were last asked for, and on every refresh while they are few enough to have a row each (1 to
 /// CUT_SHORT_ROWS), as the conflicts are: a load that failed, or a file renamed or replaced by another at the same
@@ -931,33 +939,35 @@ impl ProtonDriveNativeApp {
                 ui.add(egui::Label::new(RichText::new(error).size(12.5).color(DANGER_TEXT())).wrap());
             }
             ui.add_space(10.0);
+            let attention = std::mem::take(&mut self.attention);
             ScrollArea::vertical()
                 .id_salt("attention_scroll")
                 .max_height(ATTENTION_LIST_HEIGHT)
                 .min_scrolled_height(ATTENTION_LIST_HEIGHT)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    for (i, item) in self.attention.clone().into_iter().enumerate() {
+                    for (i, item) in attention.iter().enumerate() {
                         if i > 0 {
                             ui.add_space(8.0);
                         }
                         self.render_attention_item(ui, item);
                     }
                 });
+            self.attention = attention;
         });
     }
 
-    fn render_attention_item(&mut self, ui: &mut egui::Ui, item: Attention) {
+    fn render_attention_item(&mut self, ui: &mut egui::Ui, item: &Attention) {
         match item {
             Attention::AccountMismatch => self.render_account_mismatch(ui),
             Attention::FilesMissing => self.render_files_missing(ui),
             Attention::Conflict { id, rel_path } => {
                 attention_row(ui, |ui| {
-                    elided(ui, RichText::new(conflict_title(&rel_path)).size(13.5).strong().color(TEXT_PRIMARY()), &rel_path);
+                    elided(ui, RichText::new(conflict_title(rel_path)).size(13.5).strong().color(TEXT_PRIMARY()), rel_path);
                     ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
                         if secondary_icon_button(ui, icons::FOLDER_OPEN, "Show in Files", 30.0).clicked() {
-                            open_in_files(&conflict_folder(&self.status.sync_dir, &rel_path));
+                            open_in_files(&conflict_folder(&self.status.sync_dir, rel_path));
                         }
                         ui.add_space(8.0);
                         // Resolving needs the daemon, as Pause and Sync now do
@@ -966,22 +976,22 @@ impl ProtonDriveNativeApp {
                             let kind = if i == 0 { ButtonKind::Primary } else { ButtonKind::Secondary };
                             let button = action_button_if(ui, online, kind, Some(c.icon), c.label, 30.0);
                             if button.on_hover_text(c.hint).on_disabled_hover_text(c.hint).clicked() {
-                                let _ = self.tx.send(WorkerCommand::ResolveConflict { id, choice: c.choice.to_string() });
+                                let _ = self.tx.send(WorkerCommand::ResolveConflict { id: *id, choice: c.choice.to_string() });
                             }
                         }
                     });
                 });
             }
-            Attention::CutShort(item) => attention_row(ui, |ui| self.render_cut_short(ui, &item)),
-            Attention::CutShortMany { count, items } => self.render_cut_short_many(ui, count, &items),
+            Attention::CutShort(item) => attention_row(ui, |ui| self.render_cut_short(ui, item)),
+            Attention::CutShortMany { count, items } => self.render_cut_short_many(ui, *count, items),
             Attention::DriveNotMounted { message, can_mount } => {
                 attention_row(ui, |ui| {
-                    ui.add(egui::Label::new(RichText::new(&message).size(13.5).strong().color(TEXT_PRIMARY())).wrap());
+                    ui.add(egui::Label::new(RichText::new(message).size(13.5).strong().color(TEXT_PRIMARY())).wrap());
                     if let Some(hint) = self.status.vfs.as_ref().and_then(files_safe_hint) {
                         ui.add_space(2.0);
                         ui.add(egui::Label::new(RichText::new(hint).size(12.5).color(TEXT_MUTED())).wrap());
                     }
-                    if can_mount {
+                    if *can_mount {
                         ui.add_space(8.0);
                         let clicked = ui.add_enabled_ui(!self.drive_working, |ui| primary_icon_button(ui, icons::MOUNT, "Mount again", 32.0).clicked()).inner;
                         if clicked {
@@ -1011,7 +1021,7 @@ impl ProtonDriveNativeApp {
                 });
             }
             Attention::FailedItems(n) => attention_row(ui, |ui| {
-                ui.label(RichText::new(failed_items_text(n)).size(13.5).strong().color(TEXT_PRIMARY()));
+                ui.label(RichText::new(failed_items_text(*n)).size(13.5).strong().color(TEXT_PRIMARY()));
             }),
             Attention::LastError(text) => attention_row(ui, |ui| {
                 ui.add(egui::Label::new(RichText::new(text).size(13.0).color(DANGER_TEXT())).wrap());
@@ -1074,9 +1084,15 @@ impl ProtonDriveNativeApp {
             });
         });
         if self.cut_short_expanded {
-            for item in items {
+            for item in items.iter().take(CUT_SHORT_EXPANDED_SHOWN) {
                 ui.add_space(8.0);
                 attention_row(ui, |ui| self.render_cut_short(ui, item));
+            }
+            if let Some(more) = more_cut_short(items.len()) {
+                ui.add_space(8.0);
+                attention_row(ui, |ui| {
+                    ui.label(RichText::new(more).size(12.5).color(TEXT_MUTED()));
+                });
             }
         }
     }
@@ -1871,6 +1887,14 @@ mod tests {
         assert_eq!(more_transfers(5), None);
         assert_eq!(more_transfers(6).as_deref(), Some("1 more"));
         assert_eq!(more_transfers(12).as_deref(), Some("7 more"));
+    }
+
+    #[test]
+    fn expanded_cut_short_caps_rows_then_says_how_many_more() {
+        assert_eq!(more_cut_short(0), None);
+        assert_eq!(more_cut_short(CUT_SHORT_EXPANDED_SHOWN), None);
+        assert_eq!(more_cut_short(CUT_SHORT_EXPANDED_SHOWN + 1).as_deref(), Some("and 1 more"));
+        assert_eq!(more_cut_short(5000).as_deref(), Some("and 4950 more"));
     }
 
     #[test]
