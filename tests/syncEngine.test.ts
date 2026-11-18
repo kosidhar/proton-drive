@@ -120,6 +120,31 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         expect(longExt.endsWith(' (not fully written 2026-11-16 09-05-07 host)')).toBe(true);
     });
 
+    // #330: conflict copy names must also stay within Linux's 255-byte NAME_MAX
+    test('trims long conflict copy names within 255 bytes while keeping the mark, extension, and clash suffix', async () => {
+        const when = new Date(2026, 10, 16, 9, 5, 7);
+        for (const long of [`${'a'.repeat(246)}.txt`, `${'é'.repeat(123)}.txt`, `${'😀'.repeat(61)}.txt`]) {
+            const name = formatConflictFileName(long, when, 'host', 12);
+            expect(Buffer.byteLength(name)).toBeLessThanOrEqual(255);
+            expect(name.endsWith(' (conflict 2026-11-16 09-05-07 host)-12.txt')).toBe(true);
+            expect(long.startsWith(name.slice(0, name.indexOf(' (conflict')))).toBe(true);
+        }
+        const longExt = formatConflictFileName(`a.${'x'.repeat(240)}`, when, 'host');
+        expect(Buffer.byteLength(longExt)).toBeLessThanOrEqual(255);
+        expect(longExt.endsWith(' (conflict 2026-11-16 09-05-07 host)')).toBe(true);
+
+        const longBase = `${'a'.repeat(246)}.txt`;
+        const origPath = path.join(tempDir, longBase);
+        await writeFile(origPath, 'v1');
+        const firstCopy = await createLocalConflictCopy(origPath);
+        const secondCopy = await createLocalConflictCopy(origPath);
+        expect(Buffer.byteLength(path.basename(firstCopy))).toBeLessThanOrEqual(255);
+        expect(Buffer.byteLength(path.basename(secondCopy))).toBeLessThanOrEqual(255);
+        expect(secondCopy).not.toBe(firstCopy);
+        expect(await readFile(firstCopy, 'utf8')).toBe('v1');
+        expect(await readFile(secondCopy, 'utf8')).toBe('v1');
+    });
+
     test('performs two-way sync: downloads remote files, uploads local files, and handles remote delete events', async () => {
         const remoteNodes = new Map<string, NodeEntity & { content?: string }>();
         const rootNode = makeMockNode({
@@ -7753,6 +7778,33 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.calls.uploads).toEqual([]);
             expect(d.calls.trashed).toEqual([]);
             await d.expectEveryRecordHasItsFile();
+        });
+
+        test('a 250-byte name taken in the cloud gets a conflict name within 255 bytes even on a clash', async () => {
+            const when = new Date(2026, 10, 16, 9, 5, 7);
+            setSystemTime(when);
+            try {
+                const longTarget = `${'b'.repeat(246)}.txt`;
+                const d = setup();
+                d.add('Docs/a.txt', 'mine');
+                await pinnedAndSynced(d, d.add('Docs').uid);
+                d.down.add('renameNode');
+                await d.engine.renameItem('Docs/a.txt', `Docs/${longTarget}`);
+                await d.engine.replayRemoteOps();
+                d.add(`Docs/${longTarget}`, 'theirs');
+                d.add(`Docs/${formatConflictFileName(longTarget, when)}`, 'earlier');
+                d.down.clear();
+
+                await d.engine.reconcileNow();
+
+                const name = d.nameOf(d.nodes.get('vol~Docs/a.txt')!);
+                expect(Buffer.byteLength(name)).toBeLessThanOrEqual(255);
+                expect(name).toBe(formatConflictFileName(longTarget, when, undefined, 1));
+                expect(await readFile(d.local(`Docs/${name}`), 'utf8')).toBe('mine');
+                await d.expectEveryRecordHasItsFile();
+            } finally {
+                setSystemTime();
+            }
         });
 
         test('deleting an online-only file trashes it in the cloud and downloads nothing', async () => {
