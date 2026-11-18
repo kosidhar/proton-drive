@@ -1985,7 +1985,9 @@ export class ProtonDriveSyncEngine {
             this.keepBothCopies.delete(relPath);
             return { copyPath: copyRelPath };
         }
-        const madeAs = path.relative(this.localRoot(), await createLocalConflictCopy(localFullPath)).split(path.sep).join('/');
+        const copyWhen = new Date();
+        const copyHost = os.hostname();
+        const madeAs = path.relative(this.localRoot(), await createLocalConflictCopy(localFullPath, copyWhen, copyHost)).split(path.sep).join('/');
         // What the copy holds, which may be newer than localSha1 (read before): the local file must still be that
         const copySha1 = await computeLocalFileSha1(path.join(this.localRoot(), madeAs));
         const copied = await snapshot(copySha1);
@@ -1998,7 +2000,7 @@ export class ProtonDriveSyncEngine {
         // Past the download no retry comes (the file now holds the cloud's version): a copy whose upload fails here is
         // a new local file to the next pass
         this.keepBothCopies.delete(relPath);
-        return { copyPath: await this.uploadConflictCopy(madeAs, remoteMap, since) };
+        return { copyPath: await this.uploadConflictCopy(madeAs, path.posix.basename(relPath), copyWhen, copyHost, remoteMap, since) };
     }
 
     // Removes a conflict copy just made, while nothing tracks it (no record, no index entry) and it still holds what it
@@ -2045,15 +2047,22 @@ export class ProtonDriveSyncEngine {
     // the copy takes the next conflict name free here and tries again (a few times). Returns the path it ends up at.
     private async uploadConflictCopy(
         copyRelPath: string,
+        originalBaseName: string,
+        when: Date,
+        host: string,
         remoteMap: Map<string, NodeEntity>,
         since: number,
     ): Promise<string | null> {
         const root = this.localRoot();
-        const name = path.posix.basename(copyRelPath);
-        const dot = name.lastIndexOf('.');
-        const [stem, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ''];
+        const parentDir = parentOf(copyRelPath);
         let relPath = copyRelPath;
         let n = 0;
+        while (n < 100 && joinRel(parentDir, formatConflictFileName(originalBaseName, when, host, n)) !== copyRelPath) {
+            n += 1;
+        }
+        if (n === 100) {
+            n = 0;
+        }
         for (let attempt = 0; attempt < 10; attempt++) {
             const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
             const fullPath = path.join(root, relPath);
@@ -2103,7 +2112,7 @@ export class ProtonDriveSyncEngine {
             let next: string;
             do {
                 n += 1;
-                next = joinRel(parentOf(copyRelPath), `${stem}-${n}${ext}`);
+                next = joinRel(parentDir, formatConflictFileName(originalBaseName, when, host, n));
             } while (await this.existsLocally(next));
             this.watcher.suppressPath(relPath);
             this.watcher.suppressPath(next);
@@ -6543,11 +6552,10 @@ export class ProtonDriveSyncEngine {
     // The name being taken in Proton Drive, the item gets the usual conflict name there instead (one free here too)
     private async placeUnderConflictName(uid: string, parentUid: string, toPath: string, inParent: boolean): Promise<string> {
         const parentRel = parentOf(toPath);
-        const first = formatConflictFileName(path.posix.basename(toPath));
-        const dot = first.lastIndexOf('.');
-        const [stem, ext] = dot > 0 ? [first.slice(0, dot), first.slice(dot)] : [first, ''];
+        const baseName = path.posix.basename(toPath);
+        const when = new Date();
         for (let attempt = 0; attempt < 10; attempt++) {
-            const candidate = attempt === 0 ? first : `${stem}-${attempt}${ext}`;
+            const candidate = formatConflictFileName(baseName, when, undefined, attempt);
             const candidatePath = joinRel(parentRel, candidate);
             if (
                 (await this.existsLocally(candidatePath)) ||
