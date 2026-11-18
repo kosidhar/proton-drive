@@ -6543,11 +6543,10 @@ export class ProtonDriveSyncEngine {
     // The name being taken in Proton Drive, the item gets the usual conflict name there instead (one free here too)
     private async placeUnderConflictName(uid: string, parentUid: string, toPath: string, inParent: boolean): Promise<string> {
         const parentRel = parentOf(toPath);
-        const first = formatConflictFileName(path.posix.basename(toPath));
-        const dot = first.lastIndexOf('.');
-        const [stem, ext] = dot > 0 ? [first.slice(0, dot), first.slice(dot)] : [first, ''];
+        const baseName = path.posix.basename(toPath);
+        const when = new Date();
         for (let attempt = 0; attempt < 10; attempt++) {
-            const candidate = attempt === 0 ? first : `${stem}-${attempt}${ext}`;
+            const candidate = formatConflictFileName(baseName, when, undefined, attempt);
             const candidatePath = joinRel(parentRel, candidate);
             if (
                 (await this.existsLocally(candidatePath)) ||
