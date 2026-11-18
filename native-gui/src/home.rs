@@ -768,7 +768,7 @@ impl ProtonDriveNativeApp {
             .inner_margin(Margin::symmetric(12, 8))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                ui.add(
+                let notice = ui.add(
                     egui::Label::new(
                         RichText::new(
                             "Your computer's disk is almost full. Proton Drive keeps 5\u{a0}GB free on it, so new files can't be saved to the drive.",
@@ -778,9 +778,24 @@ impl ProtonDriveNativeApp {
                     )
                     .wrap(),
                 );
+                ui.ctx().accesskit_node_builder(notice.id, |node| {
+                    node.set_live(egui::accesskit::Live::Polite);
+                });
                 ui.add_space(8.0);
                 let can = self.daemon_online && self.working.is_empty();
-                free = ui.add_enabled_ui(can, |ui| secondary_button(ui, "Free up space…", 32.0).clicked()).inner;
+                free = ui
+                    .add_enabled_ui(can, |ui| {
+                        action_button_named(
+                            ui,
+                            crate::ButtonKind::Secondary,
+                            None,
+                            "Free up space…",
+                            "Free up space… (disk almost full)",
+                            32.0,
+                        )
+                        .clicked()
+                    })
+                    .inner;
             });
         if free {
             self.open_free_up_space(String::new());
