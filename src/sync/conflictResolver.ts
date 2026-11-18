@@ -2,8 +2,8 @@ import { copyFile, stat } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import path from 'node:path';
 
-export function formatConflictFileName(originalName: string, date = new Date(), host = hostname()): string {
-    return markedName(originalName, conflictMark(date, host));
+export function formatConflictFileName(originalName: string, date = new Date(), host = hostname(), n = 0): string {
+    return markedName(originalName, `${conflictMark(date, host)}${n > 0 ? `-${n}` : ''}`, NAME_MAX);
 }
 
 // The name a file the drive's disk guard cut short is kept under beside Proton Drive's version, once the user puts
@@ -52,19 +52,19 @@ function markedName(originalName: string, mark: string, maxBytes?: number): stri
     return `${stem}${mark}${ext}`;
 }
 
-export async function createLocalConflictCopy(localFullPath: string): Promise<string> {
+export async function createLocalConflictCopy(
+    localFullPath: string,
+    date = new Date(),
+    host = hostname(),
+): Promise<string> {
     const dir = path.dirname(localFullPath);
     const baseName = path.basename(localFullPath);
-    let candidateName = formatConflictFileName(baseName);
-    let candidatePath = path.join(dir, candidateName);
-    let counter = 1;
+    let counter = 0;
+    let candidatePath = path.join(dir, formatConflictFileName(baseName, date, host, counter));
 
     while (await fileExists(candidatePath)) {
-        const dotIndex = candidateName.lastIndexOf('.');
-        const stem = dotIndex > 0 ? candidateName.slice(0, dotIndex) : candidateName;
-        const ext = dotIndex > 0 ? candidateName.slice(dotIndex) : '';
-        candidatePath = path.join(dir, `${stem}-${counter}${ext}`);
         counter++;
+        candidatePath = path.join(dir, formatConflictFileName(baseName, date, host, counter));
     }
 
     await copyFile(localFullPath, candidatePath);
