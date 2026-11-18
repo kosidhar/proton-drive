@@ -52,17 +52,19 @@ function markedName(originalName: string, mark: string, maxBytes?: number): stri
     return `${stem}${mark}${ext}`;
 }
 
-export async function createLocalConflictCopy(localFullPath: string): Promise<string> {
+export async function createLocalConflictCopy(
+    localFullPath: string,
+    date = new Date(),
+    host = hostname(),
+): Promise<string> {
     const dir = path.dirname(localFullPath);
     const baseName = path.basename(localFullPath);
-    const when = new Date();
-    const host = hostname();
     let counter = 0;
-    let candidatePath = path.join(dir, formatConflictFileName(baseName, when, host, counter));
+    let candidatePath = path.join(dir, formatConflictFileName(baseName, date, host, counter));
 
     while (await fileExists(candidatePath)) {
         counter++;
-        candidatePath = path.join(dir, formatConflictFileName(baseName, when, host, counter));
+        candidatePath = path.join(dir, formatConflictFileName(baseName, date, host, counter));
     }
 
     await copyFile(localFullPath, candidatePath);

@@ -10753,6 +10753,34 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 });
             }
 
+            test('a 250-byte conflict copy whose name Proton Drive already has takes a free name within 255 bytes', async () => {
+                const when = new Date(2026, 10, 16, 9, 5, 7);
+                const host = 'host';
+                const longName = `${'a'.repeat(246)}.txt`;
+                const d = setup();
+                await pinnedDocs(d);
+                await writeFile(d.local(`Docs/${longName}`), 'mine');
+                const copyFullPath = await createLocalConflictCopy(d.local(`Docs/${longName}`), when, host);
+                const copyRel = path.relative(d.local(''), copyFullPath).split(path.sep).join('/');
+                d.add(copyRel, 'another device');
+
+                const uploadedRel = await (d.engine as any).uploadConflictCopy(
+                    copyRel,
+                    longName,
+                    when,
+                    host,
+                    new Map([['Docs', d.nodes.get('vol~Docs')!]]),
+                    0,
+                );
+
+                const uploadedName = path.posix.basename(uploadedRel!);
+                expect(Buffer.byteLength(uploadedName)).toBeLessThanOrEqual(255);
+                expect(uploadedName).toBe(formatConflictFileName(longName, when, host, 1));
+                expect(d.named('vol~Docs', uploadedName).map((n) => n.content)).toEqual(['mine']);
+                expect(await readFile(d.local(`Docs/${uploadedName}`), 'utf8')).toBe('mine');
+                expect(await d.files.exists(copyRel)).toBe(false);
+            });
+
             test('a pass still uploads an edit of a recorded file as a new revision of it', async () => {
                 const d = setup();
                 await pinnedDocs(d);
