@@ -7082,6 +7082,33 @@ mod tests {
     }
 
     #[test]
+    fn the_disk_full_notice_is_a_live_region_and_its_button_has_a_distinct_accessible_name() {
+        let mut h = home_with(|_| {});
+        assert!(h.nodes_named("Free up space…").len() == 1);
+        assert!(h.nodes_named("Free up space… (disk almost full)").is_empty());
+
+        h.app.status.disk_full = Some(DiskFull { refused_at: 1_700_000_000_000 });
+        h.frames(1);
+
+        let update = h.last.as_ref().unwrap().platform_output.accesskit_update.as_ref().unwrap();
+        let notice = update
+            .nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.role() == egui::accesskit::Role::Label && n.value() == Some(DISK_FULL_NOTICE))
+            .expect("the disk-full notice is exposed to screen readers");
+        assert_eq!(notice.live(), Some(egui::accesskit::Live::Polite));
+
+        let drive_buttons = h.nodes_named("Free up space…");
+        let notice_buttons = h.nodes_named("Free up space… (disk almost full)");
+        assert_eq!(drive_buttons.len(), 1, "Your drive's Free up space… button");
+        assert_eq!(notice_buttons.len(), 1, "the disk-full notice's Free up space… button");
+        assert_eq!(drive_buttons[0].role(), egui::accesskit::Role::Button);
+        assert_eq!(notice_buttons[0].role(), egui::accesskit::Role::Button);
+        assert!(notice_buttons[0].bounds().unwrap().y1 < drive_buttons[0].bounds().unwrap().y0);
+    }
+
+    #[test]
     fn the_disk_full_status_parses_and_an_old_daemons_has_none() {
         let base = r#"{"state":"idle","loggedIn":true,"syncDir":"/x","activeTransfers":[],"stats":{"totalFiles":0,"totalFolders":0,"totalBytes":0,"unresolvedConflicts":0,"errorItems":0},"settings":{}"#;
         let old: Result<DaemonStatus, _> = serde_json::from_str(&format!("{base}}}"));
