@@ -6961,6 +6961,29 @@ mod tests {
     }
 
     #[test]
+    fn five_thousand_expanded_held_files_cap_the_rows_laid_out_and_say_how_many_more() {
+        let mut h = home_with(|_| {});
+        let items: Vec<_> = (0..5000).map(|i| held_file(&format!("f{i}.txt"), true)).collect();
+        load_held(&mut h, items);
+        h.click(h.text_at("Show them").unwrap());
+        let start = std::time::Instant::now();
+        h.frames(1);
+        let elapsed = start.elapsed();
+
+        let labels: Vec<_> = accesskit_nodes(&h)
+            .into_iter()
+            .filter(|(_, n)| n.role() == egui::accesskit::Role::Label)
+            .filter_map(|(_, n)| n.value().map(str::to_string))
+            .collect();
+        let laid_out = labels.iter().filter(|v| v.ends_with(CUT_SHORT_WHY)).count();
+        assert_eq!(laid_out, home::CUT_SHORT_EXPANDED_SHOWN);
+        assert!(h.text_at(&format!("f0.txt{CUT_SHORT_WHY}")).is_some());
+        assert!(!labels.iter().any(|v| v.starts_with("f4999.txt")));
+        assert!(labels.iter().any(|v| v == &format!("and {} more", 5000 - home::CUT_SHORT_EXPANDED_SHOWN)));
+        assert!(elapsed.as_secs_f32() < 1.0, "frame took {elapsed:?}");
+    }
+
+    #[test]
     fn held_files_count_as_problems_as_the_status_says_and_reload_with_their_count() {
         let mut h = home_with(|_| {});
         load_held(&mut h, (0..5).map(|i| held_file(&format!("f{i}"), true)).collect());
