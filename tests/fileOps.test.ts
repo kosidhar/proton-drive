@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 import { type NodeEntity, NodeType, NodeWithSameNameExistsValidationError, type ProtonDriveClient } from '@protontech/drive-sdk';
 
-import { createRemoteFolder, downloadRevisionToFile } from '../src/sdk/fileOps';
+import { createRemoteFolder, downloadDriveNodeToLocal, downloadRevisionToFile } from '../src/sdk/fileOps';
 import { makeMockNode } from './helpers/mockNodes';
 
 const cleanups: Array<() => void> = [];
@@ -66,6 +66,38 @@ describe('downloadRevisionToFile', () => {
         expect(await Promise.race([done, Bun.sleep(2000).then(() => 'waited for a slot for ever')])).toBe('downloaded');
         expect(readFileSync(filePath, 'utf8')).toBe('content');
         expect(free()).toBe(5);
+    });
+});
+
+describe('downloadDriveNodeToLocal', () => {
+    // #349: staging temp file names must stay within NAME_MAX even when the target file name is 255 bytes
+    test('downloads a file whose name is at the 255-byte limit without exceeding NAME_MAX for its temp file', async () => {
+        const dir = mkdtempSync(path.join(os.tmpdir(), 'pd-fileops-'));
+        cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+        const { sdk } = slottedSdk('long-name-content');
+        const longName = `${'a'.repeat(251)}.txt`;
+        expect(Buffer.byteLength(longName)).toBe(255);
+        const remoteNode = makeMockNode({ uid: 'vol~long', parentUid: 'vol~root', nameStr: longName, type: NodeType.File, content: 'long-name-content' }) as NodeEntity;
+        const localPath = path.join(dir, longName);
+        let stagedNames: string[] = [];
+
+        const result = await downloadDriveNodeToLocal({
+            sdk,
+            logger,
+            remoteNode,
+            localPath,
+            beforePlacing: async () => {
+                stagedNames = readdirSync(dir);
+                return true;
+            },
+        });
+
+        expect(result.status).toBe('downloaded');
+        expect(stagedNames).toHaveLength(1);
+        expect(stagedNames[0]).toStartWith('.proton-drive-tmp-');
+        expect(Buffer.byteLength(stagedNames[0]!)).toBeLessThanOrEqual(255);
+        expect(readFileSync(localPath, 'utf8')).toBe('long-name-content');
+        expect(readdirSync(dir)).toEqual([longName]);
     });
 });
 
