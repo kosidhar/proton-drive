@@ -761,8 +761,9 @@ impl ProtonDriveNativeApp {
             });
     }
 
-    /// While the daemon says the computer's disk is almost full (#299): why new files aren't being saved, and the way
-    /// to make room. It has no close button: the daemon takes `diskFull` away itself, after a while or once there is room.
+    /// While the daemon says the computer's disk is almost full (#299, #343): why files can't be saved to or opened
+    /// from the drive, and the way to make room. It has no close button: the daemon takes `diskFull` away itself, after
+    /// a while or once there is room.
     fn render_disk_full_notice(&mut self, ui: &mut egui::Ui) {
         if self.status.disk_full.is_none() {
             return;
@@ -779,7 +780,7 @@ impl ProtonDriveNativeApp {
                 let notice = ui.add(
                     egui::Label::new(
                         RichText::new(
-                            "Your computer's disk is almost full. Proton Drive keeps 5\u{a0}GB free on it, so new files can't be saved to the drive.",
+                            "Your computer's disk is almost full. Proton Drive keeps 5\u{a0}GB free on it, so files can't be saved to the drive or opened from it.",
                         )
                         .size(12.5)
                         .color(TEXT_PRIMARY()),
