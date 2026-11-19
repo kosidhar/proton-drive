@@ -420,7 +420,10 @@ impl ProtonDriveNativeApp {
             ui.set_min_width(ui.available_width());
             card_heading(ui, "Account", None, None);
             ui.add_space(12.0);
-            ui.horizontal(|ui| {
+            let plan = account.as_ref().filter(|a| a.max_space > 0).map(|a| plan_name(a.max_space));
+            let logged_in = self.status.logged_in;
+            let mut account_command = None;
+            let paint_avatar = |ui: &mut egui::Ui| {
                 let (avatar, _) = ui.allocate_exact_size(Vec2::new(44.0, 44.0), Sense::hover());
                 ui.painter().rect_filled(avatar, CornerRadius::same(10), crate::PROTON_PURPLE_SOFT());
                 ui.painter().text(
@@ -430,40 +433,68 @@ impl ProtonDriveNativeApp {
                     FontId::new(16.0, FontFamily::Proportional),
                     TEXT_PRIMARY(),
                 );
-                ui.add_space(6.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if self.status.logged_in {
-                        if action_button(ui, ButtonKind::Secondary, Some(icons::SIGN_OUT), "Sign out", 32.0).clicked() {
-                            self.send_account_command(WorkerCommand::Logout);
-                        }
-                    } else if action_button(ui, ButtonKind::Primary, Some(icons::SIGN_IN), "Sign in", 32.0).clicked() {
-                        self.send_account_command(WorkerCommand::StartLogin);
+            };
+            let mut sign_action = |ui: &mut egui::Ui| {
+                if logged_in {
+                    if action_button(ui, ButtonKind::Secondary, Some(icons::SIGN_OUT), "Sign out", 32.0).clicked() {
+                        account_command = Some(WorkerCommand::Logout);
                     }
-                    ui.add_space(8.0);
-                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                        // The plan beside the name when the whole name fits beside it, else under the email
-                        let plan = account.as_ref().filter(|a| a.max_space > 0).map(|a| plan_name(a.max_space));
-                        let name_w = text_width(ui.painter(), &name, &FontId::proportional(NAME_SIZE));
-                        let beside = plan.is_some_and(|plan| {
-                            name_w + 4.0 + 2.0 * ui.spacing().item_spacing.x + plan_pill_width(ui, plan) <= ui.available_width()
-                        });
-                        ui.horizontal(|ui| {
-                            elided(ui, RichText::new(&name).size(NAME_SIZE).strong().color(TEXT_PRIMARY()), &name);
-                            if let Some(plan) = plan.filter(|_| beside) {
-                                ui.add_space(4.0);
-                                plan_pill(ui, plan);
-                            }
-                        });
+                } else if action_button(ui, ButtonKind::Primary, Some(icons::SIGN_IN), "Sign in", 32.0).clicked() {
+                    account_command = Some(WorkerCommand::StartLogin);
+                }
+            };
+            if ui.available_width() < STACKED_BELOW {
+                // Narrow card (small window, high zoom): avatar and name, then plan, then Sign out/in under them (#315)
+                ui.horizontal(|ui| {
+                    paint_avatar(ui);
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| {
+                        elided(ui, RichText::new(&name).size(NAME_SIZE).strong().color(TEXT_PRIMARY()), &name);
                         if !email.is_empty() {
                             elided(ui, RichText::new(&email).size(12.5).color(TEXT_MUTED()), &email);
                         }
-                        if let Some(plan) = plan.filter(|_| !beside) {
-                            ui.add_space(2.0);
-                            plan_pill(ui, plan);
-                        }
                     });
                 });
-            });
+                if let Some(plan) = plan {
+                    ui.add_space(8.0);
+                    plan_pill(ui, plan);
+                }
+                ui.add_space(10.0);
+                sign_action(ui);
+            } else {
+                ui.horizontal(|ui| {
+                    paint_avatar(ui);
+                    ui.add_space(6.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        sign_action(ui);
+                        ui.add_space(8.0);
+                        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                            // The plan beside the name when the whole name fits beside it, else under the email
+                            let name_w = text_width(ui.painter(), &name, &FontId::proportional(NAME_SIZE));
+                            let beside = plan.is_some_and(|plan| {
+                                name_w + 4.0 + 2.0 * ui.spacing().item_spacing.x + plan_pill_width(ui, plan) <= ui.available_width()
+                            });
+                            ui.horizontal(|ui| {
+                                elided(ui, RichText::new(&name).size(NAME_SIZE).strong().color(TEXT_PRIMARY()), &name);
+                                if let Some(plan) = plan.filter(|_| beside) {
+                                    ui.add_space(4.0);
+                                    plan_pill(ui, plan);
+                                }
+                            });
+                            if !email.is_empty() {
+                                elided(ui, RichText::new(&email).size(12.5).color(TEXT_MUTED()), &email);
+                            }
+                            if let Some(plan) = plan.filter(|_| !beside) {
+                                ui.add_space(2.0);
+                                plan_pill(ui, plan);
+                            }
+                        });
+                    });
+                });
+            }
+            if let Some(cmd) = account_command {
+                self.send_account_command(cmd);
+            }
             if let Some(s) = storage(account.as_ref()) {
                 ui.add_space(12.0);
                 ui.separator();
@@ -477,7 +508,7 @@ impl ProtonDriveNativeApp {
             // thing to do
             if self.status.logged_in {
                 ui.add_space(10.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     // Short labels, named in full for screen readers
                     let web = action_button_named(ui, ButtonKind::Secondary, Some(icons::WEB), "Web", OPEN_WEB, 32.0);
                     if web.on_hover_text(OPEN_WEB).clicked() {
@@ -604,7 +635,7 @@ pub(crate) fn plan_pill(ui: &mut egui::Ui, plan: &str) {
         .corner_radius(CornerRadius::same(5))
         .inner_margin(Margin::symmetric(PLAN_PADDING, 2))
         .show(ui, |ui| {
-            ui.label(RichText::new(plan).size(PLAN_SIZE).color(PROTON_PURPLE_TEXT()));
+            ui.add(egui::Label::new(RichText::new(plan).size(PLAN_SIZE).color(PROTON_PURPLE_TEXT())).extend());
         });
 }
 
