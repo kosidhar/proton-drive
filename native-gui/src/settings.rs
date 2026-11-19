@@ -4,7 +4,7 @@
 use eframe::egui::{self, Align, CornerRadius, FontFamily, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, Vec2};
 
 use crate::home::{
-    card_title, elided, open_in_browser, secondary_button, storage, trash_hover, OPEN_TRASH, OPEN_WEB, PROTON_DRIVE_TRASH_URL,
+    card_title, elided, open_in_browser, storage, trash_hover, OPEN_TRASH, OPEN_WEB, PROTON_DRIVE_TRASH_URL,
     PROTON_DRIVE_WEB_URL, TRASH_BUTTON,
 };
 use crate::{
@@ -48,8 +48,9 @@ const STACKED_GAP: f32 = 6.0;
 /// narrower than `STACKED_BELOW` (a small window, a large zoom), the control goes under its label instead, as on
 /// Proton's settings on a phone.
 ///
-/// `control` returns its main widget, which screen readers then hear named by the label and described by `info`. The
-/// label is no stop for the Tab key. Returns the label's response.
+/// `control` returns its main widget, which screen readers hear named by the label (unless the control already carries
+/// its own non-empty name, as an action button does) and described by `info`. The label is no stop for the Tab key.
+/// Returns the label's response.
 pub(crate) fn setting_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -147,19 +148,24 @@ fn row(
     .inner
 }
 
-/// Screen readers hear the control named by its row's label (it is laid out first, from the row's right end, so it
-/// comes first in their order too), and described by what the row's ⓘ says.
+/// Links `control` to its row's `label` and `info` for screen readers: controls without an explicit name of their own
+/// (switches, text fields, pickers) are named by the row's label, while action buttons that carry their own non-empty
+/// name (such as "Unblock rg" or "Unhide Docs/Private") keep that name instead of a conflicting `labelled_by` (#291).
 fn name_control(ui: &egui::Ui, control: &egui::Response, label: &egui::Response, info: Option<&str>) {
-    let _ = control.clone().labelled_by(label.id);
+    let mut needs_label = false;
     ui.ctx().accesskit_node_builder(control.id, |node| {
         // A name of its own, even an empty one (egui's picker has one), is read instead of its label's
         if node.label().is_some_and(str::is_empty) {
             node.clear_label();
         }
+        needs_label = node.label().is_none();
         if let Some(info) = info {
             node.set_description(info);
         }
     });
+    if needs_label {
+        let _ = control.clone().labelled_by(label.id);
+    }
 }
 
 /// The room the ⓘ takes after a label, if there is one.
@@ -574,7 +580,12 @@ impl ProtonDriveNativeApp {
                         let hiding = (item.state == "hiding").then_some("Hiding…");
                         setting_row(ui, &item.path, hiding, None, |ui| {
                             let label = if self.working.contains(&item.path) { "Unhiding…" } else { "Unhide" };
-                            let button = ui.add_enabled_ui(can, |ui| secondary_button(ui, label, 30.0)).inner;
+                            let name = format!("{label} {}", item.path);
+                            let button = ui
+                                .add_enabled_ui(can, |ui| {
+                                    action_button_named(ui, ButtonKind::Secondary, None, label, &name, 30.0)
+                                })
+                                .inner;
                             if button.clicked() {
                                 unhide = Some(item.path.clone());
                             }
