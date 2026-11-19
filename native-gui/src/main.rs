@@ -3916,12 +3916,25 @@ fn button_with(ui: &mut egui::Ui, kind: ButtonKind, icon: Option<&str>, label: &
 /// it goes to the next line whole when it doesn't fit, where egui's `add_enabled_ui` would take the rest of the line
 /// and run past its end.
 fn action_button_if(ui: &mut egui::Ui, enabled: bool, kind: ButtonKind, icon: Option<&str>, label: &str, height: f32) -> egui::Response {
+    action_button_if_named(ui, enabled, kind, icon, label, label, height)
+}
+
+/// `action_button_if` named `name` for screen readers rather than by its label.
+pub(crate) fn action_button_if_named(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    kind: ButtonKind,
+    icon: Option<&str>,
+    label: &str,
+    name: &str,
+    height: f32,
+) -> egui::Response {
     let size = Vec2::new(action_button_width(ui, icon, label), height);
     ui.allocate_ui(size, |ui| {
         if !enabled {
             ui.disable();
         }
-        action_button_sized(ui, kind, icon, label, size)
+        button_with(ui, kind, icon, label, name, size)
     })
     .inner
 }
@@ -6981,6 +6994,81 @@ mod tests {
         assert!(!labels.iter().any(|v| v.starts_with("f4999.txt")));
         assert!(labels.iter().any(|v| v == &format!("and {} more", 5000 - home::CUT_SHORT_EXPANDED_SHOWN)));
         assert!(elapsed.as_secs_f32() < 1.0, "frame took {elapsed:?}");
+    }
+
+    #[test]
+    fn cut_short_and_conflict_row_buttons_name_their_file_for_screen_readers() {
+        let mut h = home_with(|_| {});
+        h.event(WorkerEvent::ConflictsLoaded(vec![
+            ConflictRecord { id: 1, local_rel_path: "docs/budget.xlsx".into(), ..Default::default() },
+            ConflictRecord { id: 2, local_rel_path: "photos/trip.jpg".into(), ..Default::default() },
+        ]));
+        load_held(&mut h, vec![held_file("docs/report.pdf", true), held_file("notes/draft.txt", false)]);
+
+        for expected in [
+            "Upload this version of report.pdf",
+            "Put back the Proton Drive version of report.pdf",
+            "Upload draft.txt anyway",
+            "Show budget.xlsx in Files",
+            "Keep Both for budget.xlsx",
+            "Keep Local for budget.xlsx",
+            "Keep Remote for budget.xlsx",
+            "Show trip.jpg in Files",
+            "Keep Both for trip.jpg",
+            "Keep Local for trip.jpg",
+            "Keep Remote for trip.jpg",
+        ] {
+            let found = h.nodes_named(expected);
+            assert_eq!(found.len(), 1, "expected one button named {expected:?}");
+            assert_eq!(found[0].role(), egui::accesskit::Role::Button, "{expected:?}");
+        }
+        for generic in [
+            "Upload this version",
+            "Put back the Proton Drive version",
+            "Upload it anyway",
+            "Show in Files",
+            "Keep Both",
+            "Keep Local",
+            "Keep Remote",
+        ] {
+            assert!(h.nodes_named(generic).is_empty(), "generic button name {generic:?} should include the file name");
+        }
+    }
+
+    #[test]
+    fn show_and_hide_cut_short_control_reports_its_expanded_state() {
+        let mut h = home_with(|_| {});
+        load_held(
+            &mut h,
+            vec![held_file("a.txt", true), held_file("b.txt", false), held_file("c.txt", true), held_file("d.txt", true)],
+        );
+
+        let collapsed = h.nodes_named("Show them");
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].role(), egui::accesskit::Role::Button);
+        assert_eq!(collapsed[0].is_expanded(), Some(false));
+
+        h.click(h.text_at("Show them").unwrap());
+        // Even on the click frame itself, the AccessKit label and expanded state agree with the shown rows
+        let on_click = h.nodes_named("Hide them");
+        assert_eq!(on_click.len(), 1);
+        assert_eq!(on_click[0].is_expanded(), Some(true));
+        h.frames(1);
+        let expanded = h.nodes_named("Hide them");
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].role(), egui::accesskit::Role::Button);
+        assert_eq!(expanded[0].is_expanded(), Some(true));
+        assert_eq!(h.nodes_named("Upload this version of a.txt").len(), 1);
+        assert_eq!(h.nodes_named("Upload b.txt anyway").len(), 1);
+
+        h.click(h.text_at("Hide them").unwrap());
+        let on_collapse = h.nodes_named("Show them");
+        assert_eq!(on_collapse.len(), 1);
+        assert_eq!(on_collapse[0].is_expanded(), Some(false));
+        h.frames(1);
+        let collapsed_again = h.nodes_named("Show them");
+        assert_eq!(collapsed_again.len(), 1);
+        assert_eq!(collapsed_again[0].is_expanded(), Some(false));
     }
 
     #[test]
