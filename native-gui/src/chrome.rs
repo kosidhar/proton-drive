@@ -8,10 +8,11 @@ use std::path::Path;
 use eframe::egui::{self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, Vec2};
 
 use crate::{
-    action_button_sized, bold, format_bytes, home, icons, settings, truncate_middle_to_width,
-    AccountInfo, ButtonKind, NavTab, ProtonDriveNativeApp, WorkerCommand, BG_CANVAS, BG_CARD_ALT, BG_SIDEBAR,
-    BORDER_NORM, BORDER_SUBTLE, PROTON_PURPLE, PROTON_PURPLE_SOFT, SIDEBAR_HOVER, SIDEBAR_SELECTED, SIDEBAR_TEXT,
-    SIDEBAR_WEAK, STATUS_DANGER, STORAGE_FILL, STORAGE_TRACK, TEXT_MUTED, TEXT_PRIMARY,
+    action_button_on_sidebar, bold, focus_ring, focus_ring_colored, format_bytes, home, icons, settings,
+    truncate_middle_to_width, AccountInfo, ButtonKind, NavTab, ProtonDriveNativeApp, WorkerCommand, BG_CANVAS,
+    BG_CARD_ALT, BG_SIDEBAR, BORDER_NORM, BORDER_SUBTLE, PROTON_PURPLE, PROTON_PURPLE_SOFT, SIDEBAR_FOCUS,
+    SIDEBAR_HOVER, SIDEBAR_SELECTED, SIDEBAR_TEXT, SIDEBAR_WEAK, STATUS_DANGER, STORAGE_FILL, STORAGE_TRACK,
+    TEXT_MUTED, TEXT_PRIMARY,
 };
 
 /// The button that opens the drive's folder in the file manager: the sidebar's, and Home's drive card's
@@ -118,7 +119,7 @@ impl ProtonDriveNativeApp {
         let size = Vec2::new(ui.available_width(), 40.0);
         let open = ui
             .add_enabled_ui(!folder.is_empty(), |ui| {
-                action_button_sized(ui, ButtonKind::Primary, Some(icons::FOLDER_OPEN), OPEN_IN_FILES, size)
+                action_button_on_sidebar(ui, ButtonKind::Primary, Some(icons::FOLDER_OPEN), OPEN_IN_FILES, size)
             })
             .inner
             .on_disabled_hover_text(OPEN_IN_FILES_WAITS);
@@ -202,6 +203,7 @@ fn section_row(ui: &mut egui::Ui, icon: &str, label: &str, open: bool, count: Op
         painter.rect_filled(pill, CornerRadius::same(8), STATUS_DANGER);
         painter.galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
     }
+    focus_ring_colored(ui, &resp, 8.0, SIDEBAR_FOCUS());
     resp
 }
 
@@ -332,6 +334,9 @@ impl ProtonDriveNativeApp {
         painter.galley(egui::pos2(right - name.size().x, top), name, TEXT_PRIMARY());
         if let Some(email) = email {
             painter.galley(egui::pos2(right - email.size().x, below), email, TEXT_MUTED());
+        }
+        if shown.signed_in {
+            focus_ring(ui, &resp, 8.0);
         }
         resp
     }
