@@ -8465,6 +8465,115 @@ mod tests {
         assert!(settings.bottom() < meter.top(), "Settings {settings:?}, the last section, is above the meter {meter:?}");
         assert!(meter.bottom() <= h.screen.y, "the meter {meter:?} is inside the window {:?}", h.screen);
         assert!(rect(env!("CARGO_PKG_VERSION")).right() <= SIDEBAR_EDGE, "the version stays in the sidebar");
+        // No spurious scroll at 1.2x: wheeling over the sidebar leaves Settings and the version in place
+        let version_before = rect(env!("CARGO_PKG_VERSION"));
+        h.scroll(egui::pos2(SIDEBAR_EDGE / 2.0, h.screen.y / 2.0), 100.0);
+        assert_eq!(h.text_rect(env!("CARGO_PKG_VERSION")), Some(version_before), "no spurious sidebar scroll at 1.2x");
+    }
+
+    // #314: at 840x540 with high zoom, the sidebar's last section (Settings) never runs under the storage meter or
+    // version, and scrolling the sidebar reaches every section and the footer even at maximum zoom.
+    #[test]
+    fn sidebar_sections_never_overlap_the_storage_meter_at_high_zoom() {
+        let sidebar_settings_row = |h: &Harness| -> egui::Rect {
+            let update = h.last.as_ref().and_then(|o| o.platform_output.accesskit_update.as_ref()).expect("accesskit");
+            update
+                .nodes
+                .iter()
+                .filter_map(|(_, n)| {
+                    if n.label() != Some("Settings") {
+                        return None;
+                    }
+                    let b = n.bounds()?;
+                    let r = egui::Rect::from_min_max(
+                        egui::pos2(b.x0 as f32, b.y0 as f32),
+                        egui::pos2(b.x1 as f32, b.y1 as f32),
+                    );
+                    (r.center().x < SIDEBAR_EDGE).then_some(r)
+                })
+                .next()
+                .expect("the sidebar's Settings row")
+        };
+
+        for signed_in in [true, false] {
+            for zoom in [1.7, 1.8, 2.0, 3.0] {
+                let mut h = if signed_in {
+                    home_with(|s| s.account = Some(three_of_510()))
+                } else {
+                    Harness::new()
+                };
+                h.resize_zoomed(Vec2::new(840.0, 540.0), zoom);
+                let settings = sidebar_settings_row(&h);
+                // If the meter/version is painted before scrolling, it must still sit strictly below Settings
+                if let Some(version) = h.text_rect(env!("CARGO_PKG_VERSION")) {
+                    assert!(
+                        settings.bottom() < version.top(),
+                        "signed_in={signed_in} zoom={zoom}: Settings {settings:?} overlaps version {version:?}"
+                    );
+                }
+                if signed_in {
+                    if let Some((bar, _, _)) = filled_rects(&h)
+                        .into_iter()
+                        .find(|(r, _, fill)| *fill == STORAGE_TRACK() && r.center().x < SIDEBAR_EDGE)
+                    {
+                        assert!(
+                            settings.bottom() < bar.top(),
+                            "signed_in={signed_in} zoom={zoom}: Settings {settings:?} overlaps storage bar {bar:?}"
+                        );
+                    }
+                }
+                // At 1.7x and 1.8x, all four sections still fit in the window without scrolling
+                if zoom <= 1.8 {
+                    assert!(
+                        settings.bottom() <= h.screen.y,
+                        "signed_in={signed_in} zoom={zoom}: Settings {settings:?} should stay visible in {:?}",
+                        h.screen
+                    );
+                }
+
+                // Scrolling the sidebar brings the footer cleanly into view below Settings
+                h.scroll(egui::pos2(SIDEBAR_EDGE / 2.0, h.screen.y / 2.0), 400.0);
+                let settings_after = sidebar_settings_row(&h);
+                let version_after = h.text_rect(env!("CARGO_PKG_VERSION")).expect("version after scroll");
+                assert!(
+                    settings_after.bottom() < version_after.top(),
+                    "signed_in={signed_in} zoom={zoom}: Settings {settings_after:?} overlaps version {version_after:?} after scroll"
+                );
+                assert!(
+                    version_after.top() >= 0.0 && version_after.bottom() <= h.screen.y,
+                    "signed_in={signed_in} zoom={zoom}: version {version_after:?} should scroll into {:?}",
+                    h.screen
+                );
+                if signed_in {
+                    let bar = filled_rects(&h)
+                        .into_iter()
+                        .find(|(r, _, fill)| *fill == STORAGE_TRACK() && r.center().x < SIDEBAR_EDGE)
+                        .map(|(r, _, _)| r)
+                        .expect("storage bar after scroll");
+                    let meter_text = chrome::storage_meter_text(h.app.status.account.as_ref()).unwrap();
+                    let meter = h.text_rect(&meter_text).expect("storage meter text after scroll");
+                    assert!(
+                        settings_after.bottom() < bar.top(),
+                        "signed_in={signed_in} zoom={zoom}: Settings {settings_after:?} overlaps storage bar {bar:?} after scroll"
+                    );
+                    assert!(
+                        bar.top() >= 0.0 && bar.bottom() < meter.top(),
+                        "signed_in={signed_in} zoom={zoom}: storage bar {bar:?} overlaps meter text {meter:?}"
+                    );
+                    assert!(
+                        meter.top() >= 0.0 && meter.bottom() <= h.screen.y,
+                        "signed_in={signed_in} zoom={zoom}: meter {meter:?} should scroll into {:?}",
+                        h.screen
+                    );
+                    tooltips_at_once(&h);
+                    hover(&mut h, meter.center());
+                    assert!(
+                        h.text_at("Drive uses 2.0 GB").is_some(),
+                        "signed_in={signed_in} zoom={zoom}: storage tooltip still shows in scrolled sidebar"
+                    );
+                }
+            }
+        }
     }
 
     /// Every button the last frame put in the section (not the sidebar's or the top bar's): its name and its frame.

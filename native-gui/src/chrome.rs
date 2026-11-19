@@ -82,19 +82,38 @@ impl ProtonDriveNativeApp {
             // window's black clear colour as a hard line (#254)
             .show_separator_line(true)
             .exact_width(SIDEBAR_WIDTH)
-            .frame(Frame::NONE.fill(BG_SIDEBAR()).inner_margin(Margin { left: 12, right: 12, top: 16, bottom: 14 }))
+            .frame(Frame::NONE.fill(BG_SIDEBAR()))
             .show(ctx, |ui| {
-                // What is greyed out fades into the sidebar's colour, not into the theme's light grey
-                ui.visuals_mut().widgets.noninteractive.weak_bg_fill = BG_SIDEBAR();
+                // What is greyed out fades into the sidebar's colour, not into the theme's light grey, and the
+                // floating scrollbar uses sidebar-contrasting colours rather than the light canvas theme
+                {
+                    let v = ui.visuals_mut();
+                    v.widgets.noninteractive.weak_bg_fill = BG_SIDEBAR();
+                    v.extreme_bg_color = BG_SIDEBAR();
+                    v.widgets.inactive.fg_stroke.color = SIDEBAR_WEAK();
+                    v.widgets.hovered.fg_stroke.color = SIDEBAR_TEXT();
+                    v.widgets.active.fg_stroke.color = SIDEBAR_TEXT();
+                }
                 if self.dialog_open() {
                     ui.disable(); // As in the section: nothing under the confirmation dialog takes clicks while it is open
                 }
-                self.render_logo(ui);
-                ui.add_space(18.0);
-                self.render_open_in_files(ui);
-                ui.add_space(14.0);
-                self.render_sections(ui);
-                self.render_storage_meter(ui);
+                // Scroll when the window is too short (high zoom) so the sections never run under the meter (#314);
+                // keeping the margin inside the scroll area also leaves room for keyboard focus rings.
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        Frame::NONE
+                            .inner_margin(Margin { left: 12, right: 12, top: 16, bottom: 14 })
+                            .show(ui, |ui| {
+                                self.render_logo(ui);
+                                ui.add_space(18.0);
+                                self.render_open_in_files(ui);
+                                ui.add_space(14.0);
+                                self.render_sections(ui);
+                                self.render_storage_meter(ui);
+                            });
+                    });
             });
     }
 
@@ -145,27 +164,57 @@ impl ProtonDriveNativeApp {
     }
 
     /// At the foot of the sidebar: the storage meter, a thin bar over "used / total", with the version on the right.
-    /// Without the account's usage (signed out, connecting, an older daemon), the version alone.
+    /// Without the account's usage (signed out, connecting, an older daemon), the version alone. When the window is
+    /// too short for the sections and the meter together (high zoom), the meter flows under the sections and the
+    /// sidebar scrolls to it rather than painting over the last section (#314).
     fn render_storage_meter(&self, ui: &mut egui::Ui) {
+        const MIN_METER_GAP: f32 = 12.0;
         let account = self.status.account.as_ref();
         let storage = home::storage(account);
         let meter_text = storage_meter_text(account);
-        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-            let weak = |text: &str| RichText::new(text).size(11.5).color(SIDEBAR_WEAK());
-            let meter = ui
-                .horizontal(|ui| {
-                    let meter = meter_text.as_deref().map(|text| ui.label(weak(text)));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(weak(env!("CARGO_PKG_VERSION"))));
-                    meter
-                })
-                .inner;
-            if let (Some(storage), Some(meter)) = (storage, meter) {
-                ui.add_space(6.0);
+        let text_h = ui
+            .fonts(|f| f.row_height(&FontId::proportional(11.5)))
+            .max(ui.spacing().interact_size.y);
+        let bar_storage = storage.filter(|_| meter_text.is_some());
+        let meter_h = if bar_storage.is_some() {
+            // Usage bar (4 pt) + item spacing after the bar + 6 pt space + the text row
+            4.0 + ui.spacing().item_spacing.y + 6.0 + text_h
+        } else {
+            text_h
+        };
+        let weak = |text: &str| RichText::new(text).size(11.5).color(SIDEBAR_WEAK());
+        let render_row = |ui: &mut egui::Ui| {
+            ui.horizontal(|ui| {
+                let meter = meter_text.as_deref().map(|text| ui.label(weak(text)));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(weak(env!("CARGO_PKG_VERSION"))));
+                meter
+            })
+            .inner
+        };
+
+        if ui.available_height() >= meter_h + MIN_METER_GAP {
+            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                let meter = render_row(ui);
+                if let (Some(storage), Some(meter)) = (bar_storage, meter) {
+                    ui.add_space(6.0);
+                    let bar = home::usage_bar(ui, storage.fraction, STORAGE_FILL(), STORAGE_TRACK());
+                    // How much of it is Drive's
+                    meter.union(bar).on_hover_text(storage.tooltip);
+                }
+            });
+        } else {
+            ui.add_space(MIN_METER_GAP);
+            let bar = bar_storage.as_ref().map(|storage| {
                 let bar = home::usage_bar(ui, storage.fraction, STORAGE_FILL(), STORAGE_TRACK());
+                ui.add_space(6.0);
+                bar
+            });
+            let meter = render_row(ui);
+            if let (Some(storage), Some(bar), Some(meter)) = (bar_storage, bar, meter) {
                 // How much of it is Drive's
                 meter.union(bar).on_hover_text(storage.tooltip);
             }
-        });
+        }
     }
 }
 
