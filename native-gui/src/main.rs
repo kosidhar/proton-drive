@@ -3835,6 +3835,7 @@ fn button_shell(
         ui.painter()
             .rect_stroke(rect, CornerRadius::same(8), s, egui::StrokeKind::Inside);
     }
+    focus_ring(ui, &resp, 8.0);
     (rect, resp)
 }
 
@@ -10689,6 +10690,46 @@ mod tests {
         press_key(&mut h, Key::Space);
         assert_eq!(h.app.activity_filter, activity::ActivityFilter::Uploads, "Space picks it");
         assert_eq!(chip(&h, "Uploads").toggled(), Some(Toggled::True));
+    }
+
+    // #277: custom buttons (action_button, icon_button, sidebar sections, account menu) show a focus ring in both themes
+    #[test]
+    fn buttons_show_a_focus_ring_in_both_themes() {
+        for (theme, p) in [("light", &LIGHT), ("dark", &DARK)] {
+            assert!(contrast(p.focus, p.card) >= 3.0, "{theme}: focus ring readable on cards");
+            assert!(contrast(p.focus, p.card_alt) >= 3.0, "{theme}: focus ring readable on card_alt");
+            assert!(contrast(p.focus, p.sidebar) >= 3.0, "{theme}: focus ring readable on sidebar");
+        }
+
+        let mut h = home_with(|_| {});
+        h.event(WorkerEvent::ConflictsLoaded(vec![ConflictRecord {
+            id: 1,
+            local_rel_path: "docs/report.pdf".into(),
+            ..Default::default()
+        }]));
+
+        for name in ["Sync now", "Home", "Account", "Keep Both for report.pdf"] {
+            tab_to(&mut h, name);
+            let node = focused(&h).unwrap_or_else(|| panic!("{name:?} focused"));
+            let rect = node_rect(&node);
+            assert!(
+                focus_rings(&h).iter().any(|r| r.contains_rect(rect)),
+                "expected a focus ring around {name:?} ({rect:?}), got {:?}",
+                focus_rings(&h)
+            );
+        }
+
+        // Icon buttons (e.g. on the Shared page) also go through button_shell and show a focus ring
+        h.click(h.text_at("Shared").unwrap());
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(shared_rows())));
+        h.frames(3);
+        tab_to(&mut h, "Copy link");
+        let icon_btn = focused(&h).expect("Copy link icon button focused");
+        let rect = node_rect(&icon_btn);
+        assert!(
+            focus_rings(&h).iter().any(|r| r.contains_rect(rect)),
+            "expected a focus ring around icon button Copy link ({rect:?})"
+        );
     }
 
     // R19 5 and 2(c): the short Web and Trash say their whole phrase to screen readers, and Trash says on hover that it
