@@ -116,6 +116,8 @@ pub(crate) struct Palette {
     pub(crate) switch_off: Color32,
     /// The ring around what has the keyboard's focus
     pub(crate) focus: Color32,
+    /// The ring around what has the keyboard's focus in the dark sidebar (always light purple so it reads in light mode too)
+    pub(crate) sidebar_focus: Color32,
 }
 
 /// Proton's light theme, as drive.proton.me shows it (#276)
@@ -151,6 +153,7 @@ pub(crate) const LIGHT: Palette = Palette {
     pill_danger: STATUS_DANGER_HOVER,
     switch_off: Color32::from_rgb(0x85, 0x82, 0x7F), // 3.82:1 on white
     focus: PROTON_PURPLE,                            // 5.15:1 on white, 4.69:1 on the weak background
+    sidebar_focus: Color32::from_rgb(214, 204, 255), // 10.80:1 on sidebar, 9.29:1 on sidebar_selected
 };
 
 /// Proton Carbon, the app's dark theme as it was. The colours it didn't have are taken from it.
@@ -186,6 +189,7 @@ pub(crate) const DARK: Palette = Palette {
     pill_danger: Color32::from_rgb(0xFF, 0xBC, 0xC6),
     switch_off: Color32::from_rgb(0x77, 0x70, 0x8F), // 3.52:1 on a card
     focus: Color32::from_rgb(214, 204, 255),           // the light purple: PROTON_PURPLE is 2.9:1 on a box here
+    sidebar_focus: Color32::from_rgb(214, 204, 255),
 };
 
 /// The palette of the theme in use.
@@ -239,6 +243,7 @@ tokens! {
     WARNING_LINE => warning_line,
     SWITCH_OFF => switch_off,
     FOCUS_RING => focus,
+    SIDEBAR_FOCUS => sidebar_focus,
 }
 
 /// The WCAG contrast ratio of two opaque colours, from 1 (the same) to 21 (black on white).
@@ -2926,6 +2931,7 @@ impl ProtonDriveNativeApp {
                                     .frame(false),
                             )
                             .on_hover_text("Dismiss");
+                        focus_ring(ui, &close, 4.0);
                         if close.clicked() {
                             self.notice = None;
                         }
@@ -3823,6 +3829,18 @@ fn button_shell(
     hover_fill: Color32,
     stroke: Option<Stroke>,
 ) -> (egui::Rect, egui::Response) {
+    button_shell_with_focus(ui, size, label, fill, hover_fill, stroke, FOCUS_RING())
+}
+
+fn button_shell_with_focus(
+    ui: &mut egui::Ui,
+    size: Vec2,
+    label: &str,
+    fill: Color32,
+    hover_fill: Color32,
+    stroke: Option<Stroke>,
+    focus: Color32,
+) -> (egui::Rect, egui::Response) {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let enabled = ui.is_enabled();
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
@@ -3835,7 +3853,7 @@ fn button_shell(
         ui.painter()
             .rect_stroke(rect, CornerRadius::same(8), s, egui::StrokeKind::Inside);
     }
-    focus_ring(ui, &resp, 8.0);
+    focus_ring_colored(ui, &resp, 8.0, focus);
     (rect, resp)
 }
 
@@ -3891,15 +3909,32 @@ fn action_button_sized(ui: &mut egui::Ui, kind: ButtonKind, icon: Option<&str>, 
     button_with(ui, kind, icon, label, label, size)
 }
 
+/// `action_button_sized` for the always-dark sidebar, with a light focus ring that stays readable in light mode too.
+pub(crate) fn action_button_on_sidebar(ui: &mut egui::Ui, kind: ButtonKind, icon: Option<&str>, label: &str, size: Vec2) -> egui::Response {
+    button_with_focus(ui, kind, icon, label, label, size, SIDEBAR_FOCUS())
+}
+
 /// An `action_button` at `size`, named `name`.
 fn button_with(ui: &mut egui::Ui, kind: ButtonKind, icon: Option<&str>, label: &str, name: &str, size: Vec2) -> egui::Response {
+    button_with_focus(ui, kind, icon, label, name, size, FOCUS_RING())
+}
+
+fn button_with_focus(
+    ui: &mut egui::Ui,
+    kind: ButtonKind,
+    icon: Option<&str>,
+    label: &str,
+    name: &str,
+    size: Vec2,
+    focus: Color32,
+) -> egui::Response {
     let (fill, hover_fill, stroke, text_color) = match kind {
         ButtonKind::Primary => (PROTON_PURPLE, PROTON_PURPLE_HOVER, None, Color32::WHITE),
         ButtonKind::Secondary => (BG_CARD(), BG_CARD_ALT(), Some(Stroke::new(1.0_f32, BORDER_NORM())), TEXT_PRIMARY()),
         ButtonKind::Danger => (STATUS_DANGER, STATUS_DANGER_HOVER, None, Color32::WHITE),
         ButtonKind::DangerLabel => (BG_CARD(), BG_CARD_ALT(), Some(Stroke::new(1.0_f32, BORDER_NORM())), DANGER_TEXT()),
     };
-    let (rect, resp) = button_shell(ui, size, name, fill, hover_fill, stroke);
+    let (rect, resp) = button_shell_with_focus(ui, size, name, fill, hover_fill, stroke, focus);
     let content = action_button_width(ui, icon, label) - 2.0 * BUTTON_PADDING;
     let mut x = rect.center().x - content / 2.0;
     if let Some(icon) = icon {
@@ -3967,9 +4002,14 @@ fn icon_button_colored(ui: &mut egui::Ui, icon: &str, label: &str, color: Color3
 
 /// A ring around `response`'s widget while it has the keyboard's focus, `radius` its corners' (#277).
 pub(crate) fn focus_ring(ui: &egui::Ui, response: &egui::Response, radius: f32) {
+    focus_ring_colored(ui, response, radius, FOCUS_RING());
+}
+
+/// `focus_ring` painted in `color` (for example `SIDEBAR_FOCUS()` on the always-dark sidebar).
+pub(crate) fn focus_ring_colored(ui: &egui::Ui, response: &egui::Response, radius: f32, color: Color32) {
     if response.has_focus() {
         let ring = response.rect.expand(2.0);
-        ui.painter().rect_stroke(ring, CornerRadius::same((radius + 2.0) as u8), Stroke::new(2.0_f32, FOCUS_RING()), egui::StrokeKind::Outside);
+        ui.painter().rect_stroke(ring, CornerRadius::same((radius + 2.0) as u8), Stroke::new(2.0_f32, color), egui::StrokeKind::Outside);
     }
 }
 
@@ -4155,6 +4195,8 @@ fn apply_proton_visuals(ctx: &egui::Context, light: bool) {
     visuals.widgets.hovered.bg_fill = PROTON_PURPLE_HOVER;
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     visuals.widgets.active.bg_fill = PROTON_PURPLE;
+    // Focus rings extend 4 pt past a widget (2 pt gap + 2 pt outside stroke); keep scroll-area edges from clipping them
+    visuals.clip_rect_margin = 5.0;
     ctx.set_visuals(visuals);
 }
 
@@ -10553,18 +10595,24 @@ mod tests {
         panic!("the Tab key never reaches {what:?}");
     }
 
-    /// The focus rings the last frame painted.
+    /// The focus rings the last frame painted (unclipped by their enclosing clip rect).
     fn focus_rings(h: &Harness) -> Vec<egui::Rect> {
-        fn rings(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+        fn rings(shape: &egui::Shape, clip: egui::Rect, out: &mut Vec<egui::Rect>) {
             match shape {
-                egui::Shape::Rect(r) if r.stroke.color == FOCUS_RING() && r.stroke.width >= 2.0 => out.push(r.rect),
-                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| rings(s, out)),
+                egui::Shape::Rect(r)
+                    if (r.stroke.color == FOCUS_RING() || r.stroke.color == SIDEBAR_FOCUS())
+                        && r.stroke.width >= 2.0
+                        && clip.contains_rect(r.rect.expand(r.stroke.width)) =>
+                {
+                    out.push(r.rect)
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| rings(s, clip, out)),
                 _ => {}
             }
         }
         let mut out = Vec::new();
         for clipped in h.last.iter().flat_map(|o| o.shapes.iter()) {
-            rings(&clipped.shape, &mut out);
+            rings(&clipped.shape, clipped.clip_rect, &mut out);
         }
         out
     }
@@ -10692,32 +10740,54 @@ mod tests {
         assert_eq!(chip(&h, "Uploads").toggled(), Some(Toggled::True));
     }
 
-    // #277: custom buttons (action_button, icon_button, sidebar sections, account menu) show a focus ring in both themes
+    // #277: custom buttons (action_button, icon_button, sidebar sections, account menu, menu items, notice dismiss)
+    // show an unclipped focus ring with readable contrast in both themes
     #[test]
     fn buttons_show_a_focus_ring_in_both_themes() {
         for (theme, p) in [("light", &LIGHT), ("dark", &DARK)] {
             assert!(contrast(p.focus, p.card) >= 3.0, "{theme}: focus ring readable on cards");
             assert!(contrast(p.focus, p.card_alt) >= 3.0, "{theme}: focus ring readable on card_alt");
-            assert!(contrast(p.focus, p.sidebar) >= 3.0, "{theme}: focus ring readable on sidebar");
+            assert!(contrast(p.sidebar_focus, p.sidebar) >= 3.0, "{theme}: sidebar focus ring readable on sidebar");
+            assert!(
+                contrast(p.sidebar_focus, p.sidebar_selected) >= 3.0,
+                "{theme}: sidebar focus ring readable on sidebar_selected"
+            );
+            assert!(
+                contrast(p.sidebar_focus, p.sidebar_hover) >= 3.0,
+                "{theme}: sidebar focus ring readable on sidebar_hover"
+            );
         }
 
         let mut h = home_with(|_| {});
+        h.app.notice = Some("Freed 12 MB on this computer.".into());
         h.event(WorkerEvent::ConflictsLoaded(vec![ConflictRecord {
             id: 1,
             local_rel_path: "docs/report.pdf".into(),
             ..Default::default()
         }]));
 
-        for name in ["Sync now", "Home", "Account", "Keep Both for report.pdf"] {
+        for name in ["Open in Files", "Home", "Account", "Sync now", "×", "Keep Both for report.pdf"] {
             tab_to(&mut h, name);
             let node = focused(&h).unwrap_or_else(|| panic!("{name:?} focused"));
             let rect = node_rect(&node);
             assert!(
                 focus_rings(&h).iter().any(|r| r.contains_rect(rect)),
-                "expected a focus ring around {name:?} ({rect:?}), got {:?}",
+                "expected an unclipped focus ring around {name:?} ({rect:?}), got {:?}",
                 focus_rings(&h)
             );
         }
+
+        // Menu items inside popups (e.g. Pause choices) also paint a focus ring
+        h.click(h.text_at("Pause").unwrap());
+        h.frames(2);
+        tab_to(&mut h, "For 1 hour");
+        let item = focused(&h).expect("For 1 hour menu item focused");
+        let rect = node_rect(&item);
+        assert!(
+            focus_rings(&h).iter().any(|r| r.contains_rect(rect)),
+            "expected an unclipped focus ring around menu item For 1 hour ({rect:?})"
+        );
+        press_key(&mut h, Key::Escape);
 
         // Icon buttons (e.g. on the Shared page) also go through button_shell and show a focus ring
         h.click(h.text_at("Shared").unwrap());
@@ -10728,7 +10798,7 @@ mod tests {
         let rect = node_rect(&icon_btn);
         assert!(
             focus_rings(&h).iter().any(|r| r.contains_rect(rect)),
-            "expected a focus ring around icon button Copy link ({rect:?})"
+            "expected an unclipped focus ring around icon button Copy link ({rect:?})"
         );
     }
 
