@@ -8,7 +8,7 @@ use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, Ri
 
 use crate::icons;
 use crate::{
-    action_button, action_button_if, action_button_named, card_frame, decoration, drive_status_line, files_safe_hint,
+    action_button, action_button_if, action_button_if_named, action_button_named, card_frame, decoration, drive_status_line, files_safe_hint,
     format_bytes, offers_mount_again, render_transfer_line, shown_folder, spawn_reaped, AccountInfo, ButtonKind,
     ConflictRecord, CutShortItem, DaemonStatus, ProtonDriveNativeApp, VfsStatus, WorkerCommand, BG_CARD_ALT,
     BORDER_SUBTLE, DANGER_TEXT, PROTON_PURPLE, PROTON_PURPLE_TEXT, SCREENSHOT_MODE, SUCCESS_TEXT, TEXT_MUTED, TEXT_PRIMARY,
@@ -978,10 +978,12 @@ impl ProtonDriveNativeApp {
             Attention::FilesMissing => self.render_files_missing(ui),
             Attention::Conflict { id, rel_path } => {
                 attention_row(ui, |ui| {
+                    let name = file_name(rel_path);
                     elided(ui, RichText::new(conflict_title(rel_path)).size(13.5).strong().color(TEXT_PRIMARY()), rel_path);
                     ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
-                        if secondary_icon_button(ui, icons::FOLDER_OPEN, "Show in Files", 30.0).clicked() {
+                        let show_name = format!("Show {name} in Files");
+                        if action_button_named(ui, ButtonKind::Secondary, Some(icons::FOLDER_OPEN), "Show in Files", &show_name, 30.0).clicked() {
                             open_in_files(&conflict_folder(&self.status.sync_dir, rel_path));
                         }
                         ui.add_space(8.0);
@@ -989,7 +991,8 @@ impl ProtonDriveNativeApp {
                         let online = self.daemon_online;
                         for (i, c) in CONFLICT_CHOICES.iter().enumerate() {
                             let kind = if i == 0 { ButtonKind::Primary } else { ButtonKind::Secondary };
-                            let button = action_button_if(ui, online, kind, Some(c.icon), c.label, 30.0);
+                            let button_name = format!("{} for {name}", c.label);
+                            let button = action_button_if_named(ui, online, kind, Some(c.icon), c.label, &button_name, 30.0);
                             if button.on_hover_text(c.hint).on_disabled_hover_text(c.hint).clicked() {
                                 let _ = self.tx.send(WorkerCommand::ResolveConflict { id: *id, choice: c.choice.to_string() });
                             }
@@ -1058,13 +1061,19 @@ impl ProtonDriveNativeApp {
         ui.horizontal_wrapped(|ui| {
             let paths = vec![item.rel_path.clone()];
             let upload = if item.existing { "Upload this version" } else { "Upload it anyway" };
-            if action_button_if(ui, online, ButtonKind::Secondary, Some(icons::KEEP_LOCAL), upload, 30.0).clicked() {
+            let upload_name = if item.existing {
+                format!("Upload this version of {name}")
+            } else {
+                format!("Upload {name} anyway")
+            };
+            if action_button_if_named(ui, online, ButtonKind::Secondary, Some(icons::KEEP_LOCAL), upload, &upload_name, 30.0).clicked() {
                 self.resolve_cut_short(paths.clone(), false);
             }
             if item.existing {
                 ui.add_space(8.0);
                 let put_back = "Put back the Proton Drive version";
-                if action_button_if(ui, online, ButtonKind::Secondary, Some(icons::KEEP_REMOTE), put_back, 30.0).clicked() {
+                let put_back_name = format!("Put back the Proton Drive version of {name}");
+                if action_button_if_named(ui, online, ButtonKind::Secondary, Some(icons::KEEP_REMOTE), put_back, &put_back_name, 30.0).clicked() {
                     self.resolve_cut_short(paths, true);
                 }
             }
@@ -1093,9 +1102,13 @@ impl ProtonDriveNativeApp {
                 }
                 ui.add_space(8.0);
                 let label = if self.cut_short_expanded { "Hide them" } else { "Show them" };
-                if action_button_if(ui, true, ButtonKind::Secondary, None, label, 30.0).clicked() {
+                let toggle = action_button_if(ui, true, ButtonKind::Secondary, None, label, 30.0);
+                if toggle.clicked() {
                     self.cut_short_expanded = !self.cut_short_expanded;
                 }
+                ui.ctx().accesskit_node_builder(toggle.id, |node| {
+                    node.set_expanded(self.cut_short_expanded);
+                });
             });
         });
         if self.cut_short_expanded {
