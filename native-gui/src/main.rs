@@ -373,13 +373,13 @@ struct DaemonStatus {
     /// When the last sync pass finished, epoch milliseconds; absent before the first one
     #[serde(default)]
     last_sync_at: Option<i64>,
-    /// While the computer's disk is almost full and the drive refused to save a file for it (#299); the daemon
+    /// While the computer's disk is almost full and the drive refused a save or open for it (#299, #301); the daemon
     /// clears it itself. Older daemons send none.
     #[serde(default)]
     disk_full: Option<DiskFull>,
 }
 
-/// `diskFull` in /api/status: when the drive last refused a write for the disk's sake, epoch milliseconds.
+/// `diskFull` in /api/status: when the drive last refused a write or open for the disk's sake, epoch milliseconds.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DiskFull {
@@ -7064,8 +7064,8 @@ mod tests {
         assert_eq!(h.sent().len(), 1);
     }
 
-    // "5 GB" never wraps between the number and its unit (a no-break space)
-    const DISK_FULL_NOTICE: &str = "Your computer's disk is almost full. Proton Drive keeps 5\u{a0}GB free on it, so new files can't be saved to the drive.";
+    // "5 GB" never wraps between the number and its unit (a no-break space); covers both refused saves and opens (#343)
+    const DISK_FULL_NOTICE: &str = "Your computer's disk is almost full. Proton Drive keeps 5\u{a0}GB free on it, so files can't be saved to the drive or opened from it.";
 
     /// The notice's Free up space… button: the first of the two Home paints (the other is under Your drive).
     fn disk_full_button(h: &Harness) -> egui::Pos2 {
