@@ -3398,7 +3398,14 @@ impl ProtonDriveNativeApp {
                 for app in &apps {
                     // A process name, as `ps` shows it: in monospace
                     settings::code_row(ui, app, |ui| {
-                        let unblock = home::secondary_button(ui, "Unblock", 30.0);
+                        let unblock = action_button_named(
+                            ui,
+                            ButtonKind::Secondary,
+                            None,
+                            "Unblock",
+                            &format!("Unblock {app}"),
+                            30.0,
+                        );
                         if unblock.clicked() {
                             asked = Some(Ok(without_blocked_app(&apps, app)));
                         }
@@ -10955,6 +10962,81 @@ mod tests {
         let focused_node = focused(&h).expect("block app input focused");
         assert_eq!(focused_node.role(), Role::TextInput);
         assert_eq!(focused_node.label(), Some("App to block"));
+    }
+
+    // #291: each Unblock and Unhide button in Settings announces the app or path it acts on.
+    #[test]
+    fn settings_unblock_and_unhide_buttons_name_what_they_act_on() {
+        use egui::accesskit::Role;
+        let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        h.app.status.settings.blocked_apps = vec!["rg".into(), "baloo_file".into()];
+        h.app.hidden = Some(Ok(vec![
+            HiddenItem { path: "Docs/Private".into(), state: "hidden".into() },
+            HiddenItem { path: "Music".into(), state: "hidden".into() },
+        ]));
+        h.frames(3);
+
+        let check_names = |h: &Harness, expected: &[&str], forbidden: &[&str], ctx: &str| {
+            let nodes = accesskit_nodes(h);
+            for &name in expected {
+                let button = nodes
+                    .iter()
+                    .map(|(_, n)| n)
+                    .find(|n| n.role() == Role::Button && n.label() == Some(name))
+                    .unwrap_or_else(|| panic!("{ctx}: missing Button named {name:?}"));
+                assert!(
+                    labelled_by(h, button).is_empty(),
+                    "{ctx}: {name:?} should not also carry labelled_by: {:?}",
+                    labelled_by(h, button)
+                );
+            }
+            for &bad in forbidden {
+                assert!(
+                    !nodes.iter().any(|(_, n)| n.role() == Role::Button && n.label() == Some(bad)),
+                    "{ctx}: found generic Button named {bad:?}"
+                );
+            }
+        };
+
+        check_names(
+            &h,
+            &["Unblock rg", "Unblock baloo_file", "Unhide Docs/Private", "Unhide Music"],
+            &["Unblock", "Unhide"],
+            "wide",
+        );
+
+        // Working state: "Unhiding… <path>" (and disabled while working)
+        h.app.working.push("Docs/Private".into());
+        h.frames(2);
+        check_names(
+            &h,
+            &["Unblock rg", "Unblock baloo_file", "Unhiding… Docs/Private", "Unhide Music"],
+            &["Unblock", "Unhide", "Unhiding…"],
+            "wide working",
+        );
+        let unhiding = h.nodes_named("Unhiding… Docs/Private").into_iter().next().expect("Unhiding button");
+        assert!(unhiding.is_disabled(), "Unhiding button is disabled while working");
+        h.app.working.clear();
+        h.frames(2);
+
+        // Stacked narrow layout keeps the same accessible names
+        h.resize_zoomed(Vec2::new(840.0, 2400.0), 1.2);
+        check_names(
+            &h,
+            &["Unblock rg", "Unblock baloo_file", "Unhide Docs/Private", "Unhide Music"],
+            &["Unblock", "Unhide"],
+            "narrow",
+        );
+        let rg_label = h.text_at("rg").expect("rg label in narrow layout");
+        let unblock_rg = h.widget_at("Unblock rg").expect("Unblock rg button");
+        assert!(unblock_rg.y > rg_label.y, "narrow layout stacks Unblock below rg");
+
+        // Clicking by accessible name still acts on the right items
+        h.click(unblock_rg);
+        assert_eq!(h.sent(), vec!["blocked apps baloo_file".to_string()]);
+        let unhide_music = h.widget_at("Unhide Music").expect("Unhide Music button");
+        h.click(unhide_music);
+        assert_eq!(h.sent(), vec!["unhide \"Music\"".to_string()]);
     }
 
     // #277's first case: the switches show the keyboard's focus, and Space flips them as a click does
