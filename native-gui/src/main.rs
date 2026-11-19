@@ -3419,6 +3419,10 @@ impl ProtonDriveNativeApp {
                             .hint_text("App name, e.g. rg")
                             .vertical_align(Align::Center),
                     );
+                    // Not inside a setting_row, so name it directly for screen readers (#288)
+                    ui.ctx().accesskit_node_builder(field.id, |node| {
+                        node.set_label("App to block");
+                    });
                     let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.add_space(6.0);
                     let clicked = home::primary_button(ui, "Block", 32.0).clicked();
@@ -10916,6 +10920,44 @@ mod tests {
                 assert_eq!(node.label(), None, "{label}: no empty name of its own over its label's");
             }
         }
+    }
+
+    // #288: Settings > Apps blocked from downloading names its text input for screen readers.
+    #[test]
+    fn settings_block_app_field_is_named_for_screen_readers() {
+        use egui::accesskit::Role;
+        let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        let find_block_field = |h: &Harness| {
+            accesskit_nodes(h)
+                .into_iter()
+                .map(|(_, n)| n)
+                .find(|n| n.role() == Role::TextInput && n.label() == Some("App to block"))
+        };
+        let node = find_block_field(&h).expect("TextInput named \"App to block\" when empty");
+        assert_eq!(node.value(), Some(""));
+
+        // No unnamed text input left anywhere on Settings
+        let unnamed: Vec<_> = accesskit_nodes(&h)
+            .into_iter()
+            .filter(|(_, n)| {
+                matches!(n.role(), Role::TextInput | Role::MultilineTextInput)
+                    && n.label().unwrap_or_default().is_empty()
+                    && labelled_by(&h, n).is_empty()
+            })
+            .collect();
+        assert!(unnamed.is_empty(), "every TextInput on Settings should have an accessible name: {unnamed:?}");
+
+        // Typing into the field preserves its accessible name
+        h.app.block_app_input = "rg".into();
+        h.frames(2);
+        let node = find_block_field(&h).expect("TextInput keeps name \"App to block\" when filled");
+        assert_eq!(node.value(), Some("rg"));
+
+        // Reachable via Tab
+        tab_to(&mut h, "App to block");
+        let focused_node = focused(&h).expect("block app input focused");
+        assert_eq!(focused_node.role(), Role::TextInput);
+        assert_eq!(focused_node.label(), Some("App to block"));
     }
 
     // #277's first case: the switches show the keyboard's focus, and Space flips them as a click does
