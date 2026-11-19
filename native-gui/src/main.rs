@@ -10886,6 +10886,50 @@ mod tests {
         assert_eq!(beside(&h, "Docs/a.pdf", icons::FILE), Some(TEXT_MUTED()), "a file");
     }
 
+    // #315: at high zoom in the smallest window, Settings' Account card stacks so the plan pill stays one line and
+    // Sign out / Sign in never overlaps the avatar
+    #[test]
+    fn the_account_card_stacks_cleanly_at_high_zoom() {
+        let mut h = Harness::settings(Some(vfs("virtual", true, None)), Some(true));
+        h.app.status.account = Some(AccountInfo { display_name: "Gautam Chauhan".into(), ..gautam() });
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.7);
+
+        let pill_texts = h.texts(|t| t.galley.text() == "Proton Unlimited");
+        assert_eq!(pill_texts.len(), 1, "plan pill is shown");
+        assert_eq!(pill_texts[0].galley.rows.len(), 1, "plan pill stays on one line, not wrapped");
+        let pill_rect = pill_texts[0].visual_bounding_rect();
+
+        let avatar = filled_rects(&h)
+            .into_iter()
+            .find(|(r, _, f)| *f == PROTON_PURPLE_SOFT() && (r.width() - 44.0).abs() < 0.5 && (r.height() - 44.0).abs() < 0.5)
+            .expect("the 44x44 account avatar is painted")
+            .0;
+        let sign_out = node_rect(&h.nodes_named("Sign out").into_iter().next().expect("Sign out button"));
+        assert!(!sign_out.intersects(avatar), "Sign out {sign_out:?} must not intersect avatar {avatar:?}");
+        assert!(pill_rect.top() >= avatar.bottom() - 0.5, "plan pill {pill_rect:?} sits under avatar {avatar:?}");
+        assert!(sign_out.top() >= pill_rect.bottom(), "Sign out {sign_out:?} sits under plan pill {pill_rect:?}");
+        h.sent();
+        h.click(sign_out.center());
+        assert_eq!(h.sent(), vec!["sign out".to_string()]);
+
+        // Signed-out card at the same zoom: Sign in also stacks under the avatar without overlapping
+        let mut h = Harness::settings(None, None);
+        h.app.status.logged_in = false;
+        h.app.status.account = None;
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.7);
+        let avatar = filled_rects(&h)
+            .into_iter()
+            .find(|(r, _, f)| *f == PROTON_PURPLE_SOFT() && (r.width() - 44.0).abs() < 0.5 && (r.height() - 44.0).abs() < 0.5)
+            .expect("the signed-out avatar is painted")
+            .0;
+        let sign_in = node_rect(&h.nodes_named("Sign in").into_iter().next().expect("Sign in button"));
+        assert!(!sign_in.intersects(avatar), "Sign in {sign_in:?} must not intersect avatar {avatar:?}");
+        assert!(sign_in.top() >= avatar.bottom() - 0.5, "Sign in {sign_in:?} sits under avatar {avatar:?}");
+        h.sent();
+        h.click(sign_in.center());
+        assert_eq!(h.sent(), vec!["sign in".to_string()]);
+    }
+
     // #276, R19 3: at the smallest window, at 120% zoom (where the controls go under their labels) and at the
     // screenshots' size, in a 540-tall window scrolled from top to bottom: no widget (its frame, as screen readers are
     // told it) and no text runs out of its card, and no two texts run over each other
