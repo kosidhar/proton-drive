@@ -1105,9 +1105,12 @@ impl ProtonDriveNativeApp {
                 let toggle = action_button_if(ui, true, ButtonKind::Secondary, None, label, 30.0);
                 if toggle.clicked() {
                     self.cut_short_expanded = !self.cut_short_expanded;
+                    ui.ctx().request_repaint();
                 }
+                let expanded = self.cut_short_expanded;
                 ui.ctx().accesskit_node_builder(toggle.id, |node| {
-                    node.set_expanded(self.cut_short_expanded);
+                    node.set_label(if expanded { "Hide them" } else { "Show them" });
+                    node.set_expanded(expanded);
                 });
             });
         });

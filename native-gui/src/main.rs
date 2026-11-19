@@ -7049,6 +7049,10 @@ mod tests {
         assert_eq!(collapsed[0].is_expanded(), Some(false));
 
         h.click(h.text_at("Show them").unwrap());
+        // Even on the click frame itself, the AccessKit label and expanded state agree with the shown rows
+        let on_click = h.nodes_named("Hide them");
+        assert_eq!(on_click.len(), 1);
+        assert_eq!(on_click[0].is_expanded(), Some(true));
         h.frames(1);
         let expanded = h.nodes_named("Hide them");
         assert_eq!(expanded.len(), 1);
@@ -7058,6 +7062,9 @@ mod tests {
         assert_eq!(h.nodes_named("Upload b.txt anyway").len(), 1);
 
         h.click(h.text_at("Hide them").unwrap());
+        let on_collapse = h.nodes_named("Show them");
+        assert_eq!(on_collapse.len(), 1);
+        assert_eq!(on_collapse[0].is_expanded(), Some(false));
         h.frames(1);
         let collapsed_again = h.nodes_named("Show them");
         assert_eq!(collapsed_again.len(), 1);
