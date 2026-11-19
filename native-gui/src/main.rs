@@ -3976,7 +3976,7 @@ pub(crate) fn action_button_if_named(
 }
 
 /// How wide `action_button` makes a button with this icon and label.
-fn action_button_width(ui: &egui::Ui, icon: Option<&str>, label: &str) -> f32 {
+pub(crate) fn action_button_width(ui: &egui::Ui, icon: Option<&str>, label: &str) -> f32 {
     let icon_room = icon.map_or(0.0, |icon| {
         text_width(ui.painter(), icon, &icons::font(BUTTON_ICON_SIZE)) + BUTTON_ICON_GAP
     });
@@ -7660,12 +7660,19 @@ mod tests {
         let (open, trash) = (frame(&h, chrome::OPEN_IN_FILES), frame(&h, home::OPEN_TRASH));
         assert!(h.nodes_named(chrome::OPEN_IN_FILES).iter().any(|n| n.bounds().is_some_and(|b| b.x0 as f32 > SIDEBAR_EDGE)), "named for screen readers");
         assert!((trash.left() - open.right() - 12.0).abs() < 0.5, "12 between the buttons, as under the status: {open:?} {trash:?}");
+        let wide_title_gap = name.top() - page(&h, "Your drive").bottom();
+        let block_center_y = (name.top() + kind_line.bottom()) / 2.0;
         for b in [open, trash] {
-            assert!((b.center().y - name.center().y).abs() < 12.0, "{b:?} is level with the name {name:?}");
+            assert!((b.center().y - block_center_y).abs() < 4.0, "{b:?} is vertically centred with {name:?}..{kind_line:?}");
             assert!(b.left() > name.right() && b.left() > kind_line.right(), "{b:?} is right of {name:?} and {kind_line:?}");
         }
         h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
         let name = h.text_rect_starting("/srv").expect("the drive's name");
+        let narrow_title_gap = name.top() - page(&h, "Your drive").bottom();
+        assert!(
+            (wide_title_gap - narrow_title_gap).abs() < 1.0,
+            "wide gap {wide_title_gap:.1} should match narrow gap {narrow_title_gap:.1}"
+        );
         let kind_line = page(&h, kind);
         let (open, trash) = (frame(&h, chrome::OPEN_IN_FILES), frame(&h, home::OPEN_TRASH));
         assert!((trash.left() - open.right() - 12.0).abs() < 0.5, "12 between the buttons when stacked too: {open:?} {trash:?}");
@@ -7689,6 +7696,121 @@ mod tests {
         h.click(trash.center());
         assert_eq!(launched(), vec!["https://drive.proton.me/trash".to_string()]);
         assert_eq!(h.sent(), Vec::<String>::new(), "nothing goes to the daemon");
+    }
+
+    // #311: Tab and screen-reader order runs left to right (text -> first button -> second button) in both the wide
+    // and narrow layouts of Home's status card and drive row.
+    #[test]
+    fn home_tab_and_screen_reader_order_runs_left_to_right_in_both_layouts() {
+        let page_tab_stops = |h: &mut Harness| -> Vec<String> {
+            let mut seen_ids = Vec::new();
+            let mut labels = Vec::new();
+            for _ in 0..200 {
+                press_key(h, Key::Tab);
+                let Some(update) = h.last.as_ref().and_then(|o| o.platform_output.accesskit_update.as_ref()) else {
+                    continue;
+                };
+                let focus_id = update.focus;
+                if seen_ids.first() == Some(&focus_id) {
+                    return labels;
+                }
+                seen_ids.push(focus_id);
+                if let Some((_, node)) = update.nodes.iter().find(|(id, _)| *id == focus_id) {
+                    if node.bounds().is_some_and(|b| b.x0 as f32 > SIDEBAR_EDGE) {
+                        labels.push(says(node));
+                    }
+                }
+            }
+            panic!("Tab never wrapped round: {labels:?}");
+        };
+
+        let page_reading_order = |h: &Harness| -> Vec<String> {
+            let update = h.last.as_ref().and_then(|o| o.platform_output.accesskit_update.as_ref()).expect("accesskit");
+            let root = update.tree.as_ref().expect("accesskit tree").root;
+            let by_id: std::collections::HashMap<_, _> = update.nodes.iter().map(|(id, n)| (*id, n)).collect();
+            let mut out = Vec::new();
+            fn walk(
+                id: egui::accesskit::NodeId,
+                by_id: &std::collections::HashMap<egui::accesskit::NodeId, &egui::accesskit::Node>,
+                out: &mut Vec<String>,
+            ) {
+                let Some(node) = by_id.get(&id) else { return };
+                if node.bounds().is_some_and(|b| b.x0 as f32 > SIDEBAR_EDGE && b.y0 as f32 >= chrome::TOP_BAR_HEIGHT) {
+                    let s = says(node);
+                    if !s.is_empty() {
+                        out.push(s);
+                    }
+                }
+                for &child in node.children() {
+                    walk(child, by_id, out);
+                }
+            }
+            walk(root, &by_id, &mut out);
+            out
+        };
+
+        let pos = |items: &[String], needle: &str, ctx: &str| -> usize {
+            items.iter().position(|s| s == needle).unwrap_or_else(|| panic!("{ctx}: missing {needle:?} in {items:?}"))
+        };
+
+        for (layout, size, zoom) in [("wide", Vec2::new(1440.0, 900.0), 1.0), ("narrow", Vec2::new(840.0, 540.0), 1.2)] {
+            // Normal state: Up to date -> Sync now -> Pause; /srv/u/ProtonDrive -> Open in Files -> Trash
+            let mut h = home_with(|s| s.sync_dir = "/srv/u/ProtonDrive".into());
+            h.resize_zoomed(size, zoom);
+
+            let tabs = page_tab_stops(&mut h);
+            assert!(
+                pos(&tabs, "Sync now", layout) < pos(&tabs, "Pause", layout),
+                "{layout}: Tab order in status card should be Sync now -> Pause, got {tabs:?}"
+            );
+            assert!(
+                pos(&tabs, chrome::OPEN_IN_FILES, layout) < pos(&tabs, home::OPEN_TRASH, layout),
+                "{layout}: Tab order in drive row should be Open in Files -> Trash, got {tabs:?}"
+            );
+
+            let read = page_reading_order(&h);
+            assert!(
+                pos(&read, "Up to date", layout) < pos(&read, "Sync now", layout)
+                    && pos(&read, "Sync now", layout) < pos(&read, "Pause", layout),
+                "{layout}: screen-reader order in status card should be headline -> Sync now -> Pause, got {read:?}"
+            );
+            assert!(
+                pos(&read, "/srv/u/ProtonDrive", layout) < pos(&read, chrome::OPEN_IN_FILES, layout)
+                    && pos(&read, chrome::OPEN_IN_FILES, layout) < pos(&read, home::OPEN_TRASH, layout),
+                "{layout}: screen-reader order in drive row should be name -> Open in Files -> Trash, got {read:?}"
+            );
+
+            // Paused state: headline -> Sync now -> Resume
+            let mut h_paused = home_with(|s| {
+                s.sync_dir = "/srv/u/ProtonDrive".into();
+                s.settings.paused = true;
+            });
+            h_paused.resize_zoomed(size, zoom);
+            let tabs = page_tab_stops(&mut h_paused);
+            assert!(
+                pos(&tabs, "Sync now", layout) < pos(&tabs, "Resume", layout),
+                "{layout} (paused): Tab order should be Sync now -> Resume, got {tabs:?}"
+            );
+            let read = page_reading_order(&h_paused);
+            assert!(
+                pos(&read, "Paused", layout) < pos(&read, "Sync now", layout)
+                    && pos(&read, "Sync now", layout) < pos(&read, "Resume", layout),
+                "{layout} (paused): screen-reader order should be headline -> Sync now -> Resume, got {read:?}"
+            );
+
+            // Signed-out state: headline -> Sign in
+            let mut h_out = home_with(|s| {
+                s.logged_in = false;
+                s.account = None;
+            });
+            h_out.resize_zoomed(size, zoom);
+            let read = page_reading_order(&h_out);
+            let sign_in_idx = pos(&read, "Sign in", layout);
+            assert!(
+                pos(&read, "Signed out", layout) < sign_in_idx,
+                "{layout} (signed out): screen-reader order should be Signed out -> Sign in, got {read:?}"
+            );
+        }
     }
 
     #[test]
