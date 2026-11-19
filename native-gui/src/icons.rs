@@ -53,7 +53,7 @@ pub const WEB: &str = ph::GLOBE;
 pub const SEARCH: &str = ph::MAGNIFYING_GLASS;
 pub const SIGN_OUT: &str = ph::SIGN_OUT;
 pub const SIGN_IN: &str = ph::SIGN_IN;
-/// Remove someone from a share
+/// Remove someone from a share, dismiss a notice
 pub const REMOVE: &str = ph::X;
 /// Free up space, Keep online-only: a file kept in Proton Drive alone
 pub const ONLINE_ONLY: &str = ph::CLOUD;
