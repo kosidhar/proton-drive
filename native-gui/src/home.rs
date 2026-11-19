@@ -718,6 +718,7 @@ pub(crate) fn menu_item(ui: &mut egui::Ui, icon: Option<&str>, label: &str, widt
         egui::FontId::proportional(13.0),
         TEXT_PRIMARY(),
     );
+    crate::focus_ring(ui, &resp, 6.0);
     resp
 }
 
