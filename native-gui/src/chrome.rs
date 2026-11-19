@@ -202,6 +202,7 @@ fn section_row(ui: &mut egui::Ui, icon: &str, label: &str, open: bool, count: Op
         painter.rect_filled(pill, CornerRadius::same(8), STATUS_DANGER);
         painter.galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
     }
+    crate::focus_ring(ui, &resp, 8.0);
     resp
 }
 
@@ -332,6 +333,9 @@ impl ProtonDriveNativeApp {
         painter.galley(egui::pos2(right - name.size().x, top), name, TEXT_PRIMARY());
         if let Some(email) = email {
             painter.galley(egui::pos2(right - email.size().x, below), email, TEXT_MUTED());
+        }
+        if shown.signed_in {
+            crate::focus_ring(ui, &resp, 8.0);
         }
         resp
     }
