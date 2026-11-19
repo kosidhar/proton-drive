@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { mkdir, rename, stat, unlink, utimes } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -278,7 +279,7 @@ export async function downloadDriveNodeToLocal(options: {
     const parentDir = path.dirname(localPath);
     await mkdir(parentDir, { recursive: true });
 
-    const tempPath = path.join(parentDir, `.proton-drive-tmp-${process.pid}-${Date.now()}-${path.basename(localPath)}`);
+    const tempPath = path.join(parentDir, `.proton-drive-tmp-${process.pid}-${randomUUID()}`);
     const downloaded = await downloadRevisionToFile({ sdk, logger, remoteNode, revision, filePath: tempPath, onProgress });
     // Its time is set, and it is looked at, before it is placed: what it is then is what was downloaded. Set after, a
     // write between the placing and the setting would get the cloud's time and pass for the download (#199). Before
