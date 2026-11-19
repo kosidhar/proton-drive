@@ -48,6 +48,32 @@ function deletionDate(at: Date): string {
     );
 }
 
+const NAME_MAX = 255;
+const TRASHINFO_SUFFIX = '.trashinfo';
+
+// Entry name in Trash/files/ (with .2, .3, ... for clashes), shortened by whole code points so
+// `<name>.trashinfo` in Trash/info/ fits within Linux's 255-byte NAME_MAX (#353).
+function trashEntryName(base: string, n: number): string {
+    const suffix = n === 1 ? '' : `.${n}`;
+    const bytes = (text: string) => Buffer.byteLength(text, 'utf8');
+    const maxBaseBytes = NAME_MAX - bytes(TRASHINFO_SUFFIX) - bytes(suffix);
+    if (bytes(base) <= maxBaseBytes) {
+        return `${base}${suffix}`;
+    }
+    const dotIndex = base.lastIndexOf('.');
+    const hasExt = dotIndex > 0 && dotIndex < base.length - 1;
+    let stem = hasExt ? base.slice(0, dotIndex) : base;
+    let ext = hasExt ? base.slice(dotIndex) : '';
+    if (bytes(ext) >= maxBaseBytes) {
+        [stem, ext] = [base, ''];
+    }
+    const chars = Array.from(stem);
+    while (chars.length > 0 && bytes(chars.join('')) + bytes(ext) > maxBaseBytes) {
+        chars.pop();
+    }
+    return `${chars.join('')}${ext}${suffix}`;
+}
+
 // Moves into the home Trash recording `shownPath` as where the item came from, instead of where it is: in the virtual
 // layout an item lives in the hidden store, but the user knows it under the drive (#40). The name in the Trash is
 // reserved first by creating its .trashinfo exclusively (taken names get .2, .3, ... as GIO does), then the item is
@@ -64,8 +90,8 @@ export function homeTrash(trashDir: string = homeTrashDir(), fallback: MoveToDes
         const base = path.basename(fullPath);
         const info = `[Trash Info]\nPath=${trashInfoPath(shownPath)}\nDeletionDate=${deletionDate(now())}\n`;
         for (let n = 1; n < 10_000; n++) {
-            const name = n === 1 ? base : `${base}.${n}`;
-            const infoFile = path.join(infoDir, `${name}.trashinfo`);
+            const name = trashEntryName(base, n);
+            const infoFile = path.join(infoDir, `${name}${TRASHINFO_SUFFIX}`);
             try {
                 await writeFile(infoFile, info, { flag: 'wx', mode: 0o600 });
             } catch (err) {

@@ -113,4 +113,35 @@ describe('the home Trash, with the path the user knows (#40)', () => {
         expect(homeTrashDir({ XDG_DATA_HOME: 'relative' })).toBe(path.join(os.homedir(), '.local/share/Trash'));
         expect(homeTrashDir({})).toBe(path.join(os.homedir(), '.local/share/Trash'));
     });
+
+    // #353: info/<name>.trashinfo must also fit Linux's 255-byte NAME_MAX, including on .2 collisions
+    test('trims long file names so both files/ and info/.trashinfo stay within 255 bytes', async () => {
+        const t = setup();
+        const longAscii = `${'a'.repeat(251)}.txt`;
+        expect(Buffer.byteLength(longAscii)).toBe(255);
+        for (const content of ['first', 'second']) {
+            const p = path.join(t.store, longAscii);
+            writeFileSync(p, content);
+            expect(await t.move(p, `/home/u/ProtonDrive/${longAscii}`)).toBe(true);
+        }
+        expect(t.fallbacks).toEqual([]);
+        const files = readdirSync(path.join(t.trash, 'files')).sort();
+        const infos = readdirSync(path.join(t.trash, 'info')).sort();
+        expect(files).toHaveLength(2);
+        expect(infos).toEqual(files.map((f) => `${f}.trashinfo`).sort());
+        for (const info of infos) {
+            expect(Buffer.byteLength(info)).toBeLessThanOrEqual(255);
+            expect(readFileSync(path.join(t.trash, 'info', info), 'utf8')).toContain(`Path=/home/u/ProtonDrive/${longAscii}\n`);
+        }
+        expect(files.map((f) => readFileSync(path.join(t.trash, 'files', f), 'utf8')).sort()).toEqual(['first', 'second']);
+
+        for (const longName of [`${'é'.repeat(125)}.txt`, `${'😀'.repeat(62)}.txt`, `a.${'x'.repeat(250)}`]) {
+            const p = path.join(t.store, longName);
+            writeFileSync(p, longName);
+            expect(await t.move(p, `/home/u/ProtonDrive/${longName}`)).toBe(true);
+        }
+        for (const info of readdirSync(path.join(t.trash, 'info'))) {
+            expect(Buffer.byteLength(info)).toBeLessThanOrEqual(255);
+        }
+    });
 });
