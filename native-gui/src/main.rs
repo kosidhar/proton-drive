@@ -2923,24 +2923,21 @@ impl ProtonDriveNativeApp {
             .inner_margin(Margin::symmetric(12, 8))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
+                let text_w = (ui.available_width() - ICON_BUTTON_SIZE - ui.spacing().item_spacing.x).max(0.0);
                 ui.horizontal_top(|ui| {
-                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                        let close = ui
-                            .add(
-                                egui::Button::new(RichText::new("×").size(18.0).color(TEXT_MUTED()))
-                                    .frame(false),
-                            )
-                            .on_hover_text("Dismiss");
-                        focus_ring(ui, &close, 4.0);
-                        if close.clicked() {
-                            self.notice = None;
-                        }
-                        ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(text_w, ICON_BUTTON_SIZE),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.set_min_width(text_w);
                             ui.add(
                                 egui::Label::new(RichText::new(&text).size(12.5).color(TEXT_PRIMARY())).wrap(),
                             );
-                        });
-                    });
+                        },
+                    );
+                    if icon_button(ui, icons::REMOVE, "Dismiss").clicked() {
+                        self.notice = None;
+                    }
                 });
             });
     }
@@ -10999,7 +10996,7 @@ mod tests {
             ..Default::default()
         }]));
 
-        for name in ["Open in Files", "Home", "Account", "Sync now", "×", "Keep Both for report.pdf"] {
+        for name in ["Open in Files", "Home", "Account", "Sync now", "Dismiss", "Keep Both for report.pdf"] {
             tab_to(&mut h, name);
             let node = focused(&h).unwrap_or_else(|| panic!("{name:?} focused"));
             let rect = node_rect(&node);
@@ -11033,6 +11030,41 @@ mod tests {
             focus_rings(&h).iter().any(|r| r.contains_rect(rect)),
             "expected an unclipped focus ring around icon button Copy link ({rect:?})"
         );
+    }
+
+    // #290: Home's notice dismiss is an icon_button using Phosphor's X, named and saying "Dismiss" on hover.
+    #[test]
+    fn home_notice_dismiss_is_an_icon_button_named_dismiss() {
+        let mut h = home_with(|_| {});
+        h.app.notice = Some("Freed 12 MB on this computer.".into());
+        h.frames(3);
+
+        let dismiss = h.widget_at("Dismiss").expect("Dismiss button for screen readers");
+        assert!(h.widget_at("×").is_none(), "dismiss is not named \"×\"");
+        assert!(h.text_at("×").is_none(), "no raw \"×\" glyph painted");
+        let icon = h.text_at(icons::REMOVE).expect("Phosphor X icon painted");
+        assert!((icon.x - dismiss.x).abs() < 4.0 && (icon.y - dismiss.y).abs() < 4.0, "icon {icon:?} sits inside Dismiss {dismiss:?}");
+
+        tooltips_at_once(&h);
+        hover(&mut h, dismiss);
+        assert!(h.text_at("Dismiss").is_some(), "hovering Dismiss shows its tooltip");
+
+        h.click(dismiss);
+        assert_eq!(h.app.notice, None, "clicking Dismiss clears the notice");
+        assert!(h.widget_at("Dismiss").is_none(), "dismiss button disappears with the notice");
+
+        // Multi-line wrapped notice at 840x540 zoomed: text wraps to the left of Dismiss and never overlaps it
+        let long = "Couldn't free up space for a very long folder path because several files are currently open in other apps on this computer.";
+        h.app.notice = Some(long.into());
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
+        let dismiss_node = h.nodes_named("Dismiss").into_iter().next().expect("Dismiss on wrapped notice");
+        let dismiss_rect = node_rect(&dismiss_node);
+        let notice_text = h.texts(|t| t.galley.text() == long);
+        assert_eq!(notice_text.len(), 1, "wrapped notice text is painted");
+        assert!(notice_text[0].galley.rows.len() > 1, "notice wraps across multiple lines");
+        let text_rect = notice_text[0].visual_bounding_rect();
+        assert!(text_rect.right() < dismiss_rect.left(), "wrapped text {text_rect:?} stays left of Dismiss {dismiss_rect:?}");
+        assert!(dismiss_rect.right() <= h.screen.x, "Dismiss {dismiss_rect:?} stays inside {:?}", h.screen);
     }
 
     // R19 5 and 2(c): the short Web and Trash say their whole phrase to screen readers, and Trash says on hover that it
