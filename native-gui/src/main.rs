@@ -4324,8 +4324,10 @@ fn activity_pill_colors(p: &Palette, kind: activity::ActivityKind) -> (Color32, 
         Uploaded => (Color32::from_rgba_unmultiplied(109, 74, 255, 42), p.purple_text),
         FreedUp | Hidden => (Color32::from_rgba_unmultiplied(109, 74, 255, 26), p.purple_text),
         Shared => (Color32::from_rgba_unmultiplied(109, 74, 255, 26), p.purple_text),
-        FolderCreated | Other => (p.card_alt, p.text),
-        RemovedLocally => (p.card_alt, p.text_weak),
+        // Neutral pills step one shade past `input` (used for hovered rows) so their shape stays visible on hover in
+        // both light and dark themes (#287)
+        FolderCreated | Other => (p.border_weak, p.text),
+        RemovedLocally => (p.border_weak, p.text_weak),
         MovedToCloudTrash => (Color32::from_rgba_unmultiplied(245, 158, 11, 34), p.pill_warning),
         Conflict | Failed => (Color32::from_rgba_unmultiplied(239, 68, 68, 38), p.pill_danger),
     }
@@ -11839,6 +11841,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    // #287: every Activity pill (including neutral ones like Folder created, Synced, Removed locally) keeps a
+    // distinct fill on both a resting row (card) and a hovered row (input) in light and dark themes.
+    #[test]
+    fn activity_pills_stay_visible_on_hovered_rows_in_both_themes() {
+        use activity::ActivityKind::*;
+        for p in [&LIGHT, &DARK] {
+            let theme = if std::ptr::eq(p, &LIGHT) { "light" } else { "dark" };
+            for kind in [Uploaded, Downloaded, FolderCreated, FreedUp, Hidden, RemovedLocally, MovedToCloudTrash, Shared, Conflict, Failed, Other] {
+                let (fill, _) = activity_pill_colors(p, kind);
+                for (state, under) in [("resting", p.card), ("hovered", p.input)] {
+                    let shown = over(fill, under);
+                    assert_ne!(
+                        shown, under,
+                        "{theme}: {kind:?} pill {fill:?} vanishes into {state} row {under:?}"
+                    );
+                }
+            }
+        }
+        // Rendered Activity row: hovering a neutral "Folder created" row keeps the pill distinct from the hover fill
+        let mut h = Harness::new();
+        h.app.tab = NavTab::Activity;
+        h.app.activities = vec![ActivityRecord {
+            id: Some(1),
+            timestamp: 1_700_000_000_000,
+            action: "mkdir".into(),
+            local_rel_path: "Docs/NewFolder".into(),
+            details: String::new(),
+        }];
+        h.frames(3);
+        let pill = h.text_at("+ Folder created").expect("Folder created pill");
+        let row_spot = h.text_at("Docs/NewFolder").expect("row file path");
+        hover(&mut h, row_spot);
+        let row_fill = h.fill_under(row_spot).expect("hovered row fill");
+        let pill_fill = h.fill_under(pill).expect("pill fill");
+        assert_eq!(row_fill, palette().input, "hovered row uses input fill");
+        assert_eq!(pill_fill, activity_pill_colors(palette(), FolderCreated).0, "neutral pill uses activity_pill_colors");
+        assert_ne!(pill_fill, row_fill, "neutral pill stays distinct on hovered row");
     }
 
     // A switch that is off stands out from its card, and its knob from it (WCAG's 3:1 for what isn't text)
