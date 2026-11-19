@@ -825,16 +825,20 @@ impl ProtonDriveNativeApp {
             if ui.available_width() < crate::settings::STACKED_BELOW {
                 ui.horizontal_top(|ui| self.render_status_headline(ui, &summary, show_sign_in));
                 ui.add_space(12.0);
-                ui.horizontal_wrapped(|ui| self.render_status_buttons(ui, false, show_sign_in, &mut command, &mut sign_in));
+                ui.horizontal_wrapped(|ui| self.render_status_buttons(ui, show_sign_in, &mut command, &mut sign_in));
             } else {
+                // Lay out left to right so Tab and screen-reader order matches visual order: headline -> Sync now ->
+                // Pause/Resume (or headline -> Sign in) (#311).
+                let buttons_w = self.status_buttons_width(ui, show_sign_in);
+                let gap = 12.0;
+                let text_w = (ui.available_width() - buttons_w - gap - ui.spacing().item_spacing.x).max(0.0);
                 ui.horizontal_top(|ui| {
-                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                        self.render_status_buttons(ui, true, show_sign_in, &mut command, &mut sign_in);
-                        ui.add_space(12.0);
-                        ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
-                            self.render_status_headline(ui, &summary, show_sign_in);
-                        });
+                    ui.allocate_ui_with_layout(Vec2::new(text_w, 0.0), Layout::left_to_right(Align::Min), |ui| {
+                        ui.set_min_width(text_w);
+                        self.render_status_headline(ui, &summary, show_sign_in);
                     });
+                    ui.add_space(gap);
+                    self.render_status_buttons(ui, show_sign_in, &mut command, &mut sign_in);
                 });
             }
         });
@@ -880,12 +884,24 @@ impl ProtonDriveNativeApp {
         });
     }
 
-    /// Sync now and Pause (Resume while paused), Sync now on the left; Sign in alone while signed out. `right_to_left`:
-    /// the row is laid out from its right end. What they ask for lands in `command` and `sign_in`.
+    /// Width taken by `render_status_buttons` in the single-row wide layout.
+    fn status_buttons_width(&self, ui: &egui::Ui, show_sign_in: bool) -> f32 {
+        if show_sign_in {
+            return crate::action_button_width(ui, Some(icons::SIGN_IN), "Sign in");
+        }
+        let (pause_label, pause_to) = pause_button(&self.status);
+        let pause_icon = if pause_to { icons::PAUSE } else { icons::RESUME };
+        crate::action_button_width(ui, Some(icons::SYNC), "Sync now")
+            + ui.spacing().item_spacing.x
+            + 4.0
+            + crate::action_button_width(ui, Some(pause_icon), pause_label)
+    }
+
+    /// Sync now and Pause (Resume while paused), left to right; Sign in alone while signed out. What they ask for
+    /// lands in `command` and `sign_in`.
     fn render_status_buttons(
         &mut self,
         ui: &mut egui::Ui,
-        right_to_left: bool,
         show_sign_in: bool,
         command: &mut Option<WorkerCommand>,
         sign_in: &mut bool,
@@ -896,46 +912,38 @@ impl ProtonDriveNativeApp {
         }
         let (pause_label, pause_to) = pause_button(&self.status);
         ui.add_enabled_ui(self.daemon_online, |ui| {
-            let order = if right_to_left { [false, true] } else { [true, false] };
-            for (i, sync_now) in order.into_iter().enumerate() {
-                if i > 0 {
-                    ui.add_space(4.0);
+            if secondary_icon_button(ui, icons::SYNC, "Sync now", 34.0).clicked() {
+                *command = Some(WorkerCommand::TriggerSync);
+            }
+            ui.add_space(4.0);
+            // Pause looks like Sync now; Resume, while paused, is the filled one
+            let pause_icon = if pause_to { icons::PAUSE } else { icons::RESUME };
+            let button = if pause_button_is_primary(&self.status) {
+                primary_icon_button(ui, pause_icon, pause_label, 34.0)
+            } else {
+                secondary_icon_button(ui, pause_icon, pause_label, 34.0)
+            };
+            if !pause_to {
+                if button.clicked() {
+                    *command = Some(WorkerCommand::SetPaused { paused: false, until: None });
                 }
-                if sync_now {
-                    if secondary_icon_button(ui, icons::SYNC, "Sync now", 34.0).clicked() {
-                        *command = Some(WorkerCommand::TriggerSync);
-                    }
-                    continue;
+            } else if self.pause_choices_open {
+                // Over a shield that takes the click on Pause too: any click outside closes them
+                let picked = pause_choices(ui.ctx(), button.rect);
+                if let Some(choice) = picked {
+                    *command = Some(WorkerCommand::SetPaused { paused: true, until: choice.until(now_ms(), local_offset_secs) });
                 }
-                // Pause looks like Sync now; Resume, while paused, is the filled one
-                let pause_icon = if pause_to { icons::PAUSE } else { icons::RESUME };
-                let button = if pause_button_is_primary(&self.status) {
-                    primary_icon_button(ui, pause_icon, pause_label, 34.0)
-                } else {
-                    secondary_icon_button(ui, pause_icon, pause_label, 34.0)
-                };
-                if !pause_to {
-                    if button.clicked() {
-                        *command = Some(WorkerCommand::SetPaused { paused: false, until: None });
-                    }
-                } else if self.pause_choices_open {
-                    // Over a shield that takes the click on Pause too: any click outside closes them
-                    let picked = pause_choices(ui.ctx(), button.rect);
-                    if let Some(choice) = picked {
-                        *command = Some(WorkerCommand::SetPaused { paused: true, until: choice.until(now_ms(), local_offset_secs) });
-                    }
-                    // Read before ui.input: egui's context lock isn't re-entrant
-                    let choices = ui.ctx().memory(|m| m.area_rect(egui::Id::new(PAUSE_CHOICES_ID)));
-                    let outside = ui.input(|i| {
-                        i.key_pressed(egui::Key::Escape)
-                            || (i.pointer.primary_clicked() && !pause_choices_hit(choices, i.pointer.interact_pos()))
-                    });
-                    if picked.is_some() || outside {
-                        self.pause_choices_open = false;
-                    }
-                } else if button.clicked() {
-                    self.pause_choices_open = true; // #205: For 1 hour, Until tomorrow, Until I resume
+                // Read before ui.input: egui's context lock isn't re-entrant
+                let choices = ui.ctx().memory(|m| m.area_rect(egui::Id::new(PAUSE_CHOICES_ID)));
+                let outside = ui.input(|i| {
+                    i.key_pressed(egui::Key::Escape)
+                        || (i.pointer.primary_clicked() && !pause_choices_hit(choices, i.pointer.interact_pos()))
+                });
+                if picked.is_some() || outside {
+                    self.pause_choices_open = false;
                 }
+            } else if button.clicked() {
+                self.pause_choices_open = true; // #205: For 1 hour, Until tomorrow, Until I resume
             }
         });
     }
@@ -1213,17 +1221,31 @@ impl ProtonDriveNativeApp {
                         trash(ui);
                     });
                 }
+            } else if sync_dir.is_empty() {
+                ui.vertical(name_and_kind);
             } else {
+                // Lay out left to right so Tab and screen-reader order matches visual order: drive name -> Open in
+                // Files -> Trash (#311).
+                let item_gap = ui.spacing().item_spacing.x;
+                let buttons_w = crate::action_button_width(ui, Some(icons::FOLDER_OPEN), crate::chrome::OPEN_IN_FILES)
+                    + item_gap
+                    + 4.0
+                    + crate::action_button_width(ui, Some(icons::TRASH), TRASH_BUTTON);
+                let gap = 8.0;
+                let text_w = (ui.available_width() - buttons_w - gap - item_gap).max(0.0);
                 ui.horizontal(|ui| {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if !sync_dir.is_empty() {
-                            trash(ui);
-                            ui.add_space(4.0);
-                            open(ui);
-                            ui.add_space(8.0);
-                        }
-                        ui.with_layout(Layout::top_down(Align::Min), name_and_kind);
-                    });
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(text_w, ui.available_height()),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_min_width(text_w);
+                            name_and_kind(ui);
+                        },
+                    );
+                    ui.add_space(gap);
+                    open(ui);
+                    ui.add_space(4.0);
+                    trash(ui);
                 });
             }
 
