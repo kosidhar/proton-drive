@@ -818,6 +818,11 @@ impl ProtonDriveNativeApp {
         let summary = status_summary(&self.status, self.daemon_online, self.initial_connecting, self.attention.len(), now_ms());
         // Pause and Sync now mean nothing without an account: Sign in, as Settings › Account offers it
         let show_sign_in = self.daemon_online && signed_out(&self.status);
+        // Only while Pause is offered and can be used; clear before rendering buttons so an offline or paused state
+        // never paints stale choices or reports expanded=true on a disabled Pause button (#357)
+        if !self.daemon_online || show_sign_in || !pause_button(&self.status).1 {
+            self.pause_choices_open = false;
+        }
         let mut command = None;
         let mut sign_in = false;
         card_frame().show(ui, |ui| {
@@ -842,10 +847,6 @@ impl ProtonDriveNativeApp {
                 });
             }
         });
-        // Only while Pause is offered and can be used
-        if !self.daemon_online || show_sign_in || !pause_button(&self.status).1 {
-            self.pause_choices_open = false;
-        }
         if let Some(command) = command {
             let _ = self.tx.send(command);
         }
@@ -924,26 +925,36 @@ impl ProtonDriveNativeApp {
                 secondary_icon_button(ui, pause_icon, pause_label, 34.0)
             };
             if !pause_to {
+                self.pause_choices_open = false;
                 if button.clicked() {
                     *command = Some(WorkerCommand::SetPaused { paused: false, until: None });
                 }
-            } else if self.pause_choices_open {
-                // Over a shield that takes the click on Pause too: any click outside closes them
-                let picked = pause_choices(ui.ctx(), button.rect);
-                if let Some(choice) = picked {
-                    *command = Some(WorkerCommand::SetPaused { paused: true, until: choice.until(now_ms(), local_offset_secs) });
+            } else {
+                if self.pause_choices_open {
+                    // Over a shield that takes the click on Pause too: any click outside closes them
+                    let picked = pause_choices(ui.ctx(), button.rect);
+                    if let Some(choice) = picked {
+                        *command = Some(WorkerCommand::SetPaused { paused: true, until: choice.until(now_ms(), local_offset_secs) });
+                    }
+                    // Read before ui.input: egui's context lock isn't re-entrant
+                    let choices = ui.ctx().memory(|m| m.area_rect(egui::Id::new(PAUSE_CHOICES_ID)));
+                    let outside = ui.input(|i| {
+                        i.key_pressed(egui::Key::Escape)
+                            || (i.pointer.primary_clicked() && !pause_choices_hit(choices, i.pointer.interact_pos()))
+                    });
+                    if picked.is_some() || outside {
+                        self.pause_choices_open = false;
+                        ui.ctx().request_repaint();
+                    }
+                } else if button.clicked() {
+                    self.pause_choices_open = true; // #205: For 1 hour, Until tomorrow, Until I resume
+                    ui.ctx().request_repaint();
                 }
-                // Read before ui.input: egui's context lock isn't re-entrant
-                let choices = ui.ctx().memory(|m| m.area_rect(egui::Id::new(PAUSE_CHOICES_ID)));
-                let outside = ui.input(|i| {
-                    i.key_pressed(egui::Key::Escape)
-                        || (i.pointer.primary_clicked() && !pause_choices_hit(choices, i.pointer.interact_pos()))
+                let expanded = self.pause_choices_open;
+                ui.ctx().accesskit_node_builder(button.id, |node| {
+                    node.set_has_popup(egui::accesskit::HasPopup::Menu);
+                    node.set_expanded(expanded);
                 });
-                if picked.is_some() || outside {
-                    self.pause_choices_open = false;
-                }
-            } else if button.clicked() {
-                self.pause_choices_open = true; // #205: For 1 hour, Until tomorrow, Until I resume
             }
         });
     }
