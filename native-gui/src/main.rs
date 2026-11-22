@@ -1100,9 +1100,20 @@ fn shared_list(ui: &mut egui::Ui, items: &[shared::SharedItem], now_ms: i64, sto
     let name_x = header.left() + START;
     let location_x = name_x + name_w + SHARED_COLUMN_GAP;
     let sharing_x = location_x + location_w + SHARED_COLUMN_GAP;
-    for (title, x) in [("Name", name_x), ("Location", location_x), ("Sharing", sharing_x)] {
+    let enabled = ui.is_enabled();
+    let header_col = |ui: &mut egui::Ui, title: &'static str, x: f32, w: f32| -> egui::Id {
+        let rect = egui::Rect::from_min_max(egui::pos2(x, header.top()), egui::pos2(x + w.max(0.0), header.bottom()));
+        let resp = ui.interact(rect, ui.id().with(("shared_header", title)), Sense::hover());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, enabled, title));
+        ui.ctx().accesskit_node_builder(resp.id, |node| {
+            node.set_role(egui::accesskit::Role::ColumnHeader);
+        });
         painter.text(egui::pos2(x, header.center().y), egui::Align2::LEFT_CENTER, title, header_font.clone(), TEXT_MUTED());
-    }
+        resp.id
+    };
+    let name_header = header_col(ui, "Name", name_x, name_w);
+    let location_header = header_col(ui, "Location", location_x, location_w);
+    let sharing_header = header_col(ui, "Sharing", sharing_x, sharing_w);
     line(&painter, header);
 
     let mut act = None;
@@ -1112,10 +1123,11 @@ fn shared_list(ui: &mut egui::Ui, items: &[shared::SharedItem], now_ms: i64, sto
         let y = row.center().y;
         let cell = |x: f32, w: f32| egui::Rect::from_min_max(egui::pos2(x, row.top()), egui::pos2(x + w.max(0.0), row.bottom()));
         let in_cell = |rect: egui::Rect| painter.with_clip_rect(rect.intersect(painter.clip_rect()));
-        let enabled = ui.is_enabled();
-        // Each cell is named for screen readers, as a label would be, and says the whole of it on hover
-        let describe = |rect: egui::Rect, what: &str, says: &str, hover: &str| {
-            let resp = ui.interact(rect, ui.id().with(("shared_cell", i, what)), Sense::hover());
+        // Each cell is named for screen readers, linked to its column header (#283), and says the whole of it on hover
+        let describe = |rect: egui::Rect, what: &str, header_id: egui::Id, says: &str, hover: &str| {
+            let resp = ui
+                .interact(rect, ui.id().with(("shared_cell", i, what)), Sense::hover())
+                .labelled_by(header_id);
             resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, enabled, says));
             resp.on_hover_text(hover);
         };
@@ -1128,7 +1140,7 @@ fn shared_list(ui: &mut egui::Ui, items: &[shared::SharedItem], now_ms: i64, sto
         p.text(egui::pos2(name_x, y), egui::Align2::LEFT_CENTER, shared::name_icon(&item.name), icons::font(BUTTON_ICON_SIZE), icon_color);
         let name = truncate_middle_to_width(&p, &item.name, &name_font, name_w - ICON_ROOM);
         p.text(egui::pos2(name_x + ICON_ROOM, y), egui::Align2::LEFT_CENTER, name, name_font.clone(), TEXT_PRIMARY());
-        describe(name_cell, "name", &item.name, &whole);
+        describe(name_cell, "name", name_header, &item.name, &whole);
 
         // Location: the folder, or where the item is instead, in weak text. A folder is cut in the middle, keeping
         // its end; a phrase ("Hidden from this computer", "(top level)") at its end (R13)
@@ -1143,7 +1155,7 @@ fn shared_list(ui: &mut egui::Ui, items: &[shared::SharedItem], now_ms: i64, sto
             truncate_end_to_width(&p, &location, &text_font, location_w)
         };
         p.text(egui::pos2(location_x, y), egui::Align2::LEFT_CENTER, shown, text_font.clone(), color);
-        describe(location_cell, "location", &location, &whole);
+        describe(location_cell, "location", location_header, &location, &whole);
 
         // Sharing: the marks, or the warning and why; the whole sentence on hover
         let sharing_cell = cell(sharing_x, sharing_w);
@@ -1162,7 +1174,7 @@ fn shared_list(ui: &mut egui::Ui, items: &[shared::SharedItem], now_ms: i64, sto
             x += w;
         }
         let exposure = shared::exposure_text(item, now_ms, home::local_offset_secs);
-        describe(sharing_cell, "sharing", &exposure, &exposure);
+        describe(sharing_cell, "sharing", sharing_header, &exposure, &exposure);
 
         // The actions, on the right: weak until the row is hovered. A row being stopped waits for the answer
         let buttons = SharedAction::for_item(item, now_ms);
@@ -9354,6 +9366,40 @@ mod tests {
             assert!(at.y < name.y, "{header:?} above the rows");
         }
         assert!(h.rects_filled(BG_CARD()).iter().all(|r| !r.contains(name)), "no card around the rows");
+    }
+
+    // #283: Shared's column headers (Name, Location, Sharing) are exposed to screen readers as ColumnHeaders, and
+    // each row's cells are labelled by their column header.
+    #[test]
+    fn shared_column_headers_and_cells_are_announced_to_screen_readers() {
+        use egui::accesskit::Role;
+        let h = shared_with_rows();
+        let rows = shared_rows();
+        let first_row_y = h.text_at(&rows[0].name).unwrap().y;
+
+        for title in ["Name", "Location", "Sharing"] {
+            let headers: Vec<_> = h
+                .nodes_named(title)
+                .into_iter()
+                .filter(|n| n.role() == Role::ColumnHeader)
+                .collect();
+            assert_eq!(headers.len(), 1, "expected one ColumnHeader named {title:?}");
+            assert_eq!(headers[0].value(), None, "{title:?} header carries its name in label only");
+            assert!(node_rect(&headers[0]).center().y < first_row_y, "{title:?} header sits above the rows");
+        }
+
+        let nodes = accesskit_nodes(&h);
+        for item in &rows {
+            let location = shared::location_text(item);
+            let exposure = shared::exposure_text(item, home::now_ms(), home::local_offset_secs);
+            for (col, val) in [("Name", item.name.as_str()), ("Location", location.as_str()), ("Sharing", exposure.as_str())] {
+                let matched = nodes
+                    .iter()
+                    .map(|(_, n)| n)
+                    .any(|n| n.role() == Role::Label && n.value() == Some(val) && labelled_by(&h, n) == vec![col.to_string()]);
+                assert!(matched, "row {:?}: cell {:?} should be labelled by column {:?}", item.name, val, col);
+            }
+        }
     }
 
     #[test]
