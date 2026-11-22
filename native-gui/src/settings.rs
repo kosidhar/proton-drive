@@ -404,10 +404,13 @@ fn show_info_words(ctx: &egui::Context, id: egui::Id, anchor: egui::Rect, info: 
     let outer = outer.translate(Vec2::new((screen.right() - outer.right()).min(0.0), 0.0));
     let onto_screen = Vec2::new((screen.left() - outer.left()).max(0.0), (screen.top() - outer.top()).max(0.0));
     let outer = outer.translate(onto_screen);
-    // Each ⓘ's box an area of its own, as a focused one may show while another's closes
+    // Each ⓘ's box an area of its own, as a focused one may show while another's closes; non-interactable during a
+    // wheel turn so the page's ScrollArea underneath receives the scroll (#319)
+    let scrolling = ctx.input(|i| i.raw_scroll_delta != Vec2::ZERO);
     egui::Area::new(egui::Id::new(OPEN_INFO).with(id))
         .order(egui::Order::Tooltip)
         .fixed_pos(outer.min)
+        .interactable(!scrolling)
         .sense(Sense::CLICK)
         .show(ctx, |ui| {
             frame.show(ui, |ui| {
