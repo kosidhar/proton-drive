@@ -6618,8 +6618,15 @@ mod tests {
                 let chips = &boxes[..4];
                 assert!(chips.iter().all(|(_, r)| (r.center().y - chips[0].1.center().y).abs() < 0.5), "{at}: the chips on one line: {chips:?}");
                 let header = h.text_rect("File / Folder").unwrap_or_else(|| panic!("{at}: the table is painted"));
+                let table_card = card_rects(&h)
+                    .into_iter()
+                    .find(|c| c.contains(header.center()))
+                    .unwrap_or_else(|| panic!("{at}: the table's card wraps {header:?}"));
                 let lowest = boxes.iter().map(|(_, r)| r.bottom()).fold(0.0, f32::max);
-                assert!(header.top() > lowest + 14.0, "{at}: the table's card {header:?} starts below the row, at {lowest}");
+                assert!(
+                    table_card.top() >= lowest,
+                    "{at}: the table's card {table_card:?} starts at or below the row's bottom {lowest}"
+                );
                 // The table's column names stay apart, and left of the window's edge (a column with no room shows none)
                 let time = h.text_rect("Time").unwrap_or_else(|| panic!("{at}: Time is a column"));
                 for name in ["Status", "File / Folder", "Details"] {
@@ -11502,6 +11509,32 @@ mod tests {
         assert_eq!(h.sent(), vec!["sign in".to_string()]);
     }
 
+    /// Every `card_frame()` rectangle the last frame painted in the section, found by its 12 pt rounded corners and
+    /// border stroke rather than its fill colour so the check holds in both light (white card on white canvas) and
+    /// dark palettes (#292).
+    fn card_rects(h: &Harness) -> Vec<egui::Rect> {
+        let radius = card_frame().corner_radius;
+        fn cards(shape: &egui::Shape, radius: CornerRadius, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Rect(r)
+                    if r.rect.left() >= SIDEBAR_EDGE
+                        && r.corner_radius == radius
+                        && r.fill != Color32::TRANSPARENT
+                        && r.stroke.width > 0.0 =>
+                {
+                    out.push(r.rect);
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| cards(s, radius, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in h.last.iter().flat_map(|o| o.shapes.iter()) {
+            cards(&clipped.shape, radius, &mut out);
+        }
+        out
+    }
+
     // #276, R19 3: at the smallest window, at 120% zoom (where the controls go under their labels) and at the
     // screenshots' size, in a 540-tall window scrolled from top to bottom: no widget (its frame, as screen readers are
     // told it) and no text runs out of its card, and no two texts run over each other
@@ -11519,13 +11552,9 @@ mod tests {
             h.scroll(gutter, -10_000.0);
             let (mut widgets, mut seen_save) = (0, false);
             for _ in 0..40 {
-                // The cards: the widest of what is filled in the cards' colour (an outlined button is too)
-                let frames = filled_rects(&h);
-                let widest = frames.iter().filter(|(_, _, f)| *f == BG_CARD()).map(|(r, _, _)| r.width()).fold(0.0, f32::max);
-                let cards: Vec<egui::Rect> = frames
-                    .iter()
-                    .filter(|(r, _, f)| *f == BG_CARD() && r.width() == widest)
-                    .map(|(r, _, _)| r.shrink2(Vec2::new(card_frame().inner_margin.leftf(), 0.0)))
+                let cards: Vec<egui::Rect> = card_rects(&h)
+                    .into_iter()
+                    .map(|r| r.shrink2(Vec2::new(card_frame().inner_margin.leftf(), 0.0)))
                     .collect();
                 let card_of = |r: egui::Rect| cards.iter().find(|c| c.y_range().contains(r.center().y)).copied();
                 let in_sight = |r: egui::Rect| r.left() > SIDEBAR_EDGE && r.top() >= chrome::TOP_BAR_HEIGHT && r.bottom() <= h.screen.y;
