@@ -975,7 +975,7 @@ fn start_fresh_at(socket: &std::path::Path) -> Result<(), String> {
 const SHARED_LOCATION_MIN: f32 = 56.0;
 
 /// How the Shared list's text columns share `room`, as (name, location, sharing). Sharing has what its marks need (up
-/// to half the room) and what a longer reason wants (up to two fifths). The name has at least half the rest, so the
+/// to half the room) and what its words want (up to two fifths). The name has at least half the rest, so the
 /// columns line up, and more as it needs. Location gives way first, down to `SHARED_LOCATION_MIN`; then the name.
 fn shared_columns(room: f32, name_want: f32, sharing_need: f32, sharing_want: f32) -> (f32, f32, f32) {
     let room = room.max(0.0);
@@ -1082,14 +1082,20 @@ fn shared_list(ui: &mut egui::Ui, items: &[shared::SharedItem], now_ms: i64, sto
     let width = ui.available_width();
     let room = width - START - SHARED_ROW_END - actions_room - 3.0 * SHARED_COLUMN_GAP;
     let name_want = items.iter().map(|i| ICON_ROOM + text_width(&painter, &i.name, &name_font)).fold(0.0, f32::max);
-    // Sharing needs room for every readable row's marks, and wants room for its words and an unreadable row's reason
+    // Sharing needs room for every readable row's marks, and wants room for its words; an unreadable row's reason is
+    // cut to the column and shown whole on hover so one unreadable item doesn't widen the column for every row (#284)
     let sharing_need = items
         .iter()
         .zip(&pieces)
         .filter(|(i, _)| i.unreadable.is_none())
         .map(|(_, p)| sharing_width(&painter, &sharing_fit(&painter, p, 0.0)))
         .fold(text_width(&painter, "Sharing", &header_font), f32::max);
-    let sharing_want = pieces.iter().map(|p| sharing_width(&painter, &p.iter().collect::<Vec<_>>())).fold(sharing_need, f32::max);
+    let sharing_want = items
+        .iter()
+        .zip(&pieces)
+        .filter(|(i, _)| i.unreadable.is_none())
+        .map(|(_, p)| sharing_width(&painter, &p.iter().collect::<Vec<_>>()))
+        .fold(sharing_need, f32::max);
     let (name_w, location_w, sharing_w) = shared_columns(room, name_want, sharing_need, sharing_want);
 
     ui.spacing_mut().item_spacing.y = 0.0;
@@ -1157,11 +1163,25 @@ fn shared_list(ui: &mut egui::Ui, items: &[shared::SharedItem], now_ms: i64, sto
         p.text(egui::pos2(location_x, y), egui::Align2::LEFT_CENTER, shown, text_font.clone(), color);
         describe(location_cell, "location", location_header, &location, &whole);
 
-        // Sharing: the marks, or the warning and why; the whole sentence on hover
-        let sharing_cell = cell(sharing_x, sharing_w);
+        // The actions, on the right: weak until the row is hovered. A row being stopped waits for the answer
+        let buttons = SharedAction::for_item(item, now_ms);
+        let n = buttons.len() as f32;
+        let actions_w = n * ICON_BUTTON_SIZE + (n - 1.0).max(0.0) * SHARED_ACTION_GAP;
+        let right = row.right() - SHARED_ROW_END;
+        let actions = egui::Rect::from_min_max(egui::pos2(right - actions_w, row.top()), egui::pos2(right, row.bottom()));
+
+        // Sharing: the marks, or the warning and why; the whole sentence on hover. An unreadable row has fewer action
+        // buttons on the right, so its reason may use the room up to its own actions without widening Sharing for the
+        // other rows (#284).
+        let row_sharing_w = if item.unreadable.is_some() {
+            (actions.left() - SHARED_COLUMN_GAP - sharing_x).max(sharing_w)
+        } else {
+            sharing_w
+        };
+        let sharing_cell = cell(sharing_x, row_sharing_w);
         let p = in_cell(sharing_cell);
         let mut x = sharing_x;
-        let fit = sharing_fit(&p, pieces, sharing_w);
+        let fit = sharing_fit(&p, pieces, row_sharing_w);
         for (k, piece) in fit.iter().enumerate() {
             if k > 0 {
                 x += sharing_gap(fit[k - 1], piece);
@@ -1176,12 +1196,6 @@ fn shared_list(ui: &mut egui::Ui, items: &[shared::SharedItem], now_ms: i64, sto
         let exposure = shared::exposure_text(item, now_ms, home::local_offset_secs);
         describe(sharing_cell, "sharing", sharing_header, &exposure, &exposure);
 
-        // The actions, on the right: weak until the row is hovered. A row being stopped waits for the answer
-        let buttons = SharedAction::for_item(item, now_ms);
-        let n = buttons.len() as f32;
-        let actions_w = n * ICON_BUTTON_SIZE + (n - 1.0).max(0.0) * SHARED_ACTION_GAP;
-        let right = row.right() - SHARED_ROW_END;
-        let actions = egui::Rect::from_min_max(egui::pos2(right - actions_w, row.top()), egui::pos2(right, row.bottom()));
         let color = if ui.rect_contains_pointer(row) { TEXT_PRIMARY() } else { TEXT_MUTED() };
         let busy = stopping.is_some() && stopping == item.rel_path.as_deref();
         let mut actions_ui = ui.new_child(egui::UiBuilder::new().id_salt(("shared_actions", i)).max_rect(actions).layout(Layout::left_to_right(Align::Center)));
@@ -9463,6 +9477,67 @@ mod tests {
                 assert!(cols.0 >= 0.0 && cols.1 >= 0.0 && cols.2 >= 0.0, "{room} {cols:?}");
             }
         }
+    }
+
+    // #284: an unreadable row's long reason does not widen the Sharing column (or squeeze Location) for the other rows.
+    #[test]
+    fn an_unreadable_row_does_not_widen_the_sharing_column_for_other_rows() {
+        let all_rows = shared_rows();
+        assert!(all_rows.iter().any(|i| i.unreadable.is_some()), "fixture includes an unreadable row");
+        let readable_only: Vec<_> = all_rows
+            .iter()
+            .filter(|i| i.unreadable.is_none())
+            .cloned()
+            .collect();
+
+        let column_xs = |rows: Vec<shared::SharedItem>, width: f32| -> (f32, f32, f32, String) {
+            let mut h = Harness::new();
+            h.app.status.sync_dir = "/home/u/ProtonDrive".into();
+            h.click(h.text_at("Shared").unwrap());
+            h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(rows)));
+            h.resize_zoomed(Vec2::new(width, 540.0), 1.0);
+            let name_x = h.text_rect("Name").expect("Name header").left();
+            let loc_x = h.text_rect("Location").expect("Location header").left();
+            let share_x = h.text_rect("Sharing").expect("Sharing header").left();
+            let hidden_text = h
+                .texts(|t| t.galley.text().starts_with("Hidden from") && t.visual_bounding_rect().left() > SIDEBAR_EDGE)
+                .first()
+                .expect("Hidden location painted")
+                .galley
+                .text()
+                .to_string();
+            (name_x, loc_x, share_x, hidden_text)
+        };
+
+        for width in [840.0, 1100.0] {
+            let without_unreadable = column_xs(readable_only.clone(), width);
+            let with_unreadable = column_xs(all_rows.clone(), width);
+            assert_eq!(
+                with_unreadable, without_unreadable,
+                "at width {width}, an unreadable row should not shift the columns or squeeze Location"
+            );
+        }
+
+        // Even when the only readable row has a single link mark (so Sharing is as narrow as its header), adding an
+        // unreadable row leaves the columns unchanged while the unreadable row's reason still reads ("Proton Drive…")
+        let link_only = all_rows.iter().find(|i| i.name == "Taxes").cloned().unwrap();
+        let unreadable_only = all_rows.iter().find(|i| i.unreadable.is_some()).cloned().unwrap();
+        assert_eq!(
+            column_xs(vec![link_only.clone(), unreadable_only.clone()], 840.0),
+            column_xs(vec![link_only.clone()], 840.0),
+            "narrow Sharing column stays unchanged when an unreadable row is added"
+        );
+        let mut h = Harness::new();
+        h.app.status.sync_dir = "/home/u/ProtonDrive".into();
+        h.click(h.text_at("Shared").unwrap());
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(vec![link_only, unreadable_only])));
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.0);
+        assert!(
+            h.texts(|t| t.galley.text().starts_with("Proton D") && t.visual_bounding_rect().left() > SIDEBAR_EDGE)
+                .len()
+                == 1,
+            "unreadable row reason still reads clearly up to its own actions"
+        );
     }
 
     // A Shared action and Refresh are push buttons for screen readers
