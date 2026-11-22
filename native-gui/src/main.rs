@@ -10733,6 +10733,19 @@ mod tests {
         assert!(after < before, "the next turn scrolls the page: {before} → {after}");
     }
 
+    // #319: a wheel turn over the words of an ⓘ that has the keyboard focus scrolls the page.
+    #[test]
+    fn a_wheel_turn_over_a_focused_infos_words_scrolls_the_page() {
+        let mut h = Harness::settings(Some(vfs("virtual", true, None)), Some(true));
+        h.resize_zoomed(Vec2::new(1440.0, 700.0), 1.0);
+        tab_to_info(&mut h, BLOCKED_EXPLAINED, 40);
+        let words = h.text_rect(BLOCKED_EXPLAINED).expect("focused ⓘ shows its words").center();
+        let before = h.text_rect("Apps blocked from downloading").unwrap().top();
+        h.scroll(words, 60.0);
+        let after = h.text_rect("Apps blocked from downloading").map_or(f32::MIN, |r| r.top());
+        assert!(after < before, "a wheel turn over a focused ⓘ's words scrolls the page: {before} → {after}");
+    }
+
     // A screen reader moving the focus to another ⓘ closes the open one: one at a time
     #[test]
     fn focusing_another_info_closes_the_open_one() {
