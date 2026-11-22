@@ -7706,6 +7706,24 @@ mod tests {
         h.click(trash.center());
         assert_eq!(launched(), vec!["https://drive.proton.me/trash".to_string()]);
         assert_eq!(h.sent(), Vec::<String>::new(), "nothing goes to the daemon");
+
+        // #312: at 840x540 (zoom 1.0, card wider than STACKED_BELOW), a long path that doesn't fit beside the buttons
+        // stacks the buttons under it so the path is shown whole rather than shortened with "…"
+        let long_path = "/srv/work/projects/proton-drive-folder";
+        let mut h = home_with(|s| s.sync_dir = long_path.into());
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.0);
+        let painted = h.texts(|t| t.galley.text() == long_path);
+        assert_eq!(painted.len(), 1, "the long path is painted");
+        assert!(!painted[0].galley.elided, "the long path is painted unshortened at 840x540");
+        let name = painted[0].visual_bounding_rect();
+        let kind_line = page(&h, kind);
+        let (open, trash) = (frame(&h, chrome::OPEN_IN_FILES), frame(&h, home::OPEN_TRASH));
+        for b in [open, trash] {
+            assert!(
+                b.top() > kind_line.bottom() && b.top() > name.bottom(),
+                "at 840x540 with a long path, {b:?} stacks under {name:?} and {kind_line:?}"
+            );
+        }
     }
 
     // #311: Tab and screen-reader order runs left to right (text -> first button -> second button) in both the wide
