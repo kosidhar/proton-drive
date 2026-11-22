@@ -6885,6 +6885,63 @@ mod tests {
     }
 
     #[test]
+    fn pause_button_reports_its_expanded_state() {
+        let mut h = home_with(|_| {});
+        let pause_node = |h: &Harness| {
+            let nodes = h.nodes_named("Pause");
+            assert_eq!(nodes.len(), 1, "expected one Pause button");
+            assert_eq!(nodes[0].role(), egui::accesskit::Role::Button);
+            assert_eq!(nodes[0].has_popup(), Some(egui::accesskit::HasPopup::Menu));
+            nodes.into_iter().next().unwrap()
+        };
+
+        assert_eq!(pause_node(&h).is_expanded(), Some(false));
+
+        // Clicking Pause exposes expanded=true and keeps it after repaint
+        let pause = h.text_at("Pause").expect("Pause button");
+        h.click(pause);
+        assert_eq!(pause_node(&h).is_expanded(), Some(true));
+        h.frames(1);
+        assert_eq!(pause_node(&h).is_expanded(), Some(true));
+        assert!(h.text_at("For 1 hour").is_some());
+
+        // Escape closes the popup and flips expanded back to false
+        press_key(&mut h, Key::Escape);
+        assert_eq!(pause_node(&h).is_expanded(), Some(false));
+        h.frames(1);
+        assert_eq!(pause_node(&h).is_expanded(), Some(false));
+        assert!(h.text_at("For 1 hour").is_none());
+
+        // Clicking outside also flips expanded back to false
+        h.click(pause);
+        assert_eq!(pause_node(&h).is_expanded(), Some(true));
+        h.click(h.text_at("Up to date").unwrap());
+        assert_eq!(pause_node(&h).is_expanded(), Some(false));
+
+        // Picking a pause choice also closes the popup and flips expanded back to false
+        h.click(pause);
+        assert_eq!(pause_node(&h).is_expanded(), Some(true));
+        h.click(h.text_at("Until I resume").unwrap());
+        assert_eq!(pause_node(&h).is_expanded(), Some(false));
+
+        // Going offline while the popup is open closes it and reports expanded=false on the very next frame
+        h.click(pause);
+        assert_eq!(pause_node(&h).is_expanded(), Some(true));
+        h.app.daemon_online = false;
+        h.frames(1);
+        assert!(h.text_at("For 1 hour").is_none());
+        assert_eq!(pause_node(&h).is_expanded(), Some(false));
+
+        // While paused, Resume is a direct action button with no popup or expanded state
+        let paused = home_with(|s| s.settings.paused = true);
+        let resume = paused.nodes_named("Resume");
+        assert_eq!(resume.len(), 1);
+        assert_eq!(resume[0].role(), egui::accesskit::Role::Button);
+        assert_eq!(resume[0].has_popup(), None);
+        assert_eq!(resume[0].is_expanded(), None);
+    }
+
+    #[test]
     fn home_says_until_when_a_pause_ends() {
         let until = home::now_ms() + 30 * 60_000;
         let h = home_with(|s| {
