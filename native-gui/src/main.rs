@@ -3502,13 +3502,17 @@ impl ProtonDriveNativeApp {
                 None,
                 Some("Changing the sync location safely moves your existing synced files to the new folder, switches the real-time file watcher, and preserves all cloud files without re-uploading or deleting them."),
                 |ui| {
-                    // The field and Browse... as one group, the field taking the room Browse... leaves
+                    // The field and Browse... as one group of at most WIDE_CONTROL, so its left edge lines up with the
+                    // controls under it (#286)
                     let browse_w = action_button_width(ui, Some(icons::FOLDER_OPEN), "Browse...");
                     let gap = 6.0 + ui.spacing().item_spacing.x;
-                    let field_w = (ui.available_width() - browse_w - gap).clamp(0.0, settings::WIDE_CONTROL);
+                    let group_w = ui.available_width().min(settings::WIDE_CONTROL);
+                    let field_w = (group_w - browse_w - gap).max(0.0);
                     let group = Vec2::new(field_w + gap + browse_w, 32.0);
                     ui.allocate_ui_with_layout(group, Layout::left_to_right(Align::Center), |ui| {
-                        let field = egui::TextEdit::singleline(&mut self.edit_sync_dir).vertical_align(Align::Center);
+                        let field = egui::TextEdit::singleline(&mut self.edit_sync_dir)
+                            .margin(Margin::symmetric(10, 4))
+                            .vertical_align(Align::Center);
                         let field = ui.add_sized([field_w, 32.0], field);
                         if field.changed() {
                             self.mark_settings_edited();
@@ -3565,7 +3569,7 @@ impl ProtonDriveNativeApp {
                 Some("One glob pattern per line."),
                 Some("Matching files or folders (e.g. .git, node_modules, *.part) are skipped during two-way sync."),
                 |ui| {
-                    let margin = Margin::symmetric(6, 4);
+                    let margin = Margin::symmetric(10, 4);
                     let editor = egui::TextEdit::multiline(&mut self.ignore_patterns_text)
                         .desired_rows(8)
                         .margin(margin)
@@ -11382,6 +11386,59 @@ mod tests {
                 h.scroll(gutter, 100.0);
             }
             assert!(seen_save && widgets > 20, "{at}: scrolled to the end, past {widgets} widgets");
+        }
+    }
+
+    // #286: in Settings' Synchronization card at 1100 wide, the sync-folder field, the conflict-strategy picker, and
+    // the ignore-patterns box share one left edge, and their text shares the same 10 pt inner horizontal padding.
+    #[test]
+    fn sync_settings_controls_share_one_left_edge_and_inner_padding() {
+        use egui::accesskit::Role;
+        let mut h = Harness::settings(Some(vfs("virtual", true, None)), Some(true));
+        h.app.ignore_patterns_text = "*.part".into();
+        h.resize_zoomed(Vec2::new(1100.0, 2400.0), 1.0);
+
+        let nodes = accesskit_nodes(&h);
+        let control_rect = |role: Role, label: &str| -> egui::Rect {
+            let node = nodes
+                .iter()
+                .map(|(_, n)| n)
+                .find(|n| n.role() == role && labelled_by(&h, n) == vec![label.to_string()])
+                .unwrap_or_else(|| panic!("a {role:?} named by {label:?}"));
+            node_rect(node)
+        };
+
+        let folder = control_rect(Role::TextInput, "Local Sync Folder");
+        let conflict = control_rect(Role::ComboBox, "Conflict Resolution Strategy");
+        let ignore = control_rect(Role::MultilineTextInput, "Ignore Patterns (Glob)");
+
+        assert!(
+            (folder.left() - conflict.left()).abs() < 0.5,
+            "sync-folder field {folder:?} and conflict picker {conflict:?} share one left edge"
+        );
+        assert!(
+            (folder.left() - ignore.left()).abs() < 0.5,
+            "sync-folder field {folder:?} and ignore-patterns box {ignore:?} share one left edge"
+        );
+
+        let folder_text = h
+            .text_rects_all("/home/u/ProtonDrive")
+            .into_iter()
+            .find(|r| folder.contains(r.center()))
+            .expect("sync folder text inside field");
+        let conflict_text = h.text_rect_starting("Keep Both").expect("conflict strategy text");
+        let ignore_text = h.text_rect("*.part").expect("ignore pattern text");
+
+        for (name, box_rect, text_rect) in [
+            ("Local Sync Folder", folder, folder_text),
+            ("Conflict Resolution Strategy", conflict, conflict_text),
+            ("Ignore Patterns (Glob)", ignore, ignore_text),
+        ] {
+            let pad = text_rect.left() - box_rect.left();
+            assert!(
+                (pad - 10.0).abs() < 1.5,
+                "{name}: expected ~10 pt inner left padding, got {pad:.1} (box={box_rect:?}, text={text_rect:?})"
+            );
         }
     }
 
