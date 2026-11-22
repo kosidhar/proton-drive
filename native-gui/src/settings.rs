@@ -154,6 +154,7 @@ fn row(
 /// (switches, text fields, pickers) are named by the row's label, while action buttons that carry their own non-empty
 /// name (such as "Unblock rg" or "Unhide Docs/Private") keep that name instead of a conflicting `labelled_by` (#291).
 fn name_control(ui: &egui::Ui, control: &egui::Response, label: &egui::Response, info: Option<&str>) {
+    crate::scroll_to_focused(ui, control);
     let mut needs_label = false;
     ui.ctx().accesskit_node_builder(control.id, |node| {
         // A name of its own, even an empty one (egui's picker has one), is read instead of its label's

@@ -2484,7 +2484,9 @@ impl ProtonDriveNativeApp {
             let parts = width_of(ui, shared::EMPTY_PHOTOS) + PHOTOS_GAP + width_of(ui, shared::PHOTOS_LINK);
             let lead_in = |ui: &mut egui::Ui| ui.label(RichText::new(shared::EMPTY_PHOTOS).size(PHOTOS_SIZE).color(TEXT_MUTED()));
             let link = |ui: &mut egui::Ui| {
-                if ui.add(egui::Link::new(RichText::new(shared::PHOTOS_LINK).size(PHOTOS_SIZE))).clicked() {
+                let resp = ui.add(egui::Link::new(RichText::new(shared::PHOTOS_LINK).size(PHOTOS_SIZE)));
+                scroll_to_focused(ui, &resp);
+                if resp.clicked() {
                     Self::open_shared_on_web(self.screenshot_target.is_some());
                 }
             };
@@ -2513,7 +2515,9 @@ impl ProtonDriveNativeApp {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.label(RichText::new(shared::PHOTOS_NOTE).size(12.5).color(TEXT_MUTED()));
-            if ui.add(egui::Link::new(RichText::new(shared::PHOTOS_LINK).size(12.5))).clicked() {
+            let resp = ui.add(egui::Link::new(RichText::new(shared::PHOTOS_LINK).size(12.5)));
+            scroll_to_focused(ui, &resp);
+            if resp.clicked() {
                 Self::open_shared_on_web(screenshot);
             }
         });
@@ -2679,13 +2683,15 @@ impl ProtonDriveNativeApp {
             // (If the table can never be fully visible, e.g. when zoomed in, it always scrolls itself.)
             let table_in_view = ui.clip_rect().contains_rect(table_rect.shrink(0.5))
                 || table_h >= ui.clip_rect().height();
-            ScrollArea::vertical()
-                .id_salt("activity_table_scroll")
-                .max_height(table_h)
-                .min_scrolled_height(table_h)
-                .enable_scrolling(table_in_view)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
+            show_nested_scroll(
+                ScrollArea::vertical()
+                    .id_salt("activity_table_scroll")
+                    .max_height(table_h)
+                    .min_scrolled_height(table_h)
+                    .enable_scrolling(table_in_view)
+                    .auto_shrink([false, false]),
+                ui,
+                |ui| {
                     ui.set_min_width(ui.available_width());
                     let filter = self.activity_filter;
                     let shown: Vec<ActivityRecord> = self
@@ -2720,6 +2726,7 @@ impl ProtonDriveNativeApp {
                                 Vec2::new(ui.available_width(), 38.0),
                                 Sense::click(),
                             );
+                            scroll_to_focused(ui, &row_resp);
                             if row_resp.hovered() {
                                 ui.painter().rect_filled(
                                     row_rect,
@@ -3446,6 +3453,7 @@ impl ProtonDriveNativeApp {
                             .hint_text("App name, e.g. rg")
                             .vertical_align(Align::Center),
                     );
+                    scroll_to_focused(ui, &field);
                     // Not inside a setting_row, so name it directly for screen readers (#288)
                     ui.ctx().accesskit_node_builder(field.id, |node| {
                         node.set_label("App to block");
@@ -4035,6 +4043,76 @@ fn icon_button_colored(ui: &mut egui::Ui, icon: &str, label: &str, color: Color3
     resp.on_hover_text(label).on_disabled_hover_text(label)
 }
 
+/// How far `focus_ring_colored` reaches outside a widget's rect: 2 pt gap + 2 pt outside stroke.
+const FOCUS_RING_OUTSET: f32 = 4.0;
+/// Temp slots used to forward keyboard-focus scroll targets across nested `ScrollArea`s (#364).
+const NESTED_SCROLL_DEPTH_ID: &str = "nested_scroll_depth";
+const FOCUS_SCROLL_RECT_ID: &str = "focus_scroll_rect";
+
+/// Scrolls the enclosing `ScrollArea` (if any) so `response` and its focus ring are visible when keyboard focus moves
+/// onto it (#364). Pointer-initiated focus (such as clicking a visible line of a tall multiline `TextEdit`) is left to
+/// egui's own cursor scroll so clicking does not jump the page under the pointer.
+pub(crate) fn scroll_to_focused(ui: &egui::Ui, response: &egui::Response) {
+    if response.gained_focus() && !ui.input(|i| i.pointer.any_down() || i.pointer.any_pressed()) {
+        let target = response.rect.expand(FOCUS_RING_OUTSET);
+        let nested = ui.ctx().data(|d| d.get_temp::<usize>(egui::Id::new(NESTED_SCROLL_DEPTH_ID)).unwrap_or(0));
+        if nested > 0 {
+            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(FOCUS_SCROLL_RECT_ID), Some(target)));
+        } else {
+            ui.scroll_to_rect_animation(target, None, egui::style::ScrollAnimation::none());
+        }
+    }
+}
+
+/// Runs a nested vertical `ScrollArea` (such as Needs attention inside Home, or Activity's table inside Activity) so
+/// keyboard Tab focus inside it scrolls both the inner list (against its full `inner_rect`, never an outer-clipped or
+/// inverted clip rect) and the enclosing outer `ScrollArea` into view (#364).
+pub(crate) fn show_nested_scroll<R>(
+    scroll: ScrollArea,
+    ui: &mut egui::Ui,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::scroll_area::ScrollAreaOutput<R> {
+    let depth_key = egui::Id::new(NESTED_SCROLL_DEPTH_ID);
+    let target_key = egui::Id::new(FOCUS_SCROLL_RECT_ID);
+    let prev_depth = ui.ctx().data(|d| d.get_temp::<usize>(depth_key).unwrap_or(0));
+    let prev_target = ui.ctx().data_mut(|d| d.remove_temp::<Option<egui::Rect>>(target_key)).flatten();
+    ui.ctx().data_mut(|d| d.insert_temp(depth_key, prev_depth + 1));
+
+    let out = scroll.show(ui, add_contents);
+
+    ui.ctx().data_mut(|d| d.insert_temp(depth_key, prev_depth));
+    let focused_target = ui.ctx().data_mut(|d| d.remove_temp::<Option<egui::Rect>>(target_key)).flatten();
+    if let Some(target) = focused_target {
+        let inner = out.inner_rect;
+        let pad = ui.spacing().item_spacing.y.min((inner.height() - target.height()).max(0.0) / 2.0);
+        let inner_delta = if target.top() < inner.top() && target.bottom() < inner.bottom() {
+            -(inner.top() - target.top() + pad).min(inner.bottom() - target.bottom() - pad)
+        } else if target.bottom() > inner.bottom() && target.top() > inner.top() {
+            (target.bottom() - inner.bottom() + pad).min(target.top() - inner.top() - pad)
+        } else {
+            0.0
+        };
+        let max_offset = (out.content_size.y - inner.height()).max(0.0);
+        let new_offset = (out.state.offset.y + inner_delta).clamp(0.0, max_offset);
+        let actual_inner_delta = new_offset - out.state.offset.y;
+        if actual_inner_delta.abs() > 0.0 {
+            let mut state = out.state;
+            state.offset.y = new_offset;
+            state.store(ui.ctx(), out.id);
+        }
+        let moved_target = target.translate(Vec2::new(0.0, -actual_inner_delta));
+        if prev_depth > 0 {
+            ui.ctx().data_mut(|d| d.insert_temp(target_key, Some(moved_target)));
+        } else {
+            ui.scroll_to_rect_animation(moved_target, None, egui::style::ScrollAnimation::none());
+        }
+        ui.ctx().request_repaint();
+    } else if let Some(prev) = prev_target {
+        ui.ctx().data_mut(|d| d.insert_temp(target_key, Some(prev)));
+    }
+    out
+}
+
 /// A ring around `response`'s widget while it has the keyboard's focus, `radius` its corners' (#277).
 pub(crate) fn focus_ring(ui: &egui::Ui, response: &egui::Response, radius: f32) {
     focus_ring_colored(ui, response, radius, FOCUS_RING());
@@ -4042,6 +4120,7 @@ pub(crate) fn focus_ring(ui: &egui::Ui, response: &egui::Response, radius: f32) 
 
 /// `focus_ring` painted in `color` (for example `SIDEBAR_FOCUS()` on the always-dark sidebar).
 pub(crate) fn focus_ring_colored(ui: &egui::Ui, response: &egui::Response, radius: f32, color: Color32) {
+    scroll_to_focused(ui, response);
     if response.has_focus() {
         let ring = response.rect.expand(2.0);
         ui.painter().rect_stroke(ring, CornerRadius::same((radius + 2.0) as u8), Stroke::new(2.0_f32, color), egui::StrokeKind::Outside);
@@ -4328,10 +4407,11 @@ fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32) {
     let edit_rect = egui::Rect::from_min_max(egui::pos2(rect.min.x + 34.0, rect.min.y), egui::pos2(rect.max.x - 8.0, rect.max.y));
     // A child of the field's own box, so the row's spacing after it stays what the row says
     let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(edit_rect));
-    inner.add_sized(
+    let resp = inner.add_sized(
         edit_rect.size(),
         egui::TextEdit::singleline(text).id(id).hint_text(hint).frame(false).vertical_align(Align::Center),
     );
+    scroll_to_focused(&inner, &resp);
 }
 
 /// An Activity row's identity, to keep it open across refreshes: the daemon's id, or without one what it says
@@ -11336,6 +11416,150 @@ mod tests {
         assert!(
             focus_rings(&h).iter().any(|r| r.contains_rect(rect)),
             "expected an unclipped focus ring around icon button Copy link ({rect:?})"
+        );
+    }
+
+    // #364: Tabbing to an off-screen focusable widget inside a ScrollArea scrolls it into view.
+    #[test]
+    fn tab_focus_scrolls_off_screen_widgets_into_view() {
+        // 1. Settings in a short window: controls further down start off-screen below the viewport
+        let mut h = Harness::settings(Some(vfs("virtual", true, None)), Some(true));
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
+        let app_before = node_rect(&h.nodes_named("App to block")[0]);
+        assert!(
+            app_before.bottom() > h.screen.y,
+            "App to block should start scrolled off-screen below {}, got {app_before:?}",
+            h.screen.y
+        );
+        let save_before = node_rect(&h.nodes_named("Save Preferences")[0]);
+        assert!(
+            save_before.bottom() > h.screen.y,
+            "Save Preferences should start scrolled off-screen below {}, got {save_before:?}",
+            h.screen.y
+        );
+
+        // Non-button control (TextEdit) scrolled off-screen becomes visible on Tab
+        tab_to(&mut h, "App to block");
+        let app_input = node_rect(&focused(&h).expect("App to block focused"));
+        assert!(
+            app_input.top() >= chrome::TOP_BAR_HEIGHT && app_input.bottom() <= h.screen.y,
+            "Tabbing to App to block should scroll it into [{}, {}], got {app_input:?}",
+            chrome::TOP_BAR_HEIGHT,
+            h.screen.y
+        );
+
+        // Clicking a visible top line of a partially off-screen multiline TextEdit does not jump it under the pointer
+        let ignore_rect = |h: &Harness| {
+            let (_, node) = accesskit_nodes(h)
+                .into_iter()
+                .find(|(_, n)| n.role() == egui::accesskit::Role::MultilineTextInput)
+                .expect("Ignore Patterns multiline TextEdit");
+            node_rect(&node)
+        };
+        let gutter = egui::pos2(h.screen.x - SECTION_MARGIN.rightf() - SCROLL_GUTTER.rightf() / 2.0, h.screen.y / 2.0);
+        for _ in 0..40 {
+            let r = ignore_rect(&h);
+            if r.top() >= chrome::TOP_BAR_HEIGHT + 20.0 && r.top() < h.screen.y - 30.0 && r.bottom() > h.screen.y {
+                break;
+            }
+            h.scroll(gutter, 30.0);
+        }
+        let ignore_before = ignore_rect(&h);
+        assert!(
+            ignore_before.top() >= chrome::TOP_BAR_HEIGHT
+                && ignore_before.top() < h.screen.y - 20.0
+                && ignore_before.bottom() > h.screen.y,
+            "expected Ignore Patterns to straddle bottom viewport edge {}, got {ignore_before:?}",
+            h.screen.y
+        );
+        h.click(egui::pos2(ignore_before.left() + 16.0, ignore_before.top() + 10.0));
+        let ignore_after_click = ignore_rect(&h);
+        assert!(
+            (ignore_after_click.top() - ignore_before.top()).abs() < 2.0,
+            "clicking top of partially visible multiline TextEdit should not jump page: before={ignore_before:?}, after={ignore_after_click:?}"
+        );
+
+        // Button at the bottom of Settings becomes visible on Tab with its focus ring unclipped
+        tab_to(&mut h, "Save Preferences");
+        let save_after = node_rect(&focused(&h).expect("Save Preferences focused"));
+        assert!(
+            save_after.top() >= chrome::TOP_BAR_HEIGHT && save_after.bottom() <= h.screen.y,
+            "Tabbing to Save Preferences should scroll it into [{}, {}], got {save_after:?}",
+            chrome::TOP_BAR_HEIGHT,
+            h.screen.y
+        );
+        assert!(
+            focus_rings(&h).iter().any(|r| r.contains_rect(save_after)),
+            "expected an unclipped focus ring around scrolled-into-view Save Preferences ({save_after:?})"
+        );
+
+        // Wrapping back up to a control at the top of Settings scrolls it back into view
+        let sign_out_before = node_rect(&h.nodes_named("Sign out")[0]);
+        assert!(
+            sign_out_before.top() < chrome::TOP_BAR_HEIGHT,
+            "Sign out should be scrolled off-screen above {} while at bottom, got {sign_out_before:?}",
+            chrome::TOP_BAR_HEIGHT
+        );
+        tab_to(&mut h, "Sign out");
+        let sign_out_after = node_rect(&focused(&h).expect("Sign out focused"));
+        assert!(
+            sign_out_after.top() >= chrome::TOP_BAR_HEIGHT && sign_out_after.bottom() <= h.screen.y,
+            "Tabbing back to a top Settings control should scroll it into [{}, {}], got {sign_out_after:?}",
+            chrome::TOP_BAR_HEIGHT,
+            h.screen.y
+        );
+        assert!(
+            focus_rings(&h).iter().any(|r| r.contains_rect(sign_out_after)),
+            "expected an unclipped focus ring around scrolled-into-view Sign out ({sign_out_after:?})"
+        );
+
+        // 2. Sidebar at high zoom in a short window: Settings nav item starts off-screen below the viewport
+        // and scrolls into view on Tab
+        let mut h = home_with(|s| s.account = Some(three_of_510()));
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 3.0);
+        let settings_before = node_rect(&h.nodes_named("Settings")[0]);
+        assert!(
+            settings_before.bottom() > h.screen.y,
+            "Sidebar Settings item should start off-screen below {} at 300% zoom, got {settings_before:?}",
+            h.screen.y
+        );
+        tab_to(&mut h, "Settings");
+        let settings_after = node_rect(&focused(&h).expect("Sidebar Settings focused"));
+        assert!(
+            settings_after.top() >= 0.0 && settings_after.bottom() <= h.screen.y,
+            "Tabbing to Sidebar Settings should scroll it into [0, {}], got {settings_after:?}",
+            h.screen.y
+        );
+        assert!(
+            focus_rings(&h).iter().any(|r| r.contains_rect(settings_after)),
+            "expected an unclipped focus ring around scrolled-into-view Sidebar Settings ({settings_after:?})"
+        );
+
+        // 3. Nested ScrollArea (Needs attention inside Home): Tabbing to a conflict button scrolled below both the
+        // inner attention list and the outer Home viewport scrolls both areas so the button and ring are visible
+        let mut h = home_with(|_| {});
+        let conflicts = (1..=6)
+            .map(|id| ConflictRecord { id, local_rel_path: format!("doc{id}.txt"), ..Default::default() })
+            .collect();
+        h.event(WorkerEvent::ConflictsLoaded(conflicts));
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
+        let last_before = node_rect(&h.nodes_named("Show doc6.txt in Files")[0]);
+        assert!(
+            last_before.bottom() > h.screen.y,
+            "last conflict button should start off-screen below {}, got {last_before:?}",
+            h.screen.y
+        );
+        tab_to(&mut h, "Show doc6.txt in Files");
+        let last_after = node_rect(&focused(&h).expect("Show doc6.txt in Files focused"));
+        assert!(
+            last_after.top() >= chrome::TOP_BAR_HEIGHT && last_after.bottom() <= h.screen.y,
+            "Tabbing to nested conflict button should scroll it into [{}, {}], got {last_after:?}",
+            chrome::TOP_BAR_HEIGHT,
+            h.screen.y
+        );
+        assert!(
+            focus_rings(&h).iter().any(|r| r.contains_rect(last_after)),
+            "expected an unclipped focus ring around scrolled-into-view nested conflict button ({last_after:?})"
         );
     }
 

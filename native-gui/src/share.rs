@@ -1056,14 +1056,17 @@ fn dialog_frame() -> Frame {
 
 /// `field` (a text field) with Proton's rounded corners (8 points) on its input colour.
 fn input_field(ui: &mut egui::Ui, field: impl FnOnce(&mut egui::Ui) -> egui::Response) -> egui::Response {
-    ui.scope(|ui| {
-        let widgets = &mut ui.visuals_mut().widgets;
-        for state in [&mut widgets.inactive, &mut widgets.hovered, &mut widgets.active, &mut widgets.open] {
-            state.corner_radius = CornerRadius::same(8);
-        }
-        field(ui)
-    })
-    .inner
+    let resp = ui
+        .scope(|ui| {
+            let widgets = &mut ui.visuals_mut().widgets;
+            for state in [&mut widgets.inactive, &mut widgets.hovered, &mut widgets.active, &mut widgets.open] {
+                state.corner_radius = CornerRadius::same(8);
+            }
+            field(ui)
+        })
+        .inner;
+    crate::scroll_to_focused(ui, &resp);
+    resp
 }
 
 fn section_title(ui: &mut egui::Ui, title: &str) {
@@ -1110,11 +1113,12 @@ fn role_choice(ui: &mut egui::Ui, id: impl std::hash::Hash, role: &mut Role, hei
             state.corner_radius = CornerRadius::same(8);
             state.expansion = 0.0;
         }
-        egui::ComboBox::from_id_salt(id).selected_text(role.label()).width(ROLE_WIDTH).show_ui(ui, |ui| {
+        let shown = egui::ComboBox::from_id_salt(id).selected_text(role.label()).width(ROLE_WIDTH).show_ui(ui, |ui| {
             for choice in [Role::Viewer, Role::Editor] {
                 ui.selectable_value(role, choice, choice.label());
             }
         });
+        crate::scroll_to_focused(ui, &shown.response);
     });
 }
 
@@ -1167,6 +1171,7 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
             let word = ui
                 .add(egui::Label::new(RichText::new(if on { "On" } else { "Off" }).size(13.0).color(TEXT_MUTED())).sense(Sense::click()))
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
+            crate::scroll_to_focused(ui, &word);
             if switch.clicked() || word.clicked() {
                 actions.push(if on { Action::AskLinkOff } else { Action::LinkOn });
             }
