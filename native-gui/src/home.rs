@@ -1187,14 +1187,20 @@ impl ProtonDriveNativeApp {
             ui.set_min_width(ui.available_width());
             ui.label(RichText::new("Your drive").font(crate::bold(13.0)).color(TEXT_MUTED()));
             ui.add_space(8.0);
+            let width_of = |ui: &egui::Ui, t: &RichText| {
+                let galley = egui::WidgetText::from(t.clone()).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
+                galley.size().x
+            };
             let shown = if sync_dir.is_empty() { "Not set up yet".to_string() } else { shown_folder(&sync_dir) };
             let kind = drive_kind(self.status.vfs.as_ref());
+            let name_text = RichText::new(&shown).font(crate::bold(14.0)).color(TEXT_PRIMARY());
+            let kind_text = RichText::new(kind).size(12.5).color(TEXT_MUTED());
             let name_and_kind = |ui: &mut egui::Ui| {
                 ui.horizontal(|ui| {
                     decoration(ui, icons::FOLDER, 18.0, TEXT_MUTED());
-                    elided(ui, RichText::new(&shown).font(crate::bold(14.0)).color(TEXT_PRIMARY()), &sync_dir);
+                    elided(ui, name_text.clone(), &sync_dir);
                 });
-                ui.label(RichText::new(kind).size(12.5).color(TEXT_MUTED()));
+                ui.label(kind_text.clone());
             };
             // Open in Files and the trash. Not before a folder is set up
             let open = |ui: &mut egui::Ui| {
@@ -1208,24 +1214,9 @@ impl ProtonDriveNativeApp {
                     open_in_browser(PROTON_DRIVE_TRASH_URL);
                 }
             };
-            if ui.available_width() < crate::settings::STACKED_BELOW {
-                // As under the status: the buttons go under the name when they would crowd it. The fixed width stands in
-                // for "the buttons fit beside the name" (#312 tracks stacking by the actual fit); a long name is
-                // shortened, whole on hover, rather than clipped
-                ui.vertical(name_and_kind);
-                if !sync_dir.is_empty() {
-                    ui.add_space(10.0);
-                    ui.horizontal_wrapped(|ui| {
-                        open(ui);
-                        ui.add_space(4.0);
-                        trash(ui);
-                    });
-                }
-            } else if sync_dir.is_empty() {
+            if sync_dir.is_empty() {
                 ui.vertical(name_and_kind);
             } else {
-                // Lay out left to right so Tab and screen-reader order matches visual order: drive name -> Open in
-                // Files -> Trash (#311).
                 let item_gap = ui.spacing().item_spacing.x;
                 let buttons_w = crate::action_button_width(ui, Some(icons::FOLDER_OPEN), crate::chrome::OPEN_IN_FILES)
                     + item_gap
@@ -1233,20 +1224,36 @@ impl ProtonDriveNativeApp {
                     + crate::action_button_width(ui, Some(icons::TRASH), TRASH_BUTTON);
                 let gap = 8.0;
                 let text_w = (ui.available_width() - buttons_w - gap - item_gap).max(0.0);
-                ui.horizontal(|ui| {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(text_w, ui.available_height()),
-                        Layout::top_down(Align::Min),
-                        |ui| {
-                            ui.set_min_width(text_w);
-                            name_and_kind(ui);
-                        },
-                    );
-                    ui.add_space(gap);
-                    open(ui);
-                    ui.add_space(4.0);
-                    trash(ui);
-                });
+                let icon_w = ui.painter().layout_no_wrap(icons::FOLDER.to_owned(), icons::font(18.0), TEXT_MUTED()).size().x;
+                let name_need = (icon_w + item_gap + width_of(ui, &name_text)).max(width_of(ui, &kind_text));
+                // Stack when the unshortened path (or kind line) plus the buttons don't fit side by side (#312); a
+                // path too long even for the full card width is still shortened, whole on hover, rather than clipped.
+                if name_need + 1.0 > text_w {
+                    ui.vertical(name_and_kind);
+                    ui.add_space(10.0);
+                    ui.horizontal_wrapped(|ui| {
+                        open(ui);
+                        ui.add_space(4.0);
+                        trash(ui);
+                    });
+                } else {
+                    // Lay out left to right so Tab and screen-reader order matches visual order: drive name -> Open in
+                    // Files -> Trash (#311).
+                    ui.horizontal(|ui| {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(text_w, ui.available_height()),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.set_min_width(text_w);
+                                name_and_kind(ui);
+                            },
+                        );
+                        ui.add_space(gap);
+                        open(ui);
+                        ui.add_space(4.0);
+                        trash(ui);
+                    });
+                }
             }
 
             if let (Some(line), Some(hover), Some(st)) =
@@ -1258,10 +1265,6 @@ impl ProtonDriveNativeApp {
                 let label = RichText::new("Proton storage").size(13.0).color(TEXT_PRIMARY());
                 let value = RichText::new(&line).size(13.0).color(TEXT_MUTED());
                 // Side by side when they fit, else the line wraps under the label rather than clipping
-                let width_of = |ui: &egui::Ui, t: &RichText| {
-                    let galley = egui::WidgetText::from(t.clone()).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
-                    galley.size().x
-                };
                 let fits = width_of(ui, &label) + width_of(ui, &value) + 16.0 <= ui.available_width();
                 if fits {
                     ui.horizontal(|ui| {
