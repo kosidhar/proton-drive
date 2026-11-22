@@ -3270,17 +3270,14 @@ impl ProtonDriveNativeApp {
 
             // On is what the user chose (the daemon's virtualDriveWanted); without FUSE the drive is a plain folder anyway
             let on = self.status.virtual_drive_wanted.unwrap_or(vfs.mode == "virtual");
-            let clicked = ui
-                .add_enabled_ui(!self.drive_working && switch_wait_reason(vfs).is_none(), |ui| {
-                    settings::switch_row(
-                        ui,
-                        "Show online-only files in Files (virtual drive)",
-                        None,
-                        Some("Files you haven't downloaded appear in Files and download when you open them."),
-                        on,
-                    )
-                })
-                .inner;
+            let clicked = settings::switch_row_if(
+                ui,
+                !self.drive_working && switch_wait_reason(vfs).is_none(),
+                "Show online-only files in Files (virtual drive)",
+                None,
+                Some("Files you haven't downloaded appear in Files and download when you open them."),
+                on,
+            );
             // Why the drive is a plain folder although the switch is on (switched off is the user's own choice)
             if on && matches!(vfs.reason.as_deref(), Some("fuse-unavailable" | "different-disk")) {
                 ui.add_space(6.0);
@@ -10565,6 +10562,36 @@ mod tests {
         assert!(h.text_at(EXPLAINED).is_some(), "a click shows it");
         h.click(egui::pos2(SIDEBAR_EDGE + 8.0, h.screen.y - 8.0));
         assert!(h.text_at(EXPLAINED).is_none(), "a click elsewhere closes it");
+    }
+
+    // #289: while a row's control waits (greyed out), its ⓘ can still be reached with the Tab key and shows its words.
+    #[test]
+    fn a_greyed_out_rows_info_is_reached_with_the_tab_key() {
+        for (case, vfs_state, working) in [
+            ("moving", vfs("virtual", false, Some("moving")), false),
+            ("starting", vfs("virtual", false, Some("starting")), false),
+            ("drive_working", vfs("virtual", true, None), true),
+        ] {
+            let mut h = settings_tall(Some(vfs_state), Some(true));
+            h.app.drive_working = working;
+            h.frames(2);
+
+            let switch_node = h
+                .nodes_named(SWITCH)
+                .into_iter()
+                .find(|n| n.role() == egui::accesskit::Role::CheckBox)
+                .unwrap_or_else(|| panic!("{case}: virtual drive checkbox node"));
+            assert!(switch_node.is_disabled(), "{case}: switch is disabled while waiting");
+
+            assert!(h.text_at(DRIVE_EXPLAINED).is_none(), "{case}: hidden before focus");
+            tab_to(&mut h, DRIVE_EXPLAINED);
+            assert!(h.text_at(DRIVE_EXPLAINED).is_some(), "{case}: focused ⓘ shows its words");
+            let info = info_after(&h, SWITCH);
+            assert!(
+                focus_rings(&h).iter().any(|r| r.contains(info)),
+                "{case}: focused ⓘ paints a focus ring"
+            );
+        }
     }
 
     #[test]

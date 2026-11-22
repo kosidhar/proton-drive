@@ -58,12 +58,12 @@ pub(crate) fn setting_row(
     info: Option<&str>,
     control: impl FnOnce(&mut egui::Ui) -> egui::Response,
 ) -> egui::Response {
-    row(ui, label, RowLabel::Words, hint, info, control)
+    row(ui, true, label, RowLabel::Words, hint, info, control)
 }
 
 /// `setting_row` for a name typed as code, an app's process name, which its label shows in monospace.
 pub(crate) fn code_row(ui: &mut egui::Ui, name: &str, control: impl FnOnce(&mut egui::Ui) -> egui::Response) -> egui::Response {
-    row(ui, name, RowLabel::Code, None, None, control)
+    row(ui, true, name, RowLabel::Code, None, None, control)
 }
 
 /// What a row's label is.
@@ -87,9 +87,11 @@ impl RowLabel {
     }
 }
 
-/// `setting_row`, with its label as `kind` says.
+/// `setting_row`, with its label as `kind` says. When `!enabled`, the control and its label are greyed out while any
+/// ⓘ stays enabled so keyboard users can still Tab to it and read its explanation (#289).
 fn row(
     ui: &mut egui::Ui,
+    enabled: bool,
     label: &str,
     kind: RowLabel,
     hint: Option<&str>,
@@ -100,9 +102,9 @@ fn row(
     if width < STACKED_BELOW {
         return ui
             .vertical(|ui| {
-                let label = label_column(ui, label, kind, hint, info);
+                let label = label_column(ui, enabled, label, kind, hint, info);
                 ui.add_space(STACKED_GAP);
-                let control = control(ui);
+                let control = ui.add_enabled_ui(enabled, control).inner;
                 name_control(ui, &control, &label, info);
                 label
             })
@@ -122,7 +124,7 @@ fn row(
         ui.set_min_size(Vec2::new(width, row_h));
         let control = ui.scope(|ui| {
             ui.set_max_width(control_room);
-            control(ui)
+            ui.add_enabled_ui(enabled, control).inner
         });
         let control_rect = control.response.rect;
         ui.add_space(CONTROL_GAP);
@@ -139,7 +141,7 @@ fn row(
         );
         let label = ui
             .scope_builder(egui::UiBuilder::new().max_rect(column).layout(Layout::top_down(Align::Min)), |ui| {
-                label_column(ui, label, kind, hint, info)
+                label_column(ui, enabled, label, kind, hint, info)
             })
             .inner;
         name_control(ui, &control.inner, &label, info);
@@ -178,7 +180,14 @@ fn info_room(ui: &egui::Ui, info: Option<&str>) -> f32 {
 }
 
 /// A setting's label, cut to the room there is with its ⓘ after it, over its hint. The label's response.
-fn label_column(ui: &mut egui::Ui, label: &str, kind: RowLabel, hint: Option<&str>, info: Option<&str>) -> egui::Response {
+fn label_column(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    label: &str,
+    kind: RowLabel,
+    hint: Option<&str>,
+    info: Option<&str>,
+) -> egui::Response {
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = HINT_GAP;
         let label = ui
@@ -188,11 +197,15 @@ fn label_column(ui: &mut egui::Ui, label: &str, kind: RowLabel, hint: Option<&st
                 let label = ui
                     .scope(|ui| {
                         ui.set_max_width(room);
-                        let label = egui::Label::new(text).truncate();
-                        // A switch's label takes clicks, but not the keyboard's focus
-                        ui.add(if kind == RowLabel::Switch { label.sense(Sense::CLICK) } else { label })
+                        ui.add_enabled_ui(enabled, |ui| {
+                            let label = egui::Label::new(text).truncate();
+                            // A switch's label takes clicks, but not the keyboard's focus
+                            ui.add(if kind == RowLabel::Switch { label.sense(Sense::CLICK) } else { label })
+                        })
+                        .inner
                     })
                     .inner;
+                // Keep ⓘ outside the row's disabled scope so keyboard users can still reach it with Tab (#289)
                 if let Some(info) = info {
                     info_glyph(ui, info);
                 }
@@ -201,7 +214,7 @@ fn label_column(ui: &mut egui::Ui, label: &str, kind: RowLabel, hint: Option<&st
             .inner;
         if let Some(hint) = hint {
             let text = RichText::new(hint).font(FontId::proportional(HINT_SIZE)).color(TEXT_MUTED());
-            ui.add(egui::Label::new(text).truncate());
+            ui.add_enabled_ui(enabled, |ui| ui.add(egui::Label::new(text).truncate()));
         }
         label
     })
@@ -211,20 +224,32 @@ fn label_column(ui: &mut egui::Ui, label: &str, kind: RowLabel, hint: Option<&st
 /// A setting that is on or off: `setting_row` with a switch, which a click on the label flips too. Whether either was
 /// clicked: the caller flips the setting.
 pub(crate) fn switch_row(ui: &mut egui::Ui, label: &str, hint: Option<&str>, info: Option<&str>, on: bool) -> bool {
+    switch_row_if(ui, true, label, hint, info, on)
+}
+
+/// `switch_row`, greyed out unless `enabled` while keeping its ⓘ reachable with the keyboard (#289).
+pub(crate) fn switch_row_if(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    label: &str,
+    hint: Option<&str>,
+    info: Option<&str>,
+    on: bool,
+) -> bool {
     let mut switch = None;
-    let label_response = row(ui, label, RowLabel::Switch, hint, info, |ui| {
+    let label_response = row(ui, enabled, label, RowLabel::Switch, hint, info, |ui| {
         let response = toggle_switch(ui, on);
         switch = Some(response.clone());
         response
     });
-    if label_response.hovered() && ui.is_enabled() {
+    let active = enabled && ui.is_enabled();
+    if label_response.hovered() && active {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let switch = switch.expect("setting_row lays out its control");
     // Named by its label for screen readers, and on or off
-    let enabled = ui.is_enabled();
-    switch.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, on, label));
-    switch.clicked() || label_response.clicked()
+    switch.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, active, on, label));
+    (switch.clicked() || label_response.clicked()) && active
 }
 
 /// A Settings card's heading, in bold, with the ⓘ after it when there is more to say (`info`, on hover or a click),
