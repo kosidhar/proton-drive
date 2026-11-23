@@ -402,8 +402,20 @@ impl ProtonDriveNativeApp {
         }
         crate::click_shield(ctx, "account_menu_shield", egui::Order::Foreground, None);
         let screen = ctx.screen_rect();
-        // The menu's right edge lines up with the account's, which ends at the top bar's margin
-        let anchor = egui::pos2(screen.right() - f32::from(TOP_BAR_MARGIN_RIGHT), screen.top() + TOP_BAR_HEIGHT + 4.0);
+        let frame = home::menu_frame();
+        let frame_margin = frame.total_margin();
+        const MENU_EDGE_GAP: f32 = 8.0;
+        let top = screen.top() + TOP_BAR_HEIGHT + 4.0;
+        let max_menu_height = (screen.bottom() - top - MENU_EDGE_GAP - frame_margin.sum().y).max(40.0);
+        // Line up the menu's right edge with the account button when there is room; at high zoom clamp the right
+        // margin and width so the framed card stays inside the viewport (#365).
+        let right_margin = f32::from(TOP_BAR_MARGIN_RIGHT).min(
+            (screen.width() - ACCOUNT_MENU_WIDTH - frame_margin.sum().x - MENU_EDGE_GAP).max(MENU_EDGE_GAP),
+        );
+        let anchor = egui::pos2(screen.right() - right_margin, top);
+        let menu_width = ACCOUNT_MENU_WIDTH.min(
+            (anchor.x - screen.left() - MENU_EDGE_GAP - frame_margin.sum().x).max(120.0),
+        );
         let account = self.status.account.clone();
         let mut picked = None;
         // Above its shield, in the order above it, as Pause's choices are: the shield moves to the top of its own order
@@ -413,23 +425,34 @@ impl ProtonDriveNativeApp {
             .fixed_pos(anchor)
             .pivot(egui::Align2::RIGHT_TOP)
             .show(ctx, |ui| {
-                home::menu_frame().show(ui, |ui| {
-                    ui.set_width(ACCOUNT_MENU_WIDTH);
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    Frame::NONE.inner_margin(Margin::symmetric(10, 8)).show(ui, |ui| {
-                        account_menu_header(ui, &shown, account.as_ref());
-                        if let Some(storage) = home::storage(account.as_ref()) {
-                            ui.add_space(12.0);
-                            account_menu_storage(ui, &storage);
-                        }
-                    });
-                    ui.separator();
-                    if home::menu_item(ui, Some(icons::WEB), home::OPEN_WEB, ACCOUNT_MENU_WIDTH).clicked() {
-                        picked = Some(AccountAction::OpenWeb);
-                    }
-                    if home::menu_item(ui, Some(icons::SIGN_OUT), SIGN_OUT, ACCOUNT_MENU_WIDTH).clicked() {
-                        picked = Some(AccountAction::SignOut);
-                    }
+                frame.show(ui, |ui| {
+                    ui.set_width(menu_width);
+                    egui::ScrollArea::vertical()
+                        .id_salt("account_menu_scroll")
+                        .max_width(menu_width)
+                        .max_height(max_menu_height)
+                        // As high as it may be at once, not only as high as last frame's Area was: auto_shrink still
+                        // shrinks it to what it holds, so zooming back out or loading storage expands cleanly (#365).
+                        .min_scrolled_height(max_menu_height)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.set_width(menu_width);
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            Frame::NONE.inner_margin(Margin::symmetric(10, 8)).show(ui, |ui| {
+                                account_menu_header(ui, &shown, account.as_ref());
+                                if let Some(storage) = home::storage(account.as_ref()) {
+                                    ui.add_space(12.0);
+                                    account_menu_storage(ui, &storage);
+                                }
+                            });
+                            ui.separator();
+                            if home::menu_item(ui, Some(icons::WEB), home::OPEN_WEB, menu_width).clicked() {
+                                picked = Some(AccountAction::OpenWeb);
+                            }
+                            if home::menu_item(ui, Some(icons::SIGN_OUT), SIGN_OUT, menu_width).clicked() {
+                                picked = Some(AccountAction::SignOut);
+                            }
+                        });
                 });
             });
         // Read before ctx.input: egui's context lock isn't re-entrant
@@ -479,14 +502,25 @@ fn account_menu_header(ui: &mut egui::Ui, shown: &AccountShown, account: Option<
 
 /// The account menu's storage: "Proton storage", what is used of the quota, and a bar of it.
 fn account_menu_storage(ui: &mut egui::Ui, storage: &home::Storage) {
-    let row = ui
-        .horizontal(|ui| {
+    let font = FontId::proportional(12.5);
+    let heading_w = crate::text_width(ui.painter(), "Proton storage", &font);
+    let text_w = crate::text_width(ui.painter(), &storage.text, &font);
+    let row = if heading_w + 8.0 + text_w <= ui.available_width() {
+        ui.horizontal(|ui| {
             ui.label(RichText::new("Proton storage").size(12.5).color(TEXT_PRIMARY()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(RichText::new(&storage.text).size(12.5).color(TEXT_MUTED()));
             });
         })
-        .response;
+        .response
+    } else {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(RichText::new("Proton storage").size(12.5).color(TEXT_PRIMARY()));
+            ui.label(RichText::new(&storage.text).size(12.5).color(TEXT_MUTED()));
+        })
+        .response
+    };
     ui.add_space(6.0);
     let bar = home::usage_bar(ui, storage.fraction, PROTON_PURPLE, BORDER_SUBTLE());
     // How much of it is Drive's
