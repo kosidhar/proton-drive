@@ -18,7 +18,7 @@ use serde::Deserialize;
 use crate::home::{self, elided, primary_button, secondary_button};
 use crate::single_instance::PathProblem;
 use crate::{
-    action_button, action_button_sized, action_button_width, button_width, control_request_at, icon_button, icons,
+    action_button, action_button_named, action_button_sized, action_button_width, button_width, control_request_at, icon_button, icons,
     toggle_switch, ButtonKind, ProtonDriveNativeApp, WorkerCommand, BG_CARD, BG_CARD_ALT, BG_INPUT, BORDER_NORM,
     BORDER_SUBTLE, DANGER_TEXT, TEXT_MUTED, TEXT_PRIMARY,
 };
@@ -1231,14 +1231,17 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
             };
             ui.label(text.size(13.0).color(TEXT_PRIMARY()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if secondary_button(ui, "Remove", 28.0).clicked() {
+                if action_button_named(ui, ButtonKind::Secondary, None, "Remove", "Remove password", 28.0).clicked() {
                     actions.push(Action::RemovePassword);
                 }
-                if secondary_button(ui, "Change", 28.0).clicked() {
+                if action_button_named(ui, ButtonKind::Secondary, None, "Change", "Change password", 28.0).clicked() {
                     actions.push(Action::EditPassword);
                 }
                 let loading = w.password == PasswordView::Loading;
-                let show = ui.add_enabled_ui(!loading, |ui| secondary_button(ui, if shown { "Hide" } else { "Show" }, 28.0)).inner;
+                let (vis, acc) = if shown { ("Hide", "Hide password") } else { ("Show", "Show password") };
+                let show = ui
+                    .add_enabled_ui(!loading, |ui| action_button_named(ui, ButtonKind::Secondary, None, vis, acc, 28.0))
+                    .inner;
                 if show.clicked() {
                     actions.push(if shown { Action::HidePassword } else { Action::ShowPassword });
                 }
@@ -1272,10 +1275,10 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
                 field.request_focus();
             }
             let entered = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            if primary_button(ui, "Save", ROW_HEIGHT).clicked() || entered {
+            if action_button_named(ui, ButtonKind::Primary, None, "Save", "Save password", ROW_HEIGHT).clicked() || entered {
                 actions.push(Action::SavePassword);
             }
-            if secondary_button(ui, "Cancel", ROW_HEIGHT).clicked() {
+            if action_button_named(ui, ButtonKind::Secondary, None, "Cancel", "Cancel password", ROW_HEIGHT).clicked() {
                 actions.push(Action::CancelPassword);
             }
         });
@@ -1293,13 +1296,13 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
         ui.label(RichText::new(expiry).size(13.0).color(color));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if link.expires_at.is_some() {
-                if secondary_button(ui, "Remove", 28.0).clicked() {
+                if action_button_named(ui, ButtonKind::Secondary, None, "Remove", "Remove expiry", 28.0).clicked() {
                     actions.push(Action::RemoveExpiry);
                 }
-                if secondary_button(ui, "Change", 28.0).clicked() {
+                if action_button_named(ui, ButtonKind::Secondary, None, "Change", "Change expiry", 28.0).clicked() {
                     actions.push(Action::EditExpiry);
                 }
-            } else if secondary_button(ui, "Set date…", 28.0).clicked() {
+            } else if action_button_named(ui, ButtonKind::Secondary, None, "Set date…", "Set expiry date…", 28.0).clicked() {
                 actions.push(Action::EditExpiry);
             }
         });
@@ -1322,10 +1325,10 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
                 )
             });
             let entered = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            if primary_button(ui, "Set", ROW_HEIGHT).clicked() || entered {
+            if action_button_named(ui, ButtonKind::Primary, None, "Set", "Set expiry date", ROW_HEIGHT).clicked() || entered {
                 actions.push(Action::SaveExpiry);
             }
-            if secondary_button(ui, "Cancel", ROW_HEIGHT).clicked() {
+            if action_button_named(ui, ButtonKind::Secondary, None, "Cancel", "Cancel expiry", ROW_HEIGHT).clicked() {
                 actions.push(Action::CancelExpiry);
             }
         });
