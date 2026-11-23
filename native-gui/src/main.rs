@@ -3106,7 +3106,16 @@ impl ProtonDriveNativeApp {
                         ui.label(RichText::new(detail).size(12.5).color(TEXT_MUTED()));
 
                         ui.add_space(20.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.horizontal(|ui| {
+                            let buttons_w = button_width(ui, cancel) + 8.0 + ui.spacing().item_spacing.x + button_width(ui, button);
+                            let pad = (ui.available_width() - buttons_w).max(0.0);
+                            if pad > 0.0 {
+                                ui.add_space(pad);
+                            }
+                            if action_button(ui, ButtonKind::Secondary, None, cancel, 36.0).clicked() {
+                                self.pending_confirm = None;
+                            }
+                            ui.add_space(8.0);
                             // Deleting from Proton Drive or ending a share is red; switching the drive off loses nothing, so it stays purple
                             let kind = if matches!(confirm, PendingConfirm::DeleteMissing { .. } | PendingConfirm::StopSharing { .. }) {
                                 ButtonKind::Danger
@@ -3137,12 +3146,6 @@ impl ProtonDriveNativeApp {
                                         self.send_availability(action_path.clone(), action, keep_pinned);
                                     }
                                 }
-                                self.pending_confirm = None;
-                            }
-
-                            ui.add_space(8.0);
-
-                            if action_button(ui, ButtonKind::Secondary, None, cancel, 36.0).clicked() {
                                 self.pending_confirm = None;
                             }
                         });
@@ -3914,9 +3917,9 @@ fn click_shield(ctx: &egui::Context, id: &str, order: egui::Order, dim: Option<C
         .order(order)
         .fixed_pos(screen.min)
         .default_size(screen.size())
-        .sense(Sense::click())
+        .sense(Sense::CLICK)
         .show(ctx, |ui| {
-            let (rect, _) = ui.allocate_exact_size(screen.size(), Sense::click());
+            let (rect, _) = ui.allocate_exact_size(screen.size(), Sense::CLICK);
             if let Some(color) = dim {
                 ui.painter().rect_filled(rect, 0, color);
             }
@@ -4088,7 +4091,7 @@ pub(crate) fn action_button_width(ui: &egui::Ui, icon: Option<&str>, label: &str
 }
 
 /// The width and height of an icon-only button.
-const ICON_BUTTON_SIZE: f32 = 28.0;
+pub(crate) const ICON_BUTTON_SIZE: f32 = 28.0;
 
 /// An icon-only button, 28×28, with no fill until hovered. `label`, what a button with words would have said, is its
 /// tooltip and its name for screen readers.
@@ -4647,31 +4650,26 @@ fn render_transfer_line(ui: &mut egui::Ui, t: &ActiveTransfer) -> (egui::Rect, e
     ui.horizontal(|ui| {
         let badge = if t.direction == "upload" { "↑ Uploading" } else { "↓ Downloading" };
         ui.label(RichText::new(badge).size(12.5).strong().color(PROTON_PURPLE_TEXT()));
-        // Byte counts first (right to left) so the path gets what's left and never runs under them
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let counts_rect = ui
-                .label(
-                    RichText::new(format!("{} / {}", format_bytes(t.bytes_transferred), format_bytes(t.total_bytes)))
-                        .size(12.0)
-                        .color(TEXT_MUTED()),
-                )
-                .rect;
-            let path_rect = ui
-                .with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    let font = FontId::new(12.5, FontFamily::Proportional);
-                    let room = ui.available_width() - ui.spacing().item_spacing.x;
-                    let shown = truncate_middle_to_width(ui.painter(), &t.rel_path, &font, room);
-                    let resp = ui.label(RichText::new(&shown).size(12.5).color(TEXT_PRIMARY()));
-                    let rect = resp.rect;
-                    if shown != t.rel_path {
-                        resp.on_hover_text(&t.rel_path);
-                    }
-                    rect
-                })
-                .inner;
-            (path_rect, counts_rect)
-        })
-        .inner
+        let counts_text = format!("{} / {}", format_bytes(t.bytes_transferred), format_bytes(t.total_bytes));
+        let counts_font = FontId::proportional(12.0);
+        let counts_w = text_width(ui.painter(), &counts_text, &counts_font);
+        let gap = ui.spacing().item_spacing.x;
+        let path_room = (ui.available_width() - counts_w - gap).max(0.0);
+        let path_rect = ui
+            .allocate_ui_with_layout(Vec2::new(path_room, 0.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.set_min_width(path_room);
+                let font = FontId::new(12.5, FontFamily::Proportional);
+                let shown = truncate_middle_to_width(ui.painter(), &t.rel_path, &font, path_room);
+                let resp = ui.label(RichText::new(&shown).size(12.5).color(TEXT_PRIMARY()));
+                let rect = resp.rect;
+                if shown != t.rel_path {
+                    resp.on_hover_text(&t.rel_path);
+                }
+                rect
+            })
+            .inner;
+        let counts_rect = ui.label(RichText::new(counts_text).size(12.0).color(TEXT_MUTED())).rect;
+        (path_rect, counts_rect)
     })
     .inner
 }
@@ -8179,6 +8177,119 @@ mod tests {
                 "{layout} (signed out): screen-reader order should be Signed out -> Sign in, got {read:?}"
             );
         }
+    }
+
+    // #367: Settings wide rows & Account card, Share window rows/confirm, app confirm modal, and Home transfer lines
+    // lay out left to right so Tab and screen-reader reading order match visual left-to-right order.
+    #[test]
+    fn settings_share_confirm_and_transfer_rows_keep_left_to_right_order() {
+        let reading_order = |h: &Harness| -> Vec<String> {
+            let update = h.last.as_ref().and_then(|o| o.platform_output.accesskit_update.as_ref()).expect("accesskit");
+            let root = update.tree.as_ref().expect("accesskit tree").root;
+            let by_id: std::collections::HashMap<_, _> = update.nodes.iter().map(|(id, n)| (*id, n)).collect();
+            let mut out = Vec::new();
+            fn walk(
+                id: egui::accesskit::NodeId,
+                by_id: &std::collections::HashMap<egui::accesskit::NodeId, &egui::accesskit::Node>,
+                out: &mut Vec<String>,
+            ) {
+                let Some(node) = by_id.get(&id) else { return };
+                let s = says(node);
+                if !s.is_empty() {
+                    out.push(s);
+                }
+                for child in node.children() {
+                    walk(*child, by_id, out);
+                }
+            }
+            walk(root, &by_id, &mut out);
+            out
+        };
+        let idx = |list: &[String], needle: &str, ctx: &str| {
+            list.iter().position(|s| s == needle).unwrap_or_else(|| panic!("{ctx}: missing {needle:?} in {list:?}"))
+        };
+
+        // 1. Settings wide Account card + wide setting_row (ⓘ before switch)
+        let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        h.app.status.account = Some(gautam());
+        h.frames(3);
+        let read = reading_order(&h);
+        assert!(
+            idx(&read, "Gautam C", "settings account") < idx(&read, "Sign out", "settings account"),
+            "wide Account card should read name before Sign out: {read:?}"
+        );
+        let name_y = h.text_rect("Gautam C").expect("name rect").top();
+        let sign_out_rect = node_rect(&h.nodes_named("Sign out")[0]);
+        assert!(
+            name_y < sign_out_rect.center().y,
+            "wide Account card name ({name_y}) should align near avatar top, above Sign out center ({})",
+            sign_out_rect.center().y
+        );
+        let tabs: Vec<String> = tab_stops(&mut h).into_iter().map(|(_, s)| s).collect();
+        assert!(
+            idx(&tabs, DRIVE_INFO, "settings row") < idx(&tabs, "Show online-only files in Files (virtual drive)", "settings row"),
+            "wide setting_row Tab order should visit ⓘ before switch: {tabs:?}"
+        );
+
+        // 2. Share window: password/expiry buttons, invite row, people row, and share_confirm modal
+        let mut h = share_window(Some(share::ShareInfo {
+            link: Some(share_link(true, Some(home::now_ms() + 86_400_000))),
+            people: vec![share_person("alice@example.com", share::Role::Viewer, share::PersonState::Member)],
+        }));
+        let tabs: Vec<String> = tab_stops(&mut h).into_iter().map(|(_, s)| s).collect();
+        assert!(
+            idx(&tabs, "Show password", "share pwd") < idx(&tabs, "Change password", "share pwd")
+                && idx(&tabs, "Change password", "share pwd") < idx(&tabs, "Remove password", "share pwd"),
+            "Share password buttons should Tab left to right (Show -> Change -> Remove): {tabs:?}"
+        );
+        assert!(
+            idx(&tabs, "Change expiry", "share exp") < idx(&tabs, "Remove expiry", "share exp"),
+            "Share expiry buttons should Tab left to right (Change -> Remove): {tabs:?}"
+        );
+        assert!(
+            idx(&tabs, "Invite people", "share invite") < idx(&tabs, "Invite", "share invite"),
+            "Share invite row should Tab email before Invite: {tabs:?}"
+        );
+        let read = reading_order(&h);
+        assert!(
+            idx(&read, "alice@example.com", "share people") < idx(&read, "Remove alice@example.com", "share people"),
+            "Share people row should read email before Remove: {read:?}"
+        );
+        // Share confirm dialog: Cancel -> Stop sharing
+        window(&mut h).confirm = Some(share::Confirm::LinkOff);
+        h.frames(2);
+        let confirm_tabs: Vec<String> = tab_stops(&mut h).into_iter().map(|(_, s)| s).collect();
+        assert!(
+            idx(&confirm_tabs, "Cancel", "share confirm") < idx(&confirm_tabs, "Stop sharing", "share confirm"),
+            "Share confirm modal should Tab Cancel before Stop sharing: {confirm_tabs:?}"
+        );
+
+        // 3. App confirm modal: Cancel -> Start fresh
+        let mut h = home_with(|_| {});
+        h.app.pending_confirm = Some(PendingConfirm::StartFresh);
+        h.frames(2);
+        let modal_tabs: Vec<String> = tab_stops(&mut h).into_iter().map(|(_, s)| s).collect();
+        assert!(
+            idx(&modal_tabs, "Cancel", "app confirm") < idx(&modal_tabs, "Start fresh", "app confirm"),
+            "App confirm modal should Tab Cancel before Start fresh: {modal_tabs:?}"
+        );
+
+        // 4. Home transfer line: badge -> path -> byte counts
+        let h = home_with(|s| {
+            s.active_transfers = vec![ActiveTransfer {
+                id: "1".into(),
+                direction: "upload".into(),
+                rel_path: "Docs/big.zip".into(),
+                bytes_transferred: 1024 * 1024,
+                total_bytes: 2 * 1024 * 1024,
+            }];
+        });
+        let read = reading_order(&h);
+        assert!(
+            idx(&read, "↑ Uploading", "transfer") < idx(&read, "Docs/big.zip", "transfer")
+                && idx(&read, "Docs/big.zip", "transfer") < idx(&read, "1.0 MB / 2.0 MB", "transfer"),
+            "transfer line should read badge -> path -> counts: {read:?}"
+        );
     }
 
     #[test]
