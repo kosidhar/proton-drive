@@ -2947,11 +2947,7 @@ impl ProtonDriveNativeApp {
                 .inner_margin(Margin::symmetric(12, 8))
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    ui.label(
-                        RichText::new("↻ Working… this can take a while for large folders.")
-                            .size(12.5)
-                            .color(PROTON_PURPLE_TEXT()),
-                    );
+                    working_line(ui, "Working… this can take a while for large folders.");
                 });
         }
         let Some(text) = self.notice.clone() else {
@@ -2972,9 +2968,12 @@ impl ProtonDriveNativeApp {
                         Layout::left_to_right(Align::Center),
                         |ui| {
                             ui.set_min_width(text_w);
-                            ui.add(
+                            let notice = ui.add(
                                 egui::Label::new(RichText::new(&text).size(12.5).color(TEXT_PRIMARY())).wrap(),
                             );
+                            ui.ctx().accesskit_node_builder(notice.id, |node| {
+                                node.set_live(egui::accesskit::Live::Polite);
+                            });
                         },
                     );
                     if icon_button(ui, icons::REMOVE, "Dismiss").clicked() {
@@ -3336,9 +3335,7 @@ impl ProtonDriveNativeApp {
             }
             if self.drive_working {
                 ui.add_space(10.0);
-                ui.label(
-                    RichText::new("↻ Working… moving files can take a while.").size(12.5).color(PROTON_PURPLE_TEXT()),
-                );
+                working_line(ui, "Working… moving files can take a while.");
             }
             if let Some(error) = &self.drive_error {
                 ui.add_space(10.0);
@@ -4147,6 +4144,19 @@ pub(crate) fn decoration(ui: &mut egui::Ui, icon: &str, size: f32, color: Color3
     let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
     ui.painter().galley(rect.min, galley, color);
     response
+}
+
+/// A "Working…" progress banner line: paints a decorative Phosphor refresh glyph beside wrapped spoken text marked
+/// `Live::Polite`, so screen readers announce the status without reading a raw "↻" symbol aloud (#370).
+pub(crate) fn working_line(ui: &mut egui::Ui, text: &str) {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        decoration(ui, icons::REFRESH, 14.0, PROTON_PURPLE_TEXT());
+        let label = ui.add(egui::Label::new(RichText::new(text).size(12.5).color(PROTON_PURPLE_TEXT())).wrap());
+        ui.ctx().accesskit_node_builder(label.id, |node| {
+            node.set_live(egui::accesskit::Live::Polite);
+        });
+    });
 }
 
 /// The colours of the empty Shared page's picture, from one theme.
@@ -11868,6 +11878,66 @@ mod tests {
         let text_rect = notice_text[0].visual_bounding_rect();
         assert!(text_rect.right() < dismiss_rect.left(), "wrapped text {text_rect:?} stays left of Dismiss {dismiss_rect:?}");
         assert!(dismiss_rect.right() <= h.screen.x, "Dismiss {dismiss_rect:?} stays inside {:?}", h.screen);
+    }
+
+    // #370: dynamic notices expose Live::Polite, and "Working…" banners paint a decorative Phosphor glyph instead of
+    // embedding raw "↻" in the spoken label.
+    #[test]
+    fn notices_and_working_banners_use_live_polite_and_decorative_icons() {
+        use egui::accesskit::{Live, Role};
+        let label_node = |h: &Harness, text: &str| {
+            accesskit_nodes(h)
+                .into_iter()
+                .map(|(_, n)| n)
+                .find(|n| n.role() == Role::Label && n.value() == Some(text))
+                .unwrap_or_else(|| panic!("expected Label node with value {text:?}"))
+        };
+
+        // 1. Dynamic notice in render_notice exposes Live::Polite
+        let mut h = home_with(|_| {});
+        let msg = "Freed 12 MB on this computer.";
+        h.app.notice = Some(msg.into());
+        h.frames(3);
+        assert_eq!(label_node(&h, msg).live(), Some(Live::Polite));
+
+        // 2. Availability "Working…" banner in render_notice uses decorative Phosphor icon and Live::Polite
+        h.app.notice = None;
+        h.app.working.push(String::new());
+        h.frames(3);
+        let working_avail = "Working… this can take a while for large folders.";
+        assert!(h.texts(|t| t.galley.text().contains('↻')).is_empty(), "no raw ↻ painted in availability banner");
+        assert!(
+            accesskit_nodes(&h).iter().all(|(_, n)| !says(n).contains('↻')),
+            "no AccessKit node speaks raw ↻"
+        );
+        assert!(h.text_at(icons::REFRESH).is_some(), "decorative Phosphor icon painted");
+        assert!(
+            accesskit_nodes(&h).iter().all(|(_, n)| n.value() != Some(icons::REFRESH) && n.label() != Some(icons::REFRESH)),
+            "decorative icon is not exposed to AccessKit"
+        );
+        assert_eq!(label_node(&h, working_avail).live(), Some(Live::Polite));
+
+        // 3. Home's drive-progress "Working…" banner (render_drive_progress)
+        let mut h = home_with(|s| {
+            s.vfs = Some(VfsStatus {
+                reason: Some("ejected".into()),
+                ..vfs("virtual", false, None)
+            });
+        });
+        h.app.drive_working = true;
+        h.frames(3);
+        let working_drive = "Working… moving files can take a while.";
+        assert!(h.texts(|t| t.galley.text().contains('↻')).is_empty(), "no raw ↻ painted in Home drive progress");
+        assert!(h.text_at(icons::REFRESH).is_some(), "decorative Phosphor icon painted in Home drive progress");
+        assert_eq!(label_node(&h, working_drive).live(), Some(Live::Polite));
+
+        // 4. Settings' Drive card "Working…" banner (render_drive_card)
+        let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        h.app.drive_working = true;
+        h.frames(3);
+        assert!(h.texts(|t| t.galley.text().contains('↻')).is_empty(), "no raw ↻ painted in Settings drive card");
+        assert!(h.text_at(icons::REFRESH).is_some(), "decorative Phosphor icon painted in Settings drive card");
+        assert_eq!(label_node(&h, working_drive).live(), Some(Live::Polite));
     }
 
     // R19 5 and 2(c): the short Web and Trash say their whole phrase to screen readers, and Trash says on hover that it
