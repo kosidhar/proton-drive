@@ -976,19 +976,22 @@ impl ProtonDriveNativeApp {
             }
             ui.add_space(10.0);
             let attention = std::mem::take(&mut self.attention);
-            ScrollArea::vertical()
-                .id_salt("attention_scroll")
-                .max_height(ATTENTION_LIST_HEIGHT)
-                .min_scrolled_height(ATTENTION_LIST_HEIGHT)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
+            crate::show_nested_scroll(
+                ScrollArea::vertical()
+                    .id_salt("attention_scroll")
+                    .max_height(ATTENTION_LIST_HEIGHT)
+                    .min_scrolled_height(ATTENTION_LIST_HEIGHT)
+                    .auto_shrink([false, true]),
+                ui,
+                |ui| {
                     for (i, item) in attention.iter().enumerate() {
                         if i > 0 {
                             ui.add_space(8.0);
                         }
                         self.render_attention_item(ui, item);
                     }
-                });
+                },
+            );
             self.attention = attention;
         });
     }
