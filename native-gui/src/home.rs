@@ -1163,7 +1163,7 @@ impl ProtonDriveNativeApp {
     fn render_drive_progress(&self, ui: &mut egui::Ui) {
         if self.drive_working {
             ui.add_space(8.0);
-            ui.label(RichText::new("↻ Working… moving files can take a while.").size(12.5).color(PROTON_PURPLE_TEXT()));
+            crate::working_line(ui, "Working… moving files can take a while.");
         }
         if let Some(error) = &self.drive_error {
             ui.add_space(8.0);
