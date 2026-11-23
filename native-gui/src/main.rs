@@ -3210,13 +3210,21 @@ impl ProtonDriveNativeApp {
                         ui.disable();
                     }
                     let kind = if virtual_layout { ButtonKind::Primary } else { ButtonKind::Secondary };
+                    let keep_hint = "Nothing is deleted, on this computer or in Proton Drive";
                     let keep = action_button(ui, kind, Some(icons::ONLINE_ONLY), "Keep them online-only", 32.0);
-                    if keep.on_hover_text("Nothing is deleted, on this computer or in Proton Drive").clicked() {
+                    ui.ctx().accesskit_node_builder(keep.id, |node| {
+                        node.set_description(keep_hint);
+                    });
+                    if keep.on_hover_text(keep_hint).on_disabled_hover_text(keep_hint).clicked() {
                         chosen = Some(MissingChoice::KeepOnlineOnly);
                     }
                     ui.add_space(4.0);
+                    let delete_hint = "Asks first. While they are missing, nothing is deleted in Proton Drive.";
                     let delete = action_button(ui, ButtonKind::DangerLabel, Some(icons::TRASH), "Delete them from Proton Drive too", 32.0);
-                    if delete.on_hover_text("Asks first. While they are missing, nothing is deleted in Proton Drive.").clicked() {
+                    ui.ctx().accesskit_node_builder(delete.id, |node| {
+                        node.set_description(delete_hint);
+                    });
+                    if delete.on_hover_text(delete_hint).on_disabled_hover_text(delete_hint).clicked() {
                         chosen = Some(MissingChoice::DeleteInCloud);
                     }
                 });
@@ -3265,13 +3273,21 @@ impl ProtonDriveNativeApp {
                     if working {
                         ui.disable();
                     }
+                    let fresh_hint = "Asks first. The files on this computer stay, and upload to this account.";
                     let fresh = action_button(ui, ButtonKind::Primary, Some(icons::RESTART), "Start fresh with this account", 32.0);
-                    if fresh.on_hover_text("Asks first. The files on this computer stay, and upload to this account.").clicked() {
+                    ui.ctx().accesskit_node_builder(fresh.id, |node| {
+                        node.set_description(fresh_hint);
+                    });
+                    if fresh.on_hover_text(fresh_hint).on_disabled_hover_text(fresh_hint).clicked() {
                         start_fresh = true;
                     }
                     ui.add_space(4.0);
+                    let out_hint = "Then sign in to the account the files were synced with";
                     let out = action_button(ui, ButtonKind::Secondary, Some(icons::SIGN_OUT), "Sign out", 32.0);
-                    if out.on_hover_text("Then sign in to the account the files were synced with").clicked() {
+                    ui.ctx().accesskit_node_builder(out.id, |node| {
+                        node.set_description(out_hint);
+                    });
+                    if out.on_hover_text(out_hint).on_disabled_hover_text(out_hint).clicked() {
                         sign_out = true;
                     }
                 });
@@ -3449,12 +3465,12 @@ impl ProtonDriveNativeApp {
                             for action in &mv.actions {
                                 let Some(label) = move_action_label(action) else { continue };
                                 // Going on is the main way out; moving back is the other
-                                let (kind, icon) = match action.as_str() {
-                                    "move-back" => (ButtonKind::Secondary, icons::MOVE_BACK),
-                                    "finish" => (ButtonKind::Primary, icons::CHECK),
-                                    _ => (ButtonKind::Primary, icons::REFRESH),
+                                let (kind, icon, accessible) = match action.as_str() {
+                                    "move-back" => (ButtonKind::Secondary, icons::MOVE_BACK, label),
+                                    "finish" => (ButtonKind::Primary, icons::CHECK, label),
+                                    _ => (ButtonKind::Primary, icons::REFRESH, "Try moving files again"),
                                 };
-                                if action_button(ui, kind, Some(icon), label, 32.0).clicked() {
+                                if action_button_named(ui, kind, Some(icon), label, accessible, 32.0).clicked() {
                                     chosen = Some(action.clone());
                                 }
                                 ui.add_space(4.0);
@@ -4054,12 +4070,7 @@ fn button_with_focus(
 
 /// `action_button`, greyed out and deaf to clicks unless `enabled`, in a room of exactly its size: in a row that wraps,
 /// it goes to the next line whole when it doesn't fit, where egui's `add_enabled_ui` would take the rest of the line
-/// and run past its end.
-fn action_button_if(ui: &mut egui::Ui, enabled: bool, kind: ButtonKind, icon: Option<&str>, label: &str, height: f32) -> egui::Response {
-    action_button_if_named(ui, enabled, kind, icon, label, label, height)
-}
-
-/// `action_button_if` named `name` for screen readers rather than by its label.
+/// and run past its end, named `name` for screen readers rather than by its label.
 pub(crate) fn action_button_if_named(
     ui: &mut egui::Ui,
     enabled: bool,
@@ -7436,18 +7447,18 @@ mod tests {
             vec![held_file("a.txt", true), held_file("b.txt", false), held_file("c.txt", true), held_file("d.txt", true)],
         );
 
-        let collapsed = h.nodes_named("Show them");
+        let collapsed = h.nodes_named("Show 4 unfinished files");
         assert_eq!(collapsed.len(), 1);
         assert_eq!(collapsed[0].role(), egui::accesskit::Role::Button);
         assert_eq!(collapsed[0].is_expanded(), Some(false));
 
         h.click(h.text_at("Show them").unwrap());
         // Even on the click frame itself, the AccessKit label and expanded state agree with the shown rows
-        let on_click = h.nodes_named("Hide them");
+        let on_click = h.nodes_named("Hide 4 unfinished files");
         assert_eq!(on_click.len(), 1);
         assert_eq!(on_click[0].is_expanded(), Some(true));
         h.frames(1);
-        let expanded = h.nodes_named("Hide them");
+        let expanded = h.nodes_named("Hide 4 unfinished files");
         assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0].role(), egui::accesskit::Role::Button);
         assert_eq!(expanded[0].is_expanded(), Some(true));
@@ -7455,13 +7466,109 @@ mod tests {
         assert_eq!(h.nodes_named("Upload b.txt anyway").len(), 1);
 
         h.click(h.text_at("Hide them").unwrap());
-        let on_collapse = h.nodes_named("Show them");
+        let on_collapse = h.nodes_named("Show 4 unfinished files");
         assert_eq!(on_collapse.len(), 1);
         assert_eq!(on_collapse[0].is_expanded(), Some(false));
         h.frames(1);
-        let collapsed_again = h.nodes_named("Show them");
+        let collapsed_again = h.nodes_named("Show 4 unfinished files");
         assert_eq!(collapsed_again.len(), 1);
         assert_eq!(collapsed_again[0].is_expanded(), Some(false));
+    }
+
+    // #356: Needs attention buttons expose hover explanations as AccessKit descriptions, disambiguate same-basename
+    // conflicts/cut-short files with their relative path, and give bulk/retry buttons contextual AccessKit names.
+    #[test]
+    fn needs_attention_descriptions_disambiguate_same_basenames_and_bulk_actions() {
+        use egui::accesskit::Role;
+
+        // 1. AccessKit descriptions on Conflict choices, Files missing, and Account mismatch buttons
+        let mut h = home_with(|s| {
+            s.files_missing = Some(FilesMissing {
+                root: "/home/u/ProtonDrive".into(),
+                names: vec!["Docs".into()],
+                items: 1,
+                message: "Files missing".into(),
+            });
+            s.account_mismatch = Some(AccountMismatch {
+                message: "Records belong to another account.".into(),
+            });
+        });
+        h.event(WorkerEvent::ConflictsLoaded(vec![ConflictRecord {
+            id: 1,
+            local_rel_path: "docs/solo.pdf".into(),
+            ..Default::default()
+        }]));
+        for (name, expected_desc) in [
+            ("Keep Both for solo.pdf", home::CONFLICT_CHOICES[0].hint),
+            ("Keep Local for solo.pdf", home::CONFLICT_CHOICES[1].hint),
+            ("Keep Remote for solo.pdf", home::CONFLICT_CHOICES[2].hint),
+            ("Keep them online-only", "Nothing is deleted, on this computer or in Proton Drive"),
+            ("Delete them from Proton Drive too", "Asks first. While they are missing, nothing is deleted in Proton Drive."),
+            ("Start fresh with this account", "Asks first. The files on this computer stay, and upload to this account."),
+            ("Sign out", "Then sign in to the account the files were synced with"),
+        ] {
+            let found = h.nodes_named(name);
+            assert_eq!(found.len(), 1, "expected one button named {name:?}");
+            assert_eq!(found[0].role(), Role::Button);
+            assert_eq!(found[0].description(), Some(expected_desc), "description on {name:?}");
+        }
+
+        // 2. Same-basename conflicts and cut-short files disambiguate with their relative paths
+        let mut h = home_with(|_| {});
+        h.event(WorkerEvent::ConflictsLoaded(vec![
+            ConflictRecord { id: 1, local_rel_path: "docs/report.pdf".into(), ..Default::default() },
+            ConflictRecord { id: 2, local_rel_path: "archive/report.pdf".into(), ..Default::default() },
+        ]));
+        load_held(&mut h, vec![held_file("notes/todo.txt", true), held_file("work/todo.txt", true)]);
+        assert!(h.text_at("Changed here and in Proton Drive: docs/report.pdf").is_some());
+        assert!(h.text_at("Changed here and in Proton Drive: archive/report.pdf").is_some());
+        for expected in [
+            "Show docs/report.pdf in Files",
+            "Keep Both for docs/report.pdf",
+            "Show archive/report.pdf in Files",
+            "Keep Both for archive/report.pdf",
+            "Upload this version of notes/todo.txt",
+            "Put back the Proton Drive version of notes/todo.txt",
+            "Upload this version of work/todo.txt",
+            "Put back the Proton Drive version of work/todo.txt",
+        ] {
+            assert_eq!(h.nodes_named(expected).len(), 1, "expected disambiguated button {expected:?}");
+        }
+        for colliding in ["Keep Both for report.pdf", "Upload this version of todo.txt"] {
+            assert!(h.nodes_named(colliding).is_empty(), "bare basename button {colliding:?} should be disambiguated");
+        }
+
+        // 3. Bulk summary buttons and stopped-move Try again carry contextual AccessKit names
+        let mut h = home_with(|s| {
+            s.vfs = Some(VfsStatus {
+                reason: Some("move-failed".into()),
+                drive_move: Some(DriveMove {
+                    kind: "relocation".into(),
+                    from: "/a".into(),
+                    to: "/b".into(),
+                    error: Some("Disk busy".into()),
+                    actions: vec!["retry".into(), "move-back".into()],
+                }),
+                ..vfs("virtual", false, None)
+            });
+        });
+        load_held(
+            &mut h,
+            vec![held_file("a.txt", true), held_file("b.txt", false), held_file("c.txt", true), held_file("d.txt", true)],
+        );
+        for expected in [
+            "Upload all 4 unfinished files anyway",
+            "Put back Proton Drive versions of unfinished files",
+            "Show 4 unfinished files",
+            "Try moving files again",
+        ] {
+            let found = h.nodes_named(expected);
+            assert_eq!(found.len(), 1, "expected contextual button {expected:?}");
+            assert_eq!(found[0].role(), Role::Button);
+        }
+        for generic in ["Upload all anyway", "Put back all", "Show them", "Hide them", "Try again"] {
+            assert!(h.nodes_named(generic).is_empty(), "generic button {generic:?} should carry context");
+        }
     }
 
     #[test]
