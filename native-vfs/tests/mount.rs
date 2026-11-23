@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -132,7 +132,7 @@ struct FakeDaemon {
 
 impl FakeDaemon {
     fn start(socket: &Path, backing: &Path, fake: Fake) -> FakeDaemon {
-        let listener = UnixListener::bind(socket).unwrap();
+        let listener = UnixListener::bind(socket).unwrap_or_else(|e| panic!("bind {}: {e}", socket.display()));
         let calls = Arc::new(Calls::default());
         let stop = Arc::new(AtomicBool::new(false));
         let (backing, fake, counted, stopping) = (backing.to_path_buf(), Arc::new(fake), calls.clone(), stop.clone());
@@ -432,6 +432,22 @@ fn fusermount(args: &[&str], mountpoint: &Path) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Linux's `sockaddr_un.sun_path` holds 108 bytes including the trailing NUL, so a bound Unix socket path must fit in
+/// 107 bytes.
+const MAX_UNIX_SOCKET_PATH: usize = 107;
+
+/// Picks a bindable Unix socket path for one test harness. Uses `root/control.sock` when it fits within Linux's
+/// `sun_path` limit; otherwise falls back to a short private directory under `/tmp` so a long `TMPDIR` never makes
+/// `UnixListener::bind` panic (#249). Returns `(socket_path, fallback_dir_to_clean_up)`.
+fn socket_path_for(root: &Path, pid: u32, id: usize) -> (PathBuf, Option<PathBuf>) {
+    let in_root = root.join("control.sock");
+    if in_root.as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH {
+        return (in_root, None);
+    }
+    let dir = PathBuf::from(format!("/tmp/pdvfs-{pid}-{id}"));
+    (dir.join("c.sock"), Some(dir))
+}
+
 /// One test's temp dirs, fake daemon and mounted helper. Dropping it unmounts (lazily if it must), reaps the helper
 /// and removes the temp dirs, but never while anything is still mounted there.
 struct Harness {
@@ -439,6 +455,7 @@ struct Harness {
     mountpoint: PathBuf,
     backing: PathBuf,
     socket: PathBuf,
+    socket_dir: Option<PathBuf>,
     daemon: Option<FakeDaemon>,
     helper: Option<Child>,
 }
@@ -446,13 +463,19 @@ struct Harness {
 impl Harness {
     fn new() -> Harness {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let root = std::env::temp_dir()
-            .join(format!("protondrive-vfs-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
+        let pid = std::process::id();
+        let id = NEXT.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!("protondrive-vfs-test-{pid}-{id}"));
         let _ = std::fs::remove_dir_all(&root);
         let (mountpoint, backing) = (root.join("mnt"), root.join("backing"));
         std::fs::create_dir_all(&mountpoint).unwrap();
         std::fs::create_dir_all(&backing).unwrap();
-        Harness { socket: root.join("control.sock"), root, mountpoint, backing, daemon: None, helper: None }
+        let (socket, socket_dir) = socket_path_for(&root, pid, id);
+        if let Some(dir) = &socket_dir {
+            let _ = std::fs::remove_dir_all(dir);
+            std::fs::DirBuilder::new().mode(0o700).create(dir).unwrap();
+        }
+        Harness { root, mountpoint, backing, socket, socket_dir, daemon: None, helper: None }
     }
 
     fn start_daemon(&mut self, children: HashMap<&str, Vec<Value>>) {
@@ -540,6 +563,9 @@ impl Drop for Harness {
             let _ = helper.wait();
         }
         self.daemon = None;
+        if let Some(dir) = &self.socket_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
         if !mounted(&self.mountpoint) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
@@ -1888,4 +1914,32 @@ fn an_append_posts_a_close_that_isnt_replacing() {
     assert_eq!(h.daemon().closes(), [closed("log.txt"), closed("online.txt")]);
     assert_eq!(std::fs::read(h.backing.join("log.txt")).unwrap(), b"one\nmore\n");
     assert_eq!(std::fs::read(h.backing.join("online.txt")).unwrap(), [FIXTURE, b"more\n"].concat());
+}
+
+// #249: a long TMPDIR must not make binding the fake daemon's Unix socket panic
+#[test]
+fn a_long_tmpdir_falls_back_to_a_short_bindable_socket_path() {
+    let short_root = PathBuf::from("/tmp/protondrive-vfs-test-1-0");
+    let (sock, fallback) = socket_path_for(&short_root, 1, 0);
+    assert_eq!(sock, short_root.join("control.sock"));
+    assert_eq!(fallback, None);
+
+    // Exactly at the 107-byte limit stays in root; one byte over falls back
+    let suffix = "/control.sock";
+    let exact_dir = format!("/tmp/{}", "a".repeat(MAX_UNIX_SOCKET_PATH - 5 - suffix.len()));
+    let exact_root = PathBuf::from(&exact_dir);
+    assert_eq!(exact_root.join("control.sock").as_os_str().as_bytes().len(), MAX_UNIX_SOCKET_PATH);
+    assert_eq!(socket_path_for(&exact_root, 1, 0).1, None);
+
+    let over_root = PathBuf::from(format!("{exact_dir}a"));
+    assert_eq!(over_root.join("control.sock").as_os_str().as_bytes().len(), MAX_UNIX_SOCKET_PATH + 1);
+    let pid = std::process::id();
+    let (sock, fallback) = socket_path_for(&over_root, pid, 999_999);
+    let dir = fallback.expect("long root must fall back to a short directory");
+    assert!(sock.as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH, "{}", sock.display());
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let listener = UnixListener::bind(&sock).expect("fallback socket path must be bindable");
+    drop(listener);
+    let _ = std::fs::remove_dir_all(&dir);
 }
