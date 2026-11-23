@@ -1118,7 +1118,7 @@ fn role_choice(ui: &mut egui::Ui, id: impl std::hash::Hash, role: &mut Role, hei
                 ui.selectable_value(role, choice, choice.label());
             }
         });
-        crate::scroll_to_focused(ui, &shown.response);
+        crate::focus_ring(ui, &shown.response, 8.0);
     });
 }
 
@@ -1167,11 +1167,10 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
         section_title(ui, "Link");
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let switch = toggle_switch(ui, on);
-            // The word beside the switch flips it too
+            // The word beside the switch flips it on click, without creating a duplicate Tab stop (#360)
             let word = ui
-                .add(egui::Label::new(RichText::new(if on { "On" } else { "Off" }).size(13.0).color(TEXT_MUTED())).sense(Sense::click()))
+                .add(egui::Label::new(RichText::new(if on { "On" } else { "Off" }).size(13.0).color(TEXT_MUTED())).sense(Sense::CLICK))
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
-            crate::scroll_to_focused(ui, &word);
             if switch.clicked() || word.clicked() {
                 actions.push(if on { Action::AskLinkOff } else { Action::LinkOn });
             }

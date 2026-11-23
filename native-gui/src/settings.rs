@@ -302,6 +302,7 @@ pub(crate) fn picker<R>(
         let room = width - 2.0 * ui.spacing().button_padding.x - ui.spacing().icon_width - ui.spacing().icon_spacing;
         let font = egui::TextStyle::Button.resolve(ui.style());
         let mut shown = shown.inner;
+        focus_ring(ui, &shown.response, 8.0);
         if text_width(ui.painter(), selected, &font) > room {
             shown.response = shown.response.on_hover_text(selected);
         }
