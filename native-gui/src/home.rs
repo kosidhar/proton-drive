@@ -8,7 +8,7 @@ use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, Ri
 
 use crate::icons;
 use crate::{
-    action_button, action_button_if, action_button_if_named, action_button_named, card_frame, decoration, drive_status_line, files_safe_hint,
+    action_button, action_button_if_named, action_button_named, card_frame, decoration, drive_status_line, files_safe_hint,
     format_bytes, offers_mount_again, render_transfer_line, shown_folder, spawn_reaped, AccountInfo, ButtonKind,
     ConflictRecord, CutShortItem, DaemonStatus, ProtonDriveNativeApp, VfsStatus, WorkerCommand, BG_CARD_ALT,
     BORDER_SUBTLE, DANGER_TEXT, PROTON_PURPLE, PROTON_PURPLE_TEXT, SCREENSHOT_MODE, SUCCESS_TEXT, TEXT_MUTED, TEXT_PRIMARY,
@@ -348,8 +348,48 @@ fn file_name(rel_path: &str) -> &str {
 
 /// What happened to a conflict's file, by its name (its path is in the tooltip). Unresolved conflicts only exist under
 /// the "ask me" strategy: the daemon queued the file for the user and kept nothing twice yet.
+#[cfg(test)]
 pub fn conflict_title(rel_path: &str) -> String {
-    format!("Changed here and in Proton Drive: {}", file_name(rel_path))
+    conflict_title_for(file_name(rel_path))
+}
+
+fn conflict_title_for(display_name: &str) -> String {
+    format!("Changed here and in Proton Drive: {display_name}")
+}
+
+/// Basenames that appear under more than one relative path in Needs attention, so rows and button names
+/// disambiguate them with their relative path instead of colliding on the bare file name (#356).
+fn colliding_basenames<'a>(attention: &'a [Attention]) -> std::collections::HashSet<&'a str> {
+    let mut seen: std::collections::HashMap<&'a str, &'a str> = std::collections::HashMap::new();
+    let mut dupes = std::collections::HashSet::new();
+    let mut visit = |path: &'a str| {
+        let name = file_name(path);
+        if let Some(&prev) = seen.get(name) {
+            if prev != path {
+                dupes.insert(name);
+            }
+        } else {
+            seen.insert(name, path);
+        }
+    };
+    for item in attention {
+        match item {
+            Attention::Conflict { rel_path, .. } => visit(rel_path),
+            Attention::CutShort(cs) => visit(&cs.rel_path),
+            Attention::CutShortMany { items, .. } => {
+                for cs in items.iter().take(CUT_SHORT_EXPANDED_SHOWN) {
+                    visit(&cs.rel_path);
+                }
+            }
+            _ => {}
+        }
+    }
+    dupes
+}
+
+fn attention_display_name<'a>(rel_path: &'a str, colliding: &std::collections::HashSet<&str>) -> &'a str {
+    let name = file_name(rel_path);
+    if colliding.contains(name) { rel_path } else { name }
 }
 
 /// One way to resolve a conflict: what it asks the daemon for, its button and what its hover text says it does.
@@ -979,6 +1019,7 @@ impl ProtonDriveNativeApp {
             }
             ui.add_space(10.0);
             let attention = std::mem::take(&mut self.attention);
+            let colliding = colliding_basenames(&attention);
             crate::show_nested_scroll(
                 ScrollArea::vertical()
                     .id_salt("attention_scroll")
@@ -991,7 +1032,7 @@ impl ProtonDriveNativeApp {
                         if i > 0 {
                             ui.add_space(8.0);
                         }
-                        self.render_attention_item(ui, item);
+                        self.render_attention_item(ui, item, &colliding);
                     }
                 },
             );
@@ -999,14 +1040,14 @@ impl ProtonDriveNativeApp {
         });
     }
 
-    fn render_attention_item(&mut self, ui: &mut egui::Ui, item: &Attention) {
+    fn render_attention_item(&mut self, ui: &mut egui::Ui, item: &Attention, colliding: &std::collections::HashSet<&str>) {
         match item {
             Attention::AccountMismatch => self.render_account_mismatch(ui),
             Attention::FilesMissing => self.render_files_missing(ui),
             Attention::Conflict { id, rel_path } => {
                 attention_row(ui, |ui| {
-                    let name = file_name(rel_path);
-                    elided(ui, RichText::new(conflict_title(rel_path)).size(13.5).strong().color(TEXT_PRIMARY()), rel_path);
+                    let name = attention_display_name(rel_path, colliding);
+                    elided(ui, RichText::new(conflict_title_for(name)).size(13.5).strong().color(TEXT_PRIMARY()), rel_path);
                     ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
                         let show_name = format!("Show {name} in Files");
@@ -1020,6 +1061,9 @@ impl ProtonDriveNativeApp {
                             let kind = if i == 0 { ButtonKind::Primary } else { ButtonKind::Secondary };
                             let button_name = format!("{} for {name}", c.label);
                             let button = action_button_if_named(ui, online, kind, Some(c.icon), c.label, &button_name, 30.0);
+                            ui.ctx().accesskit_node_builder(button.id, |node| {
+                                node.set_description(c.hint);
+                            });
                             if button.on_hover_text(c.hint).on_disabled_hover_text(c.hint).clicked() {
                                 let _ = self.tx.send(WorkerCommand::ResolveConflict { id: *id, choice: c.choice.to_string() });
                             }
@@ -1027,8 +1071,8 @@ impl ProtonDriveNativeApp {
                     });
                 });
             }
-            Attention::CutShort(item) => attention_row(ui, |ui| self.render_cut_short(ui, item)),
-            Attention::CutShortMany { count, items } => self.render_cut_short_many(ui, *count, items),
+            Attention::CutShort(item) => attention_row(ui, |ui| self.render_cut_short(ui, item, colliding)),
+            Attention::CutShortMany { count, items } => self.render_cut_short_many(ui, *count, items, colliding),
             Attention::DriveNotMounted { message, can_mount } => {
                 attention_row(ui, |ui| {
                     ui.add(egui::Label::new(RichText::new(message).size(13.5).strong().color(TEXT_PRIMARY())).wrap());
@@ -1076,8 +1120,8 @@ impl ProtonDriveNativeApp {
 
     /// One held file: what happened to it, what Proton Drive has of it, and what can be done. The buttons wait for the
     /// daemon, as the conflict row's do.
-    fn render_cut_short(&mut self, ui: &mut egui::Ui, item: &CutShortItem) {
-        let name = file_name(&item.rel_path);
+    fn render_cut_short(&mut self, ui: &mut egui::Ui, item: &CutShortItem, colliding: &std::collections::HashSet<&str>) {
+        let name = attention_display_name(&item.rel_path, colliding);
         let (bold_part, rest) = cut_short_title(name);
         // Wrapped, as the summary row is: a long name never hides why it is held
         ui.add(egui::Label::new(cut_short_line(&bold_part, rest)).wrap()).on_hover_text(&item.rel_path);
@@ -1108,7 +1152,13 @@ impl ProtonDriveNativeApp {
     }
 
     /// Many held files: one row for all of them, which Show them opens into one row each.
-    fn render_cut_short_many(&mut self, ui: &mut egui::Ui, count: usize, items: &[CutShortItem]) {
+    fn render_cut_short_many(
+        &mut self,
+        ui: &mut egui::Ui,
+        count: usize,
+        items: &[CutShortItem],
+        colliding: &std::collections::HashSet<&str>,
+    ) {
         attention_row(ui, |ui| {
             let (bold_part, rest) = cut_short_summary(count);
             ui.add(egui::Label::new(cut_short_line(&bold_part, rest)).wrap());
@@ -1116,12 +1166,32 @@ impl ProtonDriveNativeApp {
             // The bulk buttons act on the list, which may not have arrived yet
             let online = self.daemon_online && !items.is_empty();
             ui.horizontal_wrapped(|ui| {
-                if action_button_if(ui, online, ButtonKind::Secondary, Some(icons::KEEP_LOCAL), "Upload all anyway", 30.0).clicked() {
+                let upload_all_name = format!("Upload all {count} unfinished files anyway");
+                if action_button_if_named(
+                    ui,
+                    online,
+                    ButtonKind::Secondary,
+                    Some(icons::KEEP_LOCAL),
+                    "Upload all anyway",
+                    &upload_all_name,
+                    30.0,
+                )
+                .clicked()
+                {
                     self.resolve_cut_short(items.iter().map(|i| i.rel_path.clone()).collect(), false);
                 }
                 if items.is_empty() || offers_put_back(items) {
                     ui.add_space(8.0);
-                    let clicked = action_button_if(ui, online, ButtonKind::Secondary, Some(icons::KEEP_REMOTE), "Put back all", 30.0).clicked();
+                    let clicked = action_button_if_named(
+                        ui,
+                        online,
+                        ButtonKind::Secondary,
+                        Some(icons::KEEP_REMOTE),
+                        "Put back all",
+                        "Put back Proton Drive versions of unfinished files",
+                        30.0,
+                    )
+                    .clicked();
                     if clicked {
                         // A new file has no Proton Drive version: the daemon refuses a batch that names one
                         self.resolve_cut_short(items.iter().filter(|i| i.existing).map(|i| i.rel_path.clone()).collect(), true);
@@ -1129,14 +1199,24 @@ impl ProtonDriveNativeApp {
                 }
                 ui.add_space(8.0);
                 let label = if self.cut_short_expanded { "Hide them" } else { "Show them" };
-                let toggle = action_button_if(ui, true, ButtonKind::Secondary, None, label, 30.0);
+                let toggle_name = if self.cut_short_expanded {
+                    format!("Hide {count} unfinished files")
+                } else {
+                    format!("Show {count} unfinished files")
+                };
+                let toggle = action_button_if_named(ui, true, ButtonKind::Secondary, None, label, &toggle_name, 30.0);
                 if toggle.clicked() {
                     self.cut_short_expanded = !self.cut_short_expanded;
                     ui.ctx().request_repaint();
                 }
                 let expanded = self.cut_short_expanded;
+                let spoken = if expanded {
+                    format!("Hide {count} unfinished files")
+                } else {
+                    format!("Show {count} unfinished files")
+                };
                 ui.ctx().accesskit_node_builder(toggle.id, |node| {
-                    node.set_label(if expanded { "Hide them" } else { "Show them" });
+                    node.set_label(spoken);
                     node.set_expanded(expanded);
                 });
             });
@@ -1144,7 +1224,7 @@ impl ProtonDriveNativeApp {
         if self.cut_short_expanded {
             for item in items.iter().take(CUT_SHORT_EXPANDED_SHOWN) {
                 ui.add_space(8.0);
-                attention_row(ui, |ui| self.render_cut_short(ui, item));
+                attention_row(ui, |ui| self.render_cut_short(ui, item, colliding));
             }
             if let Some(more) = more_cut_short(items.len()) {
                 ui.add_space(8.0);
