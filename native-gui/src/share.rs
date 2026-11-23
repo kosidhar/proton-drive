@@ -1054,8 +1054,8 @@ fn dialog_frame() -> Frame {
         .inner_margin(Margin::symmetric(22, 18))
 }
 
-/// `field` (a text field) with Proton's rounded corners (8 points) on its input colour.
-fn input_field(ui: &mut egui::Ui, field: impl FnOnce(&mut egui::Ui) -> egui::Response) -> egui::Response {
+/// `field` (a text field) with Proton's rounded corners (8 points) on its input colour and an AccessKit `label` (#372).
+fn input_field(ui: &mut egui::Ui, label: &str, field: impl FnOnce(&mut egui::Ui) -> egui::Response) -> egui::Response {
     let resp = ui
         .scope(|ui| {
             let widgets = &mut ui.visuals_mut().widgets;
@@ -1065,6 +1065,9 @@ fn input_field(ui: &mut egui::Ui, field: impl FnOnce(&mut egui::Ui) -> egui::Res
             field(ui)
         })
         .inner;
+    ui.ctx().accesskit_node_builder(resp.id, |node| {
+        node.set_label(label);
+    });
     crate::scroll_to_focused(ui, &resp);
     resp
 }
@@ -1260,7 +1263,7 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
         ui.horizontal(|ui| {
             field_label(ui, "");
             let buttons = button_width(ui, "Save") + button_width(ui, "Cancel") + 2.0 * ui.spacing().item_spacing.x;
-            let field = input_field(ui, |ui| {
+            let field = input_field(ui, "New password", |ui| {
                 ui.add_sized(
                     [(ui.available_width() - buttons).max(100.0), ROW_HEIGHT],
                     egui::TextEdit::singleline(typed).password(true).hint_text("New password").vertical_align(Align::Center),
@@ -1313,7 +1316,7 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
         });
         ui.horizontal(|ui| {
             field_label(ui, "");
-            let field = input_field(ui, |ui| {
+            let field = input_field(ui, "Expiry date", |ui| {
                 ui.add_sized(
                     [118.0, ROW_HEIGHT],
                     egui::TextEdit::singleline(date).hint_text("YYYY-MM-DD").vertical_align(Align::Center),
@@ -1342,7 +1345,7 @@ fn invite_section(w: &mut ShareWindow, ui: &mut egui::Ui, actions: &mut Vec<Acti
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let invite = action_button(ui, ButtonKind::Primary, Some(icons::PEOPLE), "Invite", 32.0).clicked();
             role_choice(ui, "share_invite_role", &mut w.invite_role, 32.0);
-            let field = input_field(ui, |ui| {
+            let field = input_field(ui, "Invite people", |ui| {
                 ui.add_sized(
                     [ui.available_width().max(140.0), 32.0],
                     egui::TextEdit::singleline(&mut w.invite_input).hint_text("email@example.com, …").vertical_align(Align::Center),

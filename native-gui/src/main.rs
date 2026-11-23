@@ -4411,6 +4411,9 @@ fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32) {
         edit_rect.size(),
         egui::TextEdit::singleline(text).id(id).hint_text(hint).frame(false).vertical_align(Align::Center),
     );
+    inner.ctx().accesskit_node_builder(resp.id, |node| {
+        node.set_label(hint);
+    });
     scroll_to_focused(&inner, &resp);
 }
 
@@ -12943,6 +12946,44 @@ mod tests {
         h.click(remove);
         assert!(h.text_at("Remove sam@proton.me?").is_some(), "asks first, as before");
         assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    // #372: Activity search field and all Share window text inputs expose AccessKit names for screen readers.
+    #[test]
+    fn activity_search_and_share_text_inputs_have_accesskit_names() {
+        use egui::accesskit::Role;
+        let is_text_input = |role: Role| matches!(role, Role::TextInput | Role::PasswordInput);
+
+        // 1. Activity search field
+        let mut h = Harness::new();
+        h.app.open_tab(NavTab::Activity);
+        h.frames(3);
+        let activity_inputs: Vec<_> = accesskit_nodes(&h)
+            .into_iter()
+            .filter(|(_, n)| is_text_input(n.role()))
+            .collect();
+        assert_eq!(activity_inputs.len(), 1, "expected one text input on Activity");
+        assert_eq!(activity_inputs[0].1.label(), Some("Search activity"));
+
+        // 2. Share window text inputs: Invite people, New password, Expiry date
+        let mut h = share_window(Some(share::ShareInfo {
+            link: Some(share_link(false, None)),
+            people: Vec::new(),
+        }));
+        h.click(h.text_at("Set password").expect("Set password button"));
+        h.click(h.text_at("Set date…").expect("Set date… button"));
+        let share_labels: Vec<_> = accesskit_nodes(&h)
+            .into_iter()
+            .filter(|(_, n)| is_text_input(n.role()))
+            .map(|(_, n)| n.label().map(str::to_owned))
+            .collect();
+        assert_eq!(share_labels.len(), 3, "expected 3 text inputs in Share window, got {share_labels:?}");
+        for expected in ["New password", "Expiry date", "Invite people"] {
+            assert!(
+                share_labels.iter().any(|l| l.as_deref() == Some(expected)),
+                "missing Share text input labeled {expected:?}, got {share_labels:?}"
+            );
+        }
     }
 
     #[test]
