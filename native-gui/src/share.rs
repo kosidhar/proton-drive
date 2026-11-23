@@ -884,9 +884,14 @@ impl ProtonDriveNativeApp {
         if let Some(left) = self.share.take().and_then(ShareWindow::left_change) {
             self.share_left.push(left);
         }
-        // What was shared may have changed in the window: the Shared section reads it again (#253)
-        if was_open && self.tab == crate::NavTab::Shared {
-            self.load_shared();
+        // What was shared may have changed in the window: the Shared section reads it again (#253), or marks an
+        // in-flight read stale if closed off-page so returning to Shared starts a fresh read (#268)
+        if was_open {
+            if self.tab == crate::NavTab::Shared {
+                self.load_shared();
+            } else if self.shared.loading {
+                self.shared.stale = true;
+            }
         }
     }
 
@@ -920,6 +925,8 @@ impl ProtonDriveNativeApp {
         // The Shared section read the list when the window closed, perhaps before this change landed (#253)
         if self.tab == crate::NavTab::Shared {
             self.load_shared();
+        } else if self.shared.loading {
+            self.shared.stale = true;
         }
         if let Some(cmd) = self.share.as_mut().and_then(|w| w.changed_elsewhere(&left.rel_path)) {
             let _ = self.tx.send(cmd);
