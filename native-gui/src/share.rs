@@ -18,9 +18,9 @@ use serde::Deserialize;
 use crate::home::{self, elided, primary_button, secondary_button};
 use crate::single_instance::PathProblem;
 use crate::{
-    action_button, action_button_named, action_button_sized, action_button_width, button_width, control_request_at, icon_button, icons,
-    toggle_switch, ButtonKind, ProtonDriveNativeApp, WorkerCommand, BG_CARD, BG_CARD_ALT, BG_INPUT, BORDER_NORM,
-    BORDER_SUBTLE, DANGER_TEXT, TEXT_MUTED, TEXT_PRIMARY,
+    action_button, action_button_named, action_button_sized, action_button_width, button_width, control_request_with_timeout_message,
+    icon_button, icons, toggle_switch, ButtonKind, ProtonDriveNativeApp, WorkerCommand, BG_CARD, BG_CARD_ALT, BG_INPUT, BORDER_NORM,
+    BORDER_SUBTLE, DANGER_TEXT, STILL_WORKING, TEXT_MUTED, TEXT_PRIMARY,
 };
 
 /// A share's role, for the link and for each person.
@@ -94,6 +94,8 @@ pub const DAEMON_UNREACHABLE: &str = "Can't reach Proton Drive's background serv
 pub const SHARE_NEEDS_RESTART: &str = "Restart Proton Drive to share from here";
 /// Under an expired link, whose Copy link is off (Files' Copy Link refuses it too)
 pub const LINK_EXPIRED: &str = "This link has expired: set a new date, or remove the expiry, to use it again";
+/// Shown when GET /share/list hits its read timeout: the daemon aborts the listing once the app hangs up (#257, #270).
+pub const LIST_TIMED_OUT: &str = "Listing what you've shared took too long. Try again.";
 const UNREADABLE: &str = "Unreadable reply from the Proton Drive background service";
 /// As many addresses as the daemon takes in one invitation
 const MAX_INVITES: usize = 50;
@@ -268,15 +270,26 @@ fn query_value(text: &str) -> String {
 }
 
 /// One /share request on the control socket. A 400 comes back as the daemon words it, to show as is.
-fn share_request(
+pub(crate) fn share_request(
     socket: &Path,
     method: &str,
     path_and_query: &str,
     body: Option<&serde_json::Value>,
     read_timeout: Duration,
 ) -> Result<serde_json::Value, String> {
+    share_request_with_timeout_message(socket, method, path_and_query, body, read_timeout, STILL_WORKING)
+}
+
+fn share_request_with_timeout_message(
+    socket: &Path,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&serde_json::Value>,
+    read_timeout: Duration,
+    timeout_message: &str,
+) -> Result<serde_json::Value, String> {
     // A 404 is the daemon's catch-all for a route it doesn't have, with or without its {"error":"Not found"} body
-    control_request_at(socket, method, path_and_query, body, read_timeout).map_err(|e| {
+    control_request_with_timeout_message(socket, method, path_and_query, body, read_timeout, timeout_message).map_err(|e| {
         if e == "Not found" || e.ends_with("answered 404") {
             SHARE_NEEDS_RESTART.to_string()
         } else {
@@ -334,11 +347,15 @@ pub fn remove_person_at(socket: &Path, rel_path: &str, email: &str) -> Result<()
 /// Everything the account shares (GET /share/list). Read with the longer timeout: the listing grows with the number of
 /// shared items (#257).
 pub fn list_at(socket: &Path) -> Result<Vec<crate::shared::SharedItem>, String> {
+    list_at_with_timeout(socket, SHARE_WRITE_TIMEOUT)
+}
+
+pub(crate) fn list_at_with_timeout(socket: &Path, read_timeout: Duration) -> Result<Vec<crate::shared::SharedItem>, String> {
     #[derive(Deserialize)]
     struct Reply {
         items: Vec<crate::shared::SharedItem>,
     }
-    let reply = share_request(socket, "GET", "/share/list", None, SHARE_WRITE_TIMEOUT)?;
+    let reply = share_request_with_timeout_message(socket, "GET", "/share/list", None, read_timeout, LIST_TIMED_OUT)?;
     serde_json::from_value::<Reply>(reply).map(|r| r.items).map_err(|_| UNREADABLE.to_string())
 }
 

@@ -676,6 +676,19 @@ fn control_request_at(
     body: Option<&serde_json::Value>,
     read_timeout: Duration,
 ) -> Result<serde_json::Value, String> {
+    control_request_with_timeout_message(socket, method, path_and_query, body, read_timeout, STILL_WORKING)
+}
+
+/// Like `control_request_at`, with a route-specific message when the read times out (for instance `GET /share/list`,
+/// which the daemon aborts as soon as the app hangs up, #270).
+fn control_request_with_timeout_message(
+    socket: &std::path::Path,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&serde_json::Value>,
+    read_timeout: Duration,
+    timeout_message: &str,
+) -> Result<serde_json::Value, String> {
     use std::io::{Read, Write};
     const UNREACHABLE: &str = "Can't reach the Proton Drive background service";
     // Every request on the socket goes through here: a screenshot never calls it, so it can't change anything
@@ -702,7 +715,7 @@ fn control_request_at(
     // Connection: close ends the reply at EOF; Content-Length, when present, trims anything after the body
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).map_err(|e| match e.kind() {
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => STILL_WORKING.to_string(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => timeout_message.to_string(),
         _ => format!("{UNREACHABLE} ({e})"),
     })?;
     let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or("Malformed reply from the Proton Drive background service")?;
@@ -7008,6 +7021,36 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
         let (sock, server) = serve_once(b"HTTP/1.1 404 Not Found\r\n\r\n");
         assert_eq!(share::stop_sharing_at(&sock, "a", "u").unwrap_err(), share::SHARE_NEEDS_RESTART);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // #270: the daemon stops GET /share/list as soon as the app hangs up (#257), so a timeout says it took too long
+    // rather than claiming it is still running in the background; other routes keep STILL_WORKING
+    #[test]
+    fn list_at_timeout_says_it_took_too_long_not_still_working() {
+        let dir = private_dir("pd-gui-share-list-timeout");
+        let sock = dir.join("slow.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let mut conns = Vec::new();
+            for _ in 0..2 {
+                let (conn, _) = listener.accept().unwrap();
+                conns.push(conn);
+            }
+            let _ = done_rx.recv();
+            drop(conns);
+        });
+        let err = share::list_at_with_timeout(&sock, Duration::from_millis(50)).unwrap_err();
+        assert_eq!(err, share::LIST_TIMED_OUT);
+        assert!(!err.to_lowercase().contains("background"), "{err}");
+
+        // Other /share routes still report STILL_WORKING on a read timeout
+        let other = share::share_request(&sock, "GET", "/share/info?path=a.txt", None, Duration::from_millis(50)).unwrap_err();
+        assert_eq!(other, STILL_WORKING);
+        drop(done_tx);
         server.join().unwrap();
         let _ = std::fs::remove_file(&sock);
     }
