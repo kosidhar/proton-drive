@@ -13213,26 +13213,42 @@ mod tests {
     // Minor 2: an expired link can't be copied (Files refuses it too); it says why and what to do
     #[test]
     fn an_expired_link_cant_be_copied_and_says_why() {
+        let click_release = |h: &mut Harness, pos: egui::Pos2| {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            h.frame(vec![egui::Event::PointerMoved(pos)]);
+            h.frame(vec![button(true)]);
+            h.frame(vec![button(false)]);
+        };
+
         let yesterday = home::now_ms() - 86_400_000;
         let mut h = share_window(Some(share::ShareInfo { link: Some(share_link(false, Some(yesterday))), people: vec![] }));
         assert!(h.text_at(share::LINK_EXPIRED).is_some(), "says why");
         assert!(h.text_at("Anyone with the link can view.").is_none(), "no one can, now");
+        let copy_btn = h.nodes_named("Copy link").into_iter().next().expect("Copy link button");
+        assert!(copy_btn.is_disabled(), "Copy link is disabled while expired");
         let pos = h.text_at("Copy link").expect("Copy link, disabled");
-        h.click(pos);
+        // Press and release without extra frames so `h.last` is the release frame where CopyText would be emitted (#230)
+        click_release(&mut h, pos);
         let copied = h.last.as_ref().unwrap().platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(_)));
         assert!(!copied, "nothing on the clipboard");
-        assert!(h.text_at("Copied").is_none());
-        // A new date makes it copyable again (and an older link, with no expiry, still copies)
+        assert!(!window(&mut h).copied, "expired link click does not mark copied");
+
+        // Extending the expiry into the future makes it copyable again
         let next_week = home::now_ms() + 7 * 86_400_000;
         h.event(WorkerEvent::ShareLoaded(shown(&h), Ok(share::ShareInfo { link: Some(share_link(false, Some(next_week))), people: vec![] })));
         assert!(h.text_at(share::LINK_EXPIRED).is_none());
+        let copy_btn = h.nodes_named("Copy link").into_iter().next().expect("Copy link button");
+        assert!(!copy_btn.is_disabled(), "Copy link is enabled once renewed");
         let pos = h.text_at("Copy link").unwrap();
-        h.frame(vec![egui::Event::PointerMoved(pos)]);
-        let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
-        h.frame(vec![button(true)]);
-        h.frame(vec![button(false)]);
+        click_release(&mut h, pos);
         let copied = h.last.as_ref().unwrap().platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if t == LINK_URL));
-        assert!(copied);
+        assert!(copied, "renewed link copies to clipboard");
+        assert!(window(&mut h).copied, "renewed link click marks copied");
     }
 
     /// Clicks the field showing `hint`, types `text` into it and presses Enter.

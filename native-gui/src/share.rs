@@ -514,7 +514,7 @@ pub struct ShareWindow {
     pub invite_role: Role,
     pub confirm: Option<Confirm>,
     /// Copy link was clicked (its button says Copied until the next change)
-    copied: bool,
+    pub(crate) copied: bool,
     /// The password field just opened: it takes the keyboard
     focus_field: bool,
 }
