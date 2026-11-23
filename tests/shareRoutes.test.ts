@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
+import { NodeType } from '@protontech/drive-sdk';
 
-import { ListCancelled, ShareError, type ShareInfo, type ShareService } from '../src/daemon/shareService';
+import { createShareService, ListCancelled, ShareError, type ShareInfo, type ShareService } from '../src/daemon/shareService';
 import { shareRoute } from '../src/daemon/shareRoutes';
 
 const INFO: ShareInfo = { link: null, people: [] };
@@ -192,6 +193,51 @@ describe('share routes', () => {
         expect(given).toBe(req.signal);
         expect([res.status, await res.json()]).toEqual([400, { error: 'Cancelled' }]);
         expect(lines).toEqual([]);
+    });
+
+    test('GET /share/list includes kind for files and folders and omits it for missing nodes', async () => {
+        const nodes: any[] = [
+            { uid: 'f1', name: { ok: true, value: 'Makefile' }, type: NodeType.File },
+            { uid: 'd1', name: { ok: true, value: 'v1.2 notes' }, type: NodeType.Folder },
+            { missingUid: 'm1' },
+        ];
+        const service = createShareService({
+            sdk: {
+                async *iterateSharedNodeUids() {
+                    yield* ['f1', 'd1', 'm1'];
+                },
+                async *iterateNodes() {
+                    yield* nodes;
+                },
+                async getSharingInfo() {
+                    return { members: [], protonInvitations: [], nonProtonInvitations: [], editorsCanShare: false };
+                },
+                shareNode: async () => {
+                    throw new Error('unused');
+                },
+                unshareNode: async () => {
+                    throw new Error('unused');
+                },
+            } as never,
+            nodeFor: () => ({ refused: 'unused' }),
+            placeOf: (uid) =>
+                uid === 'f1'
+                    ? { relPath: 'Makefile', hidden: false }
+                    : uid === 'd1'
+                      ? { relPath: 'v1.2 notes', hidden: false }
+                      : null,
+            logActivity() {},
+            now: () => 1000,
+        });
+        const res = await go(service, 'GET', '/share/list');
+        expect(res.status).toBe(200);
+        const items = res.json.items as Array<Record<string, unknown>>;
+        expect(items.map((i) => ({ uid: i.uid, name: i.name, kind: i.kind }))).toEqual([
+            { uid: 'f1', name: 'Makefile', kind: 'file' },
+            { uid: 'd1', name: 'v1.2 notes', kind: 'folder' },
+            { uid: 'm1', name: 'An item', kind: undefined },
+        ]);
+        expect('kind' in items[2]).toBe(false);
     });
 
     test('a wrong method is 405, no service is 404, signed out is 400', async () => {

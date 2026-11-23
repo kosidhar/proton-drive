@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from 'bun:test';
 
 import { AbortError, ConnectionError, DecryptionError, ProtonDriveError, RateLimitedError, ServerError, ValidationError } from '@protontech/drive-sdk/errors';
+import { NodeType } from '@protontech/drive-sdk';
 import { ErrorCode } from '@protontech/drive-sdk/internal/apiService/errorCodes';
 import { APICodeError, APIHTTPError, NotFoundAPIError } from '@protontech/drive-sdk/internal/apiService/errors';
 import { BatchLoading } from '@protontech/drive-sdk/internal/batchLoading';
@@ -820,6 +821,52 @@ describe('list', () => {
         });
         const info = await setup(shared()).svc.info('a.txt');
         expect(await svc.list()).toEqual([{ uid: 'a', name: 'a.txt', relPath: 'docs/a.txt', where: 'my-files', link: info.link, people: 3 }]);
+    });
+
+    // #282: /share/list carries the node's type so the app doesn't have to guess from extensions
+    test('each loaded item carries kind for files and folders, and leaves it out when the node could not be loaded', async () => {
+        const loaded = [
+            node('f1', 'Makefile', { type: NodeType.File }),
+            node('f2', '.bashrc', { type: NodeType.File }),
+            node('d1', 'v1.2 notes', { type: NodeType.Folder }),
+            node('d2', 'photos.2026', { type: NodeType.Folder }),
+            node('d3', 'err.folder', { type: NodeType.Folder }),
+            node('a1', 'Summer', { type: NodeType.Album }),
+        ];
+        const all = [...loaded, { missingUid: 'm' }, node('u', 'unloaded', { type: NodeType.File })];
+        const { svc } = listSetup({
+            nodes: all,
+            sharing: { f1: shared(), f2: shared(), d1: shared(), a1: shared() },
+            fails: { d3: new Error('boom') },
+            places: {
+                f1: { relPath: 'Makefile', hidden: false },
+                f2: { relPath: '.bashrc', hidden: false },
+                d1: { relPath: 'v1.2 notes', hidden: false },
+                d2: { relPath: 'photos.2026', hidden: false },
+                d3: { relPath: 'err.folder', hidden: false },
+            },
+            async *iterateNodes(uids) {
+                if (uids.length > 1) {
+                    for (const n of [...loaded, { missingUid: 'm' }]) yield n;
+                    throw new Error('Some items could not be loaded');
+                }
+                throw new Error('parent key');
+            },
+        });
+        const items = await svc.list();
+        const byUid = Object.fromEntries(items.map((i) => [i.uid, i]));
+        expect(byUid.f1.kind).toBe('file');
+        expect(byUid.f2.kind).toBe('file');
+        expect(byUid.d1.kind).toBe('folder');
+        // Catching-up and failed-sharing items still carry kind because the node itself loaded
+        expect(byUid.d2.kind).toBe('folder');
+        expect(byUid.d2.unreadable).toBeDefined();
+        expect(byUid.d3.kind).toBe('folder');
+        expect(byUid.d3.unreadable).toBeDefined();
+        // Non-file/folder, missing, or unloaded nodes omit kind
+        expect('kind' in byUid.a1).toBe(false);
+        expect('kind' in byUid.m).toBe(false);
+        expect('kind' in byUid.u).toBe(false);
     });
 
     test('where each item is: my files, hidden, elsewhere, trashed, the My files folder itself', async () => {

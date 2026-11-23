@@ -15,6 +15,21 @@ pub enum Place {
     Elsewhere,
 }
 
+/// Whether a shared item is a file or a folder, as the daemon gives it (#282).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemKind {
+    File,
+    Folder,
+}
+
+fn deserialize_kind<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<ItemKind>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)?.as_str() {
+        Some("file") => Some(ItemKind::File),
+        Some("folder") => Some(ItemKind::Folder),
+        _ => None,
+    })
+}
+
 /// One row of the Shared page.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,6 +37,9 @@ pub struct SharedItem {
     /// The node uid the daemon listed: stopping sharing sends it, so it acts on this item and not on what is at its path later (#260)
     pub uid: String,
     pub name: String,
+    /// File or folder from the daemon; None when an older daemon didn't say or the node couldn't be loaded (#282)
+    #[serde(default, deserialize_with = "deserialize_kind")]
+    pub kind: Option<ItemKind>,
     /// Where it is in the Proton Drive folder; None for an item not on this computer
     pub rel_path: Option<String>,
     #[serde(rename = "where")]
@@ -92,7 +110,17 @@ pub fn sharing_marks(item: &SharedItem, now_ms: i64) -> Vec<&'static str> {
     marks
 }
 
-/// The icon before a name: the daemon doesn't say what is a folder, so a name without an extension is shown as one.
+/// The icon before an item's name: from the daemon's `kind` when given, falling back to the name only when an older
+/// daemon didn't say or the node couldn't be loaded (#282).
+pub fn item_icon(item: &SharedItem) -> &'static str {
+    match item.kind {
+        Some(ItemKind::File) => icons::FILE,
+        Some(ItemKind::Folder) => icons::FOLDER,
+        None => name_icon(&item.name),
+    }
+}
+
+/// Fallback icon when `kind` isn't given: a name without an extension is shown as a folder.
 pub fn name_icon(name: &str) -> &'static str {
     if std::path::Path::new(name).extension().is_some() {
         icons::FILE
@@ -168,9 +196,10 @@ pub fn fake_shared(state: &str, now_ms: i64) -> Option<Result<Vec<SharedItem>, S
         expires_at,
         role: Role::Viewer,
     };
-    let item = |name: &str, rel_path: Option<&str>, place, link, people| SharedItem {
+    let item = |name: &str, kind, rel_path: Option<&str>, place, link, people| SharedItem {
         uid: format!("fake~{name}"),
         name: name.into(),
+        kind: Some(kind),
         rel_path: rel_path.map(String::from),
         place,
         link,
@@ -179,14 +208,14 @@ pub fn fake_shared(state: &str, now_ms: i64) -> Option<Result<Vec<SharedItem>, S
     };
     Some(match state {
         "list" => {
-            let mut catching_up = item("Budget.xlsx", Some("Finance/Budget.xlsx"), Place::MyFiles, None, 1);
+            let mut catching_up = item("Budget.xlsx", ItemKind::File, Some("Finance/Budget.xlsx"), Place::MyFiles, None, 1);
             catching_up.unreadable = Some("Proton Drive is still catching up with this item: refresh in a moment".into());
             Ok(vec![
-                item("report.pdf", Some("Documents/report.pdf"), Place::MyFiles, Some(link(true, Some(now_ms + 7 * DAY))), 2),
-                item("Icons", Some("Icons"), Place::MyFiles, None, 2),
-                item("old-notes.txt", Some("Documents/old-notes.txt"), Place::MyFiles, Some(link(false, Some(now_ms - DAY))), 1),
-                item("Taxes", Some("Private/Taxes"), Place::Hidden, Some(link(false, None)), 0),
-                item("holiday.jpg", None, Place::Elsewhere, Some(link(false, None)), 0),
+                item("report.pdf", ItemKind::File, Some("Documents/report.pdf"), Place::MyFiles, Some(link(true, Some(now_ms + 7 * DAY))), 2),
+                item("Icons", ItemKind::Folder, Some("Icons"), Place::MyFiles, None, 2),
+                item("old-notes.txt", ItemKind::File, Some("Documents/old-notes.txt"), Place::MyFiles, Some(link(false, Some(now_ms - DAY))), 1),
+                item("Taxes", ItemKind::Folder, Some("Private/Taxes"), Place::Hidden, Some(link(false, None)), 0),
+                item("holiday.jpg", ItemKind::File, None, Place::Elsewhere, Some(link(false, None)), 0),
                 catching_up,
             ])
         }
@@ -214,25 +243,33 @@ mod tests {
     }
 
     fn item(name: &str, rel_path: Option<&str>, place: Place, link: Option<ShareLink>, people: u32) -> SharedItem {
-        SharedItem { uid: format!("vol~{name}"), name: name.into(), rel_path: rel_path.map(String::from), place, link, people, unreadable: None }
+        SharedItem { uid: format!("vol~{name}"), name: name.into(), kind: None, rel_path: rel_path.map(String::from), place, link, people, unreadable: None }
     }
 
     #[test]
     fn a_list_reply_is_read_each_kind_of_item() {
         let json = r#"{ "items": [
-            { "uid": "v~1", "name": "report.pdf", "relPath": "Documents/report.pdf", "where": "my-files",
+            { "uid": "v~1", "name": "report.pdf", "kind": "file", "relPath": "Documents/report.pdf", "where": "my-files",
               "link": { "url": "https://drive.proton.me/urls/A#a", "hasPassword": true, "expiresAt": 1800000000000, "role": "viewer" }, "people": 2 },
-            { "uid": "v~2", "name": "Secret", "relPath": "Secret", "where": "hidden", "link": null, "people": 1 },
+            { "uid": "v~2", "name": "Secret", "kind": "folder", "relPath": "Secret", "where": "hidden", "link": null, "people": 1 },
             { "uid": "v~3", "name": "holiday.jpg", "relPath": null, "where": "elsewhere", "link": null, "people": 0 },
-            { "uid": "v~4", "name": "x", "relPath": "x", "where": "my-files", "link": null, "people": 0, "unreadable": "Still catching up" }
+            { "uid": "v~4", "name": "x", "kind": "album", "relPath": "x", "where": "my-files", "link": null, "people": 0, "unreadable": "Still catching up" },
+            { "uid": "v~5", "name": "null-kind", "kind": null, "relPath": "null-kind", "where": "my-files", "link": null, "people": 0 },
+            { "uid": "v~6", "name": "weird-kind", "kind": 42, "relPath": "weird-kind", "where": "my-files", "link": null, "people": 0 }
         ] }"#;
         #[derive(Deserialize)]
         struct Reply {
             items: Vec<SharedItem>,
         }
         let items = serde_json::from_str::<Reply>(json).unwrap().items;
-        assert_eq!(items.len(), 4);
-        assert_eq!(items.iter().map(|i| i.uid.as_str()).collect::<Vec<_>>(), ["v~1", "v~2", "v~3", "v~4"]);
+        assert_eq!(items.len(), 6);
+        assert_eq!(items.iter().map(|i| i.uid.as_str()).collect::<Vec<_>>(), ["v~1", "v~2", "v~3", "v~4", "v~5", "v~6"]);
+        assert_eq!(items[0].kind, Some(ItemKind::File));
+        assert_eq!(items[1].kind, Some(ItemKind::Folder));
+        assert_eq!(items[2].kind, None);
+        assert_eq!(items[3].kind, None);
+        assert_eq!(items[4].kind, None);
+        assert_eq!(items[5].kind, None);
         assert_eq!(items[0].place, Place::MyFiles);
         assert_eq!(items[0].link.as_ref().unwrap().expires_at, Some(1_800_000_000_000));
         assert_eq!(items[1].place, Place::Hidden);
@@ -329,7 +366,7 @@ mod tests {
         assert_eq!(location_text(&i(None, Place::Elsewhere)), "Not on this computer");
     }
 
-    // The daemon doesn't say which items are folders: a name without an extension is shown as one
+    // Fallback when the daemon doesn't say which items are folders: a name without an extension is shown as one
     #[test]
     fn a_name_without_an_extension_is_shown_as_a_folder() {
         use crate::icons::{FILE, FOLDER};
@@ -337,6 +374,24 @@ mod tests {
         assert_eq!(name_icon("Tax returns 2026"), FOLDER);
         assert_eq!(name_icon("report.pdf"), FILE);
         assert_eq!(name_icon("archive.tar.gz"), FILE);
+    }
+
+    // #282: item_icon trusts the daemon's kind and falls back to the name only when kind is absent
+    #[test]
+    fn item_icon_uses_kind_and_falls_back_to_name() {
+        use crate::icons::{FILE, FOLDER};
+        let with_kind = |name: &str, kind: Option<ItemKind>| {
+            let mut it = item(name, Some(name), Place::MyFiles, None, 1);
+            it.kind = kind;
+            it
+        };
+        assert_eq!(item_icon(&with_kind("v1.2 notes", Some(ItemKind::Folder))), FOLDER);
+        assert_eq!(item_icon(&with_kind("photos.2026", Some(ItemKind::Folder))), FOLDER);
+        assert_eq!(item_icon(&with_kind("Makefile", Some(ItemKind::File))), FILE);
+        assert_eq!(item_icon(&with_kind(".bashrc", Some(ItemKind::File))), FILE);
+        // Older daemon or unreadable item with no kind falls back to name_icon
+        assert_eq!(item_icon(&with_kind("report.pdf", None)), FILE);
+        assert_eq!(item_icon(&with_kind("Icons", None)), FOLDER);
     }
 
     #[test]
