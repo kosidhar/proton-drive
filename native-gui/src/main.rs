@@ -1204,7 +1204,12 @@ fn shared_list(ui: &mut egui::Ui, items: &[shared::SharedItem], now_ms: i64, sto
             for button in &buttons {
                 // One stop at a time: the other rows' Stop sharing wait for the answer
                 let can = *button != SharedAction::Stop || stopping.is_none();
-                if ui.add_enabled_ui(can, |ui| icon_button_colored(ui, button.icon(), button.label(), color)).inner.clicked() {
+                let name = button.accessible_name(&item.name);
+                if ui
+                    .add_enabled_ui(can, |ui| icon_button_colored_named(ui, button.icon(), button.label(), &name, color))
+                    .inner
+                    .clicked()
+                {
                     act = Some((*button, i));
                 }
             }
@@ -1231,6 +1236,17 @@ impl SharedAction {
             SharedAction::ShowInFiles => "Show in Files",
             SharedAction::Stop => "Stop sharing",
             SharedAction::ManageOnWeb => "Manage on the web",
+        }
+    }
+
+    /// Screen-reader name naming both the action and the row's item (#374).
+    fn accessible_name(self, item_name: &str) -> String {
+        match self {
+            SharedAction::CopyLink => format!("Copy link for {item_name}"),
+            SharedAction::Manage => format!("Manage {item_name}"),
+            SharedAction::ShowInFiles => format!("Show {item_name} in Files"),
+            SharedAction::Stop => format!("Stop sharing {item_name}"),
+            SharedAction::ManageOnWeb => format!("Manage {item_name} on the web"),
         }
     }
 
@@ -4046,10 +4062,15 @@ fn icon_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
 
 /// `icon_button` with its icon in `color`: a list row's actions, weak until their row is hovered.
 fn icon_button_colored(ui: &mut egui::Ui, icon: &str, label: &str, color: Color32) -> egui::Response {
-    let (rect, resp) = button_shell(ui, Vec2::splat(ICON_BUTTON_SIZE), label, Color32::TRANSPARENT, BG_CARD_ALT(), None);
+    icon_button_colored_named(ui, icon, label, label, color)
+}
+
+/// `icon_button_colored` with a distinct screen-reader `name` while keeping a concise `hover` tooltip (#374).
+fn icon_button_colored_named(ui: &mut egui::Ui, icon: &str, hover: &str, name: &str, color: Color32) -> egui::Response {
+    let (rect, resp) = button_shell(ui, Vec2::splat(ICON_BUTTON_SIZE), name, Color32::TRANSPARENT, BG_CARD_ALT(), None);
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, icons::font(BUTTON_ICON_SIZE), color);
     // With no words of its own, it says what it is even while it waits (greyed out)
-    resp.on_hover_text(label).on_disabled_hover_text(label)
+    resp.on_hover_text(hover).on_disabled_hover_text(hover)
 }
 
 /// How far `focus_ring_colored` reaches outside a widget's rect: 2 pt gap + 2 pt outside stroke.
@@ -9780,7 +9801,14 @@ mod tests {
     #[test]
     fn shared_actions_and_refresh_are_push_buttons() {
         let h = shared_with_rows();
-        for label in ["Copy link", "Manage…", "Show in Files", "Stop sharing", "Manage on the web", "Refresh"] {
+        for label in [
+            "Copy link for report.pdf",
+            "Manage report.pdf",
+            "Show report.pdf in Files",
+            "Stop sharing report.pdf",
+            "Manage Taxes on the web",
+            "Refresh",
+        ] {
             let nodes = h.nodes_named(label);
             assert!(!nodes.is_empty(), "{label:?}");
             for node in nodes {
@@ -9788,6 +9816,80 @@ mod tests {
                 assert_eq!(node.toggled(), None, "{label:?} is not a toggle");
             }
         }
+    }
+
+    // #374: Shared row icon buttons and Share window password/expiry buttons carry item- or setting-specific
+    // AccessKit names instead of repeated generic labels.
+    #[test]
+    fn shared_rows_and_share_link_buttons_have_specific_accessible_names() {
+        use egui::accesskit::Role;
+
+        // 1. Shared page rows
+        let mut h = shared_with_rows();
+        for expected in [
+            "Copy link for report.pdf",
+            "Manage report.pdf",
+            "Show report.pdf in Files",
+            "Stop sharing report.pdf",
+            "Manage Icons",
+            "Show Icons in Files",
+            "Stop sharing Icons",
+            "Manage Taxes on the web",
+            "Show Budget.xlsx in Files",
+            "Manage Budget.xlsx on the web",
+        ] {
+            let nodes = h.nodes_named(expected);
+            assert_eq!(nodes.len(), 1, "expected one button named {expected:?}");
+            assert_eq!(nodes[0].role(), Role::Button);
+        }
+        for generic in ["Copy link", "Manage…", "Show in Files", "Stop sharing", "Manage on the web"] {
+            assert!(h.nodes_named(generic).is_empty(), "generic Shared row button {generic:?} should name its item");
+        }
+        // Hover tooltip stays concise
+        tooltips_at_once(&h);
+        let copy_pos = h.widget_at("Copy link for report.pdf").unwrap();
+        hover(&mut h, copy_pos);
+        assert!(h.text_at("Copy link").is_some(), "hover tooltip stays concise");
+
+        // 2. Share window link settings (password + expiry both present)
+        let mut h = share_window(Some(share::ShareInfo {
+            link: Some(share_link(true, Some(home::now_ms() + 86_400_000))),
+            people: Vec::new(),
+        }));
+        for expected in ["Show password", "Change password", "Remove password", "Change expiry", "Remove expiry"] {
+            let nodes = h.nodes_named(expected);
+            assert_eq!(nodes.len(), 1, "expected one Share button named {expected:?}");
+            assert_eq!(nodes[0].role(), Role::Button);
+        }
+        for generic in ["Show", "Hide", "Change", "Remove"] {
+            assert!(h.nodes_named(generic).is_empty(), "generic Share button {generic:?} should name password or expiry");
+        }
+
+        // Open both inline editors simultaneously
+        h.click(h.widget_at("Change password").unwrap());
+        h.click(h.widget_at("Change expiry").unwrap());
+        for expected in ["Save password", "Cancel password", "Set expiry date", "Cancel expiry"] {
+            let nodes = h.nodes_named(expected);
+            assert_eq!(nodes.len(), 1, "expected one Share editor button named {expected:?}");
+            assert_eq!(nodes[0].role(), Role::Button);
+        }
+        for generic in ["Save", "Set", "Cancel"] {
+            assert!(h.nodes_named(generic).is_empty(), "generic Share editor button {generic:?} should name its field");
+        }
+
+        // Revealed password uses "Hide password"
+        window(&mut h).password = share::PasswordView::Shown("secret".into());
+        h.frames(2);
+        assert_eq!(h.nodes_named("Hide password").len(), 1);
+        assert!(h.nodes_named("Hide").is_empty());
+
+        // Link without expiry names "Set expiry date…"
+        let h_no_exp = share_window(Some(share::ShareInfo {
+            link: Some(share_link(false, None)),
+            people: Vec::new(),
+        }));
+        assert_eq!(h_no_exp.nodes_named("Set expiry date…").len(), 1);
+        assert!(h_no_exp.nodes_named("Set date…").is_empty());
     }
 
     // R13: phrases are cut at their end; paths (folders, names) in the middle, keeping their ends
@@ -9849,25 +9951,50 @@ mod tests {
         h
     }
 
-    /// The buttons on the row of `name`, left to right, by their names for screen readers (they are icons).
+    /// The buttons on the row of `name`, left to right, by their concise action labels (matched via item-specific AccessKit names).
     fn row_buttons(h: &Harness, name: &str) -> Vec<&'static str> {
         let y = h.text_at(name).unwrap_or_else(|| panic!("{name:?} is painted")).y;
-        let mut found: Vec<(f32, &'static str)> = ["Copy link", "Manage…", "Show in Files", "Stop sharing", "Manage on the web"]
+        let all = [
+            SharedAction::CopyLink,
+            SharedAction::Manage,
+            SharedAction::ShowInFiles,
+            SharedAction::Stop,
+            SharedAction::ManageOnWeb,
+        ];
+        let mut found: Vec<(f32, &'static str)> = all
             .into_iter()
-            .flat_map(|label| h.widgets_at_all(label).into_iter().filter(|p| (p.y - y).abs() < SHARED_ROW_HALF).map(move |p| (p.x, label)))
+            .flat_map(|action| {
+                let accessible = action.accessible_name(name);
+                let label = action.label();
+                h.widgets_at_all(&accessible)
+                    .into_iter()
+                    .filter(|p| (p.y - y).abs() < SHARED_ROW_HALF)
+                    .map(move |p| (p.x, label))
+            })
             .collect();
         found.sort_by(|a, b| a.0.total_cmp(&b.0));
         found.into_iter().map(|(_, label)| label).collect()
     }
 
-    /// The button named `label` on the row of `name`.
+    /// The button for action `label` on the row of `name`.
     fn on_row(h: &Harness, name: &str, label: &str) -> egui::Pos2 {
         let y = h.text_at(name).unwrap_or_else(|| panic!("{name:?} is painted")).y;
-        h.widgets_at_all(label)
+        let accessible = [
+            SharedAction::CopyLink,
+            SharedAction::Manage,
+            SharedAction::ShowInFiles,
+            SharedAction::Stop,
+            SharedAction::ManageOnWeb,
+        ]
+        .into_iter()
+        .find(|a| a.label() == label)
+        .map(|a| a.accessible_name(name))
+        .unwrap_or_else(|| label.to_string());
+        h.widgets_at_all(&accessible)
             .into_iter()
             .filter(|p| (p.y - y).abs() < SHARED_ROW_HALF)
             .min_by(|a, b| (a.y - y).abs().total_cmp(&(b.y - y).abs()))
-            .unwrap_or_else(|| panic!("{label:?} on the row of {name:?}"))
+            .unwrap_or_else(|| panic!("{accessible:?} on the row of {name:?}"))
     }
 
     #[test]
@@ -10121,12 +10248,21 @@ mod tests {
     fn a_rows_actions_stay_inside_the_window_narrow_and_zoomed() {
         let mut h = shared_with_rows();
         h.resize_zoomed(Vec2::new(840.0, 540.0), 1.2);
-        for (label, rows) in [("Copy link", 1), ("Manage…", 3), ("Show in Files", 4), ("Stop sharing", 3), ("Manage on the web", 3)] {
-            let nodes = h.nodes_named(label);
-            assert_eq!(nodes.len(), rows, "{label:?} on each of its rows");
+        for (action, expected_rows) in [
+            (SharedAction::CopyLink, 1),
+            (SharedAction::Manage, 3),
+            (SharedAction::ShowInFiles, 4),
+            (SharedAction::Stop, 3),
+            (SharedAction::ManageOnWeb, 3),
+        ] {
+            let nodes: Vec<_> = shared_rows()
+                .iter()
+                .flat_map(|item| h.nodes_named(&action.accessible_name(&item.name)))
+                .collect();
+            assert_eq!(nodes.len(), expected_rows, "{:?} on each of its rows", action.label());
             for node in nodes {
                 let right = node.bounds().expect("placed").x1 as f32;
-                assert!(right <= h.screen.x - 4.0, "{label:?} runs to {right}, past the window's {}", h.screen.x);
+                assert!(right <= h.screen.x - 4.0, "{:?} runs to {right}, past the window's {}", action.label(), h.screen.x);
             }
         }
         for header in ["Name", "Location", "Sharing"] {
@@ -11566,7 +11702,7 @@ mod tests {
         h.click(h.text_at("Shared").unwrap());
         h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(shared_rows())));
         h.frames(3);
-        tab_to(&mut h, "Copy link");
+        tab_to(&mut h, "Copy link for report.pdf");
         let icon_btn = focused(&h).expect("Copy link icon button focused");
         let rect = node_rect(&icon_btn);
         assert!(
