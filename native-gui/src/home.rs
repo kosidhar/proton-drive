@@ -711,11 +711,14 @@ pub(crate) fn menu_item(ui: &mut egui::Ui, icon: Option<&str>, label: &str, widt
         ui.painter().text(at, egui::Align2::LEFT_CENTER, icon, crate::icons::font(16.0), TEXT_MUTED());
         x += 16.0 + 10.0;
     }
+    let font = egui::FontId::proportional(13.0);
+    let room = (rect.right() - 10.0 - x).max(0.0);
+    let shown = crate::truncate_end_to_width(ui.painter(), label, &font, room);
     ui.painter().text(
         egui::pos2(x, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::proportional(13.0),
+        shown,
+        font,
         TEXT_PRIMARY(),
     );
     crate::focus_ring(ui, &resp, 6.0);

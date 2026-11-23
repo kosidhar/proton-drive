@@ -4505,7 +4505,7 @@ fn text_width(painter: &egui::Painter, text: &str, font: &FontId) -> f32 {
 }
 
 /// `s` cut at its end to fit `max_width`, with an ellipsis: for a phrase, which reads from its start.
-fn truncate_end_to_width(painter: &egui::Painter, s: &str, font: &FontId, max_width: f32) -> String {
+pub(crate) fn truncate_end_to_width(painter: &egui::Painter, s: &str, font: &FontId, max_width: f32) -> String {
     if max_width <= 0.0 {
         return String::new();
     }
@@ -9221,6 +9221,80 @@ mod tests {
         h.frames(2);
         assert!(!h.app.account_menu_open);
         assert!(h.text_at("Sign out").is_none());
+    }
+
+    // #365: at high zoom in a small window, the account menu stays within the viewport and scrolls vertically
+    // so lower items ("Open Proton Drive on the web", "Sign out") stay reachable.
+    #[test]
+    fn account_menu_fits_viewport_and_scrolls_at_high_zoom() {
+        for zoom in [2.0_f32, 2.5, 3.0] {
+            let mut h = account_menu();
+            h.resize_zoomed(Vec2::new(840.0, 540.0), zoom);
+            let menu = h
+                .ctx
+                .memory(|m| m.area_rect(egui::Id::new("account_menu")))
+                .expect("account menu area rect");
+            assert!(
+                menu.left() >= 0.0 && menu.right() <= h.screen.x,
+                "zoom={zoom}: account menu {menu:?} overflows viewport width {}",
+                h.screen.x
+            );
+            assert!(
+                menu.top() >= chrome::TOP_BAR_HEIGHT && menu.bottom() <= h.screen.y,
+                "zoom={zoom}: account menu {menu:?} overflows [{}, {}]",
+                chrome::TOP_BAR_HEIGHT,
+                h.screen.y
+            );
+
+            // Scrolling the menu brings "Sign out" into the visible menu bounds so it can be clicked
+            for _ in 0..10 {
+                if let Some(sign_out) = h.nodes_named("Sign out").into_iter().next() {
+                    let r = node_rect(&sign_out);
+                    if r.top() >= menu.top() && r.bottom() <= menu.bottom() {
+                        break;
+                    }
+                }
+                h.scroll(menu.center(), 40.0);
+            }
+            let sign_out = node_rect(&h.nodes_named("Sign out").into_iter().next().expect("Sign out item"));
+            assert!(
+                sign_out.top() >= menu.top() && sign_out.bottom() <= menu.bottom() && sign_out.bottom() <= h.screen.y,
+                "zoom={zoom}: Sign out {sign_out:?} should scroll inside menu {menu:?} and viewport {}",
+                h.screen.y
+            );
+            h.click(sign_out.center());
+            assert_eq!(h.sent(), vec!["sign out".to_string()], "zoom={zoom}: clicking Sign out logs out");
+        }
+
+        // Keyboard Tab into a scrolled-off menu item at 3.0x brings Sign out into the menu bounds
+        let mut h = account_menu();
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 3.0);
+        let menu_3x = h
+            .ctx
+            .memory(|m| m.area_rect(egui::Id::new("account_menu")))
+            .expect("account menu area rect at 3.0x");
+        tab_to(&mut h, "Sign out");
+        let focused_sign_out = node_rect(&focused(&h).expect("Sign out focused via Tab"));
+        assert!(
+            focused_sign_out.top() >= menu_3x.top() && focused_sign_out.bottom() <= menu_3x.bottom(),
+            "Tab to Sign out at 3.0x should scroll it inside {menu_3x:?}, got {focused_sign_out:?}"
+        );
+
+        // Zooming back out from 3.0x to 1.0x expands the menu back to full height without getting stuck scrolled
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.0);
+        let menu_1x = h
+            .ctx
+            .memory(|m| m.area_rect(egui::Id::new("account_menu")))
+            .expect("account menu area rect at 1.0x");
+        assert!(
+            menu_1x.height() > menu_3x.height() + 40.0,
+            "zooming back out should expand menu height beyond 3.0x ({menu_3x:?}), got {menu_1x:?}"
+        );
+        let sign_out_1x = node_rect(&h.nodes_named("Sign out").into_iter().next().expect("Sign out at 1.0x"));
+        assert!(
+            sign_out_1x.top() >= menu_1x.top() && sign_out_1x.bottom() <= menu_1x.bottom(),
+            "Sign out {sign_out_1x:?} should be visible inside expanded 1.0x menu {menu_1x:?}"
+        );
     }
 
     #[test]
