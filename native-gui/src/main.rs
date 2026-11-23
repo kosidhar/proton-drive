@@ -2726,7 +2726,7 @@ impl ProtonDriveNativeApp {
                                 Vec2::new(ui.available_width(), 38.0),
                                 Sense::click(),
                             );
-                            scroll_to_focused(ui, &row_resp);
+                            focus_ring(ui, &row_resp, 6.0);
                             if row_resp.hovered() {
                                 ui.painter().rect_filled(
                                     row_rect,
@@ -2827,10 +2827,13 @@ impl ProtonDriveNativeApp {
                             ui.painter().text(
                                 egui::pos2(r_time_right_x, cy),
                                 egui::Align2::RIGHT_CENTER,
-                                time_str,
+                                &time_str,
                                 time_font,
                                 TEXT_MUTED(),
                             );
+                            let row_label = format!("{pill_label}: {}, {time_str}", act.local_rel_path);
+                            let enabled = ui.is_enabled();
+                            row_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &row_label));
                             // Cut short: the whole text shows on hover; it shows in the row a click opens, too
                             let row_resp = if truncated {
                                 row_resp.on_hover_text(format!("{}\n{}", act.local_rel_path, act.details))
@@ -2838,7 +2841,9 @@ impl ProtonDriveNativeApp {
                                 row_resp
                             }
                             .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            let mut now_expanded = expanded;
                             if row_resp.clicked() {
+                                now_expanded = !expanded;
                                 self.expanded_activity = if expanded {
                                     None
                                 } else {
@@ -2849,7 +2854,11 @@ impl ProtonDriveNativeApp {
                                         open: activity::open_target(sync_dir, &act.local_rel_path),
                                     })
                                 };
+                                ui.ctx().request_repaint();
                             }
+                            ui.ctx().accesskit_node_builder(row_resp.id, |node| {
+                                node.set_expanded(now_expanded);
+                            });
                             if expanded {
                                 self.render_activity_details(ui, act);
                             }
@@ -4122,9 +4131,14 @@ pub(crate) fn focus_ring(ui: &egui::Ui, response: &egui::Response, radius: f32) 
 pub(crate) fn focus_ring_colored(ui: &egui::Ui, response: &egui::Response, radius: f32, color: Color32) {
     scroll_to_focused(ui, response);
     if response.has_focus() {
-        let ring = response.rect.expand(2.0);
-        ui.painter().rect_stroke(ring, CornerRadius::same((radius + 2.0) as u8), Stroke::new(2.0_f32, color), egui::StrokeKind::Outside);
+        paint_focus_ring(ui, response.rect, radius, color);
     }
+}
+
+/// Paints the standard 2 pt outside focus ring around `rect` in `color`.
+fn paint_focus_ring(ui: &egui::Ui, rect: egui::Rect, radius: f32, color: Color32) {
+    let ring = rect.expand(2.0);
+    ui.painter().rect_stroke(ring, CornerRadius::same((radius + 2.0) as u8), Stroke::new(2.0_f32, color), egui::StrokeKind::Outside);
 }
 
 /// A glyph that only decorates what is beside it: painted, with no node of its own for screen readers to read out.
@@ -4390,13 +4404,11 @@ fn chip_width(ui: &egui::Ui, label: &str) -> f32 {
     text_width(ui.painter(), label, &FontId::new(12.5, FontFamily::Proportional)) + 24.0
 }
 
-/// The search field: a rounded input with a magnifier on its left, outlined in purple only while it has focus.
+/// The search field: a rounded input with a magnifier on its left, showing the standard focus ring while focused (#360).
 fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32) {
     let id = egui::Id::new("activity_search");
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::hover());
-    let focused = ui.memory(|m| m.has_focus(id));
-    let stroke = if focused { Stroke::new(1.0_f32, PROTON_PURPLE) } else { Stroke::NONE };
-    ui.painter().rect(rect, CornerRadius::same(8), BG_INPUT(), stroke, egui::StrokeKind::Inside);
+    ui.painter().rect_filled(rect, CornerRadius::same(8), BG_INPUT());
     ui.painter().text(
         egui::pos2(rect.min.x + 10.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
@@ -4412,6 +4424,9 @@ fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32) {
         egui::TextEdit::singleline(text).id(id).hint_text(hint).frame(false).vertical_align(Align::Center),
     );
     scroll_to_focused(&inner, &resp);
+    if resp.has_focus() {
+        paint_focus_ring(ui, rect, 8.0, FOCUS_RING());
+    }
 }
 
 /// An Activity row's identity, to keep it open across refreshes: the daemon's id, or without one what it says
@@ -11625,6 +11640,122 @@ mod tests {
             focus_rings(&h).iter().any(|r| r.contains_rect(last_after)),
             "expected an unclipped focus ring around scrolled-into-view nested conflict button ({last_after:?})"
         );
+    }
+
+    // #360: Activity rows, Activity search field, and ComboBox pickers in Settings and Share paint the standard focus
+    // ring on keyboard focus; Activity rows expose AccessKit info; Share's Link "On"/"Off" label is not a Tab stop.
+    #[test]
+    fn non_button_focusable_controls_show_focus_rings_and_link_label_is_not_a_tab_stop() {
+        use egui::accesskit::Role;
+
+        // 1. Activity search field & Activity list row
+        let mut h = Harness::new();
+        h.app.open_tab(NavTab::Activity);
+        h.app.activities = vec![ActivityRecord {
+            id: Some(1),
+            action: "upload".into(),
+            local_rel_path: "Docs/notes.md".into(),
+            details: "Uploaded to Proton Drive".into(),
+            timestamp: (home::now_ms() - 60_000) as u64,
+        }];
+        h.frames(3);
+
+        // Tab to Activity search field (TextInput) and verify it paints a standard FOCUS_RING()
+        let mut found_search = None;
+        for _ in 0..40 {
+            press_key(&mut h, Key::Tab);
+            if let Some(n) = focused(&h).filter(|n| n.role() == Role::TextInput) {
+                found_search = Some(n);
+                break;
+            }
+        }
+        let search_rect = node_rect(&found_search.expect("Tab reaches Activity search field"));
+        assert!(
+            focus_rings(&h).iter().any(|r| r.contains_rect(search_rect)),
+            "expected a standard focus ring around Activity search field ({search_rect:?}), got {:?}",
+            focus_rings(&h)
+        );
+
+        // Tab to Activity list row, verify its AccessKit label + standard focus ring + Space expands details
+        let mut found_row = None;
+        for _ in 0..40 {
+            press_key(&mut h, Key::Tab);
+            if let Some(n) = focused(&h).filter(|n| n.role() == Role::Button && says(n).contains("Docs/notes.md")) {
+                found_row = Some(n);
+                break;
+            }
+        }
+        let row_node = found_row.expect("Tab reaches Activity row with AccessKit label containing its path");
+        assert_eq!(row_node.is_expanded(), Some(false));
+        let row_rect = node_rect(&row_node);
+        assert!(
+            focus_rings(&h).iter().any(|r| r.contains_rect(row_rect)),
+            "expected an unclipped focus ring around Activity row ({row_rect:?}), got {:?}",
+            focus_rings(&h)
+        );
+        press_key(&mut h, Key::Space);
+        assert!(h.app.expanded_activity.is_some(), "Space expands the focused Activity row");
+        assert_eq!(focused(&h).expect("row keeps focus").is_expanded(), Some(true));
+        press_key(&mut h, Key::Enter);
+        assert!(h.app.expanded_activity.is_none(), "Enter collapses the focused Activity row");
+        assert_eq!(focused(&h).expect("row keeps focus").is_expanded(), Some(false));
+
+        // 2. Settings ComboBox pickers (Theme & Conflict Resolution Strategy) paint a focus ring
+        let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        let mut seen_settings_combos = std::collections::HashSet::new();
+        for _ in 0..80 {
+            press_key(&mut h, Key::Tab);
+            if let Some(n) = focused(&h).filter(|n| n.role() == Role::ComboBox) {
+                let r = node_rect(&n);
+                let labels = labelled_by(&h, &n);
+                for l in &labels {
+                    seen_settings_combos.insert(l.clone());
+                }
+                assert!(
+                    focus_rings(&h).iter().any(|ring| ring.contains_rect(r)),
+                    "expected an unclipped focus ring around Settings ComboBox {labels:?} ({r:?}), got {:?}",
+                    focus_rings(&h)
+                );
+            }
+        }
+        assert!(
+            seen_settings_combos.contains("Theme") && seen_settings_combos.contains("Conflict Resolution Strategy"),
+            "expected Tab to visit both Settings ComboBoxes, saw {seen_settings_combos:?}"
+        );
+
+        // 3. Share window: Link "On"/"Off" label is clickable but NOT a duplicate Tab stop, and role ComboBoxes have rings
+        let mut h = share_window(Some(share::ShareInfo {
+            link: Some(share_link(false, None)),
+            people: vec![share_person("alice@example.com", share::Role::Viewer, share::PersonState::Member)],
+        }));
+        let stops = tab_stops(&mut h);
+        assert!(
+            !stops.iter().any(|(_, text)| text == "On" || text == "Off"),
+            "Share Link On/Off label should not be a Tab stop, got {stops:?}"
+        );
+        let mut share_combo_ys = Vec::new();
+        for _ in 0..40 {
+            press_key(&mut h, Key::Tab);
+            if let Some(n) = focused(&h).filter(|n| n.role() == Role::ComboBox) {
+                let r = node_rect(&n);
+                if !share_combo_ys.iter().any(|y: &f32| (*y - r.top()).abs() < 1.0) {
+                    share_combo_ys.push(r.top());
+                }
+                assert!(
+                    focus_rings(&h).iter().any(|ring| ring.contains_rect(r)),
+                    "expected an unclipped focus ring around Share ComboBox ({r:?}), got {:?}",
+                    focus_rings(&h)
+                );
+            }
+        }
+        assert!(
+            share_combo_ys.len() >= 2,
+            "Tab should reach both Share window ComboBox pickers (invite + member), saw {share_combo_ys:?}"
+        );
+
+        // Clicking the "On" label still toggles the link off
+        h.click(h.text_at("On").expect("On label is still visible"));
+        assert!(window(&mut h).confirm.is_some(), "clicking On label still asks to turn link off");
     }
 
     // #290: Home's notice dismiss is an icon_button using Phosphor's X, named and saying "Dismiss" on hover.
