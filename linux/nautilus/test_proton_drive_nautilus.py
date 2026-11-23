@@ -604,6 +604,40 @@ class FileMenuTest(unittest.TestCase):
             self.h.files.share("/x/y")
         self.assertEqual(len(tried), 3)
         self.assertEqual(tried[1:], ["/usr/bin/protondrive-gui", "protondrive-gui"])
+        self.assertEqual(self.h.notes, [])
+
+    def test_share_notifies_when_every_launch_location_fails(self):
+        # All missing -> "isn't installed"
+        for missing_err in (FileNotFoundError(2, "No such file"), NotADirectoryError(20, "Not a directory")):
+            tried = []
+            self.h.notes.clear()
+
+            def spawn_missing(argv, err=missing_err):
+                tried.append(argv[0])
+                raise err
+
+            with mock.patch.object(ext, "_spawn_detached", spawn_missing):
+                self.h.files.share("/x/y")
+            self.assertEqual(len(tried), 3)
+            self.assertEqual(self.h.notes, [("Couldn't open Share", "The Proton Drive app isn't installed.")])
+
+        # Installed at one location but couldn't start (e.g. not executable or bad exec format) -> "didn't start" (#226)
+        for errors in (
+            [PermissionError(13, "Permission denied"), FileNotFoundError(2, "No such file"), FileNotFoundError(2, "No such file")],
+            [FileNotFoundError(2, "No such file"), OSError(8, "Exec format error"), FileNotFoundError(2, "No such file")],
+        ):
+            tried = []
+            self.h.notes.clear()
+            remaining = iter(errors)
+
+            def spawn_fail(argv):
+                tried.append(argv[0])
+                raise next(remaining)
+
+            with mock.patch.object(ext, "_spawn_detached", spawn_fail):
+                self.h.files.share("/x/y")
+            self.assertEqual(len(tried), 3)
+            self.assertEqual(self.h.notes, [("Couldn't open Share", "protondrive-gui didn't start.")])
 
     def test_share_refuses_a_path_the_app_cant_be_given_and_says_why(self):
         # GIO hands over a name that isn't UTF-8 with each byte it can't read as a lone surrogate; a line break can't
