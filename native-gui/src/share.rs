@@ -987,12 +987,15 @@ impl ProtonDriveNativeApp {
             if w.working() {
                 ui.label(RichText::new("Working…").size(12.5).color(TEXT_MUTED()));
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                // Closing never waits: what is out still happens, and a failure is told in the app's notice
-                if primary_button(ui, "Done", 34.0).clicked() {
-                    close = true;
-                }
-            });
+            let done_w = button_width(ui, "Done");
+            let pad = (ui.available_width() - done_w).max(0.0);
+            if pad > 0.0 {
+                ui.add_space(pad);
+            }
+            // Closing never waits: what is out still happens, and a failure is told in the app's notice
+            if primary_button(ui, "Done", 34.0).clicked() {
+                close = true;
+            }
         });
         for action in actions {
             if let Some(cmd) = w.act(action, now, home::local_offset_secs) {
@@ -1024,14 +1027,19 @@ impl ProtonDriveNativeApp {
                 ui.add_space(8.0);
                 ui.add(egui::Label::new(RichText::new(body).size(13.0).color(TEXT_PRIMARY())).wrap());
                 ui.add_space(18.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.horizontal(|ui| {
+                    let buttons_w = button_width(ui, "Cancel") + 4.0 + ui.spacing().item_spacing.x + button_width(ui, button);
+                    let pad = (ui.available_width() - buttons_w).max(0.0);
+                    if pad > 0.0 {
+                        ui.add_space(pad);
+                    }
+                    if secondary_button(ui, "Cancel", 34.0).clicked() {
+                        answer = Some(Action::CancelConfirm);
+                    }
+                    ui.add_space(4.0);
                     // It takes access away: red, not the primary purple
                     if action_button(ui, ButtonKind::Danger, None, button, 34.0).clicked() {
                         answer = Some(Action::Confirm);
-                    }
-                    ui.add_space(4.0);
-                    if secondary_button(ui, "Cancel", 34.0).clicked() {
-                        answer = Some(Action::CancelConfirm);
                     }
                 });
             });
@@ -1168,16 +1176,21 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
     let on = link.is_some();
     ui.horizontal(|ui| {
         section_title(ui, "Link");
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let switch = toggle_switch(ui, on);
-            // The word beside the switch flips it on click, without creating a duplicate Tab stop (#360)
-            let word = ui
-                .add(egui::Label::new(RichText::new(if on { "On" } else { "Off" }).size(13.0).color(TEXT_MUTED())).sense(Sense::CLICK))
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-            if switch.clicked() || word.clicked() {
-                actions.push(if on { Action::AskLinkOff } else { Action::LinkOn });
-            }
-        });
+        let word_text = if on { "On" } else { "Off" };
+        let word_w = crate::text_width(ui.painter(), word_text, &egui::FontId::proportional(13.0));
+        let right_w = word_w + ui.spacing().item_spacing.x + 40.0;
+        let pad = (ui.available_width() - right_w).max(0.0);
+        if pad > 0.0 {
+            ui.add_space(pad);
+        }
+        // The word beside the switch flips it on click, without creating a duplicate Tab stop (#360)
+        let word = ui
+            .add(egui::Label::new(RichText::new(word_text).size(13.0).color(TEXT_MUTED())).sense(Sense::CLICK))
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let switch = toggle_switch(ui, on);
+        if switch.clicked() || word.clicked() {
+            actions.push(if on { Action::AskLinkOff } else { Action::LinkOn });
+        }
     });
     let Some(link) = link else {
         muted(ui, format!("Turn it on to make a link anyone can use to view {}.", w.name));
@@ -1230,29 +1243,35 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
                 PasswordView::Hidden | PasswordView::CantShow => (RichText::new("••••••••"), false),
             };
             ui.label(text.size(13.0).color(TEXT_PRIMARY()));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if action_button_named(ui, ButtonKind::Secondary, None, "Remove", "Remove password", 28.0).clicked() {
-                    actions.push(Action::RemovePassword);
-                }
-                if action_button_named(ui, ButtonKind::Secondary, None, "Change", "Change password", 28.0).clicked() {
-                    actions.push(Action::EditPassword);
-                }
-                let loading = w.password == PasswordView::Loading;
-                let (vis, acc) = if shown { ("Hide", "Hide password") } else { ("Show", "Show password") };
-                let show = ui
-                    .add_enabled_ui(!loading, |ui| action_button_named(ui, ButtonKind::Secondary, None, vis, acc, 28.0))
-                    .inner;
-                if show.clicked() {
-                    actions.push(if shown { Action::HidePassword } else { Action::ShowPassword });
-                }
-            });
+            let (vis, acc) = if shown { ("Hide", "Hide password") } else { ("Show", "Show password") };
+            let gap = ui.spacing().item_spacing.x;
+            let buttons_w = button_width(ui, vis) + button_width(ui, "Change") + button_width(ui, "Remove") + 2.0 * gap;
+            let pad = (ui.available_width() - buttons_w).max(0.0);
+            if pad > 0.0 {
+                ui.add_space(pad);
+            }
+            let loading = w.password == PasswordView::Loading;
+            let show = ui
+                .add_enabled_ui(!loading, |ui| action_button_named(ui, ButtonKind::Secondary, None, vis, acc, 28.0))
+                .inner;
+            if show.clicked() {
+                actions.push(if shown { Action::HidePassword } else { Action::ShowPassword });
+            }
+            if action_button_named(ui, ButtonKind::Secondary, None, "Change", "Change password", 28.0).clicked() {
+                actions.push(Action::EditPassword);
+            }
+            if action_button_named(ui, ButtonKind::Secondary, None, "Remove", "Remove password", 28.0).clicked() {
+                actions.push(Action::RemovePassword);
+            }
         } else {
             ui.label(RichText::new("None").size(13.0).color(TEXT_MUTED()));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if secondary_button(ui, "Set password", 28.0).clicked() {
-                    actions.push(Action::EditPassword);
-                }
-            });
+            let pad = (ui.available_width() - button_width(ui, "Set password")).max(0.0);
+            if pad > 0.0 {
+                ui.add_space(pad);
+            }
+            if secondary_button(ui, "Set password", 28.0).clicked() {
+                actions.push(Action::EditPassword);
+            }
         }
     });
     if link.has_password && w.password == PasswordView::CantShow {
@@ -1294,18 +1313,28 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
             TEXT_PRIMARY()
         };
         ui.label(RichText::new(expiry).size(13.0).color(color));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if link.expires_at.is_some() {
-                if action_button_named(ui, ButtonKind::Secondary, None, "Remove", "Remove expiry", 28.0).clicked() {
-                    actions.push(Action::RemoveExpiry);
-                }
-                if action_button_named(ui, ButtonKind::Secondary, None, "Change", "Change expiry", 28.0).clicked() {
-                    actions.push(Action::EditExpiry);
-                }
-            } else if action_button_named(ui, ButtonKind::Secondary, None, "Set date…", "Set expiry date…", 28.0).clicked() {
+        if link.expires_at.is_some() {
+            let gap = ui.spacing().item_spacing.x;
+            let buttons_w = button_width(ui, "Change") + button_width(ui, "Remove") + gap;
+            let pad = (ui.available_width() - buttons_w).max(0.0);
+            if pad > 0.0 {
+                ui.add_space(pad);
+            }
+            if action_button_named(ui, ButtonKind::Secondary, None, "Change", "Change expiry", 28.0).clicked() {
                 actions.push(Action::EditExpiry);
             }
-        });
+            if action_button_named(ui, ButtonKind::Secondary, None, "Remove", "Remove expiry", 28.0).clicked() {
+                actions.push(Action::RemoveExpiry);
+            }
+        } else {
+            let pad = (ui.available_width() - button_width(ui, "Set date…")).max(0.0);
+            if pad > 0.0 {
+                ui.add_space(pad);
+            }
+            if action_button_named(ui, ButtonKind::Secondary, None, "Set date…", "Set expiry date…", 28.0).clicked() {
+                actions.push(Action::EditExpiry);
+            }
+        }
     });
     if let Some(date) = w.expiry_editor.as_mut() {
         ui.horizontal(|ui| {
@@ -1344,20 +1373,21 @@ fn link_section(w: &mut ShareWindow, ui: &mut egui::Ui, link: Option<&ShareLink>
 fn invite_section(w: &mut ShareWindow, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
     section_title(ui, "Invite people");
     ui.horizontal(|ui| {
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let invite = action_button(ui, ButtonKind::Primary, Some(icons::PEOPLE), "Invite", 32.0).clicked();
-            role_choice(ui, "share_invite_role", &mut w.invite_role, 32.0);
-            let field = input_field(ui, "Invite people", |ui| {
-                ui.add_sized(
-                    [ui.available_width().max(140.0), 32.0],
-                    egui::TextEdit::singleline(&mut w.invite_input).hint_text("email@example.com, …").vertical_align(Align::Center),
-                )
-            });
-            let entered = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            if invite || entered {
-                actions.push(Action::Invite);
-            }
+        let invite_w = action_button_width(ui, Some(icons::PEOPLE), "Invite");
+        let gap = ui.spacing().item_spacing.x;
+        let field_w = (ui.available_width() - ROLE_WIDTH - invite_w - 2.0 * gap).max(140.0);
+        let field = input_field(ui, "Invite people", |ui| {
+            ui.add_sized(
+                [field_w, 32.0],
+                egui::TextEdit::singleline(&mut w.invite_input).hint_text("email@example.com, …").vertical_align(Align::Center),
+            )
         });
+        role_choice(ui, "share_invite_role", &mut w.invite_role, 32.0);
+        let invite = action_button(ui, ButtonKind::Primary, Some(icons::PEOPLE), "Invite", 32.0).clicked();
+        let entered = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        if invite || entered {
+            actions.push(Action::Invite);
+        }
     });
     muted(ui, "Separate addresses with commas or spaces.");
     error_line(ui, w, Section::Invite);
@@ -1370,45 +1400,55 @@ fn people_section(w: &mut ShareWindow, ui: &mut egui::Ui, people: &[SharePerson]
     ui.horizontal(|ui| {
         ui.set_min_height(ROW_HEIGHT);
         ui.label(RichText::new("You").size(13.5).color(TEXT_PRIMARY()));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new("Owner").size(13.0).color(TEXT_MUTED()));
-            if !owner.is_empty() {
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    elided(ui, RichText::new(owner).size(12.5).color(TEXT_MUTED()), owner);
-                });
+        let owner_role_w = crate::text_width(ui.painter(), "Owner", &egui::FontId::proportional(13.0));
+        let gap = ui.spacing().item_spacing.x;
+        if !owner.is_empty() {
+            let room = (ui.available_width() - owner_role_w - gap).max(0.0);
+            ui.allocate_ui_with_layout(Vec2::new(room, ROW_HEIGHT), Layout::left_to_right(Align::Center), |ui| {
+                ui.set_min_width(room);
+                ui.set_max_width(room);
+                elided(ui, RichText::new(owner).size(12.5).color(TEXT_MUTED()), owner);
+            });
+        } else {
+            let pad = (ui.available_width() - owner_role_w).max(0.0);
+            if pad > 0.0 {
+                ui.add_space(pad);
             }
-        });
+        }
+        ui.label(RichText::new("Owner").size(13.0).color(TEXT_MUTED()));
     });
     for person in people {
         ui.horizontal(|ui| {
             ui.set_min_height(PERSON_ROW_HEIGHT);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                // Named, and saying on hover, whom it removes
-                let remove = icon_button(ui, icons::REMOVE, &format!("Remove {}", person.email));
-                if remove.clicked() {
-                    actions.push(Action::AskRemove(person.email.clone()));
+            let gap = ui.spacing().item_spacing.x;
+            let right_w = ROLE_WIDTH + gap + crate::ICON_BUTTON_SIZE;
+            let left_w = (ui.available_width() - right_w - gap).max(0.0);
+            let state = match person.state {
+                PersonState::Member => None,
+                PersonState::Invited => Some("Invited"),
+                PersonState::InvitedNotProton => Some("Invited by email: no Proton account yet"),
+            };
+            let size = Vec2::new(left_w, PERSON_ROW_HEIGHT);
+            ui.allocate_ui_with_layout(size, Layout::top_down(Align::Min), |ui| {
+                ui.set_min_width(left_w);
+                // About 17 points for the address and 14 for the line under it: centred on the row
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.add_space(if state.is_some() { 2.0 } else { 9.5 });
+                elided(ui, RichText::new(&person.email).size(13.5).color(TEXT_PRIMARY()), &person.email);
+                if let Some(state) = state {
+                    elided(ui, RichText::new(state).size(11.5).color(TEXT_MUTED()), state);
                 }
-                let mut role = person.role;
-                role_choice(ui, ("share_role", &person.email), &mut role, 28.0);
-                if role != person.role {
-                    actions.push(Action::SetRole(person.email.clone(), role));
-                }
-                let state = match person.state {
-                    PersonState::Member => None,
-                    PersonState::Invited => Some("Invited"),
-                    PersonState::InvitedNotProton => Some("Invited by email: no Proton account yet"),
-                };
-                let size = Vec2::new(ui.available_width(), PERSON_ROW_HEIGHT);
-                ui.allocate_ui_with_layout(size, Layout::top_down(Align::Min), |ui| {
-                    // About 17 points for the address and 14 for the line under it: centred on the row
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.add_space(if state.is_some() { 2.0 } else { 9.5 });
-                    elided(ui, RichText::new(&person.email).size(13.5).color(TEXT_PRIMARY()), &person.email);
-                    if let Some(state) = state {
-                        elided(ui, RichText::new(state).size(11.5).color(TEXT_MUTED()), state);
-                    }
-                });
             });
+            let mut role = person.role;
+            role_choice(ui, ("share_role", &person.email), &mut role, 28.0);
+            if role != person.role {
+                actions.push(Action::SetRole(person.email.clone(), role));
+            }
+            // Named, and saying on hover, whom it removes
+            let remove = icon_button(ui, icons::REMOVE, &format!("Remove {}", person.email));
+            if remove.clicked() {
+                actions.push(Action::AskRemove(person.email.clone()));
+            }
         });
     }
     if people.is_empty() {
