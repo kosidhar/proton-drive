@@ -2636,36 +2636,54 @@ impl ProtonDriveNativeApp {
             let file_col_x = hdr_rect.min.x + 152.0;
             let details_col_x = (hdr_rect.min.x + hdr_rect.width() * 0.44).max(file_col_x + 210.0);
             let time_right_x = hdr_rect.max.x - 16.0;
+            let header_font = FontId::new(12.0, FontFamily::Proportional);
+            let time_header_w = text_width(ui.painter(), "Time", &header_font);
+            let details_room = time_right_x - time_header_w - 16.0 - details_col_x;
+            let enabled = ui.is_enabled();
+            let header_col = |ui: &mut egui::Ui, title: &'static str, left: f32, right: f32| -> egui::Id {
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(left, hdr_rect.top()),
+                    egui::pos2(right.max(left), hdr_rect.bottom()),
+                );
+                let resp = ui.interact(rect, ui.id().with(("activity_header", title)), Sense::hover());
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, enabled, title));
+                ui.ctx().accesskit_node_builder(resp.id, |node| {
+                    node.set_role(egui::accesskit::Role::ColumnHeader);
+                });
+                resp.id
+            };
+            let status_header = header_col(ui, "Status", hdr_rect.min.x + 14.0, file_col_x);
+            let file_header = header_col(ui, "File / Folder", file_col_x, details_col_x.min(time_right_x - time_header_w));
+            let details_header = header_col(ui, "Details", details_col_x, time_right_x - time_header_w - 16.0);
+            let time_header = header_col(ui, "Time", time_right_x - time_header_w, time_right_x);
 
             ui.painter().text(
                 egui::pos2(hdr_rect.min.x + 14.0, hdr_y),
                 egui::Align2::LEFT_CENTER,
                 "Status",
-                FontId::new(12.0, FontFamily::Proportional),
+                header_font.clone(),
                 TEXT_MUTED(),
             );
             ui.painter().text(
                 egui::pos2(file_col_x, hdr_y),
                 egui::Align2::LEFT_CENTER,
                 "File / Folder",
-                FontId::new(12.0, FontFamily::Proportional),
+                header_font.clone(),
                 TEXT_MUTED(),
             );
             // Details as far as Time leaves room, as the rows' details; none when zoomed in so far that it collapses
-            let header_font = FontId::new(12.0, FontFamily::Proportional);
-            let details_room = time_right_x - text_width(ui.painter(), "Time", &header_font) - 16.0 - details_col_x;
             ui.painter().text(
                 egui::pos2(details_col_x, hdr_y),
                 egui::Align2::LEFT_CENTER,
                 truncate_end_to_width(ui.painter(), "Details", &header_font, details_room),
-                header_font,
+                header_font.clone(),
                 TEXT_MUTED(),
             );
             ui.painter().text(
                 egui::pos2(time_right_x, hdr_y),
                 egui::Align2::RIGHT_CENTER,
                 "Time",
-                FontId::new(12.0, FontFamily::Proportional),
+                header_font,
                 TEXT_MUTED(),
             );
 
@@ -2718,7 +2736,7 @@ impl ProtonDriveNativeApp {
                         ui.add_space(16.0);
                         ui.label(RichText::new(text).size(13.0).color(TEXT_MUTED()));
                     } else {
-                        for act in &shown {
+                        for (row_idx, act) in shown.iter().enumerate() {
                             let kind = activity::activity_kind(&act.action, &act.details);
                             let key = activity_key(act);
                             let expanded = self.expanded_activity.as_ref().is_some_and(|e| e.key == key);
@@ -2858,7 +2876,28 @@ impl ProtonDriveNativeApp {
                             }
                             ui.ctx().accesskit_node_builder(row_resp.id, |node| {
                                 node.set_expanded(now_expanded);
+                                if !act.details.is_empty() {
+                                    node.set_description(act.details.as_str());
+                                }
                             });
+                            // Expose each column's full value to screen readers linked to its ColumnHeader without
+                            // intercepting hover or clicks on the row button (#380).
+                            let cell = |ui: &mut egui::Ui, what: &str, left: f32, right: f32, header_id: egui::Id, value: &str| {
+                                let rect = egui::Rect::from_min_max(
+                                    egui::pos2(left, row_rect.top()),
+                                    egui::pos2(right.max(left), row_rect.bottom()),
+                                );
+                                let resp = ui
+                                    .interact(rect, ui.id().with(("activity_cell", row_idx, what)), Sense::empty())
+                                    .labelled_by(header_id);
+                                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, enabled, value));
+                            };
+                            cell(ui, "status", pill_rect.left(), pill_rect.right(), status_header, pill_label);
+                            cell(ui, "file", r_file_x, (r_details_x - col_gap).min(time_left_x), file_header, &act.local_rel_path);
+                            if !act.details.is_empty() {
+                                cell(ui, "details", r_details_x, time_left_x, details_header, &act.details);
+                            }
+                            cell(ui, "time", r_time_right_x - time_w, r_time_right_x, time_header, &time_str);
                             if expanded {
                                 self.render_activity_details(ui, act);
                             }
@@ -6687,6 +6726,87 @@ mod tests {
         assert!(icon.max.x <= hint.min.x, "the glyph {icon:?} sits left of the hint {hint:?}");
         assert!((icon.center().y - hint.center().y).abs() < 4.0);
         assert_eq!(h.fill_under(hint.center()), Some(palette().input));
+    }
+
+    // #380: Activity's column headers (Status, File / Folder, Details, Time) are exposed as ColumnHeaders, and each
+    // row exposes its status, path, details, and relative timestamp to screen readers without breaking hover/click.
+    #[test]
+    fn activity_column_headers_and_rows_are_announced_to_screen_readers() {
+        use egui::accesskit::Role;
+        let mut h = Harness::new();
+        h.app.tab = NavTab::Activity;
+        let now = home::now_ms() as u64;
+        let long_path = "Projects/Quarterly/2026/VeryLongDocumentNameThatTruncatesInTheTable.pdf";
+        let records = vec![
+            ActivityRecord {
+                id: Some(1),
+                action: "upload".into(),
+                local_rel_path: "Docs/notes.md".into(),
+                details: "Uploaded to Proton Drive (2.4 KB)".into(),
+                timestamp: now - 120_000,
+            },
+            ActivityRecord {
+                id: Some(2),
+                action: "download".into(),
+                local_rel_path: long_path.into(),
+                details: "Downloaded from Proton Drive (14.2 MB)".into(),
+                timestamp: now - 3_600_000,
+            },
+        ];
+        h.app.activities = records.clone();
+        h.frames(3);
+
+        let first_row_y = h.text_at("Docs/notes.md").expect("first row painted").y;
+        for title in ["Status", "File / Folder", "Details", "Time"] {
+            let headers: Vec<_> = h
+                .nodes_named(title)
+                .into_iter()
+                .filter(|n| n.role() == Role::ColumnHeader)
+                .collect();
+            assert_eq!(headers.len(), 1, "expected one ColumnHeader named {title:?}");
+            assert_eq!(headers[0].value(), None, "{title:?} header carries its name in label only");
+            assert!(node_rect(&headers[0]).center().y < first_row_y, "{title:?} header sits above the rows");
+        }
+
+        let nodes = accesskit_nodes(&h);
+        for act in &records {
+            let status = activity::kind_label(activity::activity_kind(&act.action, &act.details));
+            let time = format_relative_timestamp(act.timestamp);
+            let row_btn = nodes
+                .iter()
+                .map(|(_, n)| n)
+                .find(|n| n.role() == Role::Button && says(n).contains(&act.local_rel_path))
+                .unwrap_or_else(|| panic!("missing row button for {:?}", act.local_rel_path));
+            assert_eq!(row_btn.description(), Some(act.details.as_str()));
+            assert_eq!(row_btn.is_expanded(), Some(false));
+
+            for (col, val) in [
+                ("Status", status),
+                ("File / Folder", act.local_rel_path.as_str()),
+                ("Details", act.details.as_str()),
+                ("Time", time.as_str()),
+            ] {
+                let matched = nodes
+                    .iter()
+                    .map(|(_, n)| n)
+                    .any(|n| n.role() == Role::Label && n.value() == Some(val) && labelled_by(&h, n) == vec![col.to_string()]);
+                assert!(matched, "row {:?}: cell {:?} should be labelled by column {:?}", act.local_rel_path, val, col);
+            }
+        }
+
+        // Hovering a truncated row still shows its tooltip, and clicking still expands it
+        let second_row = nodes
+            .iter()
+            .map(|(_, n)| n)
+            .find(|n| n.role() == Role::Button && says(n).contains(long_path))
+            .unwrap();
+        let pos = node_rect(second_row).center();
+        tooltips_at_once(&h);
+        hover(&mut h, pos);
+        let tip = format!("{long_path}\nDownloaded from Proton Drive (14.2 MB)");
+        assert!(h.text_at(&tip).is_some(), "hovering truncated Activity row still shows its tooltip");
+        h.click(pos);
+        assert!(h.app.expanded_activity.is_some(), "clicking Activity row still expands its details");
     }
 
     // #280: every chip and the search field stay inside the page at the smallest window and 120% zoom, run over
