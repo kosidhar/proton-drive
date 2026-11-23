@@ -8,7 +8,7 @@ use crate::home::{
     PROTON_DRIVE_WEB_URL, TRASH_BUTTON,
 };
 use crate::{
-    action_button, action_button_named, card_frame, focus_ring, icons, save_window_geometry, text_width, toggle_switch,
+    action_button, action_button_named, action_button_width, card_frame, focus_ring, icons, save_window_geometry, text_width, toggle_switch,
     ButtonKind, ProtonDriveNativeApp, WorkerCommand, BG_INPUT, BORDER_NORM, BORDER_SUBTLE, DANGER_TEXT,
     HIDDEN_NEEDS_RESTART, PROTON_PURPLE, PROTON_PURPLE_TEXT, TEXT_MUTED, TEXT_PRIMARY,
 };
@@ -117,37 +117,52 @@ fn row(
     let label_h = ui.fonts(|f| f.row_height(&label_font)).max(INFO_SIZE).max(ui.spacing().interact_size.y);
     let left_h = label_h + hint.map_or(0.0, |_| HINT_GAP + ui.fonts(|f| f.row_height(&hint_font)));
     let row_h = left_h.max(ROW_HEIGHT);
-    // Between the control and the label: the gap, and the item spacing egui puts after the control
     let gap = CONTROL_GAP + ui.spacing().item_spacing.x;
     let control_room = (width - need - gap).max(width * CONTROL_SHARE);
-    ui.allocate_ui_with_layout(Vec2::new(width, row_h), Layout::right_to_left(Align::Center), |ui| {
-        ui.set_min_size(Vec2::new(width, row_h));
-        let control = ui.scope(|ui| {
+    // Lay out label + ⓘ first (left to right for Tab and screen readers) while keeping the control right-aligned and
+    // giving the label every pixel the control doesn't use (#367).
+    let size_key = ui.id().with(("setting_row_ctrl_size", label));
+    let cached = ui.ctx().data(|d| d.get_temp::<Vec2>(size_key));
+    let (est_w, est_h) = match cached {
+        Some(sz) => (sz.x.min(control_room), sz.y.max(row_h)),
+        None => (control_room, row_h),
+    };
+    let label_w = (width - est_w - CONTROL_GAP).max(0.0);
+    let total_h = est_h.max(row_h);
+    let (_, row_rect) = ui.allocate_space(Vec2::new(width, total_h));
+    // The label level with the control's middle, or beside a control taller than the row (a text box), with its top line
+    let top = if total_h > row_h + 0.5 {
+        row_rect.top() + (row_h - left_h) / 2.0
+    } else {
+        row_rect.center().y - left_h / 2.0
+    };
+    let column = egui::Rect::from_min_max(
+        egui::pos2(row_rect.left(), top),
+        egui::pos2((row_rect.left() + label_w).min(row_rect.right()), top + left_h),
+    );
+    let label_resp = ui
+        .scope_builder(egui::UiBuilder::new().max_rect(column).layout(Layout::top_down(Align::Min)), |ui| {
+            label_column(ui, enabled, label, kind, hint, info)
+        })
+        .inner;
+    let ctrl_rect = egui::Rect::from_min_max(
+        egui::pos2((row_rect.right() - control_room).max(row_rect.left()), row_rect.top()),
+        row_rect.max,
+    );
+    let control_out = ui.scope_builder(
+        egui::UiBuilder::new().max_rect(ctrl_rect).layout(Layout::right_to_left(Align::Center)),
+        |ui| {
             ui.set_max_width(control_room);
             ui.add_enabled_ui(enabled, control).inner
-        });
-        let control_rect = control.response.rect;
-        ui.add_space(CONTROL_GAP);
-        // The label level with the control's middle (a picker sits a little off the row's), or, beside a control
-        // taller than the row (a text box), with its top line
-        let top = if control_rect.height() > row_h + 0.5 {
-            control_rect.top() + (row_h - left_h) / 2.0
-        } else {
-            control_rect.center().y - left_h / 2.0
-        };
-        let column = egui::Rect::from_min_max(
-            egui::pos2(ui.max_rect().left(), top),
-            egui::pos2(ui.available_rect_before_wrap().right().max(ui.max_rect().left()), top + left_h),
-        );
-        let label = ui
-            .scope_builder(egui::UiBuilder::new().max_rect(column).layout(Layout::top_down(Align::Min)), |ui| {
-                label_column(ui, enabled, label, kind, hint, info)
-            })
-            .inner;
-        name_control(ui, &control.inner, &label, info);
-        label
-    })
-    .inner
+        },
+    );
+    let actual = control_out.response.rect.size();
+    if cached.is_none_or(|c| (c.x - actual.x).abs() > 0.5 || (c.y - actual.y).abs() > 0.5) {
+        ui.ctx().data_mut(|d| d.insert_temp(size_key, actual));
+        ui.ctx().request_discard("setting_row_ctrl_size");
+    }
+    name_control(ui, &control_out.inner, &label_resp, info);
+    label_resp
 }
 
 /// Links `control` to its row's `label` and `info` for screen readers: controls without an explicit name of their own
@@ -501,31 +516,37 @@ impl ProtonDriveNativeApp {
                 ui.horizontal(|ui| {
                     paint_avatar(ui);
                     ui.add_space(6.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        sign_action(ui);
-                        ui.add_space(8.0);
-                        ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                            // The plan beside the name when the whole name fits beside it, else under the email
-                            let name_w = text_width(ui.painter(), &name, &FontId::proportional(NAME_SIZE));
-                            let beside = plan.is_some_and(|plan| {
-                                name_w + 4.0 + 2.0 * ui.spacing().item_spacing.x + plan_pill_width(ui, plan) <= ui.available_width()
-                            });
-                            ui.horizontal(|ui| {
-                                elided(ui, RichText::new(&name).size(NAME_SIZE).strong().color(TEXT_PRIMARY()), &name);
-                                if let Some(plan) = plan.filter(|_| beside) {
-                                    ui.add_space(4.0);
-                                    plan_pill(ui, plan);
-                                }
-                            });
-                            if !email.is_empty() {
-                                elided(ui, RichText::new(&email).size(12.5).color(TEXT_MUTED()), &email);
-                            }
-                            if let Some(plan) = plan.filter(|_| !beside) {
-                                ui.add_space(2.0);
+                    let btn_w = if self.status.logged_in {
+                        action_button_width(ui, Some(icons::SIGN_OUT), "Sign out")
+                    } else {
+                        action_button_width(ui, Some(icons::SIGN_IN), "Sign in")
+                    };
+                    let gap = 8.0 + ui.spacing().item_spacing.x;
+                    let text_w = (ui.available_width() - btn_w - gap).max(0.0);
+                    ui.allocate_ui_with_layout(Vec2::new(text_w, 44.0), Layout::top_down(Align::Min), |ui| {
+                        ui.set_min_width(text_w);
+                        // The plan beside the name when the whole name fits beside it, else under the email
+                        let name_w = text_width(ui.painter(), &name, &FontId::proportional(NAME_SIZE));
+                        let beside = plan.is_some_and(|plan| {
+                            name_w + 4.0 + 2.0 * ui.spacing().item_spacing.x + plan_pill_width(ui, plan) <= text_w
+                        });
+                        ui.horizontal(|ui| {
+                            elided(ui, RichText::new(&name).size(NAME_SIZE).strong().color(TEXT_PRIMARY()), &name);
+                            if let Some(plan) = plan.filter(|_| beside) {
+                                ui.add_space(4.0);
                                 plan_pill(ui, plan);
                             }
                         });
+                        if !email.is_empty() {
+                            elided(ui, RichText::new(&email).size(12.5).color(TEXT_MUTED()), &email);
+                        }
+                        if let Some(plan) = plan.filter(|_| !beside) {
+                            ui.add_space(2.0);
+                            plan_pill(ui, plan);
+                        }
                     });
+                    ui.add_space(8.0);
+                    sign_action(ui);
                 });
             }
             if let Some(cmd) = account_command {
