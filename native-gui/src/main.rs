@@ -2350,8 +2350,9 @@ impl ProtonDriveNativeApp {
                                     .map(|i| i.name.clone())
                                     .unwrap_or_else(|| rel_path.rsplit('/').next().unwrap_or(&rel_path).to_string());
                                 self.notice = Some(format!("Couldn't stop sharing {name}: {e}"));
+                            } else {
+                                self.shared.stop_error = Some(e);
                             }
-                            self.shared.stop_error = Some(e);
                         }
                     }
                 }
@@ -2392,20 +2393,20 @@ impl ProtonDriveNativeApp {
         }
     }
 
-    /// Shows a section, closing the account menu; Settings reads what is hidden as it opens.
+    /// Shows a section, closing the account menu; Settings and Shared read their lists on entry unless one is already running (#268).
     fn open_tab(&mut self, tab: NavTab) {
         self.account_menu_open = false;
         if tab == NavTab::Settings && self.tab != NavTab::Settings {
             self.load_hidden();
         }
-        if tab == NavTab::Shared && self.tab != NavTab::Shared {
+        if tab == NavTab::Shared && self.tab != NavTab::Shared && (!self.shared.loading || self.shared.stale) {
             self.load_shared();
         }
         self.tab = tab;
     }
 
-    /// Asks for what is shared. Each entry, Refresh and Retry asks again; only the newest read's answer is shown (older ones, which can
-    /// arrive later, are ignored).
+    /// Asks for what is shared. Refresh, Retry and share changes ask again; entering Shared reuses a read already in
+    /// flight (#268). Only the newest read's answer is shown (older ones, which can arrive later, are ignored).
     fn load_shared(&mut self) {
         let seq = self.shared.begin_load();
         let _ = self.tx.send(WorkerCommand::SharedLoad { seq });
@@ -9821,6 +9822,7 @@ mod tests {
         h.click(h.text_at("Shared").unwrap());
         assert_eq!(h.app.tab, NavTab::Shared);
         assert_eq!(h.sent(), ["shared list"]);
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(vec![])));
         h.frames(30);
         assert_eq!(h.sent(), Vec::<String>::new());
         h.click(h.text_at("Home").unwrap());
@@ -9883,13 +9885,66 @@ mod tests {
     }
 
     #[test]
+    fn entering_shared_while_a_read_is_running_reuses_it() {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared").unwrap());
+        assert_eq!(h.sent(), ["shared list"]);
+        let seq = h.app.shared.seq;
+        assert!(h.app.shared.loading);
+
+        // Switching away and back while that read is still out reuses it instead of starting another (#268)
+        h.click(h.text_at("Home").unwrap());
+        h.click(h.text_at("Shared").unwrap());
+        assert_eq!(h.sent(), Vec::<String>::new());
+        assert_eq!(h.app.shared.seq, seq);
+        assert!(h.app.shared.loading);
+        assert!(h.text_at(shared::LOADING).is_some());
+
+        h.click(h.text_at("Activity").unwrap());
+        h.click(h.text_at("Shared").unwrap());
+        assert_eq!(h.sent(), Vec::<String>::new());
+        assert_eq!(h.app.shared.seq, seq);
+
+        // Once it answers, the list shows and Refresh or a later re-entry starts a new read
+        let rows = shared_rows();
+        h.event(WorkerEvent::SharedLoaded(seq, Ok(rows.clone())));
+        h.frames(3);
+        assert!(!h.app.shared.loading);
+        assert!(h.text_at(&rows[0].name).is_some());
+
+        h.click(h.widget_at("Refresh").unwrap());
+        assert_eq!(h.sent(), ["shared list"]);
+        let refreshed = h.app.shared.seq;
+        assert_ne!(refreshed, seq);
+        h.event(WorkerEvent::SharedLoaded(refreshed, Ok(rows.clone())));
+        h.frames(3);
+
+        h.click(h.text_at("Home").unwrap());
+        h.click(h.text_at("Shared").unwrap());
+        assert_eq!(h.sent(), ["shared list"]);
+        assert_ne!(h.app.shared.seq, refreshed);
+
+        // If a Share window closes off-page while a read is running, returning to Shared starts a fresh read
+        let in_flight = h.app.shared.seq;
+        h.app.status.sync_dir = "/home/u/ProtonDrive".into();
+        h.click(h.text_at("Home").unwrap());
+        h.app.open_share("/home/u/ProtonDrive/Documents/report.pdf");
+        h.sent();
+        h.app.leave_share();
+        assert!(h.app.shared.stale);
+        h.click(h.text_at("Shared").unwrap());
+        assert_eq!(h.sent(), ["shared list"]);
+        assert_ne!(h.app.shared.seq, in_flight);
+        assert!(!h.app.shared.stale);
+    }
+
+    #[test]
     fn only_the_newest_read_is_shown() {
         let mut h = Harness::new();
         h.click(h.text_at("Shared").unwrap());
         let old = h.app.shared.seq;
-        // Leaving and entering again while that read is out: a second read
-        h.click(h.text_at("Home").unwrap());
-        h.click(h.text_at("Shared").unwrap());
+        // A second read started while the first is still out (for instance after a Share change lands)
+        h.app.load_shared();
         let new = h.app.shared.seq;
         assert_ne!(old, new);
         let rows = shared_rows();

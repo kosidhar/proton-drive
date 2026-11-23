@@ -378,6 +378,8 @@ pub struct SharedPage {
     pub copied: Option<String>,
     /// Why the last Stop sharing failed, shown above the list (which stays)
     pub stop_error: Option<String>,
+    /// Set when sharing may have changed off-page while a read is already running, so entering Shared starts a fresh read
+    pub stale: bool,
 }
 
 impl SharedPage {
@@ -385,6 +387,7 @@ impl SharedPage {
     pub fn begin_load(&mut self) -> u64 {
         self.seq += 1;
         self.loading = true;
+        self.stale = false;
         self.error = None;
         self.copied = None;
         self.stop_error = None;
@@ -397,6 +400,7 @@ impl SharedPage {
             return;
         }
         self.loading = false;
+        self.stale = false;
         match result {
             Ok(items) => {
                 self.items = Some(items);
