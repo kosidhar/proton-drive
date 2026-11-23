@@ -1142,8 +1142,9 @@ fn shared_list(ui: &mut egui::Ui, items: &[shared::SharedItem], now_ms: i64, sto
         // Name: a folder's or a file's icon, then the name
         let name_cell = cell(name_x, name_w);
         let p = in_cell(name_cell);
-        let icon_color = if shared::name_icon(&item.name) == icons::FOLDER { FOLDER_ICON() } else { TEXT_MUTED() };
-        p.text(egui::pos2(name_x, y), egui::Align2::LEFT_CENTER, shared::name_icon(&item.name), icons::font(BUTTON_ICON_SIZE), icon_color);
+        let icon = shared::item_icon(item);
+        let icon_color = if icon == icons::FOLDER { FOLDER_ICON() } else { TEXT_MUTED() };
+        p.text(egui::pos2(name_x, y), egui::Align2::LEFT_CENTER, icon, icons::font(BUTTON_ICON_SIZE), icon_color);
         let name = truncate_middle_to_width(&p, &item.name, &name_font, name_w - ICON_ROOM);
         p.text(egui::pos2(name_x + ICON_ROOM, y), egui::Align2::LEFT_CENTER, name, name_font.clone(), TEXT_PRIMARY());
         describe(name_cell, "name", name_header, &item.name, &whole);
@@ -9831,6 +9832,48 @@ mod tests {
 
     fn shared_rows() -> Vec<shared::SharedItem> {
         shared::fake_shared("list", home::now_ms()).unwrap().unwrap()
+    }
+
+    // #282: Shared rows draw a dotted folder name with the folder icon and an extensionless file with the file icon,
+    // falling back to the name when the daemon didn't say
+    #[test]
+    fn shared_draws_folder_and_file_icons_from_kind_with_name_fallback() {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared").unwrap());
+        let row = |uid: &str, name: &str, kind: Option<shared::ItemKind>| shared::SharedItem {
+            uid: uid.into(),
+            name: name.into(),
+            kind,
+            rel_path: Some(name.into()),
+            place: shared::Place::MyFiles,
+            link: None,
+            people: 1,
+            unreadable: None,
+        };
+        let rows = vec![
+            row("v~1", "v1.2 notes", Some(shared::ItemKind::Folder)),
+            row("v~2", "Makefile", Some(shared::ItemKind::File)),
+            row("v~3", "legacy.pdf", None),
+            row("v~4", "LegacyFolder", None),
+        ];
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(rows)));
+        h.frames(3);
+
+        let check_row = |name: &str, expected_icon: &str, other_icon: &str, expected_color: Color32| {
+            let y = h.text_at(name).unwrap_or_else(|| panic!("{name} is painted")).y;
+            let icon_rect = on_line(&h, expected_icon, y)
+                .unwrap_or_else(|| panic!("{name} should be drawn with icon {expected_icon:?}"));
+            assert!(
+                on_line(&h, other_icon, y).is_none(),
+                "{name} should not be drawn with icon {other_icon:?}"
+            );
+            assert_eq!(painted_color(&h, expected_icon, icon_rect.center()), Some(expected_color), "{name} icon color");
+        };
+
+        check_row("v1.2 notes", icons::FOLDER, icons::FILE, FOLDER_ICON());
+        check_row("Makefile", icons::FILE, icons::FOLDER, TEXT_MUTED());
+        check_row("legacy.pdf", icons::FILE, icons::FOLDER, TEXT_MUTED());
+        check_row("LegacyFolder", icons::FOLDER, icons::FILE, FOLDER_ICON());
     }
 
     #[test]

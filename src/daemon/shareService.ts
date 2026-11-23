@@ -1,6 +1,7 @@
 import {
     ConnectionError,
     MemberRole,
+    NodeType,
     RateLimitedError,
     type MaybeMissingNode,
     type ProtonDriveClient,
@@ -26,11 +27,14 @@ export class ListCancelled extends ShareError {
 }
 
 export type SharedPlace = 'my-files' | 'hidden' | 'elsewhere';
+export type SharedKind = 'file' | 'folder';
 
 export interface SharedItem {
     // The node uid the server listed: stopping sharing names it, so it acts on this item and not on whatever is at its path later
     uid: string;
     name: string;
+    // File or folder from the loaded node; omitted when the node couldn't be loaded (#282)
+    kind?: SharedKind;
     relPath: string | null;
     where: SharedPlace;
     link: ShareInfo['link'];
@@ -294,6 +298,8 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                         };
                     }
                     const name = n.name.ok ? n.name.value : indexedName(n.uid);
+                    const kindField: { kind?: SharedKind } =
+                        n.type === NodeType.Folder ? { kind: 'folder' } : n.type === NodeType.File ? { kind: 'file' } : {};
                     let relPath: string | null = null;
                     let where: SharedPlace = 'elsewhere';
                     try {
@@ -306,7 +312,7 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                             result = await sdk.getSharingInfo(n.uid);
                         } catch (e) {
                             if (failsTheList(e)) throw e;
-                            return { uid: n.uid, name, relPath, where, link: null, people: 0, unreadable: "Proton Drive couldn't say how this item is shared" };
+                            return { uid: n.uid, name, ...kindField, relPath, where, link: null, people: 0, unreadable: "Proton Drive couldn't say how this item is shared" };
                         }
                         // The server just listed it as shared, but the SDK reads the node's share from its cache, which learns
                         // of a share made elsewhere only from its events: listed, never left out, as nothing public may be hidden
@@ -314,6 +320,7 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                             return {
                                 uid: n.uid,
                                 name,
+                                ...kindField,
                                 relPath,
                                 where,
                                 link: null,
@@ -321,12 +328,12 @@ export function createShareService(deps: ShareServiceDeps): ShareService {
                                 unreadable: 'Proton Drive is still catching up with this item: refresh in a moment',
                             };
                         }
-                        return { uid: n.uid, name, relPath, where, link: toInfo(result).link, people: everyone(result).length };
+                        return { uid: n.uid, name, ...kindField, relPath, where, link: toInfo(result).link, people: everyone(result).length };
                     } catch (e) {
                         if (failsTheList(e)) throw e;
                         // An error on this computer (the index, say) with one item: that item alone is unreadable. The list has no
                         // logger, and nothing about the item (its link, the people on it) belongs in a log anyway
-                        return { uid: n.uid, name, relPath, where, link: null, people: 0, unreadable: "Proton Drive couldn't read this item on this computer" };
+                        return { uid: n.uid, name, ...kindField, relPath, where, link: null, people: 0, unreadable: "Proton Drive couldn't read this item on this computer" };
                     }
                 }
 
