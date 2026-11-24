@@ -7315,6 +7315,8 @@ export class ProtonDriveSyncEngine {
         // Its local copy is gone, so no record under it may be left (say, for a file deleted while it was hiding)
         this.clearPendingUploadsWithin(relPath);
         await this.dropRecordsWithoutFiles(relPath);
+        // Emit again after local removal completes so listeners (e.g. VFS) observe the finished hide even if removal took >250ms (#408)
+        this.stateEvents.touchSubtree(relPath);
         this.stateDb.logActivity({
             action: 'hide',
             localRelPath: relPath,
@@ -7348,6 +7350,8 @@ export class ProtonDriveSyncEngine {
         } catch (error: unknown) {
             this.logger.warn(`Could not read ${relPath} again for the remote index: ${error}`);
         }
+        // Emit after re-indexing completes so VFS sees the unhidden entry even if getNode/index took >250ms (#408)
+        this.stateEvents.touchSubtree(relPath);
         return this.availabilityResult(relPath);
     }
 

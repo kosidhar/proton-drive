@@ -35,6 +35,11 @@ impl Inodes {
         ino
     }
 
+    /// The path's number, if one has already been assigned (without assigning a new one).
+    pub fn existing_ino(&self, rel: &Path) -> Option<u64> {
+        self.by_path.get(rel).copied()
+    }
+
     pub fn path_of(&self, ino: u64) -> Option<PathBuf> {
         self.by_ino.get(&ino).cloned()
     }
@@ -64,6 +69,14 @@ impl Inodes {
             if let Some(ino) = self.by_path.remove(&path) {
                 self.by_ino.remove(&ino);
             }
+        }
+    }
+
+    /// Removes `rel` and its subtree only if `rel` still maps to `expected_ino` (so a fallback cleanup cannot remove
+    /// an inode allocated for a newly created item at the same path).
+    pub fn remove_if_ino(&mut self, rel: &Path, expected_ino: u64) {
+        if self.by_path.get(rel) == Some(&expected_ino) {
+            self.remove(rel);
         }
     }
 }
