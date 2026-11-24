@@ -13180,6 +13180,66 @@ mod tests {
         assert_eq!(h.sent(), vec![format!("share remove {SHARED} sam@proton.me")]);
     }
 
+    // #224: at 840x540, the Share window heading carries the count ("Who has access (N)") and a solid, non-overlapping
+    // scrollbar is painted when content overflows, while an empty list omits "(0)" and hides the scrollbar when it fits.
+    #[test]
+    fn who_has_access_heading_shows_people_count_and_is_visible_at_840_by_540() {
+        let clipped_text = |h: &Harness, text: &str| -> Option<(egui::Rect, egui::Rect)> {
+            fn find(shape: &egui::Shape, text: &str) -> Option<egui::Rect> {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == text => Some(t.visual_bounding_rect()),
+                    egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, text)),
+                    _ => None,
+                }
+            }
+            h.last.as_ref()?.shapes.iter().find_map(|c| find(&c.shape, text).map(|r| (r, c.clip_rect)))
+        };
+        let scrollbar_handles = |h: &Harness| -> Vec<egui::Rect> {
+            h.rects_filled(BORDER_NORM())
+                .into_iter()
+                .filter(|r| (4.0..=14.0).contains(&r.width()) && r.height() >= 20.0)
+                .collect()
+        };
+
+        // Empty list at 1440x900: plain heading, no "(0)", and no scrollbar painted when content fits
+        let mut h = share_window(Some(share::ShareInfo::default()));
+        h.frames(10);
+        assert!(h.text_at("Who has access").is_some(), "empty people list keeps plain heading");
+        assert!(h.text_at("Who has access (0)").is_none(), "no (0) when no one else has access");
+        assert!(scrollbar_handles(&h).is_empty(), "no scrollbar painted when Share window fits without overflowing");
+
+        // Single person boundary: "Who has access (1)"
+        let one = share::ShareInfo {
+            link: None,
+            people: vec![share_person("alex@proton.me", share::Role::Editor, share::PersonState::Member)],
+        };
+        let h = share_window(Some(one));
+        assert!(h.text_at("Who has access (1)").is_some(), "single person shows (1)");
+
+        // Three people at 840x540: heading is unclipped inside the scroll viewport and a non-overlapping solid scrollbar appears
+        let mut h = share_window(Some(with_people()));
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.0);
+        h.frames(10);
+        let (heading, clip) = clipped_text(&h, "Who has access (3)").expect("heading carries people count");
+        assert!(heading.bottom() <= clip.max.y, "heading {heading:?} is unclipped inside scroll viewport {clip:?}");
+        let handles = scrollbar_handles(&h);
+        assert_eq!(handles.len(), 1, "one visible solid scrollbar handle painted when overflowing");
+        let copy = h.text_rect("Copy link").expect("Copy link button");
+        let invite = h.text_rect("Invite").expect("Invite button");
+        assert!(copy.right() < handles[0].left(), "Copy link {copy:?} stays clear of scrollbar {:?}", handles[0]);
+        assert!(invite.right() < handles[0].left(), "Invite {invite:?} stays clear of scrollbar {:?}", handles[0]);
+
+        // Also with a link that has a password and expiry (the tallest link section)
+        let mut info = with_people();
+        info.link = Some(share_link(true, Some(home::now_ms() + 7 * 86_400_000)));
+        let mut h = share_window(Some(info));
+        h.resize_zoomed(Vec2::new(840.0, 540.0), 1.0);
+        h.frames(10);
+        let (heading, clip) = clipped_text(&h, "Who has access (3)").expect("heading carries count with password+expiry");
+        assert!(heading.bottom() <= clip.max.y, "heading {heading:?} is unclipped inside viewport {clip:?}");
+        assert_eq!(scrollbar_handles(&h).len(), 1, "visible solid scrollbar painted with password+expiry too");
+    }
+
     #[test]
     fn a_role_change_shows_at_once_and_a_refusal_reads_the_roles_again() {
         let mut h = share_window(Some(with_people()));

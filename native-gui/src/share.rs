@@ -994,16 +994,28 @@ impl ProtonDriveNativeApp {
         let mut actions = Vec::new();
         let mut close = escape && w.confirm.is_none();
         ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
-        // A thin bar that stays visible: on a small screen, Who has access can be below the fold
-        ui.spacing_mut().scroll = egui::style::ScrollStyle::thin();
-        // As high as it may be at once, not only as high as last frame's window was (an Area's contents get that):
-        // it then shrinks to what it holds
-        ScrollArea::vertical()
-            .id_salt("share_scroll")
-            .max_height(body_height)
-            .min_scrolled_height(body_height)
-            .auto_shrink([false, true])
-            .show(ui, |ui| share_body(w, ui, &owner, now, &mut actions));
+        // A solid, non-overlapping scrollbar in muted tones whenever content overflows so people below the fold are obvious (#224)
+        let saved_widgets = ui.visuals().widgets.clone();
+        ui.scope(|ui| {
+            let mut scroll = egui::style::ScrollStyle::solid();
+            scroll.foreground_color = true;
+            ui.spacing_mut().scroll = scroll;
+            let widgets = &mut ui.visuals_mut().widgets;
+            widgets.inactive.fg_stroke.color = BORDER_NORM();
+            widgets.hovered.fg_stroke.color = TEXT_MUTED();
+            widgets.active.fg_stroke.color = TEXT_PRIMARY();
+            // As high as it may be at once, not only as high as last frame's window was (an Area's contents get that):
+            // it then shrinks to what it holds
+            ScrollArea::vertical()
+                .id_salt("share_scroll")
+                .max_height(body_height)
+                .min_scrolled_height(body_height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.visuals_mut().widgets = saved_widgets;
+                    share_body(w, ui, &owner, now, &mut actions);
+                });
+        });
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(6.0);
@@ -1419,7 +1431,11 @@ fn invite_section(w: &mut ShareWindow, ui: &mut egui::Ui, actions: &mut Vec<Acti
 
 /// You, then everyone with access or invited, each with their role and ×.
 fn people_section(w: &mut ShareWindow, ui: &mut egui::Ui, people: &[SharePerson], owner: &str, actions: &mut Vec<Action>) {
-    section_title(ui, "Who has access");
+    if people.is_empty() {
+        section_title(ui, "Who has access");
+    } else {
+        section_title(ui, &format!("Who has access ({})", people.len()));
+    }
     ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.set_min_height(ROW_HEIGHT);
