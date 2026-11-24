@@ -105,7 +105,7 @@ const MAX_EXPIRY_YEARS: i64 = 10;
 /// Reading how an item is shared asks Proton's servers, through the daemon.
 const SHARE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// A change can take longer: inviting many people is a request for each.
-const SHARE_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const SHARE_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Why the window can't share what a start named (`--share`), in its words: Files says the same for the two it can meet.
 pub fn refusal(problem: PathProblem) -> &'static str {
@@ -300,7 +300,17 @@ fn share_request_with_timeout_message(
 
 /// A change: what it answers is read again with GET /share/info, as after every change.
 fn share_change(socket: &Path, method: &str, route: &str, body: serde_json::Value) -> Result<(), String> {
-    share_request(socket, method, route, Some(&body), SHARE_WRITE_TIMEOUT).map(|_| ())
+    share_change_with_timeout(socket, method, route, body, SHARE_WRITE_TIMEOUT)
+}
+
+pub(crate) fn share_change_with_timeout(
+    socket: &Path,
+    method: &str,
+    route: &str,
+    body: serde_json::Value,
+    read_timeout: Duration,
+) -> Result<(), String> {
+    share_request(socket, method, route, Some(&body), read_timeout).map(|_| ())
 }
 
 /// How the item is shared (GET /share/info).
@@ -449,16 +459,28 @@ static NEXT_WINDOW: AtomicU64 = AtomicU64::new(1);
 /// A change a window sent, still out when the window was closed or replaced (closing never waits): if it fails, the
 /// app's notice says so, since no window is left to.
 pub struct LeftChange {
-    window: WindowId,
+    pub(crate) window: WindowId,
     rel_path: String,
     name: String,
     change: Change,
 }
 
 impl LeftChange {
-    /// What the notice says when it failed.
-    fn failed(&self, problem: &str) -> String {
+    /// What the notice says when it failed, or timed out waiting for the daemon (#228).
+    pub(crate) fn failed(&self, problem: &str) -> String {
         let name = &self.name;
+        if problem == STILL_WORKING {
+            let action = match &self.change {
+                Change::LinkOn => format!("turning on the link to {name}"),
+                Change::LinkOff => format!("stopping the link to {name}"),
+                Change::Password => format!("changing the password of the link to {name}"),
+                Change::Expiry => format!("changing when the link to {name} expires"),
+                Change::Invite => format!("inviting people to {name}"),
+                Change::Role(email) => format!("changing {email}'s access to {name}"),
+                Change::RemovePerson(email) => format!("removing {email}'s access to {name}"),
+            };
+            return format!("Didn't hear back about {action}: open Share again to check");
+        }
         match &self.change {
             Change::LinkOn => format!("Couldn't turn on the link to {name}: {problem}"),
             Change::LinkOff => format!("Couldn't stop sharing the link to {name}: {problem}"),
@@ -946,7 +968,7 @@ impl ProtonDriveNativeApp {
         };
         let left = self.share_left.remove(i);
         if let Err(problem) = result {
-            self.notice = Some(left.failed(&problem));
+            self.share_notices.push(left.failed(&problem));
         }
         // The Shared section read the list when the window closed, perhaps before this change landed (#253)
         if self.tab == crate::NavTab::Shared {
@@ -1634,5 +1656,34 @@ mod tests {
             serde_json::json!({ "path": "a.pdf", "expiresAt": 1_800_000_000_000_i64 })
         );
         assert_eq!(settings_body("a.pdf", None, Some(None)), serde_json::json!({ "path": "a.pdf", "expiresAt": null }));
+    }
+
+    #[test]
+    fn left_change_timeout_wording_covers_every_change_without_contradicting_itself() {
+        let cases = [
+            (Change::LinkOn, "Didn't hear back about turning on the link to report.pdf: open Share again to check"),
+            (Change::LinkOff, "Didn't hear back about stopping the link to report.pdf: open Share again to check"),
+            (
+                Change::Password,
+                "Didn't hear back about changing the password of the link to report.pdf: open Share again to check",
+            ),
+            (
+                Change::Expiry,
+                "Didn't hear back about changing when the link to report.pdf expires: open Share again to check",
+            ),
+            (Change::Invite, "Didn't hear back about inviting people to report.pdf: open Share again to check"),
+            (
+                Change::Role("alex@proton.me".into()),
+                "Didn't hear back about changing alex@proton.me's access to report.pdf: open Share again to check",
+            ),
+            (
+                Change::RemovePerson("sam@proton.me".into()),
+                "Didn't hear back about removing sam@proton.me's access to report.pdf: open Share again to check",
+            ),
+        ];
+        for (change, expected) in cases {
+            let left = LeftChange { window: WindowId(1), rel_path: "Docs/report.pdf".into(), name: "report.pdf".into(), change };
+            assert_eq!(left.failed(STILL_WORKING), expected);
+        }
     }
 }
