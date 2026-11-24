@@ -542,6 +542,8 @@ pub struct ShareWindow {
     loading: bool,
     /// Sequence number of the latest read started by this window; older answers are dropped (#229)
     pub(crate) load_seq: u64,
+    /// Sequence number of the latest password Show request; older answers are dropped (#404)
+    pub(crate) password_seq: u64,
     /// A change is out: the window waits for it
     busy: Option<Change>,
     /// Why the last change, or what was typed for it, was refused; shown under its section
@@ -572,6 +574,7 @@ impl ShareWindow {
             resolved: false,
             loading: false,
             load_seq: 0,
+            password_seq: 0,
             busy: None,
             error: None,
             password: PasswordView::Hidden,
@@ -618,13 +621,19 @@ impl ShareWindow {
             return None;
         }
         self.error = None;
+        self.reset_password();
         Some(self.load())
     }
 
     /// A change sent from a window since closed, for this item, was answered: what this window read may be from before
-    /// it, so it reads again (unless its own change is out: the read after that one comes anyway).
+    /// it, so it hides any shown/loading password and reads again (unless its own change is out: the read after that
+    /// one comes anyway).
     fn changed_elsewhere(&mut self, rel_path: &str) -> Option<WorkerCommand> {
-        (self.resolved && !self.rel_path.is_empty() && self.rel_path == rel_path && self.busy.is_none()).then(|| self.load())
+        if !self.resolved || self.rel_path.is_empty() || self.rel_path != rel_path {
+            return None;
+        }
+        self.reset_password();
+        self.busy.is_none().then(|| self.load())
     }
 
     /// Works out the item's path inside My files from the sync folder the daemon reported, once, and asks how it is
@@ -672,10 +681,15 @@ impl ShareWindow {
         self.info.as_ref()?.as_ref().ok()?.link.as_ref()
     }
 
+    fn reset_password(&mut self) {
+        self.password_seq += 1;
+        self.password = PasswordView::Hidden;
+    }
+
     /// A change goes out: the window waits for it, and a shown password is hidden again (it may be about to change).
     fn start(&mut self, change: Change) {
         if matches!(change, Change::LinkOn | Change::LinkOff | Change::Password) {
-            self.password = PasswordView::Hidden;
+            self.reset_password();
         }
         self.load_seq += 1;
         self.loading = false;
@@ -725,11 +739,12 @@ impl ShareWindow {
                 }
             },
             Action::ShowPassword => {
+                self.password_seq += 1;
                 self.password = PasswordView::Loading;
-                Some(WorkerCommand::SharePassword { window, rel_path })
+                Some(WorkerCommand::SharePassword { window, seq: self.password_seq, rel_path })
             }
             Action::HidePassword => {
-                self.password = PasswordView::Hidden;
+                self.reset_password();
                 None
             }
             Action::EditPassword => {
@@ -809,6 +824,7 @@ impl ShareWindow {
             }
             Action::Retry => {
                 self.error = None;
+                self.reset_password();
                 Some(self.load())
             }
         }
@@ -822,7 +838,7 @@ impl ShareWindow {
         self.loading = false;
         if !matches!(&result, Ok(ShareInfo { link: Some(link), .. }) if link.has_password) {
             // No link, or no password: nothing to show
-            self.password = PasswordView::Hidden;
+            self.reset_password();
         }
         self.info = Some(result);
     }
@@ -849,9 +865,9 @@ impl ShareWindow {
         self.load()
     }
 
-    /// The password Show asked for, unless it was hidden again or the link changed meanwhile.
-    fn password_arrived(&mut self, result: Result<Option<String>, String>) {
-        if self.password != PasswordView::Loading {
+    /// The password Show asked for, unless it was hidden again, superseded by a newer Show, or the link changed meanwhile (#404).
+    fn password_arrived(&mut self, seq: u64, result: Result<Option<String>, String>) {
+        if seq != self.password_seq || self.password != PasswordView::Loading {
             return;
         }
         self.password = match result {
@@ -981,9 +997,9 @@ impl ProtonDriveNativeApp {
         }
     }
 
-    pub(crate) fn share_password(&mut self, window: WindowId, result: Result<Option<String>, String>) {
+    pub(crate) fn share_password(&mut self, window: WindowId, seq: u64, result: Result<Option<String>, String>) {
         if let Some(w) = self.share_for(window) {
-            w.password_arrived(result);
+            w.password_arrived(seq, result);
         }
     }
 

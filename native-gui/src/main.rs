@@ -1532,7 +1532,7 @@ enum WorkerCommand {
     ShareRole { window: share::WindowId, rel_path: String, email: String, role: share::Role },
     ShareRemovePerson { window: share::WindowId, rel_path: String, email: String },
     /// The link's password, only when Show is clicked (a read)
-    SharePassword { window: share::WindowId, rel_path: String },
+    SharePassword { window: share::WindowId, seq: u64, rel_path: String },
 }
 
 /// Set once in `main` when the app only renders a screenshot: nothing that changes anything is ever sent then, and
@@ -1674,7 +1674,7 @@ enum WorkerEvent {
     /// A change made in that Share window went through, or why not
     ShareDone(share::WindowId, Result<(), String>),
     /// The link's password (None when Proton Drive can't show it here), or why it couldn't be read
-    SharePassword(share::WindowId, Result<Option<String>, String>),
+    SharePassword(share::WindowId, u64, Result<Option<String>, String>),
 }
 
 /// A line telling how something went: done, or why not.
@@ -2373,7 +2373,7 @@ impl ProtonDriveNativeApp {
                 }
                 WorkerEvent::ShareLoaded(window, seq, result) => self.share_loaded(window, seq, result),
                 WorkerEvent::ShareDone(window, result) => self.share_done(window, result),
-                WorkerEvent::SharePassword(window, result) => self.share_password(window, result),
+                WorkerEvent::SharePassword(window, seq, result) => self.share_password(window, seq, result),
                 WorkerEvent::PinnedSummary(result) => self.pinned_summary_loaded(result),
                 WorkerEvent::AvailabilityDone { path, result } => {
                     if let Some(i) = self.working.iter().position(|w| w == &path) {
@@ -4997,8 +4997,8 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
             WorkerCommand::ShareLoad { window, seq, rel_path } => off_thread(&tx, &ctx, move || {
                 WorkerEvent::ShareLoaded(window, seq, share::info_at(&control_socket_path(), &rel_path))
             }),
-            WorkerCommand::SharePassword { window, rel_path } => off_thread(&tx, &ctx, move || {
-                WorkerEvent::SharePassword(window, share::password_at(&control_socket_path(), &rel_path))
+            WorkerCommand::SharePassword { window, seq, rel_path } => off_thread(&tx, &ctx, move || {
+                WorkerEvent::SharePassword(window, seq, share::password_at(&control_socket_path(), &rel_path))
             }),
             WorkerCommand::ShareEnsureLink { window, rel_path } => off_thread(&tx, &ctx, move || {
                 WorkerEvent::ShareDone(window, share::ensure_link_at(&control_socket_path(), &rel_path))
@@ -9069,7 +9069,7 @@ mod tests {
             // The Shared section's read and its Stop sharing (#253)
             WorkerCommand::SharedLoad { seq: 1 },
             WorkerCommand::SharedStop { rel_path: "a.pdf".into(), uid: "vol~a".into() },
-            WorkerCommand::SharePassword { window, rel_path: "a.pdf".into() },
+            WorkerCommand::SharePassword { window, seq: 1, rel_path: "a.pdf".into() },
             WorkerCommand::ShareEnsureLink { window, rel_path: "a.pdf".into() },
             WorkerCommand::ShareSettings { window, rel_path: "a.pdf".into(), password: Some(None), expires_at: None },
             WorkerCommand::ShareRemoveLink { window, rel_path: "a.pdf".into() },
@@ -13215,7 +13215,8 @@ mod tests {
         h.click(in_row(&h, "Password", "Show"));
         assert_eq!(h.sent(), vec![format!("share password {SHARED}")]);
         assert!(h.text_at("hunter2").is_none());
-        h.event(WorkerEvent::SharePassword(shown(&h), Ok(Some("hunter2".into()))));
+        let seq = window(&mut h).password_seq;
+        h.event(WorkerEvent::SharePassword(shown(&h), seq, Ok(Some("hunter2".into()))));
         assert!(h.text_at("hunter2").is_some());
         h.click(in_row(&h, "Password", "Hide"));
         assert!(h.text_at("hunter2").is_none());
@@ -13225,8 +13226,104 @@ mod tests {
         // An older link's password, which Proton Drive can't show here
         h.click(in_row(&h, "Password", "Show"));
         assert_eq!(h.sent(), vec![format!("share password {SHARED}")]);
-        h.event(WorkerEvent::SharePassword(shown(&h), Ok(None)));
+        let seq = window(&mut h).password_seq;
+        h.event(WorkerEvent::SharePassword(shown(&h), seq, Ok(None)));
         assert!(h.text_at(share::CANT_SHOW_PASSWORD).is_some());
+    }
+
+    // #404: a slow Show answer from before changing or hiding the password must not land in a later Show.
+    #[test]
+    fn two_password_reads_answered_out_of_order_keep_the_newer_one() {
+        let take_share_password = |h: &Harness| -> (share::WindowId, u64, String) {
+            let mut cmds: Vec<_> = h.commands.try_iter().collect();
+            assert_eq!(cmds.len(), 1, "expected a single SharePassword command");
+            match cmds.remove(0) {
+                WorkerCommand::SharePassword { window, seq, rel_path } => (window, seq, rel_path),
+                _ => panic!("expected SharePassword command"),
+            }
+        };
+
+        // Case A: Show -> Change password -> Show; older answer (Ok or Err) arrives first while Loading, then newer arrives
+        let info = share::ShareInfo { link: Some(share_link(true, None)), people: vec![] };
+        let mut h = share_window(Some(info.clone()));
+        h.click(in_row(&h, "Password", "Show"));
+        let (win1, seq1, path1) = take_share_password(&h);
+        assert_eq!((win1, path1.as_str()), (shown(&h), SHARED));
+
+        h.click(in_row(&h, "Password", "Change"));
+        window(&mut h).password_editor = Some("new-pass".into());
+        h.frames(2);
+        h.click(h.text_at("Save").unwrap());
+        assert_eq!(h.sent().len(), 1);
+        h.event(WorkerEvent::ShareDone(shown(&h), Ok(())));
+        assert_eq!(h.sent(), vec![format!("share info {SHARED}")]);
+        h.event(WorkerEvent::ShareLoaded(shown(&h), share_seq(&h), Ok(info)));
+
+        h.click(in_row(&h, "Password", "Show"));
+        let (win2, seq2, path2) = take_share_password(&h);
+        assert_eq!((win2, path2.as_str()), (shown(&h), SHARED));
+        assert_ne!(seq1, seq2, "second Show carries a newer sequence number");
+
+        h.event(WorkerEvent::SharePassword(shown(&h), seq1, Ok(Some("old-pass".into()))));
+        assert!(h.text_at("old-pass").is_none(), "stale password must not be shown");
+        assert!(h.text_at("Loading…").is_some(), "window still waits for the newer Show");
+        h.event(WorkerEvent::SharePassword(shown(&h), seq1, Err("Proton Drive is offline".into())));
+        assert!(h.text_at("Proton Drive is offline").is_none(), "stale error must not land");
+        assert!(h.text_at("Loading…").is_some(), "window still waits after stale error");
+
+        h.event(WorkerEvent::SharePassword(shown(&h), seq2, Ok(Some("new-pass".into()))));
+        assert!(h.text_at("new-pass").is_some(), "newer Show lands cleanly");
+        // Late stale reply after newer Show already landed is also ignored
+        h.event(WorkerEvent::SharePassword(shown(&h), seq1, Ok(Some("old-pass".into()))));
+        assert!(h.text_at("new-pass").is_some());
+        assert!(h.text_at("old-pass").is_none());
+
+        // Case B: Show -> Hide -> Show; older answer arrives after Hide + second Show
+        let info = share::ShareInfo { link: Some(share_link(true, None)), people: vec![] };
+        let mut h = share_window(Some(info));
+        h.click(in_row(&h, "Password", "Show"));
+        let (_, seq1, _) = take_share_password(&h);
+        // Simulate Hide while loading via act (or once shown -> Hide -> Show)
+        let cmd = window(&mut h).act(share::Action::HidePassword, home::now_ms(), home::local_offset_secs);
+        assert!(cmd.is_none());
+        h.frames(2);
+        h.click(in_row(&h, "Password", "Show"));
+        let (_, seq2, _) = take_share_password(&h);
+        assert_ne!(seq1, seq2, "Hide + Show advances sequence number");
+        h.event(WorkerEvent::SharePassword(shown(&h), seq1, Ok(Some("stale".into()))));
+        assert!(h.text_at("stale").is_none(), "stale answer after Hide+Show is dropped");
+        h.event(WorkerEvent::SharePassword(shown(&h), seq2, Ok(Some("fresh".into()))));
+        assert!(h.text_at("fresh").is_some(), "fresh answer lands");
+
+        // Case C: a closed window's password change finishes while the reopened window has a Show in flight, and the
+        // refreshed ShareInfo still has `has_password: true`: the pre-change Show is invalidated and hidden.
+        let info = share::ShareInfo { link: Some(share_link(true, None)), people: vec![] };
+        let mut h = share_window(Some(info.clone()));
+        let closed = shown(&h);
+        h.click(in_row(&h, "Password", "Change"));
+        window(&mut h).password_editor = Some("after".into());
+        h.frames(2);
+        h.click(h.text_at("Save").unwrap());
+        assert_eq!(h.sent().len(), 1);
+        h.click(h.text_at("Done").unwrap());
+        h.app.open_share("/home/u/ProtonDrive/Docs/report.pdf");
+        assert_eq!(h.sent(), vec![format!("share info {SHARED}")]);
+        h.event(WorkerEvent::ShareLoaded(shown(&h), share_seq(&h), Ok(info.clone())));
+        h.click(in_row(&h, "Password", "Show"));
+        let (_, seq1, _) = take_share_password(&h);
+        // Closed window's password change lands -> triggers changed_elsewhere() and resets password
+        h.event(WorkerEvent::ShareDone(closed, Ok(())));
+        assert_eq!(h.sent(), vec![format!("share info {SHARED}")]);
+        h.event(WorkerEvent::ShareLoaded(shown(&h), share_seq(&h), Ok(info)));
+        assert!(h.text_at("••••••••").is_some(), "password hidden again after external change");
+        // User clicks Show again; stale seq1 arrives first and is dropped
+        h.click(in_row(&h, "Password", "Show"));
+        let (_, seq2, _) = take_share_password(&h);
+        assert_ne!(seq1, seq2);
+        h.event(WorkerEvent::SharePassword(shown(&h), seq1, Ok(Some("before".into()))));
+        assert!(h.text_at("before").is_none(), "stale pre-change Show is dropped");
+        h.event(WorkerEvent::SharePassword(shown(&h), seq2, Ok(Some("after".into()))));
+        assert!(h.text_at("after").is_some(), "post-change Show lands");
     }
 
     #[test]
