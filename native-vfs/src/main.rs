@@ -14,6 +14,7 @@ macro_rules! log {
 }
 
 mod daemon;
+mod events;
 mod fs;
 mod inodes;
 mod listing;
@@ -150,6 +151,7 @@ fn run() -> i32 {
         Ok(unlinker) => drive.use_unlinker(unlinker),
         Err(err) => log!("protondrive-vfs: couldn't start the trash's unlinker ({err}): Files may count trashed items"),
     }
+    drive.start_events();
     let (notifier, mount) = (drive.notifier_slot(), drive.mount_slot());
     let session = match Session::new(drive, &mountpoint, &config) {
         Ok(session) => session,

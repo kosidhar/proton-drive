@@ -100,6 +100,11 @@ impl DaemonClient {
         }
     }
 
+    /// The control socket path, for background streams on the same socket (see events.rs).
+    pub fn socket_path(&self) -> &Path {
+        &self.socket
+    }
+
     /// A client of its own on the same socket, with none of this one's listing backoff: for a thread that posts
     /// alongside the drive's requests (see notices.rs).
     pub fn on_same_socket(&self) -> DaemonClient {
