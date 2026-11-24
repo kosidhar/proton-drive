@@ -13,7 +13,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -64,6 +64,10 @@ struct Fake {
     space: Value,
     /// How long a delete takes to answer
     delete_delay: Duration,
+    /// When true, GET /vfs/children returns 500 to simulate a transient daemon error (#408)
+    fail_children: AtomicBool,
+    /// Open GET /fm/events subscribers; each receives NDJSON lines to send as HTTP chunks (#408)
+    events: Mutex<Vec<mpsc::Sender<String>>>,
 }
 
 impl Fake {
@@ -76,6 +80,8 @@ impl Fake {
             exdev_while_online: Vec::new(),
             space: Value::Null,
             delete_delay: Duration::ZERO,
+            fail_children: AtomicBool::new(false),
+            events: Mutex::new(Vec::new()),
         }
     }
 
@@ -125,28 +131,49 @@ struct Calls {
 
 struct FakeDaemon {
     socket: PathBuf,
+    fake: Arc<Fake>,
     calls: Arc<Calls>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl FakeDaemon {
-    fn start(socket: &Path, backing: &Path, fake: Fake) -> FakeDaemon {
+    fn start(socket: &Path, backing: &Path, mountpoint: &Path, fake: Fake) -> FakeDaemon {
         let listener = UnixListener::bind(socket).unwrap_or_else(|e| panic!("bind {}: {e}", socket.display()));
         let calls = Arc::new(Calls::default());
         let stop = Arc::new(AtomicBool::new(false));
-        let (backing, fake, counted, stopping) = (backing.to_path_buf(), Arc::new(fake), calls.clone(), stop.clone());
+        let fake = Arc::new(fake);
+        let (backing, mountpoint, shared_fake, counted, stopping) =
+            (backing.to_path_buf(), mountpoint.to_path_buf(), fake.clone(), calls.clone(), stop.clone());
         let thread = thread::spawn(move || {
             for stream in listener.incoming() {
                 if stopping.load(Ordering::SeqCst) {
                     break;
                 }
                 let Ok(stream) = stream else { continue };
-                let (backing, fake, counted) = (backing.clone(), fake.clone(), counted.clone());
-                thread::spawn(move || serve(stream, &backing, &fake, &counted));
+                let (backing, mountpoint, fake, counted) =
+                    (backing.clone(), mountpoint.clone(), shared_fake.clone(), counted.clone());
+                thread::spawn(move || serve(stream, &backing, &mountpoint, &fake, &counted));
             }
         });
-        FakeDaemon { socket: socket.to_path_buf(), calls, stop, thread: Some(thread) }
+        FakeDaemon { socket: socket.to_path_buf(), fake, calls, stop, thread: Some(thread) }
+    }
+
+    fn set_children(&self, dir: &str, entries: Vec<Value>) {
+        self.fake.children.lock().unwrap().insert(dir.to_string(), entries);
+    }
+
+    fn set_fail_children(&self, fail: bool) {
+        self.fake.fail_children.store(fail, Ordering::SeqCst);
+    }
+
+    fn event_subscribers(&self) -> usize {
+        self.fake.events.lock().unwrap().len()
+    }
+
+    fn send_event(&self, event: Value) {
+        let line = format!("{event}\n");
+        self.fake.events.lock().unwrap().retain(|tx| tx.send(line.clone()).is_ok());
     }
 
     fn hydrate_calls(&self) -> usize {
@@ -185,6 +212,7 @@ impl FakeDaemon {
 impl Drop for FakeDaemon {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        self.fake.events.lock().unwrap().clear(); // closes any open /fm/events stream threads
         let _ = UnixStream::connect(&self.socket); // wakes the accept loop
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -211,7 +239,7 @@ fn query_decode(value: &str) -> String {
     String::from_utf8(out).unwrap()
 }
 
-fn serve(mut stream: UnixStream, backing: &Path, fake: &Fake, calls: &Calls) {
+fn serve(mut stream: UnixStream, backing: &Path, mountpoint: &Path, fake: &Fake, calls: &Calls) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut raw = Vec::new();
     let mut buf = [0u8; 4096];
@@ -233,11 +261,34 @@ fn serve(mut stream: UnixStream, backing: &Path, fake: &Fake, calls: &Calls) {
     };
     let mut request_line = head.lines().next().unwrap_or("").split_whitespace();
     let (method, target) = (request_line.next().unwrap_or(""), request_line.next().unwrap_or(""));
+    if method == "GET" && target == "/fm/events" {
+        let (tx, rx) = mpsc::channel::<String>();
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+        let hello = format!("{}\n", json!({ "type": "hello", "syncDir": mountpoint.display().to_string(), "mode": "virtual" }));
+        if stream.write_all(header.as_bytes()).is_err()
+            || write!(stream, "{:x}\r\n{}\r\n", hello.len(), hello).is_err()
+            || stream.flush().is_err()
+        {
+            return;
+        }
+        fake.events.lock().unwrap().push(tx);
+        while let Ok(line) = rx.recv() {
+            if write!(stream, "{:x}\r\n{}\r\n", line.len(), line).is_err() || stream.flush().is_err() {
+                break;
+            }
+        }
+        let _ = stream.write_all(b"0\r\n\r\n");
+        return;
+    }
     let (status, reply) = match (method, target.split_once('?')) {
         ("GET", Some(("/vfs/children", query))) => {
             calls.children.fetch_add(1, Ordering::SeqCst);
-            let path = query.strip_prefix("path=").map(query_decode).unwrap_or_default();
-            (200, json!({ "entries": fake.children.lock().unwrap().get(&path).cloned().unwrap_or_default() }))
+            if fake.fail_children.load(Ordering::SeqCst) {
+                (500, json!({ "error": "Daemon busy" }))
+            } else {
+                let path = query.strip_prefix("path=").map(query_decode).unwrap_or_default();
+                (200, json!({ "entries": fake.children.lock().unwrap().get(&path).cloned().unwrap_or_default() }))
+            }
         }
         ("GET", None) if target == "/vfs/space" => (200, json!({ "space": fake.space })),
         ("POST", None) if target == "/vfs/rename" => {
@@ -483,7 +534,7 @@ impl Harness {
     }
 
     fn start_fake(&mut self, fake: Fake) {
-        self.daemon = Some(FakeDaemon::start(&self.socket, &self.backing, fake));
+        self.daemon = Some(FakeDaemon::start(&self.socket, &self.backing, &self.mountpoint, fake));
     }
 
     fn daemon(&self) -> &FakeDaemon {
@@ -1942,4 +1993,280 @@ fn a_long_tmpdir_falls_back_to_a_short_bindable_socket_path() {
     let listener = UnixListener::bind(&sock).expect("fallback socket path must be bindable");
     drop(listener);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// #408: open Files windows watch the folder with inotify; hiding a folder (or removing an item remotely) must emit
+// IN_DELETE without sending a daemon delete, even when the hidden folder had cached children in the kernel.
+#[test]
+fn watchers_hear_a_hidden_folder_and_file_disappear() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    std::fs::create_dir_all(h.backing.join("xyz/sub")).unwrap();
+    std::fs::write(h.backing.join("xyz/in.txt"), b"inside").unwrap();
+    std::fs::write(h.backing.join("xyz/sub/deep.txt"), b"deep").unwrap();
+    std::fs::write(h.backing.join("a.txt"), b"hello").unwrap();
+    h.start_daemon(HashMap::from([
+        ("", vec![folder("xyz"), file("a.txt", 5)]),
+        ("xyz", vec![file("in.txt", 6), folder("sub")]),
+        ("xyz/sub", vec![file("deep.txt", 4)]),
+    ]));
+    h.mount();
+
+    until("the helper subscribing to /fm/events", || h.daemon().event_subscribers() > 0);
+    // Open root and xyz and lookup nested children so kernel dcache truly holds cached child dentries
+    assert_eq!(ls(&h.mountpoint), [".xdg-volume-info", "a.txt", "xyz"]);
+    assert_eq!(ls(&h.path("xyz")), ["in.txt", "sub"]);
+    assert!(std::fs::metadata(h.path("xyz/in.txt")).unwrap().is_file());
+    assert!(std::fs::metadata(h.path("xyz/sub/deep.txt")).unwrap().is_file());
+
+    let mut watch = Inotify::new();
+    watch.watch(&h.mountpoint);
+
+    // Simulate Hide from this computer on xyz and remote deletion of a.txt outside FUSE
+    std::fs::remove_dir_all(h.backing.join("xyz")).unwrap();
+    std::fs::remove_file(h.backing.join("a.txt")).unwrap();
+    h.daemon().set_children("", vec![]);
+    h.daemon().set_children("xyz", vec![]);
+    let root = h.mountpoint.display().to_string();
+    h.daemon().send_event(json!({
+        "type": "changed",
+        "paths": [root, format!("{root}/xyz"), format!("{root}/a.txt")],
+        "subtrees": [format!("{root}/xyz")],
+    }));
+
+    assert!(
+        watch.hears(&h.mountpoint, libc::IN_DELETE | libc::IN_ISDIR, "xyz", Duration::from_secs(5)),
+        "watcher must hear hidden folder xyz disappear: {:?} (stderr: {})",
+        watch.heard,
+        h.stderr()
+    );
+    assert!(
+        watch.hears(&h.mountpoint, libc::IN_DELETE, "a.txt", Duration::from_secs(5)),
+        "watcher must hear removed file a.txt disappear: {:?}",
+        watch.heard
+    );
+    assert!(
+        watch.heard.iter().any(|(d, m, n)| d == &h.mountpoint && n == "xyz" && (*m & libc::IN_DELETE != 0) && (*m & libc::IN_ISDIR != 0)),
+        "folder removal must set IN_ISDIR: {:?}",
+        watch.heard
+    );
+    assert_eq!(ls(&h.mountpoint), [".xdg-volume-info"]);
+    assert!(h.daemon().deletes().is_empty(), "announcing external removal must never call /vfs/delete");
+}
+
+// #408: unhiding a folder or adding a remote online-only file emits IN_CREATE to open watchers without creating
+// anything in the local backing store.
+#[test]
+fn watchers_hear_an_unhidden_folder_and_remote_file_appear() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    h.start_daemon(HashMap::from([("", vec![])]));
+    h.mount();
+
+    until("the helper subscribing to /fm/events", || h.daemon().event_subscribers() > 0);
+    assert_eq!(ls(&h.mountpoint), [".xdg-volume-info"]);
+
+    let mut watch = Inotify::new();
+    watch.watch(&h.mountpoint);
+
+    // Simulate Unhide of Restored/ and remote arrival of cloud.txt (both online-only)
+    h.daemon().set_children("", vec![folder("Restored"), file("cloud.txt", 42)]);
+    h.daemon().set_children("Restored", vec![file("doc.txt", 10)]);
+    let root = h.mountpoint.display().to_string();
+    h.daemon().send_event(json!({
+        "type": "changed",
+        "paths": [root, format!("{root}/Restored"), format!("{root}/cloud.txt")],
+        "subtrees": [format!("{root}/Restored")],
+    }));
+
+    assert!(
+        watch.hears(&h.mountpoint, libc::IN_CREATE, "Restored", Duration::from_secs(5)),
+        "watcher must hear unhidden folder Restored appear: {:?} (stderr: {})",
+        watch.heard,
+        h.stderr()
+    );
+    assert!(
+        watch.hears(&h.mountpoint, libc::IN_CREATE, "cloud.txt", Duration::from_secs(5)),
+        "watcher must hear remote file cloud.txt appear: {:?}",
+        watch.heard
+    );
+    assert!(
+        watch.heard.iter().any(|(d, m, n)| d == &h.mountpoint && n == "Restored" && (*m & libc::IN_CREATE != 0) && (*m & libc::IN_ISDIR != 0)),
+        "folder creation must set IN_ISDIR: {:?}",
+        watch.heard
+    );
+    assert_eq!(ls(&h.mountpoint), [".xdg-volume-info", "Restored", "cloud.txt"]);
+    assert!(!h.backing.join("Restored").exists(), "announcing online-only folder must not create backing dir");
+    assert!(!h.backing.join("cloud.txt").exists(), "announcing online-only file must not create backing file");
+}
+
+// #408: emblem/state-only events (such as sync status updates) must not emit spurious IN_CREATE or IN_DELETE.
+#[test]
+fn non_membership_events_do_not_fire_spurious_create_or_delete() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    std::fs::write(h.backing.join("keep.txt"), b"keep").unwrap();
+    h.start_daemon(HashMap::from([("", vec![file("keep.txt", 4), folder("Cloud")])]));
+    h.mount();
+
+    until("the helper subscribing to /fm/events", || h.daemon().event_subscribers() > 0);
+    assert_eq!(ls(&h.mountpoint), [".xdg-volume-info", "Cloud", "keep.txt"]);
+
+    let mut watch = Inotify::new();
+    watch.watch(&h.mountpoint);
+
+    let before_calls = h.daemon().children_calls();
+    let root = h.mountpoint.display().to_string();
+    h.daemon().send_event(json!({
+        "type": "changed",
+        "paths": [root, format!("{root}/keep.txt"), format!("{root}/Cloud")],
+        "subtrees": [],
+    }));
+    until("the event to reconcile root", || h.daemon().children_calls() > before_calls);
+
+    assert!(
+        !watch.hears(&h.mountpoint, libc::IN_CREATE | libc::IN_DELETE, "keep.txt", Duration::from_millis(300)),
+        "unchanged entry must not trigger create/delete: {:?}",
+        watch.heard
+    );
+    assert!(watch.heard.is_empty(), "expected no inotify events, got {:?}", watch.heard);
+}
+
+// #408: a parent subtree event must also reconcile deeper open folders whose own path was collapsed into `subtrees`.
+#[test]
+fn watchers_hear_changes_in_a_nested_open_folder_from_a_parent_subtree_event() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    h.start_daemon(HashMap::from([
+        ("", vec![folder("Projects")]),
+        ("Projects", vec![folder("App")]),
+        ("Projects/App", vec![file("old.txt", 3)]),
+    ]));
+    h.mount();
+
+    until("the helper subscribing to /fm/events", || h.daemon().event_subscribers() > 0);
+    // Open only Projects/App (not Projects itself) and watch it
+    assert_eq!(ls(&h.path("Projects/App")), ["old.txt"]);
+    let mut watch = Inotify::new();
+    watch.watch(&h.path("Projects/App"));
+
+    h.daemon().set_children("Projects/App", vec![file("new.txt", 3)]);
+    let root = h.mountpoint.display().to_string();
+    h.daemon().send_event(json!({
+        "type": "changed",
+        "paths": [root],
+        "subtrees": [format!("{root}/Projects")],
+    }));
+
+    assert!(
+        watch.hears(&h.path("Projects/App"), libc::IN_DELETE, "old.txt", Duration::from_secs(5)),
+        "nested watcher must hear old.txt removed: {:?}",
+        watch.heard
+    );
+    assert!(
+        watch.hears(&h.path("Projects/App"), libc::IN_CREATE, "new.txt", Duration::from_secs(5)),
+        "nested watcher must hear new.txt added: {:?}",
+        watch.heard
+    );
+    assert_eq!(ls(&h.path("Projects/App")), ["new.txt"]);
+}
+
+// #408: replacing a file with a folder of the same name (or vice versa) outside FUSE emits delete then create with the
+// new kind, without corrupting seen_dirs.
+#[test]
+fn watchers_hear_an_entry_replaced_between_file_and_folder() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    h.start_daemon(HashMap::from([("", vec![file("item", 5)])]));
+    h.mount();
+
+    until("the helper subscribing to /fm/events", || h.daemon().event_subscribers() > 0);
+    assert_eq!(ls(&h.mountpoint), [".xdg-volume-info", "item"]);
+    assert!(std::fs::metadata(h.path("item")).unwrap().is_file());
+
+    let mut watch = Inotify::new();
+    watch.watch(&h.mountpoint);
+
+    h.daemon().set_children("", vec![folder("item")]);
+    let root = h.mountpoint.display().to_string();
+    h.daemon().send_event(json!({
+        "type": "changed",
+        "paths": [root, format!("{root}/item")],
+        "subtrees": [],
+    }));
+
+    assert!(
+        watch.hears(&h.mountpoint, libc::IN_DELETE, "item", Duration::from_secs(5)),
+        "watcher must hear old file removed: {:?}",
+        watch.heard
+    );
+    assert!(
+        watch.hears(&h.mountpoint, libc::IN_CREATE, "item", Duration::from_secs(5)),
+        "watcher must hear new folder created: {:?}",
+        watch.heard
+    );
+    assert!(
+        watch.heard.iter().any(|(d, m, n)| d == &h.mountpoint && n == "item" && (*m & libc::IN_CREATE != 0) && (*m & libc::IN_ISDIR != 0)),
+        "replacement folder must emit IN_CREATE | IN_ISDIR: {:?}",
+        watch.heard
+    );
+    assert!(std::fs::metadata(h.path("item")).unwrap().is_dir());
+}
+
+// #408: if /vfs/children fails transiently during reconcile, online-only entries must NOT be wiped from open windows.
+#[test]
+fn a_transient_daemon_listing_error_does_not_wipe_online_only_entries() {
+    if !enabled() {
+        return;
+    }
+    let mut h = Harness::new();
+    h.start_daemon(HashMap::from([("", vec![folder("CloudDir"), file("cloud.txt", 12)])]));
+    h.mount();
+
+    until("the helper subscribing to /fm/events", || h.daemon().event_subscribers() > 0);
+    assert_eq!(ls(&h.mountpoint), [".xdg-volume-info", "CloudDir", "cloud.txt"]);
+
+    let mut watch = Inotify::new();
+    watch.watch(&h.mountpoint);
+
+    h.daemon().set_fail_children(true);
+    let before_calls = h.daemon().children_calls();
+    let root = h.mountpoint.display().to_string();
+    h.daemon().send_event(json!({
+        "type": "changed",
+        "paths": [root],
+        "subtrees": [],
+    }));
+    until("the failed children fetch to happen", || h.daemon().children_calls() > before_calls);
+
+    assert!(
+        !watch.hears(&h.mountpoint, libc::IN_DELETE, "CloudDir", Duration::from_millis(300)),
+        "transient daemon error must not fire IN_DELETE: {:?}",
+        watch.heard
+    );
+    assert!(watch.heard.is_empty(), "expected no inotify events on transient error, got {:?}", watch.heard);
+
+    // Once the daemon recovers, subsequent real removals still work
+    h.daemon().set_fail_children(false);
+    h.daemon().set_children("", vec![file("cloud.txt", 12)]);
+    h.daemon().send_event(json!({
+        "type": "changed",
+        "paths": [root, format!("{root}/CloudDir")],
+        "subtrees": [format!("{root}/CloudDir")],
+    }));
+    assert!(
+        watch.hears(&h.mountpoint, libc::IN_DELETE, "CloudDir", Duration::from_secs(5)),
+        "after recovery, real removals must still fire IN_DELETE: {:?}",
+        watch.heard
+    );
 }

@@ -11701,6 +11701,44 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             stateDb.setMeta('driveLayout', 'virtual');
             expect(d.flush()).toEqual([]);
         });
+
+        // #408: hide and unhide emit a final state event after local removal / remote re-indexing finishes
+        test('hide and unhide emit a subtree change after their disk/index work completes', async () => {
+            const d = setup({ virtual: true });
+            d.add('Secret/a.txt', 'secret');
+            await d.engine.reconcileNow();
+            await d.engine.setAvailability('Secret', 'pin');
+            await d.engine.reconcileNow();
+            d.flush();
+
+            // Intercept dropRecordsWithoutFiles so we can flush any early event emitted when the hide rule was saved
+            const origDrop = (d.engine as any).dropRecordsWithoutFiles.bind(d.engine);
+            let earlyFlushed: unknown[] = [];
+            (d.engine as any).dropRecordsWithoutFiles = async (rel: string) => {
+                earlyFlushed = d.flush();
+                return origDrop(rel);
+            };
+            await d.engine.setAvailability('Secret', 'hide');
+            expect(earlyFlushed.length).toBeGreaterThan(0);
+            const afterHide = d.flush() as Array<{ paths: string[]; subtrees: string[] }>;
+            expect(afterHide.length).toBe(1);
+            expect(afterHide[0].subtrees).toContain('Secret');
+            expect(afterHide[0].paths).toContain('');
+
+            // Unhide: flush before indexRemoteSubtree finishes, then verify a final event still fires after indexing
+            const origIndex = (d.engine as any).indexRemoteSubtree.bind(d.engine);
+            let earlyUnhide: unknown[] = [];
+            (d.engine as any).indexRemoteSubtree = async (...args: unknown[]) => {
+                earlyUnhide = d.flush();
+                return origIndex(...args);
+            };
+            await d.engine.setAvailability('Secret', 'unhide');
+            expect(earlyUnhide.length).toBeGreaterThan(0);
+            const afterUnhide = d.flush() as Array<{ paths: string[]; subtrees: string[] }>;
+            expect(afterUnhide.length).toBe(1);
+            expect(afterUnhide[0].subtrees).toContain('Secret');
+            expect(afterUnhide[0].paths).toContain('');
+        });
     });
     describe('itemStates', () => {
         const setup = () => {

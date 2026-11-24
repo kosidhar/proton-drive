@@ -3,7 +3,7 @@
 // watcher picks it up; renames and deletes go to the daemon, which carries each out whole; and Move to Trash goes
 // through the drive's own .Trash-<uid> (see trash.rs).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{File, Metadata, OpenOptions, Permissions};
 use std::os::fd::AsRawFd;
@@ -22,6 +22,7 @@ use fuser::{
 };
 
 use crate::daemon::{DaemonClient, DaemonError, Removal, Space};
+use crate::events::{self, DriveEvent};
 use crate::inodes::{Inodes, ROOT_INO};
 use crate::listing::{self, Entry, Kind, VOLUME_INFO_CONTENT, VOLUME_INFO_NAME};
 use crate::notices::{Notice, Notices};
@@ -84,6 +85,9 @@ impl DriveFs {
             sessions: Mutex::new(HashMap::new()),
             writing_fhs: Mutex::new(HashSet::new()),
             notices,
+            seen_dirs: Mutex::new(SeenDirs::default()),
+            announced_gone: Mutex::new(HashMap::new()),
+            announced_added: Mutex::new(HashMap::new()),
         });
         start_unlinker(Arc::downgrade(&state), dropped);
         DriveFs { state }
@@ -117,6 +121,24 @@ impl DriveFs {
             std::thread::sleep(KEEPALIVE_EVERY);
             let Some(state) = state.upgrade() else { return };
             state.keepalive_tick();
+        });
+    }
+
+    /// Subscribes to the daemon's `/fm/events` stream so open file manager windows hear when items are hidden,
+    /// unhidden, or added/removed remotely outside FUSE (#408).
+    pub fn start_events(&self) {
+        let state = Arc::downgrade(&self.state);
+        let socket = self.state.daemon.socket_path().to_path_buf();
+        let _ = std::thread::Builder::new().name("vfs-events".into()).spawn(move || {
+            events::follow_events(
+                &socket,
+                |event| {
+                    if let Some(state) = state.upgrade() {
+                        state.handle_drive_event(event);
+                    }
+                },
+                || state.strong_count() == 0,
+            );
         });
     }
 
@@ -162,8 +184,8 @@ struct State {
     /// it is gone
     unlinker: Mutex<Option<Unlinker>>,
     unlinker_pid: AtomicU32,
-    /// Names the trash dropped, for the thread that has them unlinked through the mount
-    drops: Sender<Dropped>,
+    /// Entry notifications queued for the unlinker child process (trash drops and external add/remove notices, #236, #408)
+    drops: Sender<MountAction>,
     trash: TrashArea,
     next_fh: AtomicU64,
     uid: u32,
@@ -179,6 +201,120 @@ struct State {
     writing_fhs: Mutex<HashSet<u64>>,
     /// What the daemon is told of the sessions, sent on a thread of their own
     notices: Arc<Notices>,
+    /// Recently opened folders and the entries last shown for them, to diff against external daemon changes (#408)
+    seen_dirs: Mutex<SeenDirs>,
+    /// Entry currently being announced as removed through the mount by the unlinker child (#408)
+    announced_gone: Mutex<HashMap<PathBuf, FileType>>,
+    /// Entry currently being announced as added through the mount by the unlinker child (#408)
+    announced_added: Mutex<HashMap<PathBuf, FileType>>,
+}
+
+/// Recently opened folders and their last-known child entries, bounded so deep walks don't grow without limit (#408).
+const SEEN_DIRS_MAX: usize = 128;
+
+struct SeenDir {
+    entries: HashMap<OsString, Kind>,
+    /// Incremented on local FUSE mutations in this folder so unrelated activity elsewhere cannot starve reconciliation.
+    epoch: u64,
+}
+
+#[derive(Default)]
+struct SeenDirs {
+    order: VecDeque<PathBuf>,
+    dirs: HashMap<PathBuf, SeenDir>,
+}
+
+impl SeenDirs {
+    fn record(&mut self, dir: &Path, entries: HashMap<OsString, Kind>) {
+        let epoch = self.dirs.get(dir).map(|d| d.epoch).unwrap_or(0);
+        if self.dirs.contains_key(dir) {
+            self.order.retain(|p| p != dir);
+        }
+        self.order.push_back(dir.to_path_buf());
+        self.dirs.insert(dir.to_path_buf(), SeenDir { entries, epoch });
+        while self.dirs.len() > SEEN_DIRS_MAX {
+            if let Some(oldest) = self.order.pop_front() {
+                self.dirs.remove(&oldest);
+            }
+        }
+    }
+
+    fn get(&self, dir: &Path) -> Option<HashMap<OsString, Kind>> {
+        self.dirs.get(dir).map(|d| d.entries.clone())
+    }
+
+    fn epoch(&self, dir: &Path) -> Option<u64> {
+        self.dirs.get(dir).map(|d| d.epoch)
+    }
+
+    fn contains(&self, dir: &Path) -> bool {
+        self.dirs.contains_key(dir)
+    }
+
+    fn tracked(&self) -> Vec<PathBuf> {
+        self.order.iter().cloned().collect()
+    }
+
+    fn note_added(&mut self, parent: &Path, name: &OsStr, kind: Kind) {
+        if let Some(dir) = self.dirs.get_mut(parent) {
+            dir.entries.insert(name.to_os_string(), kind);
+            dir.epoch = dir.epoch.wrapping_add(1);
+        }
+    }
+
+    fn remove_subtree(&mut self, rel: &Path) {
+        if !rel.as_os_str().is_empty() {
+            self.dirs.retain(|d, _| !d.starts_with(rel));
+            self.order.retain(|d| !d.starts_with(rel));
+        }
+    }
+
+    fn note_removed(&mut self, rel: &Path) {
+        if let (Some(parent), Some(name)) = (rel.parent(), rel.file_name()) {
+            if let Some(dir) = self.dirs.get_mut(parent) {
+                dir.entries.remove(name);
+                dir.epoch = dir.epoch.wrapping_add(1);
+            }
+        }
+        self.remove_subtree(rel);
+    }
+
+    fn note_moved(&mut self, from: &Path, to: &Path, moved_kind: Option<Kind>) {
+        let from_kind = from.parent().zip(from.file_name()).and_then(|(p, n)| {
+            let dir = self.dirs.get_mut(p)?;
+            dir.epoch = dir.epoch.wrapping_add(1);
+            dir.entries.remove(n)
+        });
+        if let (Some(parent), Some(name)) = (to.parent(), to.file_name()) {
+            if let Some(dir) = self.dirs.get_mut(parent) {
+                dir.epoch = dir.epoch.wrapping_add(1);
+                if let Some(kind) = from_kind.or(moved_kind) {
+                    dir.entries.insert(name.to_os_string(), kind);
+                } else {
+                    dir.entries.remove(name);
+                }
+            }
+        }
+        if !to.as_os_str().is_empty() {
+            self.remove_subtree(to);
+        }
+        if !from.as_os_str().is_empty() {
+            let moving: Vec<PathBuf> = self.dirs.keys().filter(|d| d.starts_with(from)).cloned().collect();
+            for old in moving {
+                let Ok(rest) = old.strip_prefix(from) else { continue };
+                let new = if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) };
+                if let Some(mut entry) = self.dirs.remove(&old) {
+                    entry.epoch = entry.epoch.wrapping_add(1);
+                    self.dirs.insert(new.clone(), entry);
+                    for p in &mut self.order {
+                        if *p == old {
+                            *p = new.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// A file's write session: from the first open that writes to it to the last one's release. The daemon hears of both
@@ -314,6 +450,39 @@ fn is_volume_info(rel: &Path) -> bool {
     rel == Path::new(VOLUME_INFO_NAME)
 }
 
+fn node_file_type(node: &Node) -> FileType {
+    match node {
+        Node::Local(meta) => {
+            if meta.is_dir() {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            }
+        }
+        Node::Online(entry) => {
+            if entry.kind == Kind::Folder {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            }
+        }
+        Node::Trash(trash_node) => match trash_node {
+            TrashNode::Root | TrashNode::Files | TrashNode::Info => FileType::Directory,
+            TrashNode::InfoFile { .. } | TrashNode::Gone => FileType::RegularFile,
+        },
+        Node::VolumeInfo => FileType::RegularFile,
+    }
+}
+
+/// Maps a folder's visible entries to `(name, Kind)`, excluding drive-internal metadata like `.xdg-volume-info`.
+fn entries_kind_map(dir: &Path, entries: &[Entry]) -> HashMap<OsString, Kind> {
+    entries
+        .iter()
+        .filter(|e| !listing::is_hidden_name(&e.name) && !(is_root(dir) && e.name == OsStr::new(VOLUME_INFO_NAME)))
+        .map(|e| (e.name.clone(), e.kind))
+        .collect()
+}
+
 /// A backing file, opened as the app asked: its access mode, O_TRUNC, and O_APPEND (so an append lands at the end
 /// even when the kernel's idea of the size is stale). A symlink there isn't part of the drive, so it isn't followed.
 fn open_backing(path: &Path, flags: i32) -> std::io::Result<File> {
@@ -397,50 +566,108 @@ fn apply_change(target: Target, change: &AttrChange, room: &LocalRoom) -> std::i
     Ok(())
 }
 
-/// A name the trash dropped from one of its folders: the folder's number and path, and the name.
-struct Dropped {
-    folder: u64,
-    dir: PathBuf,
-    name: OsString,
+/// An entry notification sent to the unlinker child process so kernel inotify watchers hear changes that happened
+/// outside FUSE (#236, #408).
+enum MountAction {
+    TrashDrop { folder: u64, dir: PathBuf, name: OsString },
+    AnnounceRemoved { folder: u64, dir: PathBuf, name: OsString, kind: Kind },
+    AnnounceAdded { folder: u64, dir: PathBuf, name: OsString, kind: Kind },
 }
 
-/// The thread that has the names the trash drops from files/ and info/ unlinked through the drive's own mount: the
-/// kernel tells its inotify watchers of an unlink, which gvfsd-trash counts the trash's items by, and of nothing FUSE
-/// can send (#236). The unlinker child makes the unlink (see unlinker.rs), which waits for the folder's lock in the
-/// kernel: held by the request that dropped the name until its reply is in, so asked only once that reply is sent,
-/// and by any rename into the folder after it. This thread only waits for the child's answer, which a signal ends.
-///
-/// When the child couldn't unlink, the name goes all the same (see after_unlink). Without a child, the kernel's entry
-/// goes with it, without a word to its watchers: that invalidation waits for the folder's lock in this thread (#247).
-fn start_unlinker(state: Weak<State>, dropped: Receiver<Dropped>) {
+/// The thread that drives the unlinker child process for trash drops (#236) and external entry add/remove
+/// notifications (#408): the kernel tells its inotify watchers of unlink/rmdir/mkdir/mknod made through the mount,
+/// and of nothing FUSE can send directly. The child never holds `/dev/fuse`, so it cannot deadlock shutdown.
+fn start_unlinker(state: Weak<State>, actions: Receiver<MountAction>) {
     let _ = std::thread::Builder::new().name("trash-unlink".into()).spawn(move || {
         let mut child: Option<Unlinker> = None;
         let mut started = false;
-        for Dropped { folder, dir, name } in dropped {
+        let stop_child = |state: &State, child: &mut Option<Unlinker>| {
+            log!("protondrive-vfs: the trash's unlinker stopped: Files may not update live until refreshed");
+            state.unlinker_pid.store(0, Ordering::SeqCst);
+            if let Some(gone) = child.take() {
+                gone.end();
+            }
+        };
+        for action in actions {
             let Some(state) = state.upgrade() else { return };
-            // Handed over before any request is served, so there by the first drop if it ever is
+            // Handed over before any request is served, so there by the first action if it ever is
             if !started {
                 child = lock(&state.unlinker).take();
                 started = true;
             }
-            let asked = match (child.as_mut(), state.mount.get()) {
-                (Some(unlinker), Some(mount)) => {
-                    Some(unlinker.unlink(mount.dev, folder, &mount.path.join(&dir), &name))
+            match action {
+                MountAction::TrashDrop { folder, dir, name } => {
+                    let asked = match (child.as_mut(), state.mount.get()) {
+                        (Some(unlinker), Some(mount)) => {
+                            Some(unlinker.unlink(mount.dev, folder, &mount.path.join(&dir), &name))
+                        }
+                        _ => None,
+                    };
+                    if let Some(Err(_)) = asked {
+                        stop_child(&state, &mut child);
+                    }
+                    if state.after_unlink(asked.as_ref(), &dir.join(&name)) {
+                        if let Some(notifier) = state.notifier.get() {
+                            let _ = notifier.inval_entry(INodeNo(folder), &name);
+                        }
+                    }
                 }
-                _ => None,
-            };
-            if let Some(Err(_)) = asked {
-                log!("protondrive-vfs: the trash's unlinker stopped: Files may count trashed items from now on");
-                // Forgotten before it is reaped, when its pid is free for another process
-                state.unlinker_pid.store(0, Ordering::SeqCst);
-                if let Some(gone) = child.take() {
-                    gone.end();
+                MountAction::AnnounceRemoved { folder, dir, name, kind } => {
+                    let rel = dir.join(&name);
+                    let file_type = if kind == Kind::Folder { FileType::Directory } else { FileType::RegularFile };
+                    // Skip if an item of the same kind reappeared in the meantime (kind replacement still unlinks old)
+                    if state.resolve(&rel).is_some_and(|n| node_file_type(&n) == file_type) {
+                        continue;
+                    }
+                    let old_ino = lock(&state.inodes).existing_ino(&rel);
+                    lock(&state.announced_gone).insert(rel.clone(), file_type);
+                    let asked = match (child.as_mut(), state.mount.get()) {
+                        (Some(unlinker), Some(mount)) => {
+                            Some(unlinker.unlink(mount.dev, folder, &mount.path.join(&dir), &name))
+                        }
+                        _ => None,
+                    };
+                    lock(&state.announced_gone).remove(&rel);
+                    if let Some(Err(_)) = asked {
+                        stop_child(&state, &mut child);
+                    }
+                    // On success, take_announced_gone_if_absent already removed the inode under the kernel's i_rwsem.
+                    // Only clean up the old inode number on fallback so a concurrent create/mkdir's fresh inode stays intact.
+                    if !matches!(asked, Some(Ok(true))) {
+                        if let Some(ino) = old_ino {
+                            if !state.resolve(&rel).is_some_and(|n| node_file_type(&n) == file_type) {
+                                lock(&state.inodes).remove_if_ino(&rel, ino);
+                            }
+                        }
+                    }
+                    if matches!(asked, None | Some(Err(_))) {
+                        if let Some(notifier) = state.notifier.get() {
+                            let _ = notifier.inval_entry(INodeNo(folder), &name);
+                        }
+                    }
                 }
-            }
-            if state.after_unlink(asked.as_ref(), &dir.join(&name)) {
-                // Set before any request is served, so never missing here
-                if let Some(notifier) = state.notifier.get() {
-                    let _ = notifier.inval_entry(INodeNo(folder), &name);
+                MountAction::AnnounceAdded { folder, dir, name, kind } => {
+                    let rel = dir.join(&name);
+                    let file_type = if kind == Kind::Folder { FileType::Directory } else { FileType::RegularFile };
+                    if !state.resolve(&rel).is_some_and(|n| node_file_type(&n) == file_type) {
+                        continue;
+                    }
+                    lock(&state.announced_added).insert(rel.clone(), file_type);
+                    let asked = match (child.as_mut(), state.mount.get()) {
+                        (Some(unlinker), Some(mount)) => {
+                            let full_dir = mount.path.join(&dir);
+                            Some(if kind == Kind::Folder {
+                                unlinker.mkdir(mount.dev, folder, &full_dir, &name)
+                            } else {
+                                unlinker.mknod(mount.dev, folder, &full_dir, &name)
+                            })
+                        }
+                        _ => None,
+                    };
+                    lock(&state.announced_added).remove(&rel);
+                    if let Some(Err(_)) = asked {
+                        stop_child(&state, &mut child);
+                    }
                 }
             }
         }
@@ -612,6 +839,8 @@ impl State {
         // Something changed through the drive while this was read: it answers this once, but isn't kept
         if self.listing_epoch.load(Ordering::SeqCst) == epoch {
             listings.insert(rel.to_path_buf(), CachedListing { at: Instant::now(), listing: merged.clone() });
+        } else {
+            listings.remove(rel);
         }
         merged
     }
@@ -1052,15 +1281,181 @@ impl State {
         }
     }
 
+    /// Records the entries shown for a folder by `opendir` so external daemon changes can be diffed against them (#408).
+    fn record_seen_dir(&self, dir: &Path, entries: &[Entry]) {
+        if self.is_trash_path(dir) {
+            return;
+        }
+        let map = entries_kind_map(dir, entries);
+        lock(&self.seen_dirs).record(dir, map);
+    }
+
+    /// Fetches a folder's merged listing directly from backing + daemon, returning `Err` if the daemon cannot answer
+    /// (unlike `listing()`, which falls back to local-only entries so browsing keeps working offline). Used when
+    /// reconciling `/fm/events` so a transient daemon error never wipes online-only entries from open windows (#408).
+    fn fetch_listing_fallible(&self, rel: &Path) -> Result<Arc<Listing>, DaemonError> {
+        let epoch = self.listing_epoch.load(Ordering::SeqCst);
+        let local = listing::read_local(&self.backing.join(rel));
+        let remote = match rel.to_str() {
+            Some(r) => self.daemon.children(r)?,
+            None => Vec::new(),
+        };
+        let mut entries = listing::merge_listing(local, remote, is_root(rel));
+        if is_root(rel) {
+            entries.retain(|e| e.name.as_os_str() != OsStr::new(self.trash.name()));
+        }
+        let merged = Arc::new(Listing::new(entries));
+        let mut listings = lock(&self.listings);
+        listings.retain(|_, c| c.at.elapsed() < LISTING_TTL);
+        if self.listing_epoch.load(Ordering::SeqCst) == epoch {
+            listings.insert(rel.to_path_buf(), CachedListing { at: Instant::now(), listing: merged.clone() });
+        } else {
+            listings.remove(rel);
+        }
+        Ok(merged)
+    }
+
+    fn handle_drive_event(&self, event: DriveEvent) {
+        let mut dirs: Vec<PathBuf> = match event {
+            DriveEvent::Reset => lock(&self.seen_dirs).tracked(),
+            DriveEvent::Changed { paths, subtrees } => {
+                let seen = lock(&self.seen_dirs);
+                let tracked = seen.tracked();
+                let mut set = HashSet::new();
+                for path in paths {
+                    if seen.contains(&path) {
+                        set.insert(path.clone());
+                    }
+                    if let Some(parent) = path.parent() {
+                        if seen.contains(parent) {
+                            set.insert(parent.to_path_buf());
+                        }
+                    }
+                }
+                for subtree in subtrees {
+                    if let Some(parent) = subtree.parent() {
+                        if seen.contains(parent) {
+                            set.insert(parent.to_path_buf());
+                        }
+                    }
+                    for dir in &tracked {
+                        if subtree.as_os_str().is_empty() || dir.starts_with(&subtree) {
+                            set.insert(dir.clone());
+                        }
+                    }
+                }
+                set.into_iter().collect()
+            }
+        };
+        // Reconcile shallowest folders first so removing a hidden parent drops tracked descendants before visiting them
+        dirs.sort_by(|a, b| a.components().count().cmp(&b.components().count()).then_with(|| a.cmp(b)));
+        for dir in dirs {
+            self.reconcile_seen_dir(&dir);
+        }
+    }
+
+    /// Re-fetches a previously opened folder's listing and queues kernel entry notifications for any names that
+    /// appeared or disappeared outside FUSE (#408).
+    fn reconcile_seen_dir(&self, dir: &Path) {
+        if self.is_trash_path(dir) {
+            return;
+        }
+        let Some(folder_ino) = lock(&self.inodes).existing_ino(dir) else { return };
+        for _ in 0..3 {
+            let Some(dir_epoch) = lock(&self.seen_dirs).epoch(dir) else { return };
+            let Ok(fresh_listing) = self.fetch_listing_fallible(dir) else { return };
+            let fresh = entries_kind_map(dir, &fresh_listing.entries);
+            let mut seen = lock(&self.seen_dirs);
+            if seen.epoch(dir) != Some(dir_epoch) {
+                // A FUSE mutation touched this exact folder while we were fetching; retry so we don't misread it
+                continue;
+            }
+            let Some(old) = seen.get(dir) else { return };
+            let mut removed = Vec::new();
+            let mut added = Vec::new();
+            for (name, &old_kind) in &old {
+                if fresh.get(name) != Some(&old_kind) {
+                    removed.push((name.clone(), old_kind));
+                }
+            }
+            for (name, &new_kind) in &fresh {
+                if old.get(name) != Some(&new_kind) {
+                    added.push((name.clone(), new_kind));
+                }
+            }
+            seen.record(dir, fresh);
+            // Evict tracked subdirectories of removed/replaced folders without deleting any same-name replacement in `dir`
+            for (name, _) in &removed {
+                seen.remove_subtree(&dir.join(name));
+            }
+            drop(seen);
+            for (name, kind) in removed {
+                let _ = self.drops.send(MountAction::AnnounceRemoved {
+                    folder: folder_ino,
+                    dir: dir.to_path_buf(),
+                    name,
+                    kind,
+                });
+            }
+            for (name, kind) in added {
+                let _ = self.drops.send(MountAction::AnnounceAdded {
+                    folder: folder_ino,
+                    dir: dir.to_path_buf(),
+                    name,
+                    kind,
+                });
+            }
+            return;
+        }
+    }
+
+    fn synthetic_attr(&self, ino: u64, kind: FileType) -> FileAttr {
+        FileAttr {
+            ino: INodeNo(ino),
+            size: 0,
+            blocks: 0,
+            atime: self.started,
+            mtime: self.started,
+            ctime: self.started,
+            crtime: self.started,
+            kind,
+            perm: if kind == FileType::Directory { 0o755 } else { 0o644 },
+            nlink: 1,
+            uid: self.uid,
+            gid: self.gid,
+            rdev: 0,
+            blksize: 4096,
+            flags: 0,
+        }
+    }
+
+    fn take_announced_gone_if_absent(&self, rel: &Path) -> bool {
+        let Some(expected_kind) = lock(&self.announced_gone).get(rel).copied() else {
+            return false;
+        };
+        if self.resolve(rel).is_some_and(|n| node_file_type(&n) == expected_kind) {
+            lock(&self.announced_gone).remove(rel);
+            return false;
+        }
+        lock(&self.announced_gone).remove(rel);
+        lock(&self.inodes).remove(rel);
+        true
+    }
+
     /// After a rename through the drive: its numbers follow it, and the listings it was in or under are stale.
     fn moved(&self, from: &Path, to: &Path) {
+        let moved_kind = std::fs::symlink_metadata(self.backing.join(to))
+            .ok()
+            .map(|m| if m.is_dir() { Kind::Folder } else { Kind::File });
         lock(&self.inodes).rename(from, to);
+        lock(&self.seen_dirs).note_moved(from, to, moved_kind);
         self.forget_listings(&[from, to]);
     }
 
     /// After a delete through the drive: its numbers go stale, and so do the listings it was in or under.
     fn removed(&self, rel: &Path) {
         lock(&self.inodes).remove(rel);
+        lock(&self.seen_dirs).note_removed(rel);
         self.forget_listings(&[rel]);
     }
 
@@ -1118,7 +1513,7 @@ impl State {
     /// Has `name`, which the trash dropped from folder `dir` (number `folder`), unlinked through the mount. Only once
     /// the reply that dropped it is sent.
     fn dropped(&self, folder: u64, dir: PathBuf, name: OsString) {
-        let _ = self.drops.send(Dropped { folder, dir, name });
+        let _ = self.drops.send(MountAction::TrashDrop { folder, dir, name });
     }
 
     /// A .trashinfo that has gone: its number goes stale, and it is unlinked through the mount.
@@ -1159,13 +1554,16 @@ impl State {
     }
 
     /// An unlink or rmdir by process `pid` answered here, without the daemon: in the trash folder, of the volume info,
-    /// or by the unlinker anywhere else, which it never has any business in. None for one the daemon carries out.
+    /// or by the unlinker announcing an externally removed entry (#408). None for one the daemon carries out.
     fn remove_here(&self, rel: &Path, removal: Removal, pid: u32) -> Option<Result<(), Errno>> {
         if self.is_trash_path(rel) {
             return Some(self.remove_in_trash(rel, removal, pid));
         }
-        if is_volume_info(rel) || self.is_unlinker(pid) {
+        if is_volume_info(rel) {
             return Some(Err(Errno::EPERM));
+        }
+        if self.is_unlinker(pid) {
+            return Some(if self.take_announced_gone_if_absent(rel) { Ok(()) } else { Err(Errno::EPERM) });
         }
         None
     }
@@ -1262,10 +1660,21 @@ impl Filesystem for DriveFs {
         Ok(())
     }
 
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let s = &self.state;
         let Some(parent_rel) = s.path_of(parent) else { return reply.error(Errno::ENOENT) };
         let rel = parent_rel.join(name);
+        if s.is_unlinker(req.pid()) {
+            if lock(&s.announced_added).contains_key(&rel) {
+                return reply.error(Errno::ENOENT);
+            }
+            let announced_gone = lock(&s.announced_gone).get(&rel).copied();
+            if let Some(kind) = announced_gone {
+                if !s.resolve(&rel).is_some_and(|n| node_file_type(&n) == kind) {
+                    return reply.entry(&Duration::ZERO, &s.synthetic_attr(s.ino_of(&rel), kind), Generation(0));
+                }
+            }
+        }
         match s.resolve(&rel) {
             Some(node) => reply.entry(&TTL, &s.attr(s.ino_of(&rel), &node), Generation(0)),
             None => reply.error(Errno::ENOENT),
@@ -1367,17 +1776,30 @@ impl Filesystem for DriveFs {
         }
     }
 
-    // Only files and folders sync
+    // Only files and folders sync; the unlinker child uses mknod solely to fire IN_CREATE for externally added files (#408)
     fn mknod(
         &self,
-        _req: &Request,
-        _parent: INodeNo,
-        _name: &OsStr,
+        req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
         _mode: u32,
         _umask: u32,
         _rdev: u32,
         reply: ReplyEntry,
     ) {
+        let s = &self.state;
+        if s.is_unlinker(req.pid()) {
+            let Some(parent_rel) = s.path_of(parent) else { return reply.error(Errno::ENOENT) };
+            let rel = parent_rel.join(name);
+            if lock(&s.announced_added).remove(&rel) == Some(FileType::RegularFile) {
+                return match s.resolve(&rel) {
+                    Some(node) if node_file_type(&node) == FileType::RegularFile => {
+                        reply.entry(&TTL, &s.attr(s.ino_of(&rel), &node), Generation(0))
+                    }
+                    _ => reply.error(Errno::ENOENT),
+                };
+            }
+        }
         reply.error(Errno::EPERM);
     }
 
@@ -1389,10 +1811,21 @@ impl Filesystem for DriveFs {
         reply.error(Errno::EPERM);
     }
 
-    fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, mode: u32, _umask: u32, reply: ReplyEntry) {
+    fn mkdir(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32, _umask: u32, reply: ReplyEntry) {
         let s = &self.state;
         let Some(parent_rel) = s.path_of(parent) else { return reply.error(Errno::ENOENT) };
         let rel = parent_rel.join(name);
+        if s.is_unlinker(req.pid()) {
+            if lock(&s.announced_added).remove(&rel) == Some(FileType::Directory) {
+                return match s.resolve(&rel) {
+                    Some(node) if node_file_type(&node) == FileType::Directory => {
+                        reply.entry(&TTL, &s.attr(s.ino_of(&rel), &node), Generation(0))
+                    }
+                    _ => reply.error(Errno::ENOENT),
+                };
+            }
+            return reply.error(Errno::EPERM);
+        }
         if listing::is_hidden_name(name) {
             return reply.error(Errno::EPERM); // the daemon's own names
         }
@@ -1413,6 +1846,7 @@ impl Filesystem for DriveFs {
         let made = std::fs::DirBuilder::new().mode(mode & 0o7777).create(&path);
         match made.and_then(|()| std::fs::symlink_metadata(&path)) {
             Ok(meta) => {
+                lock(&s.seen_dirs).note_added(&parent_rel, name, Kind::Folder);
                 s.forget_listing(&parent_rel);
                 reply.entry(&TTL, &s.attr(s.ino_of(&rel), &Node::Local(meta)), Generation(0))
             }
@@ -1655,6 +2089,7 @@ impl Filesystem for DriveFs {
             .open(s.backing.join(&rel));
         match opened.and_then(|file| file.metadata().map(|meta| (file, meta))) {
             Ok((file, meta)) => {
+                lock(&s.seen_dirs).note_added(&parent_rel, name, Kind::File);
                 s.forget_listing(&parent_rel);
                 let ino = s.ino_of(&rel);
                 let attr = s.attr(ino, &Node::Local(meta));
@@ -1772,7 +2207,9 @@ impl Filesystem for DriveFs {
             s.trash.list(&rel).into_iter().map(|(name, folder)| (name, kind(folder))).collect()
         } else {
             let kind = |e: &Entry| if e.kind == Kind::Folder { FileType::Directory } else { FileType::RegularFile };
-            s.listing(&rel).entries.iter().map(|e| (e.name.clone(), kind(e))).collect()
+            let listed = s.listing(&rel);
+            s.record_seen_dir(&rel, &listed.entries);
+            listed.entries.iter().map(|e| (e.name.clone(), kind(e))).collect()
         };
         let parent_ino = rel.parent().map_or(ROOT_INO, |p| s.ino_of(p));
         let mut rows = vec![
@@ -3063,5 +3500,55 @@ mod tests {
         assert_eq!((after.tv_sec, after.tv_nsec), (1, 500_000_000));
         let before = time_spec(Some(TimeOrNow::SpecificTime(UNIX_EPOCH - Duration::from_millis(1200))));
         assert_eq!((before.tv_sec, before.tv_nsec), (-2, 800_000_000));
+    }
+
+    #[test]
+    fn seen_dirs_tracks_entries_and_evicts_least_recently_used() {
+        let mut seen = SeenDirs::default();
+        let mut a = HashMap::new();
+        a.insert(OsString::from("one.txt"), Kind::File);
+        seen.record(Path::new("A"), a);
+
+        let mut b = HashMap::new();
+        b.insert(OsString::from("sub"), Kind::Folder);
+        seen.record(Path::new("B"), b);
+
+        // Local mutations keep tracked folders in sync with FUSE operations
+        seen.note_added(Path::new("A"), OsStr::new("two.txt"), Kind::File);
+        assert_eq!(
+            seen.get(Path::new("A")),
+            Some(HashMap::from([
+                (OsString::from("one.txt"), Kind::File),
+                (OsString::from("two.txt"), Kind::File),
+            ]))
+        );
+
+        seen.record(Path::new("C"), HashMap::new());
+        seen.note_moved(Path::new("A/one.txt"), Path::new("C/renamed.txt"), Some(Kind::File));
+        assert_eq!(seen.get(Path::new("A")), Some(HashMap::from([(OsString::from("two.txt"), Kind::File)])));
+        assert_eq!(seen.get(Path::new("C")), Some(HashMap::from([(OsString::from("renamed.txt"), Kind::File)])));
+
+        // Moving a tracked folder remaps its tracked entry rather than losing it
+        seen.record(Path::new("B/sub"), HashMap::from([(OsString::from("k"), Kind::File)]));
+        seen.note_moved(Path::new("B/sub"), Path::new("C/sub"), Some(Kind::Folder));
+        assert_eq!(seen.get(Path::new("B/sub")), None);
+        assert_eq!(seen.get(Path::new("C/sub")), Some(HashMap::from([(OsString::from("k"), Kind::File)])));
+
+        seen.note_removed(Path::new("A/two.txt"));
+        assert_eq!(seen.get(Path::new("A")), Some(HashMap::new()));
+
+        // Removing a folder also drops its own tracked subtree
+        seen.note_added(Path::new("C"), OsStr::new("Child"), Kind::Folder);
+        seen.record(Path::new("C/Child"), HashMap::from([(OsString::from("x"), Kind::File)]));
+        seen.note_removed(Path::new("C/Child"));
+        assert_eq!(seen.get(Path::new("C/Child")), None);
+
+        // Re-recording A refreshes its recency so B is evicted first when the cap is exceeded
+        seen.record(Path::new("A"), HashMap::new());
+        for i in 0..SEEN_DIRS_MAX {
+            seen.record(&PathBuf::from(format!("dir-{i}")), HashMap::new());
+        }
+        assert_eq!(seen.get(Path::new("B")), None, "oldest directory is evicted");
+        assert_eq!(seen.tracked().len(), SEEN_DIRS_MAX);
     }
 }

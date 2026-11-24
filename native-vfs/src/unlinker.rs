@@ -27,18 +27,41 @@ const FIELD_MAX: usize = 64 * 1024;
 /// How long a child that stopped answering gets to be gone, once killed
 const REAP_WAIT: Duration = Duration::from_secs(5);
 
-/// An unlink of `name` in folder `dir`, which must be on device `dev` and have number `folder`.
+/// What the child does in folder `dir`, verified against `(dev, folder)`: unlink/rmdir (for trash drops and hidden
+/// entries) or mkdir/mknod (to fire IN_CREATE for entries added outside FUSE, #408).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum Op {
+    Unlink = 0,
+    Mkdir = 1,
+    Mknod = 2,
+}
+
+impl Op {
+    fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Op::Unlink),
+            1 => Some(Op::Mkdir),
+            2 => Some(Op::Mknod),
+            _ => None,
+        }
+    }
+}
+
+/// An operation on `name` in folder `dir`, which must be on device `dev` and have number `folder`.
 #[derive(Debug, PartialEq)]
 struct Request {
+    op: Op,
     dev: u64,
     folder: u64,
     dir: PathBuf,
     name: OsString,
 }
 
-fn encode(dev: u64, folder: u64, dir: &Path, name: &OsStr) -> Vec<u8> {
+fn encode(op: Op, dev: u64, folder: u64, dir: &Path, name: &OsStr) -> Vec<u8> {
     let (dir, name) = (dir.as_os_str().as_bytes(), name.as_bytes());
-    let mut out = Vec::with_capacity(24 + dir.len() + name.len());
+    let mut out = Vec::with_capacity(25 + dir.len() + name.len());
+    out.push(op as u8);
     out.extend_from_slice(&dev.to_ne_bytes());
     out.extend_from_slice(&folder.to_ne_bytes());
     for field in [dir, name] {
@@ -51,16 +74,18 @@ fn encode(dev: u64, folder: u64, dir: &Path, name: &OsStr) -> Vec<u8> {
 /// The next request, or None at the end of the input.
 fn read_request(input: &mut impl Read) -> io::Result<Option<Request>> {
     // The end only between requests: one cut short is an error
-    let (mut dev, mut got) = ([0u8; 8], 0);
-    while got < dev.len() {
-        match input.read(&mut dev[got..]) {
-            Ok(0) if got == 0 => return Ok(None),
-            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-            Ok(n) => got += n,
+    let mut op_byte = [0u8; 1];
+    loop {
+        match input.read(&mut op_byte) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(err) => return Err(err),
         }
     }
+    let op = Op::from_byte(op_byte[0]).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown op"))?;
+    let mut dev = [0u8; 8];
+    input.read_exact(&mut dev)?;
     let mut folder = [0u8; 8];
     input.read_exact(&mut folder)?;
     let mut field = || -> io::Result<Vec<u8>> {
@@ -76,6 +101,7 @@ fn read_request(input: &mut impl Read) -> io::Result<Option<Request>> {
     };
     let (dir, name) = (field()?, field()?);
     Ok(Some(Request {
+        op,
         dev: u64::from_ne_bytes(dev),
         folder: u64::from_ne_bytes(folder),
         dir: PathBuf::from(OsString::from_vec(dir)),
@@ -112,12 +138,26 @@ impl Unlinker {
         self.child.id()
     }
 
-    /// Has the child unlink `name` in folder `dir` (see unlink_in): whether it did. An error when the child is gone.
-    pub fn unlink(&mut self, dev: u64, folder: u64, dir: &Path, name: &OsStr) -> io::Result<bool> {
-        self.input.write_all(&encode(dev, folder, dir, name))?;
+    fn ask(&mut self, op: Op, dev: u64, folder: u64, dir: &Path, name: &OsStr) -> io::Result<bool> {
+        self.input.write_all(&encode(op, dev, folder, dir, name))?;
         let mut answer = [0u8];
         self.output.read_exact(&mut answer)?;
         Ok(answer[0] == 1)
+    }
+
+    /// Has the child unlink `name` in folder `dir` (see apply_in): whether it did. An error when the child is gone.
+    pub fn unlink(&mut self, dev: u64, folder: u64, dir: &Path, name: &OsStr) -> io::Result<bool> {
+        self.ask(Op::Unlink, dev, folder, dir, name)
+    }
+
+    /// Has the child announce a newly appeared folder `name` in `dir` via mkdirat so inotify watchers hear IN_CREATE (#408).
+    pub fn mkdir(&mut self, dev: u64, folder: u64, dir: &Path, name: &OsStr) -> io::Result<bool> {
+        self.ask(Op::Mkdir, dev, folder, dir, name)
+    }
+
+    /// Has the child announce a newly appeared file `name` in `dir` via mknodat so inotify watchers hear IN_CREATE (#408).
+    pub fn mknod(&mut self, dev: u64, folder: u64, dir: &Path, name: &OsStr) -> io::Result<bool> {
+        self.ask(Op::Mknod, dev, folder, dir, name)
     }
 
     /// Done with a child that stopped answering. Its pipes are closed, so it is on its way out if not gone, and never
@@ -142,14 +182,14 @@ pub fn serve(parent: Option<&OsStr>) -> i32 {
     if parent != Some(unsafe { libc::getppid() }) {
         return 1;
     }
-    serve_on(&mut io::stdin().lock(), &mut io::stdout().lock(), unlink_in)
+    serve_on(&mut io::stdin().lock(), &mut io::stdout().lock(), apply_in)
 }
 
-fn serve_on(input: &mut impl Read, output: &mut impl Write, unlink: impl Fn(&Request) -> bool) -> i32 {
+fn serve_on(input: &mut impl Read, output: &mut impl Write, apply: impl Fn(&Request) -> bool) -> i32 {
     loop {
         match read_request(input) {
             Ok(Some(request)) => {
-                let answer = [u8::from(unlink(&request))];
+                let answer = [u8::from(apply(&request))];
                 if output.write_all(&answer).and_then(|()| output.flush()).is_err() {
                     return 1;
                 }
@@ -160,26 +200,32 @@ fn serve_on(input: &mut impl Read, output: &mut impl Write, unlink: impl Fn(&Req
     }
 }
 
-/// Unlinks the name in the folder, which must have the request's device and number: nothing is unlinked once the drive
-/// is unmounted, or wherever else the path leads. The unlink is made in the folder opened, so it can't move meanwhile.
-fn unlink_in(request: &Request) -> bool {
+/// Applies the requested entry notification in `request.dir`, which must have the request's device and inode number:
+/// nothing is touched once the drive is unmounted, or wherever else the path leads.
+fn apply_in(request: &Request) -> bool {
     let Ok(name) = CString::new(request.name.as_bytes()) else { return false };
-    // O_PATH: the folder isn't opened as such (no opendir), only held to unlink in
+    // O_PATH: the folder isn't opened as such (no opendir), only held to act in
     let opened = OpenOptions::new().read(true).custom_flags(libc::O_PATH | libc::O_DIRECTORY).open(&request.dir);
     let Ok(folder) = opened else { return false };
     if !folder.metadata().is_ok_and(|meta| meta.dev() == request.dev && meta.ino() == request.folder) {
         return false;
     }
-    // An item dropped from files/ is a file to a lookup, but still a folder to an entry the kernel holds of it
-    for flags in [0, libc::AT_REMOVEDIR, 0] {
-        if unsafe { libc::unlinkat(folder.as_raw_fd(), name.as_ptr(), flags) } == 0 {
-            return true;
+    match request.op {
+        Op::Unlink => {
+            // An item dropped from files/ is a file to a lookup, but still a folder to an entry the kernel holds of it
+            for flags in [0, libc::AT_REMOVEDIR, 0] {
+                if unsafe { libc::unlinkat(folder.as_raw_fd(), name.as_ptr(), flags) } == 0 {
+                    return true;
+                }
+                if !matches!(io::Error::last_os_error().raw_os_error(), Some(libc::EISDIR | libc::ENOTDIR)) {
+                    return false;
+                }
+            }
+            false
         }
-        if !matches!(io::Error::last_os_error().raw_os_error(), Some(libc::EISDIR | libc::ENOTDIR)) {
-            return false;
-        }
+        Op::Mkdir => unsafe { libc::mkdirat(folder.as_raw_fd(), name.as_ptr(), 0o755) == 0 },
+        Op::Mknod => unsafe { libc::mknodat(folder.as_raw_fd(), name.as_ptr(), libc::S_IFREG | 0o644, 0) == 0 },
     }
-    false
 }
 
 #[cfg(test)]
@@ -189,31 +235,35 @@ mod tests {
 
     #[test]
     fn any_name_gets_through_whole() {
-        let names = [OsStr::new("a\nb"), OsStr::from_bytes(b"\xff\xfe not UTF-8"), OsStr::new("")];
+        let cases = [
+            (Op::Unlink, OsStr::new("a\nb")),
+            (Op::Mkdir, OsStr::from_bytes(b"\xff\xfe not UTF-8")),
+            (Op::Mknod, OsStr::new("")),
+        ];
         let mut stream = Vec::new();
-        for (i, name) in names.iter().enumerate() {
-            stream.extend(encode(7, i as u64, Path::new("/mnt/my drive/.Trash-1000/files"), name));
+        for (i, (op, name)) in cases.iter().enumerate() {
+            stream.extend(encode(*op, 7, i as u64, Path::new("/mnt/my drive/.Trash-1000/files"), name));
         }
         let mut input = stream.as_slice();
-        for (i, name) in names.iter().enumerate() {
+        for (i, (op, name)) in cases.iter().enumerate() {
             let request = read_request(&mut input).unwrap().unwrap();
             let dir = PathBuf::from("/mnt/my drive/.Trash-1000/files");
-            assert_eq!(request, Request { dev: 7, folder: i as u64, dir, name: name.to_os_string() });
+            assert_eq!(request, Request { op: *op, dev: 7, folder: i as u64, dir, name: name.to_os_string() });
         }
         assert_eq!(read_request(&mut input).unwrap(), None, "the end of the input");
-        let cut = &encode(7, 1, Path::new("/d"), OsStr::new("name"))[..20];
+        let cut = &encode(Op::Unlink, 7, 1, Path::new("/d"), OsStr::new("name"))[..20];
         assert!(read_request(&mut &cut[..]).is_err(), "a request cut short");
     }
 
     #[test]
     fn the_child_answers_each_request_and_ends_with_its_input() {
-        let mut stream = encode(1, 2, Path::new("/d"), OsStr::new("yes"));
-        stream.extend(encode(1, 2, Path::new("/d"), OsStr::new("no")));
+        let mut stream = encode(Op::Unlink, 1, 2, Path::new("/d"), OsStr::new("yes"));
+        stream.extend(encode(Op::Mkdir, 1, 2, Path::new("/d"), OsStr::new("no")));
         let mut answers = Vec::new();
         let code = serve_on(&mut stream.as_slice(), &mut answers, |r| r.name == "yes");
         assert_eq!((code, answers), (0, vec![1, 0]));
         let mut answers = Vec::new();
-        assert_eq!(serve_on(&mut &[1u8, 2, 3][..], &mut answers, |_| true), 1, "garbage ends it");
+        assert_eq!(serve_on(&mut &[99u8, 2, 3][..], &mut answers, |_| true), 1, "unknown op ends it");
     }
 
     // A child that stopped answering is reaped once done with: never left a zombie, which would keep its pid taken
@@ -235,14 +285,19 @@ mod tests {
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("a"), b"a").unwrap();
         let meta = std::fs::metadata(&dir).unwrap();
-        let request = |dev: u64, folder: u64, name: &str| Request { dev, folder, dir: dir.clone(), name: name.into() };
-        assert!(!unlink_in(&request(meta.dev() + 1, meta.ino(), "a")), "another device");
-        assert!(!unlink_in(&request(meta.dev(), meta.ino() + 1, "a")), "another folder");
+        let request = |op, dev: u64, folder: u64, name: &str| Request { op, dev, folder, dir: dir.clone(), name: name.into() };
+        assert!(!apply_in(&request(Op::Unlink, meta.dev() + 1, meta.ino(), "a")), "another device");
+        assert!(!apply_in(&request(Op::Unlink, meta.dev(), meta.ino() + 1, "a")), "another folder");
         assert!(dir.join("a").exists());
-        assert!(unlink_in(&request(meta.dev(), meta.ino(), "a")));
+        assert!(apply_in(&request(Op::Unlink, meta.dev(), meta.ino(), "a")));
         assert!(!dir.join("a").exists());
-        assert!(unlink_in(&request(meta.dev(), meta.ino(), "sub")), "a folder, with rmdir");
-        assert!(!unlink_in(&request(meta.dev(), meta.ino(), "a")), "nothing left to unlink");
+        assert!(apply_in(&request(Op::Unlink, meta.dev(), meta.ino(), "sub")), "a folder, with rmdir");
+        assert!(!apply_in(&request(Op::Unlink, meta.dev(), meta.ino(), "a")), "nothing left to unlink");
+        assert!(!apply_in(&request(Op::Mkdir, meta.dev() + 1, meta.ino(), "newdir")), "mkdir checks device");
+        assert!(apply_in(&request(Op::Mkdir, meta.dev(), meta.ino(), "newdir")));
+        assert!(dir.join("newdir").is_dir());
+        assert!(apply_in(&request(Op::Mknod, meta.dev(), meta.ino(), "newfile")));
+        assert!(dir.join("newfile").is_file());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
