@@ -334,14 +334,31 @@ def rel_to_root(root, path):
     return None
 
 
-def share_path_problem(path):
-    """Why the app can't be asked to share the item at path, or None. The request is one line of UTF-8 text: a path
-    with a line break can't travel in it, nor one that isn't UTF-8 (GIO hands Python each byte of such a name it can't
-    read as a lone surrogate, \\udc80 to \\udcff, which UTF-8 can't encode)."""
+SHARE_NOT_UTF8 = "Proton Drive can't share an item whose path isn't valid UTF-8"
+CHANGE_NOT_UTF8 = "Proton Drive can't change an item whose path isn't valid UTF-8"
+
+
+def is_utf8_path(path) -> bool:
+    """Whether path is valid UTF-8 (GIO hands Python non-UTF-8 bytes as lone surrogates \\udc80–\\udcff)."""
+    if not isinstance(path, str):
+        return False
     try:
         path.encode("utf-8")
+        return True
     except UnicodeEncodeError:
-        return "Proton Drive can't share an item whose path isn't valid UTF-8"
+        return False
+
+
+def safe_name(path: str) -> str:
+    """Basename made safe as UTF-8 text for notifications (non-UTF-8 bytes become U+FFFD)."""
+    return os.path.basename(path).encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
+def share_path_problem(path):
+    """Why the app can't be asked to share the item at path, or None. The request is one line of UTF-8 text: a path
+    with a line break can't travel in it, nor one that isn't UTF-8."""
+    if not is_utf8_path(path):
+        return SHARE_NOT_UTF8
     if "\n" in path:
         return "Proton Drive can't share an item whose path has a line break in it"
     return None
@@ -505,11 +522,12 @@ class ProtonDriveFiles:
         path = file.get_location().get_path()
         if self.root is None:
             # Tracked, so that the root arriving makes Files ask again (set_root)
-            self.tracker.track(path)
+            if is_utf8_path(path):
+                self.tracker.track(path)
             self.ask_root()
             return
         rel = rel_to_root(self.root, path)
-        if not rel or skipped(rel):
+        if not rel or skipped(rel) or not is_utf8_path(path):
             return
         self.tracker.track(path)
         folder = os.path.dirname(path)
@@ -630,6 +648,9 @@ class ProtonDriveFiles:
     def copy_link(self, path):
         """Asks the daemon for the item's share link (making one only if none exists) and puts it on the clipboard.
         Never logs the link or the error text."""
+        if not is_utf8_path(path):
+            self.notify("Couldn't copy the link", SHARE_NOT_UTF8)
+            return
         rel = rel_to_root(self.menu_root(), path)
         name = os.path.basename(path)
 
@@ -653,14 +674,20 @@ class ProtonDriveFiles:
     def act(self, action, paths):
         root = self.menu_root()
         targets = [p for p in paths if self.state_of(p) is not None]
-        rels = [rel_to_root(root, p) for p in targets]
-        for path in targets:
+        valid = [p for p in targets if is_utf8_path(p)]
+        invalid = [(p, None, CHANGE_NOT_UTF8) for p in targets if not is_utf8_path(p)]
+        if not valid:
+            if invalid:
+                self.report(action, invalid)
+            return
+        rels = [rel_to_root(root, p) for p in valid]
+        for path in valid:
             self.busy.add(path)
             self.invalidate(self.tracker.get(path))
 
         def work():
             results = []
-            for path, rel in zip(targets, rels):
+            for path, rel in zip(valid, rels):
                 try:
                     results.append((path, self.request("POST", "/availability", {"path": rel, "action": action}, ACTION_READ_TIMEOUT), None))
                 except ControlError as err:
@@ -670,13 +697,13 @@ class ProtonDriveFiles:
             return results
 
         def done(results, error):
-            for path in targets:
+            for path in valid:
                 self.busy.discard(path)
                 self.cache.drop(os.path.dirname(path))
                 self.invalidate(self.tracker.get(path))
             if error is not None:
-                results = [(targets[0] if targets else "", None, str(error))]
-            self.report(action, results or [])
+                results = [(valid[0], None, str(error))]
+            self.report(action, (results or []) + invalid)
 
         self.run(work, done)
 
@@ -690,12 +717,12 @@ class ProtonDriveFiles:
             if not isinstance(result, dict):
                 continue
             if result.get("refused"):
-                self.notify(f"Can't hide {os.path.basename(path)}", str(result["refused"]))
+                self.notify(f"Can't hide {safe_name(path)}", str(result["refused"]))
             kept += len(result.get("kept") or [])
         if kept:
             self.notify(f"Kept {kept} item(s) on this computer", "They aren't in Proton Drive yet.")
         if failed:
-            names = [os.path.basename(p) for p, _e in failed]
+            names = [safe_name(p) for p, _e in failed]
             self.notify(f"Proton Drive couldn't change {summarize(names)}", failed[0][1])
 
     # Changes
