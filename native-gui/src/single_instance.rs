@@ -262,20 +262,94 @@ pub fn claim(
     }
 }
 
+/// How long one client has to send its whole request line before the listener drops it (#225).
+const REQUEST_DEADLINE: Duration = Duration::from_secs(2);
+/// Cap on simultaneous connection handler threads so slow clients cannot spawn unbounded threads (#225).
+const MAX_CONCURRENT_CONNECTIONS: usize = 16;
+/// A request is one line, at most `share ` + a path + the newline (a refusal is shorter): never read more.
+const MAX_REQUEST_LINE: usize = MAX_SHARE_PATH + 7;
+
+/// Reads one request line from `stream`, bounded in both size (`MAX_REQUEST_LINE`) and total elapsed time (`deadline`),
+/// so a client that trickles bytes slowly cannot hold a connection past `deadline` (#225).
+fn read_request_line(stream: &mut UnixStream, deadline: Instant) -> Option<String> {
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 512];
+    while bytes.len() < MAX_REQUEST_LINE {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        // Clamp above zero: on Linux, a 0-microsecond SO_RCVTIMEO means no timeout at all
+        let _ = stream.set_read_timeout(Some(remaining.max(Duration::from_millis(1))));
+        let want = (MAX_REQUEST_LINE - bytes.len()).min(buf.len());
+        match stream.read(&mut buf[..want]) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Some(nl) = buf[..n].iter().position(|&b| b == b'\n') {
+                    bytes.extend_from_slice(&buf[..=nl]);
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn handle_connection(mut stream: UnixStream, deadline: Instant, on_request: &(impl Fn(Request) + ?Sized)) {
+    let _ = stream.set_write_timeout(Some(REQUEST_DEADLINE));
+    let Some(line) = read_request_line(&mut stream, deadline) else {
+        return;
+    };
+    if let Some(request) = parse_request(&line) {
+        on_request(request);
+        let _ = stream.write_all(b"ok\n");
+    }
+}
+
 /// Answers later starts on `listener`, calling `on_request` with what each asks. Runs until the listener fails; a request it doesn't know is ignored, unanswered.
-pub fn serve(listener: UnixListener, on_request: impl Fn(Request) + Send + 'static) {
+/// Each connection runs on its own bounded worker thread with a total deadline so a slow client cannot block later starts (#225).
+pub fn serve(listener: UnixListener, on_request: impl Fn(Request) + Send + Sync + 'static) {
+    serve_with_deadline(listener, REQUEST_DEADLINE, on_request);
+}
+
+fn serve_with_deadline(listener: UnixListener, deadline: Duration, on_request: impl Fn(Request) + Send + Sync + 'static) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct Slot(Arc<AtomicUsize>);
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    let on_request = Arc::new(on_request);
+    let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
-        let Ok(mut stream) = stream else { continue };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-        let mut line = String::new();
-        // A request is one line, at most `share ` + a path + the newline (a refusal is shorter): never read more
-        if BufReader::new(&stream).take(MAX_SHARE_PATH as u64 + 7).read_line(&mut line).is_err() {
+        let Ok(stream) = stream else { continue };
+        let mut current = active.load(Ordering::SeqCst);
+        let reserved = loop {
+            if current >= MAX_CONCURRENT_CONNECTIONS {
+                break false;
+            }
+            match active.compare_exchange_weak(current, current + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break true,
+                Err(actual) => current = actual,
+            }
+        };
+        if !reserved {
+            drop(stream);
             continue;
         }
-        if let Some(request) = parse_request(&line) {
-            on_request(request);
-            let _ = stream.write_all(b"ok\n");
-        }
+        let slot = Slot(active.clone());
+        let on_request = on_request.clone();
+        let _ = std::thread::Builder::new().spawn(move || {
+            let _slot = slot;
+            handle_connection(stream, Instant::now() + deadline, &*on_request);
+        });
     }
 }
 
@@ -567,6 +641,98 @@ mod tests {
         assert_eq!(std::fs::metadata(folder).unwrap().permissions().mode() & 0o777, 0o700);
         std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(claim(&paths, uid(), false, Duration::from_millis(100), &Request::Show(None)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // #225: a same-user client that trickles bytes slowly must not hold up later requests
+    #[test]
+    fn a_slow_client_trickling_bytes_does_not_block_another_request() {
+        let dir = temp_dir("slow");
+        let paths = paths_in(&dir);
+        let Claim::Primary { lock: _lock, listener } = claim(&paths, uid(), true, Duration::from_secs(2), &Request::Show(None)).unwrap() else {
+            panic!("the first start must be the primary");
+        };
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        std::thread::spawn(move || serve(listener, move |request| sink.lock().unwrap().push(request)));
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let sock = paths.socket.clone();
+        let trickler = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(&sock).unwrap();
+            let _ = stream.write_all(b"share /");
+            let _ = started_tx.send(());
+            for _ in 0..30 {
+                if stop_rx.recv_timeout(Duration::from_millis(120)).is_ok() {
+                    break;
+                }
+                if stream.write_all(b"a").is_err() {
+                    break;
+                }
+            }
+        });
+
+        started_rx.recv().unwrap();
+        // Give serve a moment to enter read() on the trickling connection
+        std::thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        assert!(signal(&paths.socket, &Request::Show(Some("home".into()))), "second request should be answered");
+        assert!(started.elapsed() < Duration::from_secs(1), "second request waited {:?}", started.elapsed());
+        assert_eq!(*seen.lock().unwrap(), vec![Request::Show(Some("home".to_string()))]);
+
+        let _ = stop_tx.send(());
+        trickler.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // #225: a trickling client hits the total deadline even though every individual read returns quickly
+    #[test]
+    fn a_slow_client_trickling_bytes_hits_the_total_deadline() {
+        let dir = temp_dir("slow-deadline");
+        let paths = paths_in(&dir);
+        let Claim::Primary { lock: _lock, listener } = claim(&paths, uid(), true, Duration::from_secs(2), &Request::Show(None)).unwrap() else {
+            panic!("the first start must be the primary");
+        };
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        std::thread::spawn(move || serve_with_deadline(listener, Duration::from_millis(200), move |request| sink.lock().unwrap().push(request)));
+
+        let mut stream = UnixStream::connect(&paths.socket).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let started = Instant::now();
+        let _ = stream.write_all(b"share /");
+        // Trickle 1 byte every 35 ms (well below the 200 ms deadline): the server must cut off at the total deadline
+        let mut closed = false;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(35));
+            if stream.write_all(b"a").is_err() {
+                closed = true;
+                break;
+            }
+            // Check whether the peer closed (EOF on read without blocking)
+            stream.set_nonblocking(true).unwrap();
+            let mut probe = [0u8; 16];
+            match stream.read(&mut probe) {
+                Ok(0) => {
+                    closed = true;
+                    break;
+                }
+                Ok(n) => panic!("unexpected reply from server: {:?}", &probe[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    closed = true;
+                    break;
+                }
+            }
+            stream.set_nonblocking(false).unwrap();
+        }
+        assert!(closed, "server must close a trickling client at its total deadline");
+        assert!(started.elapsed() < Duration::from_secs(1), "took too long to close: {:?}", started.elapsed());
+        assert!(seen.lock().unwrap().is_empty());
+        // A normal request still works afterwards
+        assert!(signal(&paths.socket, &Request::Show(None)));
+        assert_eq!(*seen.lock().unwrap(), vec![Request::Show(None)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
