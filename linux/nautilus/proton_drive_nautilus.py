@@ -612,13 +612,20 @@ class ProtonDriveFiles:
         if problem:
             self.notify("Couldn't open Share", problem)
             return
+        found_but_failed = False
         for exe in (os.path.expanduser("~/.local/bin/protondrive-gui"), "/usr/bin/protondrive-gui", "protondrive-gui"):
             try:
                 _spawn_detached([exe, "--share", path])
                 return
-            except OSError:
+            except (FileNotFoundError, NotADirectoryError):
                 continue
-        self.notify("Couldn't open Share", "The Proton Drive app isn't installed.")
+            except OSError:
+                found_but_failed = True
+                continue
+        if found_but_failed:
+            self.notify("Couldn't open Share", "protondrive-gui didn't start.")
+        else:
+            self.notify("Couldn't open Share", "The Proton Drive app isn't installed.")
 
     def copy_link(self, path):
         """Asks the daemon for the item's share link (making one only if none exists) and puts it on the clipboard.
