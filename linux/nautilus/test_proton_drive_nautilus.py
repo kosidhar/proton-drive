@@ -545,6 +545,44 @@ class MenuTest(unittest.TestCase):
         h.release()
         self.assertEqual(h.notes, [("Proton Drive couldn't change a.txt, b.txt, c.txt and 2 more", "Not in Proton Drive: x")])
 
+    def test_non_utf8_paths_are_refused_for_pin_free_and_hide(self):
+        # #227: the daemon can't sync or match a non-UTF-8 filename, so keep/free/hide refuse it cleanly without
+        # sending a broken JSON request.
+        bad = f"{ROOT}/Docs/caf\udce9.txt"
+        why = "Proton Drive can't change an item whose path isn't valid UTF-8"
+        for action in ("pin", "free", "hide"):
+            self.h.requests.clear()
+            self.h.notes.clear()
+            self.h.files.act(action, [bad])
+            self.h.release()
+            self.assertEqual(self.h.requests, [], action)
+            self.assertNotIn(bad, self.h.files.busy, action)
+            self.assertEqual(self.h.notes, [("Proton Drive couldn't change caf\ufffd.txt", why)], action)
+
+        # Mixed selection: valid item still runs, non-UTF-8 item is refused and reported
+        self.h.requests.clear()
+        self.h.notes.clear()
+        self.h.answers["/availability"] = lambda body: {"state": "pinned", "kept": [], "refused": None}
+        self.h.files.act("pin", [f"{ROOT}/Docs/a.txt", bad])
+        self.h.release()
+        self.assertEqual(self.h.requests, [("POST", "/availability", {"path": "Docs/a.txt", "action": "pin"})])
+        self.assertEqual(self.h.notes, [("Proton Drive couldn't change caf\ufffd.txt", why)])
+
+        # A valid filename inside a non-UTF-8 ancestor folder is refused too
+        nested = f"{ROOT}/caf\udce9/a.txt"
+        self.h.requests.clear()
+        self.h.notes.clear()
+        self.h.files.act("pin", [nested])
+        self.h.release()
+        self.assertEqual(self.h.requests, [])
+        self.assertEqual(self.h.notes, [("Proton Drive couldn't change a.txt", why)])
+
+        # A file inside a non-UTF-8 folder must not crash file_info / urllib.parse.quote
+        self.h.requests.clear()
+        self.h.files.file_info(FakeFile(nested))
+        self.h.release()
+        self.assertEqual(self.h.requests, [])
+
 
 class FileMenuTest(unittest.TestCase):
     """#214: the right-click menu holds only actions on what was clicked, with no "Proton Drive:" prefix; syncing and
@@ -716,6 +754,22 @@ class CopyLinkTest(unittest.TestCase):
         self.assertEqual(f.share_items_for([ROOT]), [])
         self.assertEqual(f.share_items_for(["/tmp/elsewhere.txt"]), [])
         self.assertEqual(f.share_items_for([None]), [])
+
+    def test_non_utf8_path_is_refused_without_contacting_daemon(self):
+        # #227: GIO hands non-UTF-8 bytes as lone surrogates; Copy Link refuses instead of sending an unmatchable path.
+        for bad in (f"{ROOT}/Docs/caf\udce9.txt", f"{ROOT}/caf\udce9/report.pdf"):
+            self.h.requests.clear()
+            self.h.copied.clear()
+            self.h.notes.clear()
+            self.h.files.copy_link(bad)
+            self.h.release()
+            self.assertEqual(self.h.requests, [], repr(bad))
+            self.assertEqual(self.h.copied, [], repr(bad))
+            self.assertEqual(
+                self.h.notes,
+                [("Couldn't copy the link", "Proton Drive can't share an item whose path isn't valid UTF-8")],
+                repr(bad),
+            )
 
 
 class OtherFileManagersTest(unittest.TestCase):
