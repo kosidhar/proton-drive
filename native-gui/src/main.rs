@@ -1926,9 +1926,15 @@ struct ProtonDriveNativeApp {
     share: Option<share::ShareWindow>,
     /// What the Shared section lists (#253)
     shared: shared::SharedPage,
-    /// Changes sent from Share windows closed or replaced before they were answered: a failure goes to the notice
+    /// Changes sent from Share windows closed or replaced before they were answered: a failure goes to `share_notices`
     share_left: Vec<share::LeftChange>,
+    /// Failed share changes shown across every section until dismissed (#228)
+    share_notices: Vec<String>,
+    /// Shared handoff slot populated in `on_exit` so `main()` can wait for in-flight share changes after the window closes (#228)
+    exit_shares: Option<std::sync::Arc<std::sync::Mutex<Option<PendingExitShares>>>>,
 }
+
+type PendingExitShares = (Vec<share::LeftChange>, Option<(String, String)>, Receiver<WorkerEvent>);
 
 impl ProtonDriveNativeApp {
     fn new(
@@ -2056,6 +2062,8 @@ impl ProtonDriveNativeApp {
             share: None,
             shared,
             share_left: Vec::new(),
+            share_notices: Vec::new(),
+            exit_shares: None,
         }
     }
 
@@ -2355,15 +2363,8 @@ impl ProtonDriveNativeApp {
                             // Reading the list again when Shared is next opened would drop this: off the page it is told
                             // in the notice, with the item's name
                             if self.tab != NavTab::Shared {
-                                let name = self
-                                    .shared
-                                    .items
-                                    .iter()
-                                    .flatten()
-                                    .find(|i| i.rel_path.as_deref() == Some(rel_path.as_str()))
-                                    .map(|i| i.name.clone())
-                                    .unwrap_or_else(|| rel_path.rsplit('/').next().unwrap_or(&rel_path).to_string());
-                                self.notice = Some(format!("Couldn't stop sharing {name}: {e}"));
+                                let name = self.shared_item_name(&rel_path);
+                                self.share_notices.push(shared_stop_failed_message(&name, &e));
                             } else {
                                 self.shared.stop_error = Some(e);
                             }
@@ -3024,33 +3025,37 @@ impl ProtonDriveNativeApp {
             return;
         };
         ui.add_space(10.0);
-        Frame::NONE
-            .fill(WARNING_SOFT())
-            .stroke(Stroke::new(1.0_f32, WARNING_LINE()))
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::symmetric(12, 8))
+        if render_notice_banner(ui, &text) {
+            self.notice = None;
+        }
+    }
+
+    /// Failed share changes, shown at the top of whichever section is open until each is dismissed (#228).
+    fn render_share_notices(&mut self, ui: &mut egui::Ui) {
+        if self.share_notices.is_empty() {
+            return;
+        }
+        let mut dismissed = None;
+        ScrollArea::vertical()
+            .id_salt("share_notices_scroll")
+            .max_height(160.0)
+            .auto_shrink([false, true])
             .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                let text_w = (ui.available_width() - ICON_BUTTON_SIZE - ui.spacing().item_spacing.x).max(0.0);
-                ui.horizontal_top(|ui| {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(text_w, ICON_BUTTON_SIZE),
-                        Layout::left_to_right(Align::Center),
-                        |ui| {
-                            ui.set_min_width(text_w);
-                            let notice = ui.add(
-                                egui::Label::new(RichText::new(&text).size(12.5).color(TEXT_PRIMARY())).wrap(),
-                            );
-                            ui.ctx().accesskit_node_builder(notice.id, |node| {
-                                node.set_live(egui::accesskit::Live::Polite);
-                            });
-                        },
-                    );
-                    if icon_button(ui, icons::REMOVE, "Dismiss").clicked() {
-                        self.notice = None;
+                Frame::NONE.inner_margin(SCROLL_GUTTER).show(ui, |ui| {
+                    for (i, text) in self.share_notices.iter().enumerate() {
+                        if i > 0 {
+                            ui.add_space(6.0);
+                        }
+                        if ui.push_id(("share_notice", i), |ui| render_notice_banner(ui, text)).inner {
+                            dismissed = Some(i);
+                        }
                     }
                 });
             });
+        if let Some(i) = dismissed {
+            self.share_notices.remove(i);
+        }
+        ui.add_space(10.0);
     }
 
     /// Confirmation for Free up space, switching the virtual drive off and deleting the missing files in Proton Drive.
@@ -3345,6 +3350,7 @@ impl ProtonDriveNativeApp {
                     ui.disable();
                     settings::close_open_info(ctx);
                 }
+                self.render_share_notices(ui);
                 match self.tab {
                     NavTab::Home => self.render_home(ui),
                     NavTab::Shared => self.render_shared(ui),
@@ -3899,8 +3905,138 @@ impl eframe::App for ProtonDriveNativeApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if self.screenshot_target.is_none() {
             save_window_geometry(&self.window_geometry);
+            self.handoff_pending_shares_on_exit();
         }
     }
+}
+
+impl ProtonDriveNativeApp {
+    /// Display name for a shared item at `rel_path`, from the loaded Shared list or its path basename.
+    fn shared_item_name(&self, rel_path: &str) -> String {
+        self.shared
+            .items
+            .iter()
+            .flatten()
+            .find(|i| i.rel_path.as_deref() == Some(rel_path))
+            .map(|i| i.name.clone())
+            .unwrap_or_else(|| rel_path.rsplit('/').next().unwrap_or(rel_path).to_string())
+    }
+
+    /// Captures any still-pending share changes (from an open or already-closed Share window, or an in-flight Stop
+    /// sharing in Shared) and hands them off with the worker event channel so `main()` can wait for the daemon's
+    /// answers after the window closes (#228).
+    fn handoff_pending_shares_on_exit(&mut self) {
+        if let Some(left) = self.share.take().and_then(share::ShareWindow::left_change) {
+            self.share_left.push(left);
+        }
+        let stopping = self.shared.stopping.take().map(|rel_path| {
+            let name = self.shared_item_name(&rel_path);
+            (rel_path, name)
+        });
+        if self.share_left.is_empty() && stopping.is_none() {
+            return;
+        }
+        if let Some(slot) = &self.exit_shares {
+            let (_, dummy_rx) = mpsc::channel();
+            let rx = std::mem::replace(&mut self.rx, dummy_rx);
+            let pending = std::mem::take(&mut self.share_left);
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some((pending, stopping, rx));
+            }
+        }
+    }
+}
+
+fn shared_stop_failed_message(name: &str, problem: &str) -> String {
+    if problem == STILL_WORKING {
+        format!("Didn't hear back about stopping sharing {name}: open Shared again to check")
+    } else {
+        format!("Couldn't stop sharing {name}: {problem}")
+    }
+}
+
+/// Draws a dismissible warning notice banner with a `Live::Polite` label and Phosphor X button; returns true if Dismiss was clicked.
+fn render_notice_banner(ui: &mut egui::Ui, text: &str) -> bool {
+    let mut dismissed = false;
+    Frame::NONE
+        .fill(WARNING_SOFT())
+        .stroke(Stroke::new(1.0_f32, WARNING_LINE()))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            let text_w = (ui.available_width() - ICON_BUTTON_SIZE - ui.spacing().item_spacing.x).max(0.0);
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(text_w, ICON_BUTTON_SIZE),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.set_min_width(text_w);
+                        let notice = ui.add(egui::Label::new(RichText::new(text).size(12.5).color(TEXT_PRIMARY())).wrap());
+                        ui.ctx().accesskit_node_builder(notice.id, |node| {
+                            node.set_live(egui::accesskit::Live::Polite);
+                        });
+                    },
+                );
+                if icon_button(ui, icons::REMOVE, "Dismiss").clicked() {
+                    dismissed = true;
+                }
+            });
+        });
+    dismissed
+}
+
+/// Waits after the window closes for in-flight share changes to finish and reports any failure or timeout (#228).
+fn finish_pending_shares_on_exit(
+    mut pending: Vec<share::LeftChange>,
+    mut stopping: Option<(String, String)>,
+    rx: &Receiver<WorkerEvent>,
+    timeout: Duration,
+    mut report: impl FnMut(String),
+) {
+    let deadline = Instant::now() + timeout;
+    while !pending.is_empty() || stopping.is_some() {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match rx.recv_timeout(remaining) {
+            Ok(WorkerEvent::ShareDone(window, result)) => {
+                if let Some(i) = pending.iter().position(|c| c.window == window) {
+                    let left = pending.remove(i);
+                    if let Err(problem) = result {
+                        report(left.failed(&problem));
+                    }
+                }
+            }
+            Ok(WorkerEvent::SharedStopped(rel_path, result)) => {
+                if stopping.as_ref().is_some_and(|(p, _)| p == &rel_path) {
+                    if let Some((_, name)) = stopping.take() {
+                        if let Err(problem) = result {
+                            report(shared_stop_failed_message(&name, &problem));
+                        }
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    for left in pending {
+        report(left.failed(STILL_WORKING));
+    }
+    if let Some((_, name)) = stopping {
+        report(shared_stop_failed_message(&name, STILL_WORKING));
+    }
+}
+
+/// Sends a desktop notification for a share failure that finished after the app window closed; ignored if notify-send is unavailable.
+fn send_desktop_notification(body: String) {
+    let _ = Command::new("notify-send")
+        .args(["--app-name=Proton Drive", "--icon=ch.proton.drive", "--", "Proton Drive", &body])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// The blocklist with one more app, as the daemon will take it (see problemWithBlockedApps): a process name of 1 to 15
@@ -5228,7 +5364,7 @@ fn main() -> eframe::Result {
     let share_request = cli_share.as_deref().map(single_instance::share_request);
 
     // One app window per user (#129): a second start shows the running window and exits. A screenshot runs beside it
-    let mut _instance_lock: Option<std::fs::File> = None;
+    let mut instance_lock: Option<(std::fs::File, std::path::PathBuf)> = None;
     if screenshot_target.is_none() {
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty());
         let in_runtime_dir = runtime_dir.is_some();
@@ -5238,7 +5374,7 @@ fn main() -> eframe::Result {
         match single_instance::claim(&paths, own_uid(), in_runtime_dir, Duration::from_secs(5), &request) {
             Ok(single_instance::Claim::Signalled) => return Ok(()),
             Ok(single_instance::Claim::Primary { lock, listener }) => {
-                _instance_lock = Some(lock);
+                instance_lock = Some((lock, paths.socket.clone()));
                 thread::spawn(move || {
                     single_instance::serve(listener, |request| {
                         match request {
@@ -5312,7 +5448,11 @@ fn main() -> eframe::Result {
         }));
     }
 
-    eframe::run_native(
+    let exit_shares: std::sync::Arc<std::sync::Mutex<Option<PendingExitShares>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let exit_shares_app = std::sync::Arc::clone(&exit_shares);
+
+    let run_result = eframe::run_native(
         "Proton Drive",
         options,
         Box::new(move |cc| {
@@ -5323,6 +5463,7 @@ fn main() -> eframe::Result {
                 initial_tab,
                 saved_geom,
             );
+            app.exit_shares = Some(exit_shares_app);
             if let Some(q) = cli_search {
                 app.search_query = q;
             }
@@ -5411,7 +5552,23 @@ fn main() -> eframe::Result {
             }
             Ok(Box::new(app))
         }),
-    )
+    );
+
+    // Release the single-instance lock before waiting for any in-flight share changes so reopening the app isn't blocked (#228)
+    if let Some((lock, socket)) = instance_lock.take() {
+        let _ = std::fs::remove_file(&socket);
+        drop(lock);
+    }
+    if let Some((pending, stopping, rx)) = exit_shares.lock().ok().and_then(|mut g| g.take()) {
+        finish_pending_shares_on_exit(
+            pending,
+            stopping,
+            &rx,
+            share::SHARE_WRITE_TIMEOUT + Duration::from_secs(5),
+            send_desktop_notification,
+        );
+    }
+    run_result
 }
 
 #[cfg(test)]
@@ -5934,6 +6091,8 @@ mod tests {
                 share: None,
                 shared: shared::SharedPage::default(),
                 share_left: Vec::new(),
+                share_notices: Vec::new(),
+                exit_shares: None,
             };
             let ctx = egui::Context::default();
             configure_proton_theme(&ctx);
@@ -10775,12 +10934,20 @@ mod tests {
     fn a_stop_that_fails_after_leaving_shared_is_told_in_the_notice() {
         let mut h = shared_with_rows();
         h.app.shared.stopping = Some("Documents/report.pdf".into());
-        h.click(h.text_at("Home").unwrap());
+        h.click(h.text_at("Settings").unwrap());
         h.event(WorkerEvent::SharedStopped("Documents/report.pdf".into(), Err("Proton Drive is offline".into())));
-        assert_eq!(h.app.notice.as_deref(), Some("Couldn't stop sharing report.pdf: Proton Drive is offline"));
-        // on Shared itself the list shows it, and no notice
+        assert_eq!(h.app.share_notices, vec!["Couldn't stop sharing report.pdf: Proton Drive is offline"]);
+        assert!(h.text_at("Couldn't stop sharing report.pdf: Proton Drive is offline").is_some(), "shown on Settings too");
+        // A timeout says it didn't hear back instead of contradicting itself (#228)
+        h.event(WorkerEvent::SharedStopped("Documents/report.pdf".into(), Err(STILL_WORKING.into())));
+        assert!(
+            h.text_at("Didn't hear back about stopping sharing report.pdf: open Shared again to check").is_some(),
+            "timeout notice on off-page stop"
+        );
+        // on Shared itself the list shows it, and no share notice
         let mut h = shared_with_rows();
         h.event(WorkerEvent::SharedStopped("Documents/report.pdf".into(), Err("Proton Drive is offline".into())));
+        assert!(h.app.share_notices.is_empty());
         assert_eq!(h.app.notice, None);
     }
 
@@ -13233,13 +13400,13 @@ mod tests {
         h.click(h.text_at("Done").unwrap());
         assert!(h.app.share.is_none(), "Done doesn't wait");
         h.event(WorkerEvent::ShareDone(first, offline()));
-        assert_eq!(h.app.notice.as_deref(), Some("Couldn't stop sharing the link to report.pdf: Proton Drive is offline"));
+        assert_eq!(h.app.share_notices, vec!["Couldn't stop sharing the link to report.pdf: Proton Drive is offline"]);
         assert!(h.text_at("Couldn't stop sharing the link to report.pdf: Proton Drive is offline").is_some(), "on Home");
         assert_eq!(h.sent(), Vec::<String>::new(), "no window to read again for");
         // Told once: a second answer for that window is nobody's
-        h.app.notice = None;
+        h.app.share_notices.clear();
         h.event(WorkerEvent::ShareDone(first, offline()));
-        assert_eq!(h.app.notice, None);
+        assert!(h.app.share_notices.is_empty());
 
         // Escape while someone's access is being removed
         let mut h = share_window(Some(with_people()));
@@ -13250,7 +13417,7 @@ mod tests {
         press_key(&mut h, egui::Key::Escape);
         assert!(h.app.share.is_none(), "Escape doesn't wait either");
         h.event(WorkerEvent::ShareDone(second, offline()));
-        assert_eq!(h.app.notice.as_deref(), Some("Couldn't remove sam@proton.me's access to report.pdf: Proton Drive is offline"));
+        assert_eq!(h.app.share_notices, vec!["Couldn't remove sam@proton.me's access to report.pdf: Proton Drive is offline"]);
 
         // Files' Share… for another item, while a password is being set: that window replaces this one
         let mut h = share_window(Some(share::ShareInfo { link: Some(share_link(false, None)), people: vec![] }));
@@ -13262,8 +13429,11 @@ mod tests {
         assert_eq!(h.sent().len(), 1);
         h.app.open_share("/home/u/ProtonDrive/Notes/plan.txt");
         assert_eq!(h.sent(), vec!["share info Notes/plan.txt".to_string()]);
-        h.event(WorkerEvent::ShareDone(third, Err("Timed out".into())));
-        assert_eq!(h.app.notice.as_deref(), Some("Couldn't change the password of the link to report.pdf: Timed out"));
+        h.event(WorkerEvent::ShareDone(third, Err(STILL_WORKING.into())));
+        assert_eq!(
+            h.app.share_notices,
+            vec!["Didn't hear back about changing the password of the link to report.pdf: open Share again to check"]
+        );
         assert_eq!(window(&mut h).error, None, "not shown in the other item's window");
         assert_eq!(h.sent(), Vec::<String>::new(), "the open window is another item's: it has nothing to read again");
 
@@ -13274,8 +13444,185 @@ mod tests {
         assert_eq!(h.sent(), vec![format!("share link on {SHARED}")]);
         h.click(h.text_at("Done").unwrap());
         h.event(WorkerEvent::ShareDone(fourth, Ok(())));
-        assert_eq!(h.app.notice, None);
+        assert!(h.app.share_notices.is_empty());
         assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    // #228: a failed share change is visible on every section, not overwritten by another failure or wiped by a quiet
+    // availability action, dismissible individually, and a real timeout says it didn't hear back.
+    #[test]
+    fn failed_closed_share_change_is_seen_on_every_section_and_not_lost() {
+        // 1. Visible on Settings, Activity, Shared, and Home (not only Home)
+        let mut h = share_window(Some(with_people()));
+        let first = shown(&h);
+        h.click(h.text_at("On").unwrap());
+        h.click(h.text_at("Stop sharing").unwrap());
+        assert_eq!(h.sent(), vec![format!("share link off {SHARED}")]);
+        h.click(h.text_at("Done").unwrap());
+        h.click(h.text_at("Settings").unwrap());
+        assert_eq!(h.app.tab, NavTab::Settings);
+        h.event(WorkerEvent::ShareDone(first, Err("Proton Drive is offline".into())));
+        let msg1 = "Couldn't stop sharing the link to report.pdf: Proton Drive is offline";
+        assert!(h.text_at(msg1).is_some(), "visible on Settings");
+        h.click(h.text_at("Activity").unwrap());
+        assert!(h.text_at(msg1).is_some(), "visible on Activity");
+        h.click(h.text_at("Shared").unwrap());
+        assert!(h.text_at(msg1).is_some(), "visible on Shared");
+        h.click(h.text_at("Home").unwrap());
+        assert!(h.text_at(msg1).is_some(), "visible on Home");
+
+        // 2. A second failed share change does not overwrite the first
+        h.sent();
+        h.app.open_share("/home/u/ProtonDrive/Docs/report.pdf");
+        assert_eq!(h.sent(), vec![format!("share info {SHARED}")]);
+        let second = shown(&h);
+        h.event(WorkerEvent::ShareLoaded(second, share_seq(&h), Ok(with_people())));
+        h.click(h.widget_at("Remove sam@proton.me").unwrap());
+        h.click(h.text_at("Remove access").unwrap());
+        assert_eq!(h.sent(), vec![format!("share remove {SHARED} sam@proton.me")]);
+        h.click(h.text_at("Done").unwrap());
+        h.event(WorkerEvent::ShareDone(second, Err("Proton Drive is offline".into())));
+        let msg2 = "Couldn't remove sam@proton.me's access to report.pdf: Proton Drive is offline";
+        assert!(h.text_at(msg1).is_some(), "first failure is kept");
+        assert!(h.text_at(msg2).is_some(), "second failure is shown too");
+
+        // 3. A quiet AvailabilityDone (no notice), a loud one, and starting an availability action leave share failures intact
+        let quiet = AvailabilityResult { state: "pinned".into(), kept: vec![], refused: None };
+        h.event(WorkerEvent::AvailabilityDone { path: "Docs".into(), result: Ok(quiet) });
+        assert!(h.text_at(msg1).is_some(), "quiet AvailabilityDone does not wipe first failure");
+        assert!(h.text_at(msg2).is_some(), "quiet AvailabilityDone does not wipe second failure");
+        let loud = AvailabilityResult { state: "online-only".into(), kept: vec!["Docs/a.txt".into()], refused: None };
+        h.event(WorkerEvent::AvailabilityDone { path: "Docs".into(), result: Ok(loud) });
+        assert!(h.text_at(msg1).is_some(), "loud AvailabilityDone does not overwrite first failure");
+        assert!(h.text_at(msg2).is_some(), "loud AvailabilityDone does not overwrite second failure");
+        h.app.send_availability("Docs".into(), "pin", None);
+        h.frames(2);
+        assert!(h.text_at(msg1).is_some(), "starting an availability action does not wipe first failure");
+        assert!(h.text_at(msg2).is_some(), "starting an availability action does not wipe second failure");
+
+        // Dismissing the first share notice removes only it; the second stays until dismissed
+        let mut dismiss_buttons: Vec<_> = h.nodes_named("Dismiss").into_iter().map(|n| node_rect(&n).center()).collect();
+        dismiss_buttons.sort_by(|a, b| a.y.total_cmp(&b.y));
+        assert_eq!(dismiss_buttons.len(), 2, "each share notice has its own Dismiss button");
+        h.click(dismiss_buttons[0]);
+        assert!(h.text_at(msg1).is_none(), "first notice dismissed");
+        assert!(h.text_at(msg2).is_some(), "second notice remains");
+        h.click(h.widget_at("Dismiss").unwrap());
+        assert!(h.text_at(msg2).is_none(), "second notice dismissed");
+        assert!(h.app.share_notices.is_empty());
+
+        // 4. A real read timeout from share_change_with_timeout says it didn't hear back instead of contradicting itself
+        let dir = private_dir("pd-gui-share-change-timeout");
+        let sock = dir.join("slow.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let _ = done_rx.recv();
+            drop(conn);
+        });
+        let real_timeout = share::share_change_with_timeout(
+            &sock,
+            "DELETE",
+            "/share/link",
+            serde_json::json!({ "path": SHARED }),
+            Duration::from_millis(50),
+        );
+        drop(done_tx);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+        assert_eq!(real_timeout.as_ref().map_err(String::as_str), Err(STILL_WORKING));
+
+        let mut h = share_window(Some(with_people()));
+        let timed = shown(&h);
+        h.click(h.text_at("On").unwrap());
+        h.click(h.text_at("Stop sharing").unwrap());
+        h.sent();
+        h.click(h.text_at("Done").unwrap());
+        h.event(WorkerEvent::ShareDone(timed, real_timeout));
+        let expected = "Didn't hear back about stopping the link to report.pdf: open Share again to check";
+        assert_eq!(h.app.share_notices, vec![expected]);
+        assert!(h.text_at(expected).is_some(), "real timeout notice says it didn't hear back");
+        assert!(h.texts(|t| t.galley.text().contains("Couldn't")).is_empty(), "does not claim Couldn't");
+        assert!(h.texts(|t| t.galley.text().contains("Still working")).is_empty(), "does not contradict itself");
+    }
+
+    // #228: closing the app while a share change is still in flight hands it off and waits to report failures or timeouts.
+    #[test]
+    fn closing_the_app_waits_for_in_flight_share_changes_and_reports_failures() {
+        // Case A: closed Share window left a change in flight, then the app closes before the worker answers with an error
+        let mut h = share_window(Some(with_people()));
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        h.app.exit_shares = Some(std::sync::Arc::clone(&slot));
+        let left_win = shown(&h);
+        h.click(h.text_at("On").unwrap());
+        h.click(h.text_at("Stop sharing").unwrap());
+        h.sent();
+        h.click(h.text_at("Done").unwrap());
+        h.app.handoff_pending_shares_on_exit();
+        let (pending, stopping, rx) = slot.lock().unwrap().take().expect("pending share change handed off on exit");
+        let evt_tx = h.events.clone();
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            let _ = evt_tx.send(WorkerEvent::ShareDone(left_win, Err("Proton Drive is offline".into())));
+        });
+        let mut reported = Vec::new();
+        finish_pending_shares_on_exit(pending, stopping, &rx, Duration::from_secs(2), |msg| reported.push(msg));
+        worker.join().unwrap();
+        assert_eq!(reported, vec!["Couldn't stop sharing the link to report.pdf: Proton Drive is offline"]);
+
+        // Case B: Share window is still open with a busy change when the app closes; success reports nothing
+        let mut h = share_window(Some(share::ShareInfo::default()));
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        h.app.exit_shares = Some(std::sync::Arc::clone(&slot));
+        let open_win = shown(&h);
+        h.click(h.text_at("Off").unwrap());
+        h.sent();
+        h.app.handoff_pending_shares_on_exit();
+        let (pending, stopping, rx) = slot.lock().unwrap().take().expect("busy open Share window captured on exit");
+        let evt_tx = h.events.clone();
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            let _ = evt_tx.send(WorkerEvent::ShareDone(open_win, Ok(())));
+        });
+        let mut reported = Vec::new();
+        finish_pending_shares_on_exit(pending, stopping, &rx, Duration::from_secs(2), |msg| reported.push(msg));
+        worker.join().unwrap();
+        assert!(reported.is_empty(), "a share change that succeeds after exit reports nothing");
+
+        // Case C: worker never answers before exit timeout -> reports "Didn't hear back"
+        let mut h = share_window(Some(with_people()));
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        h.app.exit_shares = Some(std::sync::Arc::clone(&slot));
+        h.click(h.widget_at("Remove sam@proton.me").unwrap());
+        h.click(h.text_at("Remove access").unwrap());
+        h.sent();
+        h.app.handoff_pending_shares_on_exit();
+        let (pending, stopping, rx) = slot.lock().unwrap().take().expect("pending change captured");
+        let mut reported = Vec::new();
+        finish_pending_shares_on_exit(pending, stopping, &rx, Duration::from_millis(30), |msg| reported.push(msg));
+        assert_eq!(
+            reported,
+            vec!["Didn't hear back about removing sam@proton.me's access to report.pdf: open Share again to check"]
+        );
+
+        // Case D: Stop sharing from Shared tab still in flight when app closes -> failure is reported
+        let mut h = shared_with_rows();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        h.app.exit_shares = Some(std::sync::Arc::clone(&slot));
+        h.app.shared.stopping = Some("Documents/report.pdf".into());
+        h.app.handoff_pending_shares_on_exit();
+        let (pending, stopping, rx) = slot.lock().unwrap().take().expect("in-flight Shared stop captured on exit");
+        let evt_tx = h.events.clone();
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            let _ = evt_tx.send(WorkerEvent::SharedStopped("Documents/report.pdf".into(), Err("Proton Drive is offline".into())));
+        });
+        let mut reported = Vec::new();
+        finish_pending_shares_on_exit(pending, stopping, &rx, Duration::from_secs(2), |msg| reported.push(msg));
+        worker.join().unwrap();
+        assert_eq!(reported, vec!["Couldn't stop sharing report.pdf: Proton Drive is offline"]);
     }
 
     // Minor 3: an answer for a window since closed never lands in one opened again on the same item
@@ -13304,7 +13651,7 @@ mod tests {
         assert!(h.text_at("Working…").is_some(), "the invitation is still out");
         assert!(h.text_at("Proton Drive is offline").is_none(), "not pinned on the invitation");
         assert_eq!(window(&mut h).invite_input, "kim@proton.me");
-        assert_eq!(h.app.notice.as_deref(), Some("Couldn't change alex@proton.me's access to report.pdf: Proton Drive is offline"));
+        assert_eq!(h.app.share_notices, vec!["Couldn't change alex@proton.me's access to report.pdf: Proton Drive is offline"]);
         assert_eq!(h.sent(), Vec::<String>::new(), "it reads again once its own invitation is answered");
         h.event(WorkerEvent::ShareDone(shown(&h), Ok(())));
         assert_eq!(h.sent(), vec![format!("share info {SHARED}")]);
