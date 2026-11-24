@@ -518,6 +518,8 @@ pub struct ShareWindow {
     resolved: bool,
     /// A read is out
     loading: bool,
+    /// Sequence number of the latest read started by this window; older answers are dropped (#229)
+    pub(crate) load_seq: u64,
     /// A change is out: the window waits for it
     busy: Option<Change>,
     /// Why the last change, or what was typed for it, was refused; shown under its section
@@ -547,6 +549,7 @@ impl ShareWindow {
             info: None,
             resolved: false,
             loading: false,
+            load_seq: 0,
             busy: None,
             error: None,
             password: PasswordView::Hidden,
@@ -638,8 +641,9 @@ impl ShareWindow {
     }
 
     fn load(&mut self) -> WorkerCommand {
+        self.load_seq += 1;
         self.loading = true;
-        WorkerCommand::ShareLoad { window: self.id, rel_path: self.rel_path.clone() }
+        WorkerCommand::ShareLoad { window: self.id, seq: self.load_seq, rel_path: self.rel_path.clone() }
     }
 
     fn link(&self) -> Option<&ShareLink> {
@@ -651,6 +655,8 @@ impl ShareWindow {
         if matches!(change, Change::LinkOn | Change::LinkOff | Change::Password) {
             self.password = PasswordView::Hidden;
         }
+        self.load_seq += 1;
+        self.loading = false;
         self.busy = Some(change);
         self.error = None;
         self.copied = false;
@@ -786,8 +792,11 @@ impl ShareWindow {
         }
     }
 
-    /// How the item is shared, as just read.
-    fn loaded(&mut self, result: Result<ShareInfo, String>) {
+    /// How the item is shared, as just read; answers from older reads are dropped (#229).
+    fn loaded(&mut self, seq: u64, result: Result<ShareInfo, String>) {
+        if seq != self.load_seq {
+            return;
+        }
         self.loading = false;
         if !matches!(&result, Ok(ShareInfo { link: Some(link), .. }) if link.has_password) {
             // No link, or no password: nothing to show
@@ -919,9 +928,9 @@ impl ProtonDriveNativeApp {
         }
     }
 
-    pub(crate) fn share_loaded(&mut self, window: WindowId, result: Result<ShareInfo, String>) {
+    pub(crate) fn share_loaded(&mut self, window: WindowId, seq: u64, result: Result<ShareInfo, String>) {
         if let Some(w) = self.share_for(window) {
-            w.loaded(result);
+            w.loaded(seq, result);
         }
     }
 
