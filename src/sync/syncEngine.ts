@@ -293,6 +293,9 @@ export class ProtonDriveSyncEngine {
     private lastError: string | null = null;
     private rootNode: NodeEntity | null = null;
     private activeTransfers = new Map<string, ActiveTransfer>();
+    // Local paths known to be waiting to upload (watcher, VFS writes, or sync pass scan), cleared once synced, deleted,
+    // or cut short. Rolled up into folder emblems so ancestor folders show syncing while children wait to upload (#53).
+    private readonly pendingUploads = new Set<string>();
     private watcher: LocalFolderWatcher;
     private unsubscribeDriveEvents: (() => void) | null = null;
     private reconcileRunning = false;
@@ -712,6 +715,10 @@ export class ProtonDriveSyncEngine {
             settling.cancel(); // The pass at the next start looks at them again
         }
         this.settlingFiles.clear();
+        if (this.pendingUploads.size > 0) {
+            this.pendingUploads.clear();
+            this.stateEvents.reset();
+        }
         this.clearPauseTimer(); // Set again at the next start, from the stored time
         // A look already running isn't waited for here: holdForMove waits for it (see idleForMove), as long as it
         // allows, and a caller about to close the database waits with waitForRunningLooks
@@ -1477,6 +1484,7 @@ export class ProtonDriveSyncEngine {
         // One gone from Proton Drive goes on below: followed where its item moved (its hold with it), or else kept in the
         // desktop Trash, as anything changed here is.
         if (localInfo && !localInfo.isDirectory && this.stateDb.getCutShort(relPath) && (remoteNode || !dbRecord)) {
+            this.clearPendingUpload(relPath);
             if (
                 remoteNode?.type === NodeType.File &&
                 this.liveWritingMark(relPath) === undefined &&
@@ -1497,6 +1505,7 @@ export class ProtonDriveSyncEngine {
 
         // Case 1: Present remotely, not present locally
         if (remoteNode && !localInfo) {
+            this.clearPendingUploadsWithin(relPath);
             if (dbRecord) {
                 // Was previously synced, so user deleted it locally -> trash remotely. Look again first: the listing
                 // can predate the record being dropped (e.g. by Free up space or Hide) or the item coming back; either
@@ -1602,6 +1611,7 @@ export class ProtonDriveSyncEngine {
                     // Its folder is in the Proton Drive trash: made there, it would be recorded as synced, and the folder's
                     // removal here would take it for an unchanged copy. Left here unrecorded, which that removal keeps (#160)
                     this.logger.warn(`Not making ${relPath} in Proton Drive: ${held}`);
+                    this.clearPendingUpload(relPath);
                     return;
                 }
                 const { node: createdFolder, created } = await createRemoteFolder(this.sdk, parentNode, path.basename(relPath));
@@ -1645,6 +1655,7 @@ export class ProtonDriveSyncEngine {
 
         // Case 3: Deleted both locally and remotely, cleanup stale DB record
         if (!localInfo && !remoteNode && dbRecord) {
+            this.clearPendingUpload(relPath);
             this.stateDb.removeItemByPath(relPath);
             return;
         }
@@ -1652,6 +1663,7 @@ export class ProtonDriveSyncEngine {
         // Case 4: Present both locally and remotely
         if (localInfo && remoteNode) {
             if (localInfo.isDirectory && remoteNode.type === NodeType.Folder) {
+                this.clearPendingUpload(relPath);
                 if (!dbRecord) {
                     this.recordSynced({
                         localRelPath: relPath,
@@ -1672,6 +1684,7 @@ export class ProtonDriveSyncEngine {
 
             if (!localInfo.isDirectory && remoteNode.type === NodeType.File) {
                 if (isUnsupportedRemoteNode(remoteNode)) {
+                    this.clearPendingUpload(relPath);
                     return;
                 }
                 const remoteSha1 = remoteNode.activeRevision?.claimedDigests?.sha1 ?? null;
@@ -1705,6 +1718,7 @@ export class ProtonDriveSyncEngine {
                     localInfo.size === dbRecord.size &&
                     !cloudChangedSince(remoteAtSync, remoteNow)
                 ) {
+                    this.clearPendingUpload(relPath);
                     return;
                 }
 
@@ -1758,8 +1772,11 @@ export class ProtonDriveSyncEngine {
                 } else if (!localChangedSinceSync && remoteChangedSinceSync) {
                     if (!hiding) {
                         await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since);
+                    } else {
+                        this.clearPendingUpload(relPath);
                     }
                 } else if (localChangedSinceSync && remoteChangedSinceSync) {
+                    this.clearPendingUpload(relPath);
                     await this.handleFileConflict(
                         relPath,
                         localFullPath,
@@ -1773,19 +1790,25 @@ export class ProtonDriveSyncEngine {
                         since,
                         dbRecord,
                     );
-                } else if (dbRecord && dbRecord.syncStatus === 'synced' && localSha1 === dbRecord.localSha1) {
-                    // Neither side changed: only the ctime moved (a chmod, a rename, a layout move). The record is current
-                    // as of before the hash, so the next pass's fast path applies again instead of hashing on every pass
-                    // (a cloud file with no sha1 never reaches the equal-content branch that would re-record it, #105)
-                    this.stateDb.touchItem(relPath, hashedFrom);
-                    // And both sides hold what the record says, the cloud's version (synced by a download, say): a
-                    // conflict still waiting here is over, as the equal-content branch closes one for a cloud with a
-                    // sha1 (#68, #88)
-                    if (!this.manualResolvingPaths.has(relPath)) {
-                        this.stateDb.closeWaitingConflict(relPath, 'in-sync');
+                } else if (dbRecord && localSha1 === dbRecord.localSha1) {
+                    this.clearPendingUpload(relPath);
+                    if (dbRecord.syncStatus === 'synced') {
+                        // Neither side changed: only the ctime moved (a chmod, a rename, a layout move). The record is current
+                        // as of before the hash, so the next pass's fast path applies again instead of hashing on every pass
+                        // (a cloud file with no sha1 never reaches the equal-content branch that would re-record it, #105)
+                        this.stateDb.touchItem(relPath, hashedFrom);
+                        // And both sides hold what the record says, the cloud's version (synced by a download, say): a
+                        // conflict still waiting here is over, as the equal-content branch closes one for a cloud with a
+                        // sha1 (#68, #88)
+                        if (!this.manualResolvingPaths.has(relPath)) {
+                            this.stateDb.closeWaitingConflict(relPath, 'in-sync');
+                        }
                     }
                 }
+                return;
             }
+            // Local file vs remote folder (or vice versa): never uploaded as is
+            this.clearPendingUpload(relPath);
         }
     }
 
@@ -2278,6 +2301,7 @@ export class ProtonDriveSyncEngine {
             totalBytes: remoteNode.activeRevision?.claimedSize ?? 0,
             startedAt: Date.now(),
         });
+        this.stateEvents.touch(relPath);
 
         try {
             // Before anything is placed or hashed here: a write from then on is newer than what the record says (#109)
@@ -2339,6 +2363,7 @@ export class ProtonDriveSyncEngine {
             throw error;
         } finally {
             this.activeTransfers.delete(transferId);
+            this.stateEvents.touch(relPath);
             this.watcher.suppressPath(relPath, 2500);
         }
     }
@@ -2371,6 +2396,7 @@ export class ProtonDriveSyncEngine {
             totalBytes: st.size,
             startedAt: Date.now(),
         });
+        this.stateEvents.touch(relPath);
 
         try {
             const result = await uploadLocalFileToDrive({
@@ -2437,6 +2463,7 @@ export class ProtonDriveSyncEngine {
             throw error;
         } finally {
             this.activeTransfers.delete(transferId);
+            this.stateEvents.touch(relPath);
         }
     }
 
@@ -2456,6 +2483,7 @@ export class ProtonDriveSyncEngine {
             // unchanged copy, leaving it only in the trash. Left here unrecorded: a file only on this computer, which
             // that removal keeps (#160)
             this.logger.warn(`Not uploading ${relPath}: ${held}`);
+            this.clearPendingUpload(relPath);
             return null;
         }
         for (let attempt = 1; ; attempt++) {
@@ -2842,6 +2870,7 @@ export class ProtonDriveSyncEngine {
         }
         // Synced: whatever conflict it was in is over, and a keep-both of it left unfinished with it (see keepBoth)
         this.keepBothCopies.delete(relPath);
+        this.clearPendingUpload(relPath);
         this.forgetFailure(relPath);
         return true;
     }
@@ -2916,6 +2945,7 @@ export class ProtonDriveSyncEngine {
             this.logger.warn(`Could not follow up ${relPath} in Proton Drive after it was renamed or deleted: ${error}`);
             return;
         }
+        this.clearPendingUpload(follows ? now : relPath);
         void this.replayRemoteOps();
     }
 
@@ -3015,6 +3045,7 @@ export class ProtonDriveSyncEngine {
     }
 
     private async handleLocalFileChange(relPath: string): Promise<void> {
+        this.noteLocalChangePending(relPath);
         this.stateEvents.touch(relPath); // a new file shows as waiting to upload; a removed one goes
         this.failingItems.delete(relPath); // Changed here: the next pass looks at it again at once
         // A report for a path whose look hasn't started yet joins it: it will see the file as it is when it runs
@@ -3053,17 +3084,21 @@ export class ProtonDriveSyncEngine {
 
     private async handleLocalFileChangeNow(relPath: string): Promise<void> {
         const settings = this.stateDb.getSettings();
+        if (settings.paused) {
+            return;
+        }
         if (
-            settings.paused ||
             matchesIgnorePatterns(relPath, settings.ignorePatterns) ||
             this.policy.hiddenBy(relPath)?.hide === 'hidden'
         ) {
+            this.clearPendingUpload(relPath);
             return;
         }
 
         await this.availabilityRun;
         // Looked at again: a hide may have finished meanwhile. One still waiting syncs local changes as usual.
         if (this.policy.hiddenBy(relPath)?.hide === 'hidden') {
+            this.clearPendingUpload(relPath);
             return;
         }
         // A rename, move or delete through the drive that Proton Drive hasn't got yet is about it: left to the sync after
@@ -3083,6 +3118,9 @@ export class ProtonDriveSyncEngine {
             waited &&
             (this.stopped || this.holding() || this.policy.hiddenBy(relPath)?.hide === 'hidden' || this.awaitsRemoteOp(relPath))
         ) {
+            if (this.policy.hiddenBy(relPath)?.hide === 'hidden') {
+                this.clearPendingUpload(relPath);
+            }
             return;
         }
 
@@ -3096,6 +3134,7 @@ export class ProtonDriveSyncEngine {
             } else if (this.stateDb.getCutShort(relPath)) {
                 // Cut short by the drive's disk guard (#300): held until the user decides, with no wait to settle, as it
                 // isn't uploaded either way; a sync pass sees a change in Proton Drive
+                this.clearPendingUpload(relPath);
                 return;
             } else if (
                 dbRecord?.type === 'file' &&
@@ -3107,12 +3146,14 @@ export class ProtonDriveSyncEngine {
                 // to upload, so no hash and no look at Proton Drive; a sync pass compares it with the cloud (#89). The ctime
                 // is the system's, set by every write, so an edit that keeps the size and puts the old mtime back (a
                 // container, cp -p, touch -r) still goes on to be hashed and uploaded
+                this.clearPendingUpload(relPath);
                 return;
             } else if ((changedSinceRecord(st, dbRecord) || this.beingReplaced(relPath)) && this.stillBeingWritten(relPath, st)) {
                 return; // Looked at again once it has stayed as it is (one being replaced through the drive, once closed)
             }
 
             if (!st) {
+                this.clearPendingUploadsWithin(relPath);
                 // Not a delete of this item: every file is missing from the folder; or the files came back after a hold
                 // and no pass has looked at what is still missing yet (a copy cancelled part-way removes what it wrote)
                 if (this.filesGone() || this.heldBack(relPath)) {
@@ -3142,6 +3183,7 @@ export class ProtonDriveSyncEngine {
                     // Its folder is in the Proton Drive trash: made there, it would be recorded as synced, and the folder's
                     // removal here would take it for an unchanged copy. Left here unrecorded, which that removal keeps (#160)
                     this.logger.warn(`Not making ${relPath} in Proton Drive: ${held}`);
+                    this.clearPendingUpload(relPath);
                     return;
                 }
                 const { node: folder, created } = await createRemoteFolder(this.sdk, parentNode, path.basename(relPath));
@@ -3174,6 +3216,7 @@ export class ProtonDriveSyncEngine {
                 // Proton Drive would make the upload land on whatever now has that name.
                 const node = await this.sdk.getNode(dbRecord.nodeUid).catch(() => null);
                 if (!(await stat(fullPath).catch(() => null))?.isFile()) {
+                    this.clearPendingUpload(relPath);
                     return; // Gone while Proton Drive was asked (freed, deleted): the next look at it decides
                 }
                 if (!node || node.trashTime || node.type !== NodeType.File || (await this.inTrashedFolder(node))) {
@@ -3217,6 +3260,9 @@ export class ProtonDriveSyncEngine {
                     const dbRecordNow = this.recordOf(relPath, there.uid); // Recorded meanwhile, by a pass
                     await this.reconcileSinglePath(relPath, there, localInfo, dbRecordNow, remoteMap, now, since);
                 }
+            } else {
+                // Neither a regular file nor a directory (e.g. symlink): never uploaded
+                this.clearPendingUpload(relPath);
             }
         });
 
@@ -3563,7 +3609,10 @@ export class ProtonDriveSyncEngine {
                 records.drop(entry.relPath);
             }
             return this.clearKeptAfterCloudDelete(root, relPath, scan.entries, kept);
-        }).finally(() => this.holdsAfterRemoval(relPath));
+        }).finally(() => {
+            this.clearMissingPendingUploadsWithin(relPath);
+            this.holdsAfterRemoval(relPath);
+        });
         const told: string[] = [];
         if (moved > 0) {
             told.push(`${moved} item(s) that existed only on this computer were moved to your Trash.`);
@@ -3811,6 +3860,7 @@ export class ProtonDriveSyncEngine {
                     } else {
                         // Stuck at toRel: its records can't stay at fromRel without it, so it syncs from there as new
                         records.dropSubtree(fromRel);
+                        this.movePendingUploads(fromRel, toRel);
                     }
                     return false;
                 }
@@ -3820,6 +3870,7 @@ export class ProtonDriveSyncEngine {
                 return true;
             });
             if (moved) {
+                this.movePendingUploads(fromRel, toRel);
                 this.stateDb.logActivity({
                     action: 'sync',
                     localRelPath: toRel,
@@ -4006,6 +4057,10 @@ export class ProtonDriveSyncEngine {
         const rel = drivePathOrNull(relPath);
         if (rel) {
             this.writingMarks.set(rel, { replacing, at: this.markNow() });
+            const settings = this.stateDb.getSettings();
+            if (!matchesIgnorePatterns(rel, settings.ignorePatterns) && this.policy.hiddenBy(rel)?.hide !== 'hidden') {
+                this.markPendingUpload(rel);
+            }
         }
     }
 
@@ -4043,6 +4098,7 @@ export class ProtonDriveSyncEngine {
     // refused session) is held as it is now, at once, with no read: it keeps when it was found, and the hold stays.
     private holdIfCutShort(rel: string): void {
         this.forgetSettling(rel); // Held, not looked at once settled
+        this.clearPendingUpload(rel);
         const fullPath = path.join(this.localRoot(), rel);
         let st: Stats | undefined;
         try {
@@ -4330,7 +4386,11 @@ export class ProtonDriveSyncEngine {
     // The drive helper (re)started: no file is open for writing through it any more, and those that were settle as any
     // other (see stillBeingWritten)
     clearDriveWriting(): void {
+        const paths = [...this.writingMarks.keys()];
         this.writingMarks.clear();
+        for (const rel of paths) {
+            this.noteLocalChangePending(rel);
+        }
     }
 
     // A file whose last writer closed it settles as any other (see stillBeingWritten), from what it is at the close: it
@@ -4348,7 +4408,17 @@ export class ProtonDriveSyncEngine {
         const earlier = this.settlingFiles.get(rel);
         this.forgetSettling(rel); // its wait, and one that a report began meanwhile
         if (!st?.isFile()) {
+            this.clearPendingUpload(rel);
             return;
+        }
+        const dbRecord = this.stateDb.getItemByPath(rel);
+        if (
+            dbRecord?.type === 'file' &&
+            dbRecord.syncStatus === 'synced' &&
+            !changedSinceRecord(st, dbRecord) &&
+            notWrittenSince(st, dbRecord)
+        ) {
+            this.clearPendingUpload(rel);
         }
         const now = this.settleNow();
         const settle = this.options.settle ?? {};
@@ -4497,6 +4567,7 @@ export class ProtonDriveSyncEngine {
                 this.stateDb.deleteMeta(ACCOUNT_MISMATCH);
             })();
             this.keepBothCopies.clear(); // the index, journal and policy are read from their tables: nothing else to drop
+            this.pendingUploads.clear();
         });
         this.accountMismatch = null;
         this.accountVerified = true;
@@ -4674,13 +4745,12 @@ export class ProtonDriveSyncEngine {
         }
         for (const name of localNames ?? []) {
             if (!(name in children) && !availability.has(name)) {
-                // Shown as syncing on itself only: what waits to upload is known by looking at the disk, which a folder's
-                // emblem can't do for everything below it, so folders sum up what the records say, the same from any view.
-                // What was cut short (#300) is recorded: an error, here and above
+                // Local-only item waiting to upload (syncing), or worse if cut short (#300); pending uploads seen by
+                // the watcher, VFS writes, or a sync pass also roll up to ancestor folders via transfersBelow (#53)
                 children[name] = this.localOnlyState(childRel(rel, name), ignorePatterns, transfers.get(name));
             }
         }
-        let below: Transfer = null;
+        let below: Transfer = this.pendingUploads.has(rel) || this.hasActiveTransferAt(rel) ? 'syncing' : null;
         for (const transfer of transfers.values()) {
             below = worseTransfer(below, transfer);
         }
@@ -4688,6 +4758,127 @@ export class ProtonDriveSyncEngine {
         const self =
             rel === '' || selfState === 'hidden' || selfState === 'hiding' ? null : { availability: selfState, transfer: below };
         return { self, children };
+    }
+
+    private markPendingUpload(relPath: string): void {
+        if (!relPath || this.pendingUploads.has(relPath)) {
+            return;
+        }
+        this.pendingUploads.add(relPath);
+        this.stateEvents.touch(relPath);
+    }
+
+    private clearPendingUpload(relPath: string): void {
+        if (this.pendingUploads.delete(relPath)) {
+            this.stateEvents.touch(relPath);
+        }
+    }
+
+    private clearPendingUploadsWithin(relPath: string): void {
+        let cleared = false;
+        for (const p of [...this.pendingUploads]) {
+            if (relPath === '' || isWithin(p, relPath)) {
+                this.pendingUploads.delete(p);
+                cleared = true;
+            }
+        }
+        if (cleared) {
+            this.stateEvents.touchSubtree(relPath);
+        }
+    }
+
+    private clearMissingPendingUploadsWithin(relPath: string): void {
+        let cleared = false;
+        for (const p of [...this.pendingUploads]) {
+            if ((relPath === '' || isWithin(p, relPath)) && !this.localItemExists(p)) {
+                this.pendingUploads.delete(p);
+                cleared = true;
+            }
+        }
+        if (cleared) {
+            this.stateEvents.touchSubtree(relPath);
+        }
+    }
+
+    private movePendingUploads(fromRel: string, toRel: string): void {
+        const moved: string[] = [];
+        let changed = false;
+        for (const rel of [...this.pendingUploads]) {
+            if (isSameOrUnder(rel, toRel)) {
+                this.pendingUploads.delete(rel);
+                changed = true;
+            } else if (isSameOrUnder(rel, fromRel)) {
+                this.pendingUploads.delete(rel);
+                moved.push(toRel + rel.slice(fromRel.length));
+                changed = true;
+            }
+        }
+        for (const rel of moved) {
+            this.pendingUploads.add(rel);
+        }
+        if (changed) {
+            this.stateEvents.touchSubtree(fromRel);
+            this.stateEvents.touchSubtree(toRel);
+        }
+    }
+
+    private hasActiveTransferAt(relPath: string): boolean {
+        if (!relPath) {
+            return false;
+        }
+        for (const transfer of this.activeTransfers.values()) {
+            if (transfer.relPath === relPath) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Notes a local path reported by the watcher as pending upload (or clears it if deleted, ignored, hidden, cut short,
+    // or already synced unchanged) before it waits for a localChangeSlots turn (#53).
+    private noteLocalChangePending(relPath: string): void {
+        const settings = this.stateDb.getSettings();
+        if (
+            !relPath ||
+            matchesIgnorePatterns(relPath, settings.ignorePatterns) ||
+            this.policy.hiddenBy(relPath)?.hide === 'hidden'
+        ) {
+            this.clearPendingUpload(relPath);
+            return;
+        }
+        let st: Stats | undefined;
+        try {
+            st = statSync(path.join(this.localRoot(), relPath), { throwIfNoEntry: false });
+        } catch {
+            this.clearPendingUploadsWithin(relPath);
+            return;
+        }
+        if (!st) {
+            this.clearPendingUploadsWithin(relPath);
+            return;
+        }
+        if (st.isDirectory()) {
+            if (!this.liveIndexEntry(relPath)) {
+                this.markPendingUpload(relPath);
+            }
+            return;
+        }
+        if (!st.isFile() || this.stateDb.getCutShort(relPath)) {
+            this.clearPendingUpload(relPath);
+            return;
+        }
+        const dbRecord = this.stateDb.getItemByPath(relPath);
+        const unchanged =
+            dbRecord?.type === 'file' &&
+            dbRecord.syncStatus === 'synced' &&
+            !changedSinceRecord(st, dbRecord) &&
+            notWrittenSince(st, dbRecord) &&
+            !this.beingReplaced(relPath);
+        if (unchanged) {
+            this.clearPendingUpload(relPath);
+        } else {
+            this.markPendingUpload(relPath);
+        }
     }
 
     // The names in a folder of the local root (engine temp files left out), or null when it isn't a folder here
@@ -4704,9 +4895,9 @@ export class ProtonDriveSyncEngine {
         return matchesIgnorePatterns(rel, ignorePatterns) ? null : { availability: 'downloaded', transfer: worseTransfer('syncing', below) };
     }
 
-    // The worst transfer at or below each child of a folder, by the child's name: uploads and downloads under way and
-    // opens of online-only files (syncing), errors and files cut short by the drive's disk guard (#300), and unresolved
-    // conflicts
+    // The worst transfer at or below each child of a folder, by the child's name: uploads and downloads under way,
+    // pending local uploads (#53), opens of online-only files (syncing), errors and files cut short by the drive's disk
+    // guard (#300), and unresolved conflicts
     private transfersBelow(folderRel: string): Map<string, Transfer> {
         const prefix = folderRel === '' ? '' : `${folderRel}/`;
         const below = (column: string) => (folderRel === '' ? `${column} != ''` : `(${column} >= $lo AND ${column} < $hi)`);
@@ -4733,11 +4924,25 @@ export class ProtonDriveSyncEngine {
         for (const row of rows) {
             out.set(row.name, worseTransfer(out.get(row.name) ?? null, row.transfer));
         }
-        for (const opening of this.hydrations.keys()) {
-            if (opening.startsWith(prefix) && opening !== folderRel) {
-                const name = opening.slice(prefix.length).split('/')[0];
-                out.set(name, worseTransfer(out.get(name) ?? null, 'syncing'));
+        const ignorePatterns = this.stateDb.getSettings().ignorePatterns;
+        const markSyncing = (relPath: string) => {
+            if (!relPath || relPath === folderRel || !relPath.startsWith(prefix)) {
+                return;
             }
+            if (matchesIgnorePatterns(relPath, ignorePatterns) || this.policy.hiddenBy(relPath)?.hide === 'hidden') {
+                return;
+            }
+            const name = relPath.slice(prefix.length).split('/')[0]!;
+            out.set(name, worseTransfer(out.get(name) ?? null, 'syncing'));
+        };
+        for (const opening of this.hydrations.keys()) {
+            markSyncing(opening);
+        }
+        for (const transfer of this.activeTransfers.values()) {
+            markSyncing(transfer.relPath);
+        }
+        for (const pending of this.pendingUploads) {
+            markSyncing(pending);
         }
         return out;
     }
@@ -5418,6 +5623,11 @@ export class ProtonDriveSyncEngine {
                     this.stateDb.moveEditBaselines(fromRel, toRel);
                 }
                 this.moveWritingMarks(fromRel, toRel);
+                if (ignoredTo) {
+                    this.clearPendingUploadsWithin(fromRel);
+                } else {
+                    this.movePendingUploads(fromRel, toRel);
+                }
                 // What was settling at the old path went with what the rename took away: a file made there next (a
                 // save through a temp file of a fixed name) starts afresh, never in the run of the one before (#64)
                 for (const rel of [...this.settlingFiles.keys()]) {
@@ -5554,6 +5764,7 @@ export class ProtonDriveSyncEngine {
             { from: relPath, to: null },
         ).finally(() => {
             if (removed) {
+                this.clearPendingUploadsWithin(relPath);
                 this.holdsAfterRemoval(relPath);
             }
         });
@@ -7002,6 +7213,7 @@ export class ProtonDriveSyncEngine {
             await records.putBack(result.kept);
             return result;
         });
+        this.clearMissingPendingUploadsWithin(relPath);
         // A folder left because it holds something kept isn't what the user is told stayed: only what isn't in Proton
         // Drive yet is
         const kept = removal.kept.filter((p) => !holdingKept.has(p));
@@ -7101,6 +7313,7 @@ export class ProtonDriveSyncEngine {
             return this.availabilityResult(relPath);
         }
         // Its local copy is gone, so no record under it may be left (say, for a file deleted while it was hiding)
+        this.clearPendingUploadsWithin(relPath);
         await this.dropRecordsWithoutFiles(relPath);
         this.stateDb.logActivity({
             action: 'hide',
@@ -7421,7 +7634,45 @@ export class ProtonDriveSyncEngine {
             new Set([...remoteChildByName.keys(), ...localChildByName.keys(), ...dbChildByName.keys()]),
         ).sort((a, b) => a.localeCompare(b));
 
-        const subFoldersToRecurse: Array<{ node: NodeEntity; relPath: string }> = [];
+        // Prune any stale pending upload entries under this folder whose local entry is gone, and mark local-only or
+        // modified local entries as pending upload so folders show syncing immediately during a pass (#53)
+        const dirPrefix = prefix ? `${prefix}/` : '';
+        for (const pending of [...this.pendingUploads]) {
+            if (pending !== prefix && pending.startsWith(dirPrefix)) {
+                const seg = pending.slice(dirPrefix.length).split('/')[0]!;
+                if (
+                    !localChildByName.has(seg) &&
+                    (matchesIgnorePatterns(pending, freshSettings.ignorePatterns) || !this.localItemExists(pending))
+                ) {
+                    this.clearPendingUpload(pending);
+                }
+            }
+        }
+        for (const [name, localChild] of localChildByName) {
+            const relPath = prefix ? `${prefix}/${name}` : name;
+            if (this.policy.hiddenBy(relPath)?.hide === 'hidden') {
+                continue;
+            }
+            if (!localChild.isDirectory && this.stateDb.getCutShort(relPath)) {
+                this.clearPendingUpload(relPath);
+                continue;
+            }
+            const remoteChild = remoteChildByName.get(name);
+            const dbRecord = dbChildByName.get(name);
+            if (
+                (!remoteChild && !dbRecord) ||
+                (!localChild.isDirectory &&
+                    remoteChild &&
+                    (!dbRecord ||
+                        dbRecord.syncStatus !== 'synced' ||
+                        changedSinceRecord(localChild, dbRecord) ||
+                        !notWrittenSince(localChild, dbRecord)))
+            ) {
+                this.markPendingUpload(relPath);
+            }
+        }
+
+        const subFoldersToRecurse: Array<{ node: NodeEntity; relPath: string; newlyCreated: boolean }> = [];
 
         for (const name of childNames) {
             const stepSettings = this.stateDb.getSettings();
@@ -7466,7 +7717,12 @@ export class ProtonDriveSyncEngine {
                 .then((s) => s.isDirectory())
                 .catch(() => false);
             if (resolvedFolderNode && resolvedFolderNode.type === NodeType.Folder && localStillExists) {
-                subFoldersToRecurse.push({ node: resolvedFolderNode, relPath }); // Its failure is forgotten once listed
+                const newlyCreated = !remoteChild;
+                if (newlyCreated) {
+                    // Keep newly created folders marked syncing until their subtree has been scanned and uploaded (#53)
+                    this.markPendingUpload(relPath);
+                }
+                subFoldersToRecurse.push({ node: resolvedFolderNode, relPath, newlyCreated }); // Its failure is forgotten once listed
                 continue;
             }
             this.forgetFailure(relPath);
@@ -7484,6 +7740,9 @@ export class ProtonDriveSyncEngine {
                 matchesIgnorePatterns(sub.relPath, nextSettings.ignorePatterns) ||
                 this.policy.hiddenBy(sub.relPath)?.hide === 'hidden'
             ) {
+                if (sub.newlyCreated) {
+                    this.clearPendingUpload(sub.relPath);
+                }
                 continue;
             }
             try {
@@ -7491,6 +7750,10 @@ export class ProtonDriveSyncEngine {
             } catch (error: unknown) {
                 this.itemFailed(sub.relPath, error, failed); // Its listing, say: nothing in it is looked at this pass
                 continue;
+            } finally {
+                if (sub.newlyCreated && !this.stateDb.getSettings().paused) {
+                    this.clearPendingUpload(sub.relPath);
+                }
             }
             this.forgetFailure(sub.relPath);
         }

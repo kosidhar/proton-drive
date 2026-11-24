@@ -11786,6 +11786,326 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 children: { 'one.txt': { availability: 'downloaded', transfer: 'syncing' }, node_modules: null },
             });
         });
+
+        // #53: active uploads/downloads and pending local files roll up to every ancestor folder
+        test('active uploads roll up syncing to every ancestor folder and clear once done', async () => {
+            const drive = makeMockDrive();
+            const flushed: Array<{ paths: string[]; subtrees: string[] } | 'reset'> = [];
+            const pendingFlush: Array<() => void> = [];
+            const flushEvents = () => {
+                while (pendingFlush.length > 0) {
+                    pendingFlush.shift()!();
+                }
+            };
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
+                ...uploadAtOnce,
+                stateEventSchedule: (run) => {
+                    pendingFlush.push(run);
+                    return () => {
+                        const i = pendingFlush.indexOf(run);
+                        if (i >= 0) pendingFlush.splice(i, 1);
+                    };
+                },
+            });
+            const files = localFiles(stateDb);
+            drive.add('xyz/Other/other.jpg', 'remote');
+            drive.add('xyz/frannxoxo/Photos/done.jpg', 'done');
+            drive.add('xyz/frannxoxo/Videos');
+            await engine.reconcileNow();
+            // Make xyz/frannxoxo/Photos/done.jpg local so xyz is partial and Photos/frannxoxo are downloaded
+            await engine.setAvailability('xyz/frannxoxo/Photos/done.jpg', 'pin');
+
+            let started!: () => void;
+            let release!: () => void;
+            const uploadStarted = new Promise<void>((r) => (started = r));
+            const allowFinish = new Promise<void>((r) => (release = r));
+            const origGetUploader = drive.sdk.getFileUploader.bind(drive.sdk);
+            (drive.sdk as any).getFileUploader = async (parent: NodeEntity, name: string, metadata: any) => {
+                const uploader = await origGetUploader(parent, name, metadata);
+                if (name !== 'uploading.jpg') return uploader;
+                const origUpload = uploader.uploadFromStream.bind(uploader);
+                uploader.uploadFromStream = async (...args: any[]) => {
+                    started();
+                    await allowFinish;
+                    return (origUpload as (...a: any[]) => any)(...args);
+                };
+                return uploader;
+            };
+
+            const unsub = engine.stateEvents.subscribe((ev) => flushed.push(ev));
+            await files.writeLocal('xyz/frannxoxo/Photos/uploading.jpg', 'new photo');
+            const pass = engine.reconcileNow();
+            await uploadStarted;
+            flushEvents();
+
+            // Mid-upload: file and every ancestor folder (Photos, frannxoxo, xyz) show syncing from inside and outside
+            expect(engine.itemStates('xyz/frannxoxo/Photos')!.children['uploading.jpg']?.transfer).toBe('syncing');
+            expect(engine.itemStates('xyz/frannxoxo/Photos')!.self?.transfer).toBe('syncing');
+            expect(engine.itemStates('xyz/frannxoxo')!.children.Photos?.transfer).toBe('syncing');
+            expect(engine.itemStates('xyz/frannxoxo')!.children.Videos?.transfer).toBeNull();
+            expect(engine.itemStates('xyz/frannxoxo')!.self?.transfer).toBe('syncing');
+            expect(engine.itemStates('xyz')!.children.frannxoxo?.transfer).toBe('syncing');
+            expect(engine.itemStates('xyz')!.self?.transfer).toBe('syncing');
+            expect(engine.itemStates('')!.children.xyz?.transfer).toBe('syncing');
+            const touchedPaths = flushed.flatMap((e) => (e === 'reset' ? [] : e.paths));
+            expect(touchedPaths).toContain('xyz');
+            expect(touchedPaths).toContain('xyz/frannxoxo');
+            expect(touchedPaths).toContain('xyz/frannxoxo/Photos');
+            expect(touchedPaths).toContain('xyz/frannxoxo/Photos/uploading.jpg');
+
+            flushed.length = 0;
+            release();
+            await pass;
+            flushEvents();
+            unsub();
+            const finishedPaths = flushed.flatMap((e) => (e === 'reset' ? [] : e.paths));
+            expect(finishedPaths).toContain('xyz');
+            expect(finishedPaths).toContain('xyz/frannxoxo');
+            expect(finishedPaths).toContain('xyz/frannxoxo/Photos');
+
+            // Once uploaded: every folder clears back to its normal availability emblem
+            expect(engine.itemStates('xyz/frannxoxo/Photos')!.self).toEqual({ availability: 'downloaded', transfer: null });
+            expect(engine.itemStates('xyz/frannxoxo')!.children.Photos).toEqual({ availability: 'downloaded', transfer: null });
+            expect(engine.itemStates('xyz/frannxoxo')!.self).toEqual({ availability: 'downloaded', transfer: null });
+            expect(engine.itemStates('xyz')!.children.frannxoxo).toEqual({ availability: 'downloaded', transfer: null });
+            expect(engine.itemStates('xyz')!.self).toEqual({ availability: 'partial', transfer: null });
+            expect(engine.itemStates('')!.children.xyz).toEqual({ availability: 'partial', transfer: null });
+        });
+
+        // #53: files waiting to upload (while paused, queued, or written via VFS) show syncing on ancestor folders
+        test('pending local uploads show syncing on ancestor folders while paused and clear on upload or delete', async () => {
+            const d = setup();
+            d.add('xyz/Other/other.jpg', 'remote');
+            d.add('xyz/frannxoxo/Photos');
+            d.add('xyz/frannxoxo/Videos');
+            await d.engine.reconcileNow();
+
+            // Pause sync, then paste files into Photos and Videos and an ignored file into .git
+            stateDb.updateSettings({ paused: true });
+            await d.files.writeLocal('xyz/frannxoxo/Photos/a.jpg', 'photo');
+            await d.files.writeLocal('xyz/frannxoxo/Videos/v.mp4', 'video');
+            await d.files.writeLocal('xyz/frannxoxo/Photos/.git/HEAD', 'ref');
+            await (d.engine as any).handleLocalFileChange('xyz/frannxoxo/Photos/a.jpg');
+            await (d.engine as any).handleLocalFileChange('xyz/frannxoxo/Videos/v.mp4');
+            await (d.engine as any).handleLocalFileChange('xyz/frannxoxo/Photos/.git/HEAD');
+
+            // Both Photos and Videos, plus frannxoxo and xyz, show syncing — same from parent and from inside
+            for (const [parent, child] of [
+                ['', 'xyz'],
+                ['xyz', 'frannxoxo'],
+                ['xyz/frannxoxo', 'Photos'],
+                ['xyz/frannxoxo', 'Videos'],
+            ] as const) {
+                const full = parent ? `${parent}/${child}` : child;
+                expect(d.engine.itemStates(parent)!.children[child]?.transfer).toBe('syncing');
+                expect(d.engine.itemStates(full)!.self?.transfer).toBe('syncing');
+            }
+
+            // Deleting the pending video clears Videos immediately while Photos, frannxoxo, and xyz stay syncing
+            await rm(path.join(d.engine.localRoot(), 'xyz/frannxoxo/Videos/v.mp4'));
+            await (d.engine as any).handleLocalFileChange('xyz/frannxoxo/Videos/v.mp4');
+            expect(d.engine.itemStates('xyz/frannxoxo')!.children.Videos?.transfer).toBeNull();
+            expect(d.engine.itemStates('xyz/frannxoxo/Videos')!.self?.transfer).toBeNull();
+            expect(d.engine.itemStates('xyz/frannxoxo')!.children.Photos?.transfer).toBe('syncing');
+            expect(d.engine.itemStates('xyz')!.children.frannxoxo?.transfer).toBe('syncing');
+            expect(d.engine.itemStates('')!.children.xyz?.transfer).toBe('syncing');
+
+            // Resuming and syncing clears Photos, frannxoxo, and xyz (ignored .git/HEAD never keeps them syncing)
+            stateDb.updateSettings({ paused: false });
+            await d.engine.reconcileNow();
+            expect(d.engine.itemStates('xyz/frannxoxo')!.children.Photos?.transfer).toBeNull();
+            expect(d.engine.itemStates('xyz')!.children.frannxoxo?.transfer).toBeNull();
+            expect(d.engine.itemStates('')!.children.xyz?.transfer).toBeNull();
+        });
+
+        // #53: newly pasted sibling subfolders (like Videos while Photos is uploading) stay syncing during a full pass
+        test('newly created sibling folders stay syncing during a pass until their contents are synced', async () => {
+            const d = setup();
+            d.add('xyz/Other/other.jpg', 'remote');
+            await d.engine.reconcileNow();
+
+            // Write a brand-new folder tree without watcher events (as after a daemon restart)
+            await d.files.writeLocal('xyz/frannxoxo/Photos/a.jpg', 'photo');
+            await d.files.writeLocal('xyz/frannxoxo/Videos/v.mp4', 'video');
+
+            let started!: () => void;
+            let release!: () => void;
+            const photoStarted = new Promise<void>((r) => (started = r));
+            const allowFinish = new Promise<void>((r) => (release = r));
+            const origGetUploader = d.sdk.getFileUploader.bind(d.sdk);
+            (d.sdk as any).getFileUploader = async (parent: NodeEntity, name: string, metadata: any) => {
+                const uploader = await origGetUploader(parent, name, metadata);
+                if (name !== 'a.jpg') return uploader;
+                const origUpload = uploader.uploadFromStream.bind(uploader);
+                uploader.uploadFromStream = async (...args: any[]) => {
+                    started();
+                    await allowFinish;
+                    return (origUpload as (...a: any[]) => any)(...args);
+                };
+                return uploader;
+            };
+
+            const pass = d.engine.reconcileNow();
+            await photoStarted;
+
+            // Both Photos (actively uploading) and Videos (created remotely, waiting its turn to recurse) show syncing
+            expect(d.engine.itemStates('xyz/frannxoxo')!.children.Photos?.transfer).toBe('syncing');
+            expect(d.engine.itemStates('xyz/frannxoxo')!.children.Videos?.transfer).toBe('syncing');
+            expect(d.engine.itemStates('xyz/frannxoxo/Videos')!.self?.transfer).toBe('syncing');
+            expect(d.engine.itemStates('xyz')!.children.frannxoxo?.transfer).toBe('syncing');
+            expect(d.engine.itemStates('')!.children.xyz?.transfer).toBe('syncing');
+
+            release();
+            await pass;
+
+            expect(d.engine.itemStates('xyz/frannxoxo')!.children.Photos?.transfer).toBeNull();
+            expect(d.engine.itemStates('xyz/frannxoxo')!.children.Videos?.transfer).toBeNull();
+            expect(d.engine.itemStates('xyz')!.children.frannxoxo?.transfer).toBeNull();
+            expect(d.engine.itemStates('')!.children.xyz?.transfer).toBeNull();
+        });
+
+        test('driveWriting marks ancestor folders syncing, and drive rename/delete follow or clear it', async () => {
+            const d = setup();
+            d.add('xyz/frannxoxo/Videos');
+            await d.engine.reconcileNow();
+
+            await d.files.writeLocal('xyz/frannxoxo/Videos/clip.mp4', 'part');
+            d.engine.driveWriting('xyz/frannxoxo/Videos/clip.mp4', true);
+            expect(d.engine.itemStates('xyz/frannxoxo')!.children.Videos?.transfer).toBe('syncing');
+            expect(d.engine.itemStates('xyz')!.children.frannxoxo?.transfer).toBe('syncing');
+            expect(d.engine.itemStates('')!.children.xyz?.transfer).toBe('syncing');
+
+            await d.engine.renameItem('xyz/frannxoxo/Videos', 'xyz/frannxoxo/Clips');
+            expect(d.engine.itemStates('xyz/frannxoxo')!.children.Clips?.transfer).toBe('syncing');
+            expect(d.engine.itemStates('xyz')!.children.frannxoxo?.transfer).toBe('syncing');
+
+            await d.engine.deleteItem('xyz/frannxoxo/Clips');
+            expect(d.engine.itemStates('xyz')!.children.frannxoxo?.transfer).toBeNull();
+            expect(d.engine.itemStates('')!.children.xyz?.transfer).toBeNull();
+        });
+
+        test('active downloads roll up syncing to ancestor folders and clear once done', async () => {
+            const drive = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, uploadAtOnce);
+            drive.add('xyz/Other/big.bin', 'remote payload');
+            await engine.reconcileNow();
+
+            let started!: () => void;
+            let release!: () => void;
+            const dlStarted = new Promise<void>((r) => (started = r));
+            const allowFinish = new Promise<void>((r) => (release = r));
+            const origGetDownloader = drive.sdk.getFileRevisionDownloader.bind(drive.sdk);
+            (drive.sdk as any).getFileRevisionDownloader = async (uid: string) => {
+                const dl = await origGetDownloader(uid);
+                const origDownload = dl.downloadToStream.bind(dl);
+                dl.downloadToStream = (...args: any[]) => {
+                    const ctrl = (origDownload as (...a: any[]) => any)(...args);
+                    const origCompletion = ctrl.completion;
+                    return {
+                        ...ctrl,
+                        completion: async () => {
+                            started();
+                            await allowFinish;
+                            return origCompletion();
+                        },
+                    };
+                };
+                return dl;
+            };
+
+            const pin = engine.setAvailability('xyz/Other/big.bin', 'pin');
+            await dlStarted;
+            expect(engine.itemStates('xyz/Other')!.children['big.bin']?.transfer).toBe('syncing');
+            expect(engine.itemStates('xyz/Other')!.self?.transfer).toBe('syncing');
+            expect(engine.itemStates('xyz')!.children.Other?.transfer).toBe('syncing');
+            expect(engine.itemStates('')!.children.xyz?.transfer).toBe('syncing');
+
+            release();
+            await pin;
+            expect(engine.itemStates('xyz/Other')!.self?.transfer).toBeNull();
+            expect(engine.itemStates('')!.children.xyz?.transfer).toBeNull();
+        });
+
+        test('cloud delete, cloud move, free, hide/unhide, rename-to-ignored, and unchanged driveClosed never stick on syncing', async () => {
+            const d = setup();
+            const docs = d.add('Docs');
+            const gone = d.add('Docs/gone.txt', 'bye');
+            const moved = d.add('Docs/Sub/stay.txt', 'stay');
+            const clean = d.add('Docs/clean.txt', 'same');
+            d.add('Dest');
+            d.engine.availability.setPin(docs.uid, 'pinned', false);
+            await d.engine.reconcileNow();
+
+            // 1. Cloud delete discovered in a reconcile pass clears cleanly (never sticks Docs on syncing)
+            d.nodes.delete(gone.uid);
+            await d.engine.reconcileNow();
+            expect(d.engine.itemStates('Docs')!.self?.transfer).toBeNull();
+            expect(d.engine.itemStates('')!.children.Docs?.transfer).toBeNull();
+
+            // 2. Cloud move of a folder holding a pending local file moves the pending state to the new parent
+            await d.files.writeLocal('Docs/Sub/waiting.txt', 'not uploaded');
+            stateDb.updateSettings({ paused: true });
+            await (d.engine as any).handleLocalFileChange('Docs/Sub/waiting.txt');
+            expect(d.engine.itemStates('')!.children.Docs?.transfer).toBe('syncing');
+            const subNode = d.nodes.get(moved.parentUid!)!;
+            const destNode = [...d.nodes.values()].find((n) => n.name.ok && n.name.value === 'Dest')!;
+            d.nodes.set(subNode.uid, { ...subNode, parentUid: destNode.uid });
+            stateDb.updateSettings({ paused: false });
+            await d.engine.reconcileNow();
+            // Docs/Sub moved to Dest/Sub: Docs cleared, Dest inherited the pending upload until the next pass uploads it
+            expect(d.engine.itemStates('')!.children.Docs?.transfer).toBeNull();
+            expect(d.engine.itemStates('')!.children.Dest?.transfer).toBe('syncing');
+            await d.engine.reconcileNow();
+            expect(d.engine.itemStates('')!.children.Dest?.transfer).toBeNull();
+
+            // 3. Unchanged driveWriting -> driveClosed clears syncing immediately without waiting to settle
+            d.engine.driveWriting('Docs/clean.txt', false);
+            expect(d.engine.itemStates('Docs')!.self?.transfer).toBe('syncing');
+            await d.engine.driveClosed('Docs/clean.txt', { refused: false, replaced: false });
+            expect(d.engine.itemStates('Docs')!.self?.transfer).toBeNull();
+
+            // 4. clearDriveWriting clears unchanged files marked by driveWriting
+            d.engine.driveWriting('Docs/clean.txt', false);
+            expect(d.engine.itemStates('Docs')!.self?.transfer).toBe('syncing');
+            d.engine.clearDriveWriting();
+            expect(d.engine.itemStates('Docs')!.self?.transfer).toBeNull();
+
+            // 5. Free (including whole-drive free on '') and Hide+Unhide clear stale pending entries on unchanged files
+            d.engine.driveWriting('Docs/clean.txt', false);
+            await d.engine.setAvailability('', 'free');
+            expect(d.engine.itemStates('Docs')!.children['clean.txt']?.transfer).toBeNull();
+            expect(d.engine.itemStates('Docs')!.self?.transfer).toBeNull();
+
+            await d.engine.setAvailability('Docs/clean.txt', 'pin');
+            d.engine.driveWriting('Docs/clean.txt', false);
+            await d.engine.setAvailability('Docs/clean.txt', 'hide');
+            await d.engine.setAvailability('Docs/clean.txt', 'unhide');
+            expect(d.engine.itemStates('Docs')!.children['clean.txt']?.transfer).toBeNull();
+            expect(d.engine.itemStates('Docs')!.self?.transfer).toBeNull();
+
+            // 6. Renaming a pending file to an ignored name clears it (and error/conflict still win over syncing)
+            await d.files.writeLocal('Docs/temp.txt', 'tmp');
+            d.engine.driveWriting('Docs/temp.txt', true);
+            expect(d.engine.itemStates('Docs')!.self?.transfer).toBe('syncing');
+            await d.engine.renameItem('Docs/temp.txt', 'Docs/.DS_Store');
+            expect(d.engine.itemStates('Docs')!.self?.transfer).toBeNull();
+
+            // 7. Error and conflict still win over pending syncing on the same folder
+            await d.files.writeLocal('Docs/pending.txt', 'p');
+            d.engine.driveWriting('Docs/pending.txt', true);
+            expect(d.engine.itemStates('Docs')!.self?.transfer).toBe('syncing');
+            record('Docs/clean.txt', 'error');
+            expect(d.engine.itemStates('Docs')!.self?.transfer).toBe('error');
+            stateDb.recordConflict({
+                localRelPath: 'Docs/clean.txt',
+                nodeUid: clean.uid,
+                localSha1: null,
+                remoteSha1: null,
+                localMtimeMs: 0,
+                remoteMtimeMs: 0,
+            });
+            expect(d.engine.itemStates('Docs')!.self?.transfer).toBe('conflict');
+        });
     });
     describe('waiting prompt conflicts after the strategy changes or the sides agree (#68)', () => {
         // As an older version stored it, past the checks a save makes now
