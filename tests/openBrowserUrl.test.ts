@@ -20,7 +20,8 @@ test('a started opener resolves ok', async () => {
     const f = fakeSpawn('spawn');
     expect(await openBrowserUrl('https://example.com/a', f.spawnFn)).toEqual({ ok: true });
     expect(f.calls.length).toBe(1);
-    expect(f.calls[0].args).toContain('https://example.com/a');
+    expect(f.calls[0].cmd).toBe('xdg-open');
+    expect(f.calls[0].args).toEqual(['https://example.com/a']);
 });
 
 test('a spawn error such as ENOENT is reported with its reason', async () => {

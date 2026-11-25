@@ -115,24 +115,6 @@ function defaultDataDirs(): Pick<Config, 'cacheDir' | 'appDir' | 'logDir'> {
         return { cacheDir: override, appDir: override, logDir: override };
     }
 
-    if (process.platform === 'darwin') {
-        return {
-            cacheDir: path.join(home, 'Library', 'Caches', APP_DIR_NAME),
-            appDir: path.join(home, 'Library', 'Application Support', APP_DIR_NAME),
-            logDir: path.join(home, 'Library', 'Logs', APP_DIR_NAME),
-        };
-    }
-
-    if (process.platform === 'win32') {
-        const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
-        const root = path.join(localAppData, APP_DIR_NAME);
-        return {
-            cacheDir: path.join(root, 'Cache'),
-            appDir: path.join(root, 'Data'),
-            logDir: path.join(root, 'Logs'),
-        };
-    }
-
     const xdgCache = process.env.XDG_CACHE_HOME || path.join(home, '.cache');
     const xdgData = process.env.XDG_DATA_HOME || path.join(home, '.local', 'share');
     const xdgState = process.env.XDG_STATE_HOME || path.join(home, '.local', 'state');
