@@ -1,5 +1,6 @@
 import { open } from 'node:fs/promises';
 
+import type { OpenResult } from '../sdk/openBrowserUrl';
 import type { DocKind } from '../sync/docNodes';
 
 // A placeholder is a few hundred bytes; anything bigger is not one.
@@ -57,10 +58,10 @@ export function parseDocLink(text: string): { url: string; kind: DocKind } | nul
     return { url: `https://docs.proton.me/doc?type=${type}&mode=open&volumeId=${volumeId}&linkId=${linkId}`, kind: type };
 }
 
-/** Opens the placeholder's document in the browser. Returns the exit code: 0 opened, 1 refused. */
+/** Opens the placeholder's document in the browser. Returns the exit code: 0 opened, 1 refused or the opener could not start. */
 export async function openDoc(
     file: string,
-    deps: { open: (url: string) => void; notify: (title: string, body: string) => void },
+    deps: { open: (url: string) => Promise<OpenResult>; notify: (title: string, body: string) => void },
 ): Promise<number> {
     let link: { url: string; kind: DocKind } | null = null;
     try {
@@ -84,6 +85,10 @@ export async function openDoc(
         deps.notify('Proton Drive', NOT_A_DOC_LINK);
         return 1;
     }
-    deps.open(link.url);
+    const result = await deps.open(link.url);
+    if (!result.ok) {
+        deps.notify('Proton Drive', `Couldn't open the document in the browser: ${result.reason}`);
+        return 1;
+    }
     return 0;
 }

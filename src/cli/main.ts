@@ -380,7 +380,11 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
             if (sub === 'login') {
                 console.log(`Notice: ${THIRD_PARTY_DISCLOSURE}`);
                 await runtime.auth.authViaWeb((signInUrl) => {
-                    openBrowserUrl(signInUrl);
+                    void openBrowserUrl(signInUrl).then((r) => {
+                        if (!r.ok) {
+                            console.error(`Could not open the browser: ${r.reason}`);
+                        }
+                    });
                     console.log('Complete sign-in in your browser. Waiting for authentication...');
                     console.log(`If the browser did not open, visit:\n${signInUrl}`);
                 });
