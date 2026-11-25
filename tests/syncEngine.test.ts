@@ -7949,6 +7949,271 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
         });
 
+        // #447: a file here where Proton Drive has a folder of that name (another device made it before the file
+        // uploaded), or a folder here where it has a file. The drive shows the local item (local wins), so a delete
+        // through it is of that item only: nothing is journalled for the cloud item, which stays indexed and is listed
+        // again once the local one is gone. #432's refusals still hold.
+        describe('a local item of the other kind than the cloud item at its path (#447)', () => {
+            // A desktop Trash that works: what is only here goes to it
+            const withDesktopTrash = (d: ReturnType<typeof setup>) => {
+                const desktopTrash = path.join(tempDir, 'DesktopTrash');
+                (d.engine as any).options.moveToDesktopTrash = async (fullPath: string) => {
+                    d.handedToTrash.push(fullPath);
+                    await mkdir(desktopTrash, { recursive: true });
+                    await rename(fullPath, path.join(desktopTrash, `${d.handedToTrash.length}-${path.basename(fullPath)}`));
+                    return true;
+                };
+                return () => d.handedToTrash.map((p) => path.relative(path.join(tempDir, 'files'), p));
+            };
+            // Everything journalled from here on, whether or not a replay has sent it since (deleteItem starts one)
+            const journalling = (d: ReturnType<typeof setup>) => {
+                const enqueue = spyOn((d.engine as any).journal as RemoteOpsJournal, 'enqueue');
+                return Object.assign(d, { journalled: () => enqueue.mock.calls.map(([op]) => op) });
+            };
+            type Watched = ReturnType<typeof journalling>;
+            // A file made here, never uploaded, where Proton Drive has a folder X with a file in it
+            const fileOverFolder = async () => {
+                const d = setup();
+                d.add('X/inner.txt', 'inner');
+                await d.engine.reconcileNow();
+                await d.files.writeLocal('X', 'mine');
+                return journalling(d);
+            };
+            // A folder made here, never uploaded, where Proton Drive has a file X
+            const folderOverFile = async (holding?: string) => {
+                const d = setup();
+                d.add('X', 'theirs');
+                await d.engine.reconcileNow();
+                await mkdir(d.local('X'));
+                if (holding !== undefined) {
+                    await d.files.writeLocal(`X/${holding}`, 'mine');
+                }
+                return journalling(d);
+            };
+            const refusal = (d: Watched, opts?: { onlyIfEmpty?: boolean; trash?: boolean }) =>
+                d.engine.deleteItem('X', opts).then(
+                    () => null,
+                    (e: unknown) => (e instanceof DriveOpError ? e.code : e),
+                );
+            // Nothing journalled or trashed, the cloud item still indexed, and after the next sync still there and
+            // listed by the drive as Proton Drive has it, with nothing uploaded or downloaded
+            const expectCloudItemKept = async (d: Watched, type: 'file' | 'folder') => {
+                expect(d.journalled()).toEqual([]);
+                expect(d.journal()).toEqual([]);
+                expect(d.engine.remoteIndex.getByPath('X')).toMatchObject({ uid: 'vol~X', type });
+                await d.engine.replayRemoteOps();
+                expect(d.calls.trashed).toEqual([]);
+                await d.engine.reconcileNow();
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.downloads).toEqual([]);
+                expect(d.nodes.has('vol~X')).toBe(true);
+                expect(d.engine.remoteIndex.getByPath('X')).toMatchObject({ uid: 'vol~X', type });
+                expect(d.engine.vfsChildren('').find((e) => e.name === 'X')?.type).toBe(type);
+                await d.expectEveryRecordHasItsFile();
+            };
+            const recordX = (nodeUid: string, type: 'file' | 'folder') =>
+                stateDb.upsertItem({
+                    localRelPath: 'X',
+                    nodeUid,
+                    parentNodeUid: null,
+                    type,
+                    localSha1: null,
+                    remoteSha1: null,
+                    localMtimeMs: 0,
+                    remoteMtimeMs: 0,
+                    size: 0,
+                    syncStatus: 'synced',
+                    lastError: null,
+                });
+            const expectFolderContentKept = (d: ReturnType<typeof setup>) => {
+                expect(d.nodes.has('vol~X/inner.txt')).toBe(true);
+                expect(d.engine.remoteIndex.getByPath('X/inner.txt')).not.toBeNull();
+                expect(d.engine.vfsChildren('X').map((e) => e.name)).toEqual(['inner.txt']);
+            };
+
+            describe('a file here, a folder in Proton Drive', () => {
+                test('an unlink removes only the local file, and the cloud folder stays', async () => {
+                    const d = await fileOverFolder();
+
+                    await d.engine.deleteItem('X');
+
+                    expect(await d.files.exists('X')).toBe(false);
+                    expect(d.handedToTrash).toEqual([]);
+                    await expectCloudItemKept(d, 'folder');
+                    expectFolderContentKept(d);
+                    expect(activity()).toContain('Deleted on this computer; the folder Proton Drive has at that name stays');
+                });
+
+                test('a Move to Trash puts only the local file in the desktop Trash, and the cloud folder stays', async () => {
+                    const d = await fileOverFolder();
+                    const handed = withDesktopTrash(d);
+
+                    await d.engine.deleteItem('X', { trash: true });
+
+                    expect(await d.files.exists('X')).toBe(false);
+                    expect(handed()).toEqual(['X']);
+                    await expectCloudItemKept(d, 'folder');
+                    expectFolderContentKept(d);
+                });
+
+                test('an rmdir is refused, as the local item is a file: nothing changes', async () => {
+                    const d = await fileOverFolder();
+
+                    expect(await refusal(d, { onlyIfEmpty: true })).toBe('EIO');
+
+                    expect(await readFile(d.local('X'), 'utf8')).toBe('mine');
+                    expect(d.journalled()).toEqual([]);
+                    expect(d.engine.remoteIndex.getByPath('X')).toMatchObject({ uid: 'vol~X', type: 'folder' });
+                });
+
+                // Only the drive's helper sends deletes, but deleteItem isn't tied to the layout: in the plain one, the
+                // local file is in the sync folder, and the same holds
+                test('in the plain layout too, an unlink removes only the local file, and the cloud folder stays', async () => {
+                    const d = setup();
+                    d.add('X/inner.txt', 'inner');
+                    await d.engine.reconcileNow();
+                    stateDb.setMeta('driveLayout', 'plain');
+                    const inSyncFolder = path.join(stateDb.getSettings().syncDir, 'X');
+                    await mkdir(path.dirname(inSyncFolder), { recursive: true });
+                    await writeFile(inSyncFolder, 'mine');
+                    const w = journalling(d);
+
+                    await d.engine.deleteItem('X');
+
+                    expect(await stat(inSyncFolder).catch(() => null)).toBeNull();
+                    expect(w.journalled()).toEqual([]);
+                    expect(d.engine.remoteIndex.getByPath('X')).toMatchObject({ uid: 'vol~X', type: 'folder' });
+                    expect(d.engine.remoteIndex.getByPath('X/inner.txt')).not.toBeNull();
+                    await d.engine.replayRemoteOps();
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.nodes.has('vol~X/inner.txt')).toBe(true);
+                });
+
+                // A record naming the cloud folder itself can't be this file's: the folder isn't trashed for it
+                test('a stale record that names the cloud folder: an unlink still leaves the folder', async () => {
+                    const d = await fileOverFolder();
+                    recordX('vol~X', 'folder');
+
+                    await d.engine.deleteItem('X');
+
+                    expect(await d.files.exists('X')).toBe(false);
+                    expect(stateDb.getItemByPath('X')).toBeNull();
+                    await expectCloudItemKept(d, 'folder');
+                    expectFolderContentKept(d);
+                });
+
+                // A record of another node is what the file was synced as: that goes as before, never the folder
+                test('a file recorded as another node: the folder stays indexed and untouched', async () => {
+                    const d = await fileOverFolder();
+                    recordX('vol~Elsewhere/mine.txt', 'file');
+
+                    await d.engine.deleteItem('X');
+
+                    expect(await d.files.exists('X')).toBe(false);
+                    expect(d.journalled().map((op) => op.nodeUid)).toEqual(['vol~Elsewhere/mine.txt']);
+                    expect(d.engine.remoteIndex.getByPath('X')).toMatchObject({ uid: 'vol~X', type: 'folder' });
+                    expectFolderContentKept(d);
+                    await d.engine.replayRemoteOps();
+                    expect(d.calls.trashed.flat()).not.toContain('vol~X');
+                    expect(d.nodes.has('vol~X/inner.txt')).toBe(true);
+                });
+            });
+
+            describe('a folder here, a file in Proton Drive', () => {
+                test('an unlink is refused with EISDIR (#432): nothing changes', async () => {
+                    const d = await folderOverFile('mine.txt');
+
+                    expect(await refusal(d)).toBe('EISDIR');
+
+                    expect(await readFile(d.local('X/mine.txt'), 'utf8')).toBe('mine');
+                    expect(d.handedToTrash).toEqual([]);
+                    expect(d.journalled()).toEqual([]);
+                    expect(d.engine.remoteIndex.getByPath('X')).toMatchObject({ uid: 'vol~X', type: 'file' });
+                });
+
+                test('an rmdir of the empty local folder removes only it, and the cloud file stays', async () => {
+                    const d = await folderOverFile();
+
+                    await d.engine.deleteItem('X', { onlyIfEmpty: true });
+
+                    expect(await d.files.exists('X')).toBe(false);
+                    await expectCloudItemKept(d, 'file');
+                    expect(d.nodes.get('vol~X')?.content).toBe('theirs');
+                });
+
+                test('an rmdir of a local folder that holds something is refused with ENOTEMPTY (#432): nothing changes', async () => {
+                    const d = await folderOverFile('mine.txt');
+
+                    expect(await refusal(d, { onlyIfEmpty: true })).toBe('ENOTEMPTY');
+
+                    expect(await readFile(d.local('X/mine.txt'), 'utf8')).toBe('mine');
+                    expect(d.journalled()).toEqual([]);
+                    expect(d.engine.remoteIndex.getByPath('X')).toMatchObject({ uid: 'vol~X', type: 'file' });
+                });
+
+                test('a Move to Trash puts only the local folder in the desktop Trash, and the cloud file stays', async () => {
+                    const d = await folderOverFile('mine.txt');
+                    const handed = withDesktopTrash(d);
+
+                    await d.engine.deleteItem('X', { trash: true });
+
+                    expect(await d.files.exists('X')).toBe(false);
+                    expect(handed()).toEqual(['X']);
+                    await expectCloudItemKept(d, 'file');
+                    expect(d.nodes.get('vol~X')?.content).toBe('theirs');
+                });
+            });
+
+            // Controls: where the local item is of the same kind as the cloud item, with no record either, a delete is of
+            // that cloud item, as before
+            describe('the same kind here and in Proton Drive', () => {
+                const sameKind = async (make: (d: ReturnType<typeof setup>) => Promise<void>) => {
+                    const d = setup();
+                    await make(d);
+                    withDesktopTrash(d);
+                    return journalling(d);
+                };
+                const expectCloudItemTrashed = async (d: Watched) => {
+                    expect(d.journalled()).toMatchObject([{ kind: 'trash', nodeUid: 'vol~X' }]);
+                    expect(d.engine.remoteIndex.getByPath('X')).toBeNull();
+                    await d.engine.replayRemoteOps();
+                    expect(d.calls.trashed).toEqual([['vol~X']]);
+                    expect(await d.files.exists('X')).toBe(false);
+                };
+
+                test('an unlink of a local file with the very content of the cloud file trashes that file', async () => {
+                    const d = await sameKind(async (d) => {
+                        d.add('X', 'same');
+                        await d.engine.reconcileNow();
+                        await d.files.writeLocal('X', 'same');
+                    });
+                    await d.engine.deleteItem('X');
+                    await expectCloudItemTrashed(d);
+                });
+
+                test('an rmdir of an empty local folder where Proton Drive has an empty folder trashes that folder', async () => {
+                    const d = await sameKind(async (d) => {
+                        d.add('X');
+                        await d.engine.reconcileNow();
+                        await mkdir(d.local('X'), { recursive: true });
+                    });
+                    await d.engine.deleteItem('X', { onlyIfEmpty: true });
+                    await expectCloudItemTrashed(d);
+                });
+
+                test('a Move to Trash of a local folder where Proton Drive has a folder trashes that folder', async () => {
+                    const d = await sameKind(async (d) => {
+                        d.add('X/inner.txt', 'inner');
+                        await d.engine.reconcileNow();
+                        await mkdir(d.local('X'), { recursive: true });
+                    });
+                    await d.engine.deleteItem('X', { trash: true });
+                    await expectCloudItemTrashed(d);
+                });
+            });
+        });
+
         test('moving a downloaded folder to the Trash trashes it once in Proton Drive, uploads nothing of an ignored .git, and does not bring it back', async () => {
             const d = setup();
             d.add('Projects/readme.txt', 'readme');
