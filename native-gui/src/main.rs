@@ -10236,6 +10236,20 @@ mod tests {
     }
 
     #[test]
+    fn a_keyboard_refresh_leaves_the_focus_where_the_user_went_during_the_read() {
+        let mut h = shared_with_rows();
+        tab_to(&mut h, "Refresh");
+        press_key(&mut h, Key::Enter);
+        press_key(&mut h, Key::Tab);
+        let other = focused(&h).map(|n| says(&n)).expect("Tab reached another control");
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(shared_rows())));
+        h.frames(3);
+        assert!(h.widget_at("Refresh").is_some());
+        assert!(!says_focused(&h, "Refresh"));
+        assert_eq!(focused(&h).map(|n| says(&n)), Some(other));
+    }
+
+    #[test]
     fn a_mouse_refresh_on_shared_leaves_the_focus_alone() {
         let mut h = shared_with_rows();
         h.click(h.widget_at("Refresh").unwrap());
@@ -10244,10 +10258,15 @@ mod tests {
         h.frames(3);
         assert!(h.widget_at("Refresh").is_some());
         assert!(!says_focused(&h, "Refresh"), "{:?}", focused(&h).map(|n| says(&n)));
-        // Nor does a mouse Retry, or one after a keyboard Refresh was left behind
+        // Nor does a mouse Retry after a failure
+        h.click(h.widget_at("Refresh").unwrap());
         h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Err("You're offline".into())));
         h.frames(3);
-        assert!(!says_focused(&h, "Retry"));
+        h.click(h.widget_at("Retry").unwrap());
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Err("You're offline".into())));
+        h.frames(3);
+        assert!(h.widget_at("Retry").is_some());
+        assert!(!says_focused(&h, "Retry"), "{:?}", focused(&h).map(|n| says(&n)));
     }
 
     #[test]

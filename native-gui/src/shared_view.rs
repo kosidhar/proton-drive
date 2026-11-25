@@ -484,11 +484,16 @@ impl ProtonDriveNativeApp {
     /// while the page reads is given to the one that shows when the read ends; a mouse click moves no focus (#411).
     fn shared_button_pressed(&mut self, ui: &egui::Ui, button: &egui::Response) -> bool {
         if self.shared.refocus && !self.shared.loading {
+            // Spent when the read ends, but only given if the user hasn't gone to something else meanwhile
             self.shared.refocus = false;
-            button.request_focus();
+            if ui.memory(|m| m.focused().is_none()) {
+                button.request_focus();
+            }
         }
         let pressed = button.clicked();
         if pressed {
+            // An activation from a screen reader (AccessKit) has no pointer click, so it deliberately counts as the
+            // keyboard
             self.shared.refocus = !ui.input(|i| i.pointer.any_click());
         }
         pressed
