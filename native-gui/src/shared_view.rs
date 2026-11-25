@@ -421,8 +421,11 @@ impl ProtonDriveNativeApp {
                             let words = ui.label(RichText::new(shared::REFRESHING).size(13.0).color(TEXT_MUTED()));
                             announce_politely(ui, &words);
                             home::turning_decoration(ui, icons::SYNC, 16.0, PROTON_PURPLE_TEXT(), home::turning_angle(ui));
-                        } else if action_button(ui, ButtonKind::Secondary, Some(icons::SYNC), "Refresh", 34.0).clicked() {
-                            self.load_shared();
+                        } else {
+                            let refresh = action_button(ui, ButtonKind::Secondary, Some(icons::SYNC), "Refresh", 34.0);
+                            if self.shared_button_pressed(ui, &refresh) {
+                                self.load_shared();
+                            }
                         }
                     }
                 });
@@ -442,7 +445,8 @@ impl ProtonDriveNativeApp {
                             ui.add(egui::Label::new(RichText::new(error).size(13.0).color(DANGER_TEXT())).wrap().halign(Align::Center));
                         });
                         ui.add_space(12.0);
-                        action_button(ui, ButtonKind::Primary, Some(icons::REFRESH), "Retry", 34.0).clicked()
+                        let retry = action_button(ui, ButtonKind::Primary, Some(icons::REFRESH), "Retry", 34.0);
+                        self.shared_button_pressed(ui, &retry)
                     });
                     if retry {
                         self.load_shared();
@@ -476,9 +480,28 @@ impl ProtonDriveNativeApp {
         });
     }
 
+    /// Whether a Refresh or Retry was pressed. One pressed from the keyboard is remembered, and the focus it loses
+    /// while the page reads is given to the one that shows when the read ends; a mouse click moves no focus (#411).
+    fn shared_button_pressed(&mut self, ui: &egui::Ui, button: &egui::Response) -> bool {
+        if self.shared.refocus && !self.shared.loading {
+            // Spent when the read ends, but only given if the user hasn't gone to something else meanwhile
+            self.shared.refocus = false;
+            if ui.memory(|m| m.focused().is_none()) {
+                button.request_focus();
+            }
+        }
+        let pressed = button.clicked();
+        if pressed {
+            // An activation from a screen reader (AccessKit) has no pointer click, so it deliberately counts as the
+            // keyboard
+            self.shared.refocus = !ui.input(|i| i.pointer.any_click());
+        }
+        pressed
+    }
+
     /// Nothing shared yet: a picture, a heading and the one way to share, a little above the middle of the page (the
     /// height it is placed by is last frame's), Refresh, and where Photos shares are. True when Refresh was clicked.
-    fn render_shared_empty(&self, ui: &mut egui::Ui, viewport: f32) -> bool {
+    fn render_shared_empty(&mut self, ui: &mut egui::Ui, viewport: f32) -> bool {
         place_above_middle(ui, "shared_empty_h", viewport, |ui| {
             paint_share_picture(ui);
             ui.add_space(20.0);
@@ -489,7 +512,8 @@ impl ProtonDriveNativeApp {
                 ui.add(egui::Label::new(RichText::new(shared::EMPTY_HOW).size(13.0).color(TEXT_MUTED())).wrap().halign(Align::Center));
             });
             ui.add_space(16.0);
-            let refresh = action_button(ui, ButtonKind::Secondary, Some(icons::SYNC), "Refresh", 34.0).clicked();
+            let refresh = action_button(ui, ButtonKind::Secondary, Some(icons::SYNC), "Refresh", 34.0);
+            let refresh = self.shared_button_pressed(ui, &refresh);
             ui.add_space(24.0);
             // Centred in one row if both parts fit the page, else the lead-in above the link
             let width_of = |ui: &egui::Ui, text: &str| ui.painter().layout_no_wrap(text.into(), FontId::proportional(PHOTOS_SIZE), TEXT_MUTED()).size().x;
