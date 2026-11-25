@@ -1,14 +1,23 @@
 import { describe, expect, test } from 'bun:test';
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const SELF = 'tests/branding.test.ts';
 
-// Tracked text files, except vendor/, docs/, bun.lock and binary assets.
-function scannedFiles(): string[] {
-    const listed = Bun.spawnSync(['git', 'ls-files', '-z'], { cwd: ROOT }).stdout.toString().split('\0').filter(Boolean);
+// Files the scan must always see: if they are missing from the list, the list is wrong and a pass would mean nothing.
+const SENTINELS = ['src/sdk/config.ts', 'packaging/linux/install.sh', 'package.json'];
+
+// Tracked text files, except vendor/, docs/, bun.lock and binary assets. Throws when the list cannot be trusted.
+function scannedFiles(cwd: string = ROOT): string[] {
+    const ls = Bun.spawnSync(['git', 'ls-files', '-z'], { cwd });
+    if (ls.exitCode !== 0) throw new Error(`git ls-files failed (exit ${ls.exitCode}) in ${cwd}: ${ls.stderr.toString().trim()}`);
+    const listed = ls.stdout.toString().split('\0').filter(Boolean);
+    for (const sentinel of SENTINELS) {
+        if (!listed.includes(sentinel)) throw new Error(`git ls-files in ${cwd} did not list ${sentinel}: the scan would be vacuous`);
+    }
     return listed.filter(
         (f) =>
             !f.startsWith('vendor/') &&
@@ -25,8 +34,9 @@ function occurrences(pattern: RegExp, allowed: (file: string, line: string) => b
         let text: string;
         try {
             text = readFileSync(path.join(ROOT, file), 'utf8');
-        } catch {
-            continue; // deleted in the working tree but still listed
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue; // deleted in the working tree but still listed
+            throw err;
         }
         text.split('\n').forEach((line, i) => {
             if (pattern.test(line) && !allowed(file, line)) found.push(`${file}:${i + 1}: ${line.trim()}`);
@@ -44,6 +54,18 @@ const DATA_FOLDER_ALLOWED: Array<[file: string, line: RegExp, why: string]> = [
 ];
 
 describe('names after #413', () => {
+    test('the scan refuses a file list it cannot trust', () => {
+        const dir = mkdtempSync(path.join(os.tmpdir(), 'branding-'));
+        try {
+            expect(() => scannedFiles(dir)).toThrow(/git ls-files/); // not a repo
+            Bun.spawnSync(['git', 'init', '-q'], { cwd: dir });
+            expect(() => scannedFiles(dir)).toThrow(/vacuous/); // a repo that lists nothing
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+        expect(scannedFiles().length).toBeGreaterThan(100);
+    });
+
     test('ch.proton.drive and ch_proton appear nowhere', () => {
         expect(occurrences(/ch\.proton\.drive|ch_proton/, () => false)).toEqual([]);
     });
