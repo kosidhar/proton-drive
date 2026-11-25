@@ -2,6 +2,8 @@
 
 A fast, native Linux desktop application and two-way background folder synchronization client for **Proton Drive**, built on top of the official **Proton Drive SDK (`@protontech/drive-sdk`)** and a native Rust **`eframe` / `egui`** desktop GUI.
 
+**Unofficial:** this app is not made, endorsed or supported by Proton AG. "Proton" and "Proton Drive" are trademarks of Proton AG.
+
 ---
 
 ## Supported Linux Distributions & Package Formats
@@ -137,3 +139,9 @@ protondrive trash <remotePath>             # Move a remote node to Trash
 - To act on the whole drive (pin and free only), name it explicitly: `/my-files` or the sync folder itself. A relative path that would mean the whole drive, such as `.` at the top of the sync folder, is refused, and so is anything outside the sync folder.
 - `status <path>` answers `Not in Proton Drive: <path>` for a path that is neither in Proton Drive nor in the sync folder.
 - These commands go through the running daemon's user-only control socket, so `protondrive daemon` must be running.
+
+---
+
+## License
+
+MIT, see [`LICENSE`](LICENSE). Third-party parts are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
