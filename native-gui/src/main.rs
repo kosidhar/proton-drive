@@ -917,7 +917,29 @@ fn sign_out_at(socket: &std::path::Path) -> Result<(), String> {
 
 /// POST /drive/settings with only the changed fields (or just virtualDriveWanted, for the switch).
 fn save_settings_at(socket: &std::path::Path, changes: &serde_json::Value) -> Result<SettingsReply, String> {
-    let reply = control_request_at(socket, "POST", "/drive/settings", Some(changes), DRIVE_READ_TIMEOUT)?;
+    save_settings_with_timeout(socket, changes, DRIVE_READ_TIMEOUT)
+}
+
+/// A setting changed in Settings > Sync is saved at once, and since #426 a newer value of it waits for the answer. A
+/// daemon that accepts the connection and never answers would hold the control for the 10 minutes of
+/// DRIVE_READ_TIMEOUT (#449), so a save gives up after this long. Only a folder move (syncDir) can take minutes.
+const SETTINGS_SAVE_TIMEOUT: Duration = Duration::from_secs(15);
+/// What a save that gave up shows, as any failed save does.
+const SETTINGS_NO_ANSWER: &str = "Proton Drive didn't answer";
+
+/// How long the save of `changes` may wait for the daemon: long for a folder move, short for the rest.
+fn settings_save_timeout(changes: &serde_json::Value) -> Duration {
+    if changes.get("syncDir").is_some() { DRIVE_READ_TIMEOUT } else { SETTINGS_SAVE_TIMEOUT }
+}
+
+fn save_settings_with_timeout(
+    socket: &std::path::Path,
+    changes: &serde_json::Value,
+    timeout: Duration,
+) -> Result<SettingsReply, String> {
+    let reply = control_request_with_timeout_message(
+        socket, "POST", "/drive/settings", Some(changes), timeout, SETTINGS_NO_ANSWER,
+    )?;
     serde_json::from_value(reply).map_err(|e| e.to_string())
 }
 
@@ -4736,7 +4758,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
             WorkerCommand::Logout => off_thread(&tx, &ctx, || WorkerEvent::LoggedOut(sign_out_at(&control_socket_path()))),
             WorkerCommand::SaveSettings { seq, changes } => off_thread(&tx, &ctx, move || {
                 let keys = changes.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
-                WorkerEvent::SettingsSaved { seq, keys, result: save_settings_at(&control_socket_path(), &changes) }
+                WorkerEvent::SettingsSaved { seq, keys, result: save_settings_with_timeout(&control_socket_path(), &changes, settings_save_timeout(&changes)) }
             }),
             WorkerCommand::SetVirtualDrive(on) => off_thread(&tx, &ctx, move || {
                 let change = serde_json::json!({ "virtualDriveWanted": on });
@@ -8935,6 +8957,28 @@ mod tests {
         server.join().unwrap();
     }
 
+    // #449: a daemon that accepts the connection and never answers must not hold a setting for 10 minutes
+    #[test]
+    fn a_save_the_daemon_never_answers_gives_up_and_says_so() {
+        let dir = private_dir("pd-gui-save-timeout");
+        let sock = dir.join("silent.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let _ = done_rx.recv();
+            drop(conn);
+        });
+        let started = Instant::now();
+        let err = save_settings_with_timeout(&sock, &serde_json::json!({ "paused": true }), Duration::from_millis(100)).unwrap_err();
+        assert_eq!(err, SETTINGS_NO_ANSWER);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(done_tx);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+    }
+
     #[test]
     fn writes_that_can_move_files_wait_long_and_sign_in_waits_for_the_browser() {
         assert_eq!(DRIVE_READ_TIMEOUT, Duration::from_secs(600));
@@ -11927,6 +11971,48 @@ mod tests {
         h.frames(2);
         assert!(h.text_at("Saved").is_some());
         assert!(h.text_at("Can't reach the Proton Drive daemon").is_none());
+    }
+
+    // #449: the save gave up after SETTINGS_SAVE_TIMEOUT; the worker delivers that as any failed save
+    #[test]
+    fn a_save_that_timed_out_releases_the_held_value() {
+        let mut h = settings_tall(None, None);
+        flip_notifications(&mut h);
+        let first = h.app.settings_seq;
+        flip_notifications(&mut h);
+        h.event(WorkerEvent::SettingsSaved {
+            seq: first,
+            keys: vec!["notificationsEnabled".into()],
+            result: Err(SETTINGS_NO_ANSWER.into()),
+        });
+        assert_eq!(h.sent(), vec![save_notifications(false), save_notifications(true)]);
+        h.frames(2);
+        assert!(h.text_at(SETTINGS_NO_ANSWER).is_none(), "the first failure isn't shown");
+    }
+
+    #[test]
+    fn a_final_timeout_restores_the_daemons_value_and_says_why() {
+        let mut h = settings_tall(None, None);
+        flip_notifications(&mut h);
+        assert!(!h.app.edit_notifications);
+        h.event(WorkerEvent::SettingsSaved {
+            seq: h.app.settings_seq,
+            keys: vec!["notificationsEnabled".into()],
+            result: Err(SETTINGS_NO_ANSWER.into()),
+        });
+        h.frames(2);
+        assert!(h.app.edit_notifications, "back to what the daemon holds");
+        assert!(!h.app.is_pending("notificationsEnabled"));
+        assert!(h.text_at(SETTINGS_NO_ANSWER).is_some());
+    }
+
+    #[test]
+    fn only_a_folder_move_waits_long_for_its_save() {
+        assert_eq!(settings_save_timeout(&serde_json::json!({ "syncDir": "/x" })), DRIVE_READ_TIMEOUT);
+        for key in ["notificationsEnabled", "conflictStrategy", "ignorePatterns", "reconcileIntervalSec", "paused"] {
+            assert_eq!(settings_save_timeout(&serde_json::json!({ key: 1 })), SETTINGS_SAVE_TIMEOUT, "{key}");
+        }
+        assert_eq!(SETTINGS_SAVE_TIMEOUT, Duration::from_secs(15));
     }
 
     #[test]
