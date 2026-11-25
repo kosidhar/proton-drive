@@ -5784,16 +5784,21 @@ export class ProtonDriveSyncEngine {
         if (!local && !entry) {
             throw new DriveOpError('ENOENT', `Not found: ${relPath}`);
         }
+        // Only a file or a folder here counts: the drive doesn't show anything else of its backing store (a symlink, say),
+        // and shows the cloud item at that name instead, which is then what the user deletes. The folder checks below
+        // go by the item the drive shows, not by what lstat finds, or a link over a cloud folder is refused as "not a
+        // folder" (#456). The link is never followed.
+        const shown = local && (local.isFile() || local.isDirectory()) ? local : null;
         // An unlink (neither flag) is what the drive sends for a file, and for a folder it is refused as unlink(2) does,
         // before any trash is journalled or anything is removed here (#432). rmdir and Move to Trash take folders.
-        if (!onlyIfEmpty && !trash && (local ? local.isDirectory() : entry?.type === 'folder')) {
+        if (!onlyIfEmpty && !trash && (shown ? shown.isDirectory() : entry?.type === 'folder')) {
             throw new DriveOpError('EISDIR', `Is a folder: ${relPath}`);
         }
         if (onlyIfEmpty) {
-            if (local ? !local.isDirectory() : entry?.type !== 'folder') {
+            if (shown ? !shown.isDirectory() : entry?.type !== 'folder') {
                 throw new DriveOpError('EIO', `Not a folder: ${relPath}`);
             }
-            if (await this.holdsAnything(relPath, Boolean(local), entry)) {
+            if (await this.holdsAnything(relPath, Boolean(shown), entry)) {
                 throw new DriveOpError('ENOTEMPTY', `Not empty: ${relPath}`);
             }
         }
@@ -5801,10 +5806,7 @@ export class ProtonDriveSyncEngine {
         // made by another device before the file uploaded, or the reverse) is not that item, whatever a record says:
         // the drive shows the local one, and only it goes. The cloud item stays, in Proton Drive and in the index, with
         // everything in it, and is listed again once the local one is gone (#447). When unsure, keep both.
-        // Only a file or a folder here counts: the drive doesn't show anything else of its backing store (a symlink,
-        // say), and shows the cloud item at that name instead, which is then what the user deleted.
-        const shown = local && (local.isFile() || local.isDirectory());
-        const otherKind = shown && entry && local.isDirectory() !== (entry.type === 'folder') ? entry : null;
+        const otherKind = shown && entry && shown.isDirectory() !== (entry.type === 'folder') ? entry : null;
         const ownEntry = otherKind ? null : entry;
         // A local file in an unresolved collision is what the drive shows there (#29): only it goes, and the other file
         // Proton Drive has at that name stays (with the folders it is in), listed again once the local one is gone.
@@ -5863,7 +5865,11 @@ export class ProtonDriveSyncEngine {
                 // records went in the transaction), so it can't fail after the delete committed
                 records.noteSubtree(relPath);
                 removed = true;
-                if (local && onlyIfEmpty) {
+                if (local && !shown && onlyIfEmpty) {
+                    // The cloud folder is what goes (trashed above); of the backing store only the link itself, not its
+                    // target (#456)
+                    await rm(path.join(root, relPath), { force: true });
+                } else if (local && onlyIfEmpty) {
                     // Never what was put in it since the look above: that stays, and syncs as new, folder and all
                     await rmdir(path.join(root, relPath)).catch((error: NodeJS.ErrnoException) => {
                         throw error.code === 'ENOTEMPTY' || error.code === 'EEXIST'
