@@ -3095,10 +3095,11 @@ impl ProtonDriveNativeApp {
                 Frame::NONE.inner_margin(SCROLL_GUTTER).show(ui, |ui| {
                     self.render_account_card(ui);
                     ui.add_space(14.0);
-                    // A daemon before Stage 2 has no virtual drive to show
-                    if let Some(vfs) = self.status.vfs.clone() {
-                        self.render_drive_card(ui, &vfs);
-                        ui.add_space(14.0);
+                    // A daemon before Stage 2 has no virtual drive: its card shows the folder, and moves it, only
+                    let vfs = self.status.vfs.clone();
+                    self.render_drive_card(ui, vfs.as_ref());
+                    ui.add_space(14.0);
+                    if vfs.is_some() {
                         self.render_blocked_apps_card(ui);
                         ui.add_space(14.0);
                     }
@@ -3112,20 +3113,47 @@ impl ProtonDriveNativeApp {
             });
     }
 
-    /// The drive: where it is, and the virtual drive switch, which acts at once. Its state, Mount again and a move that
-    /// stopped are Home's.
-    fn render_drive_card(&mut self, ui: &mut egui::Ui, vfs: &VfsStatus) {
+    /// The drive: where it is, with Move… to put it elsewhere (#427, the one place the folder shows), and the virtual
+    /// drive switch, which acts at once. Its state, Mount again and a move that stopped are Home's. A daemon before
+    /// Stage 2 has no virtual drive (`vfs` None): the folder and Move… only.
+    fn render_drive_card(&mut self, ui: &mut egui::Ui, vfs: Option<&VfsStatus>) {
+        let now = Instant::now();
+        self.setting_notes.retain(|_, n| n.until.is_none_or(|until| until > now));
+        if let Some(next) = self.setting_notes.values().filter_map(|n| n.until).min() {
+            ui.ctx().request_repaint_after(next.saturating_duration_since(now));
+        }
+        let mut move_folder = false;
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             settings::card_heading(ui, "Drive", None, None);
             ui.add_space(10.0);
 
-            let sync_dir = &self.status.sync_dir;
-            let shown = if sync_dir.is_empty() { "Not set up yet".to_string() } else { shown_folder(sync_dir) };
-            settings::setting_row(ui, "Location", Some(home::drive_kind(Some(vfs))), None, |ui| {
-                ui.add(egui::Label::new(RichText::new(&shown).size(13.5).color(TEXT_PRIMARY())).truncate())
-                    .on_hover_text(sync_dir)
+            let sync_dir = self.status.sync_dir.clone();
+            let moving = self.move_in_progress();
+            let moving_here = self.is_pending("syncDir");
+            let shown = if sync_dir.is_empty() { "Not set up yet".to_string() } else { shown_folder(&sync_dir) };
+            settings::setting_row(ui, "Location", Some(home::drive_kind(vfs)), None, |ui| {
+                // Move… at the right edge, the folder before it, cut short to the room there is (whole on hover)
+                // Not while a move is out: it takes minutes, and a second one is refused as busy
+                let button = ui
+                    .add_enabled_ui(!moving, |ui| {
+                        action_button_named(ui, ButtonKind::Secondary, Some(icons::FOLDER_OPEN), "Move…", "Move Proton Drive folder…", 32.0)
+                    })
+                    .inner;
+                move_folder = button.clicked() && !moving;
+                ui.add_space(6.0);
+                let path = ui.add(egui::Label::new(RichText::new(&shown).size(13.5).color(TEXT_PRIMARY())).truncate());
+                if !sync_dir.is_empty() {
+                    path.on_hover_text(&sync_dir);
+                }
+                button
             });
+            if moving_here {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| working_line(ui, "Moving…"));
+            } else {
+                self.show_setting_note(ui, "syncDir");
+            }
+            let Some(vfs) = vfs else { return };
             ui.add_space(settings::ROW_GAP);
 
             // On is what the user chose (the daemon's virtualDriveWanted); without FUSE the drive is a plain folder anyway
@@ -3168,6 +3196,9 @@ impl ProtonDriveNativeApp {
                 }
             }
         });
+        if move_folder {
+            self.choose_folder_to_move_to();
+        }
     }
 
     /// A move that stopped: where from and to, why, and one button per action the daemon offers now.
@@ -3361,7 +3392,7 @@ impl ProtonDriveNativeApp {
         });
     }
 
-    /// Sync: the folder, notifications, start at login, the conflict choice and the files to ignore. Each applies as
+    /// Sync: notifications, start at login, the conflict choice and the files to ignore. Each applies as
     /// soon as it is changed (the ignore box when it loses focus), and says how it went beside it (#425).
     fn render_sync_settings_card(&mut self, ui: &mut egui::Ui) {
         let now = Instant::now();
@@ -3369,7 +3400,6 @@ impl ProtonDriveNativeApp {
         if let Some(next) = self.setting_notes.values().filter_map(|n| n.until).min() {
             ui.ctx().request_repaint_after(next.saturating_duration_since(now));
         }
-        let mut move_folder = false;
         let mut ignore_blurred = false;
         let mut ignore_escaped = false;
         let mut chosen_strategy = None;
@@ -3377,33 +3407,6 @@ impl ProtonDriveNativeApp {
             ui.set_min_width(ui.available_width());
             settings::card_heading(ui, "Sync", None, None);
             ui.add_space(10.0);
-
-            let dir = self.status.sync_dir.clone();
-            let moving = self.move_in_progress();
-            let moving_here = self.is_pending("syncDir");
-            settings::setting_row(ui, "Proton Drive folder", None, None, |ui| {
-                // Move… at the right edge, the folder before it, cut short to the room there is (whole on hover)
-                // Not while a move is out: it takes minutes, and a second one is refused as busy
-                let button = ui
-                    .add_enabled_ui(!moving, |ui| {
-                        action_button_named(ui, ButtonKind::Secondary, Some(icons::FOLDER_OPEN), "Move…", "Move Proton Drive folder…", 32.0)
-                    })
-                    .inner;
-                move_folder = button.clicked() && !moving;
-                ui.add_space(6.0);
-                let shown = if dir.is_empty() { "Not set up yet" } else { dir.as_str() };
-                let path = ui.add(egui::Label::new(RichText::new(shown).size(13.0).color(TEXT_MUTED())).truncate());
-                if !dir.is_empty() {
-                    path.on_hover_text(&dir);
-                }
-                button
-            });
-            if moving_here {
-                ui.with_layout(Layout::right_to_left(Align::Min), |ui| working_line(ui, "Moving…"));
-            } else {
-                self.show_setting_note(ui, "syncDir");
-            }
-            ui.add_space(settings::ROW_GAP);
 
             if settings::switch_row(ui, "Desktop notifications", None, None, self.edit_notifications) {
                 self.edit_notifications = !self.edit_notifications;
@@ -3476,9 +3479,6 @@ impl ProtonDriveNativeApp {
             self.revert_ignore_text();
         } else if ignore_blurred {
             self.apply_ignore_patterns();
-        }
-        if move_folder {
-            self.choose_folder_to_move_to();
         }
     }
 
@@ -11783,7 +11783,7 @@ mod tests {
     #[test]
     fn move_asks_first_and_moves_only_on_move() {
         let mut h = settings_tall(None, None);
-        assert!(h.text_at("Proton Drive folder").is_some());
+        assert!(h.text_at("Location").is_some());
         assert!(h.text_at("/home/u/ProtonDrive").is_some());
         assert!(h.text_at("Move…").is_some());
         assert!(h.text_at("Browse...").is_none());
@@ -11873,6 +11873,28 @@ mod tests {
         assert!(h.text_at("Saved").is_some());
         let button = h.nodes_named("Move Proton Drive folder…").into_iter().next().unwrap();
         assert!(!button.is_disabled(), "Move… is enabled again");
+    }
+
+    // #427: the folder shows once, on the Drive card, with Move… on that row
+    #[test]
+    fn the_folder_shows_once_with_move_on_the_drive_cards_location_row() {
+        for vfs_status in [Some(vfs("virtual", true, None)), None] {
+            let h = settings_tall(vfs_status, Some(true));
+            assert_eq!(h.text_at_all("/home/u/ProtonDrive").len(), 1, "the path shows once on the page");
+            assert!(h.text_at("Proton Drive folder").is_none(), "the Sync card has no folder row");
+            let location = h.text_rect("Location").expect("the Location row");
+            let moves = h.text_rects_all("Move…");
+            assert_eq!(moves.len(), 1, "one Move…");
+            assert!((moves[0].center().y - location.center().y).abs() < 20.0, "Move… is on the Location row: {moves:?} {location:?}");
+            let title = h.text_rect("Drive").expect("the Drive card's title");
+            let switch = h.text_rect(SWITCH).map(|r| r.top());
+            assert!(moves[0].top() > title.bottom(), "below the Drive title");
+            if let Some(switch) = switch {
+                assert!(moves[0].bottom() < switch, "above the virtual drive switch");
+            }
+        }
+        let h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        assert!(h.text_at("Virtual drive · mounted").is_some(), "the row keeps its detail");
     }
 
     // #425 final review: the notes are announced as they appear
@@ -12373,7 +12395,6 @@ mod tests {
         let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
         let y = |h: &Harness, text: &str| h.text_at(text).unwrap_or_else(|| panic!("{text:?} is painted")).y;
         let rows = [
-            "Proton Drive folder",
             "Desktop notifications",
             "Start Proton Drive when I log in",
             "When a file changes in both places",
@@ -12511,7 +12532,6 @@ mod tests {
         for label in [
             SWITCH,
             "Location",
-            "Proton Drive folder",
             "When a file changes in both places",
             "Desktop notifications",
             "Start Proton Drive when I log in",
