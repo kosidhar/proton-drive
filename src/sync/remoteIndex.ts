@@ -59,6 +59,9 @@ export class RemoteIndex {
     // Told of every path whose state may have changed (subtree: everything below it too), for the file manager's
     // emblems (see StateEvents)
     onChange: ((relPath: string, subtree: boolean) => void) | null = null;
+    // Told of the uids of the folders a removed subtree held, inside the removal's transaction, so that the Docs and Sheets
+    // records parented by them go with them (#436)
+    onFoldersRemoved: ((folderUids: string[]) => void) | null = null;
 
     constructor(private db: Database) {
         this.db.run(`
@@ -181,9 +184,17 @@ export class RemoteIndex {
         if (!node) {
             return;
         }
-        this.db
-            .query(`DELETE FROM remote_nodes WHERE ${selfOrDescendantWhere('relPath')}`)
-            .run(selfOrDescendant(node.relPath));
+        this.db.transaction(() => {
+            // Taken before the rows go. The records of a document are keyed by its folder's uid, which nothing looks up once
+            // the folder is out of the index, but a restored folder (the same uid) would show them again (#436).
+            const folders = this.db
+                .query(`SELECT uid FROM remote_nodes WHERE type = 'folder' AND ${selfOrDescendantWhere('relPath')}`)
+                .all(selfOrDescendant(node.relPath)) as { uid: string }[];
+            this.db
+                .query(`DELETE FROM remote_nodes WHERE ${selfOrDescendantWhere('relPath')}`)
+                .run(selfOrDescendant(node.relPath));
+            this.onFoldersRemoved?.(folders.map((f) => f.uid));
+        })();
         this.onChange?.(node.relPath, true);
     }
 

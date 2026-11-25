@@ -504,6 +504,65 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await engine.stop();
         });
 
+        describe('Docs and Sheets records leave with their folder (#436)', () => {
+            const withDocsBelow = async () => {
+                const d = setup();
+                addDoc(d.remoteNodes, 'vol~inA', d.archive.uid, 'InArchive');
+                addDoc(d.remoteNodes, 'vol~inYear', 'vol~year', 'InYear', 'application/vnd.proton.sheet');
+                addDoc(d.remoteNodes, 'vol~inRoot', d.rootNode.uid, 'InRoot');
+                await d.engine.start();
+                expect(d.engine.docNodes.anyChildren(d.archive.uid)).toBe(true);
+                expect(d.engine.docNodes.anyChildren('vol~year')).toBe(true);
+                return d;
+            };
+            const gone = (type: DriveEventType, nodeUid: string, isTrashed?: boolean) =>
+                ({ type, nodeUid, parentNodeUid: 'vol~root', isTrashed, isShared: false, treeEventScopeId: 'scope-main', eventId: 'evt-436' }) as unknown as DriveEvent;
+
+            test('a deleted folder takes the records of the documents in it and in its subfolders, and no others', async () => {
+                const d = await withDocsBelow();
+                await d.fire(gone(DriveEventType.NodeDeleted, d.archive.uid));
+                expect(d.engine.remoteIndex.getByUid('vol~year')).toBeNull();
+                expect(d.engine.docNodes.anyChildren(d.archive.uid)).toBe(false);
+                expect(d.engine.docNodes.anyChildren('vol~year')).toBe(false);
+                expect(d.engine.docNodes.listChildren(d.rootNode.uid).map((r) => r.uid)).toEqual(['vol~inRoot']);
+                await d.engine.stop();
+            });
+
+            test('a trashed folder takes them too', async () => {
+                const d = await withDocsBelow();
+                await d.fire(gone(DriveEventType.NodeUpdated, d.archive.uid, true));
+                expect(d.engine.docNodes.anyChildren(d.archive.uid)).toBe(false);
+                expect(d.engine.docNodes.anyChildren('vol~year')).toBe(false);
+                expect(d.engine.docNodes.listChildren(d.rootNode.uid).map((r) => r.uid)).toEqual(['vol~inRoot']);
+                await d.engine.stop();
+            });
+
+            test('a folder restored under the same uid shows what the fresh listing holds, not what it held', async () => {
+                const d = await withDocsBelow();
+                await d.fire(gone(DriveEventType.NodeDeleted, d.archive.uid));
+                // Restored: the same uids are back in the index, and nothing from before shows until they are listed again
+                d.engine.remoteIndex.upsert(entryFromNode(d.archive, '')!);
+                d.engine.remoteIndex.upsert(entryFromNode(d.remoteNodes.get('vol~year')!, 'Archive')!);
+                expect(d.engine.docNodes.anyChildren(d.archive.uid)).toBe(false);
+                expect(d.engine.docNodes.anyChildren('vol~year')).toBe(false);
+                d.remoteNodes.delete('vol~inYear');
+                addDoc(d.remoteNodes, 'vol~fresh', 'vol~year', 'Fresh');
+                (d.engine as any).recordListing(d.remoteNodes.get('vol~year')!, 'Archive/2025', [d.remoteNodes.get('vol~fresh')!]);
+                expect(d.engine.docNodes.listChildren('vol~year').map((r) => r.uid)).toEqual(['vol~fresh']);
+                await d.engine.stop();
+            });
+
+            test('a folder renamed keeps its records', async () => {
+                const d = await withDocsBelow();
+                d.remoteNodes.set(d.archive.uid, { ...d.archive, name: { ok: true, value: 'Old' } });
+                await d.engine.reconcileNow();
+                expect(d.engine.remoteIndex.getByUid(d.archive.uid)?.relPath).toBe('Old');
+                expect(d.engine.docNodes.listChildren(d.archive.uid).map((r) => r.uid)).toEqual(['vol~inA']);
+                expect(d.engine.docNodes.listChildren('vol~year').map((r) => r.uid)).toEqual(['vol~inYear']);
+                await d.engine.stop();
+            });
+        });
+
         test('a locally deleted synced folder leaves no index entries once it is trashed', async () => {
             const { engine, remoteNodes, rootNode, archive } = setup();
             // Another top-level item stays, so the delete is a partial loss, never the files missing (#45)

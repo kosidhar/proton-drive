@@ -99,6 +99,16 @@ export class DocNodes {
         return [...changed];
     }
 
+    // Forgets the documents of folders that have left the index, so one restored under its uid starts from its next listing (#436).
+    removeInFolders(parentUids: string[]): void {
+        const del = this.db.query('DELETE FROM doc_nodes WHERE parentUid = $parentUid');
+        this.db.transaction(() => {
+            for (const parentUid of parentUids) {
+                del.run({ $parentUid: parentUid });
+            }
+        })();
+    }
+
     // Forgets a document; returns the uid of the folder it was in, or null when none was recorded.
     remove(uid: string): string | null {
         const before = this.get(uid);
