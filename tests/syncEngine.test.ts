@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test } from 'bun:test';
-import { appendFileSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, lstatSync, utimesSync, writeFileSync } from 'node:fs';
 import { chmod, cp, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -8233,6 +8233,84 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.engine.replayRemoteOps();
                 expect(d.calls.trashed).toEqual([['vol~X']]);
                 expect(await readFile(target, 'utf8')).toBe('not in the drive');
+            });
+        });
+
+        // #456: the folder checks of a delete (rmdir's "not a folder" and "not empty", unlink's EISDIR) go by the item the
+        // drive shows, which over a symlink of the backing store is the cloud item. The link is never followed.
+        describe('a cloud item shown over a symlink of the backing store (#456)', () => {
+            const over = async (kind: 'folder' | 'empty folder' | 'file') => {
+                const d = setup();
+                if (kind === 'folder') {
+                    d.add('X/inner.txt', 'inner');
+                } else if (kind === 'empty folder') {
+                    d.add('X');
+                } else {
+                    d.add('X', 'theirs');
+                }
+                await d.engine.reconcileNow();
+                const target = path.join(tempDir, 'elsewhere.txt');
+                await writeFile(target, 'not in the drive');
+                await mkdir(d.local(''), { recursive: true });
+                await rm(d.local('X'), { recursive: true, force: true });
+                await symlink(target, d.local('X'));
+                const enqueue = spyOn((d.engine as any).journal as RemoteOpsJournal, 'enqueue');
+                return { d, target, journalled: () => enqueue.mock.calls.map(([op]) => op) };
+            };
+            const code = (d: ReturnType<typeof setup>, opts?: { onlyIfEmpty?: boolean }) =>
+                d.engine.deleteItem('X', opts).then(
+                    () => null,
+                    (e: unknown) => (e instanceof DriveOpError ? e.code : e),
+                );
+            const targetKept = async (target: string) => expect(await readFile(target, 'utf8')).toBe('not in the drive');
+            const linkGone = (d: ReturnType<typeof setup>) =>
+                expect(lstatSync(d.local('X'), { throwIfNoEntry: false })).toBeUndefined();
+
+            test('rmdir of an empty cloud folder trashes it and removes only the link', async () => {
+                const { d, target, journalled } = await over('empty folder');
+                expect(await code(d, { onlyIfEmpty: true })).toBeNull();
+                expect(journalled()).toMatchObject([{ kind: 'trash', nodeUid: 'vol~X' }]);
+                linkGone(d);
+                await targetKept(target);
+                await d.engine.replayRemoteOps();
+                expect(d.calls.trashed).toEqual([['vol~X']]);
+            });
+
+            test('rmdir of a non-empty cloud folder is ENOTEMPTY and changes nothing', async () => {
+                const { d, target, journalled } = await over('folder');
+                expect(await code(d, { onlyIfEmpty: true })).toBe('ENOTEMPTY');
+                expect(journalled()).toEqual([]);
+                expect(lstatSync(d.local('X')).isSymbolicLink()).toBe(true);
+                expect(d.engine.remoteIndex.getByPath('X')).toMatchObject({ uid: 'vol~X', type: 'folder' });
+                await targetKept(target);
+            });
+
+            test('unlink of a cloud folder is EISDIR and changes nothing', async () => {
+                for (const kind of ['folder', 'empty folder'] as const) {
+                    const { d, target, journalled } = await over(kind);
+                    expect(await code(d)).toBe('EISDIR');
+                    expect(journalled()).toEqual([]);
+                    expect(lstatSync(d.local('X')).isSymbolicLink()).toBe(true);
+                    expect(d.engine.remoteIndex.getByPath('X')).toMatchObject({ uid: 'vol~X', type: 'folder' });
+                    await targetKept(target);
+                }
+            });
+
+            test('unlink of a cloud file trashes it and removes only the link', async () => {
+                const { d, target, journalled } = await over('file');
+                expect(await code(d)).toBeNull();
+                expect(journalled()).toMatchObject([{ kind: 'trash', nodeUid: 'vol~X' }]);
+                linkGone(d);
+                await targetKept(target);
+            });
+
+            test('rmdir of a cloud file is refused as not a folder and changes nothing', async () => {
+                const { d, target, journalled } = await over('file');
+                expect(await code(d, { onlyIfEmpty: true })).toBe('EIO');
+                expect(journalled()).toEqual([]);
+                expect(lstatSync(d.local('X')).isSymbolicLink()).toBe(true);
+                expect(d.engine.remoteIndex.getByPath('X')).toMatchObject({ uid: 'vol~X', type: 'file' });
+                await targetKept(target);
             });
         });
 
