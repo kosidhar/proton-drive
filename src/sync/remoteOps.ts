@@ -117,6 +117,13 @@ export class RemoteOpsJournal {
         this.db.query('UPDATE remote_ops SET path = $path WHERE nodeUid = $nodeUid AND id > $id').run({ $nodeUid: nodeUid, $id: id, $path: path });
     }
 
+    // The id the latest operation journalled was given, pending or not (0 before any). Ids only grow, so an operation with
+    // a higher one was journalled after this was read.
+    lastId(): number {
+        const row = this.db.query("SELECT seq FROM sqlite_sequence WHERE name = 'remote_ops'").get() as { seq: number } | null;
+        return row?.seq ?? 0;
+    }
+
     hasPending(): boolean {
         return this.db.query('SELECT 1 FROM remote_ops LIMIT 1').get() !== null;
     }
