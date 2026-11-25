@@ -3163,7 +3163,12 @@ impl ProtonDriveNativeApp {
             let shown = if sync_dir.is_empty() { "Not set up yet".to_string() } else { shown_folder(&sync_dir) };
             // No kind before a reachable daemon has answered: no virtual drive yet is not a plain folder
             let kind = (vfs.is_some() || (self.daemon_online && !self.initial_connecting)).then(|| home::drive_kind(vfs));
-            settings::setting_row(ui, "Location", kind, None, |ui| {
+            let location_note = if moving_here {
+                Some(settings::RowNote { text: "Moving…".into(), tone: settings::NoteTone::Working })
+            } else {
+                self.setting_note("syncDir")
+            };
+            settings::setting_row_noted(ui, "Location", kind, None, location_note.as_ref(), |ui| {
                 // Move… at the right edge, the folder before it, cut short to the room there is (whole on hover)
                 // Not while a move is out: it takes minutes, and a second one is refused as busy
                 let button = ui
@@ -3179,11 +3184,6 @@ impl ProtonDriveNativeApp {
                 }
                 button
             });
-            if moving_here {
-                ui.with_layout(Layout::right_to_left(Align::Min), |ui| working_line(ui, "Moving…"));
-            } else {
-                self.show_setting_note(ui, "syncDir");
-            }
             let Some(vfs) = vfs else { return };
             ui.add_space(settings::ROW_GAP);
 
@@ -3379,16 +3379,12 @@ impl ProtonDriveNativeApp {
         let _ = self.tx.send(cmd);
     }
 
-    /// The line under a setting's row that says how its change went (#425): Saved for a few seconds, or why it wasn't
-    /// made, kept until the setting is changed again.
-    fn show_setting_note(&self, ui: &mut egui::Ui, key: &str) {
-        let Some(note) = self.setting_notes.get(key) else { return };
-        let color = if note.notice.error { DANGER_TEXT() } else { TEXT_MUTED() };
-        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-            let label = ui.add(egui::Label::new(RichText::new(&note.notice.text).size(12.5).color(color)).wrap());
-            // Announced as it appears, as the Working… lines are (#370)
-            ui.ctx().accesskit_node_builder(label.id, |node| node.set_live(egui::accesskit::Live::Polite));
-        });
+    /// What a setting's row says beside its control about how its change went (#425): Saved for a few seconds, or why it
+    /// wasn't made, kept until the setting is changed again. Beside the control, never a line of its own (#428).
+    fn setting_note(&self, key: &str) -> Option<settings::RowNote> {
+        let note = self.setting_notes.get(key)?;
+        let tone = if note.notice.error { settings::NoteTone::Error } else { settings::NoteTone::Success };
+        Some(settings::RowNote { text: note.notice.text.clone(), tone })
     }
 
     /// A move of the drive is out or reported by the daemon: the folder can't be moved again until it is over.
@@ -3439,31 +3435,34 @@ impl ProtonDriveNativeApp {
             settings::card_heading(ui, "Sync", None, None);
             ui.add_space(10.0);
 
-            if settings::switch_row(ui, "Desktop notifications", None, None, self.edit_notifications) {
+            let note = self.setting_note("notificationsEnabled");
+            if settings::switch_row_noted(ui, "Desktop notifications", None, None, self.edit_notifications, note.as_ref()) {
                 self.edit_notifications = !self.edit_notifications;
                 self.apply_setting("notificationsEnabled", serde_json::Value::from(self.edit_notifications));
             }
-            self.show_setting_note(ui, "notificationsEnabled");
             ui.add_space(settings::ROW_GAP);
 
-            if settings::switch_row(
+            let note = self.setting_note("startAtLogin");
+            if settings::switch_row_noted(
                 ui,
                 "Start Proton Drive when I log in",
                 None,
                 Some("Syncs and mounts the drive at login, with the tray icon, without opening this window"),
                 self.edit_start_at_login,
+                note.as_ref(),
             ) {
                 self.edit_start_at_login = !self.edit_start_at_login;
                 self.apply_setting("startAtLogin", serde_json::Value::from(self.edit_start_at_login));
             }
-            self.show_setting_note(ui, "startAtLogin");
             ui.add_space(settings::ROW_GAP);
 
-            settings::setting_row(
+            let note = self.setting_note("conflictStrategy");
+            settings::setting_row_noted(
                 ui,
                 "When a file changes in both places",
                 None,
                 Some("Keep both copies saves the other copy next to the file, with the time in its name. Ask me each time waits for your choice in Home's Needs attention. Nothing is replaced until you choose."),
+                note.as_ref(),
                 |ui| {
                     let choices = [("keep-both", "Keep both copies"), ("prompt", "Ask me each time")];
                     let shown = if self.edit_conflict_strategy == "prompt" { choices[1].1 } else { choices[0].1 };
@@ -3478,14 +3477,15 @@ impl ProtonDriveNativeApp {
                     .response
                 },
             );
-            self.show_setting_note(ui, "conflictStrategy");
             ui.add_space(settings::ROW_GAP);
 
-            settings::setting_row(
+            let note = self.setting_note("ignorePatterns");
+            settings::setting_row_noted(
                 ui,
                 "Files to ignore",
                 Some("One pattern per line, like *.log or build/"),
                 Some("Matching files and folders are skipped during sync. The app's own temporary files are always skipped, so they aren't listed here."),
+                note.as_ref(),
                 |ui| {
                     let margin = Margin::symmetric(10, 4);
                     let editor = egui::TextEdit::multiline(&mut self.ignore_patterns_text)
@@ -3500,7 +3500,6 @@ impl ProtonDriveNativeApp {
                     editor
                 },
             );
-            self.show_setting_note(ui, "ignorePatterns");
         });
         if let Some(choice) = chosen_strategy.filter(|c| *c != self.edit_conflict_strategy) {
             self.edit_conflict_strategy = choice.to_string();
@@ -12261,6 +12260,196 @@ mod tests {
         }
         h.frames(2);
         assert!(h.text_at("Saved").is_none());
+    }
+
+    // #428: a note beside a control takes the room the row has: nothing below it moves, whatever the window's width
+    const NOTE_WIDTHS: [f32; 6] = [1440.0, 1000.0, 840.0, 800.0, 700.0, 560.0];
+    /// Whether a window this wide lays a setting's control on its label's row (not under it)
+    fn row_beside(width: f32) -> bool {
+        width >= 800.0
+    }
+
+    fn put_note(h: &mut Harness, key: &str, notice: Notice) {
+        let now = Instant::now();
+        let until = (!notice.error).then(|| now + Duration::from_secs(3));
+        h.app.setting_notes.insert(key.into(), SettingNote { notice, until, since: now });
+        h.frames(3);
+    }
+
+    /// Where the label node with exactly these words is (the full text, even when the painted line is cut short).
+    fn note_rect(h: &Harness, text: &str) -> egui::Rect {
+        accesskit_nodes(h)
+            .into_iter()
+            .find(|(_, n)| n.role() == egui::accesskit::Role::Label && says(n) == text && n.bounds().is_some())
+            .map(|(_, n)| node_rect(&n))
+            .unwrap_or_else(|| panic!("the note {text:?} is there"))
+    }
+
+    fn top_of(h: &Harness, text: &str) -> f32 {
+        h.text_rect(text).unwrap_or_else(|| panic!("{text:?} is painted")).top()
+    }
+
+    #[test]
+    fn a_note_beside_a_switch_or_the_picker_moves_nothing_below_it() {
+        for width in NOTE_WIDTHS {
+            for (key, label, below, error) in [
+                ("notificationsEnabled", "Desktop notifications", "Start Proton Drive when I log in", false),
+                ("notificationsEnabled", "Desktop notifications", "Start Proton Drive when I log in", true),
+                ("startAtLogin", "Start Proton Drive when I log in", "When a file changes in both places", false),
+                ("startAtLogin", "Start Proton Drive when I log in", "When a file changes in both places", true),
+                ("conflictStrategy", "When a file changes in both places", "Files to ignore", false),
+                ("conflictStrategy", "When a file changes in both places", "Files to ignore", true),
+            ] {
+                let mut h = settings_tall(None, None);
+                h.resize_zoomed(Vec2::new(width, 2400.0), 1.0);
+                h.frames(4);
+                let (below_before, label_before) = (top_of(&h, below), top_of(&h, label));
+                let text = if error { "Can't reach the daemon" } else { "Saved" };
+                put_note(&mut h, key, if error { Notice::error(text) } else { Notice::info(text) });
+                if row_beside(width) {
+                    assert_eq!(top_of(&h, below), below_before, "{key} {text} at {width}: the row below stays put");
+                }
+                assert_eq!(top_of(&h, label), label_before, "{key} {text} at {width}: its own label stays put");
+                if !row_beside(width) {
+                    continue; // below the window's least width the label may take the whole line: no room for a note
+                }
+                let note = note_rect(&h, text);
+                let label_rect = h.text_rect(label).unwrap();
+                assert!(
+                    note.center().y >= label_rect.top() - 14.0 && note.center().y <= below_before - 6.0,
+                    "{key} {text} at {width}: on the control's row, not between rows ({note:?} vs label {label_rect:?})"
+                );
+                assert!(note.bottom() <= below_before, "{key} {text} at {width}: above the next row");
+            }
+        }
+    }
+
+    #[test]
+    fn a_note_beside_the_ignore_box_sits_in_the_label_column_and_moves_nothing() {
+        let mut h = settings_tall(None, None);
+        let box_rect = |h: &Harness| {
+            accesskit_nodes(h)
+                .into_iter()
+                .find(|(_, n)| n.role() == egui::accesskit::Role::MultilineTextInput)
+                .map(|(_, n)| node_rect(&n))
+                .unwrap()
+        };
+        let before = box_rect(&h);
+        let hint_before = top_of(&h, "One pattern per line, like *.log or build/");
+        for notice in [Notice::info("Saved"), Notice::error("That would hide everything")] {
+            let text = notice.text.clone();
+            put_note(&mut h, "ignorePatterns", notice);
+            assert_eq!(box_rect(&h), before, "{text}: the box, and so the card, keeps its place");
+            assert_eq!(top_of(&h, "One pattern per line, like *.log or build/"), hint_before);
+            let note = note_rect(&h, &text);
+            assert!(note.top() >= hint_before, "{text}: under the hint");
+            assert!(note.bottom() <= before.bottom(), "{text}: not taller than the box");
+            assert!(note.right() <= before.left(), "{text}: in the label column, not over the box");
+        }
+    }
+
+    #[test]
+    fn a_note_beside_move_moves_nothing_below_it() {
+        for width in NOTE_WIDTHS {
+            let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+            h.resize_zoomed(Vec2::new(width, 2400.0), 1.0);
+            h.frames(4);
+            let switch = "Show online-only files in Files (virtual drive)";
+            let (below, label_top) = (top_of(&h, switch), top_of(&h, "Location"));
+            let move_rect = node_rect(&h.nodes_named("Move Proton Drive folder…")[0]);
+            put_note(&mut h, "syncDir", Notice::info("Saved"));
+            assert_eq!(top_of(&h, switch), below, "Saved at {width}");
+            assert_eq!(top_of(&h, "Location"), label_top);
+            let note = note_rect(&h, "Saved");
+            if row_beside(width) {
+                assert!(note.right() <= move_rect.left() && note.center().y > move_rect.top() && note.center().y < move_rect.bottom());
+            }
+
+            h.app.setting_notes.clear();
+            h.app.folder_chosen("/mnt/b/ProtonDrive");
+            h.frames(2);
+            h.click(h.text_at("Move").unwrap());
+            h.frames(3);
+            assert_eq!(top_of(&h, switch), below, "Moving… at {width}");
+            let note = note_rect(&h, "Moving…");
+            if row_beside(width) {
+                assert!(note.right() <= move_rect.left() && note.center().y > move_rect.top() && note.center().y < move_rect.bottom());
+            }
+        }
+    }
+
+    // #428 round 1: a note takes no room from the row: at the least width the window has, with none showing, nothing is cut
+    #[test]
+    fn at_the_least_width_the_rows_keep_their_full_labels_and_folder() {
+        let label = "When a file changes in both places";
+        let mut wide = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        wide.resize_zoomed(Vec2::new(1440.0, 2400.0), 1.0);
+        wide.frames(4);
+        let (label_w, path_w) = (wide.text_rect(label).unwrap().width(), wide.text_rect("/home/u/ProtonDrive").unwrap().width());
+        let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        h.resize_zoomed(Vec2::new(840.0, 2400.0), 1.0);
+        h.frames(4);
+        assert_eq!(h.text_rect(label).expect("painted").width(), label_w, "the picker's label is whole");
+        assert_eq!(h.text_rect("/home/u/ProtonDrive").expect("painted").width(), path_w, "the folder is whole");
+        let picker = accesskit_nodes(&h).into_iter().find(|(_, n)| n.role() == egui::accesskit::Role::ComboBox).map(|(_, n)| node_rect(&n)).unwrap();
+        assert!(picker.width() >= 190.0, "the picker keeps its room: {picker:?}");
+    }
+
+    // #428 round 1: with no room for words, the note is its icon alone, and says its words to screen readers
+    #[test]
+    fn a_note_with_no_room_for_words_is_its_icon_with_the_words_for_screen_readers() {
+        use egui::accesskit::Live;
+        let mut h = settings_tall(None, None);
+        h.resize_zoomed(Vec2::new(840.0, 2400.0), 1.0);
+        put_note(&mut h, "conflictStrategy", Notice::info("Saved"));
+        assert!(h.text_rect("Saved").is_none(), "the words aren't painted");
+        let node = accesskit_nodes(&h)
+            .into_iter()
+            .map(|(_, n)| n)
+            .find(|n| says(n) == "Saved" && n.bounds().is_some())
+            .expect("the icon carries the words");
+        assert_eq!(node.live(), Some(Live::Polite));
+        assert!(node_rect(&node).width() <= 20.0, "just the icon");
+        assert!(h.text_rect(icons::CHECK).is_some(), "the check icon is painted");
+    }
+
+    // #428 round 2: where not even the icon fits beside the control (the label fills its line), the note is a line of
+    // its own under the row, as before, and still announced: an error is never dropped
+    #[test]
+    fn a_note_with_no_room_beside_its_control_falls_back_to_its_own_line() {
+        use egui::accesskit::Live;
+        for (width, zoom) in [(560.0, 1.0), (840.0, 2.0)] {
+            let mut h = settings_tall(None, None);
+            h.resize_zoomed(Vec2::new(width, 2400.0), zoom);
+            h.frames(3);
+            let label = "Start Proton Drive when I log in";
+            let text = "Can't reach the daemon";
+            put_note(&mut h, "startAtLogin", Notice::error(text));
+            let line = h.text_rect(text).unwrap_or_else(|| panic!("{width}x{zoom}: the error is seen"));
+            let switch = node_rect(&h.nodes_named(label)[0]);
+            assert!(line.top() >= switch.bottom() - 1.0, "{width}x{zoom}: under the row: {line:?} vs {switch:?}");
+            let node = accesskit_nodes(&h).into_iter().map(|(_, n)| n).find(|n| says(n) == text).expect("announced");
+            assert_eq!(node.live(), Some(Live::Polite));
+        }
+    }
+
+    #[test]
+    fn a_long_error_beside_a_control_is_cut_short_and_whole_on_hover() {
+        let long = "Can't reach the daemon, so nothing was saved. Check that it is running, then change the setting again to retry";
+        let mut h = settings_tall(None, None);
+        h.resize_zoomed(Vec2::new(1000.0, 2400.0), 1.0);
+        let below = top_of(&h, "Start Proton Drive when I log in");
+        put_note(&mut h, "notificationsEnabled", Notice::error(long));
+        assert_eq!(top_of(&h, "Start Proton Drive when I log in"), below);
+        let note = note_rect(&h, long);
+        let switch = node_rect(&h.nodes_named("Desktop notifications")[0]);
+        assert!(note.right() <= switch.left(), "{note:?} left of {switch:?}");
+        let painted = h.text_rects_all(long);
+        assert_eq!(painted.len(), 1, "painted once");
+        assert!(painted[0].right() <= switch.left() && painted[0].width() < 600.0, "cut short to the room: {painted:?}");
+        h.frame(vec![egui::Event::PointerMoved(note.center())]);
+        h.frames(2);
+        assert!(h.text_rects_all(long).len() > 1, "whole on hover, in the tooltip");
     }
 
     // #276: Settings in Proton's rows. The ⓘ painted right after `label`, on its line.
