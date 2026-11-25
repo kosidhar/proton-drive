@@ -48,6 +48,12 @@ fn folder(name: &str) -> Value {
     json!({ "name": name, "type": "folder", "size": 0, "mtimeMs": 1_700_000_000_000u64 })
 }
 
+/// A Docs or Sheets placeholder as the daemon lists it (#430): a file whose content the drive serves itself.
+fn placeholder(name: &str, kind: &str, content: &str) -> Value {
+    json!({ "name": name, "type": "file", "size": content.len(), "mtimeMs": 1_700_000_000_000u64,
+            "placeholder": { "kind": kind, "content": content } })
+}
+
 /// What the fake daemon answers: listings from a map, and hydrate copying FIXTURE into the backing store after a
 /// delay (200 ms unless told otherwise), through a staging file as the daemon does, or refusing with a code. Renames
 /// and deletes are recorded with their bodies and, unless refused, applied to the map and the backing store as the
@@ -2269,4 +2275,49 @@ fn a_transient_daemon_listing_error_does_not_wipe_online_only_entries() {
         "after recovery, real removals must still fire IN_DELETE: {:?}",
         watch.heard
     );
+}
+
+#[test]
+fn a_docs_placeholder_reads_from_memory_and_refuses_every_change() {
+    if !enabled() {
+        return;
+    }
+    let content = "{\"url\":\"https://docs.proton.me/doc?type=doc&mode=open&volumeId=v&linkId=l\"}\n";
+    let mut h = Harness::new();
+    h.start_daemon(HashMap::from([
+        ("", vec![placeholder("Plan.protondoc", "doc", content), file("a.txt", 3), folder("Docs")]),
+        ("Docs", vec![]),
+    ]));
+    h.mount();
+
+    assert_eq!(ls(&h.mountpoint), [".xdg-volume-info", "Docs", "Plan.protondoc", "a.txt"]);
+    let meta = std::fs::metadata(h.path("Plan.protondoc")).unwrap();
+    assert!(meta.is_file());
+    assert_eq!((meta.mode() & 0o777, meta.len()), (0o444, content.len() as u64));
+    let cat = run(Command::new("cat").arg(h.path("Plan.protondoc")));
+    assert_eq!(cat.stdout, content.as_bytes());
+
+    let plan = h.path("Plan.protondoc");
+    let eperm = Some(libc::EPERM);
+    // The kernel refuses a writer or a truncation of a 0444 file before the helper hears of it
+    let kernel_refusal = [Some(libc::EACCES), eperm];
+    assert!(kernel_refusal.contains(&errno_of_open(&plan, libc::O_WRONLY)));
+    assert!(kernel_refusal.contains(&errno_of_open(&plan, libc::O_RDWR)));
+    assert!(kernel_refusal.contains(&errno_of_open(&plan, libc::O_RDONLY | libc::O_TRUNC)));
+    assert_eq!(errno_of_open(&plan, libc::O_RDONLY | libc::O_APPEND), eperm);
+    assert_eq!(std::fs::remove_file(&plan).unwrap_err().raw_os_error(), eperm);
+    assert_eq!(std::fs::rename(&plan, h.path("Docs/Plan.protondoc")).unwrap_err().raw_os_error(), eperm);
+    assert_eq!(std::fs::rename(&plan, h.path("Renamed.protondoc")).unwrap_err().raw_os_error(), eperm);
+    assert_eq!(std::fs::rename(h.path("a.txt"), &plan).unwrap_err().raw_os_error(), eperm);
+    assert_eq!(std::fs::set_permissions(&plan, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap_err().raw_os_error(), eperm);
+    let truncated = run(Command::new("truncate").args(["-s", "0"]).arg(&plan));
+    assert!(!truncated.status.success());
+
+    assert_eq!(std::fs::read(&plan).unwrap(), content.as_bytes(), "unchanged");
+    let daemon = h.daemon();
+    assert_eq!(daemon.hydrate_calls(), 0);
+    assert!(daemon.renames().is_empty(), "{:?}", daemon.renames());
+    assert!(daemon.deletes().is_empty(), "{:?}", daemon.deletes());
+    assert!(daemon.truncates().is_empty(), "{:?}", daemon.truncates());
+    assert!(daemon.writings().is_empty() && daemon.closes().is_empty());
 }

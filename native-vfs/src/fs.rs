@@ -357,6 +357,8 @@ enum Handle {
     /// An online-only file opened write-only, not downloaded until something writes through it
     Deferred(Arc<Deferred>),
     VolumeInfo,
+    /// A Docs or Sheets placeholder's content, held in memory; only ever opened read-only (#430)
+    Placeholder(Arc<[u8]>),
     /// A .trashinfo in the trash folder's info/
     TrashInfo(u64),
     /// The folder's rows as opendir saw them, so readdir's offsets stay valid while the folder changes.
@@ -391,6 +393,8 @@ struct DirRow {
 enum Node {
     Local(Metadata),
     Online(Entry),
+    /// A Docs or Sheets document shown as a read-only file: its content, and when it changed (#430)
+    Placeholder(Arc<[u8]>, SystemTime),
     VolumeInfo,
     Trash(TrashNode),
 }
@@ -470,8 +474,15 @@ fn node_file_type(node: &Node) -> FileType {
             TrashNode::Root | TrashNode::Files | TrashNode::Info => FileType::Directory,
             TrashNode::InfoFile { .. } | TrashNode::Gone => FileType::RegularFile,
         },
-        Node::VolumeInfo => FileType::RegularFile,
+        Node::Placeholder(..) | Node::VolumeInfo => FileType::RegularFile,
     }
+}
+
+/// What a read of `size` bytes at `offset` gets of an in-memory file.
+fn slice_of(content: &[u8], offset: u64, size: u32) -> &[u8] {
+    let start = (offset as usize).min(content.len());
+    let end = start.saturating_add(size as usize).min(content.len());
+    &content[start..end]
 }
 
 /// Maps a folder's visible entries to `(name, Kind)`, excluding drive-internal metadata like `.xdg-volume-info`.
@@ -899,7 +910,30 @@ impl State {
                 return Some(Node::Local(meta));
             }
         }
-        self.online_entry(parent, name).map(Node::Online)
+        self.online_entry(parent, name).map(|entry| match &entry.placeholder {
+            Some(content) if entry.kind == Kind::File => Node::Placeholder(content.clone(), entry.mtime),
+            _ => Node::Online(entry),
+        })
+    }
+
+    /// Whether `rel` is a Docs or Sheets placeholder (a real file of its name wins, as in the listing).
+    fn is_placeholder(&self, rel: &Path) -> bool {
+        matches!(self.resolve(rel), Some(Node::Placeholder(..)))
+    }
+
+    /// An open of `rel` if it is a placeholder, else None. Served from the folder's listing (the one the lookup before
+    /// the open read, however old; a fresh one only if `fetch`): no download, no write session. An open that could
+    /// change it (for writing, truncating or appending) is refused. Without `fetch` it asks the daemon nothing, so a
+    /// background reader or a sniff, which mustn't refresh a listing, can be asked first.
+    fn placeholder_open(&self, ino: u64, rel: &Path, flags: i32, fetch: bool) -> Option<Result<FileHandle, Errno>> {
+        let (parent, name) = (rel.parent()?, rel.file_name()?);
+        let listed = |l: Arc<Listing>| l.get(name).filter(|e| !e.local).and_then(|e| e.placeholder.clone());
+        let cached = self.cached_listing(parent).and_then(listed);
+        let content = if fetch { cached.or_else(|| listed(self.listing(parent)))? } else { cached? };
+        if flags & libc::O_ACCMODE != libc::O_RDONLY || flags & (libc::O_TRUNC | libc::O_APPEND) != 0 {
+            return Some(Err(Errno::EPERM));
+        }
+        Some(Ok(self.add_handle(ino, Handle::Placeholder(content))))
     }
 
     fn attr(&self, ino: u64, node: &Node) -> FileAttr {
@@ -947,6 +981,7 @@ impl State {
                 Kind::File => virtual_attr(FileType::RegularFile, 0o644, entry.size, entry.mtime),
                 Kind::Folder => virtual_attr(FileType::Directory, 0o755, 0, entry.mtime),
             },
+            Node::Placeholder(content, mtime) => virtual_attr(FileType::RegularFile, 0o444, content.len() as u64, *mtime),
             Node::VolumeInfo => {
                 virtual_attr(FileType::RegularFile, 0o444, VOLUME_INFO_CONTENT.len() as u64, self.started)
             }
@@ -1275,7 +1310,7 @@ impl State {
                 Ok(())
             }
             Err(err) => {
-                let allowed = [libc::ENOENT, libc::EEXIST, libc::EACCES, libc::EXDEV, libc::EIO];
+                let allowed = [libc::ENOENT, libc::EEXIST, libc::EACCES, libc::EXDEV, libc::EPERM, libc::EIO];
                 Err(self.refused(&format!("rename {from_str:?} to {to_str:?}"), err, &allowed))
             }
         }
@@ -1470,9 +1505,9 @@ impl State {
             }
             Err(err) => {
                 let allowed: &[i32] = if removal == Removal::Rmdir {
-                    &[libc::ENOENT, libc::EACCES, libc::ENOTEMPTY, libc::EIO]
+                    &[libc::ENOENT, libc::EACCES, libc::ENOTEMPTY, libc::EPERM, libc::EIO]
                 } else {
-                    &[libc::ENOENT, libc::EACCES, libc::EIO]
+                    &[libc::ENOENT, libc::EACCES, libc::EPERM, libc::EIO]
                 };
                 s.reply_refused(reply, &format!("delete {rel_str:?}"), err, allowed)
             }
@@ -1564,6 +1599,10 @@ impl State {
         }
         if self.is_unlinker(pid) {
             return Some(if self.take_announced_gone_if_absent(rel) { Ok(()) } else { Err(Errno::EPERM) });
+        }
+        // A document is only ever removed in the cloud, by its owner there (#430)
+        if self.is_placeholder(rel) {
+            return Some(Err(Errno::EPERM));
         }
         None
     }
@@ -1749,6 +1788,8 @@ impl Filesystem for DriveFs {
             return reply.error(Errno::EPERM);
         }
         match s.resolve(&rel) {
+            // Not its size, mode or times: a placeholder is changed only in the cloud, by its owner (#430)
+            Some(Node::Placeholder(..)) => reply.error(Errno::EPERM),
             Some(Node::Local(_)) => s.reply_after_change(ino, None, &change, reply),
             // Made here to take the change, as when a file is saved into it
             Some(Node::Online(entry)) if entry.kind == Kind::Folder => match s.backing_folder(&rel) {
@@ -1910,7 +1951,7 @@ impl Filesystem for DriveFs {
         }
         let from_trash = s.is_trash_path(&from);
         if !from_trash && s.trash.trashed_source(&to.to_string_lossy()) {
-            if is_volume_info(&from) {
+            if is_volume_info(&from) || s.is_placeholder(&from) {
                 return reply.error(Errno::EPERM);
             }
             return s.trash_item(from, newparent.0, newname.to_os_string(), reply);
@@ -1934,7 +1975,7 @@ impl Filesystem for DriveFs {
                 Err(errno) => reply.error(errno),
             };
         }
-        if is_volume_info(&from) || is_volume_info(&to) {
+        if is_volume_info(&from) || is_volume_info(&to) || s.is_placeholder(&from) || s.is_placeholder(&to) {
             return reply.error(Errno::EPERM);
         }
         let (Some(from_str), Some(to_str)) = (from.to_str().map(String::from), to.to_str().map(String::from)) else {
@@ -1981,9 +2022,19 @@ impl Filesystem for DriveFs {
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => return reply.error(err.into()),
             Err(_) => {}
         }
+        let opened_placeholder = |opened: Result<FileHandle, Errno>, reply: ReplyOpen| match opened {
+            Ok(fh) => reply.opened(fh, FopenFlags::empty()),
+            Err(errno) => reply.error(errno),
+        };
+        if let Some(opened) = s.placeholder_open(ino.0, &rel, flags.0, false) {
+            return opened_placeholder(opened, reply);
+        }
         let (Some(parent), Some(name)) = (rel.parent(), rel.file_name()) else { return reply.error(Errno::ENOENT) };
         let online_file = |l: &Listing| l.get(name).is_some_and(|e| !e.local && e.kind == Kind::File);
         if truncate {
+            if let Some(opened) = s.placeholder_open(ino.0, &rel, flags.0, true) {
+                return opened_placeholder(opened, reply);
+            }
             // Overwritten from the start: an empty file here does, with nothing from the cloud
             if !s.online_entry(parent, name).is_some_and(|e| e.kind == Kind::File) {
                 return reply.error(Errno::ENOENT);
@@ -2008,6 +2059,9 @@ impl Filesystem for DriveFs {
                 reply.error(if gone { Errno::ENOENT } else { Errno::EACCES })
             }
             Reader::App => {
+                if let Some(opened) = s.placeholder_open(ino.0, &rel, flags.0, true) {
+                    return opened_placeholder(opened, reply);
+                }
                 // With the daemon down and the listing expired, the cloud's entries are gone from the listing: the
                 // file is then ENOENT, as the local-only listing the user sees says, rather than EIO
                 if !s.online_entry(parent, name).is_some_and(|e| e.kind == Kind::File) {
@@ -2071,6 +2125,9 @@ impl Filesystem for DriveFs {
                 Err(errno) => reply.error(errno),
             };
         }
+        if s.is_placeholder(&rel) {
+            return reply.error(Errno::EPERM); // a document's name is its owner's to change, in the cloud
+        }
         if is_volume_info(&rel) || (exclusive && s.listed_online(&parent_rel, name)) {
             return reply.error(Errno::EEXIST);
         }
@@ -2115,11 +2172,8 @@ impl Filesystem for DriveFs {
         let s = &self.state;
         match s.handle(fh) {
             Some(Handle::File(file)) => reply_read(&file, offset, size, reply),
-            Some(Handle::VolumeInfo) => {
-                let start = (offset as usize).min(VOLUME_INFO_CONTENT.len());
-                let end = start.saturating_add(size as usize).min(VOLUME_INFO_CONTENT.len());
-                reply.data(&VOLUME_INFO_CONTENT[start..end])
-            }
+            Some(Handle::VolumeInfo) => reply.data(slice_of(VOLUME_INFO_CONTENT, offset, size)),
+            Some(Handle::Placeholder(content)) => reply.data(slice_of(&content, offset, size)),
             Some(Handle::TrashInfo(id)) => reply.data(&s.trash.read_info(id, offset, size)),
             // A deferred open is write-only
             _ => reply.error(Errno::EBADF),
@@ -3103,13 +3157,16 @@ mod tests {
             for rel in ["a.txt", "Docs", "Docs/a.txt", VOLUME_INFO_NAME] {
                 assert_eq!(s.remove_here(Path::new(rel), removal, unlinker), Some(Err(Errno::EPERM)), "{rel}");
             }
-            assert_eq!(s.remove_here(Path::new("a.txt"), removal, 1), None, "anyone else's goes to the daemon");
         }
         assert_eq!(s.remove_here(Path::new(VOLUME_INFO_NAME), Removal::Unlink, 1), Some(Err(Errno::EPERM)));
         assert_eq!(s.trash.trashed(OsStr::new("x")), None);
         let item = s.trash_files_dir().join("x");
         assert_eq!(s.remove_here(&item, Removal::Unlink, unlinker), Some(Ok(())), "a dropped name, in the trash");
         assert_eq!(g.listings.load(Ordering::SeqCst), 0, "nothing reached the daemon");
+        // Anyone else's removal goes on to the daemon (after the check for a placeholder, which lists the folder)
+        for removal in [Removal::Unlink, Removal::Rmdir] {
+            assert_eq!(s.remove_here(Path::new("a.txt"), removal, 1), None, "anyone else's goes to the daemon");
+        }
     }
 
     #[test]
@@ -3421,6 +3478,115 @@ mod tests {
         release(s, volume);
         assert_eq!(g.sent(), []);
         assert!(nothing_held(s));
+    }
+
+    // #430: Docs and Sheets placeholders, served from memory and never changed
+    const DOC_JSON: &str = "{\"url\":\"https://docs.proton.me/doc?type=doc&mode=open&volumeId=v&linkId=l\"}\n";
+
+    /// A daemon whose root holds the placeholder Plan.protondoc, and that records every request line.
+    fn with_placeholder(name: &str) -> (Gated, Arc<Mutex<Vec<String>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let g = scripted(name, None, move |line, _| {
+            seen.lock().unwrap().push(line.to_string());
+            let reply = if line.starts_with("GET /vfs/children") {
+                serde_json::json!({ "entries": [
+                    { "name": "Plan.protondoc", "type": "file", "size": DOC_JSON.len(), "mtimeMs": 5000,
+                      "placeholder": { "kind": "doc", "content": DOC_JSON } },
+                    { "name": "real.txt", "type": "file", "size": 4, "mtimeMs": 0 },
+                ] })
+                .to_string()
+            } else {
+                r#"{"ok":true}"#.to_string()
+            };
+            (200, reply)
+        });
+        (g, requests)
+    }
+
+    fn nothing_but_listings(requests: &Mutex<Vec<String>>) -> bool {
+        requests.lock().unwrap().iter().all(|line| line.starts_with("GET /vfs/children"))
+    }
+
+    #[test]
+    fn a_placeholder_is_a_read_only_regular_file_of_its_contents_length() {
+        let (g, requests) = with_placeholder("placeholder-attr");
+        let s = &g.drive.state;
+        let rel = Path::new("Plan.protondoc");
+        let node = s.resolve(rel).expect("listed");
+        assert!(matches!(node, Node::Placeholder(..)));
+        assert_eq!(node_file_type(&node), FileType::RegularFile);
+        let attr = s.attr(s.ino_of(rel), &node);
+        assert_eq!((attr.kind, attr.perm, attr.size), (FileType::RegularFile, 0o444, DOC_JSON.len() as u64));
+        assert!(matches!(s.resolve(Path::new("real.txt")), Some(Node::Online(_))));
+        assert!(nothing_but_listings(&requests));
+    }
+
+    #[test]
+    fn a_read_only_open_of_a_placeholder_asks_the_daemon_for_nothing_and_sends_no_notice() {
+        let (g, requests) = with_placeholder("placeholder-open");
+        let s = &g.drive.state;
+        let rel = Path::new("Plan.protondoc");
+        let ino = s.ino_of(rel);
+        s.resolve(rel); // the lookup before an open lists the folder
+        let listed = requests.lock().unwrap().len();
+        let fh = s.placeholder_open(ino, rel, libc::O_RDONLY, false).expect("a placeholder").expect("opens");
+        let Some(Handle::Placeholder(content)) = s.handle(fh) else { panic!("not a placeholder handle") };
+        assert_eq!(&*content, DOC_JSON.as_bytes());
+        assert_eq!(slice_of(&content, 0, 4096), DOC_JSON.as_bytes());
+        assert_eq!(slice_of(&content, 3, 5), &DOC_JSON.as_bytes()[3..8]);
+        assert_eq!(slice_of(&content, 9999, 5), b"");
+        release(s, fh);
+        assert_eq!(g.sent(), []);
+        assert!(nothing_held(s));
+        assert_eq!(requests.lock().unwrap().len(), listed, "no request for the open");
+        assert!(nothing_but_listings(&requests));
+        // Without a listing in hand it asks nothing, and a fetching open lists the folder
+        s.forget_listing(Path::new(""));
+        let before = requests.lock().unwrap().len();
+        assert!(s.placeholder_open(ino, rel, libc::O_RDONLY, false).is_none());
+        assert_eq!(requests.lock().unwrap().len(), before);
+        assert!(s.placeholder_open(ino, rel, libc::O_RDONLY, true).is_some());
+        assert!(s.placeholder_open(s.ino_of(Path::new("real.txt")), Path::new("real.txt"), libc::O_RDONLY, false).is_none());
+    }
+
+    #[test]
+    fn an_open_of_a_placeholder_that_could_change_it_is_refused_before_any_notice() {
+        let (g, requests) = with_placeholder("placeholder-open-write");
+        let s = &g.drive.state;
+        let rel = Path::new("Plan.protondoc");
+        let ino = s.ino_of(rel);
+        s.resolve(rel); // the lookup before an open lists the folder
+        for flags in [
+            libc::O_WRONLY,
+            libc::O_RDWR,
+            libc::O_RDONLY | libc::O_TRUNC,
+            libc::O_RDONLY | libc::O_APPEND,
+            libc::O_WRONLY | libc::O_TRUNC,
+        ] {
+            assert_eq!(s.placeholder_open(ino, rel, flags, false).expect("a placeholder").err(), Some(Errno::EPERM), "{flags}");
+        }
+        assert_eq!(g.sent(), []);
+        assert!(nothing_held(s));
+        assert!(nothing_but_listings(&requests));
+    }
+
+    #[test]
+    fn nothing_removes_renames_or_creates_over_a_placeholder() {
+        let (g, requests) = with_placeholder("placeholder-change");
+        let s = &g.drive.state;
+        let rel = Path::new("Plan.protondoc");
+        assert!(s.is_placeholder(rel));
+        assert!(!s.is_placeholder(Path::new("real.txt")));
+        assert!(!s.is_placeholder(Path::new("missing.protondoc")));
+        for removal in [Removal::Unlink, Removal::Rmdir] {
+            assert_eq!(s.remove_here(rel, removal, 1), Some(Err(Errno::EPERM)));
+            assert_eq!(s.remove_here(Path::new("real.txt"), removal, 1), None, "an ordinary file goes to the daemon");
+        }
+        // A real file of that name wins, as everywhere else
+        std::fs::write(g.root.join("backing/Plan.protondoc"), b"mine").unwrap();
+        assert!(!s.is_placeholder(rel));
+        assert!(nothing_but_listings(&requests));
     }
 
     // Review: a keepalive is queued under the sessions' lock, so it never follows the session's close
