@@ -2959,6 +2959,10 @@ impl ProtonDriveNativeApp {
     /// One frame of the window's contents: the sidebar, the top bar, the current section and anything floating over
     /// them.
     fn render_ui(&mut self, ctx: &egui::Context) {
+        // The notice needs an answer: Escape does nothing, and must not close a window behind it either
+        if self.unofficial_notice_open() {
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
+        }
         self.render_sidebar(ctx);
         self.render_top_bar(ctx);
 
@@ -6148,7 +6152,6 @@ mod tests {
         assert_eq!(h.sent(), Vec::<String>::new());
     }
 
-    /// Opens `confirm`, clicks its button (`label`) and returns the harness for the checks on what was sent.
     // #421: the one-time "An unofficial app" notice
     fn saved_prefs() -> Vec<WindowGeometry> {
         SAVED_PREFS.with(|s| std::mem::take(&mut *s.borrow_mut()))
@@ -6251,6 +6254,7 @@ mod tests {
         assert!(saved_prefs().last().is_some_and(|p| p.unofficial_notice_accepted));
     }
 
+    /// Opens `confirm`, clicks its button (`label`) and returns the harness for the checks on what was sent.
     fn confirm_and_click(confirm: PendingConfirm, label: &str) -> Harness {
         let mut h = Harness::new();
         h.app.pending_confirm = Some(confirm);
@@ -13153,6 +13157,17 @@ mod tests {
         // Once
         h.event(WorkerEvent::StatusAndActivity { status: Box::new(Ok(status)), activity: Vec::new() });
         assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn escape_with_the_notice_up_leaves_a_share_window_behind_it_open() {
+        let mut h = share_window(Some(share::ShareInfo::default()));
+        h.app.window_geometry.unofficial_notice_accepted = false;
+        h.frames(3);
+        assert!(h.text_at(UNOFFICIAL_TITLE).is_some());
+        press_key(&mut h, egui::Key::Escape);
+        assert!(h.app.share.is_some(), "Escape doesn't reach the Share window");
+        assert!(h.text_at(UNOFFICIAL_TITLE).is_some(), "and the notice stays");
     }
 
     #[test]
