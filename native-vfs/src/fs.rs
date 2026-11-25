@@ -921,6 +921,31 @@ impl State {
         matches!(self.resolve(rel), Some(Node::Placeholder(..)))
     }
 
+    /// Like `is_placeholder`, from the folder's cached listing alone (however old): a session thread never waits on
+    /// the daemon for it (#437). The daemon refuses to change a placeholder too (#430), so a miss here is no risk.
+    fn is_cached_placeholder(&self, rel: &Path) -> bool {
+        let (Some(parent), Some(name)) = (rel.parent(), rel.file_name()) else { return false };
+        if listing::is_hidden_name(name) || is_volume_info(rel) || self.is_trash_path(rel) {
+            return false;
+        }
+        // A real file of its name wins, as in the listing
+        if std::fs::symlink_metadata(self.backing.join(rel)).is_ok_and(|m| m.is_file() || m.is_dir()) {
+            return false;
+        }
+        self.cached_listing(parent)
+            .is_some_and(|l| l.get(name).is_some_and(|e| !e.local && e.kind == Kind::File && e.placeholder.is_some()))
+    }
+
+    /// Why renaming `from` to `to` is refused for what they name (the volume info, or a placeholder at either end),
+    /// from cached listings only.
+    fn rename_refusal(&self, from: &Path, to: &Path) -> Option<Errno> {
+        let refused = is_volume_info(from)
+            || is_volume_info(to)
+            || self.is_cached_placeholder(from)
+            || self.is_cached_placeholder(to);
+        refused.then_some(Errno::EPERM)
+    }
+
     /// Why creating `rel` is refused when it names a placeholder: its name is its owner's to change, in the cloud.
     fn create_refusal(&self, rel: &Path) -> Option<Errno> {
         self.is_placeholder(rel).then_some(Errno::EPERM)
@@ -1606,7 +1631,7 @@ impl State {
             return Some(if self.take_announced_gone_if_absent(rel) { Ok(()) } else { Err(Errno::EPERM) });
         }
         // A document is only ever removed in the cloud, by its owner there (#430)
-        if self.is_placeholder(rel) {
+        if self.is_cached_placeholder(rel) {
             return Some(Err(Errno::EPERM));
         }
         None
@@ -1956,7 +1981,7 @@ impl Filesystem for DriveFs {
         }
         let from_trash = s.is_trash_path(&from);
         if !from_trash && s.trash.trashed_source(&to.to_string_lossy()) {
-            if is_volume_info(&from) || s.is_placeholder(&from) {
+            if s.rename_refusal(&from, &to).is_some() {
                 return reply.error(Errno::EPERM);
             }
             return s.trash_item(from, newparent.0, newname.to_os_string(), reply);
@@ -1980,8 +2005,8 @@ impl Filesystem for DriveFs {
                 Err(errno) => reply.error(errno),
             };
         }
-        if is_volume_info(&from) || is_volume_info(&to) || s.is_placeholder(&from) || s.is_placeholder(&to) {
-            return reply.error(Errno::EPERM);
+        if let Some(errno) = s.rename_refusal(&from, &to) {
+            return reply.error(errno);
         }
         let (Some(from_str), Some(to_str)) = (from.to_str().map(String::from), to.to_str().map(String::from)) else {
             return reply.error(Errno::EILSEQ); // the daemon's paths are UTF-8
@@ -3168,7 +3193,7 @@ mod tests {
         let item = s.trash_files_dir().join("x");
         assert_eq!(s.remove_here(&item, Removal::Unlink, unlinker), Some(Ok(())), "a dropped name, in the trash");
         assert_eq!(g.listings.load(Ordering::SeqCst), 0, "nothing reached the daemon");
-        // Anyone else's removal goes on to the daemon (after the check for a placeholder, which lists the folder)
+        // Anyone else's removal goes on to the daemon (the placeholder check reads the cache only)
         for removal in [Removal::Unlink, Removal::Rmdir] {
             assert_eq!(s.remove_here(Path::new("a.txt"), removal, 1), None, "anyone else's goes to the daemon");
         }
@@ -3612,6 +3637,29 @@ mod tests {
         std::fs::write(g.root.join("backing/Plan.protondoc"), b"mine").unwrap();
         assert!(!s.is_placeholder(rel));
         assert!(nothing_but_listings(&requests));
+    }
+
+    // #437: the checks on unlink and rename never fetch a listing on a session thread
+    #[test]
+    fn unlink_and_rename_check_placeholders_from_the_cache_only() {
+        let (g, requests) = with_placeholder("placeholder-cache-only");
+        let s = &g.drive.state;
+        let (rel, other) = (Path::new("Plan.protondoc"), Path::new("real.txt"));
+        for removal in [Removal::Unlink, Removal::Rmdir] {
+            assert_eq!(s.remove_here(rel, removal, 1), None, "uncached: left to the daemon, which refuses it");
+            assert_eq!(s.remove_here(other, removal, 1), None);
+        }
+        assert_eq!(s.rename_refusal(rel, other), None);
+        assert_eq!(s.rename_refusal(other, rel), None);
+        assert!(requests.lock().unwrap().is_empty(), "no daemon call: {:?}", requests.lock().unwrap());
+        // Once the folder is cached, the refusals are served from it, still without a call
+        assert!(s.is_placeholder(rel));
+        let calls = requests.lock().unwrap().len();
+        assert_eq!(s.remove_here(rel, Removal::Unlink, 1), Some(Err(Errno::EPERM)));
+        assert_eq!(s.rename_refusal(rel, other), Some(Errno::EPERM));
+        assert_eq!(s.rename_refusal(other, rel), Some(Errno::EPERM));
+        assert_eq!(s.rename_refusal(other, Path::new("x.txt")), None);
+        assert_eq!(requests.lock().unwrap().len(), calls);
     }
 
     // Review: a keepalive is queued under the sessions' lock, so it never follows the session's close
