@@ -189,6 +189,20 @@ class MountItemTest(unittest.TestCase):
         self.assertEqual(tray.APP_LABEL, "Status & Settings…")
 
 
+class AppIdTest(unittest.TestCase):
+    # #413: the app's own ID, off Proton's namespace
+    def test_the_notification_carries_the_apps_icon(self):
+        with mock.patch.object(tray, "spawn_detached") as spawn:
+            tray.notify("t", "b")
+        self.assertIn("--icon=io.github.kosidhar.ProtonDrive", spawn.call_args.args[0])
+
+    def test_the_indicator_is_named_for_the_app(self):
+        tray.AppIndicator.Indicator.new.reset_mock()
+        with mock.patch.object(tray.ProtonDriveTrayIndicator, "poll_status"):
+            tray.ProtonDriveTrayIndicator()
+        self.assertEqual(tray.AppIndicator.Indicator.new.call_args.args[0], "io.github.kosidhar.ProtonDrive.tray")
+
+
 class OpenTrashTest(unittest.TestCase):
     # #201: a delete through the drive goes to the Proton Drive trash, which the tray opens in the browser
     def test_open_trash_opens_the_proton_drive_trash_in_the_browser(self):

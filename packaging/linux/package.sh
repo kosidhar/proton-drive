@@ -13,7 +13,7 @@ export PATH="$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.local/bin:$PATH"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HERE="$ROOT/packaging/linux"
-APP_ID="ch.proton.drive"
+APP_ID="io.github.kosidhar.ProtonDrive"
 VERSION="0.1.0"
 BUILD_DATE="$(date -u +%Y-%m-%d)"
 DIST="$ROOT/dist/release"
@@ -83,7 +83,7 @@ done
 
 # File manager integrations (GNOME Nautilus, Cinnamon Nemo, KDE Dolphin)
 install -Dm644 "$ROOT/linux/nautilus/proton_drive_nautilus.py" \
-  "$STAGE/usr/share/nautilus-python/extensions/ch_proton_drive_nautilus.py"
+  "$STAGE/usr/share/nautilus-python/extensions/kosidhar_protondrive_nautilus.py"
 install -Dm644 "$ROOT/linux/nemo/proton_drive_nemo.py" \
   "$STAGE/usr/share/nemo-python/extensions/proton_drive_nemo.py"
 install -Dm644 "$ROOT/linux/dolphin/protondrive.desktop" \

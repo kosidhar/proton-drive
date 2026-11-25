@@ -3552,10 +3552,24 @@ fn finish_pending_shares_on_exit(
     }
 }
 
+/// The app's ID: the window's app ID (what the desktop matches to the .desktop file and its icon) and the notification icon.
+pub(crate) const APP_ID: &str = "io.github.kosidhar.ProtonDrive";
+
+/// The notify-send arguments for a notification with this body.
+fn notification_args(body: &str) -> Vec<String> {
+    vec![
+        "--app-name=Proton Drive".into(),
+        format!("--icon={APP_ID}"),
+        "--".into(),
+        "Proton Drive".into(),
+        body.into(),
+    ]
+}
+
 /// Sends a desktop notification for a share failure that finished after the app window closed; ignored if notify-send is unavailable.
 fn send_desktop_notification(body: String) {
     let _ = Command::new("notify-send")
-        .args(["--app-name=Proton Drive", "--icon=ch.proton.drive", "--", "Proton Drive", &body])
+        .args(notification_args(&body))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -4054,7 +4068,7 @@ fn apply_proton_visuals(ctx: &egui::Context, light: bool) {
 }
 
 fn load_app_icon() -> Option<IconData> {
-    let png_bytes = include_bytes!("../../assets/app-icon/hicolor/256x256/apps/ch.proton.drive.png");
+    let png_bytes = include_bytes!("../../assets/app-icon/hicolor/256x256/apps/io.github.kosidhar.ProtonDrive.png");
     eframe::icon_data::from_png_bytes(png_bytes).ok()
 }
 
@@ -4911,7 +4925,7 @@ fn main() -> eframe::Result {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Proton Drive")
-        .with_app_id("ch.proton.drive")
+        .with_app_id(APP_ID)
         .with_inner_size(initial_size)
         .with_min_inner_size([840.0, 540.0]);
 
@@ -5067,6 +5081,15 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
     use crate::shared_view::{share_picture_colors, shared_columns, SharedAction, SHARED_LOCATION_MIN};
+
+    #[test]
+    fn the_app_id_is_kosidhars() {
+        assert_eq!(APP_ID, "io.github.kosidhar.ProtonDrive");
+        assert!(notification_args("b").contains(&"--icon=io.github.kosidhar.ProtonDrive".to_string()));
+        let desktop = include_str!("../../packaging/linux/io.github.kosidhar.ProtonDrive.desktop");
+        assert!(desktop.contains("StartupWMClass=io.github.kosidhar.ProtonDrive\n"));
+        assert!(desktop.contains("Icon=io.github.kosidhar.ProtonDrive\n"));
+    }
 
     fn with_painter(f: impl FnOnce(&egui::Painter)) {
         let ctx = egui::Context::default();

@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HERE="$ROOT/packaging/linux"
-APP_ID="ch.proton.drive"
+APP_ID="io.github.kosidhar.ProtonDrive"
 VERSION="0.1.0"
 DIST="$ROOT/dist/release"
 CARGO_TARGET_DIR="$ROOT/native-gui/target"

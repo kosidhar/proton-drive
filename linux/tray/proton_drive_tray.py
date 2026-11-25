@@ -336,7 +336,7 @@ def storage_line(account: dict):
 def notify(title: str, body: str) -> None:
     """A desktop notification; nothing happens if notify-send is missing."""
     try:
-        spawn_detached(["notify-send", "--app-name=Proton Drive", "--icon=ch.proton.drive", title, body])
+        spawn_detached(["notify-send", "--app-name=Proton Drive", "--icon=io.github.kosidhar.ProtonDrive", title, body])
     except OSError:
         pass
 
@@ -381,7 +381,7 @@ class ProtonDriveTrayIndicator:
     def __init__(self):
         icon_dir = find_icon_dir()
         self.indicator = AppIndicator.Indicator.new(
-            "ch.proton.drive.tray",
+            "io.github.kosidhar.ProtonDrive.tray",
             "protondrive-tray-idle",
             AppIndicator.IndicatorCategory.APPLICATION_STATUS,
         )

@@ -9,12 +9,12 @@ import type { SyncStateDatabase } from '../sync/syncStateDb';
 // Turned off with the desktop's own controls (Hidden, X-GNOME-Autostart-enabled=false), or deleted by hand, the setting
 // follows instead of the entry being written back.
 
-const ENTRY_NAME = 'proton-drive.desktop';
+const ENTRY_NAME = 'kosidhar-protondrive.desktop';
 const OURS = 'X-ProtonDrive-Autostart=true';
 // Where the entry is, once the daemon has written it (or left starting at login to the user's systemd unit): gone from
 // there after that, the user removed it, or disabled the unit (install.sh --uninstall clears it with the entry)
 const WRITTEN = 'autostartWritten';
-const SYSTEMD_UNITS = ['protondrive.service', 'proton-drive-ubuntu.service'];
+const SYSTEMD_UNITS = ['protondrive.service'];
 
 type Env = { XDG_CONFIG_HOME?: string; HOME?: string; APPIMAGE?: string; FLATPAK_ID?: string; [name: string]: string | undefined };
 
@@ -56,7 +56,7 @@ export function desktopEntry(command: string[]): string {
         `Exec=${command.map(execArg).join(' ')}`,
         // Skipped quietly once that program is gone (Proton Drive uninstalled by a package manager)
         `TryExec=${stringValue(command[0]!)}`,
-        'Icon=ch.proton.drive',
+        'Icon=io.github.kosidhar.ProtonDrive',
         'Terminal=false',
         'X-GNOME-Autostart-enabled=true',
         OURS,

@@ -45,7 +45,7 @@ export function sendDesktopNotification(options: {
     }
 
     const urgency = options.urgency ?? 'normal';
-    const icon = options.icon ?? 'ch.proton.drive';
+    const icon = options.icon ?? 'io.github.kosidhar.ProtonDrive';
 
     try {
         const child = spawn(
@@ -92,7 +92,7 @@ export async function sendActionNotification(options: {
         options.command ?? 'notify-send',
         '--app-name=Proton Drive',
         `--urgency=${options.urgency ?? 'normal'}`,
-        `--icon=${options.icon ?? 'ch.proton.drive'}`,
+        `--icon=${options.icon ?? 'io.github.kosidhar.ProtonDrive'}`,
         '--wait',
         ...options.actions.map((action) => `--action=${action.key}=${action.label}`),
         options.title,

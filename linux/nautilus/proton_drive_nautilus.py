@@ -806,7 +806,7 @@ def _lookup_file(path):
 
 def _notify(title: str, body: str) -> None:
     try:
-        _spawn_detached(["notify-send", "--app-name=Proton Drive", "--icon=ch.proton.drive", title, body])
+        _spawn_detached(["notify-send", "--app-name=Proton Drive", "--icon=io.github.kosidhar.ProtonDrive", title, body])
     except OSError:
         pass
 
