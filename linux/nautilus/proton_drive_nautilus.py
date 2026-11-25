@@ -15,10 +15,8 @@ import os
 import signal
 import socket
 import stat
-import sys
 import threading
 import time
-import types
 import urllib.parse
 from collections import OrderedDict
 
@@ -55,21 +53,6 @@ SHARE_LABEL = "Share…"
 NOT_RUNNING = "Proton Drive isn't running"
 
 UNKNOWN = object()  # a state not fetched yet (None is "no emblem": a local item matching an ignore pattern)
-
-
-def _neutralize_legacy_extension():
-    legacy_mod = sys.modules.get("proton_drive_nautilus")
-    if legacy_mod is not None and hasattr(legacy_mod, "ProtonDriveUbuntuExtension"):
-        legacy_cls = getattr(legacy_mod, "ProtonDriveUbuntuExtension")
-        legacy_cls.get_file_items = lambda self, *args: []
-        legacy_cls.get_background_items = lambda self, *args: []
-        legacy_cls.update_file_info = lambda self, *args: None
-    elif "proton_drive_nautilus" not in sys.modules:
-        # Block the module name "proton_drive_nautilus" from being imported later (this file is installed as kosidhar_protondrive_nautilus.py)
-        sys.modules["proton_drive_nautilus"] = types.ModuleType("proton_drive_nautilus")
-
-
-_neutralize_legacy_extension()
 
 
 class ControlError(Exception):
@@ -952,7 +935,6 @@ class ProtonDriveNautilusExtension(
         pass  # nothing is ever in progress
 
     def get_file_items(self, *args):
-        _neutralize_legacy_extension()
         files = args[-1] if args else []
         if not files:
             return []
