@@ -104,6 +104,9 @@ if [ "$UNINSTALL" -eq 1 ]; then
   rm -f "$PREFIX/bin/protondrive" "$PREFIX/bin/protondrive-gui" "$PREFIX/bin/protondrive-vfs"
   rm -f "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.desktop"
   rm -f "$PREFIX/share/metainfo/io.github.kosidhar.ProtonDrive.metainfo.xml"
+  # The Proton Docs and Sheets file types and the handler that opens them
+  rm -f "$PREFIX/share/mime/packages/io.github.kosidhar.ProtonDrive.xml" \
+    "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop"
   rm -f "$SYSTEMD_USER_DIR/protondrive.service"
   # The login entry the daemon wrote (#92), only if it is ours: a user's own entry of that name stays
   autostart_entry="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/kosidhar-protondrive.desktop"
@@ -125,6 +128,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
   find "$PREFIX/share/icons/hicolor" \( -name "io.github.kosidhar.ProtonDrive.*" -o -name "protondrive.*" -o -name "protondrive-tray-*" \) \
     -delete 2>/dev/null || true
   command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$PREFIX/share/applications" 2>/dev/null || true
+  command -v update-mime-database >/dev/null 2>&1 && update-mime-database -n "$PREFIX/share/mime" 2>/dev/null || true
   command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f "$PREFIX/share/icons/hicolor" 2>/dev/null || true
   echo "==> Uninstalled Proton Drive."
   warn_about_store
@@ -136,6 +140,7 @@ mkdir -p \
   "$PREFIX/bin" \
   "$PREFIX/share/applications" \
   "$PREFIX/share/metainfo" \
+  "$PREFIX/share/mime/packages" \
   "$PREFIX/share/icons" \
   "$PREFIX/share/protondrive/tray" \
   "$PREFIX/share/nautilus-python/extensions" \
@@ -153,6 +158,10 @@ if [ -d "$SRC_Root/bin" ]; then
   install -Dm644 "$SRC_Root/share/applications/io.github.kosidhar.ProtonDrive.desktop" "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.desktop"
   [ -f "$SRC_Root/share/metainfo/io.github.kosidhar.ProtonDrive.metainfo.xml" ] && \
     install -Dm644 "$SRC_Root/share/metainfo/io.github.kosidhar.ProtonDrive.metainfo.xml" "$PREFIX/share/metainfo/io.github.kosidhar.ProtonDrive.metainfo.xml"
+  [ -f "$SRC_Root/share/mime/packages/io.github.kosidhar.ProtonDrive.xml" ] && \
+    install -Dm644 "$SRC_Root/share/mime/packages/io.github.kosidhar.ProtonDrive.xml" "$PREFIX/share/mime/packages/io.github.kosidhar.ProtonDrive.xml"
+  [ -f "$SRC_Root/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop" ] && \
+    install -Dm644 "$SRC_Root/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop" "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop"
   [ -f "$SRC_Root/share/nautilus-python/extensions/kosidhar_protondrive_nautilus.py" ] && \
     install -Dm644 "$SRC_Root/share/nautilus-python/extensions/kosidhar_protondrive_nautilus.py" "$PREFIX/share/nautilus-python/extensions/kosidhar_protondrive_nautilus.py"
   [ -f "$SRC_Root/share/nemo-python/extensions/proton_drive_nemo.py" ] && \
@@ -172,6 +181,8 @@ else
   done
   install -Dm644 "$SRC_Root/packaging/linux/io.github.kosidhar.ProtonDrive.desktop" "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.desktop"
   install -Dm644 "$SRC_Root/linux/nautilus/proton_drive_nautilus.py" "$PREFIX/share/nautilus-python/extensions/kosidhar_protondrive_nautilus.py"
+  install -Dm644 "$SRC_Root/packaging/linux/io.github.kosidhar.ProtonDrive.xml" "$PREFIX/share/mime/packages/io.github.kosidhar.ProtonDrive.xml"
+  install -Dm644 "$SRC_Root/packaging/linux/io.github.kosidhar.ProtonDrive.OpenDoc.desktop" "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop"
   install -Dm644 "$SRC_Root/linux/nemo/proton_drive_nemo.py" "$PREFIX/share/nemo-python/extensions/proton_drive_nemo.py"
   install -Dm644 "$SRC_Root/linux/dolphin/protondrive.desktop" "$PREFIX/share/kio/servicemenus/protondrive.desktop"
 fi
@@ -197,9 +208,13 @@ if [ "$MODE" = "user" ]; then
   # Rewrite Exec= and Icon= in user desktop entry so it works even if ~/.local/bin is not in the display manager's PATH
   sed -i "s|^Exec=.*|Exec=$PREFIX/bin/protondrive-gui|; s|^TryExec=.*|TryExec=$PREFIX/bin/protondrive-gui|; s|^Icon=.*|Icon=$PREFIX/share/icons/hicolor/256x256/apps/io.github.kosidhar.ProtonDrive.png|" \
     "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.desktop"
+  # The same for the document handler: its Exec is absolute, so Files finds it however it was started
+  sed -i "s|^Exec=.*|Exec=$PREFIX/bin/protondrive open-doc %f|" \
+    "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop"
 fi
 
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$PREFIX/share/applications" 2>/dev/null || true
+command -v update-mime-database >/dev/null 2>&1 && update-mime-database -n "$PREFIX/share/mime" 2>/dev/null || true
 command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f "$PREFIX/share/icons/hicolor" 2>/dev/null || true
 
 if command -v systemctl >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ]; then

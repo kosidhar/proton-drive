@@ -3,6 +3,7 @@ import {
     accessSync,
     constants,
     existsSync,
+    readFileSync,
     lstatSync,
     mkdirSync,
     mkdtempSync,
@@ -62,5 +63,61 @@ describe('Arch PKGBUILD package()', () => {
         } finally {
             rmSync(tmp, { recursive: true, force: true });
         }
+    });
+});
+
+describe('Docs and Sheets file types', () => {
+    const dir = path.join(import.meta.dir, '..', 'packaging', 'linux');
+    const read = (name: string): string => readFileSync(path.join(dir, name), 'utf8');
+
+    test('the MIME package declares both types with their globs and generic icons', () => {
+        const xml = read('io.github.kosidhar.ProtonDrive.xml');
+        const types = [...xml.matchAll(/<mime-type type="([^"]+)">([\s\S]*?)<\/mime-type>/g)];
+        expect(types.map((t) => t[1])).toEqual(['application/vnd.proton.doc', 'application/vnd.proton.sheet']);
+        expect(types[0]![2]).toContain('<comment>Proton Docs document</comment>');
+        expect(types[0]![2]).toContain('<glob pattern="*.protondoc"/>');
+        expect(types[0]![2]).toContain('<generic-icon name="x-office-document"/>');
+        expect(types[1]![2]).toContain('<comment>Proton Sheets spreadsheet</comment>');
+        expect(types[1]![2]).toContain('<glob pattern="*.protonsheet"/>');
+        expect(types[1]![2]).toContain('<generic-icon name="x-office-spreadsheet"/>');
+    });
+
+    test('the open handler is hidden, takes both types, and runs protondrive open-doc', () => {
+        const desktop = read('io.github.kosidhar.ProtonDrive.OpenDoc.desktop');
+        expect(desktop).toMatch(/^NoDisplay=true$/m);
+        expect(desktop).toMatch(/^MimeType=application\/vnd\.proton\.doc;application\/vnd\.proton\.sheet;$/m);
+        expect(desktop).toMatch(/^Exec=protondrive open-doc %f$/m);
+        expect(desktop).toMatch(/^Name=Proton Drive$/m);
+    });
+
+    test('install.sh installs both files, refreshes the MIME database, and removes them on uninstall', () => {
+        const sh = read('install.sh');
+        const mime = 'share/mime/packages/io.github.kosidhar.ProtonDrive.xml';
+        const opendoc = 'share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop';
+        for (const file of [mime, opendoc]) {
+            // uninstall rm, tarball install, source install
+            expect(sh.split(file).length - 1).toBeGreaterThanOrEqual(3);
+        }
+        expect(sh).toContain('packaging/linux/io.github.kosidhar.ProtonDrive.xml');
+        expect(sh).toContain('packaging/linux/io.github.kosidhar.ProtonDrive.OpenDoc.desktop');
+        expect(sh).toContain('update-mime-database -n "$PREFIX/share/mime"');
+        expect(sh).toContain('Exec=$PREFIX/bin/protondrive open-doc %f');
+        // the main entry's sed must not touch the handler
+        const mainSed = sh.split('\n').find((l) => l.includes('Exec=$PREFIX/bin/protondrive-gui'))!;
+        expect(mainSed).not.toContain('OpenDoc');
+    });
+
+    test('package.sh stages both files under usr/share and validates the handler', () => {
+        const sh = read('package.sh');
+        expect(sh).toContain('"$STAGE/usr/share/mime/packages/$APP_ID.xml"');
+        expect(sh).toContain('"$STAGE/usr/share/applications/$APP_ID.OpenDoc.desktop"');
+        expect(sh).toMatch(/desktop-file-validate "\$STAGE\/usr\/share\/applications\/\$APP_ID\.OpenDoc\.desktop"/);
+    });
+
+    test('postinst refreshes the MIME database, and the Flatpak installs both files', () => {
+        expect(read('postinst.sh')).toContain('update-mime-database /usr/share/mime');
+        const flatpak = read('flatpak/io.github.kosidhar.ProtonDrive.bundle.yml');
+        expect(flatpak).toContain('/app/share/mime/packages/io.github.kosidhar.ProtonDrive.xml');
+        expect(flatpak).toContain('/app/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop');
     });
 });
