@@ -12163,7 +12163,7 @@ mod tests {
     }
 
     // #428: a note beside a control takes the room the row has: nothing below it moves, whatever the window's width
-    const NOTE_WIDTHS: [f32; 5] = [1440.0, 1000.0, 800.0, 700.0, 560.0];
+    const NOTE_WIDTHS: [f32; 6] = [1440.0, 1000.0, 840.0, 800.0, 700.0, 560.0];
     /// Whether a window this wide lays a setting's control on its label's row (not under it)
     fn row_beside(width: f32) -> bool {
         width >= 800.0
