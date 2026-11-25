@@ -51,6 +51,7 @@ pub struct Space {
 /// What a delete through the drive is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Removal {
+    /// A plain unlink: a file or link. Of a folder it is refused with EISDIR (#432)
     Unlink,
     /// Only a folder that holds nothing, here or in the cloud
     Rmdir,
@@ -173,7 +174,8 @@ impl DaemonClient {
     }
 
     /// Deletes an item of the drive, everything in it included, and moves it to the cloud's trash later on. An rmdir
-    /// of a folder holding anything, here or in the cloud, is refused with ENOTEMPTY.
+    /// of a folder holding anything, here or in the cloud, is refused with ENOTEMPTY, and an unlink of a folder is refused
+    /// with EISDIR (#432).
     pub fn delete(&self, rel: &str, removal: Removal) -> Result<(), DaemonError> {
         let mut body = serde_json::json!({ "path": rel });
         match removal {

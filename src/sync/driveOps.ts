@@ -16,7 +16,8 @@ export interface VfsEntry {
 // file replacing another), ENOTEMPTY for a folder that a delete only if empty (rmdir) finds something in, EINVAL for
 // something that can't be done to that item (putting back Proton Drive's version of a file it has none of), ENOSPC for a
 // download for an open that would leave this computer's disk with less than the drive's reserve (#301), EIO for anything
-// else (a failed download, say), EPERM for a change to a Proton Doc or Sheet's placeholder (they open in the browser)
+// else (a failed download, say), EPERM for a change to a Proton Doc or Sheet's placeholder (they open in the browser), EISDIR for an unlink of a
+// folder (neither rmdir nor Move to Trash), which is refused before anything is trashed or removed (#432)
 export type DriveOpErrorCode = 'ENOENT' | 'EEXIST' | 'EACCES' | 'EIO' | 'EXDEV' | 'ENOTEMPTY' | 'EINVAL' | 'ENOSPC' | 'EPERM' | 'EISDIR';
 
 export class DriveOpError extends Error {

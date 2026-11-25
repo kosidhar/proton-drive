@@ -7949,6 +7949,35 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
         });
 
+        test('moving a downloaded folder to the Trash trashes it once in Proton Drive, uploads nothing of an ignored .git, and does not bring it back', async () => {
+            const d = setup();
+            d.add('Projects/readme.txt', 'readme');
+            await pinnedAndSynced(d, d.add('Projects').uid);
+            await d.files.writeLocal('Projects/app/.git/HEAD', 'ref: refs/heads/main');
+            // A desktop Trash that works: what is only here goes to it
+            const desktopTrash = path.join(tempDir, 'DesktopTrash');
+            (d.engine as any).options.moveToDesktopTrash = async (fullPath: string) => {
+                d.handedToTrash.push(fullPath);
+                await mkdir(desktopTrash, { recursive: true });
+                await rename(fullPath, path.join(desktopTrash, `${d.handedToTrash.length}-${path.basename(fullPath)}`));
+                return true;
+            };
+
+            await d.engine.deleteItem('Projects', { trash: true });
+
+            expect(await d.files.exists('Projects')).toBe(false);
+            expect(d.files.recordCount('Projects')).toBe(0);
+            expect(d.engine.remoteIndex.getByPath('Projects')).toBeNull();
+            expect(d.handedToTrash.map((p) => path.relative(path.join(tempDir, 'files'), p))).toEqual(['Projects/app']);
+            await d.engine.replayRemoteOps();
+            expect(d.calls.trashed).toEqual([['vol~Projects']]);
+            await d.engine.reconcileNow();
+            expect(await d.files.exists('Projects')).toBe(false);
+            expect(d.calls.uploads).toEqual([]);
+            expect(d.calls.downloads).toEqual(['Projects/readme.txt']);
+            expect(d.calls.trashed).toEqual([['vol~Projects']]);
+        });
+
         test('an unlink of a downloaded folder (#432) removes nothing here, ignored things included, and trashes nothing', async () => {
             const d = setup();
             d.add('Projects/readme.txt', 'readme');
@@ -11226,10 +11255,16 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
                     if (!trash) {
                         // An unlink of a folder is refused (#432), before anything is trashed
+                        const records = d.files.recordCount('Docs');
+                        const indexed = ['Docs', 'Docs/doc.txt', 'Docs/other.txt', 'Docs/Sub'].map((p) => d.engine.remoteIndex.getByPath(p)?.uid ?? null);
                         const refused = await driveRoute(d, '/vfs/delete', { path: 'Docs', trash });
                         expect(refused).toMatchObject({ status: 400, body: { code: 'EISDIR' } });
                         await d.engine.replayRemoteOps();
                         expect(d.calls.trashed).toEqual([]);
+                        expect(d.journal()).toEqual([]);
+                        expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('mine');
+                        expect(d.files.recordCount('Docs')).toBe(records);
+                        expect(['Docs', 'Docs/doc.txt', 'Docs/other.txt', 'Docs/Sub'].map((p) => d.engine.remoteIndex.getByPath(p)?.uid ?? null)).toEqual(indexed);
                         return;
                     }
                     expect(await driveRoute(d, '/vfs/delete', { path: 'Docs', trash })).toEqual({ status: 200, body: { ok: true } });
