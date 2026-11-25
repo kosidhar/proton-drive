@@ -103,14 +103,30 @@ const NOTE_MIN_ROOM: f32 = 14.0;
 
 /// Draws `note` in `rect`, on one line: its icon, then its words cut to the room left (whole on hover), flush with the
 /// right edge of `rect` when `right_aligned`, else with its left. The words are announced politely as they appear (#425).
-fn draw_note(ui: &mut egui::Ui, rect: egui::Rect, note: &RowNote, right_aligned: bool) {
+/// Whether it fit: not when `rect` has no room even for the icon.
+fn draw_note(ui: &mut egui::Ui, rect: egui::Rect, note: &RowNote, right_aligned: bool) -> bool {
     if rect.width() < NOTE_MIN_ROOM || rect.height() < 14.0 {
-        return;
+        return false;
     }
     let layout = if right_aligned { Layout::right_to_left(Align::Center) } else { Layout::left_to_right(Align::Center) };
     // A child that takes no room from its parent: the note is drawn into the row, it doesn't lay a line of its own out
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
     note_contents(&mut child, note, rect.width());
+    true
+}
+
+/// A note with no room beside its control (a squeezed or stacked row): on a line of its own under the row, at the right,
+/// as it was before #428. Seen and announced all the same, never dropped: an error says why the control went back.
+fn note_line(ui: &mut egui::Ui, note: &RowNote) {
+    let color = match note.tone {
+        NoteTone::Success => TEXT_MUTED(),
+        NoteTone::Error => DANGER_TEXT(),
+        NoteTone::Working => PROTON_PURPLE_TEXT(),
+    };
+    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+        let label = ui.add(egui::Label::new(RichText::new(&note.text).size(12.5).color(color)).wrap());
+        ui.ctx().accesskit_node_builder(label.id, |node| node.set_live(egui::accesskit::Live::Polite));
+    });
 }
 
 /// A note's icon and words in `room`, in the layout `ui` has: for a control's own row, whose layout runs right to left
@@ -198,6 +214,7 @@ fn row(
         return ui
             .vertical(|ui| {
                 // The note on the label's line, at the right, in what the label and its hint leave
+                let mut stacked_fits = true;
                 let top = ui.cursor().min;
                 let column = ui.scope(|ui| label_column(ui, enabled, label, kind, hint, info));
                 let label = column.inner;
@@ -205,11 +222,14 @@ fn row(
                     let line_h = ui.fonts(|f| f.row_height(&kind.font())).max(INFO_SIZE);
                     let left = (column.response.rect.right() + NOTE_GAP).min(top.x + width);
                     let rect = egui::Rect::from_min_max(egui::pos2(left, top.y), egui::pos2(top.x + width, top.y + line_h));
-                    draw_note(ui, rect, note, true);
+                    stacked_fits = draw_note(ui, rect, note, true);
                 }
                 ui.add_space(STACKED_GAP);
                 let control = ui.add_enabled_ui(enabled, control).inner;
                 name_control(ui, &control, &label, info);
+                if let Some(note) = note.filter(|_| !stacked_fits) {
+                    note_line(ui, note);
+                }
                 label
             })
             .inner;
@@ -265,22 +285,26 @@ fn row(
         ui.ctx().data_mut(|d| d.insert_temp(size_key, actual));
         ui.ctx().request_discard("setting_row_ctrl_size");
     }
+    let mut fits = true;
     if let Some(note) = note {
         if total_h > row_h + 0.5 {
             // A control taller than its label (a text box): the note under the label's hint, in the label's column,
             // and no taller than what is left of the box
             let top = column.bottom() + HINT_GAP;
             let rect = egui::Rect::from_min_max(egui::pos2(column.left(), top), egui::pos2(column.right(), row_rect.bottom()));
-            draw_note(ui, rect, note, false);
+            fits = draw_note(ui, rect, note, false);
         } else {
             // Just left of the control, in what its label doesn't take
             let left = row_rect.left() + need.min(label_w) + NOTE_GAP;
             let right = control_out.response.rect.left() - NOTE_GAP;
             let rect = egui::Rect::from_min_max(egui::pos2(left, row_rect.top()), egui::pos2(right.max(left), row_rect.bottom()));
-            draw_note(ui, rect, note, true);
+            fits = draw_note(ui, rect, note, true);
         }
     }
     name_control(ui, &control_out.inner, &label_resp, info);
+    if let Some(note) = note.filter(|_| !fits) {
+        note_line(ui, note);
+    }
     label_resp
 }
 

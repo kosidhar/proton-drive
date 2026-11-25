@@ -12206,7 +12206,9 @@ mod tests {
                 let (below_before, label_before) = (top_of(&h, below), top_of(&h, label));
                 let text = if error { "Can't reach the daemon" } else { "Saved" };
                 put_note(&mut h, key, if error { Notice::error(text) } else { Notice::info(text) });
-                assert_eq!(top_of(&h, below), below_before, "{key} {text} at {width}: the row below stays put");
+                if row_beside(width) {
+                    assert_eq!(top_of(&h, below), below_before, "{key} {text} at {width}: the row below stays put");
+                }
                 assert_eq!(top_of(&h, label), label_before, "{key} {text} at {width}: its own label stays put");
                 if !row_beside(width) {
                     continue; // below the window's least width the label may take the whole line: no room for a note
@@ -12309,6 +12311,26 @@ mod tests {
         assert_eq!(node.live(), Some(Live::Polite));
         assert!(node_rect(&node).width() <= 20.0, "just the icon");
         assert!(h.text_rect(icons::CHECK).is_some(), "the check icon is painted");
+    }
+
+    // #428 round 2: where not even the icon fits beside the control (the label fills its line), the note is a line of
+    // its own under the row, as before, and still announced: an error is never dropped
+    #[test]
+    fn a_note_with_no_room_beside_its_control_falls_back_to_its_own_line() {
+        use egui::accesskit::Live;
+        for (width, zoom) in [(560.0, 1.0), (840.0, 2.0)] {
+            let mut h = settings_tall(None, None);
+            h.resize_zoomed(Vec2::new(width, 2400.0), zoom);
+            h.frames(3);
+            let label = "Start Proton Drive when I log in";
+            let text = "Can't reach the daemon";
+            put_note(&mut h, "startAtLogin", Notice::error(text));
+            let line = h.text_rect(text).unwrap_or_else(|| panic!("{width}x{zoom}: the error is seen"));
+            let switch = node_rect(&h.nodes_named(label)[0]);
+            assert!(line.top() >= switch.bottom() - 1.0, "{width}x{zoom}: under the row: {line:?} vs {switch:?}");
+            let node = accesskit_nodes(&h).into_iter().map(|(_, n)| n).find(|n| says(n) == text).expect("announced");
+            assert_eq!(node.live(), Some(Live::Polite));
+        }
     }
 
     #[test]
