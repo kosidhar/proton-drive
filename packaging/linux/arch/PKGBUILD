@@ -1,10 +1,10 @@
 # Maintainer: Gautam Chauhan <gautam@linux.local>
-pkgname=protondrive
+pkgname=kosidhar-protondrive
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="Native Linux desktop client and two-way folder sync daemon for Proton Drive"
 arch=('x86_64' 'aarch64')
-url="https://github.com/gautamchauhan/proton-drive"
+url="https://github.com/kosidhar/proton-drive"
 license=('MIT')
 depends=('glibc' 'gcc-libs' 'libxkbcommon' 'vulkan-icd-loader' 'hicolor-icon-theme' 'fuse3')
 optdepends=(
@@ -15,11 +15,9 @@ optdepends=(
   'nemo-python: Cinnamon (Nemo) context menu and sync emblem integration'
   'dolphin: KDE Plasma Dolphin service menu integration'
 )
-provides=('protondrive' 'proton-drive-ubuntu')
-conflicts=('proton-drive-ubuntu')
-source=("protondrive-${pkgver}-linux-${CARCH}.tar.gz")
+source=("kosidhar-protondrive-${pkgver}-linux-${CARCH}.tar.gz")
 sha256sums=('SKIP')
 
 package() {
-  cp -a "${srcdir}/protondrive-${pkgver}-linux-${CARCH}/"* "${pkgdir}/usr/"
+  cp -a "${srcdir}/kosidhar-protondrive-${pkgver}-linux-${CARCH}/"* "${pkgdir}/usr/"
 }

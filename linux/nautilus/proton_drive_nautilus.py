@@ -65,7 +65,7 @@ def _neutralize_legacy_extension():
         legacy_cls.get_background_items = lambda self, *args: []
         legacy_cls.update_file_info = lambda self, *args: None
     elif "proton_drive_nautilus" not in sys.modules:
-        # Block /usr/share/nautilus-python/extensions/proton_drive_nautilus.py from being imported later
+        # Block the module name "proton_drive_nautilus" from being imported later (this file is installed as kosidhar_protondrive_nautilus.py)
         sys.modules["proton_drive_nautilus"] = types.ModuleType("proton_drive_nautilus")
 
 

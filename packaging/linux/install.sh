@@ -101,7 +101,7 @@ WARNING
 if [ "$UNINSTALL" -eq 1 ]; then
   echo "==> Uninstalling Proton Drive from $PREFIX..."
   systemctl --user disable --now protondrive.service 2>/dev/null || true
-  rm -f "$PREFIX/bin/protondrive" "$PREFIX/bin/protondrive-gui" "$PREFIX/bin/protondrive-vfs" "$PREFIX/bin/proton-drive-ubuntu"
+  rm -f "$PREFIX/bin/protondrive" "$PREFIX/bin/protondrive-gui" "$PREFIX/bin/protondrive-vfs"
   rm -f "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.desktop"
   rm -f "$PREFIX/share/metainfo/io.github.kosidhar.ProtonDrive.metainfo.xml"
   rm -f "$SYSTEMD_USER_DIR/protondrive.service"
@@ -148,7 +148,6 @@ if [ -d "$SRC_Root/bin" ]; then
   install -Dm755 "$SRC_Root/bin/protondrive-gui" "$PREFIX/bin/protondrive-gui"
   # The virtual drive helper must sit next to protondrive (the daemon looks beside itself first)
   install -Dm755 "$SRC_Root/bin/protondrive-vfs" "$PREFIX/bin/protondrive-vfs"
-  ln -sf protondrive "$PREFIX/bin/proton-drive-ubuntu"
   cp -R "$SRC_Root/share/icons/hicolor" "$PREFIX/share/icons/"
   [ -d "$SRC_Root/share/protondrive" ] && cp -R "$SRC_Root/share/protondrive/"* "$PREFIX/share/protondrive/"
   install -Dm644 "$SRC_Root/share/applications/io.github.kosidhar.ProtonDrive.desktop" "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.desktop"
@@ -161,10 +160,9 @@ if [ -d "$SRC_Root/bin" ]; then
   [ -f "$SRC_Root/share/kio/servicemenus/protondrive.desktop" ] && \
     install -Dm644 "$SRC_Root/share/kio/servicemenus/protondrive.desktop" "$PREFIX/share/kio/servicemenus/protondrive.desktop"
 else
-  install -Dm755 "$SRC_Root/release/proton-drive-ubuntu" "$PREFIX/bin/protondrive"
+  install -Dm755 "$SRC_Root/release/protondrive" "$PREFIX/bin/protondrive"
   install -Dm755 "$SRC_Root/release/protondrive-gui" "$PREFIX/bin/protondrive-gui"
   install -Dm755 "$SRC_Root/release/protondrive-vfs" "$PREFIX/bin/protondrive-vfs"
-  ln -sf protondrive "$PREFIX/bin/proton-drive-ubuntu"
   cp -R "$SRC_Root/assets/app-icon/hicolor" "$PREFIX/share/icons/"
   cp -R "$SRC_Root/assets/app-icon/tray/"*.png "$PREFIX/share/protondrive/tray/"
   cp -R "$SRC_Root/assets/app-icon/tray/"*.png "$PREFIX/share/icons/hicolor/64x64/apps/"

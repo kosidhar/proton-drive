@@ -10,10 +10,10 @@ Built to work out-of-the-box across all major Linux distributions and desktop en
 
 | Format | Output Artifact (`dist/release/`) | Target Distributions |
 | :--- | :--- | :--- |
-| **AppImage** | `protondrive-0.1.0-linux-x86_64.AppImage` | **Universal** — runs on any Linux distro (Ubuntu, Fedora, Arch, openSUSE, Mint, NixOS, SteamOS) without installation |
-| **Debian / Ubuntu (`.deb`)** | `protondrive-0.1.0-linux-amd64.deb` | Debian, Ubuntu, Linux Mint, Pop!\_OS, Zorin OS, Elementary OS, Kali |
-| **Fedora / RHEL / SUSE (`.rpm`)** | `protondrive-0.1.0-linux-x86_64.rpm` | Fedora, RHEL, CentOS Stream, Rocky Linux, AlmaLinux, openSUSE Tumbleweed / Leap |
-| **Portable Tarball (`.tar.gz`)** | `protondrive-0.1.0-linux-x86_64.tar.gz` | Any Linux distro — includes FHS tree (`bin/`, `share/`, `lib/systemd/user/`) and universal `install.sh` (`--user` or `--system`) |
+| **AppImage** | `kosidhar-protondrive-0.1.0-linux-x86_64.AppImage` | **Universal** — runs on any Linux distro (Ubuntu, Fedora, Arch, openSUSE, Mint, NixOS, SteamOS) without installation |
+| **Debian / Ubuntu (`.deb`)** | `kosidhar-protondrive-0.1.0-linux-amd64.deb` | Debian, Ubuntu, Linux Mint, Pop!\_OS, Zorin OS, Elementary OS, Kali |
+| **Fedora / RHEL / SUSE (`.rpm`)** | `kosidhar-protondrive-0.1.0-linux-x86_64.rpm` | Fedora, RHEL, CentOS Stream, Rocky Linux, AlmaLinux, openSUSE Tumbleweed / Leap |
+| **Portable Tarball (`.tar.gz`)** | `kosidhar-protondrive-0.1.0-linux-x86_64.tar.gz` | Any Linux distro — includes FHS tree (`bin/`, `share/`, `lib/systemd/user/`) and universal `install.sh` (`--user` or `--system`) |
 | **Arch Linux (`PKGBUILD`)** | `packaging/linux/arch/PKGBUILD` | Arch Linux, Manjaro, EndeavourOS, Garuda (`makepkg -si`) |
 | **Flatpak Bundle (`.flatpak`)** | `packaging/linux/flatpak-bundle.sh` | Sandboxed Flatpak bundle for Flathub / Fedora Silverblue / immutable distros |
 
@@ -69,10 +69,10 @@ Proton Drive shows up in your file manager's sidebar as **Proton Drive**. It lis
 ```
 
 This outputs all 4 universal release artifacts to `./dist/release/`:
-- `dist/release/protondrive-0.1.0-linux-x86_64.AppImage`
-- `dist/release/protondrive-0.1.0-linux-amd64.deb`
-- `dist/release/protondrive-0.1.0-linux-x86_64.rpm`
-- `dist/release/protondrive-0.1.0-linux-x86_64.tar.gz`
+- `dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.AppImage`
+- `dist/release/kosidhar-protondrive-0.1.0-linux-amd64.deb`
+- `dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.rpm`
+- `dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.tar.gz`
 
 ### Option A: Universal Per-User Install (Any Distro, No Root Needed)
 
@@ -86,22 +86,22 @@ Install `fuse3` from your distro first if you want the virtual drive.
 ### Option B: Debian / Ubuntu / Mint / Pop!\_OS (`.deb`)
 
 ```bash
-sudo dpkg -i ./dist/release/protondrive-0.1.0-linux-amd64.deb
+sudo dpkg -i ./dist/release/kosidhar-protondrive-0.1.0-linux-amd64.deb
 systemctl --user enable --now protondrive.service
 ```
 
 ### Option C: Fedora / RHEL / openSUSE (`.rpm`)
 
 ```bash
-sudo dnf install ./dist/release/protondrive-0.1.0-linux-x86_64.rpm
+sudo dnf install ./dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.rpm
 systemctl --user enable --now protondrive.service
 ```
 
 ### Option D: Universal AppImage (Zero Installation)
 
 ```bash
-chmod +x ./dist/release/protondrive-0.1.0-linux-x86_64.AppImage
-./dist/release/protondrive-0.1.0-linux-x86_64.AppImage
+chmod +x ./dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.AppImage
+./dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.AppImage
 ```
 
 ---

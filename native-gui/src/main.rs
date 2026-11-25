@@ -4361,7 +4361,6 @@ fn try_autostart_daemon() {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("protondrive"));
-            candidates.push(dir.join("proton-drive-ubuntu"));
         }
     }
     if let Ok(home) = std::env::var("HOME") {

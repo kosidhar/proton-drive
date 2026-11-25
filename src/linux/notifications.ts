@@ -112,7 +112,7 @@ export async function sendActionNotification(options: {
     }
 }
 
-export async function getSystemdServiceStatus(serviceName = 'proton-drive-ubuntu.service'): Promise<{
+export async function getSystemdServiceStatus(serviceName = 'protondrive.service'): Promise<{
     installed: boolean;
     enabled: boolean;
     active: boolean;

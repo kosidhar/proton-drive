@@ -1,4 +1,4 @@
-name: protondrive
+name: kosidhar-protondrive
 arch: ${NFPM_ARCH}
 platform: linux
 version: ${VERSION}
@@ -7,8 +7,8 @@ release: 1
 section: net
 priority: optional
 maintainer: ${PROTONDRIVE_MAINTAINER}
-vendor: Proton Drive Linux Community
-homepage: https://github.com/gautamchauhan/proton-drive
+vendor: Kosidhar
+homepage: https://github.com/kosidhar/proton-drive
 license: MIT
 description: |-
   Native Linux desktop client and two-way folder sync daemon for Proton Drive.
@@ -19,10 +19,6 @@ description: |-
 
 overrides:
   deb:
-    replaces:
-      - proton-drive-ubuntu
-    provides:
-      - proton-drive-ubuntu
     depends:
       - libc6 (>= 2.35)
       - libgcc-s1
@@ -69,9 +65,6 @@ contents:
   - src: ${STAGE}/usr/bin/protondrive-vfs
     dst: /usr/bin/protondrive-vfs
     file_info: { mode: 0755 }
-  - src: /usr/bin/protondrive
-    dst: /usr/bin/proton-drive-ubuntu
-    type: symlink
   - src: ${STAGE}/usr/lib/
     dst: /usr/lib/
     type: tree

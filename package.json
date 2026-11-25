@@ -1,12 +1,12 @@
 {
-    "name": "proton-drive-ubuntu",
+    "name": "kosidhar-protondrive",
     "private": true,
     "version": "0.1.0",
     "description": "Unofficial Proton Drive client for Ubuntu/Linux powered by Proton Drive SDK",
     "license": "MIT",
     "main": "src/cli/main.ts",
     "bin": {
-        "proton-drive-ubuntu": "./src/cli/main.ts"
+        "protondrive": "./src/cli/main.ts"
     },
     "engines": {
         "bun": ">=1.4.2"

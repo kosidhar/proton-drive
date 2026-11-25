@@ -7,7 +7,7 @@ const rootDir = path.resolve(import.meta.dir, '..');
 const outDir = path.join(rootDir, 'release');
 await mkdir(outDir, { recursive: true });
 
-const outfile = path.join(outDir, 'proton-drive-ubuntu');
+const outfile = path.join(outDir, 'protondrive');
 const appVersion = process.env.PROTON_DRIVE_APP_VERSION || 'external-drive-ubuntu_sync@0.1.0-alpha';
 const sdkVersion = 'js@0.0.1';
 
@@ -40,7 +40,3 @@ if (exitCode !== 0) {
     process.exit(exitCode);
 }
 console.log(`Successfully built ${outfile}`);
-const aliasFile = path.join(outDir, 'protondrive');
-await Bun.write(aliasFile, Bun.file(outfile));
-await Bun.spawn(['chmod', '0755', aliasFile]).exited;
-console.log(`Created executable alias ${aliasFile}`);

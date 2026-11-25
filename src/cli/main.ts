@@ -185,13 +185,13 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     }
 
     if (cmd === 'daemon') {
-        console.log(`[proton-drive-ubuntu] ${THIRD_PARTY_DISCLOSURE}`);
+        console.log(`[protondrive] ${THIRD_PARTY_DISCLOSURE}`);
         const daemon = await startSyncDaemon({ enableConsoleLog: verboseFlag });
-        console.log(`[proton-drive-ubuntu] Sync daemon listening at ${daemon.url}`);
-        console.log(`[proton-drive-ubuntu] Syncing local folder: ${daemon.stateDb.getSettings().syncDir}`);
+        console.log(`[protondrive] Sync daemon listening at ${daemon.url}`);
+        console.log(`[protondrive] Syncing local folder: ${daemon.stateDb.getSettings().syncDir}`);
 
         const shutdown = async () => {
-            console.log('\n[proton-drive-ubuntu] Shutting down sync daemon...');
+            console.log('\n[protondrive] Shutting down sync daemon...');
             await daemon.stop();
             process.exit(0);
         };
@@ -204,17 +204,17 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
 
     if (cmd === 'gui') {
         if (await isDaemonRunning()) {
-            console.log(`[proton-drive-ubuntu] Opening desktop GUI (${DAEMON_BASE_URL})...`);
+            console.log(`[protondrive] Opening desktop GUI (${DAEMON_BASE_URL})...`);
             ensureSystemTrayIndicator();
             launchDesktopWindow(DAEMON_BASE_URL);
             await new Promise((r) => setTimeout(r, 200));
             return;
         }
-        console.log(`[proton-drive-ubuntu] Starting sync daemon and opening desktop GUI...`);
+        console.log(`[protondrive] Starting sync daemon and opening desktop GUI...`);
         const daemon = await startSyncDaemon({ enableConsoleLog: verboseFlag });
         launchDesktopWindow(daemon.url);
-        console.log(`[proton-drive-ubuntu] Desktop GUI opened at ${daemon.url}`);
-        console.log(`[proton-drive-ubuntu] Syncing ${daemon.stateDb.getSettings().syncDir} in the background (keep open or install systemd service).`);
+        console.log(`[protondrive] Desktop GUI opened at ${daemon.url}`);
+        console.log(`[protondrive] Syncing ${daemon.stateDb.getSettings().syncDir} in the background (keep open or install systemd service).`);
         const shutdown = async () => {
             await daemon.stop();
             process.exit(0);
@@ -267,7 +267,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
                 console.log(JSON.stringify(payload, null, 2));
             } else {
                 console.log(`Notice:       ${THIRD_PARTY_DISCLOSURE}`);
-                console.log(`Daemon:       Stopped (run 'proton-drive-ubuntu daemon' to start)`);
+                console.log(`Daemon:       Stopped (run 'protondrive daemon' to start)`);
                 console.log(`Account:      ${loggedIn ? 'Signed In' : 'Not Signed In'}`);
                 console.log(`Sync Folder:  ${settings.syncDir}`);
                 console.log(`Synced Files: ${stats.totalFiles} (${formatBytes(stats.totalBytes)})`);
@@ -319,7 +319,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
         const runtime = await createStandaloneRuntime(verboseFlag);
         try {
             if (!runtime.auth.isLoggedIn()) {
-                throw new Error('Not signed in. Run `proton-drive-ubuntu auth login` first.');
+                throw new Error('Not signed in. Run `protondrive auth login` first.');
             }
             const stateDbPath = path.join(runtime.config.appDir, 'ubuntu-sync-state.sqlite');
             const stateDb = new SyncStateDatabase(stateDbPath);
@@ -401,7 +401,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
             const id = Number(args[2]);
             const choice = args[3] as 'keep-both' | 'keep-local' | 'keep-remote';
             if (!id || !['keep-both', 'keep-local', 'keep-remote'].includes(choice)) {
-                throw new Error('Usage: proton-drive-ubuntu conflicts resolve <id> <keep-both|keep-local|keep-remote>');
+                throw new Error('Usage: protondrive conflicts resolve <id> <keep-both|keep-local|keep-remote>');
             }
             // A running daemon resolves it with its own engine, over the user-only control socket
             if (await isDaemonRunning()) {
@@ -482,7 +482,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
         const runtime = await createStandaloneRuntime(verboseFlag);
         try {
             if (!runtime.auth.isLoggedIn()) {
-                throw new Error('Not signed in. Run `proton-drive-ubuntu auth login` first.');
+                throw new Error('Not signed in. Run `protondrive auth login` first.');
             }
             const node = await runtime.paths.getNode(remotePath, [
                 PathType.MyFiles,
@@ -515,7 +515,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
         const parentPath = args[1];
         const name = args[2];
         if (!parentPath || !name) {
-            throw new Error('Usage: proton-drive-ubuntu mkdir <remoteParentPath> <folderName>');
+            throw new Error('Usage: protondrive mkdir <remoteParentPath> <folderName>');
         }
         const runtime = await createStandaloneRuntime(verboseFlag);
         try {
@@ -536,7 +536,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
         const localFile = args[1];
         const remoteDir = args[2] || '/my-files';
         if (!localFile) {
-            throw new Error('Usage: proton-drive-ubuntu upload <localFilePath> [remoteParentPath]');
+            throw new Error('Usage: protondrive upload <localFilePath> [remoteParentPath]');
         }
         const runtime = await createStandaloneRuntime(verboseFlag);
         try {
@@ -562,7 +562,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
         const remoteFile = args[1];
         const localTarget = args[2];
         if (!remoteFile || !localTarget) {
-            throw new Error('Usage: proton-drive-ubuntu download <remoteFilePath> <localTargetPath>');
+            throw new Error('Usage: protondrive download <remoteFilePath> <localTargetPath>');
         }
         const runtime = await createStandaloneRuntime(verboseFlag);
         try {
@@ -587,7 +587,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     if (cmd === 'trash') {
         const remotePath = args[1];
         if (!remotePath) {
-            throw new Error('Usage: proton-drive-ubuntu trash <remotePath>');
+            throw new Error('Usage: protondrive trash <remotePath>');
         }
         const runtime = await createStandaloneRuntime(verboseFlag);
         try {
@@ -608,7 +608,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
         return;
     }
 
-    throw new Error(`Unknown command: ${cmd}. Run 'proton-drive-ubuntu help' for usage.`);
+    throw new Error(`Unknown command: ${cmd}. Run 'protondrive help' for usage.`);
 }
 
 if (import.meta.main) {
