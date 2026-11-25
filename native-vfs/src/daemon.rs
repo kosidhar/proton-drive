@@ -51,6 +51,7 @@ pub struct Space {
 /// What a delete through the drive is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Removal {
+    /// A plain unlink: a file or link. Of a folder it is refused with EISDIR (#432)
     Unlink,
     /// Only a folder that holds nothing, here or in the cloud
     Rmdir,
@@ -173,7 +174,8 @@ impl DaemonClient {
     }
 
     /// Deletes an item of the drive, everything in it included, and moves it to the cloud's trash later on. An rmdir
-    /// of a folder holding anything, here or in the cloud, is refused with ENOTEMPTY.
+    /// of a folder holding anything, here or in the cloud, is refused with ENOTEMPTY, and an unlink of a folder is refused
+    /// with EISDIR (#432).
     pub fn delete(&self, rel: &str, removal: Removal) -> Result<(), DaemonError> {
         let mut body = serde_json::json!({ "path": rel });
         match removal {
@@ -307,6 +309,8 @@ fn errno_of_code(code: Option<&str>) -> i32 {
         Some("EACCES") => libc::EACCES,
         Some("EXDEV") => libc::EXDEV,
         Some("ENOTEMPTY") => libc::ENOTEMPTY,
+        // An unlink of a folder (#432)
+        Some("EISDIR") => libc::EISDIR,
         Some("ENOSPC") => libc::ENOSPC,
         // A Docs or Sheets placeholder, which can't be changed (#430)
         Some("EPERM") => libc::EPERM,
@@ -574,6 +578,7 @@ mod tests {
         assert_eq!(errno_of_code(Some("EIO")), libc::EIO);
         assert_eq!(errno_of_code(Some("EXDEV")), libc::EXDEV);
         assert_eq!(errno_of_code(Some("ENOTEMPTY")), libc::ENOTEMPTY);
+        assert_eq!(errno_of_code(Some("EISDIR")), libc::EISDIR);
         // A Docs or Sheets placeholder, which can't be changed (#430)
         assert_eq!(errno_of_code(Some("EPERM")), libc::EPERM);
         // A download for an open that would leave the system disk under the reserve (#301)

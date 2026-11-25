@@ -1218,7 +1218,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const a = d.hold('A');
             const pass = d.engine.reconcileNow();
             await a.asked; // A's listing, which still holds C, is on its way
-            await d.engine.deleteItem('A/C');
+            await d.engine.deleteItem('A/C', { trash: true });
             a.release();
             await pass;
             await d.engine.replayRemoteOps();
@@ -1240,7 +1240,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const a = d.hold('A');
             const pass = d.engine.reconcileNow(); // the first pass crawls A, then C
             await a.asked;
-            await d.engine.deleteItem('C');
+            await d.engine.deleteItem('C', { trash: true });
             a.release();
             await pass;
             await d.engine.replayRemoteOps();
@@ -5164,12 +5164,13 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(d.calls.uploads).toEqual([]);
             });
 
-            test('a folder deleted through the drive drops the holds in it', async () => {
+            test('an unlink of a folder is refused (#432), and the holds in it stay', async () => {
                 const d = await started();
                 await cutShort(d, 'Docs/new.bin', 'part of it');
                 await cutShort(d, 'Docs/b.txt', 'b fr');
-                await d.engine.deleteItem('Docs');
-                expect(d.engine.listCutShort()).toEqual([]);
+                const held = d.engine.listCutShort();
+                await expect(d.engine.deleteItem('Docs')).rejects.toMatchObject({ code: 'EISDIR' });
+                expect(d.engine.listCutShort()).toEqual(held);
             });
 
             test('a drive rename carries the hold to the new name, and the file stays held there', async () => {
@@ -7891,18 +7892,83 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
         });
 
-        test('deleting a downloaded folder removes everything in it here, ignored things included, and trashes the folder once', async () => {
+        // #432: an unlink (neither onlyIfEmpty nor trash) is what FUSE sends for a file. For a folder it is refused
+        // before anything is trashed or removed; rmdir and Move to Trash stay as they were.
+        describe('a folder and the three ways to delete it (#432)', () => {
+            const folderWithFiles = async () => {
+                const d = setup();
+                d.add('Projects/readme.txt', 'readme');
+                d.add('Projects/Inner/b.txt', 'b');
+                await pinnedAndSynced(d, d.add('Projects').uid);
+                return d;
+            };
+
+            test('an unlink of a folder is refused with EISDIR: nothing trashed, nothing removed here, no records lost', async () => {
+                const d = await folderWithFiles();
+                const recordsBefore = d.files.recordCount('Projects');
+                const error = await d.engine.deleteItem('Projects').then(() => null, (e: unknown) => e);
+                expect(error).toBeInstanceOf(DriveOpError);
+                expect((error as DriveOpError).code).toBe('EISDIR');
+                await d.engine.replayRemoteOps();
+                expect(d.journal()).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.handedToTrash).toEqual([]);
+                expect(await d.files.exists('Projects/readme.txt')).toBe(true);
+                expect(await d.files.exists('Projects/Inner/b.txt')).toBe(true);
+                expect(d.files.recordCount('Projects')).toBe(recordsBefore);
+                expect(d.engine.remoteIndex.getByPath('Projects')).not.toBeNull();
+                await d.expectEveryRecordHasItsFile();
+            });
+
+            test('an unlink of a folder that is only in the cloud (online-only) is refused too', async () => {
+                const d = setup();
+                d.add('Cloud/a.txt', 'a');
+                await d.engine.reconcileNow();
+                const error = await d.engine.deleteItem('Cloud').then(() => null, (e: unknown) => e);
+                expect((error as DriveOpError | null)?.code).toBe('EISDIR');
+                await d.engine.replayRemoteOps();
+                expect(d.journal()).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+            });
+
+            test('rmdir of an empty folder still works', async () => {
+                const d = setup();
+                await d.engine.reconcileNow();
+                await mkdir(d.local('Empty'), { recursive: true });
+                await d.engine.reconcileNow();
+                await d.engine.deleteItem('Empty', { onlyIfEmpty: true });
+                expect(await d.files.exists('Empty')).toBe(false);
+            });
+
+            test('Move to Trash of a folder still trashes it', async () => {
+                const d = await folderWithFiles();
+                await d.engine.deleteItem('Projects', { trash: true });
+                await d.engine.replayRemoteOps();
+                expect(d.calls.trashed).toEqual([['vol~Projects']]);
+                expect(await d.files.exists('Projects')).toBe(false);
+            });
+        });
+
+        test('moving a downloaded folder to the Trash trashes it once in Proton Drive, uploads nothing of an ignored .git, and does not bring it back', async () => {
             const d = setup();
             d.add('Projects/readme.txt', 'readme');
             await pinnedAndSynced(d, d.add('Projects').uid);
             await d.files.writeLocal('Projects/app/.git/HEAD', 'ref: refs/heads/main');
+            // A desktop Trash that works: what is only here goes to it
+            const desktopTrash = path.join(tempDir, 'DesktopTrash');
+            (d.engine as any).options.moveToDesktopTrash = async (fullPath: string) => {
+                d.handedToTrash.push(fullPath);
+                await mkdir(desktopTrash, { recursive: true });
+                await rename(fullPath, path.join(desktopTrash, `${d.handedToTrash.length}-${path.basename(fullPath)}`));
+                return true;
+            };
 
-            await d.engine.deleteItem('Projects');
+            await d.engine.deleteItem('Projects', { trash: true });
 
             expect(await d.files.exists('Projects')).toBe(false);
             expect(d.files.recordCount('Projects')).toBe(0);
             expect(d.engine.remoteIndex.getByPath('Projects')).toBeNull();
-            expect(d.handedToTrash).toEqual([]);
+            expect(d.handedToTrash.map((p) => path.relative(path.join(tempDir, 'files'), p))).toEqual(['Projects/app']);
             await d.engine.replayRemoteOps();
             expect(d.calls.trashed).toEqual([['vol~Projects']]);
             await d.engine.reconcileNow();
@@ -7910,6 +7976,23 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.calls.uploads).toEqual([]);
             expect(d.calls.downloads).toEqual(['Projects/readme.txt']);
             expect(d.calls.trashed).toEqual([['vol~Projects']]);
+        });
+
+        test('an unlink of a downloaded folder (#432) removes nothing here, ignored things included, and trashes nothing', async () => {
+            const d = setup();
+            d.add('Projects/readme.txt', 'readme');
+            await pinnedAndSynced(d, d.add('Projects').uid);
+            await d.files.writeLocal('Projects/app/.git/HEAD', 'ref: refs/heads/main');
+
+            await expect(d.engine.deleteItem('Projects')).rejects.toMatchObject({ code: 'EISDIR' });
+
+            expect(await d.files.exists('Projects/app/.git/HEAD')).toBe(true);
+            expect(await d.files.exists('Projects/readme.txt')).toBe(true);
+            expect(d.engine.remoteIndex.getByPath('Projects')).not.toBeNull();
+            expect(d.handedToTrash).toEqual([]);
+            await d.engine.replayRemoteOps();
+            expect(d.calls.trashed).toEqual([]);
+            expect(d.journal()).toEqual([]);
         });
 
         test('a new file made at the old name while a rename waits is not uploaded onto the renamed item, and uploads as new once the rename lands', async () => {
@@ -8217,7 +8300,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 const d = await heldBack({ 'Projects/a.txt': 'a', 'Projects/b.txt': 'b', 'keep.txt': 'k' });
 
                 await d.engine.renameItem('Projects', 'Work');
-                await d.engine.deleteItem('Work');
+                await d.engine.deleteItem('Work', { trash: true });
                 await d.resume();
 
                 expect(d.calls.renamed).toEqual([{ uid: 'vol~Projects', name: 'Work' }]);
@@ -8641,7 +8724,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.engine.remoteIndex.getByPath('Work')?.uid).toBe('vol~Projects');
             expect(d.engine.remoteIndex.getByPath('Work/b.txt')?.uid).toBe('vol~Projects/b.txt');
             expect(d.engine.remoteIndex.getByPath('Projects')).toBeNull();
-            const error = await d.engine.deleteItem('Projects').then(() => null, (e: Error) => e.message);
+            const error = await d.engine.deleteItem('Projects', { trash: true }).then(() => null, (e: Error) => e.message);
             expect(error).toBe('Not found: Projects');
             d.down.clear();
             await d.engine.reconcileNow();
@@ -11167,9 +11250,23 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             };
 
             for (const trash of [false, true]) {
-                test(`a folder ${trash ? 'moved to the Trash' : 'deleted'} through the drive trashes what else is in it, never the colliding cloud file`, async () => {
+                test(`a folder ${trash ? 'moved to the Trash' : 'unlinked (refused)'} through the drive trashes what else is in it, never the colliding cloud file`, async () => {
                     const d = await collidedInFolder();
 
+                    if (!trash) {
+                        // An unlink of a folder is refused (#432), before anything is trashed
+                        const records = d.files.recordCount('Docs');
+                        const indexed = ['Docs', 'Docs/doc.txt', 'Docs/other.txt', 'Docs/Sub'].map((p) => d.engine.remoteIndex.getByPath(p)?.uid ?? null);
+                        const refused = await driveRoute(d, '/vfs/delete', { path: 'Docs', trash });
+                        expect(refused).toMatchObject({ status: 400, body: { code: 'EISDIR' } });
+                        await d.engine.replayRemoteOps();
+                        expect(d.calls.trashed).toEqual([]);
+                        expect(d.journal()).toEqual([]);
+                        expect(await readFile(d.local('Docs/doc.txt'), 'utf8')).toBe('mine');
+                        expect(d.files.recordCount('Docs')).toBe(records);
+                        expect(['Docs', 'Docs/doc.txt', 'Docs/other.txt', 'Docs/Sub'].map((p) => d.engine.remoteIndex.getByPath(p)?.uid ?? null)).toEqual(indexed);
+                        return;
+                    }
                     expect(await driveRoute(d, '/vfs/delete', { path: 'Docs', trash })).toEqual({ status: 200, body: { ok: true } });
                     await d.engine.replayRemoteOps();
 
@@ -11313,7 +11410,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(d.calls.trashed).toEqual([['vol~Folder']]);
             });
 
-            test('a plain delete still removes everything, as the user asked', async () => {
+            test('a plain delete (unlink) of a folder is refused (#432): nothing is removed or handed to the Trash', async () => {
                 const d = withDesktopTrash();
                 d.add('Folder/a.txt', 'a');
                 await d.engine.reconcileNow();
@@ -11321,10 +11418,10 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.engine.reconcileNow();
                 await writeFile(d.local('Folder/new.txt'), 'never uploaded');
 
-                await d.engine.deleteItem('Folder');
+                await expect(d.engine.deleteItem('Folder')).rejects.toMatchObject({ code: 'EISDIR' });
 
                 expect(d.handed).toEqual([]);
-                expect(await d.files.exists('Folder')).toBe(false);
+                expect(await d.files.exists('Folder/new.txt')).toBe(true);
             });
         });
 
@@ -11569,7 +11666,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 d.down.add('trashNodes');
 
                 await d.engine.renameItem('Docs/a.txt', 'Docs/a2.txt');
-                await d.engine.deleteItem('Work');
+                await d.engine.deleteItem('Work', { trash: true });
                 await d.engine.renameItem('Docs', 'Work');
                 await d.engine.reconcileNow(); // lists the old Work, which Proton Drive still has, at its name
 
@@ -11734,7 +11831,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 d.down.add('getNode'); // the move waits
                 await d.engine.renameItem('Docs/a.txt', 'New/a.txt');
 
-                await d.engine.deleteItem('New');
+                await d.engine.deleteItem('New', { trash: true });
 
                 expect(d.journal().filter((op) => op.kind === 'trash').map((op) => op.nodeUid)).toEqual([d.uid('Docs/a.txt')]);
                 d.down.clear();
@@ -11806,7 +11903,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 d.down.add('trashNodes');
 
                 await d.engine.renameItem('F/c.txt', 'G/c.txt');
-                await d.engine.deleteItem('F');
+                await d.engine.deleteItem('F', { trash: true });
                 await d.engine.reconcileNow();
 
                 const index = d.engine.remoteIndex;
@@ -12256,7 +12353,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             expect(d.engine.itemStates('xyz/frannxoxo')!.children.Clips?.transfer).toBe('syncing');
             expect(d.engine.itemStates('xyz')!.children.frannxoxo?.transfer).toBe('syncing');
 
-            await d.engine.deleteItem('xyz/frannxoxo/Clips');
+            await d.engine.deleteItem('xyz/frannxoxo/Clips', { trash: true });
             expect(d.engine.itemStates('xyz')!.children.frannxoxo?.transfer).toBeNull();
             expect(d.engine.itemStates('')!.children.xyz?.transfer).toBeNull();
         });
@@ -13454,7 +13551,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const manual = engine.resolveConflictManually(conflict.id, 'keep-remote');
             await inside;
             let deleted = false;
-            const del = engine.deleteItem('F').then(() => (deleted = true));
+            const del = engine.deleteItem('F', { trash: true }).then(() => (deleted = true));
             await Bun.sleep(20);
             expect(deleted).toBe(false);
             release();
@@ -14219,7 +14316,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await engine.reconcileNow();
             const record = stateDb.getItemByPath('Docs/a.txt')!;
             await (engine as any).observingLocal(async (since: number) => {
-                await engine.deleteItem('Docs');
+                await engine.deleteItem('Docs', { trash: true });
                 expect((engine as any).driveTouched('Docs/a.txt', since)).toBe(true);
                 expect((engine as any).driveDestination('Docs/a.txt', since)).toBeNull();
                 // An upload begun before the delete, finishing after it, records nothing
