@@ -35,8 +35,8 @@ This app bundles the following third-party parts. Each keeps its own license.
 - Copyright: (c) 2020 Phosphor Icons
 - License text: `assets/fonts/MIT-Phosphor.txt`
 
-## App icon and tray icons
+## Proton Drive logo
 
-The app icon (`assets/app-icon/hicolor/`) and the tray icons (`assets/app-icon/tray/`) are based on the Proton Drive logo. The logo is Proton AG's artwork and trademark; it is not covered by this repository's MIT license, and is used only so the app looks like Proton Drive. To redistribute or modify this project without it, replace these icons with your own.
+The app icon (`assets/app-icon/hicolor/`), the tray icons (`assets/app-icon/tray/`), the sidebar mark (`assets/app-icon/protondrive-mark-128.png`) and the source drawings of the logo (`assets/app-icon/protondrive.svg`, `assets/app-icon/protondrive-mark.svg`) are based on the Proton Drive logo. The logo is Proton AG's artwork and trademark; it is not covered by this repository's MIT license, and is used only so the app looks like Proton Drive. To redistribute or modify this project without it, replace these icons with your own.
 
 Dependencies installed by the package managers (npm/bun, cargo) carry their own licenses in their packages.
