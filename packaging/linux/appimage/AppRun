@@ -1,0 +1,73 @@
+#!/bin/sh
+SELF="$(readlink -f "$0")"
+HERE="${SELF%/*}"
+export PATH="${HERE}/usr/bin:${PATH}"
+export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+
+# Desktop integration: an AppImage installs nothing on the host, so register the
+# Proton Docs and Sheets file types and their open handler in the user's data
+# folder. Best effort: any failure is ignored and the app always starts.
+integrate() {
+  [ -n "$APPIMAGE" ] && [ -f "$APPIMAGE" ] || return 0
+  case "$APPIMAGE" in *'
+'*) return 0 ;; esac
+  id=io.github.kosidhar.ProtonDrive
+  data="${XDG_DATA_HOME:-$HOME/.local/share}"
+  share="$HERE/usr/share"
+  changed=
+
+  # Copy a packaged file into the data folder, only if absent.
+  put() {
+    [ -e "$2" ] && return 0
+    mkdir -p "${2%/*}" && cp "$1" "$2.$$" && mv "$2.$$" "$2" && changed=1
+    rm -f "$2.$$"
+  }
+  put "$share/mime/packages/$id.xml" "$data/mime/packages/$id.xml"
+  for kind in doc sheet; do
+    f="icons/hicolor/scalable/mimetypes/application-vnd.proton.$kind.svg"
+    put "$share/$f" "$data/$f"
+  done
+
+  # The open handler runs this AppImage. Quote the path for Exec: a literal
+  # backslash is written as four (string escape, then quoting), " ` $ get one
+  # backslash, and % is doubled. An entry without our marker belongs to
+  # install.sh or a package and is never touched.
+  desktop="$data/applications/$id.OpenDoc.desktop"
+  if [ ! -e "$desktop" ] || grep -qx 'X-Kosidhar-AppImage=true' "$desktop"; then
+    q="$(printf '%s' "$APPIMAGE" | sed -e 's/\\/\\\\\\\\/g' -e 's/["`$]/\\&/g' -e 's/%/%%/g')"
+    mkdir -p "${desktop%/*}" || return 0
+    {
+      while IFS= read -r line; do
+        case "$line" in
+          Exec=*) printf 'Exec="%s" open-doc %%f\n' "$q" ;;
+          TryExec=*) ;;
+          *) printf '%s\n' "$line" ;;
+        esac
+      done < "$share/applications/$id.OpenDoc.desktop"
+      printf 'X-Kosidhar-AppImage=true\n'
+    } > "$desktop.$$" || { rm -f "$desktop.$$"; return 0; }
+    if cmp -s "$desktop.$$" "$desktop"; then
+      rm -f "$desktop.$$"
+    elif mv "$desktop.$$" "$desktop"; then
+      changed=1
+    else
+      rm -f "$desktop.$$"
+    fi
+  fi
+
+  [ -n "$changed" ] || return 0
+  if command -v update-mime-database >/dev/null; then
+    update-mime-database "$data/mime" >/dev/null 2>&1
+  fi
+  if command -v update-desktop-database >/dev/null; then
+    update-desktop-database "$data/applications" >/dev/null 2>&1
+  fi
+  return 0
+}
+integrate >/dev/null 2>&1 </dev/null
+
+if [ $# -gt 0 ] && [ "$1" != "--screenshot" ] && [ "$1" != "--version" ] && [ "$1" != "--help" ] && [ "$1" != "-h" ]; then
+  exec "${HERE}/usr/bin/protondrive" "$@"
+else
+  exec "${HERE}/usr/bin/protondrive-gui" "$@"
+fi

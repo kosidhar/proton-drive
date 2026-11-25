@@ -170,20 +170,10 @@ if has appimage; then
   APPDIR="$WORK/ProtonDrive.AppDir"
   cp -R "$STAGE" "$APPDIR"
 
-  # Custom AppRun that adds $APPDIR/usr/bin to PATH so protondrive-gui can auto-spawn protondrive daemon
-  cat > "$APPDIR/AppRun" <<'EOF'
-#!/bin/sh
-SELF="$(readlink -f "$0")"
-HERE="${SELF%/*}"
-export PATH="${HERE}/usr/bin:${PATH}"
-export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
-if [ $# -gt 0 ] && [ "$1" != "--screenshot" ] && [ "$1" != "--version" ] && [ "$1" != "--help" ] && [ "$1" != "-h" ]; then
-  exec "${HERE}/usr/bin/protondrive" "$@"
-else
-  exec "${HERE}/usr/bin/protondrive-gui" "$@"
-fi
-EOF
-  chmod 0755 "$APPDIR/AppRun"
+  # AppRun puts $APPDIR/usr/bin on PATH (so protondrive-gui can spawn the daemon), dispatches
+  # CLI arguments, and registers the Docs and Sheets file types on the host at launch. The MIME
+  # XML, icons and OpenDoc.desktop it copies are the ones staged under usr/share above.
+  install -m 0755 "$HERE/appimage/AppRun" "$APPDIR/AppRun"
 
   cp "$HERE/$APP_ID.desktop" "$APPDIR/$APP_ID.desktop"
   cp "$ROOT/assets/app-icon/hicolor/256x256/apps/$APP_ID.png" "$APPDIR/$APP_ID.png"

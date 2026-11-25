@@ -106,6 +106,8 @@ chmod +x ./dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.AppImage
 ./dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.AppImage
 ```
 
+The first time it runs, the AppImage registers the Proton Docs and Sheets file types and an open handler under `~/.local/share`, so the `.protondoc` and `.protonsheet` placeholders open in your browser. If you move the AppImage file, it updates them the next time it runs. To remove them, delete `~/.local/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop`, `~/.local/share/mime/packages/io.github.kosidhar.ProtonDrive.xml` and the two icons `~/.local/share/icons/hicolor/scalable/mimetypes/application-vnd.proton.{doc,sheet}.svg`, then run `update-mime-database ~/.local/share/mime`.
+
 ---
 
 ## CLI Reference
