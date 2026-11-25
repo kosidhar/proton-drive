@@ -352,7 +352,13 @@ fn paint_share_loading(ui: &mut egui::Ui) {
     let (_, centre) = allocate_picture_circle(ui);
     home::paint_turned_glyph(ui.painter(), centre, icons::SYNC, 44.0, share_picture_colors(palette()).glyph, home::turning_angle(ui));
     ui.add_space(20.0);
-    ui.label(RichText::new(shared::LOADING).size(13.0).color(TEXT_MUTED()));
+    let words = ui.label(RichText::new(shared::LOADING).size(13.0).color(TEXT_MUTED()));
+    announce_politely(ui, &words);
+}
+
+/// Has screen readers say `label` as it appears, without taking the focus (as `working_line` does, #370).
+fn announce_politely(ui: &egui::Ui, label: &egui::Response) {
+    ui.ctx().accesskit_node_builder(label.id, |node| node.set_live(egui::accesskit::Live::Polite));
 }
 
 /// The empty Shared page's picture, for looking at only (screen readers get the heading): a link in a soft circle with
@@ -408,14 +414,16 @@ impl ProtonDriveNativeApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // Only a list has a Refresh here. The empty page and the error have their own, centred where
                     // the eyes are, and a first read has the page's loading picture
-                    if self.shared.error.is_some() || !self.shared.has_rows() {
-                    } else if self.shared.loading {
-                        // The rows reload (greyed out): the arrows turn here, where Refresh was. Right to left:
-                        // the words, then the arrows
-                        ui.label(RichText::new(shared::REFRESHING).size(13.0).color(TEXT_MUTED()));
-                        home::turning_decoration(ui, icons::SYNC, 16.0, PROTON_PURPLE_TEXT(), home::turning_angle(ui));
-                    } else if action_button(ui, ButtonKind::Secondary, Some(icons::SYNC), "Refresh", 34.0).clicked() {
-                        self.load_shared();
+                    if self.shared.has_rows() && self.shared.error.is_none() {
+                        if self.shared.loading {
+                            // The rows reload (greyed out): the arrows turn here, where Refresh was. Right to left:
+                            // the words, then the arrows
+                            let words = ui.label(RichText::new(shared::REFRESHING).size(13.0).color(TEXT_MUTED()));
+                            announce_politely(ui, &words);
+                            home::turning_decoration(ui, icons::SYNC, 16.0, PROTON_PURPLE_TEXT(), home::turning_angle(ui));
+                        } else if action_button(ui, ButtonKind::Secondary, Some(icons::SYNC), "Refresh", 34.0).clicked() {
+                            self.load_shared();
+                        }
                     }
                 });
             });
