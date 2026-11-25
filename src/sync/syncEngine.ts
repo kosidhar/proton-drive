@@ -97,6 +97,9 @@ const MAX_PERMANENT_REFUSALS = 3;
 const GIVE_UP_UNMAPPED_AFTER_MS = 24 * 60 * 60_000;
 const MIN_UNMAPPED_FAILURES = 5;
 const MAX_REPLAY_BACKOFF_MS = 60 * 60_000;
+// How many fresh listings an rmdir asks for (#435): another is needed only when the folder changes while one is on its
+// way, which happening again and again is refused with EIO
+const RMDIR_LISTINGS = 2;
 // An item that keeps failing in sync passes is tried again after 1 minute, doubling each time, up to this (#18)
 const MAX_ITEM_BACKOFF_MS = 60 * 60_000;
 // A local file that changed uploads only once it has stayed as it is (size and times) this long, so that a copy that
@@ -3974,11 +3977,13 @@ export class ProtonDriveSyncEngine {
     // Deletes an item of My files through the virtual drive: its local copy (everything in it, things that exist only on
     // this computer included, as the user asked), its records and its index entries go at once, and Proton Drive moves it
     // to its trash from the journal, downloading nothing. An ignored item is only ever local, so only its local copy goes.
-    // With onlyIfEmpty (rmdir), only a folder that holds nothing, here or in Proton Drive, is deleted. With trash (Move
-    // to Trash through the drive), what exists only on this computer (never uploaded, or changed since) goes to the
-    // desktop Trash rather than away, as after a cloud delete, and the user is told.
+    // With onlyIfEmpty (rmdir), only a folder that holds nothing, here or in Proton Drive, is deleted: one Proton Drive
+    // has is listed there first (#435). With trash (Move to Trash through the drive), what exists only on this computer
+    // (never uploaded, or changed since) goes to the desktop Trash rather than away, as after a cloud delete, and the user
+    // is told.
     // Rejects with a DriveOpError: `Not found: <path>` (ENOENT), `Hidden: <path>` (EACCES), with onlyIfEmpty `Not empty:
-    // <path>` (ENOTEMPTY) or `Not a folder: <path>` (EIO); without either, `Is a folder: <path>` (EISDIR); or with `Invalid path: <path>`.
+    // <path>` (ENOTEMPTY), `Not a folder: <path>` (EIO), or EIO when the folder can't be listed in Proton Drive; without
+    // either, `Is a folder: <path>` (EISDIR); or with `Invalid path: <path>`.
     async deleteItem(
         relPath: string,
         opts: { onlyIfEmpty?: boolean; trash?: boolean; deadlineMs?: number } = {},
@@ -3990,11 +3995,24 @@ export class ProtonDriveSyncEngine {
         }
         this.refusePlaceholder(rel);
         await this.afterResolutions([rel], opts.deadlineMs);
-        await this.inAvailabilityRun(() => {
-            this.refuseWhileHeld(); // again: a move of the files may have begun while it waited
-            this.inTime(opts.deadlineMs, rel);
-            return this.drivingAt([rel], () => this.deleteLocally(rel, opts.onlyIfEmpty === true, opts.trash === true));
-        });
+        // An rmdir that would trash a cloud folder needs a fresh listing of it (#435). The listing is asked for between
+        // two turns, never during one, and the next turn looks at the folder afresh: it may have changed meanwhile, and
+        // then need a listing of another node.
+        let listing: RmdirListing | null = null;
+        for (let listed = 0; ; listed += 1) {
+            const toList = await this.inAvailabilityRun(() => {
+                this.refuseWhileHeld(); // again: a move of the files may have begun while it waited
+                this.inTime(opts.deadlineMs, rel);
+                return this.drivingAt([rel], () => this.deleteLocally(rel, opts.onlyIfEmpty === true, opts.trash === true, listing));
+            });
+            if (toList === null) {
+                break;
+            }
+            if (listed === RMDIR_LISTINGS) {
+                throw new DriveOpError('EIO', `Changed while being looked at: ${rel}`);
+            }
+            listing = await this.listForRmdir(toList, rel);
+        }
         void this.replayRemoteOps();
     }
 
@@ -5772,7 +5790,14 @@ export class ProtonDriveSyncEngine {
         }
     }
 
-    private async deleteLocally(relPath: string, onlyIfEmpty: boolean, trash: boolean): Promise<void> {
+    // Resolves to null once done, or, for an rmdir, to the uid of the cloud folder it has to have a fresh listing of
+    // before it goes on (nothing has changed then): see deleteItem.
+    private async deleteLocally(
+        relPath: string,
+        onlyIfEmpty: boolean,
+        trash: boolean,
+        listing: RmdirListing | null = null,
+    ): Promise<string | null> {
         this.recoverLocalMove();
         if (this.policy.hiddenBy(relPath)?.hide === 'hidden') {
             throw new DriveOpError('EACCES', `Hidden: ${relPath}`);
@@ -5800,6 +5825,19 @@ export class ProtonDriveSyncEngine {
             }
             if (await this.holdsAnything(relPath, Boolean(shown), entry)) {
                 throw new DriveOpError('ENOTEMPTY', `Not empty: ${relPath}`);
+            }
+            // What this computer knows of the cloud folder can be behind (#435): Docs and Sheets not recorded yet, an item
+            // added since the last listing. The folder goes to the Proton Drive trash with whatever it holds there, so
+            // it goes only once a listing of it, asked for after this turn's look, finds nothing more.
+            const cloudFolder = ignored ? null : this.cloudFolderOfRmdir(relPath, entry);
+            if (cloudFolder !== null) {
+                if (!listing || listing.uid !== cloudFolder) {
+                    return cloudFolder;
+                }
+                if (this.listingHoldsAnything(relPath, listing)) {
+                    this.recordRmdirListing(relPath, listing);
+                    throw new DriveOpError('ENOTEMPTY', `Not empty: ${relPath}`);
+                }
             }
         }
         // A local item of the other kind than the cloud item at its path (a file here where Proton Drive has a folder,
@@ -5926,6 +5964,7 @@ export class ProtonDriveSyncEngine {
                 enabled: this.stateDb.getSettings().notificationsEnabled,
             });
         }
+        return null;
     }
 
     // The local file at a path in an unresolved collision (#29), or null: a file made or changed here and another file,
@@ -6078,6 +6117,71 @@ export class ProtonDriveSyncEngine {
             return true;
         }
         return [...latest.values()].some((op) => op.kind !== 'trash' && op.toPath.startsWith(`${relPath}/`));
+    }
+
+    // The cloud folder an rmdir of relPath sends to the Proton Drive trash, if any, as trashTargets picks it: the node its
+    // record names, or else the folder the remote index has there. A folder only on this computer has none.
+    private cloudFolderOfRmdir(relPath: string, entry: RemoteIndexEntry | null): string | null {
+        const record = this.stateDb.getItemByPath(relPath);
+        if (record) {
+            return record.type === 'folder' && !isProvisional(record.nodeUid) ? record.nodeUid : null;
+        }
+        return entry?.type === 'folder' ? nodeUidOf(entry) : null;
+    }
+
+    // A fresh listing of the cloud folder an rmdir would trash (#435), with the journal as it was just before it was asked
+    // for. A listing that fails (offline, say) refuses the rmdir with EIO, which the drive's helper passes on for an rmdir
+    // (an app may try again): while what is in the folder isn't known, nothing is trashed.
+    private async listForRmdir(uid: string, relPath: string): Promise<RmdirListing> {
+        const pending = this.journal.pending();
+        const before = {
+            latestOpBefore: new Map(pending.map((op) => [op.nodeUid, op])), // in journal order: the latest of each node wins
+            opsBefore: pending.map((op) => op.id),
+            lastOpBefore: this.journal.lastId(),
+        };
+        try {
+            const node = await this.sdk.getNode(uid);
+            return { uid, node, children: await listFolderChildren(this.sdk, node), ...before };
+        } catch (error: unknown) {
+            throw new DriveOpError('EIO', `Could not list ${relPath} in Proton Drive to see that it is empty: ${messageOf(error)}`, {
+                cause: error,
+            });
+        }
+    }
+
+    // Whether a fresh listing of the folder at relPath has anything in it that is to stay there: a Proton Doc or Sheet, or
+    // any item that no trash or move elsewhere through the drive takes away. Such an operation can still be pending, or
+    // can have been pending when the listing was asked for and have reached Proton Drive since (the listing may still
+    // have the item then): that item counts only while the remote index still has it in the folder.
+    private listingHoldsAnything(relPath: string, listing: RmdirListing): boolean {
+        const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
+        const takesOut = (op: RemoteOp | undefined) => op !== undefined && (op.kind === 'trash' || !op.toPath.startsWith(`${relPath}/`));
+        return listing.children.some((child) => {
+            const now = latest.get(child.uid);
+            if (now) {
+                return !takesOut(now);
+            }
+            if (takesOut(listing.latestOpBefore.get(child.uid))) {
+                return this.index.getByUid(child.uid)?.parentUid === listing.uid;
+            }
+            return true;
+        });
+    }
+
+    // Records the listing an rmdir was refused for, so the remote index and the recorded Docs and Sheets catch up and the
+    // drive shows what is in the folder. Not when an operation of the journal reached Proton Drive (or was given up on)
+    // while the listing was on its way: the listing may be older than what that put in the index (#235). The next listing
+    // of the folder records it then.
+    private recordRmdirListing(relPath: string, listing: RmdirListing): void {
+        const pending = new Set(this.journal.pending().map((op) => op.id));
+        const lastOp = this.journal.lastId();
+        let overtaken = listing.opsBefore.some((id) => !pending.has(id));
+        for (let id = listing.lastOpBefore + 1; id <= lastOp && !overtaken; id += 1) {
+            overtaken = !pending.has(id);
+        }
+        if (!overtaken) {
+            this.recordListing(listing.node, relPath, listing.children);
+        }
     }
 
     // What goes to the Proton Drive trash for a delete of relPath: the item itself if Proton Drive has it, and whatever was
@@ -7974,6 +8078,18 @@ export interface FilesMissingStatus {
     names: string[];
     items: number;
     message: string;
+}
+
+// A fresh listing of a cloud folder for an rmdir (#435): the uid it was asked for, the node and its children in Proton
+// Drive, and the journal just before the listing was asked for (the latest pending operation of each node, the ids of
+// those pending, and the latest id given)
+interface RmdirListing {
+    uid: string;
+    node: NodeEntity;
+    children: NodeEntity[];
+    latestOpBefore: Map<string, RemoteOp>;
+    opsBefore: number[];
+    lastOpBefore: number;
 }
 
 // What one removal of local copies took away: paths whose records it dropped, and whole subtrees it moved away (a move
