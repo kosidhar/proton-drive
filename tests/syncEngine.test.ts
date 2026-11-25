@@ -7402,6 +7402,21 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 });
             const engine = start();
             const files = localFiles(stateDb, () => backingDir);
+            // A record that names a node of the other kind (a file recorded as a folder's node, or the reverse) is trusted
+            // by the sync: an upload of the file goes out as a new revision of the folder, and the file gone reads as the
+            // folder deleted (#453). Each record is of the kind the index has its node as, when the index has it
+            const expectNoRecordOfTheOtherKind = () => {
+                for (const item of stateDb.getAllItems()) {
+                    const entry = engine.remoteIndex.getByUid(item.nodeUid);
+                    if (entry) {
+                        expect({ path: item.localRelPath, nodeUid: item.nodeUid, type: item.type }).toEqual({
+                            path: item.localRelPath,
+                            nodeUid: item.nodeUid,
+                            type: entry.type,
+                        });
+                    }
+                }
+            };
             // A record whose file is gone reads as the user deleting it, which trashes the cloud copy
             const expectEveryRecordHasItsFile = async () => {
                 for (const item of stateDb.getAllItems()) {
@@ -7410,6 +7425,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                         exists: true,
                     });
                 }
+                expectNoRecordOfTheOtherKind();
             };
             const named = (parentUid: string, name: string) =>
                 [...drive.nodes.values()].filter((n) => n.parentUid === parentUid && drive.nameOf(n) === name && n.uid !== drive.root.uid);
@@ -7420,6 +7436,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 files,
                 handedToTrash,
                 expectEveryRecordHasItsFile,
+                expectNoRecordOfTheOtherKind,
                 named,
                 journal: () => new RemoteOpsJournal(stateDb.connection).pending(),
                 local: (rel: string) => path.join(backingDir, rel),
@@ -8233,6 +8250,319 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.engine.replayRemoteOps();
                 expect(d.calls.trashed).toEqual([['vol~X']]);
                 expect(await readFile(target, 'utf8')).toBe('not in the drive');
+            });
+
+            // #453: a rename from or onto such a path takes its nodes as a delete does (#447). The local item moves as
+            // itself, a new item as one only here would be: nothing is journalled for the cloud item, which stays where
+            // it is, indexed and listed again at its name, and no record ever names it. Renames of the same kind, and of a
+            // symlink the drive doesn't show, are as before.
+            describe('a rename through the drive (#453)', () => {
+                const touchesX = (uid: string) => uid === 'vol~X' || uid.startsWith('vol~X/');
+                // Nothing journalled for the cloud item, which no record names, and after the next sync it is at X as it
+                // was, not renamed, moved, trashed or written over, and listed by the drive there as Proton Drive has it
+                const expectCloudItemStays = async (d: Watched, type: 'file' | 'folder') => {
+                    expect(d.journalled().filter((op) => touchesX(op.nodeUid))).toEqual([]);
+                    expect(stateDb.getItemByNodeUid('vol~X')).toBeNull();
+                    expect(d.engine.remoteIndex.getByPath('X')).toMatchObject({ uid: 'vol~X', type });
+                    d.expectNoRecordOfTheOtherKind();
+                    await d.engine.replayRemoteOps();
+                    await d.engine.reconcileNow();
+                    expect(d.calls.renamed.filter((r) => touchesX(r.uid))).toEqual([]);
+                    expect(d.calls.moved.filter((m) => touchesX(m.uid))).toEqual([]);
+                    expect(d.calls.trashed.flat().filter(touchesX)).toEqual([]);
+                    expect(d.nodes.get('vol~X')).toMatchObject({ type, parentUid: d.root.uid, name: { ok: true, value: 'X' } });
+                    if (type === 'file') {
+                        expect(d.nodes.get('vol~X')?.content).toBe('theirs');
+                    }
+                    expect(stateDb.getItemByNodeUid('vol~X')).toBeNull();
+                    expect(d.engine.remoteIndex.getByPath('X')).toMatchObject({ uid: 'vol~X', type });
+                    expect(d.engine.vfsChildren('').find((e) => e.name === 'X')?.type).toBe(type);
+                    await d.expectEveryRecordHasItsFile();
+                };
+                // What uploaded as a new item at a name, by content
+                const uploadedAt = (d: Watched, name: string) =>
+                    d.named(d.root.uid, name).filter((n) => n.uid.startsWith('vol~uploaded')).map((n) => n.content);
+                const refusedRename = (d: Watched, from: string, to: string) =>
+                    d.engine.renameItem(from, to).then(
+                        () => null,
+                        (e: unknown) => (e instanceof DriveOpError ? e.code : e),
+                    );
+
+                describe('a file here, a folder in Proton Drive', () => {
+                    test('renaming the local file moves only it: the cloud folder keeps its name, and the file uploads as new', async () => {
+                        const d = await fileOverFolder();
+
+                        await d.engine.renameItem('X', 'Y');
+
+                        expect(d.journalled()).toEqual([]);
+                        expect(await d.files.exists('X')).toBe(false);
+                        expect(await readFile(d.local('Y'), 'utf8')).toBe('mine');
+                        expect(stateDb.getItemByPath('Y')).toBeNull();
+                        expect(d.engine.vfsChildren('').find((e) => e.name === 'X')?.type).toBe('folder');
+                        expect(activity()).toContain('Renamed on this computer: X → Y; the folder Proton Drive has at X stays');
+                        await expectCloudItemStays(d, 'folder');
+                        expectFolderContentKept(d);
+                        expect(d.calls.uploads).toEqual(['Y']);
+                        expect(uploadedAt(d, 'Y')).toEqual(['mine']);
+                        expect(stateDb.getItemByPath('Y')?.nodeUid).toBe(d.named(d.root.uid, 'Y')[0]!.uid);
+                    });
+
+                    // The replace keeps the target's identity, as any replace of a cloud file does; the source stands for
+                    // no node, so nothing of it goes to the trash
+                    test('renaming the local file over a cloud file is a new revision of that file, and the cloud folder stays', async () => {
+                        const d = await fileOverFolder();
+                        d.add('Y', 'old');
+                        await d.engine.reconcileNow();
+
+                        await d.engine.renameItem('X', 'Y');
+
+                        expect(d.journalled()).toEqual([]);
+                        expect(stateDb.getItemByPath('Y')).toMatchObject({ nodeUid: 'vol~Y', type: 'file' });
+                        await expectCloudItemStays(d, 'folder');
+                        expectFolderContentKept(d);
+                        expect(d.calls.uploads).toEqual(['Y']);
+                        expect(d.nodes.get('vol~Y')?.content).toBe('mine');
+                        expect(d.calls.trashed).toEqual([]);
+                    });
+
+                    // Both sides mismatched: a local file over a cloud folder renamed onto another local file over another
+                    // cloud folder. Before #453 this journalled a trash of the folder at X and recorded Y as the folder at Y
+                    test('renaming such a file onto another such file touches neither cloud folder', async () => {
+                        const d = await fileOverFolder();
+                        d.add('Y/inner2.txt', 'inner2');
+                        await d.engine.reconcileNow();
+                        await d.files.writeLocal('Y', 'also mine');
+
+                        await d.engine.renameItem('X', 'Y');
+
+                        expect(d.journalled()).toEqual([]);
+                        expect(await d.files.exists('X')).toBe(false);
+                        expect(await readFile(d.local('Y'), 'utf8')).toBe('mine');
+                        expect(stateDb.getItemByNodeUid('vol~X')).toBeNull();
+                        expect(stateDb.getItemByNodeUid('vol~Y')).toBeNull();
+                        d.expectNoRecordOfTheOtherKind();
+                        await d.engine.replayRemoteOps();
+                        await d.engine.reconcileNow();
+                        expect(d.calls.trashed).toEqual([]);
+                        expect(d.calls.renamed).toEqual([]);
+                        expect(d.calls.moved).toEqual([]);
+                        expect(d.nodes.get('vol~X')).toMatchObject({ type: 'folder', name: { ok: true, value: 'X' } });
+                        expect(d.nodes.get('vol~Y')).toMatchObject({ type: 'folder', name: { ok: true, value: 'Y' } });
+                        expect(d.engine.remoteIndex.getByPath('X')).toMatchObject({ uid: 'vol~X', type: 'folder' });
+                        expect(d.engine.remoteIndex.getByPath('Y')).toMatchObject({ uid: 'vol~Y', type: 'folder' });
+                        expectFolderContentKept(d);
+                        await d.expectEveryRecordHasItsFile();
+                    });
+
+                    // An editor's save: the new content is written to a temp file, which is renamed over the file. What
+                    // replaces the local file is a new item, as it would be over a file only here: it doesn't take the
+                    // cloud folder's identity. It stays here, beside the folder in Proton Drive, until the sync can put
+                    // a local file whose name a cloud folder holds anywhere (#171): never written over the folder
+                    test("an editor's save over the local file takes nothing of the cloud folder: no record names it, and both stay", async () => {
+                        const d = await fileOverFolder();
+                        await d.files.writeLocal('X.tmp', 'mine, saved');
+
+                        await d.engine.renameItem('X.tmp', 'X');
+
+                        expect(d.journalled()).toEqual([]);
+                        expect(stateDb.getItemByPath('X')).toBeNull();
+                        expect(await d.files.exists('X.tmp')).toBe(false);
+                        await expectCloudItemStays(d, 'folder');
+                        expectFolderContentKept(d);
+                        expect(await readFile(d.local('X'), 'utf8')).toBe('mine, saved');
+                        expect(d.calls.uploads).toEqual([]);
+                        expect(stateDb.getItemByPath('X')).toBeNull();
+                    });
+
+                    // A temp file that uploaded before the save has its own node: that moves to the name, as over a file
+                    // only here. Proton Drive refuses it the folder's name: it takes a conflict name, here and there
+                    test("an editor's save from a temp file that had uploaded: its node takes the name, and the folder keeps it in Proton Drive", async () => {
+                        const d = await fileOverFolder();
+                        await d.files.writeLocal('X.tmp', 'mine, saved');
+                        await d.engine.reconcileNow();
+                        expect(d.calls.uploads).toEqual(['X.tmp']);
+                        const tempUid = stateDb.getItemByPath('X.tmp')!.nodeUid;
+
+                        await d.engine.renameItem('X.tmp', 'X');
+
+                        expect(d.journalled()).toMatchObject([{ kind: 'rename', nodeUid: tempUid, toPath: 'X' }]);
+                        expect(stateDb.getItemByPath('X')?.nodeUid).toBe(tempUid);
+                        await expectCloudItemStays(d, 'folder');
+                        expectFolderContentKept(d);
+                        expect(d.calls.uploads).toEqual(['X.tmp']);
+                        expect(d.nodes.get(tempUid)?.content).toBe('mine, saved');
+                        const conflictName = d.nameOf(d.nodes.get(tempUid)!);
+                        expect(conflictName).toMatch(/^X \(conflict .+\)$/);
+                        expect(await readdir(d.local(''))).toEqual([conflictName]);
+                        expect(await readFile(d.local(conflictName), 'utf8')).toBe('mine, saved');
+                        expect(stateDb.getItemByPath(conflictName)).toMatchObject({ nodeUid: tempUid, type: 'file' });
+                        expect(d.calls.trashed).toEqual([]);
+                    });
+
+                    test('a stale record that names the cloud folder: renaming the file moves only it, and the record goes', async () => {
+                        const d = await fileOverFolder();
+                        recordX('vol~X', 'folder');
+
+                        await d.engine.renameItem('X', 'Y');
+
+                        expect(d.journalled()).toEqual([]);
+                        expect(stateDb.getItemByPath('Y')).toBeNull();
+                        expect(stateDb.getItemByPath('X')).toBeNull();
+                        await expectCloudItemStays(d, 'folder');
+                        expectFolderContentKept(d);
+                        expect(uploadedAt(d, 'Y')).toEqual(['mine']);
+                    });
+
+                    test("an editor's save over a file with a stale record that names the cloud folder: the record goes, and no record names the folder", async () => {
+                        const d = await fileOverFolder();
+                        recordX('vol~X', 'folder');
+                        await d.files.writeLocal('X.tmp', 'mine, saved');
+
+                        await d.engine.renameItem('X.tmp', 'X');
+
+                        expect(d.journalled()).toEqual([]);
+                        expect(stateDb.getItemByPath('X')).toBeNull();
+                        await expectCloudItemStays(d, 'folder');
+                        expectFolderContentKept(d);
+                        expect(await readFile(d.local('X'), 'utf8')).toBe('mine, saved');
+                    });
+
+                    // A record of another node is what the file was synced as: that node is renamed with it, never the
+                    // folder (as a delete trashes that node, #447)
+                    test('a file recorded as another node: renaming it renames that node, and the folder stays', async () => {
+                        const d = await fileOverFolder();
+                        recordX('vol~Elsewhere/mine.txt', 'file');
+
+                        await d.engine.renameItem('X', 'Y');
+
+                        expect(d.journalled()).toMatchObject([{ kind: 'rename', nodeUid: 'vol~Elsewhere/mine.txt', toPath: 'Y' }]);
+                        expect(stateDb.getItemByPath('Y')?.nodeUid).toBe('vol~Elsewhere/mine.txt');
+                        expect(d.engine.remoteIndex.getByPath('X')).toMatchObject({ uid: 'vol~X', type: 'folder' });
+                        expectFolderContentKept(d);
+                    });
+                });
+
+                describe('a folder here, a file in Proton Drive', () => {
+                    test('renaming the local folder moves only it, with what is in it: the cloud file keeps its name, and the folder uploads as new', async () => {
+                        const d = await folderOverFile('mine.txt');
+
+                        await d.engine.renameItem('X', 'Y');
+
+                        expect(d.journalled()).toEqual([]);
+                        expect(await d.files.exists('X')).toBe(false);
+                        expect(await readFile(d.local('Y/mine.txt'), 'utf8')).toBe('mine');
+                        expect(d.engine.vfsChildren('').find((e) => e.name === 'X')?.type).toBe('file');
+                        expect(activity()).toContain('Renamed on this computer: X → Y; the file Proton Drive has at X stays');
+                        await expectCloudItemStays(d, 'file');
+                        expect(d.calls.uploads).toEqual(['Y/mine.txt']);
+                        expect(stateDb.getItemByPath('Y')?.type).toBe('folder');
+                        expect(stateDb.getItemByPath('Y/mine.txt')?.type).toBe('file');
+                    });
+
+                    test('a stale record that names the cloud file: renaming the folder moves only it, and the record goes', async () => {
+                        const d = await folderOverFile('mine.txt');
+                        recordX('vol~X', 'file');
+
+                        await d.engine.renameItem('X', 'Y');
+
+                        expect(d.journalled()).toEqual([]);
+                        expect(stateDb.getItemByPath('Y')).toBeNull();
+                        await expectCloudItemStays(d, 'file');
+                        expect(d.calls.uploads).toEqual(['Y/mine.txt']);
+                    });
+
+                    // Only a file replaces, and only a file: as before #453
+                    test("an editor's save over the local folder is refused with EEXIST: nothing changes", async () => {
+                        const d = await folderOverFile('mine.txt');
+                        await d.files.writeLocal('X.tmp', 'saved');
+
+                        expect(await refusedRename(d, 'X.tmp', 'X')).toBe('EEXIST');
+
+                        expect(d.journalled()).toEqual([]);
+                        expect(await readFile(d.local('X/mine.txt'), 'utf8')).toBe('mine');
+                        expect(await readFile(d.local('X.tmp'), 'utf8')).toBe('saved');
+                        expect(d.engine.remoteIndex.getByPath('X')).toMatchObject({ uid: 'vol~X', type: 'file' });
+                    });
+                });
+
+                // Controls: the local item of the same kind as the cloud item at its path, with no record either, is that
+                // item, as before
+                describe('the same kind here and in Proton Drive', () => {
+                    const sameKind = async (make: (d: ReturnType<typeof setup>) => Promise<void>) => {
+                        const d = setup();
+                        await make(d);
+                        return journalling(d);
+                    };
+                    const expectCloudItemRenamed = async (d: Watched) => {
+                        expect(d.journalled()).toMatchObject([{ kind: 'rename', nodeUid: 'vol~X', toPath: 'Y' }]);
+                        expect(d.engine.remoteIndex.getByPath('Y')?.uid).toBe('vol~X');
+                        await d.engine.replayRemoteOps();
+                        expect(d.calls.renamed).toEqual([{ uid: 'vol~X', name: 'Y' }]);
+                        expect(d.calls.trashed).toEqual([]);
+                    };
+
+                    test('renaming a local file with the very content of the cloud file renames that file', async () => {
+                        const d = await sameKind(async (d) => {
+                            d.add('X', 'same');
+                            await d.engine.reconcileNow();
+                            await d.files.writeLocal('X', 'same');
+                        });
+                        await d.engine.renameItem('X', 'Y');
+                        await expectCloudItemRenamed(d);
+                        expect(await readFile(d.local('Y'), 'utf8')).toBe('same');
+                    });
+
+                    test('renaming a local folder where Proton Drive has a folder renames that folder', async () => {
+                        const d = await sameKind(async (d) => {
+                            d.add('X/inner.txt', 'inner');
+                            await d.engine.reconcileNow();
+                            await mkdir(d.local('X'), { recursive: true });
+                        });
+                        await d.engine.renameItem('X', 'Y');
+                        await expectCloudItemRenamed(d);
+                        expect(d.engine.remoteIndex.getByPath('Y/inner.txt')?.uid).toBe('vol~X/inner.txt');
+                    });
+
+                    test("an editor's save over a local file with the very content of the cloud file is a new revision of that file", async () => {
+                        const d = await sameKind(async (d) => {
+                            d.add('X', 'same');
+                            await d.engine.reconcileNow();
+                            await d.files.writeLocal('X', 'same');
+                        });
+                        await d.files.writeLocal('X.tmp', 'saved');
+
+                        await d.engine.renameItem('X.tmp', 'X');
+
+                        expect(d.journalled()).toEqual([]);
+                        expect(stateDb.getItemByPath('X')).toMatchObject({ nodeUid: 'vol~X', type: 'file' });
+                        await d.engine.reconcileNow();
+                        expect(d.calls.uploads).toEqual(['X']);
+                        expect(d.nodes.get('vol~X')?.content).toBe('saved');
+                        expect(d.calls.trashed).toEqual([]);
+                        await d.expectEveryRecordHasItsFile();
+                    });
+                });
+
+                // The drive doesn't show a symlink of its backing store, and shows the cloud folder there instead: a
+                // rename of that name is of the cloud folder, as before #453
+                test('a symlink here, which the drive does not show: a rename of the cloud folder it shows renames it', async () => {
+                    const d = setup();
+                    d.add('X/inner.txt', 'inner');
+                    await d.engine.reconcileNow();
+                    const target = path.join(tempDir, 'elsewhere.txt');
+                    await writeFile(target, 'not in the drive');
+                    await mkdir(d.local(''), { recursive: true });
+                    await symlink(target, d.local('X'));
+                    const w = journalling(d);
+
+                    await d.engine.renameItem('X', 'Y');
+
+                    expect(w.journalled()).toMatchObject([{ kind: 'rename', nodeUid: 'vol~X', toPath: 'Y' }]);
+                    await d.engine.replayRemoteOps();
+                    expect(d.calls.renamed).toEqual([{ uid: 'vol~X', name: 'Y' }]);
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(await readFile(target, 'utf8')).toBe('not in the drive');
+                });
             });
         });
 
