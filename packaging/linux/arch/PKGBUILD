@@ -5,7 +5,7 @@ pkgrel=1
 pkgdesc="Native Linux desktop client and two-way folder sync daemon for Proton Drive"
 arch=('x86_64' 'aarch64')
 url="https://github.com/kosidhar/proton-drive"
-license=('MIT')
+license=('MIT' 'GPL-3.0-only')
 depends=('glibc' 'gcc-libs' 'libxkbcommon' 'vulkan-icd-loader' 'hicolor-icon-theme' 'fuse3')
 optdepends=(
   'glib2: gio, used to move files to the desktop Trash'

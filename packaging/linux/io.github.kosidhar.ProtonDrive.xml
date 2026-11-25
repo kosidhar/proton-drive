@@ -3,11 +3,13 @@
   <mime-type type="application/vnd.proton.doc">
     <comment>Proton Docs document</comment>
     <glob pattern="*.protondoc"/>
+    <icon name="application-vnd.proton.doc"/>
     <generic-icon name="x-office-document"/>
   </mime-type>
   <mime-type type="application/vnd.proton.sheet">
     <comment>Proton Sheets spreadsheet</comment>
     <glob pattern="*.protonsheet"/>
+    <icon name="application-vnd.proton.sheet"/>
     <generic-icon name="x-office-spreadsheet"/>
   </mime-type>
 </mime-info>

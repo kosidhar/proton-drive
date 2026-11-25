@@ -9,7 +9,7 @@ priority: optional
 maintainer: ${PROTONDRIVE_MAINTAINER}
 vendor: Kosidhar
 homepage: https://github.com/kosidhar/proton-drive
-license: MIT
+license: MIT AND GPL-3.0-only
 description: |-
   Native Linux desktop client and two-way folder sync daemon for Proton Drive.
   Built on the official Proton Drive SDK (@protontech/drive-sdk) with a fast
