@@ -23,7 +23,10 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 function harness() {
     const opened: string[] = [];
     const notes: Array<[string, string]> = [];
-    return { opened, notes, deps: { open: (u: string) => void opened.push(u), notify: (t: string, b: string) => void notes.push([t, b]) } };
+    return { opened, notes, deps: { open: async (u: string) => {
+                opened.push(u);
+                return { ok: true as const };
+            }, notify: (t: string, b: string) => void notes.push([t, b]) } };
 }
 
 const asContent = (url: string, type = 'doc') => JSON.stringify({ type, url, name: 'x' }) + '\n';
@@ -112,4 +115,14 @@ test('a file of exactly 64 KiB is read, one byte more is refused', async () => {
     const over = path.join(dir, 'over.protondoc');
     writeFileSync(over, head + ' '.repeat(64 * 1024 - Buffer.byteLength(head) + 1));
     expect(await openDoc(over, h.deps)).toBe(1);
+});
+
+test('openDoc notifies and exits 1 when the opener cannot start', async () => {
+    const h = harness();
+    const file = path.join(dir, 'Plan.protondoc');
+    writeFileSync(file, placeholderContent(rec('doc')));
+    const deps = { notify: h.deps.notify, open: async () => ({ ok: false as const, reason: 'spawn xdg-open ENOENT' }) };
+    expect(await openDoc(file, deps)).toBe(1);
+    expect(h.notes.length).toBe(1);
+    expect(h.notes[0][1]).toContain('spawn xdg-open ENOENT');
 });

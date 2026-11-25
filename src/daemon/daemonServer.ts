@@ -274,7 +274,11 @@ export async function startSyncDaemon(options: {
         // Run authViaWeb in background and resolve signInUrl as soon as ready
         void runtime.auth
             .authViaWeb((signInUrl) => {
-                openBrowserUrl(signInUrl);
+                void openBrowserUrl(signInUrl).then((r) => {
+                    if (!r.ok) {
+                        runtime.logger.warn(`Could not open the browser for sign-in: ${r.reason}`);
+                    }
+                });
                 signInUrlResolver?.(signInUrl);
             })
             .then(async () => {
