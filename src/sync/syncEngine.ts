@@ -5797,6 +5797,15 @@ export class ProtonDriveSyncEngine {
                 throw new DriveOpError('ENOTEMPTY', `Not empty: ${relPath}`);
             }
         }
+        // A local item of the other kind than the cloud item at its path (a file here where Proton Drive has a folder,
+        // made by another device before the file uploaded, or the reverse) is not that item, whatever a record says:
+        // the drive shows the local one, and only it goes. The cloud item stays, in Proton Drive and in the index, with
+        // everything in it, and is listed again once the local one is gone (#447). When unsure, keep both.
+        // Only a file or a folder here counts: the drive doesn't show anything else of its backing store (a symlink,
+        // say), and shows the cloud item at that name instead, which is then what the user deleted.
+        const shown = local && (local.isFile() || local.isDirectory());
+        const otherKind = shown && entry && local.isDirectory() !== (entry.type === 'folder') ? entry : null;
+        const ownEntry = otherKind ? null : entry;
         // A local file in an unresolved collision is what the drive shows there (#29): only it goes, and the other file
         // Proton Drive has at that name stays (with the folders it is in), listed again once the local one is gone.
         // Everything else in a folder being deleted goes to the Proton Drive trash, item by item.
@@ -5806,7 +5815,10 @@ export class ProtonDriveSyncEngine {
             ? new Map<string, string>()
             : collision
               ? this.trashTargetsKeeping(relPath, collisions)
-              : this.trashTargets(relPath, entry);
+              : this.trashTargets(relPath, ownEntry);
+        for (const kept of otherKind ? this.index.listSubtree(otherKind.relPath) : []) {
+            toTrash.delete(kept.uid);
+        }
         this.watcher.suppressPath(relPath);
         // For a Move to Trash, what is only here is told apart from unchanged synced copies while the records still say
         // which those are
@@ -5838,8 +5850,8 @@ export class ProtonDriveSyncEngine {
                         for (const uid of toTrash.keys()) {
                             this.index.removeSubtree(uid);
                         }
-                    } else if (entry) {
-                        this.index.removeSubtree(entry.uid);
+                    } else if (ownEntry) {
+                        this.index.removeSubtree(ownEntry.uid);
                     }
                     for (const [uid, where] of toTrash) {
                         this.journal.enqueue({ kind: 'trash', nodeUid: uid, path: where });
@@ -5892,7 +5904,9 @@ export class ProtonDriveSyncEngine {
                 ? 'Deleted on this computer; it goes to Proton Drive Trash'
                 : collision
                   ? 'Deleted on this computer; the other file Proton Drive has at that name stays'
-                  : 'Deleted on this computer';
+                  : otherKind
+                    ? `Deleted on this computer; the ${otherKind.type} Proton Drive has at that name stays`
+                    : 'Deleted on this computer';
         this.stateDb.logActivity({
             action: 'delete-local',
             localRelPath: relPath,
