@@ -2,6 +2,8 @@ import { existsSync, watch, type FSWatcher } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 
+import { BUILTIN_IGNORE_PATTERNS } from './ignoreDefaults';
+
 export type LocalFileChangeEvent = {
     relPath: string;
     fullPath: string;
@@ -25,7 +27,14 @@ function plainGlob(pattern: string): string {
     return out;
 }
 
-export function matchesIgnorePatterns(relPath: string, patterns: string[]): boolean {
+// Whether a path is ignored: by the user's patterns, or by the app's own built-in ones, which always apply (they are not
+// settings; see BUILTIN_IGNORE_PATTERNS). Every reader of the ignore list goes through this.
+export function matchesIgnorePatterns(relPath: string, patterns: readonly string[]): boolean {
+    return matchesPatternList(relPath, patterns) || matchesPatternList(relPath, BUILTIN_IGNORE_PATTERNS);
+}
+
+// Whether a path matches the patterns given, and no others: what the settings rules judge the user's list by
+export function matchesPatternList(relPath: string, patterns: readonly string[]): boolean {
     const normalized = relPath.split(path.sep).join('/');
     if (!normalized || normalized === '.') {
         return false;
@@ -38,7 +47,8 @@ export function matchesIgnorePatterns(relPath: string, patterns: string[]): bool
     }
 
     for (const pattern of patterns) {
-        const trimmed = pattern.trim();
+        // A trailing slash is as in .gitignore: build/ is a folder named build, so it matches as build does
+        const trimmed = pattern.trim().replace(/(?<!\\)\/+$/, '');
         if (!trimmed) {
             continue;
         }
