@@ -8212,6 +8212,28 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     await expectCloudItemTrashed(d);
                 });
             });
+
+            // The drive shows only files and folders of its backing store (listing.rs read_local, fs.rs resolve): over a
+            // symlink there it shows the cloud item, so a delete of that name is of the cloud item, as before #447
+            test('a symlink here, which the drive does not show: a Move to Trash of the cloud folder it shows trashes it', async () => {
+                const d = setup();
+                d.add('X/inner.txt', 'inner');
+                await d.engine.reconcileNow();
+                const target = path.join(tempDir, 'elsewhere.txt');
+                await writeFile(target, 'not in the drive');
+                await mkdir(d.local(''), { recursive: true });
+                await symlink(target, d.local('X'));
+                withDesktopTrash(d);
+                const w = journalling(d);
+
+                await d.engine.deleteItem('X', { trash: true });
+
+                expect(w.journalled()).toMatchObject([{ kind: 'trash', nodeUid: 'vol~X' }]);
+                expect(d.engine.remoteIndex.getByPath('X')).toBeNull();
+                await d.engine.replayRemoteOps();
+                expect(d.calls.trashed).toEqual([['vol~X']]);
+                expect(await readFile(target, 'utf8')).toBe('not in the drive');
+            });
         });
 
         test('moving a downloaded folder to the Trash trashes it once in Proton Drive, uploads nothing of an ignored .git, and does not bring it back', async () => {

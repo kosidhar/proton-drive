@@ -5801,7 +5801,10 @@ export class ProtonDriveSyncEngine {
         // made by another device before the file uploaded, or the reverse) is not that item, whatever a record says:
         // the drive shows the local one, and only it goes. The cloud item stays, in Proton Drive and in the index, with
         // everything in it, and is listed again once the local one is gone (#447). When unsure, keep both.
-        const otherKind = local && entry && local.isDirectory() !== (entry.type === 'folder') ? entry : null;
+        // Only a file or a folder here counts: the drive doesn't show anything else of its backing store (a symlink,
+        // say), and shows the cloud item at that name instead, which is then what the user deleted.
+        const shown = local && (local.isFile() || local.isDirectory());
+        const otherKind = shown && entry && local.isDirectory() !== (entry.type === 'folder') ? entry : null;
         const ownEntry = otherKind ? null : entry;
         // A local file in an unresolved collision is what the drive shows there (#29): only it goes, and the other file
         // Proton Drive has at that name stays (with the folders it is in), listed again once the local one is gone.
