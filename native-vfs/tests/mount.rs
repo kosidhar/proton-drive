@@ -2286,7 +2286,7 @@ fn a_docs_placeholder_reads_from_memory_and_refuses_every_change() {
     let mut h = Harness::new();
     h.start_daemon(HashMap::from([
         ("", vec![placeholder("Plan.protondoc", "doc", content), file("a.txt", 3), folder("Docs")]),
-        ("Docs", vec![]),
+        ("Docs", vec![placeholder("Inner.protondoc", "doc", content)]),
     ]));
     h.mount();
 
@@ -2312,6 +2312,23 @@ fn a_docs_placeholder_reads_from_memory_and_refuses_every_change() {
     assert_eq!(std::fs::set_permissions(&plan, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap_err().raw_os_error(), eperm);
     let truncated = run(Command::new("truncate").args(["-s", "0"]).arg(&plan));
     assert!(!truncated.status.success());
+    // Setting the times (utimensat with named ones, as the owner may) reaches the helper; touch itself opens first
+    let times = [libc::timespec { tv_sec: 1000, tv_nsec: 0 }; 2];
+    let set = unsafe { libc::utimensat(libc::AT_FDCWD, c_path(&plan).as_ptr(), times.as_ptr(), 0) };
+    assert_eq!((set, std::io::Error::last_os_error().raw_os_error()), (-1, eperm), "utimensat");
+    assert!(!run(Command::new("touch").arg(&plan)).status.success(), "touch");
+    let gio_trash = |path: &Path| {
+        run(Command::new("gio")
+            .arg("trash")
+            .arg(path)
+            .env("GIO_USE_VFS", "local")
+            .env_remove("GTK_USE_PORTAL")
+            .env_remove("GIO_USE_PORTALS"))
+    };
+    // Move to Trash of one document is refused, and nothing is deleted
+    assert!(!gio_trash(&plan).status.success(), "gio trash of a placeholder");
+    assert!(h.daemon().deletes().is_empty(), "{:?}", h.daemon().deletes());
+    assert_eq!(std::fs::read(&plan).unwrap(), content.as_bytes());
 
     assert_eq!(std::fs::read(&plan).unwrap(), content.as_bytes(), "unchanged");
     let daemon = h.daemon();
@@ -2320,4 +2337,8 @@ fn a_docs_placeholder_reads_from_memory_and_refuses_every_change() {
     assert!(daemon.deletes().is_empty(), "{:?}", daemon.deletes());
     assert!(daemon.truncates().is_empty(), "{:?}", daemon.truncates());
     assert!(daemon.writings().is_empty() && daemon.closes().is_empty());
+
+    // Move to Trash of a folder holding a document still works: exactly one delete, of the folder
+    assert_ok(&gio_trash(&h.path("Docs")), "gio trash of a folder holding a placeholder");
+    assert_eq!(h.daemon().deletes(), [json!({ "path": "Docs", "trash": true })]);
 }

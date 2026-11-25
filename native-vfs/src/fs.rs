@@ -921,6 +921,11 @@ impl State {
         matches!(self.resolve(rel), Some(Node::Placeholder(..)))
     }
 
+    /// Why creating `rel` is refused when it names a placeholder: its name is its owner's to change, in the cloud.
+    fn create_refusal(&self, rel: &Path) -> Option<Errno> {
+        self.is_placeholder(rel).then_some(Errno::EPERM)
+    }
+
     /// An open of `rel` if it is a placeholder, else None. Served from the folder's listing (the one the lookup before
     /// the open read, however old; a fresh one only if `fetch`): no download, no write session. An open that could
     /// change it (for writing, truncating or appending) is refused. Without `fetch` it asks the daemon nothing, so a
@@ -1017,7 +1022,7 @@ impl State {
                 return Err(Failure { errno: Errno::EINTR, line: Some(line) });
             }
             // Only what open(2) can sensibly report from a download
-            let errno = if matches!(err.errno, libc::ENOENT | libc::EACCES) { err.errno } else { libc::EIO };
+            let errno = if matches!(err.errno, libc::ENOENT | libc::EACCES | libc::EPERM) { err.errno } else { libc::EIO };
             let line = format!("protondrive-vfs: couldn't download {rel_str:?}: {}", err.message);
             return Err(Failure { errno: Errno::from_i32(errno), line: Some(line) });
         }
@@ -1086,7 +1091,7 @@ impl State {
             Ok(()) => {}
             Err(err) if err.errno == libc::EEXIST => {}
             Err(err) => {
-                let allowed = [libc::ENOENT, libc::EACCES, libc::EIO];
+                let allowed = [libc::ENOENT, libc::EACCES, libc::EPERM, libc::EIO];
                 return Err(self.refused(&format!("empty {rel_str:?}"), err, &allowed));
             }
         }
@@ -1531,7 +1536,7 @@ impl State {
                 }
             }
             Err(err) => {
-                let allowed = [libc::ENOENT, libc::EACCES, libc::EIO];
+                let allowed = [libc::ENOENT, libc::EACCES, libc::EPERM, libc::EIO];
                 s.reply_refused(reply, &format!("move {from_str:?} to the trash"), err, &allowed)
             }
         });
@@ -2125,8 +2130,8 @@ impl Filesystem for DriveFs {
                 Err(errno) => reply.error(errno),
             };
         }
-        if s.is_placeholder(&rel) {
-            return reply.error(Errno::EPERM); // a document's name is its owner's to change, in the cloud
+        if let Some(errno) = s.create_refusal(&rel) {
+            return reply.error(errno);
         }
         if is_volume_info(&rel) || (exclusive && s.listed_online(&parent_rel, name)) {
             return reply.error(Errno::EEXIST);
@@ -3504,6 +3509,23 @@ mod tests {
         (g, requests)
     }
 
+    #[test]
+    fn the_daemons_eperm_for_a_placeholder_reaches_the_caller() {
+        let g = scripted("placeholder-eperm", None, |line, _| {
+            if line.starts_with("GET /vfs/children") {
+                return (200, r#"{"entries":[{"name":"Plan.protondoc","type":"file","size":3,"mtimeMs":0}]}"#.into());
+            }
+            (400, r#"{"error":"A Proton document can't be changed","code":"EPERM"}"#.into())
+        });
+        let s = &g.drive.state;
+        let rel = Path::new("Plan.protondoc");
+        // The helper's listing lags the daemon: it doesn't know this is a document yet
+        assert_eq!(s.hydrate(0, rel), Err(Errno::EPERM));
+        assert_eq!(s.make_empty(rel), Err(Errno::EPERM));
+        let err = s.daemon.delete("Plan.protondoc", Removal::Trash).unwrap_err();
+        assert_eq!(refusal("trash", err, &[libc::ENOENT, libc::EACCES, libc::EPERM, libc::EIO]).errno, Errno::EPERM);
+    }
+
     fn nothing_but_listings(requests: &Mutex<Vec<String>>) -> bool {
         requests.lock().unwrap().iter().all(|line| line.starts_with("GET /vfs/children"))
     }
@@ -3579,6 +3601,9 @@ mod tests {
         assert!(s.is_placeholder(rel));
         assert!(!s.is_placeholder(Path::new("real.txt")));
         assert!(!s.is_placeholder(Path::new("missing.protondoc")));
+        assert_eq!(s.create_refusal(rel), Some(Errno::EPERM));
+        assert_eq!(s.create_refusal(Path::new("real.txt")), None);
+        assert_eq!(s.create_refusal(Path::new("new.txt")), None);
         for removal in [Removal::Unlink, Removal::Rmdir] {
             assert_eq!(s.remove_here(rel, removal, 1), Some(Err(Errno::EPERM)));
             assert_eq!(s.remove_here(Path::new("real.txt"), removal, 1), None, "an ordinary file goes to the daemon");
