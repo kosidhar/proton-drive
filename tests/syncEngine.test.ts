@@ -8741,6 +8741,28 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 await d.expectEveryRecordHasItsFile();
             });
 
+            // The folder listed is the one a delete would trash (#454): a recorded node another device has moved away since
+            // isn't trashed, as only the local folder goes, so it isn't listed either, and that works offline
+            test('a folder whose node another device moved away since is removed here only, without asking Proton Drive, offline too', async () => {
+                const d = setup();
+                d.add('Docs/E');
+                await pinnedAndSynced(d, d.add('Docs').uid);
+                expect(stateDb.getItemByPath('Docs/E')?.nodeUid).toBe('vol~Docs/E');
+                const node = d.nodes.get('vol~Docs/E')!;
+                d.nodes.set(node.uid, { ...node, name: { ok: true as const, value: 'E2' } });
+                d.engine.remoteIndex.upsert(entryFromNode(d.nodes.get(node.uid)!, 'Docs')!);
+                const w = watching(d);
+                d.down.add('getNode');
+                d.down.add('iterateFolderChildren');
+
+                expect(await rmdir(w, 'Docs/E')).toBeNull();
+
+                expect(w.cloudCalls()).toBe(0);
+                expect(w.journalled()).toEqual([]);
+                expect(await d.files.exists('Docs/E')).toBe(false);
+                expect(d.engine.remoteIndex.getByUid('vol~Docs/E')?.relPath).toBe('Docs/E2');
+            });
+
             for (const [how, fail] of [
                 ['its listing fails', (d: ReturnType<typeof setup>) => d.failListing.add('vol~Cloud')],
                 ['Proton Drive is out of reach', (d: ReturnType<typeof setup>) => ['getNode', 'iterateFolderChildren'].forEach((m) => d.down.add(m))],

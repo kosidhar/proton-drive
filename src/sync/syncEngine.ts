@@ -5843,6 +5843,11 @@ export class ProtonDriveSyncEngine {
         if (!onlyIfEmpty && !trash && (shown ? shown.isDirectory() : entry?.type === 'folder')) {
             throw new DriveOpError('EISDIR', `Is a folder: ${relPath}`);
         }
+        // A local item of the other kind than the cloud item at its path (see otherKindAt): the drive shows the local
+        // one, and only it goes. The cloud item stays, in Proton Drive and in the index, with everything in it, and is
+        // listed again once the local one is gone (#447). When unsure, keep both.
+        const otherKind = otherKindAt(local, entry);
+        const ownEntry = otherKind ? null : entry;
         if (onlyIfEmpty) {
             if (shown ? !shown.isDirectory() : entry?.type !== 'folder') {
                 throw new DriveOpError('EIO', `Not a folder: ${relPath}`);
@@ -5853,7 +5858,7 @@ export class ProtonDriveSyncEngine {
             // What this computer knows of the cloud folder can be behind (#435): Docs and Sheets not recorded yet, an item
             // added since the last listing. The folder goes to the Proton Drive trash with whatever it holds there, so
             // it goes only once a listing of it, asked for after this turn's look, finds nothing more.
-            const cloudFolder = ignored ? null : this.cloudFolderOfRmdir(relPath, entry);
+            const cloudFolder = ignored ? null : this.cloudFolderOfRmdir(relPath, ownEntry);
             if (cloudFolder !== null) {
                 if (!listing || listing.uid !== cloudFolder) {
                     return cloudFolder;
@@ -5864,11 +5869,6 @@ export class ProtonDriveSyncEngine {
                 }
             }
         }
-        // A local item of the other kind than the cloud item at its path (see otherKindAt): the drive shows the local
-        // one, and only it goes. The cloud item stays, in Proton Drive and in the index, with everything in it, and is
-        // listed again once the local one is gone (#447). When unsure, keep both.
-        const otherKind = otherKindAt(local, entry);
-        const ownEntry = otherKind ? null : entry;
         // A local file in an unresolved collision is what the drive shows there (#29): only it goes, and the other file
         // Proton Drive has at that name stays (with the folders it is in), listed again once the local one is gone.
         // Everything else in a folder being deleted goes to the Proton Drive trash, item by item.
@@ -6142,14 +6142,19 @@ export class ProtonDriveSyncEngine {
         return [...latest.values()].some((op) => op.kind !== 'trash' && op.toPath.startsWith(`${relPath}/`));
     }
 
-    // The cloud folder an rmdir of relPath sends to the Proton Drive trash, if any, as trashTargets picks it: the node its
-    // record names, or else the folder the remote index has there. A folder only on this computer has none.
+    // The cloud folder an rmdir of relPath sends to the Proton Drive trash as the item itself, if any: the node trashTargets
+    // trashes for it, given the same entry (ownNodeAt, unless another device moved that node away since). A folder only
+    // on this computer has none, nor does one whose node is elsewhere now (only the local folder goes then), nor a file
+    // node (nothing is in it).
     private cloudFolderOfRmdir(relPath: string, entry: RemoteIndexEntry | null): string | null {
-        const record = this.stateDb.getItemByPath(relPath);
-        if (record) {
-            return record.type === 'folder' && !isProvisional(record.nodeUid) ? record.nodeUid : null;
+        const own = this.ownNodeAt(relPath, entry);
+        if (own === null || isProvisional(own) || this.movedAwayFrom(own, relPath)) {
+            return null;
         }
-        return entry?.type === 'folder' ? nodeUidOf(entry) : null;
+        // Not indexed: the record's node, as it says, or else an edit baseline's, a file
+        const record = this.stateDb.getItemByPath(relPath);
+        const type = this.index.getByUid(own)?.type ?? (record?.nodeUid === own ? record.type : 'file');
+        return type === 'folder' ? own : null;
     }
 
     // A fresh listing of the cloud folder an rmdir would trash (#435), with the journal as it was just before it was asked
@@ -6215,9 +6220,7 @@ export class ProtonDriveSyncEngine {
     // from where it is recorded is not the item there (see movedAwayFrom, #454).
     private trashTargets(relPath: string, entry: RemoteIndexEntry | null): Map<string, string> {
         const targets = new Map<string, string>();
-        // A file being edited through the drive with no record yet stands for its baseline's node, not for another node
-        // the index may hold at its path since
-        const own = this.stateDb.getItemByPath(relPath)?.nodeUid ?? this.stateDb.getEditBaseline(relPath)?.nodeUid ?? nodeUidOf(entry);
+        const own = this.ownNodeAt(relPath, entry);
         if (own !== null) {
             if (!this.movedAwayFrom(own, relPath)) {
                 targets.set(own, relPath);
@@ -6235,6 +6238,13 @@ export class ProtonDriveSyncEngine {
             }
         }
         return targets;
+    }
+
+    // The node a delete of relPath takes as the item itself (see trashTargets, and cloudFolderOfRmdir for an rmdir), null
+    // for none: the one its record names, else its edit baseline's (a file being edited through the drive with no record
+    // yet stands for that node, not for another node the index may hold at its path since), else the index's node there
+    private ownNodeAt(relPath: string, entry: RemoteIndexEntry | null): string | null {
+        return this.stateDb.getItemByPath(relPath)?.nodeUid ?? this.stateDb.getEditBaseline(relPath)?.nodeUid ?? nodeUidOf(entry);
     }
 
     // Whether the remote index has a recorded (or baselined) node somewhere else than at relPath, where this computer has
