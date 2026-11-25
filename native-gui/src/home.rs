@@ -621,7 +621,7 @@ pub(crate) fn open_in_browser(url: &str) {
 
 /// Whether the app only renders a screenshot. A test can say so for its own thread (AS_SCREENSHOT), as the global is
 /// shared by tests running at once
-fn screenshot() -> bool {
+pub(crate) fn screenshot() -> bool {
     #[cfg(test)]
     if AS_SCREENSHOT.with(|s| s.get()) {
         return true;
