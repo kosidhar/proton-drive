@@ -11859,7 +11859,8 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             d.flush();
             const doc = (name: string) => {
                 const node = makeMockNode({ uid: 'vol~plan', parentUid: 'vol~Docs', nameStr: name, type: NodeType.File });
-                Object.assign(node, { mediaType: 'application/vnd.proton.doc' });
+                // Fixed times: a re-listing of the same document must read as unchanged
+                Object.assign(node, { mediaType: 'application/vnd.proton.doc', modificationTime: new Date(1_700_000_000_000), activeRevision: undefined });
                 return node;
             };
             const list = (uid: string, rel: string, children: NodeEntity[]) =>
