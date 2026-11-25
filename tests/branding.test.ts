@@ -49,7 +49,8 @@ function occurrences(pattern: RegExp, allowed: (file: string, line: string) => b
 const DATA_FOLDER_ALLOWED: Array<[file: string, line: RegExp, why: string]> = [
     ['src/sdk/config.ts', /^const APP_DIR_NAME = 'proton-drive-ubuntu';/, 'the data folder name'],
     ['native-gui/src/main.rs', /\.local\/share\/proton-drive-ubuntu/, 'the data folder, in the layout move and its test'],
-    ['packaging/linux/install.sh', /proton-drive-ubuntu/, 'proton_app_dir: the data folder (comment and echo)'],
+    ['packaging/linux/install.sh', /^# \/proton-drive-ubuntu; under sudo, the invoking user's$/, 'proton_app_dir: the data folder (comment)'],
+    ['packaging/linux/install.sh', /^  echo "\$\{data:-\$home\/\.local\/share\}\/proton-drive-ubuntu"$/, 'proton_app_dir: the data folder (echo)'],
     ['README.md', /~\/\.local\/share\/proton-drive-ubuntu\/files/, 'the data folder, where the store lives'],
 ];
 
@@ -96,7 +97,10 @@ describe('names after #413', () => {
     test('the daemon is built and found as protondrive, and the old deb build is gone', () => {
         const read = (p: string) => readFileSync(path.join(ROOT, p), 'utf8');
         expect(read('scripts/build.ts')).not.toContain('alias');
-        expect(read('packaging/linux/package.sh')).toContain('release/protondrive"');
+        for (const script of ['packaging/linux/package.sh', 'packaging/linux/install.sh']) {
+            expect(read(script)).toMatch(/release\/protondrive\b(?!-)/);
+            expect(read(script)).not.toMatch(/release\/proton-drive-ubuntu/);
+        }
         expect(read('src/linux/notifications.ts')).toContain("serviceName = 'protondrive.service'");
         for (const gone of [
             'scripts/build-deb.sh',

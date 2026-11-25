@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import path from 'node:path';
 
 import type { SyncStateDatabase } from '../sync/syncStateDb';
+import { APP_ID } from './appId';
 
 // Starting Proton Drive at login (#92): an XDG autostart entry that runs the daemon, which mounts the drive and starts
 // the tray. While the startAtLogin setting is on the daemon keeps the entry in place, naming the binary it runs from; it
@@ -56,7 +57,7 @@ export function desktopEntry(command: string[]): string {
         `Exec=${command.map(execArg).join(' ')}`,
         // Skipped quietly once that program is gone (Proton Drive uninstalled by a package manager)
         `TryExec=${stringValue(command[0]!)}`,
-        'Icon=io.github.kosidhar.ProtonDrive',
+        `Icon=${APP_ID}`,
         'Terminal=false',
         'X-GNOME-Autostart-enabled=true',
         OURS,

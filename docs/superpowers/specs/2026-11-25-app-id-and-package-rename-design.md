@@ -55,6 +55,8 @@ The rename was considered at four levels:
   files), the control socket, and port 49152.
 - What the app sends Proton's servers to identify itself (`external-drive-ubuntu_sync@…`, client UID prefix
   `ubuntu-sync`): changing it risks Proton's servers refusing the app.
+- A Flatpak build's data folder is per app ID (`~/.var/app/<id>/`), so it moves with the new ID. No Flatpak build
+  is installed anywhere, so nothing migrates.
 
 ## No upgrade path (owner's call, 2026-11-25)
 
