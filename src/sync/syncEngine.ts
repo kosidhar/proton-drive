@@ -6084,17 +6084,22 @@ export class ProtonDriveSyncEngine {
     // moved into it whose move hasn't reached Proton Drive yet (it isn't in the item there yet). A folder made here that
     // never reached Proton Drive holds only such things, or things that are still where they were there. A pending move
     // to relPath itself is no reason: its node is the item (then it is that already), or is hidden behind it, as the
-    // cloud has another node at that name, which is what the user deleted.
+    // cloud has another node at that name, which is what the user deleted. A recorded node another device has moved away
+    // from where it is recorded is not the item there (see movedAwayFrom, #454).
     private trashTargets(relPath: string, entry: RemoteIndexEntry | null): Map<string, string> {
         const targets = new Map<string, string>();
         // A file being edited through the drive with no record yet stands for its baseline's node, not for another node
         // the index may hold at its path since
         const own = this.stateDb.getItemByPath(relPath)?.nodeUid ?? this.stateDb.getEditBaseline(relPath)?.nodeUid ?? nodeUidOf(entry);
         if (own !== null) {
-            targets.set(own, relPath);
+            if (!this.movedAwayFrom(own, relPath)) {
+                targets.set(own, relPath);
+            }
         } else {
             for (const item of this.topmostRecordedUnder(relPath)) {
-                targets.set(item.nodeUid, item.localRelPath);
+                if (!this.movedAwayFrom(item.nodeUid, item.localRelPath)) {
+                    targets.set(item.nodeUid, item.localRelPath);
+                }
             }
         }
         for (const op of this.latestOpPerNode()) {
@@ -6103,6 +6108,16 @@ export class ProtonDriveSyncEngine {
             }
         }
         return targets;
+    }
+
+    // Whether the remote index has a recorded (or baselined) node somewhere else than at relPath, where this computer has
+    // it: another device renamed or moved it, or a folder it is in, and the index has heard before the local copy
+    // followed. A delete through the drive at relPath is then of the local copy only, which is all the drive shows there:
+    // trashing the node would trash it at its new place, with whatever the other device put in it (#454). When unsure,
+    // keep both. A node the index has no entry for is gone from Proton Drive or not indexed yet, and is trashed as before.
+    private movedAwayFrom(uid: string, relPath: string): boolean {
+        const now = this.index.getByUid(uid);
+        return now !== null && now.relPath !== relPath;
     }
 
     // The records at or under a path that aren't under another of them
