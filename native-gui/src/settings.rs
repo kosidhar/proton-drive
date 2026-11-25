@@ -660,8 +660,7 @@ impl ProtonDriveNativeApp {
         }
     }
 
-    /// Appearance: the theme, taken and saved as soon as it is picked, as before, unlike the Synchronization card's
-    /// settings, which wait for Save Preferences.
+    /// Appearance: the theme, taken and saved as soon as it is picked, like the Sync card's settings.
     pub(crate) fn render_appearance_card(&mut self, ui: &mut egui::Ui) {
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());

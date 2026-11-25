@@ -8,6 +8,7 @@ mod shared;
 mod shared_view;
 mod single_instance;
 
+use std::collections::HashMap;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -842,6 +843,26 @@ struct LoginReply {
     sign_in_url: String,
 }
 
+/// A setting sent to the daemon and not answered yet (#425).
+#[derive(Clone, Debug, PartialEq)]
+struct PendingSetting {
+    key: String,
+    /// The number it was sent as: only the answer to the newest send for a key settles it
+    seq: u64,
+    value: serde_json::Value,
+}
+
+/// What a setting's row says beside its control (#425).
+#[derive(Clone, Debug, PartialEq)]
+struct SettingNote {
+    notice: Notice,
+    /// When it goes; None stays until the setting is changed again
+    until: Option<Instant>,
+}
+
+/// How long "Saved" stays beside a control.
+const SAVED_NOTE_FOR: Duration = Duration::from_secs(3);
+
 /// What POST /drive/settings answers: the settings as stored now, and why a folder move or the switch didn't happen.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -864,37 +885,6 @@ impl SettingsReply {
 /// The ignore list as the editor holds it: one pattern per line, trimmed, blank lines left out.
 fn parse_ignore_patterns(text: &str) -> Vec<String> {
     text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
-}
-
-/// The body of POST /drive/settings: only the fields edited since the settings were loaded, so that a value the daemon
-/// adjusted on load (an ignore list it trimmed) is never written back unless the user changed it.
-fn settings_changes(
-    loaded: &SyncSettings,
-    sync_dir: &str,
-    conflict_strategy: &str,
-    notifications_enabled: bool,
-    start_at_login: bool,
-    ignore_patterns_text: &str,
-) -> serde_json::Map<String, serde_json::Value> {
-    use serde_json::Value;
-    let mut changes = serde_json::Map::new();
-    if sync_dir.trim() != loaded.sync_dir.trim() {
-        changes.insert("syncDir".into(), Value::from(sync_dir.trim()));
-    }
-    if conflict_strategy != loaded.conflict_strategy {
-        changes.insert("conflictStrategy".into(), Value::from(conflict_strategy));
-    }
-    if notifications_enabled != loaded.notifications_enabled {
-        changes.insert("notificationsEnabled".into(), Value::from(notifications_enabled));
-    }
-    if start_at_login != loaded.start_at_login {
-        changes.insert("startAtLogin".into(), Value::from(start_at_login));
-    }
-    let patterns = parse_ignore_patterns(ignore_patterns_text);
-    if patterns != parse_ignore_patterns(&loaded.ignore_patterns.join("\n")) {
-        changes.insert("ignorePatterns".into(), Value::from(patterns));
-    }
-    changes
 }
 
 // The control socket's write routes (src/daemon/controlServer.ts). TCP refuses all of them with 403; a status other
@@ -1001,6 +991,8 @@ enum PendingConfirm {
     StartFresh,
     /// Stop all sharing of an item of the Shared page: `question` is what it asks, naming what is lost (#253)
     StopSharing { rel_path: String, uid: String, question: String },
+    /// Move the whole Proton Drive folder to `to` (#425): the folder only moves after this is answered
+    MoveFolder { to: String },
 }
 
 /// What the whole drive's Free up space knows of the Always keep marks (#296), which decides what its dialog says and
@@ -1131,6 +1123,16 @@ fn confirm_copy(confirm: &PendingConfirm, virtual_drive: bool) -> ConfirmCopy {
             // Not an availability action: render_confirm_modal sends the start-fresh instead
             action: "start-fresh",
         },
+        PendingConfirm::MoveFolder { to } => ConfirmCopy {
+            title: format!("Move your Proton Drive folder to {to}?"),
+            body: "Your files will move there. Proton Drive pauses until the move is done.".to_string(),
+            detail: "Nothing is deleted, and your files stay in Proton Drive.",
+            button: "Move",
+            cancel: "Cancel",
+            rel_path: String::new(),
+            // Not an availability action: render_confirm_modal sends the move instead
+            action: "move-folder",
+        },
         PendingConfirm::StopSharing { question, .. } => ConfirmCopy {
             title: "Stop sharing?".to_string(),
             body: question.clone(),
@@ -1174,8 +1176,8 @@ enum WorkerCommand {
     SetPaused { paused: bool, until: Option<i64> },
     StartLogin,
     Logout,
-    /// Only the settings that changed (see `settings_changes`)
-    SaveSettings(serde_json::Value),
+    /// One setting that changed (see `apply_setting`), numbered so that its answer can be told from another's
+    SaveSettings { seq: u64, changes: serde_json::Value },
     /// The Settings switch `Show online-only files in Files (virtual drive)`
     SetVirtualDrive(bool),
     /// POST /drive/settings with the whole new list of blocked apps (Block or Unblock in Settings)
@@ -1346,7 +1348,8 @@ enum WorkerEvent {
     PinnedSummary(Result<(u32, bool), String>),
     /// What is hidden from this computer, or why it couldn't be read
     HiddenLoaded(Result<Vec<HiddenItem>, String>),
-    SettingsSaved(Result<SettingsReply, String>),
+    /// The answer to `SaveSettings` number `seq`, which changed the settings named by `keys`
+    SettingsSaved { seq: u64, keys: Vec<String>, result: Result<SettingsReply, String> },
     VirtualDriveSwitched(Result<SettingsReply, String>),
     BlockedAppsSaved(Result<SettingsReply, String>),
     /// Mount again or an action on a stopped move finished, or why not
@@ -1557,12 +1560,16 @@ struct ProtonDriveNativeApp {
 
     // Ignore patterns editor (Settings)
     ignore_patterns_text: String,
-    settings_dirty: bool,
-    /// The settings as last loaded into the form: Save Preferences sends only what differs from them
+    /// The settings as the daemon last said it holds them: a refused change goes back to them, and the ignore box is
+    /// sent only when it differs from them
     loaded_settings: SyncSettings,
-    settings_saving: bool,
-    /// Under Save Preferences: saved, nothing to save, or why not
-    settings_notice: Option<Notice>,
+    /// The number of the last setting sent (see `apply_setting`), and of the newest answer taken in
+    settings_seq: u64,
+    settings_applied_seq: u64,
+    /// The settings sent and not yet answered, one per key: the shown value is the user's until its answer comes
+    pending_settings: Vec<PendingSetting>,
+    /// What to say beside a control: Saved for a few seconds, or why its change wasn't made, by setting key
+    setting_notes: HashMap<String, SettingNote>,
     /// The virtual drive switch, Mount again or an action on a stopped move is still running
     drive_working: bool,
     /// Why the last of those was refused or failed
@@ -1596,7 +1603,6 @@ struct ProtonDriveNativeApp {
     fake_cut_short: Option<Vec<CutShortItem>>,
 
     // Settings edits
-    edit_sync_dir: String,
     edit_conflict_strategy: String,
     edit_notifications: bool,
     edit_start_at_login: bool,
@@ -1697,7 +1703,6 @@ impl ProtonDriveNativeApp {
             let _ = cmd_tx.send(WorkerCommand::SharedLoad { seq });
         }
 
-        let edit_sync_dir = initial_status.settings.sync_dir.clone();
         let edit_conflict_strategy = if initial_status.settings.conflict_strategy.is_empty() {
             "keep-both".to_string()
         } else {
@@ -1731,10 +1736,11 @@ impl ProtonDriveNativeApp {
             pending_confirm: None,
             notice: None,
             ignore_patterns_text,
-            settings_dirty: false,
             loaded_settings,
-            settings_saving: false,
-            settings_notice: None,
+            settings_seq: 0,
+            settings_applied_seq: 0,
+            pending_settings: Vec::new(),
+            setting_notes: HashMap::new(),
             drive_working: false,
             drive_error: None,
             block_app_input: String::new(),
@@ -1752,7 +1758,6 @@ impl ProtonDriveNativeApp {
             cut_short_asked_at: 0,
             cut_short_error: None,
             fake_cut_short: None,
-            edit_sync_dir,
             edit_conflict_strategy,
             edit_notifications,
             edit_start_at_login,
@@ -1868,9 +1873,7 @@ impl ProtonDriveNativeApp {
     /// What POST /drive/settings answered: the settings, the drive and the switch as they are now.
     fn apply_settings_reply(&mut self, reply: SettingsReply) {
         if let Some(settings) = reply.settings {
-            if !self.settings_dirty && !self.settings_saving {
-                self.load_settings_form(&settings);
-            }
+            self.load_settings_form(&settings);
             self.status.sync_dir = settings.sync_dir.clone();
             self.status.settings = settings;
         }
@@ -1895,14 +1898,101 @@ impl ProtonDriveNativeApp {
         self.account_error = Some(text);
     }
 
-    /// Fills the Settings form from the daemon's settings, which become what Save compares against.
+    /// Fills the Settings form from the daemon's settings, which become what a refused change goes back to. What the
+    /// user chose and the daemon hasn't answered yet stays (a refresh must not flicker it back), and so does ignore
+    /// text typed and not yet applied.
     fn load_settings_form(&mut self, settings: &SyncSettings) {
-        self.edit_sync_dir = settings.sync_dir.clone();
-        self.edit_conflict_strategy = settings.conflict_strategy.clone();
-        self.edit_notifications = settings.notifications_enabled;
-        self.edit_start_at_login = settings.start_at_login;
-        self.ignore_patterns_text = settings.ignore_patterns.join("\n");
+        if !self.is_pending("conflictStrategy") {
+            self.edit_conflict_strategy = settings.conflict_strategy.clone();
+        }
+        if !self.is_pending("notificationsEnabled") {
+            self.edit_notifications = settings.notifications_enabled;
+        }
+        if !self.is_pending("startAtLogin") {
+            self.edit_start_at_login = settings.start_at_login;
+        }
+        let typed = parse_ignore_patterns(&self.ignore_patterns_text)
+            != parse_ignore_patterns(&self.loaded_settings.ignore_patterns.join("\n"));
+        if !self.is_pending("ignorePatterns") && !typed {
+            self.ignore_patterns_text = settings.ignore_patterns.join("\n");
+        }
         self.loaded_settings = settings.clone();
+    }
+
+    fn is_pending(&self, key: &str) -> bool {
+        self.pending_settings.iter().any(|p| p.key == key)
+    }
+
+    /// Sends one setting, at once (#425). It is pending until the daemon answers, and a newer send for the same key
+    /// takes its place: only the newest one's answer settles the control.
+    fn apply_setting(&mut self, key: &'static str, value: serde_json::Value) {
+        self.settings_seq += 1;
+        let seq = self.settings_seq;
+        self.pending_settings.retain(|p| p.key != key);
+        self.pending_settings.push(PendingSetting { key: key.to_string(), seq, value: value.clone() });
+        self.setting_notes.remove(key);
+        let changes = serde_json::json!({ key: value });
+        let _ = self.tx.send(WorkerCommand::SaveSettings { seq, changes });
+    }
+
+    /// What the daemon answered to a setting sent as `seq` (see `apply_setting`).
+    fn setting_answered(&mut self, seq: u64, keys: Vec<String>, result: Result<SettingsReply, String>) {
+        // The keys whose newest send this answers; an older one's answer leaves the control as the user has it
+        let mut newest = Vec::new();
+        for key in keys {
+            if let Some(i) = self.pending_settings.iter().position(|p| p.key == key && p.seq == seq) {
+                newest.push(self.pending_settings.remove(i));
+            }
+        }
+        let note = |notice: Notice, until| SettingNote { notice, until };
+        match result {
+            Ok(reply) => {
+                let problem = reply.problem();
+                for sent in &newest {
+                    // The ignore box shows what the daemon stored, unless more was typed meanwhile
+                    if sent.key == "ignorePatterns" {
+                        if let Some(settings) = &reply.settings {
+                            let sent_patterns: Vec<String> = serde_json::from_value(sent.value.clone()).unwrap_or_default();
+                            if parse_ignore_patterns(&self.ignore_patterns_text) == sent_patterns {
+                                self.ignore_patterns_text = settings.ignore_patterns.join("\n");
+                                self.loaded_settings.ignore_patterns = settings.ignore_patterns.clone();
+                            }
+                        }
+                    }
+                    let n = match &problem {
+                        Some(why) => note(Notice::error(why), None),
+                        None => note(Notice::info("Saved"), Some(Instant::now() + SAVED_NOTE_FOR)),
+                    };
+                    self.setting_notes.insert(sent.key.clone(), n);
+                }
+                // Answers can come out of order: only a newer one's settings are taken in
+                if seq >= self.settings_applied_seq {
+                    self.settings_applied_seq = seq;
+                    self.apply_settings_reply(reply);
+                }
+            }
+            // Nothing was stored: a switch or choice goes back to what the daemon holds; the ignore text stays, to fix
+            Err(why) => {
+                for sent in &newest {
+                    let held = self.loaded_settings.clone();
+                    match sent.key.as_str() {
+                        "conflictStrategy" => self.edit_conflict_strategy = held.conflict_strategy,
+                        "notificationsEnabled" => self.edit_notifications = held.notifications_enabled,
+                        "startAtLogin" => self.edit_start_at_login = held.start_at_login,
+                        _ => {}
+                    }
+                    self.setting_notes.insert(sent.key.clone(), note(Notice::error(&why), None));
+                }
+            }
+        }
+    }
+
+    /// A folder was chosen to move the drive to (#425): a different one is asked about first, never moved to at once.
+    fn folder_chosen(&mut self, chosen: &str) {
+        let to = chosen.trim();
+        if !to.is_empty() && to != self.status.sync_dir.trim() {
+            self.pending_confirm = Some(PendingConfirm::MoveFolder { to: to.to_string() });
+        }
     }
 
     /// Recomputes what Needs attention lists (and the Home badge counts) from the status and the conflicts.
@@ -1937,10 +2027,8 @@ impl ProtonDriveNativeApp {
                         if let Some(fake) = &self.fake_cut_short {
                             s.stats.cut_short_files = fake.len() as u64;
                         }
-                        // Edits being made or saved stay as they are; Save compares them with what they were loaded from
-                        if !self.settings_dirty && !self.settings_saving {
-                            self.load_settings_form(&s.settings);
-                        }
+                        // What was chosen and isn't answered yet stays as it is (see load_settings_form)
+                        self.load_settings_form(&s.settings);
                         if s.logged_in {
                             self.login_url = None;
                         }
@@ -1998,18 +2086,8 @@ impl ProtonDriveNativeApp {
                     let _ = self.tx.send(WorkerCommand::LoadConflicts);
                     let _ = self.tx.send(WorkerCommand::RefreshAll);
                 }
-                WorkerEvent::SettingsSaved(result) => {
-                    self.settings_saving = false;
-                    match result {
-                        Ok(reply) => {
-                            self.settings_notice =
-                                Some(reply.problem().map_or_else(|| Notice::info("Preferences saved."), Notice::error));
-                            self.settings_dirty = false;
-                            self.apply_settings_reply(reply);
-                        }
-                        // Nothing was stored: the edits stay, to fix and save again
-                        Err(e) => self.settings_notice = Some(Notice::error(e)),
-                    }
+                WorkerEvent::SettingsSaved { seq, keys, result } => {
+                    self.setting_answered(seq, keys, result);
                     let _ = self.tx.send(WorkerCommand::RefreshAll);
                 }
                 WorkerEvent::VirtualDriveSwitched(result) => {
@@ -2706,6 +2784,9 @@ impl ProtonDriveNativeApp {
                                         self.shared.stop_error = None;
                                         let _ = self.tx.send(WorkerCommand::SharedStop { rel_path: rel_path.clone(), uid: uid.clone() });
                                     }
+                                    PendingConfirm::MoveFolder { to } => {
+                                        self.apply_setting("syncDir", serde_json::Value::from(to.as_str()));
+                                    }
                                     PendingConfirm::StartFresh => {
                                         self.start_fresh_working = true;
                                         self.start_fresh_error = None;
@@ -3012,7 +3093,7 @@ impl ProtonDriveNativeApp {
                     ui.add_space(14.0);
                     self.render_appearance_card(ui);
                     ui.add_space(14.0);
-                    // Last, with Save Preferences at its foot: the settings that wait for it
+                    // Last: the sync settings, each applied as it is changed
                     self.render_sync_settings_card(ui);
                 });
             });
@@ -3223,94 +3304,53 @@ impl ProtonDriveNativeApp {
         let _ = self.tx.send(cmd);
     }
 
-    /// Save Preferences: only the settings edited since they were loaded (see `settings_changes`).
-    fn save_preferences(&mut self) {
-        let changes = settings_changes(
-            &self.loaded_settings,
-            &self.edit_sync_dir,
-            &self.edit_conflict_strategy,
-            self.edit_notifications,
-            self.edit_start_at_login,
-            &self.ignore_patterns_text,
-        );
-        if changes.is_empty() {
-            self.settings_dirty = false;
-            self.settings_notice = Some(Notice::info("No changes to save."));
-            return;
-        }
-        self.settings_saving = true;
-        self.settings_notice = None;
-        let _ = self.tx.send(WorkerCommand::SaveSettings(serde_json::Value::Object(changes)));
+    /// The line under a setting's row that says how its change went (#425): Saved for a few seconds, or why it wasn't
+    /// made, kept until the setting is changed again.
+    fn show_setting_note(&self, ui: &mut egui::Ui, key: &str) {
+        let Some(note) = self.setting_notes.get(key) else { return };
+        let color = if note.notice.error { DANGER_TEXT() } else { TEXT_MUTED() };
+        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+            ui.add(egui::Label::new(RichText::new(&note.notice.text).size(12.5).color(color)).wrap());
+        });
     }
 
-    /// An edit in the Settings form: it is kept through status refreshes until saved.
-    fn mark_settings_edited(&mut self) {
-        self.settings_dirty = true;
-        self.settings_notice = None;
-    }
-
-    /// Synchronization: the settings that wait for Save Preferences, at the card's foot (the sync folder, the conflict
-    /// choice, notifications, start at login and the ignore patterns), and only those.
+    /// Sync: the folder, notifications, start at login, the conflict choice and the files to ignore. Each applies as
+    /// soon as it is changed (the ignore box when it loses focus), and says how it went beside it (#425).
     fn render_sync_settings_card(&mut self, ui: &mut egui::Ui) {
-        let mut browse = false;
+        let now = Instant::now();
+        self.setting_notes.retain(|_, n| n.until.is_none_or(|until| until > now));
+        if let Some(next) = self.setting_notes.values().filter_map(|n| n.until).min() {
+            ui.ctx().request_repaint_after(next.saturating_duration_since(now));
+        }
+        let mut move_folder = false;
+        let mut ignore_blurred = false;
+        let mut chosen_strategy = None;
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            settings::card_heading(ui, "Synchronization Settings", Some("These apply when you save"), None);
+            settings::card_heading(ui, "Sync", None, None);
             ui.add_space(10.0);
 
-            settings::setting_row(
-                ui,
-                "Local Sync Folder",
-                None,
-                Some("Changing the sync location safely moves your existing synced files to the new folder, switches the real-time file watcher, and preserves all cloud files without re-uploading or deleting them."),
-                |ui| {
-                    // The field and Browse... as one group of at most WIDE_CONTROL, so its left edge lines up with the
-                    // controls under it (#286)
-                    let browse_w = action_button_width(ui, Some(icons::FOLDER_OPEN), "Browse...");
-                    let gap = 6.0 + ui.spacing().item_spacing.x;
-                    let group_w = ui.available_width().min(settings::WIDE_CONTROL);
-                    let field_w = (group_w - browse_w - gap).max(0.0);
-                    let group = Vec2::new(field_w + gap + browse_w, 32.0);
-                    ui.allocate_ui_with_layout(group, Layout::left_to_right(Align::Center), |ui| {
-                        let field = egui::TextEdit::singleline(&mut self.edit_sync_dir)
-                            .margin(Margin::symmetric(10, 4))
-                            .vertical_align(Align::Center);
-                        let field = ui.add_sized([field_w, 32.0], field);
-                        if field.changed() {
-                            self.mark_settings_edited();
-                        }
-                        ui.add_space(6.0);
-                        browse = action_button(ui, ButtonKind::Secondary, Some(icons::FOLDER_OPEN), "Browse...", 32.0).clicked();
-                        field
-                    })
-                    .inner
-                },
-            );
-            ui.add_space(settings::ROW_GAP);
-
-            settings::setting_row(ui, "Conflict Resolution Strategy", None, None, |ui| {
-                // Both versions are always kept (#91): at once, or once the user chose in Home's Needs attention
-                let choices = [
-                    ("keep-both", "Keep Both (Save conflict copy with timestamp)"),
-                    ("prompt", "Ask me each time (in Home's Needs attention)"),
-                ];
-                let shown = if self.edit_conflict_strategy == "prompt" { choices[1].1 } else { choices[0].1 };
-                let width = ui.available_width().min(settings::WIDE_CONTROL);
-                settings::picker(ui, "conflict_strategy_combo", shown, width, |ui| {
-                    for (val, text) in choices {
-                        if ui.selectable_value(&mut self.edit_conflict_strategy, val.to_string(), text).changed() {
-                            self.mark_settings_edited();
-                        }
-                    }
-                })
-                .response
+            let dir = self.status.sync_dir.clone();
+            settings::setting_row(ui, "Proton Drive folder", None, None, |ui| {
+                // Move… at the right edge, the folder before it, cut short to the room there is (whole on hover)
+                let button = action_button(ui, ButtonKind::Secondary, Some(icons::FOLDER_OPEN), "Move…", 32.0);
+                move_folder = button.clicked();
+                ui.add_space(6.0);
+                let shown = if dir.is_empty() { "Not set up yet" } else { dir.as_str() };
+                let path = ui.add(egui::Label::new(RichText::new(shown).size(13.0).color(TEXT_MUTED())).truncate());
+                if !dir.is_empty() {
+                    path.on_hover_text(&dir);
+                }
+                button
             });
+            self.show_setting_note(ui, "syncDir");
             ui.add_space(settings::ROW_GAP);
 
-            if settings::switch_row(ui, "Enable Ubuntu desktop notifications", None, None, self.edit_notifications) {
+            if settings::switch_row(ui, "Desktop notifications", None, None, self.edit_notifications) {
                 self.edit_notifications = !self.edit_notifications;
-                self.mark_settings_edited();
+                self.apply_setting("notificationsEnabled", serde_json::Value::from(self.edit_notifications));
             }
+            self.show_setting_note(ui, "notificationsEnabled");
             ui.add_space(settings::ROW_GAP);
 
             if settings::switch_row(
@@ -3321,15 +3361,38 @@ impl ProtonDriveNativeApp {
                 self.edit_start_at_login,
             ) {
                 self.edit_start_at_login = !self.edit_start_at_login;
-                self.mark_settings_edited();
+                self.apply_setting("startAtLogin", serde_json::Value::from(self.edit_start_at_login));
             }
+            self.show_setting_note(ui, "startAtLogin");
             ui.add_space(settings::ROW_GAP);
 
             settings::setting_row(
                 ui,
-                "Ignore Patterns (Glob)",
-                Some("One glob pattern per line."),
-                Some("Matching files or folders (e.g. .git, node_modules, *.part) are skipped during two-way sync."),
+                "When a file changes in both places",
+                None,
+                Some("Keep both copies saves the other copy next to the file, with the time in its name. Ask me each time waits for your choice in Home's Needs attention. Either way, both versions are kept."),
+                |ui| {
+                    let choices = [("keep-both", "Keep both copies"), ("prompt", "Ask me each time")];
+                    let shown = if self.edit_conflict_strategy == "prompt" { choices[1].1 } else { choices[0].1 };
+                    let width = ui.available_width().min(settings::WIDE_CONTROL);
+                    settings::picker(ui, "conflict_strategy_combo", shown, width, |ui| {
+                        for (val, text) in choices {
+                            if ui.selectable_label(self.edit_conflict_strategy == val, text).clicked() {
+                                chosen_strategy = Some(val);
+                            }
+                        }
+                    })
+                    .response
+                },
+            );
+            self.show_setting_note(ui, "conflictStrategy");
+            ui.add_space(settings::ROW_GAP);
+
+            settings::setting_row(
+                ui,
+                "Files to ignore",
+                Some("One pattern per line, like *.log or build/"),
+                Some("Matching files and folders are skipped during sync. The app's own temporary files are always skipped, so they aren't listed here."),
                 |ui| {
                     let margin = Margin::symmetric(10, 4);
                     let editor = egui::TextEdit::multiline(&mut self.ignore_patterns_text)
@@ -3338,46 +3401,48 @@ impl ProtonDriveNativeApp {
                         .desired_width(ui.available_width().min(settings::WIDE_CONTROL) - margin.sum().x)
                         .font(FontId::new(13.0, FontFamily::Monospace));
                     let editor = ui.add(editor);
-                    if editor.changed() {
-                        self.mark_settings_edited();
-                    }
+                    ignore_blurred = editor.lost_focus();
                     editor
                 },
             );
-
-            ui.add_space(18.0);
-            let label = if self.settings_saving { "Saving…" } else { "Save Preferences" };
-            let clicked = ui
-                .add_enabled_ui(!self.settings_saving, |ui| action_button(ui, ButtonKind::Primary, None, label, 36.0).clicked())
-                .inner;
-            if clicked {
-                self.save_preferences();
-            }
-            if let Some(notice) = &self.settings_notice {
-                ui.add_space(8.0);
-                let color = if notice.error { DANGER_TEXT() } else { TEXT_MUTED() };
-                ui.add(egui::Label::new(RichText::new(&notice.text).size(12.5).color(color)).wrap());
-            }
+            self.show_setting_note(ui, "ignorePatterns");
         });
-        if browse {
-            self.browse_for_sync_folder();
+        if let Some(choice) = chosen_strategy.filter(|c| *c != self.edit_conflict_strategy) {
+            self.edit_conflict_strategy = choice.to_string();
+            self.apply_setting("conflictStrategy", serde_json::Value::from(choice));
+        }
+        if ignore_blurred {
+            self.apply_ignore_patterns();
+        }
+        if move_folder {
+            self.choose_folder_to_move_to();
         }
     }
 
-    /// Browse...: the folder picker (zenity); a folder chosen goes in the field, to be saved with Save Preferences.
-    fn browse_for_sync_folder(&mut self) {
+    /// The ignore box lost focus: its patterns are sent if they differ from what was sent last, or else from what the
+    /// daemon holds.
+    fn apply_ignore_patterns(&mut self) {
+        let patterns = parse_ignore_patterns(&self.ignore_patterns_text);
+        let known = match self.pending_settings.iter().find(|p| p.key == "ignorePatterns") {
+            Some(sent) => serde_json::from_value(sent.value.clone()).unwrap_or_default(),
+            None => parse_ignore_patterns(&self.loaded_settings.ignore_patterns.join("\n")),
+        };
+        if patterns != known {
+            self.apply_setting("ignorePatterns", serde_json::Value::from(patterns));
+        }
+    }
+
+    /// Move…: the folder picker (zenity); a folder chosen is asked about before anything moves (see `folder_chosen`).
+    fn choose_folder_to_move_to(&mut self) {
         let Ok(out) = Command::new("zenity")
-            .args(["--file-selection", "--directory", "--title=Choose Proton Drive Local Sync Folder"])
+            .args(["--file-selection", "--directory", "--title=Choose the new Proton Drive folder"])
             .output()
         else {
             return;
         };
         if out.status.success() {
             let chosen = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !chosen.is_empty() && chosen != self.edit_sync_dir {
-                self.edit_sync_dir = chosen;
-                self.mark_settings_edited();
-            }
+            self.folder_chosen(&chosen);
         }
     }
 }
@@ -4543,8 +4608,9 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
             // every file), and the status polls must go on meanwhile. The app refreshes once their event arrives.
             WorkerCommand::StartLogin => off_thread(&tx, &ctx, || WorkerEvent::LoginStarted(sign_in_at(&control_socket_path()))),
             WorkerCommand::Logout => off_thread(&tx, &ctx, || WorkerEvent::LoggedOut(sign_out_at(&control_socket_path()))),
-            WorkerCommand::SaveSettings(changes) => off_thread(&tx, &ctx, move || {
-                WorkerEvent::SettingsSaved(save_settings_at(&control_socket_path(), &changes))
+            WorkerCommand::SaveSettings { seq, changes } => off_thread(&tx, &ctx, move || {
+                let keys = changes.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
+                WorkerEvent::SettingsSaved { seq, keys, result: save_settings_at(&control_socket_path(), &changes) }
             }),
             WorkerCommand::SetVirtualDrive(on) => off_thread(&tx, &ctx, move || {
                 let change = serde_json::json!({ "virtualDriveWanted": on });
@@ -5678,10 +5744,11 @@ mod tests {
                 pending_confirm: None,
                 notice: None,
                 ignore_patterns_text: String::new(),
-                settings_dirty: false,
                 loaded_settings: SyncSettings { conflict_strategy: "keep-both".into(), ..Default::default() },
-                settings_saving: false,
-                settings_notice: None,
+                settings_seq: 0,
+                settings_applied_seq: 0,
+                pending_settings: Vec::new(),
+                setting_notes: HashMap::new(),
                 drive_working: false,
                 drive_error: None,
                 block_app_input: String::new(),
@@ -5699,7 +5766,6 @@ mod tests {
                 cut_short_asked_at: 0,
                 cut_short_error: None,
                 fake_cut_short: None,
-                edit_sync_dir: String::new(),
                 edit_conflict_strategy: "keep-both".into(),
                 edit_notifications: false,
                 edit_start_at_login: true,
@@ -5989,7 +6055,7 @@ mod tests {
                         Some(format!("{action} {path:?}{}", if keep_pinned == Some(true) { " keep-pinned" } else { "" }))
                     }
                     WorkerCommand::PinnedSummary => Some("pinned summary".to_string()),
-                    WorkerCommand::SaveSettings(changes) => Some(format!("save {changes}")),
+                    WorkerCommand::SaveSettings { changes, .. } => Some(format!("save {changes}")),
                     WorkerCommand::SetVirtualDrive(on) => Some(format!("virtual drive {on}")),
                     WorkerCommand::SetBlockedApps(apps) => Some(format!("blocked apps {}", apps.join(","))),
                     WorkerCommand::MountAgain => Some("mount again".to_string()),
@@ -8613,44 +8679,10 @@ mod tests {
         }
     }
 
+    // #92: Start at login reads as on from a daemon that doesn't send it
     #[test]
-    fn settings_save_sends_only_the_fields_that_changed() {
-        let loaded = loaded_settings();
-        let changes = |dir: &str, strategy: &str, notify: bool, ignore: &str| {
-            serde_json::Value::Object(settings_changes(&loaded, dir, strategy, notify, loaded.start_at_login, ignore))
-        };
-        let same = ".git\n*.part";
-        assert_eq!(changes("/home/u/ProtonDrive", "keep-both", true, same), serde_json::json!({}));
-        assert_eq!(
-            changes("/home/u/ProtonDrive", "prompt", true, same),
-            serde_json::json!({ "conflictStrategy": "prompt" })
-        );
-        assert_eq!(changes("/home/u/ProtonDrive", "keep-both", false, same), serde_json::json!({ "notificationsEnabled": false }));
-        assert_eq!(changes(" /mnt/b/ProtonDrive ", "keep-both", true, same), serde_json::json!({ "syncDir": "/mnt/b/ProtonDrive" }));
-        // Spacing, blank lines and a trailing newline are no edit: the list as loaded is never written back
-        assert_eq!(changes("/home/u/ProtonDrive/", "keep-both", true, "  .git \n\n*.part\n"), serde_json::json!({ "syncDir": "/home/u/ProtonDrive/" }));
-        assert_eq!(changes("/home/u/ProtonDrive ", "keep-both", true, "  .git \n\n*.part\n"), serde_json::json!({}));
-        assert_eq!(
-            changes("/home/u/ProtonDrive", "keep-both", true, ".git\n*.part\nnode_modules"),
-            serde_json::json!({ "ignorePatterns": [".git", "*.part", "node_modules"] })
-        );
-        assert_eq!(
-            changes("/mnt/x", "prompt", false, ""),
-            serde_json::json!({ "syncDir": "/mnt/x", "conflictStrategy": "prompt", "notificationsEnabled": false, "ignorePatterns": [] })
-        );
-    }
-
-    // #92: the Start at login switch is saved like the others, and reads as on from a daemon that doesn't send it
-    #[test]
-    fn start_at_login_is_sent_only_when_changed_and_on_unless_said_otherwise() {
-        let loaded = loaded_settings();
-        let same = ".git\n*.part";
-        let changes = |start: bool| {
-            serde_json::Value::Object(settings_changes(&loaded, "/home/u/ProtonDrive", "keep-both", true, start, same))
-        };
-        assert!(loaded.start_at_login);
-        assert_eq!(changes(true), serde_json::json!({}));
-        assert_eq!(changes(false), serde_json::json!({ "startAtLogin": false }));
+    fn start_at_login_reads_as_on_unless_said_otherwise() {
+        assert!(loaded_settings().start_at_login);
         let older: SyncSettings = serde_json::from_value(serde_json::json!({ "syncDir": "/home/u/ProtonDrive" })).unwrap();
         assert!(older.start_at_login);
         let off: SyncSettings = serde_json::from_value(serde_json::json!({ "startAtLogin": false })).unwrap();
@@ -8799,7 +8831,7 @@ mod tests {
             WorkerCommand::SetPaused { paused: false, until: None },
             WorkerCommand::StartLogin,
             WorkerCommand::Logout,
-            WorkerCommand::SaveSettings(serde_json::json!({})),
+            WorkerCommand::SaveSettings { seq: 1, changes: serde_json::json!({}) },
             WorkerCommand::SetVirtualDrive(false),
             WorkerCommand::MountAgain,
             WorkerCommand::DriveMove { action: "finish".into(), from: "a".into(), to: "b".into() },
@@ -11302,7 +11334,7 @@ mod tests {
         // A daemon before Stage 2 has no drive to show
         let h = Harness::settings(None, None);
         assert!(h.text_at(SWITCH).is_none());
-        assert!(h.text_at("Save Preferences").is_some());
+        assert!(h.text_at("Move…").is_some());
     }
 
     #[test]
@@ -11466,68 +11498,245 @@ mod tests {
         assert!(h.text_at("Proton Drive is busy moving files").is_some());
     }
 
-    #[test]
-    fn save_preferences_sends_only_what_changed() {
-        let mut h = Harness::settings(None, None);
-        // Below the fold at 1440x900 since Settings gained the Account card and Start at login
-        h.scroll(h.text_at("Save Preferences").unwrap() - Vec2::new(0.0, 200.0), 400.0);
-        h.click(h.text_at("Save Preferences").unwrap());
-        assert_eq!(h.sent(), Vec::<String>::new());
-        assert_eq!(h.app.settings_notice, Some(Notice::info("No changes to save.")));
-
-        h.app.edit_conflict_strategy = "prompt".into();
-        h.app.settings_dirty = true;
-        h.frames(2);
-        h.click(h.text_at("Save Preferences").unwrap());
-        assert_eq!(h.sent(), vec![r#"save {"conflictStrategy":"prompt"}"#.to_string()]);
-        assert!(h.app.settings_saving);
-    }
 
     // #92 and #91 merged into Stage 1's Settings: the login switch is there and saves, and the conflict strategy offers
     // only the two the daemon still takes
     #[test]
     fn settings_has_start_at_login_and_no_strategy_that_replaces_a_version() {
-        let mut h = Harness::settings(None, None);
-        h.scroll(h.text_at("Save Preferences").unwrap() - Vec2::new(0.0, 200.0), 400.0);
+        let mut h = settings_tall(None, None);
         h.click(h.text_at("Start Proton Drive when I log in").expect("the login switch is in Settings"));
         assert!(!h.app.edit_start_at_login);
-        h.click(h.text_at("Save Preferences").unwrap());
         assert_eq!(h.sent(), vec![r#"save {"startAtLogin":false}"#.to_string()]);
 
-        h.click(h.text_at("Keep Both (Save conflict copy with timestamp)").expect("the strategy's dropdown"));
-        assert!(h.text_at("Ask me each time (in Home's Needs attention)").is_some(), "the dropdown is open");
+        h.click(h.text_at("Keep both copies").expect("the strategy's dropdown"));
+        assert!(h.text_at("Ask me each time").is_some(), "the dropdown is open");
         for gone in ["Keep Local (Overwrite remote revision)", "Keep Remote (Overwrite local file)", "Ask manually in Conflicts tab"] {
             assert!(h.text_at(gone).is_none(), "{gone}");
         }
     }
 
+    /// The daemon's answer to the setting `key` sent as number `seq`: stored, as `settings` now hold.
+    fn saved(seq: u64, key: &str, settings: SyncSettings) -> WorkerEvent {
+        WorkerEvent::SettingsSaved {
+            seq,
+            keys: vec![key.into()],
+            result: Ok(SettingsReply { settings: Some(settings), ..Default::default() }),
+        }
+    }
+
+    /// A status refresh in which the daemon holds `settings`.
+    fn status_holding(h: &Harness, settings: SyncSettings) -> WorkerEvent {
+        let mut status = h.app.status.clone();
+        status.settings = settings;
+        WorkerEvent::StatusAndActivity { status: Box::new(Ok(status)), activity: Vec::new() }
+    }
+
+    fn with_notifications(on: bool) -> SyncSettings {
+        SyncSettings { notifications_enabled: on, ..loaded_settings() }
+    }
+
+    /// Where the ignore box is painted.
+    fn ignore_box(h: &Harness) -> egui::Pos2 {
+        accesskit_nodes(h)
+            .into_iter()
+            .find(|(_, n)| n.role() == egui::accesskit::Role::MultilineTextInput)
+            .map(|(_, n)| node_rect(&n).center())
+            .expect("the ignore box is painted")
+    }
+
+    // #425: each control sends only its own setting, at once
     #[test]
-    fn a_save_refreshes_the_form_from_the_reply_and_shows_what_was_refused() {
-        let mut h = Harness::settings(None, None);
-        h.app.edit_sync_dir = "/mnt/b/ProtonDrive".into();
-        h.app.edit_conflict_strategy = "prompt".into();
-        h.app.settings_dirty = true;
-        h.app.settings_saving = true;
-        let stored = SyncSettings { conflict_strategy: "prompt".into(), ..loaded_settings() };
+    fn sync_card_switches_and_choice_apply_at_once() {
+        let mut h = settings_tall(None, None);
+        assert!(!h.text_at_all("Sync").is_empty(), "the card is titled Sync");
+        for gone in ["Save Preferences", "These apply when you save", "Synchronization Settings", "No changes to save."] {
+            assert!(h.text_at(gone).is_none(), "{gone:?} is gone");
+        }
+        assert!(h.texts(|t| t.galley.text().contains("Ubuntu")).is_empty(), "no distro is named");
+
+        h.click(h.text_at("Desktop notifications").expect("the notifications switch"));
+        assert_eq!(h.sent(), vec![r#"save {"notificationsEnabled":false}"#.to_string()]);
+        assert!(!h.app.edit_notifications, "it shows the new value at once");
+        assert!(h.text_at("Saved").is_none(), "nothing is saved until the daemon says so");
+        h.event(saved(h.app.settings_seq, "notificationsEnabled", with_notifications(false)));
+        assert!(h.text_at("Saved").is_some(), "Saved shows beside it");
+
+        h.click(h.text_at("Start Proton Drive when I log in").expect("the login switch"));
+        assert_eq!(h.sent(), vec![r#"save {"startAtLogin":false}"#.to_string()]);
+
+        h.click(h.text_at("Keep both copies").expect("the picker shows the choice"));
+        h.click(h.text_at("Ask me each time").expect("the picker is open"));
+        assert_eq!(h.sent(), vec![r#"save {"conflictStrategy":"prompt"}"#.to_string()]);
+        assert!(h.text_at("When a file changes in both places").is_some());
+    }
+
+    // #425: the ignore box applies when it loses focus, and only if its text changed
+    #[test]
+    fn files_to_ignore_applies_when_the_box_loses_focus_and_only_if_changed() {
+        let mut h = settings_tall(None, None);
+        assert!(h.text_at("Files to ignore").is_some());
+        assert!(h.text_at("One pattern per line, like *.log or build/").is_some());
+        h.app.ignore_patterns_text.clear();
+        h.frames(2);
+        h.click(ignore_box(&h));
+        h.frame(vec![egui::Event::Text("*.log".into())]);
+        h.frames(2);
+        assert_eq!(h.sent(), Vec::<String>::new(), "typing sends nothing");
+        press_key(&mut h, Key::Tab);
+        assert_eq!(h.sent(), vec![r#"save {"ignorePatterns":["*.log"]}"#.to_string()]);
+
+        // In and out again without a change: nothing more, whether the answer is in or not
+        h.click(ignore_box(&h));
+        press_key(&mut h, Key::Tab);
+        assert_eq!(h.sent(), Vec::<String>::new());
+        h.event(saved(h.app.settings_seq, "ignorePatterns", SyncSettings { ignore_patterns: vec!["*.log".into()], ..loaded_settings() }));
+        h.click(ignore_box(&h));
+        press_key(&mut h, Key::Tab);
+        assert_eq!(h.sent(), Vec::<String>::new());
+        assert_eq!(h.app.ignore_patterns_text, "*.log");
+    }
+
+    // #425, review focus 1: a refresh while a change is in flight
+    #[test]
+    fn a_refresh_during_a_save_keeps_the_new_value() {
+        let mut h = settings_tall(None, None);
+        h.click(h.text_at("Desktop notifications").unwrap());
+        let seq = h.app.settings_seq;
+        assert_eq!(h.sent().len(), 1);
+        // The daemon hasn't stored it yet: its status still says on
+        h.event(status_holding(&h, with_notifications(true)));
+        assert!(!h.app.edit_notifications, "the switch keeps what the user chose");
+        h.event(saved(seq, "notificationsEnabled", with_notifications(false)));
+        assert!(!h.app.edit_notifications);
+        h.event(status_holding(&h, with_notifications(false)));
+        assert!(!h.app.edit_notifications);
+        // Once answered, the daemon's word goes again: another program changed it
+        h.event(status_holding(&h, with_notifications(true)));
+        assert!(h.app.edit_notifications);
+    }
+
+    // #425, review focus 2: the last change wins, in whatever order the answers come
+    #[test]
+    fn two_quick_changes_end_on_the_last() {
+        for in_order in [true, false] {
+            let mut h = settings_tall(None, None);
+            h.click(h.text_at("Desktop notifications").unwrap());
+            let first = h.app.settings_seq;
+            h.click(h.text_at("Desktop notifications").unwrap());
+            let second = h.app.settings_seq;
+            assert_ne!(first, second);
+            assert_eq!(
+                h.sent(),
+                vec![r#"save {"notificationsEnabled":false}"#.to_string(), r#"save {"notificationsEnabled":true}"#.to_string()]
+            );
+            assert!(h.app.edit_notifications);
+            let answers = [saved(first, "notificationsEnabled", with_notifications(false)), saved(second, "notificationsEnabled", with_notifications(true))];
+            let [a, b] = answers;
+            let (one, two) = if in_order { (a, b) } else { (b, a) };
+            h.event(one);
+            assert!(h.app.edit_notifications, "in_order={in_order}: still on after the first answer");
+            h.event(two);
+            assert!(h.app.edit_notifications, "in_order={in_order}: on once both answered");
+            assert!(h.app.loaded_settings.notifications_enabled, "in_order={in_order}");
+            assert!(h.app.pending_settings.is_empty());
+        }
+    }
+
+    // #425, review focus 3: a refused change goes back and says why; the ignore box keeps its text
+    #[test]
+    fn a_failed_save_goes_back_and_says_why() {
+        let mut h = settings_tall(None, None);
+        h.click(h.text_at("Desktop notifications").unwrap());
+        h.event(WorkerEvent::SettingsSaved {
+            seq: h.app.settings_seq,
+            keys: vec!["notificationsEnabled".into()],
+            result: Err("Can't reach the Proton Drive daemon".into()),
+        });
+        assert!(h.app.edit_notifications, "the switch shows what the daemon holds");
+        assert!(h.text_at("Can't reach the Proton Drive daemon").is_some());
+        assert!(h.text_at("Saved").is_none());
+
+        h.click(h.text_at("Keep both copies").unwrap());
+        h.click(h.text_at("Ask me each time").unwrap());
+        h.event(WorkerEvent::SettingsSaved {
+            seq: h.app.settings_seq,
+            keys: vec!["conflictStrategy".into()],
+            result: Err("conflictStrategy must be one of keep-both".into()),
+        });
+        assert_eq!(h.app.edit_conflict_strategy, "keep-both");
+        assert!(h.text_at("conflictStrategy must be one of keep-both").is_some());
+
+        h.app.ignore_patterns_text = "*".into();
+        h.frames(2);
+        h.click(ignore_box(&h));
+        press_key(&mut h, Key::Tab);
+        assert_eq!(h.sent().last(), Some(&r#"save {"ignorePatterns":["*"]}"#.to_string()));
+        h.event(WorkerEvent::SettingsSaved {
+            seq: h.app.settings_seq,
+            keys: vec!["ignorePatterns".into()],
+            result: Err("That would hide everything".into()),
+        });
+        assert_eq!(h.app.ignore_patterns_text, "*", "the text is kept, to be fixed");
+        assert!(h.text_at("That would hide everything").is_some());
+        // A refresh doesn't wipe the text that was refused either
+        h.event(status_holding(&h, loaded_settings()));
+        assert_eq!(h.app.ignore_patterns_text, "*");
+    }
+
+    // #425, review focus 5: Move… asks first
+    #[test]
+    fn move_asks_first_and_moves_only_on_move() {
+        let mut h = settings_tall(None, None);
+        assert!(h.text_at("Proton Drive folder").is_some());
+        assert!(h.text_at("/home/u/ProtonDrive").is_some());
+        assert!(h.text_at("Move…").is_some());
+        assert!(h.text_at("Browse...").is_none());
+
+        // The folder it already is: no dialog, nothing sent
+        h.app.folder_chosen(" /home/u/ProtonDrive ");
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+
+        h.app.folder_chosen("/mnt/b/ProtonDrive");
+        h.frames(2);
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::MoveFolder { to: "/mnt/b/ProtonDrive".into() }));
+        assert!(h.text_at("Move your Proton Drive folder to /mnt/b/ProtonDrive?").is_some());
+        assert!(h.text_at("Your files will move there. Proton Drive pauses until the move is done.").is_some());
+        assert_eq!(h.sent(), Vec::<String>::new(), "nothing moves before the answer");
+        h.click(h.text_at("Cancel").expect("the dialog is painted"));
+        assert_eq!(h.app.pending_confirm, None);
+        assert_eq!(h.sent(), Vec::<String>::new());
+
+        h.app.folder_chosen("/mnt/b/ProtonDrive");
+        h.frames(2);
+        h.click(h.text_at("Move").expect("the dialog's Move"));
+        assert_eq!(h.sent(), vec![r#"save {"syncDir":"/mnt/b/ProtonDrive"}"#.to_string()]);
+        assert_eq!(h.app.pending_confirm, None);
+
+        // The daemon refused: its reason shows beside the folder row, and the folder shown is the one it holds
         let reply = SettingsReply {
-            settings: Some(stored.clone()),
+            settings: Some(loaded_settings()),
             folder_error: Some("The new folder must be empty".into()),
             ..Default::default()
         };
-        h.event(WorkerEvent::SettingsSaved(Ok(reply)));
-        assert!(!h.app.settings_saving && !h.app.settings_dirty);
-        assert_eq!(h.app.edit_sync_dir, "/home/u/ProtonDrive");
-        assert_eq!(h.app.loaded_settings, stored);
-        assert_eq!(h.app.settings_notice, Some(Notice::error("The new folder must be empty")));
+        h.event(WorkerEvent::SettingsSaved { seq: h.app.settings_seq, keys: vec!["syncDir".into()], result: Ok(reply) });
+        assert!(h.text_at("The new folder must be empty").is_some());
+        assert!(h.text_at("Saved").is_none());
+        assert!(h.text_at("/home/u/ProtonDrive").is_some());
+    }
 
-        // A refused save keeps the edits to fix them
-        h.app.edit_conflict_strategy = "prompt".into();
-        h.app.settings_dirty = true;
-        h.app.settings_saving = true;
-        h.event(WorkerEvent::SettingsSaved(Err("conflictStrategy must be one of keep-both".into())));
-        assert_eq!(h.app.edit_conflict_strategy, "prompt");
-        assert!(h.app.settings_dirty && !h.app.settings_saving);
-        assert_eq!(h.app.settings_notice, Some(Notice::error("conflictStrategy must be one of keep-both")));
+    // #425: Saved goes after a few seconds
+    #[test]
+    fn the_saved_note_goes_after_a_few_seconds() {
+        let mut h = settings_tall(None, None);
+        h.click(h.text_at("Desktop notifications").unwrap());
+        h.event(saved(h.app.settings_seq, "notificationsEnabled", with_notifications(false)));
+        assert!(h.text_at("Saved").is_some());
+        for note in h.app.setting_notes.values_mut() {
+            note.until = Some(Instant::now() - Duration::from_millis(1));
+        }
+        h.frames(2);
+        assert!(h.text_at("Saved").is_none());
     }
 
     // #276: Settings in Proton's rows. The ⓘ painted right after `label`, on its line.
@@ -11596,15 +11805,9 @@ mod tests {
                 "Hidden from this computer",
                 "Hidden items stay in Proton Drive, but aren't kept on this computer or shown in Files. To hide something, right-click it in Files.",
             ),
-            (
-                "Local Sync Folder",
-                "Changing the sync location safely moves your existing synced files to the new folder, switches the real-time file watcher, and preserves all cloud files without re-uploading or deleting them.",
-            ),
             ("Start Proton Drive when I log in", "Syncs and mounts the drive at login, with the tray icon, without opening this window"),
-            (
-                "Ignore Patterns (Glob)",
-                "Matching files or folders (e.g. .git, node_modules, *.part) are skipped during two-way sync.",
-            ),
+            ("When a file changes in both places", CONFLICT_INFO),
+            ("Files to ignore", IGNORE_INFO),
         ] {
             assert!(h.text_at(explained).is_none(), "{label}: not painted until its ⓘ is hovered");
             let info = info_after(&h, label);
@@ -11614,7 +11817,7 @@ mod tests {
             hover(&mut h, away);
         }
         // How to write the patterns stays in sight, as the row's one-line hint
-        assert!(h.text_at("One glob pattern per line.").is_some());
+        assert!(h.text_at("One pattern per line, like *.log or build/").is_some());
     }
 
     // #318: a click on an ⓘ shows its words at once (egui hides tooltips right after a click, so a hover alone showed
@@ -11926,30 +12129,23 @@ mod tests {
     }
 
     #[test]
-    fn the_save_group_says_it_applies_when_saved() {
+    fn the_sync_card_lists_its_settings_in_order_and_none_waits_for_a_save() {
         let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
         let y = |h: &Harness, text: &str| h.text_at(text).unwrap_or_else(|| panic!("{text:?} is painted")).y;
-        let (heading, hint, save) =
-            (y(&h, "Synchronization Settings"), y(&h, "These apply when you save"), y(&h, "Save Preferences"));
-        assert!(heading < hint && hint < save, "the hint under the heading, above Save Preferences");
-        // Exactly the settings Save Preferences sends are in the group; what acts at once is outside it
-        for row in [
-            "Local Sync Folder",
-            "Conflict Resolution Strategy",
-            "Enable Ubuntu desktop notifications",
+        let rows = [
+            "Proton Drive folder",
+            "Desktop notifications",
             "Start Proton Drive when I log in",
-            "Ignore Patterns (Glob)",
-        ] {
-            assert!((hint..save).contains(&y(&h, row)), "{row} is in the group");
-        }
-        for elsewhere in [SWITCH, "Follow the system", "Apps blocked from downloading", "Hidden from this computer"] {
-            assert!(!(heading..save).contains(&y(&h, elsewhere)), "{elsewhere} is outside the group");
-        }
-        // Its switches wait for Save, as its checkboxes did
-        h.click(h.text_at("Enable Ubuntu desktop notifications").unwrap());
-        assert!(!h.app.edit_notifications && h.app.settings_dirty);
-        assert_eq!(h.sent(), Vec::<String>::new(), "nothing is sent before Save");
-        h.click(h.text_at("Save Preferences").unwrap());
+            "When a file changes in both places",
+            "Files to ignore",
+        ];
+        let ys: Vec<f32> = rows.iter().map(|r| y(&h, r)).collect();
+        assert!(ys.windows(2).all(|w| w[0] < w[1]), "the rows in the card's order: {ys:?}");
+        assert!(y(&h, "Follow the system") < ys[0], "the card is below Appearance, last on the page");
+        assert!(h.text_at("Synchronization Settings").is_none() && h.text_at("Save Preferences").is_none());
+        // A switch applies as it is clicked
+        h.click(h.text_at("Desktop notifications").unwrap());
+        assert!(!h.app.edit_notifications);
         assert_eq!(h.sent(), vec![r#"save {"notificationsEnabled":false}"#.to_string()]);
     }
 
@@ -12055,8 +12251,8 @@ mod tests {
         out
     }
 
-    const SYNC_FOLDER_INFO: &str = "Changing the sync location safely moves your existing synced files to the new folder, switches the real-time file watcher, and preserves all cloud files without re-uploading or deleting them.";
-    const IGNORE_INFO: &str = "Matching files or folders (e.g. .git, node_modules, *.part) are skipped during two-way sync.";
+    const CONFLICT_INFO: &str = "Keep both copies saves the other copy next to the file, with the time in its name. Ask me each time waits for your choice in Home's Needs attention. Either way, both versions are kept.";
+    const IGNORE_INFO: &str = "Matching files and folders are skipped during sync. The app's own temporary files are always skipped, so they aren't listed here.";
     const AT_LOGIN_INFO: &str = "Syncs and mounts the drive at login, with the tray icon, without opening this window";
     const DRIVE_INFO: &str = "Files you haven't downloaded appear in Files and download when you open them.";
     const BLOCKED_INFO: &str = "These apps can't download online-only files. Files they already have on this computer still open.";
@@ -12075,27 +12271,27 @@ mod tests {
         for label in [
             SWITCH,
             "Location",
-            "Local Sync Folder",
-            "Conflict Resolution Strategy",
-            "Enable Ubuntu desktop notifications",
+            "Proton Drive folder",
+            "When a file changes in both places",
+            "Desktop notifications",
             "Start Proton Drive when I log in",
-            "Ignore Patterns (Glob)",
+            "Files to ignore",
             "Theme",
             "rg",
         ] {
             assert!(!stops.contains(&(Role::Label, label.into())), "{label:?} is a stop of the Tab key: {stops:?}");
         }
-        for info in [SYNC_FOLDER_INFO, IGNORE_INFO, AT_LOGIN_INFO, DRIVE_INFO, BLOCKED_INFO, HIDDEN_INFO] {
+        for info in [CONFLICT_INFO, IGNORE_INFO, AT_LOGIN_INFO, DRIVE_INFO, BLOCKED_INFO, HIDDEN_INFO] {
             assert!(stops.contains(&(Role::Label, info.into())), "the ⓘ saying {info:?} is a stop of the Tab key: {stops:?}");
         }
         // A switch is one stop, named by its words
-        assert!(stops.contains(&(Role::CheckBox, "Enable Ubuntu desktop notifications".into())), "{stops:?}");
+        assert!(stops.contains(&(Role::CheckBox, "Desktop notifications".into())), "{stops:?}");
 
         // The ⓘ with the focus shows its words, with a ring
-        assert!(h.text_at(SYNC_FOLDER_INFO).is_none());
-        tab_to(&mut h, SYNC_FOLDER_INFO);
-        assert!(h.text_at(SYNC_FOLDER_INFO).is_some(), "the focused ⓘ says it");
-        let info = info_after(&h, "Local Sync Folder");
+        assert!(h.text_at(CONFLICT_INFO).is_none());
+        tab_to(&mut h, CONFLICT_INFO);
+        assert!(h.text_at(CONFLICT_INFO).is_some(), "the focused ⓘ says it");
+        let info = info_after(&h, "When a file changes in both places");
         assert!(focus_rings(&h).iter().any(|r| r.contains(info)), "with its ring");
 
         // Each control named by its label, and described by its ⓘ
@@ -12108,10 +12304,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("a {role:?} named by {label:?}"))
         };
         for (role, label, info) in [
-            (Role::TextInput, "Local Sync Folder", Some(SYNC_FOLDER_INFO)),
-            (Role::ComboBox, "Conflict Resolution Strategy", None),
+            (Role::ComboBox, "When a file changes in both places", Some(CONFLICT_INFO)),
             (Role::ComboBox, "Theme", None),
-            (Role::MultilineTextInput, "Ignore Patterns (Glob)", Some(IGNORE_INFO)),
+            (Role::MultilineTextInput, "Files to ignore", Some(IGNORE_INFO)),
             (Role::CheckBox, "Start Proton Drive when I log in", Some(AT_LOGIN_INFO)),
             (Role::CheckBox, SWITCH, Some(DRIVE_INFO)),
         ] {
@@ -12240,15 +12435,14 @@ mod tests {
     #[test]
     fn a_switch_shows_the_keyboards_focus_and_space_flips_it() {
         let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
-        tab_to(&mut h, "Enable Ubuntu desktop notifications");
-        let switch = h.nodes_named("Enable Ubuntu desktop notifications").into_iter().find(|n| n.role() == egui::accesskit::Role::CheckBox).unwrap();
+        tab_to(&mut h, "Desktop notifications");
+        let switch = h.nodes_named("Desktop notifications").into_iter().find(|n| n.role() == egui::accesskit::Role::CheckBox).unwrap();
         let switch = node_rect(&switch);
         assert!(focus_rings(&h).iter().any(|r| r.contains_rect(switch)), "a ring around the switch {switch:?}");
         let was = h.app.edit_notifications;
         press_key(&mut h, Key::Space);
         assert_eq!(h.app.edit_notifications, !was, "Space flips it");
-        assert!(h.app.settings_dirty);
-        assert_eq!(h.sent(), Vec::<String>::new(), "it waits for Save, as a click does");
+        assert_eq!(h.sent(), vec![r#"save {"notificationsEnabled":false}"#.to_string()], "it applies at once, as a click does");
     }
 
     // #296: Free up space's choice shows the keyboard's focus on its box, and Space ticks it as a click does
@@ -12365,10 +12559,17 @@ mod tests {
             "App to block should start scrolled off-screen below {}, got {app_before:?}",
             h.screen.y
         );
-        let save_before = node_rect(&h.nodes_named("Save Preferences")[0]);
+        let ignore_rect = |h: &Harness| {
+            let (_, node) = accesskit_nodes(h)
+                .into_iter()
+                .find(|(_, n)| n.role() == egui::accesskit::Role::MultilineTextInput)
+                .expect("Ignore Patterns multiline TextEdit");
+            node_rect(&node)
+        };
+        let ignore_start = ignore_rect(&h);
         assert!(
-            save_before.bottom() > h.screen.y,
-            "Save Preferences should start scrolled off-screen below {}, got {save_before:?}",
+            ignore_start.bottom() > h.screen.y,
+            "The ignore box should start scrolled off-screen below {}, got {ignore_start:?}",
             h.screen.y
         );
 
@@ -12383,13 +12584,6 @@ mod tests {
         );
 
         // Clicking a visible top line of a partially off-screen multiline TextEdit does not jump it under the pointer
-        let ignore_rect = |h: &Harness| {
-            let (_, node) = accesskit_nodes(h)
-                .into_iter()
-                .find(|(_, n)| n.role() == egui::accesskit::Role::MultilineTextInput)
-                .expect("Ignore Patterns multiline TextEdit");
-            node_rect(&node)
-        };
         let gutter = egui::pos2(h.screen.x - SECTION_MARGIN.rightf() - SCROLL_GUTTER.rightf() / 2.0, h.screen.y / 2.0);
         for _ in 0..40 {
             let r = ignore_rect(&h);
@@ -12413,18 +12607,16 @@ mod tests {
             "clicking top of partially visible multiline TextEdit should not jump page: before={ignore_before:?}, after={ignore_after_click:?}"
         );
 
-        // Button at the bottom of Settings becomes visible on Tab with its focus ring unclipped
-        tab_to(&mut h, "Save Preferences");
-        let save_after = node_rect(&focused(&h).expect("Save Preferences focused"));
+        // The last control of Settings becomes visible on Tab
+        // A text box says what it holds
+        let held = h.app.ignore_patterns_text.clone();
+        tab_to(&mut h, &held);
+        let save_after = node_rect(&focused(&h).expect("the ignore box focused"));
         assert!(
             save_after.top() >= chrome::TOP_BAR_HEIGHT && save_after.bottom() <= h.screen.y,
-            "Tabbing to Save Preferences should scroll it into [{}, {}], got {save_after:?}",
+            "Tabbing to the ignore box should scroll it into [{}, {}], got {save_after:?}",
             chrome::TOP_BAR_HEIGHT,
             h.screen.y
-        );
-        assert!(
-            focus_rings(&h).iter().any(|r| r.contains_rect(save_after)),
-            "expected an unclipped focus ring around scrolled-into-view Save Preferences ({save_after:?})"
         );
 
         // Wrapping back up to a control at the top of Settings scrolls it back into view
@@ -12574,7 +12766,7 @@ mod tests {
             }
         }
         assert!(
-            seen_settings_combos.contains("Theme") && seen_settings_combos.contains("Conflict Resolution Strategy"),
+            seen_settings_combos.contains("Theme") && seen_settings_combos.contains("When a file changes in both places"),
             "expected Tab to visit both Settings ComboBoxes, saw {seen_settings_combos:?}"
         );
 
@@ -12738,16 +12930,18 @@ mod tests {
         assert_eq!(rg[0].galley.job.sections[0].format.font_id.family, FontFamily::Monospace);
     }
 
-    // R19 4: the conflict choice, cut short in a narrow window, is whole on hover
+    // R19 4: a picker's choice, cut short where there isn't the room for it, is whole on hover (the Sync card's choices
+    // are short now, so a long one stands in)
     #[test]
     fn a_cut_short_choice_is_whole_on_hover() {
-        const CHOICE: &str = "Keep Both (Save conflict copy with timestamp)";
-        let mut h = Harness::settings(None, None);
-        h.resize_zoomed(Vec2::new(840.0, 2400.0), 1.0);
+        const CHOICE: &str = "A choice far too long to fit in the picker that shows it";
+        let mut h = Harness::widget(|ui| {
+            settings::picker(ui, "long_choice", CHOICE, 140.0, |_| {});
+        });
         tooltips_at_once(&h);
         let whole = |h: &Harness| h.texts(|t| t.galley.text() == CHOICE && !t.galley.elided).len();
-        assert_eq!(whole(&h), 0, "cut short at 840");
-        let shown = h.text_rect_starting("Keep Both (").expect("the picker shows the choice's start");
+        assert_eq!(whole(&h), 0, "cut short");
+        let shown = h.text_rect_starting("A choice").expect("the picker shows the choice's start");
         hover(&mut h, shown.center());
         assert_eq!(whole(&h), 1, "whole on hover");
     }
@@ -12904,7 +13098,7 @@ mod tests {
                     .map(|t| (t.galley.text().to_string(), t.visual_bounding_rect()))
                     .filter(|(_, r)| in_sight(*r))
                     .collect();
-                seen_save |= texts.iter().any(|(t, _)| t == "Save Preferences");
+                seen_save |= texts.iter().any(|(t, _)| t == "Files to ignore");
                 for (text, r) in &texts {
                     let card = card_of(*r).unwrap_or_else(|| panic!("{at}: {text:?} {r:?} is in a card"));
                     assert!(r.right() <= card.right() + 0.5, "{at}: {text:?} runs out of its card: {r:?}");
@@ -12924,8 +13118,7 @@ mod tests {
         }
     }
 
-    // #286: in Settings' Synchronization card at 1100 wide, the sync-folder field, the conflict-strategy picker, and
-    // the ignore-patterns box share one left edge, and their text shares the same 10 pt inner horizontal padding.
+    // #286: in Settings' Sync card at 1100 wide, the conflict picker and the ignore box share one left edge, and their text shares the same 10 pt inner horizontal padding.
     #[test]
     fn sync_settings_controls_share_one_left_edge_and_inner_padding() {
         use egui::accesskit::Role;
@@ -12943,31 +13136,20 @@ mod tests {
             node_rect(node)
         };
 
-        let folder = control_rect(Role::TextInput, "Local Sync Folder");
-        let conflict = control_rect(Role::ComboBox, "Conflict Resolution Strategy");
-        let ignore = control_rect(Role::MultilineTextInput, "Ignore Patterns (Glob)");
+        let conflict = control_rect(Role::ComboBox, "When a file changes in both places");
+        let ignore = control_rect(Role::MultilineTextInput, "Files to ignore");
 
         assert!(
-            (folder.left() - conflict.left()).abs() < 0.5,
-            "sync-folder field {folder:?} and conflict picker {conflict:?} share one left edge"
-        );
-        assert!(
-            (folder.left() - ignore.left()).abs() < 0.5,
-            "sync-folder field {folder:?} and ignore-patterns box {ignore:?} share one left edge"
+            (conflict.left() - ignore.left()).abs() < 0.5,
+            "conflict picker {conflict:?} and ignore-patterns box {ignore:?} share one left edge"
         );
 
-        let folder_text = h
-            .text_rects_all("/home/u/ProtonDrive")
-            .into_iter()
-            .find(|r| folder.contains(r.center()))
-            .expect("sync folder text inside field");
-        let conflict_text = h.text_rect_starting("Keep Both").expect("conflict strategy text");
+        let conflict_text = h.text_rect_starting("Keep both copies").expect("conflict strategy text");
         let ignore_text = h.text_rect("*.part").expect("ignore pattern text");
 
         for (name, box_rect, text_rect) in [
-            ("Local Sync Folder", folder, folder_text),
-            ("Conflict Resolution Strategy", conflict, conflict_text),
-            ("Ignore Patterns (Glob)", ignore, ignore_text),
+            ("When a file changes in both places", conflict, conflict_text),
+            ("Files to ignore", ignore, ignore_text),
         ] {
             let pad = text_rect.left() - box_rect.left();
             assert!(
@@ -14383,7 +14565,7 @@ mod tests {
         // Settings' Account card: Sign out, and Sign in while signed out
         let h = settings_tall(None, None);
         assert!(icon_before(&h, "Sign out", icons::SIGN_OUT), "the Account card's Sign out");
-        assert!(icon_before(&h, "Browse...", icons::FOLDER_OPEN), "Browse...");
+        assert!(icon_before(&h, "Move…", icons::FOLDER_OPEN), "Move…");
         let mut h = Harness::settings(None, None);
         h.app.status.logged_in = false;
         h.frames(2);
