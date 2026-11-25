@@ -8644,6 +8644,325 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             });
         });
 
+        // #435: an rmdir sends the folder to the Proton Drive trash with whatever Proton Drive has in it, and what this
+        // computer knows of that (the remote index, the recorded Docs and Sheets) can be behind. So a folder with a cloud
+        // node that looks empty is listed afresh first: anything in it refuses the rmdir (and is recorded, so the drive
+        // shows it), and so does a listing that fails. Only a folder that is empty there too goes.
+        describe('an rmdir lists the folder in Proton Drive before trashing it (#435)', () => {
+            const DOC = 'application/vnd.proton.doc';
+            const SHEET = 'application/vnd.proton.sheet';
+            // The cloud calls and journalled operations from here on
+            const watching = (d: ReturnType<typeof setup>) => {
+                const enqueue = spyOn((d.engine as any).journal as RemoteOpsJournal, 'enqueue');
+                const getNode = spyOn(d.sdk as any, 'getNode');
+                const listing = spyOn(d.sdk as any, 'iterateFolderChildren');
+                return Object.assign(d, {
+                    journalled: () => enqueue.mock.calls.map(([op]) => op),
+                    cloudCalls: () => getNode.mock.calls.length + listing.mock.calls.length,
+                    listed: () => listing.mock.calls.map(([parent]) => (typeof parent === 'string' ? parent : (parent as { uid: string }).uid)),
+                });
+            };
+            // An empty folder Cloud, online-only and indexed, and then what `then` adds to it in Proton Drive, which
+            // this computer hasn't seen
+            const onlineOnly = async (then: (d: ReturnType<typeof setup>) => unknown = () => {}) => {
+                const d = setup();
+                d.add('Cloud');
+                await d.engine.reconcileNow();
+                expect(d.engine.remoteIndex.getByPath('Cloud')).toMatchObject({ uid: 'vol~Cloud', type: 'folder' });
+                then(d);
+                return watching(d);
+            };
+            const addDoc = (d: ReturnType<typeof setup>, rel: string, mediaType = DOC) => Object.assign(d.add(rel, 'x'), { mediaType });
+            const rmdir = (d: ReturnType<typeof setup>, rel = 'Cloud') =>
+                d.engine.deleteItem(rel, { onlyIfEmpty: true }).then(
+                    () => null,
+                    (e: unknown) => (e instanceof DriveOpError ? e.code : e),
+                );
+            // Nothing journalled or trashed, and the folder still indexed with what is in it in Proton Drive
+            const expectKept = async (d: ReturnType<typeof watching>, inside: string) => {
+                expect(d.journalled()).toEqual([]);
+                await d.engine.replayRemoteOps();
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.nodes.has('vol~Cloud')).toBe(true);
+                expect(d.nodes.has(`vol~Cloud/${inside}`)).toBe(true);
+                expect(d.engine.remoteIndex.getByPath('Cloud')).toMatchObject({ uid: 'vol~Cloud', type: 'folder' });
+            };
+
+            test('a folder whose only children are Docs and Sheets not recorded yet is not empty: ENOTEMPTY, nothing trashed, and they are recorded', async () => {
+                const d = await onlineOnly((d) => {
+                    addDoc(d, 'Cloud/Notes');
+                    addDoc(d, 'Cloud/Budget', SHEET);
+                });
+                expect(d.engine.docNodes.anyChildren('vol~Cloud')).toBe(false); // all #430 alone went by
+
+                expect(await rmdir(d)).toBe('ENOTEMPTY');
+
+                await expectKept(d, 'Notes');
+                expect(d.nodes.has('vol~Cloud/Budget')).toBe(true);
+                expect(d.engine.docNodes.listChildren('vol~Cloud').map((r) => [r.name, r.kind])).toEqual([
+                    ['Budget', 'sheet'],
+                    ['Notes', 'doc'],
+                ]);
+                expect(d.engine.vfsChildren('Cloud').map((e) => e.name)).toEqual(['Budget.protonsheet', 'Notes.protondoc']);
+            });
+
+            for (const [kind, add, type] of [
+                ['a file', (d: ReturnType<typeof setup>) => d.add('Cloud/New', 'new'), 'file'],
+                ['a folder', (d: ReturnType<typeof setup>) => d.add('Cloud/New'), 'folder'],
+            ] as const) {
+                test(`a folder holding ${kind} the remote index hasn't seen yet is not empty: ENOTEMPTY, nothing trashed, and it is indexed`, async () => {
+                    const d = await onlineOnly(add);
+                    expect(d.engine.remoteIndex.getByPath('Cloud/New')).toBeNull();
+
+                    expect(await rmdir(d)).toBe('ENOTEMPTY');
+
+                    await expectKept(d, 'New');
+                    expect(d.engine.remoteIndex.getByPath('Cloud/New')).toMatchObject({ uid: 'vol~Cloud/New', type });
+                    expect(d.engine.vfsChildren('Cloud').map((e) => e.name)).toEqual(['New']);
+                });
+            }
+
+            test('a folder on this computer is listed too: one holding a file the index has not seen stays, here and there', async () => {
+                const d = setup();
+                await pinnedAndSynced(d, d.add('Kept').uid);
+                expect(await d.files.exists('Kept')).toBe(true);
+                expect(stateDb.getItemByPath('Kept')).not.toBeNull();
+                d.add('Kept/new.txt', 'new');
+                const w = watching(d);
+
+                expect(await rmdir(w, 'Kept')).toBe('ENOTEMPTY');
+
+                expect(w.journalled()).toEqual([]);
+                expect(await d.files.exists('Kept')).toBe(true);
+                expect(stateDb.getItemByPath('Kept')).not.toBeNull();
+                await d.engine.replayRemoteOps();
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.nodes.has('vol~Kept/new.txt')).toBe(true);
+                await d.expectEveryRecordHasItsFile();
+            });
+
+            // The folder listed is the one a delete would trash (#454): a recorded node another device has moved away since
+            // isn't trashed, as only the local folder goes, so it isn't listed either, and that works offline
+            test('a folder whose node another device moved away since is removed here only, without asking Proton Drive, offline too', async () => {
+                const d = setup();
+                d.add('Docs/E');
+                await pinnedAndSynced(d, d.add('Docs').uid);
+                expect(stateDb.getItemByPath('Docs/E')?.nodeUid).toBe('vol~Docs/E');
+                const node = d.nodes.get('vol~Docs/E')!;
+                d.nodes.set(node.uid, { ...node, name: { ok: true as const, value: 'E2' } });
+                d.engine.remoteIndex.upsert(entryFromNode(d.nodes.get(node.uid)!, 'Docs')!);
+                const w = watching(d);
+                d.down.add('getNode');
+                d.down.add('iterateFolderChildren');
+
+                expect(await rmdir(w, 'Docs/E')).toBeNull();
+
+                expect(w.cloudCalls()).toBe(0);
+                expect(w.journalled()).toEqual([]);
+                expect(await d.files.exists('Docs/E')).toBe(false);
+                expect(d.engine.remoteIndex.getByUid('vol~Docs/E')?.relPath).toBe('Docs/E2');
+            });
+
+            for (const [how, fail] of [
+                ['its listing fails', (d: ReturnType<typeof setup>) => d.failListing.add('vol~Cloud')],
+                ['Proton Drive is out of reach', (d: ReturnType<typeof setup>) => ['getNode', 'iterateFolderChildren'].forEach((m) => d.down.add(m))],
+            ] as const) {
+                test(`when ${how}, the rmdir is refused with EIO, to be tried again, and nothing changes`, async () => {
+                    const d = await onlineOnly((d) => addDoc(d, 'Cloud/Notes'));
+                    fail(d);
+
+                    expect(await rmdir(d)).toBe('EIO');
+
+                    await expectKept(d, 'Notes');
+                    // Once it can be listed, the document is found
+                    d.failListing.clear();
+                    d.down.clear();
+                    expect(await rmdir(d)).toBe('ENOTEMPTY');
+                    expect(d.engine.docNodes.anyChildren('vol~Cloud')).toBe(true);
+                    expect(d.calls.trashed).toEqual([]);
+                });
+            }
+
+            test('a folder that is empty in Proton Drive too is trashed as before, after one listing of it', async () => {
+                const d = await onlineOnly();
+
+                expect(await rmdir(d)).toBeNull();
+
+                expect(d.listed()).toEqual(['vol~Cloud']);
+                expect(d.journalled()).toMatchObject([{ kind: 'trash', nodeUid: 'vol~Cloud' }]);
+                expect(d.engine.remoteIndex.getByPath('Cloud')).toBeNull();
+                await d.engine.replayRemoteOps();
+                expect(d.calls.trashed).toEqual([['vol~Cloud']]);
+            });
+
+            test('a folder only on this computer is removed without asking Proton Drive anything, offline too', async () => {
+                const d = setup();
+                await d.engine.reconcileNow();
+                await mkdir(d.local('Mine'), { recursive: true }); // never synced: no record, no index entry
+                const w = watching(d);
+                d.down.add('getNode');
+                d.down.add('iterateFolderChildren');
+
+                expect(await rmdir(w, 'Mine')).toBeNull();
+
+                expect(await d.files.exists('Mine')).toBe(false);
+                expect(w.cloudCalls()).toBe(0);
+                expect(w.journalled()).toEqual([]);
+            });
+
+            test('a folder that holds something here is refused without asking Proton Drive', async () => {
+                const d = await onlineOnly();
+                await d.files.writeLocal('Cloud/mine.txt', 'mine');
+
+                expect(await rmdir(d)).toBe('ENOTEMPTY');
+
+                expect(d.cloudCalls()).toBe(0);
+                expect(await readFile(d.local('Cloud/mine.txt'), 'utf8')).toBe('mine');
+            });
+
+            test('Move to Trash of a folder holding Docs not recorded yet still trashes it whole, without listing it', async () => {
+                const d = await onlineOnly((d) => addDoc(d, 'Cloud/Notes'));
+
+                await d.engine.deleteItem('Cloud', { trash: true });
+                await d.engine.replayRemoteOps();
+
+                // PINNED (#430): the folder goes to the Proton Drive trash as a whole, its documents with it
+                expect(d.calls.trashed).toEqual([['vol~Cloud']]);
+                expect(d.listed()).toEqual([]);
+            });
+
+            // rm -r through the drive unlinks what is in a folder, then removes it: the trashes and moves of its children are
+            // in the journal, not yet in Proton Drive, whose listing still has them. They don't keep the folder, and none
+            // of them is trashed with it: a child moved elsewhere is moved first, as the journal keeps the order.
+            test('children deleted or moved away through the drive, not yet in Proton Drive, do not keep the folder', async () => {
+                const d = setup();
+                d.add('Cloud/a.txt', 'a');
+                d.add('Cloud/b.txt', 'b');
+                d.add('Other');
+                await d.engine.reconcileNow();
+                d.down.add('trashNodes');
+                d.down.add('moveNodes');
+                await d.engine.deleteItem('Cloud/a.txt');
+                await d.engine.renameItem('Cloud/b.txt', 'Other/b.txt');
+                const w = watching(d);
+
+                expect(await rmdir(w)).toBeNull();
+
+                expect(w.listed()).toEqual(['vol~Cloud']);
+                d.down.clear();
+                await d.engine.replayRemoteOps();
+                expect(d.calls.trashed).toEqual([['vol~Cloud/a.txt'], ['vol~Cloud']]);
+                expect(d.calls.moved).toEqual([{ uid: 'vol~Cloud/b.txt', parentUid: 'vol~Other' }]);
+                expect(d.nodes.get('vol~Cloud/b.txt')?.parentUid).toBe('vol~Other');
+            });
+
+            // The listing is asked for outside the engine's turn, so the folder at that path can change meanwhile: the
+            // turn after it goes by the folder there then, and a listing of another node doesn't do for it
+            describe('a folder replaced at that path while the listing is on its way', () => {
+                // Empty folders Cloud and `next`, indexed; each listing renames the folder at Cloud away and the next of
+                // `next` to Cloud, through the drive
+                const replacingDuringListing = async (next: string[], then: (d: ReturnType<typeof setup>) => unknown = () => {}) => {
+                    const d = setup();
+                    for (const rel of ['Cloud', ...next]) {
+                        d.add(rel);
+                    }
+                    await d.engine.reconcileNow();
+                    then(d);
+                    const real = (d.sdk as any).iterateFolderChildren;
+                    let n = 0;
+                    (d.sdk as any).iterateFolderChildren = async function* (parent: unknown) {
+                        const listed: unknown[] = [];
+                        for await (const child of real(parent)) listed.push(child);
+                        const to = next[n];
+                        if (to !== undefined) {
+                            await d.engine.renameItem('Cloud', `Old${n}`);
+                            await d.engine.renameItem(to, 'Cloud');
+                            n += 1;
+                        }
+                        yield* listed;
+                    };
+                    return watching(d);
+                };
+
+                test('the folder now there is listed in turn, and what it holds keeps it', async () => {
+                    const d = await replacingDuringListing(['Other'], (d) => addDoc(d, 'Other/Notes'));
+
+                    expect(await rmdir(d)).toBe('ENOTEMPTY');
+
+                    expect(d.listed()).toEqual(['vol~Cloud', 'vol~Other']);
+                    expect(d.journalled().filter((op) => op.kind === 'trash')).toEqual([]);
+                    await d.engine.replayRemoteOps();
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.nodes.has('vol~Other/Notes')).toBe(true);
+                });
+
+                test('a folder that keeps changing is refused with EIO after two listings, and nothing is trashed', async () => {
+                    const d = await replacingDuringListing(['Next0', 'Next1']);
+
+                    expect(await rmdir(d)).toBe('EIO');
+
+                    expect(d.listed()).toEqual(['vol~Cloud', 'vol~Next0']);
+                    expect(d.journalled().filter((op) => op.kind === 'trash')).toEqual([]);
+                    await d.engine.replayRemoteOps();
+                    expect(d.calls.trashed).toEqual([]);
+                });
+            });
+
+            // The trash of a child deleted through the drive can reach Proton Drive while the listing is on its way, which
+            // then still has the child: it doesn't keep the folder either. Such a listing is out of date, so it isn't
+            // recorded: it would put the trashed child back in the remote index (#235).
+            describe('a trash that reaches Proton Drive while the listing is on its way', () => {
+                const settlingDuringListing = async (withDoc: boolean) => {
+                    const d = setup();
+                    d.add('Cloud/a.txt', 'a');
+                    await d.engine.reconcileNow();
+                    d.down.add('trashNodes');
+                    await d.engine.deleteItem('Cloud/a.txt');
+                    if (withDoc) {
+                        addDoc(d, 'Cloud/Notes');
+                    }
+                    const real = (d.sdk as any).iterateFolderChildren;
+                    let once = true;
+                    (d.sdk as any).iterateFolderChildren = async function* (parent: unknown) {
+                        const listed: unknown[] = [];
+                        for await (const child of real(parent)) listed.push(child);
+                        if (once) {
+                            once = false;
+                            d.down.delete('trashNodes');
+                            await d.engine.replayRemoteOps(); // a.txt goes to the trash now, after the listing was taken
+                            expect(d.calls.trashed).toEqual([['vol~Cloud/a.txt']]);
+                        }
+                        yield* listed;
+                    };
+                    return d;
+                };
+
+                test('it does not keep the folder', async () => {
+                    const d = await settlingDuringListing(false);
+
+                    expect(await rmdir(d)).toBeNull();
+
+                    await d.engine.replayRemoteOps();
+                    expect(d.calls.trashed).toEqual([['vol~Cloud/a.txt'], ['vol~Cloud']]);
+                });
+
+                test('a document there still keeps it, and the out-of-date listing is not recorded', async () => {
+                    const d = await settlingDuringListing(true);
+
+                    expect(await rmdir(d)).toBe('ENOTEMPTY');
+
+                    expect(d.engine.remoteIndex.getByPath('Cloud/a.txt')).toBeNull();
+                    expect(d.engine.vfsChildren('Cloud').map((e) => e.name)).not.toContain('a.txt');
+                    expect(d.journal()).toEqual([]);
+                    // A listing that nothing overtook is recorded
+                    expect(await rmdir(d)).toBe('ENOTEMPTY');
+                    expect(d.engine.docNodes.listChildren('vol~Cloud').map((r) => r.name)).toEqual(['Notes']);
+                    expect(d.engine.remoteIndex.getByPath('Cloud/a.txt')).toBeNull();
+                    expect(d.calls.trashed).toEqual([['vol~Cloud/a.txt']]);
+                });
+            });
+        });
+
         // #454: a delete through the drive trashes the node a record (or an edit baseline) names only where the remote
         // index still has that node at the deleted path. Another device may have moved it away since (renamed it, moved
         // it, or renamed the folder it is in), and the index heard of it (a listing, an event) before this computer's copy

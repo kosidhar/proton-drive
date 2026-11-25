@@ -48,6 +48,21 @@ describe('RemoteOpsJournal', () => {
         expect(new RemoteOpsJournal(stateDb.connection).pending()).toEqual(before);
     });
 
+    // #435: whether an operation was journalled since a moment, even one that has completed since
+    test('lastId is the id the latest operation journalled was given, whether or not it is still pending', () => {
+        const journal = new RemoteOpsJournal(stateDb.connection);
+        expect(journal.lastId()).toBe(0);
+        const a = journal.enqueue({ kind: 'trash', nodeUid: 'vol~a', path: 'a.txt' });
+        expect(journal.lastId()).toBe(a);
+        const b = journal.enqueue({ kind: 'trash', nodeUid: 'vol~b', path: 'b.txt' });
+        journal.complete(b);
+        expect(journal.lastId()).toBe(b);
+        journal.complete(a);
+        expect(journal.pending()).toEqual([]);
+        expect(journal.lastId()).toBe(b);
+        expect(journal.enqueue({ kind: 'trash', nodeUid: 'vol~c', path: 'c.txt' })).toBe(b + 1);
+    });
+
     test('complete removes an operation; failed keeps it pending, counting the attempt and keeping the error', () => {
         const journal = new RemoteOpsJournal(stateDb.connection);
         const a = journal.enqueue({ kind: 'rename', nodeUid: 'vol~a', toPath: 'A2' });
