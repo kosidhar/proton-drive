@@ -39,6 +39,8 @@ pub(crate) const WIDE_CONTROL: f32 = 360.0;
 pub(crate) const STACKED_BELOW: f32 = 440.0;
 /// The room between a label and the control under it
 const STACKED_GAP: f32 = 6.0;
+/// The share of a stacked row's width its label has while a note is beside it
+const STACKED_LABEL_SHARE: f32 = 0.6;
 
 /// A setting as Proton lays one out (#276): its label, and a one-line `hint` at most, on the left; the ⓘ after the label
 /// when there is more to say (`info`, on hover, a click or keyboard focus); and its `control` on the right, vertically
@@ -58,12 +60,124 @@ pub(crate) fn setting_row(
     info: Option<&str>,
     control: impl FnOnce(&mut egui::Ui) -> egui::Response,
 ) -> egui::Response {
-    row(ui, true, label, RowLabel::Words, hint, info, control)
+    row(ui, true, label, RowLabel::Words, hint, info, Slot::None, control)
+}
+
+/// `setting_row` with a `note` (how a change went, or that a move is under way) beside its control, in the room the
+/// row already has, so it never changes where the rows below are (#428).
+pub(crate) fn setting_row_noted(
+    ui: &mut egui::Ui,
+    label: &str,
+    hint: Option<&str>,
+    info: Option<&str>,
+    note: Option<&RowNote>,
+    control: impl FnOnce(&mut egui::Ui) -> egui::Response,
+) -> egui::Response {
+    row(ui, true, label, RowLabel::Words, hint, info, Slot::Of(note), control)
+}
+
+/// Whether a row has a place for a note, and the note in it.
+#[derive(Clone, Copy)]
+enum Slot<'a> {
+    /// No place: the row's control has all the room
+    None,
+    /// A place beside the control, kept free whether or not there is a note, so a note appearing moves nothing (#428)
+    Of(Option<&'a RowNote>),
+}
+
+fn reserve_for(slot: Slot) -> f32 {
+    if slot.reserved() {
+        NOTE_RESERVE
+    } else {
+        0.0
+    }
+}
+
+impl<'a> Slot<'a> {
+    fn reserved(self) -> bool {
+        matches!(self, Slot::Of(_))
+    }
+
+    fn note(self) -> Option<&'a RowNote> {
+        match self {
+            Slot::Of(note) => note,
+            Slot::None => None,
+        }
+    }
+}
+
+/// What kind of thing a row's note says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NoteTone {
+    /// A change was saved
+    Success,
+    /// A change wasn't made, and why
+    Error,
+    /// Something is under way
+    Working,
+}
+
+/// A line beside a setting's control: its words, and a tone that gives its colour and icon.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RowNote {
+    pub text: String,
+    pub tone: NoteTone,
+}
+
+/// The room an icon takes before a note's words, with the gap after it
+const NOTE_ICON_ROOM: f32 = 18.0;
+/// The room between a row's label (or its control) and a note beside it
+const NOTE_GAP: f32 = 8.0;
+/// The room a row with a note keeps free beside its control, however little its label leaves: an icon and a few words
+const NOTE_RESERVE: f32 = 100.0;
+/// A note with less room than an icon and a few letters shows nothing
+const NOTE_MIN_ROOM: f32 = NOTE_ICON_ROOM;
+
+/// Draws `note` in `rect`, on one line: its icon, then its words cut to the room left (whole on hover), flush with the
+/// right edge of `rect` when `right_aligned`, else with its left. The words are announced politely as they appear (#425).
+fn draw_note(ui: &mut egui::Ui, rect: egui::Rect, note: &RowNote, right_aligned: bool) {
+    if rect.width() < NOTE_MIN_ROOM || rect.height() < 14.0 {
+        return;
+    }
+    let layout = if right_aligned { Layout::right_to_left(Align::Center) } else { Layout::left_to_right(Align::Center) };
+    // A child that takes no room from its parent: the note is drawn into the row, it doesn't lay a line of its own out
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
+    note_contents(&mut child, note, rect.width());
+}
+
+/// A note's icon and words in `room`, in the layout `ui` has: for a control's own row, whose layout runs right to left
+/// (so the words go first, and the icon after them).
+fn note_contents(ui: &mut egui::Ui, note: &RowNote, room: f32) {
+    let (color, icon) = match note.tone {
+        NoteTone::Success => (TEXT_MUTED(), icons::CHECK),
+        NoteTone::Error => (DANGER_TEXT(), icons::WARNING),
+        NoteTone::Working => (PROTON_PURPLE_TEXT(), icons::REFRESH),
+    };
+    let right_to_left = ui.layout().prefer_right_to_left();
+    ui.spacing_mut().item_spacing.x = 4.0;
+    let words = |ui: &mut egui::Ui| {
+        ui.scope(|ui| {
+            ui.set_max_width((room - NOTE_ICON_ROOM).max(1.0));
+            let label = ui.add(egui::Label::new(RichText::new(&note.text).size(12.5).color(color)).truncate());
+            // Announced as it appears, as the Working… lines are (#370)
+            ui.ctx().accesskit_node_builder(label.id, |node| node.set_live(egui::accesskit::Live::Polite));
+        });
+    };
+    let icon = |ui: &mut egui::Ui| {
+        crate::decoration(ui, icon, 14.0, color).on_hover_text(&note.text);
+    };
+    if right_to_left {
+        words(ui);
+        icon(ui);
+    } else {
+        icon(ui);
+        words(ui);
+    }
 }
 
 /// `setting_row` for a name typed as code, an app's process name, which its label shows in monospace.
 pub(crate) fn code_row(ui: &mut egui::Ui, name: &str, control: impl FnOnce(&mut egui::Ui) -> egui::Response) -> egui::Response {
-    row(ui, true, name, RowLabel::Code, None, None, control)
+    row(ui, true, name, RowLabel::Code, None, None, Slot::None, control)
 }
 
 /// What a row's label is.
@@ -89,6 +203,7 @@ impl RowLabel {
 
 /// `setting_row`, with its label as `kind` says. When `!enabled`, the control and its label are greyed out while any
 /// ⓘ stays enabled so keyboard users can still Tab to it and read its explanation (#289).
+#[allow(clippy::too_many_arguments)] // a row's label, hint, ⓘ, note slot and control are each its own
 fn row(
     ui: &mut egui::Ui,
     enabled: bool,
@@ -96,13 +211,30 @@ fn row(
     kind: RowLabel,
     hint: Option<&str>,
     info: Option<&str>,
+    slot: Slot,
     control: impl FnOnce(&mut egui::Ui) -> egui::Response,
 ) -> egui::Response {
+    let note = slot.note();
     let width = ui.available_width();
     if width < STACKED_BELOW {
         return ui
             .vertical(|ui| {
-                let label = label_column(ui, enabled, label, kind, hint, info);
+                // The note on the label's line, at the right: the label gives it a share of that line
+                let top = ui.cursor().min;
+                let label = ui
+                    .scope(|ui| {
+                        if slot.reserved() {
+                            ui.set_max_width(width * STACKED_LABEL_SHARE);
+                        }
+                        label_column(ui, enabled, label, kind, hint, info)
+                    })
+                    .inner;
+                if let Some(note) = note {
+                    let line_h = ui.fonts(|f| f.row_height(&kind.font())).max(INFO_SIZE);
+                    let left = top.x + width * STACKED_LABEL_SHARE + NOTE_GAP;
+                    let rect = egui::Rect::from_min_max(egui::pos2(left, top.y), egui::pos2(top.x + width, top.y + line_h));
+                    draw_note(ui, rect, note, true);
+                }
                 ui.add_space(STACKED_GAP);
                 let control = ui.add_enabled_ui(enabled, control).inner;
                 name_control(ui, &control, &label, info);
@@ -118,7 +250,7 @@ fn row(
     let left_h = label_h + hint.map_or(0.0, |_| HINT_GAP + ui.fonts(|f| f.row_height(&hint_font)));
     let row_h = left_h.max(ROW_HEIGHT);
     let gap = CONTROL_GAP + ui.spacing().item_spacing.x;
-    let control_room = (width - need - gap).max(width * CONTROL_SHARE);
+    let control_room = (width - need - gap - reserve_for(slot)).max(width * CONTROL_SHARE);
     // Lay out label + ⓘ first (left to right for Tab and screen readers) while keeping the control right-aligned and
     // giving the label every pixel the control doesn't use (#367).
     let size_key = ui.id().with(("setting_row_ctrl_size", label));
@@ -127,7 +259,9 @@ fn row(
         Some(sz) => (sz.x.min(control_room), sz.y.max(row_h)),
         None => (control_room, row_h),
     };
-    let label_w = (width - est_w - CONTROL_GAP).max(0.0);
+    // A row with a note keeps its room free: the label is cut short for it, where the control leaves the label too little
+    let reserve = reserve_for(slot);
+    let label_w = (width - est_w - CONTROL_GAP - reserve).max(0.0);
     let total_h = est_h.max(row_h);
     let (_, row_rect) = ui.allocate_space(Vec2::new(width, total_h));
     // The label level with the control's middle, or beside a control taller than the row (a text box), with its top line
@@ -160,6 +294,21 @@ fn row(
     if cached.is_none_or(|c| (c.x - actual.x).abs() > 0.5 || (c.y - actual.y).abs() > 0.5) {
         ui.ctx().data_mut(|d| d.insert_temp(size_key, actual));
         ui.ctx().request_discard("setting_row_ctrl_size");
+    }
+    if let Some(note) = note {
+        if total_h > row_h + 0.5 {
+            // A control taller than its label (a text box): the note under the label's hint, in the label's column,
+            // and no taller than what is left of the box
+            let top = column.bottom() + HINT_GAP;
+            let rect = egui::Rect::from_min_max(egui::pos2(column.left(), top), egui::pos2(column.right(), row_rect.bottom()));
+            draw_note(ui, rect, note, false);
+        } else {
+            // Just left of the control, in what its label doesn't take
+            let left = row_rect.left() + need.min(label_w) + NOTE_GAP;
+            let right = control_out.response.rect.left() - NOTE_GAP;
+            let rect = egui::Rect::from_min_max(egui::pos2(left, row_rect.top()), egui::pos2(right.max(left), row_rect.bottom()));
+            draw_note(ui, rect, note, true);
+        }
     }
     name_control(ui, &control_out.inner, &label_resp, info);
     label_resp
@@ -237,13 +386,20 @@ fn label_column(
     .inner
 }
 
-/// A setting that is on or off: `setting_row` with a switch, which a click on the label flips too. Whether either was
-/// clicked: the caller flips the setting.
-pub(crate) fn switch_row(ui: &mut egui::Ui, label: &str, hint: Option<&str>, info: Option<&str>, on: bool) -> bool {
-    switch_row_if(ui, true, label, hint, info, on)
+/// A setting that is on or off: `setting_row` with a switch, which a click on the label flips too, and a `note` beside
+/// the switch (see `setting_row_noted`). Whether either was clicked: the caller flips the setting.
+pub(crate) fn switch_row_noted(
+    ui: &mut egui::Ui,
+    label: &str,
+    hint: Option<&str>,
+    info: Option<&str>,
+    on: bool,
+    note: Option<&RowNote>,
+) -> bool {
+    switch_row_with(ui, true, label, hint, info, on, Slot::Of(note))
 }
 
-/// `switch_row`, greyed out unless `enabled` while keeping its ⓘ reachable with the keyboard (#289).
+/// A switch row, greyed out unless `enabled` while keeping its ⓘ reachable with the keyboard (#289).
 pub(crate) fn switch_row_if(
     ui: &mut egui::Ui,
     enabled: bool,
@@ -252,8 +408,20 @@ pub(crate) fn switch_row_if(
     info: Option<&str>,
     on: bool,
 ) -> bool {
+    switch_row_with(ui, enabled, label, hint, info, on, Slot::None)
+}
+
+fn switch_row_with(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    label: &str,
+    hint: Option<&str>,
+    info: Option<&str>,
+    on: bool,
+    slot: Slot,
+) -> bool {
     let mut switch = None;
-    let label_response = row(ui, enabled, label, RowLabel::Switch, hint, info, |ui| {
+    let label_response = row(ui, enabled, label, RowLabel::Switch, hint, info, slot, |ui| {
         let response = toggle_switch(ui, on);
         switch = Some(response.clone());
         response
