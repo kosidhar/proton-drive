@@ -497,6 +497,7 @@ export class ProtonDriveSyncEngine {
     ) {
         this.index = new RemoteIndex(this.stateDb.connection);
         this.docs = new DocNodes(this.stateDb.connection);
+        this.index.onFoldersRemoved = (uids) => this.docs.removeInFolders(uids); // #436
         this.policy = new AvailabilityPolicy(this.stateDb.connection, this.index);
         this.localChangeSlots = new Slots(options.localChangeConcurrency ?? LOCAL_CHANGE_CONCURRENCY);
         this.stateEvents = new StateEvents(options.stateEventSchedule ? { schedule: options.stateEventSchedule } : {});
