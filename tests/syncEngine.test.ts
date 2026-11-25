@@ -8893,6 +8893,96 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 });
             });
 
+            // This computer's own rename, not in Proton Drive yet, onto a name another device has taken meanwhile: the
+            // index keeps the node where the cloud has it (see applyPendingOpsToIndex), but it belongs where this computer
+            // put it, which is where the replay takes it. A delete there is of that node, trashed as before: left alone,
+            // it would come back under a conflict name, undoing the delete
+            describe("where this computer's own pending rename puts it", () => {
+                // The journal replayed, with the rename through, and a sync pass run: only the node trashed, nothing
+                // uploaded, and nothing of it back, here or in Proton Drive
+                const afterReplay = async (d: ReturnType<typeof setup>) => {
+                    d.down.clear();
+                    await d.engine.replayRemoteOps();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+                    expect(d.nodes.has('vol~Docs/a.txt')).toBe(false);
+                    expect(d.calls.uploads).toEqual([]);
+                    expect(d.journal()).toEqual([]);
+                    expect(stateDb.getAllItems().filter((item) => item.nodeUid === 'vol~Docs/a.txt')).toEqual([]);
+                    await d.expectEveryRecordHasItsFile();
+                };
+
+                test('an unlink of a file renamed through the drive onto a name another device took meanwhile trashes its node', async () => {
+                    const d = setup();
+                    d.add('Docs/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('Docs').uid);
+                    d.down.add('renameNode');
+                    await d.engine.renameItem('Docs/a.txt', 'Docs/b.txt');
+                    d.add('Docs/b.txt', 'theirs');
+                    await d.engine.reconcileNow(); // a listing of Docs, with the rename still not through
+                    expect(d.engine.remoteIndex.getByUid('vol~Docs/a.txt')?.relPath).toBe('Docs/a.txt');
+                    expect(stateDb.getItemByPath('Docs/b.txt')?.nodeUid).toBe('vol~Docs/a.txt');
+                    const w = journalling(d);
+
+                    await d.engine.deleteItem('Docs/b.txt');
+
+                    expect(w.journalled()).toMatchObject([{ kind: 'trash', nodeUid: 'vol~Docs/a.txt' }]);
+                    await afterReplay(d);
+                    expect(d.nodes.get('vol~Docs/b.txt')?.content).toBe('theirs');
+                    expect(d.named('vol~Docs', 'b.txt').map((n) => n.uid)).toEqual(['vol~Docs/b.txt']);
+                    expect([...d.nodes.values()].filter((n) => n.parentUid === 'vol~Docs').map((n) => d.nameOf(n))).toEqual(['b.txt']);
+                    expect(await readdir(d.local('Docs'))).toEqual(['b.txt']);
+                    expect(await readFile(d.local('Docs/b.txt'), 'utf8')).toBe('theirs'); // theirs comes down as Docs is pinned
+                });
+
+                test('an unlink of a file in a folder renamed through the drive onto a name another device took meanwhile trashes its node', async () => {
+                    const d = setup();
+                    d.add('Docs/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('Docs').uid);
+                    d.down.add('renameNode');
+                    await d.engine.renameItem('Docs', 'Papers');
+                    d.add('Papers');
+                    await d.engine.reconcileNow(); // a listing of the drive's root, with the rename still not through
+                    expect(d.engine.remoteIndex.getByUid('vol~Docs')?.relPath).toBe('Docs');
+                    expect(d.engine.remoteIndex.getByUid('vol~Docs/a.txt')?.relPath).toBe('Docs/a.txt');
+                    expect(stateDb.getItemByPath('Papers/a.txt')?.nodeUid).toBe('vol~Docs/a.txt');
+                    const w = journalling(d);
+
+                    await d.engine.deleteItem('Papers/a.txt');
+
+                    expect(w.journalled()).toMatchObject([{ kind: 'trash', nodeUid: 'vol~Docs/a.txt' }]);
+                    await afterReplay(d);
+                    const docs = d.nameOf(d.nodes.get('vol~Docs')!);
+                    expect(docs).toMatch(/^Papers \(conflict .+\)$/);
+                    expect([...d.nodes.values()].filter((n) => n.parentUid === 'vol~Docs')).toEqual([]);
+                    expect(await d.files.exists(`${docs}/a.txt`)).toBe(false);
+                    expect(await d.files.exists('Papers/a.txt')).toBe(false);
+                });
+
+                // Only where it puts the node: one another device renamed in a folder this computer renamed has moved away
+                // all the same
+                test('an unlink of a file another device renamed, in a folder renamed through the drive: only the local file goes', async () => {
+                    const d = setup();
+                    d.add('Docs/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('Docs').uid);
+                    d.down.add('renameNode');
+                    await d.engine.renameItem('Docs', 'Papers');
+                    movedByAnotherDevice(d, 'vol~Docs/a.txt', { name: 'c.txt' });
+                    expect(d.engine.remoteIndex.getByUid('vol~Docs/a.txt')?.relPath).toBe('Papers/c.txt');
+                    expect(stateDb.getItemByPath('Papers/a.txt')?.nodeUid).toBe('vol~Docs/a.txt');
+                    const w = journalling(d);
+
+                    await d.engine.deleteItem('Papers/a.txt');
+
+                    expect(w.journalled()).toEqual([]);
+                    d.down.clear();
+                    await afterReplayAndSync(d, 'Papers/a.txt', { trashed: [], downloadsAt: 'Papers/c.txt' });
+                    expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('a');
+                    expect(d.engine.remoteIndex.getByUid('vol~Docs/a.txt')?.relPath).toBe('Papers/c.txt');
+                });
+            });
+
             // A node the index has no entry for is either gone from Proton Drive or not indexed yet: the delete trashes it
             // as before (here another device deleted it, the index heard, and the local copy hadn't gone yet), and the
             // replay finds nothing more to do

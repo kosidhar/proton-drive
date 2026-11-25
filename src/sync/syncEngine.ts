@@ -6138,9 +6138,27 @@ export class ProtonDriveSyncEngine {
     // followed. A delete through the drive at relPath is then of the local copy only, which is all the drive shows there:
     // trashing the node would trash it at its new place, with whatever the other device put in it (#454). When unsure,
     // keep both. A node the index has no entry for is gone from Proton Drive or not indexed yet, and is trashed as before.
+    // Nor has a node moved away that this computer's own pending rename or move (of it, or of a folder above it) puts at
+    // relPath: the index keeps it where the cloud has it while another node holds that place (see
+    // applyPendingOpsToIndex), but the replay takes it there all the same. Left alone, it would come back under a
+    // conflict name, undoing the delete (#454).
     private movedAwayFrom(uid: string, relPath: string): boolean {
         const now = this.index.getByUid(uid);
-        return now !== null && now.relPath !== relPath;
+        return now !== null && now.relPath !== relPath && this.pendingPlaceOf(now) !== relPath;
+    }
+
+    // Where this computer's pending renames and moves put an indexed node once they reach Proton Drive: the target of
+    // its own latest one, or else of the nearest folder above it with one, with the node's path below that folder there
+    // (null: none of them is pending)
+    private pendingPlaceOf(entry: RemoteIndexEntry): string | null {
+        const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
+        for (let e: RemoteIndexEntry | null = entry; e; e = e.parentUid ? this.index.getByUid(e.parentUid) : null) {
+            const op = latest.get(e.uid);
+            if (op !== undefined && op.kind !== 'trash') {
+                return op.toPath + entry.relPath.slice(e.relPath.length);
+            }
+        }
+        return null;
     }
 
     // The records at or under a path that aren't under another of them
