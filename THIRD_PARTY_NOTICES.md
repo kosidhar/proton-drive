@@ -39,4 +39,12 @@ This app bundles the following third-party parts. Each keeps its own license.
 
 The app icon (`assets/app-icon/hicolor/`), the tray icons (`assets/app-icon/tray/`), the sidebar mark (`assets/app-icon/protondrive-mark-128.png`) and the source drawings of the logo (`assets/app-icon/protondrive.svg`, `assets/app-icon/protondrive-mark.svg`) are based on the Proton Drive logo. The logo is Proton AG's artwork and trademark; it is not covered by this repository's MIT license, and is used only so the app looks like Proton Drive. To redistribute or modify this project without it, replace these icons with your own.
 
+## Proton Docs and Sheets icons
+
+- What it is: the icons Files shows for Proton Docs (`*.protondoc`) and Proton Sheets (`*.protonsheet`) placeholder files, the blue Docs icon and the green Sheets icon.
+- Where: `assets/mimetypes/application-vnd.proton.doc.svg` and `assets/mimetypes/application-vnd.proton.sheet.svg`, installed to `share/icons/hicolor/scalable/mimetypes/`
+- Source: the `mime-lg-proton-doc` and `mime-lg-proton-sheet` symbols of `packages/file-icons/assets/file-icons.svg` in https://github.com/ProtonMail/WebClients
+- License: GPL-3.0 (the license of that repository); the text is at `assets/mimetypes/LICENSE`
+- These icons are Proton AG's artwork and trademark. They are not covered by this repository's MIT license, and they are the reason the packages declare `MIT AND GPL-3.0-only`. To redistribute or modify this project without them, delete `assets/mimetypes/` and the lines that install it.
+
 Dependencies installed by the package managers (npm/bun, cargo) carry their own licenses in their packages.

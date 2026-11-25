@@ -122,4 +122,63 @@ describe('Docs and Sheets file types', () => {
         expect(flatpak).toContain('/app/share/mime/packages/io.github.kosidhar.ProtonDrive.xml');
         expect(flatpak).toContain('/app/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop');
     });
+
+    describe('Proton icons for the placeholders (#439)', () => {
+        const root = path.join(import.meta.dir, '..');
+        const icons = ['application-vnd.proton.doc', 'application-vnd.proton.sheet'];
+        const hicolor = 'share/icons/hicolor/scalable/mimetypes';
+
+        test('both SVGs exist and are well-formed XML', () => {
+            for (const name of icons) {
+                const file = path.join(root, 'assets', 'mimetypes', `${name}.svg`);
+                expect(existsSync(file)).toBe(true);
+                const svg = readFileSync(file, 'utf8');
+                expect(svg).toMatch(/^\s*<svg[\s>]/);
+                expect(svg.trimEnd()).toEndWith('</svg>');
+                expect(Bun.spawnSync(['xmllint', '--noout', file]).exitCode).toBe(0);
+            }
+        });
+
+        test('the license text for the icons ships next to them', () => {
+            const text = readFileSync(path.join(root, 'assets', 'mimetypes', 'LICENSE'), 'utf8');
+            expect(text).toContain('GNU GENERAL PUBLIC LICENSE');
+            expect(text.split('\n')[0]).toContain('ProtonMail/WebClients');
+        });
+
+        test('the MIME package names both icons and keeps the generic fallback', () => {
+            const xml = read('io.github.kosidhar.ProtonDrive.xml');
+            expect(xml).toContain('<icon name="application-vnd.proton.doc"/>');
+            expect(xml).toContain('<icon name="application-vnd.proton.sheet"/>');
+            expect(xml).toContain('<generic-icon name="x-office-document"/>');
+            expect(xml).toContain('<generic-icon name="x-office-spreadsheet"/>');
+        });
+
+        test('install.sh installs and removes both, from the tarball and the source tree', () => {
+            const sh = read('install.sh');
+            for (const name of icons) {
+                expect(sh).toContain(`$SRC_Root/${hicolor}/${name}.svg`);
+                expect(sh).toContain(`$SRC_Root/assets/mimetypes/${name}.svg`);
+                expect(sh).toMatch(new RegExp(`rm -f[^\\n]*\\$PREFIX/${hicolor}/${name}\\.svg`));
+            }
+            expect(sh).toContain('gtk-update-icon-cache -q -t -f "$PREFIX/share/icons/hicolor"');
+        });
+
+        test('package.sh stages both, and the Flatpak installs both', () => {
+            const sh = read('package.sh');
+            const flatpak = read('flatpak/io.github.kosidhar.ProtonDrive.bundle.yml');
+            for (const name of icons) {
+                expect(sh).toContain(`assets/mimetypes/${name}.svg`);
+                expect(sh).toContain(`$STAGE/usr/${hicolor}/${name}.svg`);
+                expect(flatpak).toContain(`install -Dm644 ${hicolor}/${name}.svg /app/${hicolor}/${name}.svg`);
+            }
+        });
+
+        test('the package license metadata and the notices cover the GPL icons', () => {
+            expect(read('nfpm.yaml')).toMatch(/^license: MIT AND GPL-3\.0-only$/m);
+            expect(read('arch/PKGBUILD')).toContain("license=('MIT' 'GPL-3.0-only')");
+            const notices = readFileSync(path.join(root, 'THIRD_PARTY_NOTICES.md'), 'utf8');
+            expect(notices).toContain('## Proton Docs and Sheets icons');
+            expect(notices).toContain('assets/mimetypes/LICENSE');
+        });
+    });
 });

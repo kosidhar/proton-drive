@@ -81,6 +81,9 @@ install -Dm755 "$ROOT/linux/tray/proton_drive_tray.py" "$STAGE/usr/share/protond
 for emblem in "$ROOT"/linux/icons/emblems/emblem-protondrive-*.svg; do
   install -Dm644 "$emblem" "$STAGE/usr/share/icons/hicolor/scalable/emblems/$(basename "$emblem")"
 done
+# Proton's own Docs and Sheets icons for the placeholders (GPL-3.0, see assets/mimetypes/LICENSE)
+install -Dm644 "$ROOT/assets/mimetypes/application-vnd.proton.doc.svg" "$STAGE/usr/share/icons/hicolor/scalable/mimetypes/application-vnd.proton.doc.svg"
+install -Dm644 "$ROOT/assets/mimetypes/application-vnd.proton.sheet.svg" "$STAGE/usr/share/icons/hicolor/scalable/mimetypes/application-vnd.proton.sheet.svg"
 
 # File manager integrations (GNOME Nautilus, Cinnamon Nemo, KDE Dolphin)
 install -Dm644 "$ROOT/linux/nautilus/proton_drive_nautilus.py" \

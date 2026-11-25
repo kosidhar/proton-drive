@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+<g id="mime-lg-proton-sheet" clip-path="url(#mime-lg-proton-sheet-clip-path)">
+            <path
+                fill="url(#mime-lg-proton-sheet-gradient)"
+                d="M0 8a8 8 0 0 1 8-8h32a8 8 0 0 1 8 8v32a8 8 0 0 1-8 8H8a8 8 0 0 1-8-8V8Z"
+            />
+            <path
+                fill="#fff"
+                d="M15.648 18.816c1.114 0 2.016.903 2.016 2.016v9.12h10.271a2.016 2.016 0 1 1 0 4.032h-10.27v3.936a2.016 2.016 0 0 1-4.033 0v-3.936H8.928a2.016 2.016 0 0 1 0-4.032h4.704v-9.12c0-1.113.903-2.016 2.016-2.016Z"
+            />
+            <path fill="#fff" fill-opacity=".5" d="M24 0h12v12H24V0Z" />
+            <path fill="#fff" fill-opacity=".8" d="M36 0h4a8 8 0 0 1 8 8v4H36V0Z" />
+            <path fill="#fff" fill-opacity=".5" d="M36 12h12v12H36V12Z" />
+            <radialGradient
+                id="mime-lg-proton-sheet-gradient"
+                cx="0"
+                cy="0"
+                r="1"
+                gradientTransform="rotate(-53.15 55.901 32.11) scale(56.6412)"
+                gradientUnits="userSpaceOnUse"
+            >
+                <stop stop-color="#1B854C" />
+                <stop offset="1" stop-color="#26DA79" />
+            </radialGradient>
+            <clipPath id="mime-lg-proton-sheet-clip-path">
+                <path fill="#fff" d="M0 0h48v48H0z" />
+            </clipPath>
+        </g>
+</svg>
