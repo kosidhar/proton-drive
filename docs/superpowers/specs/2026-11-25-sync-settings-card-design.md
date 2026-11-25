@@ -23,7 +23,6 @@ The owner approved the proposal below on 2026-11-25.
 
 ```
  Sync
- Proton Drive folder     /home/u/ProtonDrive                     [ Move… ]
  Desktop notifications                                              (●)
  Start Proton Drive when I log in  ⓘ                                (●)
  When a file changes in both places   [ Keep both copies          ▾ ]
@@ -42,7 +41,8 @@ The owner approved the proposal below on 2026-11-25.
   - It shows only the user's own patterns, and its hint reads "One pattern per line, like *.log or build/".
   - It applies when the box loses focus (Tab or clicking elsewhere), and only if the text changed. It doesn't apply on
     every keystroke.
-- **Proton Drive folder:** the path plus **Move…** (was Browse…, applied by Save).
+- **Proton Drive folder:** not in this card (#427). The folder shows once, on the Drive card's Location row, with
+  **Move…** there (was Browse…, applied by Save).
   - Move… opens the folder picker.
   - Choosing a different folder opens a confirmation in the app's existing dialog style: "Move your Proton Drive
     folder to <new path>? Your files will move there. Proton Drive pauses until the move is done."
