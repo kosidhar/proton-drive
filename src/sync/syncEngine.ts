@@ -47,7 +47,7 @@ import { HYDRATE_STAGING_PREFIX, isEngineTempName, removeScannedEntries, type Sc
 import { moveWithoutReplacing } from './localMove';
 import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
 import { pathsOverlap } from './mountPoint';
-import { DocNodes, docRecordOf } from './docNodes';
+import { DocNodes, docRecordOf, placeholderContent, placeholderName, type DocRecord } from './docNodes';
 import { entryFromNode, RemoteIndex, type RemoteIndexEntry } from './remoteIndex';
 import { type RemoteOp, RemoteOpsJournal } from './remoteOps';
 import type { ConflictRecord, CutShortFile, EditBaseline, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
@@ -3960,6 +3960,8 @@ export class ProtonDriveSyncEngine {
         if (to.startsWith(`${from}/`)) {
             throw new Error(`Can't move ${from} into itself`);
         }
+        this.refusePlaceholder(from);
+        this.refusePlaceholder(to);
         await this.afterResolutions([from, to], opts.deadlineMs);
         await this.inAvailabilityRun(() => {
             this.refuseWhileHeld(); // again: a move of the files may have begun while it waited
@@ -3986,6 +3988,7 @@ export class ProtonDriveSyncEngine {
         if (rel === '') {
             throw new Error("The whole of Proton Drive can't be deleted");
         }
+        this.refusePlaceholder(rel);
         await this.afterResolutions([rel], opts.deadlineMs);
         await this.inAvailabilityRun(() => {
             this.refuseWhileHeld(); // again: a move of the files may have begun while it waited
@@ -4048,6 +4051,7 @@ export class ProtonDriveSyncEngine {
         this.refuseWhileHeld();
         this.refuseWhileFilesGone();
         const rel = normalizeDrivePath(relPath);
+        this.refusePlaceholder(rel);
         await this.inAvailabilityRun(() => {
             this.inTime(opts.deadlineMs, rel);
             return this.truncateLocally(rel);
@@ -4653,10 +4657,47 @@ export class ProtonDriveSyncEngine {
         }
     }
 
+    // The Proton Doc or Sheet that the virtual drive shows as a read-only placeholder at rel, or null. Only the virtual
+    // drive has them, and only in a folder it lists (not hidden, not ignored), under a name that no real item (in Proton
+    // Drive or on this computer) has: a real item wins, and is then not a placeholder.
+    private placeholderAt(rel: string): DocRecord | null {
+        const slash = rel.lastIndexOf('/');
+        const parentRel = slash < 0 ? '' : rel.slice(0, slash);
+        const name = rel.slice(slash + 1);
+        if (!this.inBackingStore() || name === '') {
+            return null;
+        }
+        const parent = this.liveIndexEntry(parentRel);
+        if (!parent || parent.type !== 'folder') {
+            return null;
+        }
+        const ignorePatterns = this.stateDb.getSettings().ignorePatterns;
+        if (
+            matchesIgnorePatterns(parentRel, ignorePatterns) ||
+            this.policy.hiddenBy(parentRel) !== null ||
+            matchesIgnorePatterns(rel, ignorePatterns) ||
+            this.policy.hiddenBy(rel) !== null
+        ) {
+            return null;
+        }
+        const doc = this.docNodes.listChildren(parent.uid).find((d) => placeholderName(d) === name);
+        if (!doc || this.liveIndexEntry(rel) || (this.localChildNames(parentRel) ?? []).includes(name)) {
+            return null;
+        }
+        return doc;
+    }
+
+    private refusePlaceholder(rel: string): void {
+        if (this.placeholderAt(rel)) {
+            throw new DriveOpError('EPERM', "Proton Docs and Sheets open in the browser; they can't be changed here");
+        }
+    }
+
     // A folder's listing for the virtual drive: what the remote index holds in it, as this computer sees it, online-only
     // and downloaded items alike (the helper merges it with the backing store), sorted by name. Left out are hidden items
     // (and those being hidden), ignored names, and entries that a pending rename, move or delete takes away from there
-    // (see liveIndexEntry); Proton Docs and Sheets aren't indexed. A folder made here that Proton Drive doesn't have yet
+    // (see liveIndexEntry); Proton Docs and Sheets aren't indexed, and are listed in the virtual drive as read-only placeholders
+    // (see placeholderAt). A folder made here that Proton Drive doesn't have yet
     // is listed as the folder it is. A folder the index doesn't hold lists nothing.
     vfsChildren(relPath: string): VfsEntry[] {
         this.refuseWhileHeld();
@@ -4691,6 +4732,23 @@ export class ProtonDriveSyncEngine {
                     ? { name: child.name, type: 'file', size: local.size, mtimeMs: local.mtimeMs }
                     : { name: child.name, type: child.type, size: child.size, mtimeMs: child.mtimeMs },
             );
+        }
+        if (this.inBackingStore()) {
+            const taken = new Set([...entries.map((e) => e.name), ...localNames]);
+            for (const doc of this.docNodes.listChildren(folder.uid)) {
+                const name = placeholderName(doc);
+                if (taken.has(name) || matchesIgnorePatterns(childRel(rel, name), ignorePatterns)) {
+                    continue;
+                }
+                const content = placeholderContent(doc);
+                entries.push({
+                    name,
+                    type: 'file',
+                    size: Buffer.byteLength(content),
+                    mtimeMs: doc.mtimeMs,
+                    placeholder: { kind: doc.kind, content },
+                });
+            }
         }
         return entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     }
@@ -4971,6 +5029,7 @@ export class ProtonDriveSyncEngine {
             this.refuseWhileHeld();
             this.refuseWhileFilesGone();
             rel = normalizeDrivePath(relPath);
+            this.refusePlaceholder(rel);
         } catch (error: unknown) {
             return Promise.reject(error);
         }
@@ -5944,6 +6003,10 @@ export class ProtonDriveSyncEngine {
         }
         const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
         if (entry && this.index.listChildren(relPath).some((child) => !takesAway(latest.get(child.uid), child))) {
+            return true;
+        }
+        // Proton Docs and Sheets in it (the index leaves them out) are something too: a folder of only those isn't empty
+        if (entry && this.docNodes.anyChildren(entry.uid)) {
             return true;
         }
         return [...latest.values()].some((op) => op.kind !== 'trash' && op.toPath.startsWith(`${relPath}/`));

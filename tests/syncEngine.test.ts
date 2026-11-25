@@ -27,6 +27,7 @@ import { entryFromNode } from '../src/sync/remoteIndex';
 import { startControlServer } from '../src/daemon/controlServer';
 import { createLocalConflictCopy, formatConflictFileName, formatNotFullyWrittenName } from '../src/sync/conflictResolver';
 import { DriveOpError } from '../src/sync/driveOps';
+import { placeholderContent } from '../src/sync/docNodes';
 import { matchesIgnorePatterns } from '../src/sync/localWatcher';
 import {
     type AvailabilityResult,
@@ -9094,6 +9095,108 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             };
             return { release, started: () => started, restore: () => (sdk.getFileRevisionDownloader = real) };
         };
+
+        describe('Docs and Sheets placeholders (#430)', () => {
+            const REFUSED = "Proton Docs and Sheets open in the browser; they can't be changed here";
+            const withDocs = async (d: ReturnType<typeof setup>) => {
+                d.add('Docs/a.txt', 'aaa');
+                d.add('Docs/Plan', 'x');
+                d.add('Docs/Budget', 'x');
+                d.add('OnlyDocs/Notes', 'x');
+                Object.assign(d.nodes.get('vol~Docs/Plan')!, { mediaType: 'application/vnd.proton.doc' });
+                Object.assign(d.nodes.get('vol~Docs/Budget')!, { mediaType: 'application/vnd.proton.sheet' });
+                Object.assign(d.nodes.get('vol~OnlyDocs/Notes')!, { mediaType: 'application/vnd.proton.doc' });
+                await d.engine.reconcileNow();
+            };
+
+            test('in virtual mode a folder lists its documents as read-only placeholders', async () => {
+                const d = setup();
+                await withDocs(d);
+                const rec = d.engine.docNodes.listChildren('vol~Docs').find((r) => r.name === 'Plan')!;
+                const content = placeholderContent(rec);
+                const listed = d.engine.vfsChildren('Docs');
+                expect(listed.map((e) => e.name)).toEqual(['Budget.protonsheet', 'Plan.protondoc', 'a.txt']);
+                expect(listed.find((e) => e.name === 'Plan.protondoc')).toEqual({
+                    name: 'Plan.protondoc',
+                    type: 'file',
+                    size: Buffer.byteLength(content),
+                    mtimeMs: rec.mtimeMs,
+                    placeholder: { kind: 'doc', content },
+                });
+                expect(listed.find((e) => e.name === 'Budget.protonsheet')!.placeholder?.kind).toBe('sheet');
+                expect(listed.find((e) => e.name === 'a.txt')!.placeholder).toBeUndefined();
+            });
+
+            test('plain mode lists no placeholders', async () => {
+                const d = setup();
+                stateDb.setMeta('driveLayout', 'plain');
+                await withDocs(d);
+                expect(d.engine.docNodes.anyChildren('vol~Docs')).toBe(true);
+                expect(d.engine.vfsChildren('Docs').map((e) => e.name)).toEqual(['a.txt']);
+            });
+
+            test("a real item with the placeholder's name wins", async () => {
+                const d = setup();
+                d.add('Docs/Plan.protondoc', 'real');
+                await withDocs(d);
+                const plans = d.engine.vfsChildren('Docs').filter((e) => e.name === 'Plan.protondoc');
+                expect(plans).toHaveLength(1);
+                expect(plans[0]!.placeholder).toBeUndefined();
+                // and a local file of that name
+                await mkdir(d.local('Docs'), { recursive: true });
+                await writeFile(d.local('Docs/Budget.protonsheet'), 'mine');
+                expect(d.engine.vfsChildren('Docs').filter((e) => e.name === 'Budget.protonsheet')).toEqual([]); // the helper lists the local file
+                expect((await failure(d.engine.truncateItem('Docs/Budget.protonsheet')))?.code).not.toBe('EPERM');
+                // not refused: it is a real file
+                expect((await failure(d.engine.truncateItem('Docs/Plan.protondoc')))?.code).not.toBe('EPERM');
+            });
+
+            test('placeholders follow the ignore and hidden rules of their folder', async () => {
+                const d = setup();
+                await withDocs(d);
+                stateDb.updateSettings({ ignorePatterns: ['*.protonsheet'] });
+                expect(d.engine.vfsChildren('Docs').map((e) => e.name)).toEqual(['Plan.protondoc', 'a.txt']);
+                stateDb.updateSettings({ ignorePatterns: [] });
+                await d.engine.setAvailability('OnlyDocs', 'hide');
+                expect(d.engine.vfsChildren('OnlyDocs')).toEqual([]);
+            });
+
+            test('rename, delete, truncate and hydrate of a placeholder are refused with EPERM, changing nothing', async () => {
+                const d = setup();
+                await withDocs(d);
+                const before = d.engine.docNodes.listChildren('vol~Docs');
+                const eperm = { code: 'EPERM', message: REFUSED, driveOpError: true };
+                expect(await failure(d.engine.renameItem('Docs/Plan.protondoc', 'Docs/Other.protondoc'))).toEqual(eperm);
+                expect(await failure(d.engine.renameItem('Docs/a.txt', 'Docs/Plan.protondoc'))).toEqual(eperm);
+                expect(await failure(d.engine.renameItem('Docs/a.txt', 'Docs/Plan.protondoc', { noReplace: true }))).toEqual(eperm);
+                expect(await failure(d.engine.deleteItem('Docs/Plan.protondoc'))).toEqual(eperm);
+                expect(await failure(d.engine.truncateItem('Docs/Plan.protondoc'))).toEqual(eperm);
+                expect(await failure(d.engine.hydrate('Docs/Plan.protondoc'))).toEqual(eperm);
+                expect(d.engine.docNodes.listChildren('vol~Docs')).toEqual(before);
+                expect(d.journal()).toEqual([]);
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.engine.vfsChildren('Docs').map((e) => e.name)).toContain('Plan.protondoc');
+                expect(await d.files.exists('Docs/a.txt')).toBe(false); // untouched: still online-only
+            });
+
+            test('a folder holding only documents is not empty: rmdir is refused, nothing is trashed', async () => {
+                const d = setup();
+                await withDocs(d);
+                expect(await failure(d.engine.deleteItem('OnlyDocs', { onlyIfEmpty: true }))).toMatchObject({ code: 'ENOTEMPTY' });
+                await d.engine.replayRemoteOps();
+                expect(d.calls.trashed).toEqual([]);
+                expect(d.engine.docNodes.anyChildren('vol~OnlyDocs')).toBe(true);
+            });
+
+            test('Move to Trash of a folder holding documents behaves as before', async () => {
+                const d = setup();
+                await withDocs(d);
+                await d.engine.deleteItem('OnlyDocs', { trash: true });
+                await d.engine.replayRemoteOps();
+                // PINNED: the folder is trashed in Proton Drive as a whole, and the documents in it go with it
+                expect(d.calls.trashed).toEqual([['vol~OnlyDocs']]);
+            });
+        });
 
         describe('vfsChildren', () => {
             test('lists online-only and downloaded items with their size and mtime, leaving out hidden items and a remote .git', async () => {

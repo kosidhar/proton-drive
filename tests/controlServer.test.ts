@@ -46,6 +46,9 @@ function makeFake(rejectWith?: string) {
         vfsChildren(relPath: string): VfsEntry[] {
             driveCalls.push(['children', relPath]);
             if (relPath === 'Hidden') throw new DriveOpError('EACCES', `Hidden: ${relPath}`);
+            if (relPath === 'WithDocs') {
+                return [{ name: 'Plan.protondoc', type: 'file', size: 9, mtimeMs: 3000, placeholder: { kind: 'doc', content: '{}\n' } }];
+            }
             return [
                 { name: 'Sub folder', type: 'folder', size: 0, mtimeMs: 1000 },
                 { name: 'résumé b.txt', type: 'file', size: 12, mtimeMs: 2000 },
@@ -66,6 +69,7 @@ function makeFake(rejectWith?: string) {
         async deleteItem(relPath: string, opts?: { onlyIfEmpty?: boolean; trash?: boolean }): Promise<void> {
             driveCalls.push(['delete', relPath, opts]);
             if (relPath === 'missing.txt') throw new DriveOpError('ENOENT', `Not found: ${relPath}`);
+            if (relPath.endsWith('.protondoc')) throw new DriveOpError('EPERM', "Proton Docs and Sheets open in the browser; they can't be changed here");
             if (relPath === 'Full' && opts?.onlyIfEmpty) throw new DriveOpError('ENOTEMPTY', `Not empty: ${relPath}`);
         },
         async truncateItem(relPath: string, opts?: { deadlineMs?: number }): Promise<void> {
@@ -318,6 +322,20 @@ describe('drive routes', () => {
             ['children', 'Docs/été 2026/a b'],
             ['children', ''],
         ]);
+    });
+
+    test('GET /vfs/children passes a placeholder through, and an EPERM refusal answers 400 with its code', async () => {
+        const { socketPath } = await start();
+        const res = await call(socketPath, '/vfs/children?path=WithDocs');
+        expect(await res.json()).toEqual({
+            entries: [{ name: 'Plan.protondoc', type: 'file', size: 9, mtimeMs: 3000, placeholder: { kind: 'doc', content: '{}\n' } }],
+        });
+        const refused = await post(socketPath, '/vfs/delete', { path: 'Plan.protondoc' });
+        expect(refused.status).toBe(400);
+        expect(await refused.json()).toEqual({
+            error: "Proton Docs and Sheets open in the browser; they can't be changed here",
+            code: 'EPERM',
+        });
     });
 
     test('POST /vfs/hydrate waits for the download and answers ok', async () => {
