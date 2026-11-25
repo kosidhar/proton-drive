@@ -19,5 +19,8 @@ source=("kosidhar-protondrive-${pkgver}-linux-${CARCH}.tar.gz")
 sha256sums=('SKIP')
 
 package() {
-  cp -a "${srcdir}/kosidhar-protondrive-${pkgver}-linux-${CARCH}/"* "${pkgdir}/usr/"
+  # The tarball is the staged /usr tree plus install.sh, which is not part of the package.
+  local root="${srcdir}/kosidhar-protondrive-${pkgver}-linux-${CARCH}"
+  install -d "${pkgdir}/usr"
+  cp -a "${root}/bin" "${root}/share" "${root}/lib" "${pkgdir}/usr/"
 }
