@@ -25,6 +25,9 @@ modules:
       - install -Dm644 share/mime/packages/io.github.kosidhar.ProtonDrive.xml /app/share/mime/packages/io.github.kosidhar.ProtonDrive.xml
       - install -Dm644 share/metainfo/io.github.kosidhar.ProtonDrive.metainfo.xml /app/share/metainfo/io.github.kosidhar.ProtonDrive.metainfo.xml
       - mkdir -p /app/share/icons && cp -R share/icons/hicolor /app/share/icons/
+      - install -Dm644 share/licenses/kosidhar-protondrive/LICENSE /app/share/licenses/kosidhar-protondrive/LICENSE
+      - install -Dm644 share/licenses/kosidhar-protondrive/THIRD_PARTY_NOTICES.md /app/share/licenses/kosidhar-protondrive/THIRD_PARTY_NOTICES.md
+      - install -Dm644 share/licenses/kosidhar-protondrive/LICENSE.proton-file-icons /app/share/licenses/kosidhar-protondrive/LICENSE.proton-file-icons
       - install -Dm644 share/icons/hicolor/scalable/mimetypes/application-vnd.proton.doc.svg /app/share/icons/hicolor/scalable/mimetypes/application-vnd.proton.doc.svg
       - install -Dm644 share/icons/hicolor/scalable/mimetypes/application-vnd.proton.sheet.svg /app/share/icons/hicolor/scalable/mimetypes/application-vnd.proton.sheet.svg
     sources:

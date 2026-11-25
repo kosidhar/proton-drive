@@ -84,6 +84,10 @@ done
 # Proton's own Docs and Sheets icons for the placeholders (GPL-3.0, see assets/mimetypes/LICENSE)
 install -Dm644 "$ROOT/assets/mimetypes/application-vnd.proton.doc.svg" "$STAGE/usr/share/icons/hicolor/scalable/mimetypes/application-vnd.proton.doc.svg"
 install -Dm644 "$ROOT/assets/mimetypes/application-vnd.proton.sheet.svg" "$STAGE/usr/share/icons/hicolor/scalable/mimetypes/application-vnd.proton.sheet.svg"
+# The license texts: the project's own, the third-party notices, and the GPL text for the Proton icons
+install -Dm644 "$ROOT/LICENSE" "$STAGE/usr/share/licenses/kosidhar-protondrive/LICENSE"
+install -Dm644 "$ROOT/THIRD_PARTY_NOTICES.md" "$STAGE/usr/share/licenses/kosidhar-protondrive/THIRD_PARTY_NOTICES.md"
+install -Dm644 "$ROOT/assets/mimetypes/LICENSE" "$STAGE/usr/share/licenses/kosidhar-protondrive/LICENSE.proton-file-icons"
 
 # File manager integrations (GNOME Nautilus, Cinnamon Nemo, KDE Dolphin)
 install -Dm644 "$ROOT/linux/nautilus/proton_drive_nautilus.py" \

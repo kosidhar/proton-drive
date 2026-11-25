@@ -119,6 +119,9 @@ if [ "$UNINSTALL" -eq 1 ]; then
     fi
   fi
   rm -f "$PREFIX/share/icons/hicolor/scalable/emblems/emblem-protondrive-"*.svg
+  # The license texts
+  rm -f "$PREFIX/share/licenses/kosidhar-protondrive/LICENSE" "$PREFIX/share/licenses/kosidhar-protondrive/THIRD_PARTY_NOTICES.md" "$PREFIX/share/licenses/kosidhar-protondrive/LICENSE.proton-file-icons"
+  rmdir "$PREFIX/share/licenses/kosidhar-protondrive" 2>/dev/null || true
   # Proton's own Docs and Sheets icons for the placeholders
   rm -f "$PREFIX/share/icons/hicolor/scalable/mimetypes/application-vnd.proton.doc.svg" "$PREFIX/share/icons/hicolor/scalable/mimetypes/application-vnd.proton.sheet.svg"
   # The file manager integrations and the tray, so Files, Nemo and Dolphin stop offering Proton Drive (#54)
@@ -162,6 +165,12 @@ if [ -d "$SRC_Root/bin" ]; then
     install -Dm644 "$SRC_Root/share/metainfo/io.github.kosidhar.ProtonDrive.metainfo.xml" "$PREFIX/share/metainfo/io.github.kosidhar.ProtonDrive.metainfo.xml"
   [ -f "$SRC_Root/share/mime/packages/io.github.kosidhar.ProtonDrive.xml" ] && \
     install -Dm644 "$SRC_Root/share/mime/packages/io.github.kosidhar.ProtonDrive.xml" "$PREFIX/share/mime/packages/io.github.kosidhar.ProtonDrive.xml"
+  [ -f "$SRC_Root/share/licenses/kosidhar-protondrive/LICENSE" ] && \
+    install -Dm644 "$SRC_Root/share/licenses/kosidhar-protondrive/LICENSE" "$PREFIX/share/licenses/kosidhar-protondrive/LICENSE"
+  [ -f "$SRC_Root/share/licenses/kosidhar-protondrive/THIRD_PARTY_NOTICES.md" ] && \
+    install -Dm644 "$SRC_Root/share/licenses/kosidhar-protondrive/THIRD_PARTY_NOTICES.md" "$PREFIX/share/licenses/kosidhar-protondrive/THIRD_PARTY_NOTICES.md"
+  [ -f "$SRC_Root/share/licenses/kosidhar-protondrive/LICENSE.proton-file-icons" ] && \
+    install -Dm644 "$SRC_Root/share/licenses/kosidhar-protondrive/LICENSE.proton-file-icons" "$PREFIX/share/licenses/kosidhar-protondrive/LICENSE.proton-file-icons"
   [ -f "$SRC_Root/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop" ] && \
     install -Dm644 "$SRC_Root/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop" "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop"
   [ -f "$SRC_Root/share/nautilus-python/extensions/kosidhar_protondrive_nautilus.py" ] && \
@@ -191,6 +200,9 @@ else
   install -Dm644 "$SRC_Root/packaging/linux/io.github.kosidhar.ProtonDrive.OpenDoc.desktop" "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop"
   install -Dm644 "$SRC_Root/linux/nemo/proton_drive_nemo.py" "$PREFIX/share/nemo-python/extensions/proton_drive_nemo.py"
   install -Dm644 "$SRC_Root/linux/dolphin/protondrive.desktop" "$PREFIX/share/kio/servicemenus/protondrive.desktop"
+  install -Dm644 "$SRC_Root/LICENSE" "$PREFIX/share/licenses/kosidhar-protondrive/LICENSE"
+  install -Dm644 "$SRC_Root/THIRD_PARTY_NOTICES.md" "$PREFIX/share/licenses/kosidhar-protondrive/THIRD_PARTY_NOTICES.md"
+  install -Dm644 "$SRC_Root/assets/mimetypes/LICENSE" "$PREFIX/share/licenses/kosidhar-protondrive/LICENSE.proton-file-icons"
   install -Dm644 "$SRC_Root/assets/mimetypes/application-vnd.proton.doc.svg" "$PREFIX/share/icons/hicolor/scalable/mimetypes/application-vnd.proton.doc.svg"
   install -Dm644 "$SRC_Root/assets/mimetypes/application-vnd.proton.sheet.svg" "$PREFIX/share/icons/hicolor/scalable/mimetypes/application-vnd.proton.sheet.svg"
 fi

@@ -173,6 +173,50 @@ describe('Docs and Sheets file types', () => {
             }
         });
 
+        test('the icons stay byte for byte what was taken from upstream', () => {
+            const sha = (name: string): string =>
+                new Bun.CryptoHasher('sha256')
+                    .update(readFileSync(path.join(root, 'assets', 'mimetypes', `${name}.svg`)))
+                    .digest('hex');
+            expect(sha('application-vnd.proton.doc')).toBe('9b008fcefc5d19247dc5032352205afaf38db795eb8ce9948a6a26fe248d5e59');
+            expect(sha('application-vnd.proton.sheet')).toBe('81ec64f5420e9a4ff5324e6d5c9a1a02cc5aecccf8a4a142cb89b39672391c0f');
+        });
+
+        describe('the license texts ship with every package', () => {
+            const lic = 'share/licenses/kosidhar-protondrive';
+            const files: [string, string][] = [
+                ['LICENSE', 'LICENSE'],
+                ['THIRD_PARTY_NOTICES.md', 'THIRD_PARTY_NOTICES.md'],
+                ['LICENSE.proton-file-icons', 'assets/mimetypes/LICENSE'],
+            ];
+
+            test('package.sh stages all three, which nfpm and the tarball then carry', () => {
+                const sh = read('package.sh');
+                for (const [name, from] of files) {
+                    expect(sh).toContain(`"$ROOT/${from}" "$STAGE/usr/${lic}/${name}"`);
+                }
+                expect(read('nfpm.yaml')).toContain('${STAGE}/usr/share/');
+            });
+
+            test('install.sh installs them from the tarball and the source tree, and removes them', () => {
+                const sh = read('install.sh');
+                for (const [name, from] of files) {
+                    expect(sh).toContain(`"$SRC_Root/${lic}/${name}" "$PREFIX/${lic}/${name}"`);
+                    expect(sh).toContain(`"$SRC_Root/${from}" "$PREFIX/${lic}/${name}"`);
+                    expect(sh).toMatch(new RegExp(`rm -f[^\\n]*\\$PREFIX/${lic}/${name.replace(/\./g, '\\.')}`));
+                }
+                expect(sh).toContain(`rmdir "$PREFIX/${lic}"`);
+            });
+
+            test('the Flatpak installs them, and the PKGBUILD takes the whole share tree', () => {
+                const flatpak = read('flatpak/io.github.kosidhar.ProtonDrive.bundle.yml');
+                for (const [name] of files) {
+                    expect(flatpak).toContain(`install -Dm644 ${lic}/${name} /app/${lic}/${name}`);
+                }
+                expect(read('arch/PKGBUILD')).toContain('"${root}/share"');
+            });
+        });
+
         test('the package license metadata and the notices cover the GPL icons', () => {
             expect(read('nfpm.yaml')).toMatch(/^license: MIT AND GPL-3\.0-only$/m);
             expect(read('arch/PKGBUILD')).toContain("license=('MIT' 'GPL-3.0-only')");
