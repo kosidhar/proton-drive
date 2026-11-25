@@ -8981,6 +8981,49 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('a');
                     expect(d.engine.remoteIndex.getByUid('vol~Docs/a.txt')?.relPath).toBe('Papers/c.txt');
                 });
+
+                // The same with the folder's rename stuck, as another device took its name: the index keeps the folder,
+                // and the renamed file in it, where the cloud has them, and the file goes with the folder to c.txt there
+                test('an unlink of a file another device renamed, in a folder renamed through the drive onto a name another device took: only the local file goes', async () => {
+                    const d = setup();
+                    d.add('Docs/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('Docs').uid);
+                    d.down.add('renameNode');
+                    await d.engine.renameItem('Docs', 'Papers');
+                    d.add('Papers');
+                    await d.engine.reconcileNow(); // a listing of the drive's root, with the rename still not through
+                    expect(d.engine.remoteIndex.getByUid('vol~Docs')?.relPath).toBe('Docs');
+                    movedByAnotherDevice(d, 'vol~Docs/a.txt', { name: 'c.txt' });
+                    const moved = d.engine.remoteIndex.getByUid('vol~Docs/a.txt')!;
+                    expect(moved.relPath).toBe('Docs/c.txt');
+                    expect((d.engine as any).pendingPlaceOf(moved)).toBe('Papers/c.txt');
+                    expect(stateDb.getItemByPath('Papers/a.txt')?.nodeUid).toBe('vol~Docs/a.txt');
+                    const w = journalling(d);
+
+                    await d.engine.deleteItem('Papers/a.txt');
+
+                    expect(w.journalled()).toEqual([]);
+                    expect(await d.files.exists('Papers/a.txt')).toBe(false);
+                    expect(stateDb.getItemByPath('Papers/a.txt')).toBeNull();
+                    expect(d.engine.remoteIndex.getByUid('vol~Docs/a.txt')?.relPath).toBe('Docs/c.txt');
+                    d.down.clear();
+                    const downloadsBefore = d.calls.downloads.length;
+                    await d.engine.replayRemoteOps();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    const docs = d.nameOf(d.nodes.get('vol~Docs')!);
+                    expect(docs).toMatch(/^Papers \(conflict .+\)$/);
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.calls.uploads).toEqual([]);
+                    expect(d.calls.downloads.slice(downloadsBefore).filter((p) => !p.startsWith(`${docs}/`))).toEqual([]);
+                    expect(d.journal()).toEqual([]);
+                    expect(d.nodes.get('vol~Docs/a.txt')).toMatchObject({ parentUid: 'vol~Docs', content: 'a' });
+                    expect(d.nameOf(d.nodes.get('vol~Docs/a.txt')!)).toBe('c.txt');
+                    expect(d.engine.remoteIndex.getByUid('vol~Docs/a.txt')?.relPath).toBe(`${docs}/c.txt`);
+                    expect(await d.files.exists('Papers/a.txt')).toBe(false);
+                    expect(await d.files.exists(`${docs}/a.txt`)).toBe(false);
+                    await d.expectEveryRecordHasItsFile();
+                });
             });
 
             // A node the index has no entry for is either gone from Proton Drive or not indexed yet: the delete trashes it
