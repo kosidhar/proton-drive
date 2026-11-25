@@ -1,4 +1,4 @@
-import { matchesIgnorePatterns } from './localWatcher';
+import { matchesPatternList } from './localWatcher';
 
 // What the settings may hold. The control socket checks a request against these before it stores anything, and
 // getSettings checks what is stored (values saved before the checks existed), so a bad value never reaches the engine.
@@ -64,7 +64,7 @@ const NEARLY_ALL = 0.9;
 function hiddenBy(patterns: string[]) {
     return (sample: string) => {
         const names = sample.split('/');
-        return names.some((_, i) => matchesIgnorePatterns(names.slice(0, i + 1).join('/'), patterns));
+        return names.some((_, i) => matchesPatternList(names.slice(0, i + 1).join('/'), patterns));
     };
 }
 

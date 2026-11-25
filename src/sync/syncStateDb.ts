@@ -117,18 +117,13 @@ export interface SyncSettings {
     blockedApps: string[];
 }
 
-export const DEFAULT_IGNORE_PATTERNS = [
-    '.git',
-    '.git/**',
-    'node_modules',
-    'node_modules/**',
-    '.proton-drive-tmp-*',
-    '*.part',
-    '*.crdownload',
-    '*~',
-    '.DS_Store',
-    '.Trash-*',
-];
+// The app's own temporary and junk files. They are not a setting: matchesIgnorePatterns always applies them, because
+// the app's own temporary files (and a browser's half-downloaded ones) must never sync, whatever the user's list says.
+// They are not in the stored list, so the user can neither remove them by mistake nor see them as theirs to edit.
+export const BUILTIN_IGNORE_PATTERNS: readonly string[] = ['.proton-drive-tmp-*', '*.part', '*.crdownload', '.DS_Store', '.Trash-*'];
+
+// What a new install starts the user's own, editable list with
+export const DEFAULT_IGNORE_PATTERNS = ['.git', '.git/**', 'node_modules', 'node_modules/**', '*~'];
 
 // Meta keys whose change changes where the files are, so every emblem may be stale
 const RESET_META_KEYS: readonly string[] = ['driveLayout', 'virtualDriveWanted'];
@@ -312,7 +307,9 @@ export class SyncStateDatabase {
             if (usable === null) {
                 this.warnBadSetting('ignorePatterns', raw);
             } else {
-                value = usable.patterns;
+                // An install from before the built-ins stopped being settings holds them in its list: they apply
+                // anyway, so leaving them out changes nothing that is ignored
+                value = usable.patterns.filter((pattern) => !BUILTIN_IGNORE_PATTERNS.includes(pattern));
                 if (usable.dropped > 0) this.warnBadSetting('ignorePatterns', raw, `leaving out ${usable.dropped} unusable pattern(s)`);
             }
         }
