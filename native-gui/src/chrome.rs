@@ -67,10 +67,10 @@ pub(crate) fn tab_title(tab: NavTab) -> &'static str {
 }
 
 impl ProtonDriveNativeApp {
-    /// Whether the confirmation dialog or the Share window is open: nothing under either takes clicks or keys, and
-    /// the account menu doesn't stay over them.
+    /// Whether the confirmation dialog, the Share window or the first-run notice is open: nothing under any of them
+    /// takes clicks or keys, and the account menu doesn't stay over them.
     pub(crate) fn dialog_open(&self) -> bool {
-        self.pending_confirm.is_some() || self.share.is_some()
+        self.pending_confirm.is_some() || self.share.is_some() || self.unofficial_notice_open()
     }
 
     /// The sidebar, navy in light mode as on drive.proton.me, and dark in dark mode.

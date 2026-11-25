@@ -1383,6 +1383,15 @@ impl Notice {
     }
 }
 
+/// The first-run notice that this isn't Proton's own app (#421)
+const UNOFFICIAL_TITLE: &str = "An unofficial app";
+const UNOFFICIAL_BODY: &str = "This app isn't made, endorsed or supported by Proton AG. It's an independent open-source app that syncs your Proton Drive using Proton's open-source Drive SDK. Your files stay end-to-end encrypted.";
+const UNOFFICIAL_SOURCE_LEAD: &str = "Source code:";
+const UNOFFICIAL_SOURCE_LINK: &str = "github.com/kosidhar/proton-drive";
+const UNOFFICIAL_SOURCE_URL: &str = "https://github.com/kosidhar/proton-drive";
+const UNOFFICIAL_QUIT: &str = "Quit";
+const UNOFFICIAL_ACCEPT: &str = "I understand";
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct WindowGeometry {
@@ -1391,6 +1400,9 @@ struct WindowGeometry {
     height: f32,
     maximized: bool,
     theme_mode: String,
+    /// The person has read the "An unofficial app" notice and chose I understand (#421). Missing in an older ui.json,
+    /// which reads as not yet.
+    unofficial_notice_accepted: bool,
 }
 
 impl Default for WindowGeometry {
@@ -1402,6 +1414,7 @@ impl Default for WindowGeometry {
             height: 640.0,
             maximized: false,
             theme_mode: "system".to_string(),
+            unofficial_notice_accepted: false,
         }
     }
 }
@@ -1433,7 +1446,15 @@ fn load_window_geometry() -> WindowGeometry {
     WindowGeometry::default()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// What the app asked to save to ui.json: tests never write the real file, they read what would have been written
+    static SAVED_PREFS: std::cell::RefCell<Vec<WindowGeometry>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn save_window_geometry(geom: &WindowGeometry) {
+    #[cfg(test)]
+    SAVED_PREFS.with(|saved| saved.borrow_mut().push(geom.clone()));
     let Some(p) = ui_prefs_path() else { return };
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -1605,6 +1626,10 @@ struct ProtonDriveNativeApp {
     window_geometry: WindowGeometry,
     maximize_applied_on_open: bool,
     applied_light_mode: bool,
+    /// `--show-unofficial-notice`: a screenshot shows the "An unofficial app" notice only when asked (#421)
+    show_notice_in_screenshot: bool,
+    /// The notice's I understand button has been given the keyboard focus, once, as the notice opened
+    notice_focus_given: bool,
 
     // Automatic screenshot support for visual verification
     screenshot_target: Option<String>,
@@ -1744,6 +1769,8 @@ impl ProtonDriveNativeApp {
             window_geometry,
             maximize_applied_on_open: false,
             applied_light_mode: initial_light,
+            show_notice_in_screenshot: false,
+            notice_focus_given: false,
             screenshot_target,
             frames_rendered: 0,
             screenshot_requested: false,
@@ -2705,6 +2732,81 @@ impl ProtonDriveNativeApp {
         }
     }
 
+    /// Whether the "An unofficial app" notice is up: until it is accepted, and never in a screenshot unless asked (#421).
+    pub(crate) fn unofficial_notice_open(&self) -> bool {
+        !self.window_geometry.unofficial_notice_accepted && (!home::screenshot() || self.show_notice_in_screenshot)
+    }
+
+    /// The first-run notice that this isn't Proton's own app (#421). Nothing under it takes clicks or keys; Escape and
+    /// a click outside do nothing, it needs an answer. Quit closes the app and saves nothing, so it shows again next
+    /// time; I understand is saved at once. Syncing is the daemon's and goes on either way.
+    fn render_unofficial_notice(&mut self, ctx: &egui::Context) {
+        if !self.unofficial_notice_open() {
+            return;
+        }
+        let screen_rect = ctx.screen_rect();
+        click_shield(ctx, "notice_backdrop", egui::Order::Foreground, Some(Color32::from_rgba_unmultiplied(10, 8, 16, 175)));
+
+        let modal_w = 460.0;
+        let modal_pos = egui::pos2(screen_rect.center().x - modal_w * 0.5, (screen_rect.center().y - 130.0).max(16.0));
+        egui::Area::new(egui::Id::new("unofficial_notice"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(modal_pos)
+            .show(ctx, |ui| {
+                Frame::NONE
+                    .fill(BG_CARD())
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE()))
+                    .corner_radius(CornerRadius::same(14))
+                    .shadow(egui::Shadow {
+                        offset: [0, 12],
+                        blur: 32,
+                        spread: 2,
+                        color: Color32::from_rgba_unmultiplied(0, 0, 0, 190),
+                    })
+                    .inner_margin(Margin::symmetric(24, 22))
+                    .show(ui, |ui| {
+                        ui.set_min_width(modal_w - 48.0);
+                        ui.set_max_width(modal_w - 48.0);
+
+                        ui.label(RichText::new(UNOFFICIAL_TITLE).size(16.5).strong().color(TEXT_PRIMARY()));
+                        ui.add_space(10.0);
+                        ui.label(RichText::new(UNOFFICIAL_BODY).size(13.0).color(TEXT_PRIMARY()));
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.label(RichText::new(UNOFFICIAL_SOURCE_LEAD).size(12.5).color(TEXT_MUTED()));
+                            if ui.add(egui::Link::new(RichText::new(UNOFFICIAL_SOURCE_LINK).size(12.5))).clicked() {
+                                home::open_in_browser(UNOFFICIAL_SOURCE_URL);
+                            }
+                        });
+
+                        ui.add_space(20.0);
+                        ui.horizontal(|ui| {
+                            let buttons_w =
+                                button_width(ui, UNOFFICIAL_QUIT) + 8.0 + ui.spacing().item_spacing.x + button_width(ui, UNOFFICIAL_ACCEPT);
+                            let pad = (ui.available_width() - buttons_w).max(0.0);
+                            if pad > 0.0 {
+                                ui.add_space(pad);
+                            }
+                            if action_button(ui, ButtonKind::Secondary, None, UNOFFICIAL_QUIT, 36.0).clicked() {
+                                ctx.send_viewport_cmd(ViewportCommand::Close);
+                            }
+                            ui.add_space(8.0);
+                            let accept = action_button(ui, ButtonKind::Primary, None, UNOFFICIAL_ACCEPT, 36.0);
+                            // The answer the notice expects has the keyboard: Enter or Space takes it
+                            if !self.notice_focus_given {
+                                self.notice_focus_given = true;
+                                accept.request_focus();
+                            }
+                            if accept.clicked() {
+                                self.window_geometry.unofficial_notice_accepted = true;
+                                save_window_geometry(&self.window_geometry);
+                            }
+                        });
+                    });
+            });
+    }
+
     /// In Home's Needs attention while the daemon holds because the files are missing from the folder: what is missing, that
     /// nothing was deleted, and what can be done besides waiting, which is the default and needs nothing. Keeping them
     /// online-only deletes nothing, so it asks nothing: the banner says what it does. Deleting them from Proton Drive too
@@ -2857,6 +2959,10 @@ impl ProtonDriveNativeApp {
     /// One frame of the window's contents: the sidebar, the top bar, the current section and anything floating over
     /// them.
     fn render_ui(&mut self, ctx: &egui::Context) {
+        // The notice needs an answer: Escape does nothing, and must not close a window behind it either
+        if self.unofficial_notice_open() {
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
+        }
         self.render_sidebar(ctx);
         self.render_top_bar(ctx);
 
@@ -2884,6 +2990,7 @@ impl ProtonDriveNativeApp {
 
         self.render_confirm_modal(ctx);
         self.render_share(ctx);
+        self.render_unofficial_notice(ctx);
     }
 
     fn render_settings_tab(&mut self, ui: &mut egui::Ui) {
@@ -3373,6 +3480,7 @@ impl eframe::App for ProtonDriveNativeApp {
                             height: content_size.y.clamp(540.0, 16384.0),
                             maximized: false,
                             theme_mode: self.window_geometry.theme_mode.clone(),
+                            unofficial_notice_accepted: self.window_geometry.unofficial_notice_accepted,
                         })
                     } else {
                         None
@@ -4624,6 +4732,7 @@ OPTIONS:
   --fake-disk-full      with --screenshot: show Home's notice that the computer's disk is almost full
   --fake-shared <S>     with --screenshot: show the Shared section (--tab shared) as S
                         (list | empty | offline | loading | refreshing)
+  --show-unofficial-notice  with --screenshot: show the first-run unofficial-app notice
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --zoom <F>            with --screenshot: render at zoom factor F (0.5 to 3, e.g. 1.2), as Ctrl+= would
   --version             print the version
@@ -4661,6 +4770,7 @@ fn main() -> eframe::Result {
     let mut cli_confirm_files_missing = false;
     let mut cli_login_error: Option<String> = None;
     let mut cli_hidden_items = false;
+    let mut cli_show_unofficial_notice = false;
     let mut cli_fake_attention: Option<usize> = None;
     let mut cli_fake_transfers: Option<usize> = None;
     let mut cli_signed_out = false;
@@ -4747,6 +4857,9 @@ fn main() -> eframe::Result {
             "--hidden-items" => {
                 cli_hidden_items = true;
             }
+            "--show-unofficial-notice" => {
+                cli_show_unofficial_notice = true;
+            }
             "--login-error" => {
                 cli_login_error = text(args.next());
             }
@@ -4806,12 +4919,13 @@ fn main() -> eframe::Result {
             || cli_fake_shared.is_some()
             || cli_fake_cut_short.is_some()
             || cli_fake_disk_full
+            || cli_show_unofficial_notice
             || cli_confirm_stop_sharing.is_some()
             || cli_fake_pinned.is_some()
             || cli_zoom.is_some())
     {
         eprintln!(
-            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --account-menu, --fake-share, --fake-shared, --fake-cut-short, --fake-disk-full, --confirm-stop-sharing, --fake-pinned and --zoom only apply together with --screenshot; ignoring them"
+            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --account-menu, --fake-share, --fake-shared, --fake-cut-short, --fake-disk-full, --confirm-stop-sharing, --fake-pinned, --show-unofficial-notice and --zoom only apply together with --screenshot; ignoring them"
         );
     }
     let fake_share = match cli_fake_share {
@@ -4991,6 +5105,7 @@ fn main() -> eframe::Result {
                 } else if cli_confirm_drive_off {
                     app.pending_confirm = Some(PendingConfirm::VirtualDriveOff);
                 }
+                app.show_notice_in_screenshot = cli_show_unofficial_notice;
                 app.fake_drive = fake_drive;
                 app.fake_files_missing = cli_files_missing;
                 app.fake_attention = cli_fake_attention;
@@ -5598,7 +5713,10 @@ mod tests {
                 fake_paused_until: None,
                 pause_choices_open: false,
                 account_menu_open: false,
-                window_geometry: WindowGeometry::default(),
+                // Most tests aren't about the notice: they start with it answered (`Harness::fresh` doesn't)
+                window_geometry: WindowGeometry { unofficial_notice_accepted: true, ..WindowGeometry::default() },
+                show_notice_in_screenshot: false,
+                notice_focus_given: false,
                 maximize_applied_on_open: true,
                 applied_light_mode: false,
                 screenshot_target: None,
@@ -5617,6 +5735,15 @@ mod tests {
             // Widgets then say what they are, and `widget_at` finds them by name, as a screen reader would
             ctx.enable_accesskit();
             let mut h = Self { ctx, app, commands, events, last: None, screen: Vec2::new(1440.0, 900.0), scene: None, minimized: false };
+            h.frames(3);
+            h
+        }
+
+        /// The app as a first run has it: the "An unofficial app" notice not yet answered.
+        fn fresh() -> Self {
+            let mut h = Self::new();
+            h.app.window_geometry.unofficial_notice_accepted = false;
+            SAVED_PREFS.with(|s| s.borrow_mut().clear());
             h.frames(3);
             h
         }
@@ -6023,6 +6150,108 @@ mod tests {
         assert_eq!(h.app.pending_confirm, None);
         assert_eq!(h.app.tab, NavTab::Home);
         assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    // #421: the one-time "An unofficial app" notice
+    fn saved_prefs() -> Vec<WindowGeometry> {
+        SAVED_PREFS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+
+    #[test]
+    fn a_fresh_app_shows_the_unofficial_notice_until_understood() {
+        let mut h = Harness::fresh();
+        assert!(h.text_at(UNOFFICIAL_TITLE).is_some(), "titled");
+        assert!(h.text_at(UNOFFICIAL_BODY).is_some(), "says what it is");
+        assert!(h.text_at(UNOFFICIAL_SOURCE_LINK).is_some(), "links the source");
+        // The app behind it can't be used: Activity does nothing
+        h.click(h.text_at("Activity").expect("the sidebar's Activity"));
+        assert_eq!(h.app.tab, NavTab::Home);
+        assert!(h.text_at(UNOFFICIAL_TITLE).is_some(), "the click behind it didn't close it either");
+        assert!(saved_prefs().iter().all(|p| !p.unofficial_notice_accepted), "nothing is accepted yet");
+
+        h.click(h.widget_at("I understand").expect("the button"));
+        assert!(h.text_at(UNOFFICIAL_TITLE).is_none(), "closed");
+        assert!(h.text_at(UNOFFICIAL_BODY).is_none());
+        let saved = saved_prefs();
+        assert!(saved.last().is_some_and(|p| p.unofficial_notice_accepted), "saved at once: {saved:?}");
+        h.frames(5);
+        assert!(h.text_at(UNOFFICIAL_TITLE).is_none(), "later frames don't show it");
+        // The page works again
+        h.click(h.text_at("Activity").expect("the sidebar's Activity"));
+        assert_eq!(h.app.tab, NavTab::Activity);
+    }
+
+    #[test]
+    fn the_notice_links_the_source_and_quit_closes_without_accepting() {
+        let mut h = Harness::fresh();
+        let launched = || home::LAUNCHED.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        launched();
+        h.click(h.text_at(UNOFFICIAL_SOURCE_LINK).expect("the link"));
+        assert_eq!(launched(), ["https://github.com/kosidhar/proton-drive"]);
+        assert!(h.text_at(UNOFFICIAL_TITLE).is_some(), "following the link leaves it open");
+
+        // The click's own frame is the one that asks to close
+        let pos = h.widget_at("Quit").expect("Quit");
+        let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        h.frame(vec![egui::Event::PointerMoved(pos)]);
+        h.frame(vec![button(true)]);
+        h.frame(vec![button(false)]);
+        let closed = h.last.as_ref().unwrap().viewport_output.values().any(|v| v.commands.iter().any(|c| matches!(c, ViewportCommand::Close)));
+        assert!(closed, "Quit closes the app");
+        assert!(saved_prefs().iter().all(|p| !p.unofficial_notice_accepted), "and records no answer");
+        assert!(!h.app.window_geometry.unofficial_notice_accepted);
+    }
+
+    #[test]
+    fn escape_does_nothing_to_the_notice() {
+        let mut h = Harness::fresh();
+        press_key(&mut h, Key::Escape);
+        assert!(h.text_at(UNOFFICIAL_TITLE).is_some());
+        assert!(!h.app.window_geometry.unofficial_notice_accepted);
+    }
+
+    #[test]
+    fn an_accepted_notice_never_shows() {
+        let mut h = Harness::new();
+        assert!(h.app.window_geometry.unofficial_notice_accepted);
+        h.frames(5);
+        assert!(h.text_at(UNOFFICIAL_TITLE).is_none());
+        assert!(h.widget_at("I understand").is_none());
+    }
+
+    #[test]
+    fn ui_json_without_the_field_reads_as_not_accepted() {
+        assert!(!serde_json::from_str::<WindowGeometry>("{}").unwrap().unofficial_notice_accepted);
+        let older = r#"{"position":[10.0,20.0],"width":1000.0,"height":700.0,"maximized":false,"themeMode":"dark"}"#;
+        let g: WindowGeometry = serde_json::from_str(older).unwrap();
+        assert!(!g.unofficial_notice_accepted);
+        assert_eq!(g.theme_mode, "dark");
+        let accepted = WindowGeometry { unofficial_notice_accepted: true, ..g };
+        let json = serde_json::to_string(&accepted).unwrap();
+        assert!(json.contains("\"unofficialNoticeAccepted\":true"), "{json}");
+        assert_eq!(serde_json::from_str::<WindowGeometry>(&json).unwrap(), accepted);
+    }
+
+    #[test]
+    fn screenshots_hide_the_notice_unless_asked() {
+        let mut h = Harness::fresh();
+        home::AS_SCREENSHOT.with(|s| s.set(true));
+        h.frames(3);
+        assert!(h.text_at(UNOFFICIAL_TITLE).is_none(), "a screenshot doesn't show it");
+        h.app.show_notice_in_screenshot = true;
+        h.frames(3);
+        assert!(h.text_at(UNOFFICIAL_TITLE).is_some(), "unless --show-unofficial-notice asks");
+        home::AS_SCREENSHOT.with(|s| s.set(false));
+    }
+
+    #[test]
+    fn i_understand_has_the_focus() {
+        let mut h = Harness::fresh();
+        let node = focused(&h).expect("something has the focus");
+        assert_eq!(says(&node), "I understand");
+        press_key(&mut h, Key::Enter);
+        assert!(h.text_at(UNOFFICIAL_TITLE).is_none(), "Enter accepts");
+        assert!(saved_prefs().last().is_some_and(|p| p.unofficial_notice_accepted));
     }
 
     /// Opens `confirm`, clicks its button (`label`) and returns the harness for the checks on what was sent.
@@ -12928,6 +13157,17 @@ mod tests {
         // Once
         h.event(WorkerEvent::StatusAndActivity { status: Box::new(Ok(status)), activity: Vec::new() });
         assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn escape_with_the_notice_up_leaves_a_share_window_behind_it_open() {
+        let mut h = share_window(Some(share::ShareInfo::default()));
+        h.app.window_geometry.unofficial_notice_accepted = false;
+        h.frames(3);
+        assert!(h.text_at(UNOFFICIAL_TITLE).is_some());
+        press_key(&mut h, egui::Key::Escape);
+        assert!(h.app.share.is_some(), "Escape doesn't reach the Share window");
+        assert!(h.text_at(UNOFFICIAL_TITLE).is_some(), "and the notice stays");
     }
 
     #[test]
