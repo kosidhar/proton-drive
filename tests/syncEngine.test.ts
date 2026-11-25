@@ -441,6 +441,68 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             await engine.stop();
         });
 
+        const addDoc = (remoteNodes: Map<string, NodeEntity>, uid: string, parentUid: string, name: string, mediaType = 'application/vnd.proton.doc') => {
+            const node = makeMockNode({ uid, parentUid, nameStr: name, type: NodeType.File });
+            Object.assign(node, { mediaType });
+            remoteNodes.set(uid, node);
+            return node;
+        };
+
+        test("a listing records the folder's Docs and Sheets, and the next listing follows renames and moves", async () => {
+            const { engine, remoteNodes, rootNode, archive, fire } = setup();
+            const update = (parentNodeUid: string) =>
+                fire({ type: DriveEventType.NodeUpdated, nodeUid: 'vol~plan', parentNodeUid, isTrashed: false, isShared: false, treeEventScopeId: 'scope-main', eventId: 'evt-1' } as DriveEvent);
+            addDoc(remoteNodes, 'vol~plan', archive.uid, 'Plan');
+            addDoc(remoteNodes, 'vol~budget', rootNode.uid, 'Budget', 'application/vnd.proton.sheet');
+            await engine.start();
+
+            expect(engine.docNodes.listChildren(archive.uid).map((d) => [d.uid, d.name, d.kind])).toEqual([['vol~plan', 'Plan', 'doc']]);
+            expect(engine.docNodes.listChildren(rootNode.uid).map((d) => [d.name, d.kind])).toEqual([['Budget', 'sheet']]);
+            // Documents are not synced files: the remote index leaves them out
+            expect(engine.remoteIndex.getByUid('vol~plan')).toBeNull();
+            expect(engine.remoteIndex.getByPath('Archive/Plan')).toBeNull();
+
+            // Renamed in place, then moved to another folder: only the new parent is re-listed
+            addDoc(remoteNodes, 'vol~plan', archive.uid, 'Plan v2');
+            await update(archive.uid);
+            expect(engine.docNodes.listChildren(archive.uid).map((d) => d.name)).toEqual(['Plan v2']);
+
+            addDoc(remoteNodes, 'vol~plan', 'vol~year', 'Plan v2');
+            await update('vol~year');
+            expect(engine.docNodes.listChildren('vol~year').map((d) => d.uid)).toEqual(['vol~plan']);
+            expect(engine.docNodes.listChildren(archive.uid)).toEqual([]);
+            await engine.stop();
+        });
+
+        test('a document moved by an event leaves its old folder even when only the new parent is listed', async () => {
+            const { engine, remoteNodes, archive, rootNode, fire } = setup();
+            addDoc(remoteNodes, 'vol~plan', archive.uid, 'Plan');
+            await engine.start();
+            expect(engine.docNodes.anyChildren(archive.uid)).toBe(true);
+
+            addDoc(remoteNodes, 'vol~plan', rootNode.uid, 'Plan');
+            await fire({ type: DriveEventType.NodeUpdated, nodeUid: 'vol~plan', parentNodeUid: rootNode.uid, isTrashed: false, isShared: false, treeEventScopeId: 'scope-main', eventId: 'evt-1' } as DriveEvent);
+
+            expect(engine.docNodes.listChildren(rootNode.uid).map((d) => d.uid)).toEqual(['vol~plan']);
+            expect(engine.docNodes.anyChildren(archive.uid)).toBe(false);
+            await engine.stop();
+        });
+
+        test('a trashed or deleted document event removes its record', async () => {
+            const { engine, remoteNodes, archive, fire } = setup();
+            addDoc(remoteNodes, 'vol~plan', archive.uid, 'Plan');
+            addDoc(remoteNodes, 'vol~other', archive.uid, 'Other');
+            await engine.start();
+            expect(engine.docNodes.listChildren(archive.uid)).toHaveLength(2);
+
+            await fire({ type: DriveEventType.NodeUpdated, nodeUid: 'vol~plan', parentNodeUid: archive.uid, isTrashed: true, isShared: false, treeEventScopeId: 'scope-main', eventId: 'evt-1' } as DriveEvent);
+            expect(engine.docNodes.listChildren(archive.uid).map((d) => d.uid)).toEqual(['vol~other']);
+
+            await fire({ type: DriveEventType.NodeDeleted, nodeUid: 'vol~other', parentNodeUid: archive.uid, treeEventScopeId: 'scope-main', eventId: 'evt-2' } as DriveEvent);
+            expect(engine.docNodes.anyChildren(archive.uid)).toBe(false);
+            await engine.stop();
+        });
+
         test('a locally deleted synced folder leaves no index entries once it is trashed', async () => {
             const { engine, remoteNodes, rootNode, archive } = setup();
             // Another top-level item stays, so the delete is a partial loss, never the files missing (#45)

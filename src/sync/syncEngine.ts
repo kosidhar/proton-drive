@@ -47,6 +47,7 @@ import { HYDRATE_STAGING_PREFIX, isEngineTempName, removeScannedEntries, type Sc
 import { moveWithoutReplacing } from './localMove';
 import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
 import { pathsOverlap } from './mountPoint';
+import { DocNodes, docRecordOf } from './docNodes';
 import { entryFromNode, RemoteIndex, type RemoteIndexEntry } from './remoteIndex';
 import { type RemoteOp, RemoteOpsJournal } from './remoteOps';
 import type { ConflictRecord, CutShortFile, EditBaseline, SyncedItemRecord, SyncSettings, SyncStateDatabase } from './syncStateDb';
@@ -324,6 +325,7 @@ export class ProtonDriveSyncEngine {
     private removalBatches: Array<{ n: number; takenAway: TakenAway }> = [];
     private workSince = new Map<number, number>();
     private readonly index: RemoteIndex;
+    private readonly docs: DocNodes;
     private readonly policy: AvailabilityPolicy;
     // What changed, for the file manager's emblems (see StateEvents and the control socket's /fm/events)
     readonly stateEvents: StateEvents;
@@ -491,6 +493,7 @@ export class ProtonDriveSyncEngine {
         } = {},
     ) {
         this.index = new RemoteIndex(this.stateDb.connection);
+        this.docs = new DocNodes(this.stateDb.connection);
         this.policy = new AvailabilityPolicy(this.stateDb.connection, this.index);
         this.localChangeSlots = new Slots(options.localChangeConcurrency ?? LOCAL_CHANGE_CONCURRENCY);
         this.stateEvents = new StateEvents(options.stateEventSchedule ? { schedule: options.stateEventSchedule } : {});
@@ -3507,6 +3510,7 @@ export class ProtonDriveSyncEngine {
         if (event.type === DriveEventType.NodeDeleted) {
             this.forgetHeldNodes(event.nodeUid);
             this.index.removeSubtree(event.nodeUid);
+            this.docs.remove(event.nodeUid);
             const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
             // One with a rename or move through the drive on its way is left to its replay, which keeps its local copy
             if (tracked && !this.awaitsRemoteOp(tracked.localRelPath, event.nodeUid)) {
@@ -3519,6 +3523,7 @@ export class ProtonDriveSyncEngine {
             if (event.isTrashed) {
                 this.forgetHeldNodes(event.nodeUid);
                 this.index.removeSubtree(event.nodeUid);
+                this.docs.remove(event.nodeUid);
                 const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
                 if (tracked && !this.awaitsRemoteOp(tracked.localRelPath, event.nodeUid)) {
                     await this.removeAfterCloudDelete(tracked.localRelPath, 'trashed');
@@ -6913,6 +6918,11 @@ export class ProtonDriveSyncEngine {
         return this.index;
     }
 
+    // The account's Docs and Sheets, for the virtual drive's placeholders (they are not in the remote index)
+    get docNodes(): DocNodes {
+        return this.docs;
+    }
+
     get availability(): AvailabilityPolicy {
         return this.policy;
     }
@@ -7494,7 +7504,18 @@ export class ProtonDriveSyncEngine {
             if (relPath !== '' && this.index.getByUid(folder.uid)?.relPath !== relPath) {
                 return false;
             }
-            this.indexWrite(() => this.index.replaceChildren(folder.uid, relPath, this.indexEntries(children, relPath)));
+            this.indexWrite(() => {
+                this.index.replaceChildren(folder.uid, relPath, this.indexEntries(children, relPath));
+                // Docs and Sheets are not synced files, so the index leaves them out; they are recorded beside it, keyed by uid
+                // (a document listed under a new folder leaves its old one), for the virtual drive's placeholders.
+                this.docs.replaceChildren(
+                    folder.uid,
+                    children.flatMap((child) => {
+                        const rec = docRecordOf(child, folder.uid);
+                        return rec ? [rec] : [];
+                    }),
+                );
+            });
             return true;
         } catch (error: unknown) {
             this.logger.warn(`Failed to update the remote index for ${relPath || '/'}: ${error}`);
