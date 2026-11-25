@@ -9151,6 +9151,33 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect((await failure(d.engine.truncateItem('Docs/Plan.protondoc')))?.code).not.toBe('EPERM');
             });
 
+            test('a hidden real item with the placeholder name keeps it: no placeholder, no EPERM, and it stays hidden', async () => {
+                const d = setup();
+                d.add('Docs/Plan.protondoc', 'real');
+                await withDocs(d);
+                expect((await d.engine.setAvailability('Docs/Plan.protondoc', 'hide')).state).toBe('hidden');
+                const listed = d.engine.vfsChildren('Docs');
+                expect(listed.map((e) => e.name)).not.toContain('Plan.protondoc');
+                expect(listed.some((e) => e.placeholder?.content.includes('Plan'))).toBe(false);
+                for (const op of [
+                    () => d.engine.deleteItem('Docs/Plan.protondoc'),
+                    () => d.engine.truncateItem('Docs/Plan.protondoc'),
+                    () => d.engine.hydrate('Docs/Plan.protondoc'),
+                ]) {
+                    expect((await failure(op()))?.code).not.toBe('EPERM');
+                }
+            });
+
+            test('the size of a placeholder is the byte length of its content, not its character count', async () => {
+                const d = setup();
+                d.add('Docs/Été 2026', 'x');
+                Object.assign(d.nodes.get('vol~Docs/Été 2026')!, { mediaType: 'application/vnd.proton.doc' });
+                await d.engine.reconcileNow();
+                const e = d.engine.vfsChildren('Docs').find((x) => x.name === 'Été 2026.protondoc')!;
+                expect(e.size).toBe(Buffer.byteLength(e.placeholder!.content));
+                expect(e.size).not.toBe(e.placeholder!.content.length);
+            });
+
             test('placeholders follow the ignore and hidden rules of their folder', async () => {
                 const d = setup();
                 await withDocs(d);

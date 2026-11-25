@@ -4717,7 +4717,12 @@ export class ProtonDriveSyncEngine {
         const localNames = new Set(this.localChildNames(rel) ?? []);
         const conflictPaths = new Set(this.stateDb.listConflicts().map((conflict) => conflict.localRelPath));
         const entries: VfsEntry[] = [];
+        // A real item holds its name even when hidden or ignored (placeholderAt agrees): no placeholder takes its place
+        const taken = new Set(localNames);
         for (const child of this.index.listChildren(rel)) {
+            if (!takesAway(latest.get(child.uid), child)) {
+                taken.add(child.name);
+            }
             if (
                 takesAway(latest.get(child.uid), child) ||
                 matchesIgnorePatterns(child.relPath, ignorePatterns) ||
@@ -4734,7 +4739,6 @@ export class ProtonDriveSyncEngine {
             );
         }
         if (this.inBackingStore()) {
-            const taken = new Set([...entries.map((e) => e.name), ...localNames]);
             for (const doc of this.docNodes.listChildren(folder.uid)) {
                 const name = placeholderName(doc);
                 if (taken.has(name) || matchesIgnorePatterns(childRel(rel, name), ignorePatterns)) {
