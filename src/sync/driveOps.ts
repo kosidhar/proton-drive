@@ -17,7 +17,7 @@ export interface VfsEntry {
 // something that can't be done to that item (putting back Proton Drive's version of a file it has none of), ENOSPC for a
 // download for an open that would leave this computer's disk with less than the drive's reserve (#301), EIO for anything
 // else (a failed download, say), EPERM for a change to a Proton Doc or Sheet's placeholder (they open in the browser)
-export type DriveOpErrorCode = 'ENOENT' | 'EEXIST' | 'EACCES' | 'EIO' | 'EXDEV' | 'ENOTEMPTY' | 'EINVAL' | 'ENOSPC' | 'EPERM';
+export type DriveOpErrorCode = 'ENOENT' | 'EEXIST' | 'EACCES' | 'EIO' | 'EXDEV' | 'ENOTEMPTY' | 'EINVAL' | 'ENOSPC' | 'EPERM' | 'EISDIR';
 
 export class DriveOpError extends Error {
     constructor(

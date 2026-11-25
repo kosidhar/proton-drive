@@ -307,6 +307,8 @@ fn errno_of_code(code: Option<&str>) -> i32 {
         Some("EACCES") => libc::EACCES,
         Some("EXDEV") => libc::EXDEV,
         Some("ENOTEMPTY") => libc::ENOTEMPTY,
+        // An unlink of a folder (#432)
+        Some("EISDIR") => libc::EISDIR,
         Some("ENOSPC") => libc::ENOSPC,
         // A Docs or Sheets placeholder, which can't be changed (#430)
         Some("EPERM") => libc::EPERM,
@@ -574,6 +576,7 @@ mod tests {
         assert_eq!(errno_of_code(Some("EIO")), libc::EIO);
         assert_eq!(errno_of_code(Some("EXDEV")), libc::EXDEV);
         assert_eq!(errno_of_code(Some("ENOTEMPTY")), libc::ENOTEMPTY);
+        assert_eq!(errno_of_code(Some("EISDIR")), libc::EISDIR);
         // A Docs or Sheets placeholder, which can't be changed (#430)
         assert_eq!(errno_of_code(Some("EPERM")), libc::EPERM);
         // A download for an open that would leave the system disk under the reserve (#301)

@@ -3978,7 +3978,7 @@ export class ProtonDriveSyncEngine {
     // to Trash through the drive), what exists only on this computer (never uploaded, or changed since) goes to the
     // desktop Trash rather than away, as after a cloud delete, and the user is told.
     // Rejects with a DriveOpError: `Not found: <path>` (ENOENT), `Hidden: <path>` (EACCES), with onlyIfEmpty `Not empty:
-    // <path>` (ENOTEMPTY) or `Not a folder: <path>` (EIO); or with `Invalid path: <path>`.
+    // <path>` (ENOTEMPTY) or `Not a folder: <path>` (EIO); without either, `Is a folder: <path>` (EISDIR); or with `Invalid path: <path>`.
     async deleteItem(
         relPath: string,
         opts: { onlyIfEmpty?: boolean; trash?: boolean; deadlineMs?: number } = {},
@@ -5783,6 +5783,11 @@ export class ProtonDriveSyncEngine {
         const entry = ignored ? null : this.liveIndexEntry(relPath);
         if (!local && !entry) {
             throw new DriveOpError('ENOENT', `Not found: ${relPath}`);
+        }
+        // An unlink (neither flag) is what the drive sends for a file, and for a folder it is refused as unlink(2) does,
+        // before any trash is journalled or anything is removed here (#432). rmdir and Move to Trash take folders.
+        if (!onlyIfEmpty && !trash && (local ? local.isDirectory() : entry?.type === 'folder')) {
+            throw new DriveOpError('EISDIR', `Is a folder: ${relPath}`);
         }
         if (onlyIfEmpty) {
             if (local ? !local.isDirectory() : entry?.type !== 'folder') {

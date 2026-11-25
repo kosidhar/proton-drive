@@ -1512,7 +1512,7 @@ impl State {
                 let allowed: &[i32] = if removal == Removal::Rmdir {
                     &[libc::ENOENT, libc::EACCES, libc::ENOTEMPTY, libc::EPERM, libc::EIO]
                 } else {
-                    &[libc::ENOENT, libc::EACCES, libc::EPERM, libc::EIO]
+                    &[libc::ENOENT, libc::EACCES, libc::EPERM, libc::EISDIR, libc::EIO]
                 };
                 s.reply_refused(reply, &format!("delete {rel_str:?}"), err, allowed)
             }
