@@ -143,7 +143,8 @@ describe('AppImage AppRun', () => {
         const escaped = ai.replace(/\\/g, '\\\\\\\\').replace(/["`$]/g, (c) => '\\\\' + c);
         expect(d).toContain(`Exec="${escaped}" open-doc %f\n`);
         expect(d).toContain('X-Kosidhar-AppImage=true');
-        expect(d).not.toMatch(/^TryExec=(?!.*kosidhar)/m);
+        // TryExec is a plain string: only backslashes are escaped (none in this path)
+        expect(d).toContain(`TryExec=${ai}\n`);
         expect(d).toContain('MimeType=application/vnd.proton.doc;application/vnd.proton.sheet;');
         expect(callLines(env)).toEqual([
             `mime:${env.data}/mime`,
@@ -183,11 +184,20 @@ describe('AppImage AppRun', () => {
             'import gi',
             'gi.require_version("Gio", "2.0")',
             'from gi.repository import Gio, GLib',
-            'a = Gio.DesktopAppInfo.new_from_filename(sys.argv[1])',
+            'try:',
+            '    a = Gio.DesktopAppInfo.new_from_filename(sys.argv[1])',
+            'except TypeError:  # PyGObject raises when the constructor returns NULL',
+            '    a = None',
             'print("NULL" if a is None else GLib.shell_parse_argv(a.get_commandline())[1][0])',
         ].join('\n');
-        const p = Bun.spawnSync(['python3', '-I', '-W', 'ignore', '-c', script, desktopPath(env)]);
-        expect(p.stdout.toString().replace(/\n$/, '')).toBe(ai);
+        const load = () =>
+            Bun.spawnSync(['python3', '-I', '-W', 'ignore', '-c', script, desktopPath(env)])
+                .stdout.toString()
+                .replace(/\n$/, '');
+        expect(load()).toBe(ai);
+        // Once the AppImage is gone GLib ignores the entry, so a system handler wins again.
+        rmSync(ai);
+        expect(load()).toBe('NULL');
     });
 
     test('(c) a second run with the same AppImage writes nothing', () => {
