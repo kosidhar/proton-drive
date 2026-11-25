@@ -9825,9 +9825,8 @@ mod tests {
         h.click(h.text_at("Shared").unwrap());
         h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(shared_rows())));
         h.sent();
-        // An icon, named Refresh
-        assert!(h.text_at(icons::REFRESH).is_some());
-        assert!(h.text_at("Refresh").is_none());
+        // A labelled button (#410)
+        assert!(h.text_at("Refresh").is_some());
         h.click(h.widget_at("Refresh").unwrap());
         assert_eq!(h.sent(), ["shared list"]);
         h.frames(3);
@@ -10397,6 +10396,83 @@ mod tests {
         let photos = h.text_rect(shared::EMPTY_PHOTOS).expect("reachable by scrolling");
         let link = h.text_rect(shared::PHOTOS_LINK).expect("reachable by scrolling");
         assert!(photos.bottom() <= h.screen.y && link.bottom() <= h.screen.y && photos.top() >= toolbar, "{photos:?} {link:?}");
+        // The centred Refresh is reachable too: under the how line (it may start below the fold; reachable is the rule)
+        let refresh = h.widget_at("Refresh").expect("Refresh is reachable by scrolling");
+        let how = h.text_rect(shared::EMPTY_HOW).map_or(f32::MIN, |r| r.bottom());
+        assert!(refresh.y <= h.screen.y && refresh.y >= toolbar && refresh.y > how, "{refresh:?} under the how line {how}");
+    }
+
+    // #410: with a list, Refresh is a labelled button with the sync glyph at the toolbar's right end
+    #[test]
+    fn shared_refresh_is_a_labelled_button_with_rows() {
+        let mut h = shared_with_rows();
+        let label = h.text_rect("Refresh").expect("the label is painted");
+        let glyphs = h.text_at_all(icons::SYNC);
+        assert!(glyphs.iter().any(|g| (g.y - label.center().y).abs() < 4.0 && g.x < label.left()), "{glyphs:?} left of {label:?}");
+        let nodes = h.nodes_named("Refresh");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].role(), egui::accesskit::Role::Button);
+        h.click(h.widget_at("Refresh").unwrap());
+        assert_eq!(h.sent(), ["shared list"]);
+    }
+
+    // #410: nothing shared: a centred Refresh between the how line and the Photos line, and none in the toolbar
+    #[test]
+    fn shared_empty_offers_a_centred_refresh() {
+        let mut h = empty_shared();
+        h.sent();
+        let r = h.widget_at("Refresh").expect("a Refresh");
+        let how = h.text_rect(shared::EMPTY_HOW).unwrap();
+        assert!((r.x - how.center().x).abs() < 2.0, "{r:?} under {how:?}");
+        let next = h.text_rect(shared::EMPTY_PHOTOS).unwrap_or_else(|| h.text_rect(shared::PHOTOS_LINK).unwrap());
+        assert!(how.bottom() < r.y && r.y < next.top(), "{how:?} {r:?} {next:?}");
+        assert_eq!(h.nodes_named("Refresh").len(), 1);
+        h.click(r);
+        assert_eq!(h.sent(), ["shared list"]);
+    }
+
+    // #410: couldn't read: the message and a primary Retry, centred, placed as the empty group is
+    #[test]
+    fn shared_error_centres_the_message_and_retry() {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared").unwrap());
+        let offline = "Proton Drive is offline: try again when you are connected";
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Err(offline.into())));
+        h.frames(10);
+        let said = h.text_rect(offline).expect("the message");
+        let retry = h.widget_at("Retry").expect("Retry");
+        let middle = (SIDEBAR_EDGE + h.screen.x) / 2.0;
+        assert!((said.center().x - retry.x).abs() < 2.0, "{said:?} over {retry:?}");
+        assert!((retry.x - middle).abs() < 30.0, "{retry:?} in the page");
+        assert!(retry.y > said.bottom());
+        assert!(said.top() - shared_content_top() > 40.0, "not at the top: {said:?}");
+        assert_eq!(painted_color(&h, offline, said.center()), Some(DANGER_TEXT()));
+        assert!(h.nodes_named("Refresh").is_empty());
+        h.sent();
+        h.click(retry);
+        assert_eq!(h.sent(), ["shared list"]);
+    }
+
+    // #410: one Refresh at most, in every state
+    #[test]
+    fn shared_shows_at_most_one_refresh_in_every_state() {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared").unwrap());
+        h.frames(3);
+        assert_eq!(h.nodes_named("Refresh").len(), 0, "first load");
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(shared_rows())));
+        h.frames(3);
+        assert_eq!(h.nodes_named("Refresh").len(), 1, "rows");
+        h.click(h.widget_at("Refresh").unwrap());
+        h.frames(3);
+        assert_eq!(h.nodes_named("Refresh").len(), 0, "refreshing");
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(vec![])));
+        h.frames(3);
+        assert_eq!(h.nodes_named("Refresh").len(), 1, "empty");
+        h.click(h.widget_at("Refresh").unwrap());
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Err("Proton Drive is offline".into())));
+        h.frames(3);
+        assert_eq!(h.nodes_named("Refresh").len(), 0, "error");
     }
 
     #[test]

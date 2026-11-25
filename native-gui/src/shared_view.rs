@@ -4,7 +4,7 @@
 use eframe::egui::{self, Align, Color32, FontId, Frame, Layout, Margin, RichText, ScrollArea, Sense, Stroke, Vec2};
 
 use crate::{
-    action_button, activity, bold, decoration, home, icon_button, icon_button_colored_named, icons, palette,
+    action_button, activity, bold, decoration, home, icon_button_colored_named, icons, palette,
     scroll_to_focused, shared, text_width, truncate_end_to_width, truncate_middle_to_width, ButtonKind, Palette,
     PendingConfirm, ProtonDriveNativeApp, BORDER_SUBTLE, BUTTON_ICON_SIZE, DANGER_TEXT, FOLDER_ICON, ICON_BUTTON_SIZE,
     PROTON_PURPLE_TEXT, SCROLL_GUTTER, STATUS_SUCCESS, TEXT_MUTED, TEXT_PRIMARY,
@@ -372,8 +372,8 @@ fn paint_share_picture(ui: &mut egui::Ui) -> egui::Response {
 
 /// Lays `add` out top-down and centred, a little above the middle of a page `viewport` tall: it starts
 /// `(viewport - its height) * 0.4` down, and its height is last frame's, kept under `id`. When that changes, the frame
-/// is drawn again with the new one.
-fn place_above_middle(ui: &mut egui::Ui, id: &str, viewport: f32, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+/// is drawn again with the new one. Gives back what `add` gave.
+fn place_above_middle<R>(ui: &mut egui::Ui, id: &str, viewport: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let id = egui::Id::new(id);
     let last: f32 = ui.ctx().data_mut(|d| d.get_temp(id)).unwrap_or(0.0);
     ui.add_space(((viewport - last) * 0.4).max(0.0));
@@ -384,7 +384,7 @@ fn place_above_middle(ui: &mut egui::Ui, id: &str, viewport: f32, add: impl FnOn
         // This frame placed the group by a stale height: draw it again with the new one
         ui.ctx().request_discard("shared group height");
     }
-    group.response
+    group.inner
 }
 
 impl ProtonDriveNativeApp {
@@ -406,17 +406,15 @@ impl ProtonDriveNativeApp {
                     ui.label(RichText::new("Link copied").size(13.0).color(TEXT_MUTED()));
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let rows_show = self.shared.items.as_ref().is_some_and(|items| !items.is_empty());
-                    if self.shared.error.is_some() {
-                        // Retry is the action while the list couldn't be read
+                    // Only a list has a Refresh here. The empty page and the error have their own, centred where
+                    // the eyes are, and a first read has the page's loading picture
+                    if self.shared.error.is_some() || !self.shared.has_rows() {
                     } else if self.shared.loading {
-                        // The rows reload (greyed out): the arrows turn here, where Refresh was. With no rows, the
-                        // page's own loading picture does it. Right to left: the words, then the arrows
-                        if rows_show {
-                            ui.label(RichText::new(shared::REFRESHING).size(13.0).color(TEXT_MUTED()));
-                            home::turning_decoration(ui, icons::SYNC, 16.0, PROTON_PURPLE_TEXT(), home::turning_angle(ui));
-                        }
-                    } else if icon_button(ui, icons::REFRESH, "Refresh").clicked() {
+                        // The rows reload (greyed out): the arrows turn here, where Refresh was. Right to left:
+                        // the words, then the arrows
+                        ui.label(RichText::new(shared::REFRESHING).size(13.0).color(TEXT_MUTED()));
+                        home::turning_decoration(ui, icons::SYNC, 16.0, PROTON_PURPLE_TEXT(), home::turning_angle(ui));
+                    } else if action_button(ui, ButtonKind::Secondary, Some(icons::SYNC), "Refresh", 34.0).clicked() {
                         self.load_shared();
                     }
                 });
@@ -428,22 +426,31 @@ impl ProtonDriveNativeApp {
         ScrollArea::vertical().id_salt("shared_scroll").auto_shrink([false, false]).show(ui, |ui| {
             Frame::NONE.inner_margin(gutter).show(ui, |ui| {
                 if let Some(error) = self.shared.error.clone() {
-                    ui.add(egui::Label::new(RichText::new(error).size(13.0).color(DANGER_TEXT())).wrap());
-                    ui.add_space(10.0);
-                    if action_button(ui, ButtonKind::Primary, Some(icons::REFRESH), "Retry", 34.0).clicked() {
+                    // Placed as the empty page is, with the one way out right under what went wrong
+                    let retry = place_above_middle(ui, "shared_error_h", viewport, |ui| {
+                        ui.scope(|ui| {
+                            // A fixed width, so the box is centred and the words are centred in it
+                            ui.set_width(ui.available_width().min(420.0));
+                            ui.add(egui::Label::new(RichText::new(error).size(13.0).color(DANGER_TEXT())).wrap().halign(Align::Center));
+                        });
+                        ui.add_space(12.0);
+                        action_button(ui, ButtonKind::Primary, Some(icons::REFRESH), "Retry", 34.0).clicked()
+                    });
+                    if retry {
                         self.load_shared();
                     }
                     return;
                 }
                 let loading = self.shared.loading;
-                let rows_show = self.shared.items.as_ref().is_some_and(|items| !items.is_empty());
-                if loading && !rows_show {
+                if loading && !self.shared.has_rows() {
                     place_above_middle(ui, "shared_loading_h", viewport, paint_share_loading);
                     return;
                 }
                 let Some(items) = &self.shared.items else { return };
                 if items.is_empty() {
-                    self.render_shared_empty(ui, viewport);
+                    if self.render_shared_empty(ui, viewport) {
+                        self.load_shared();
+                    }
                     return;
                 }
                 if let Some(error) = &self.shared.stop_error {
@@ -462,8 +469,8 @@ impl ProtonDriveNativeApp {
     }
 
     /// Nothing shared yet: a picture, a heading and the one way to share, a little above the middle of the page (the
-    /// height it is placed by is last frame's), and where Photos shares are.
-    fn render_shared_empty(&self, ui: &mut egui::Ui, viewport: f32) {
+    /// height it is placed by is last frame's), Refresh, and where Photos shares are. True when Refresh was clicked.
+    fn render_shared_empty(&self, ui: &mut egui::Ui, viewport: f32) -> bool {
         place_above_middle(ui, "shared_empty_h", viewport, |ui| {
             paint_share_picture(ui);
             ui.add_space(20.0);
@@ -473,6 +480,8 @@ impl ProtonDriveNativeApp {
                 ui.set_max_width(ui.available_width().min(420.0));
                 ui.add(egui::Label::new(RichText::new(shared::EMPTY_HOW).size(13.0).color(TEXT_MUTED())).wrap().halign(Align::Center));
             });
+            ui.add_space(16.0);
+            let refresh = action_button(ui, ButtonKind::Secondary, Some(icons::SYNC), "Refresh", 34.0).clicked();
             ui.add_space(24.0);
             // Centred in one row if both parts fit the page, else the lead-in above the link
             let width_of = |ui: &egui::Ui, text: &str| ui.painter().layout_no_wrap(text.into(), FontId::proportional(PHOTOS_SIZE), TEXT_MUTED()).size().x;
@@ -496,7 +505,8 @@ impl ProtonDriveNativeApp {
                 lead_in(ui);
                 link(ui);
             }
-        });
+            refresh
+        })
     }
 
     /// The daemon never lists Photos shares, so the page says where to find them (#256).
