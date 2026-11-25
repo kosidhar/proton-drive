@@ -12180,7 +12180,7 @@ mod tests {
     fn note_rect(h: &Harness, text: &str) -> egui::Rect {
         accesskit_nodes(h)
             .into_iter()
-            .find(|(_, n)| n.role() == egui::accesskit::Role::Label && n.value() == Some(text))
+            .find(|(_, n)| n.role() == egui::accesskit::Role::Label && says(n) == text && n.bounds().is_some())
             .map(|(_, n)| node_rect(&n))
             .unwrap_or_else(|| panic!("the note {text:?} is there"))
     }
@@ -12208,7 +12208,9 @@ mod tests {
                 put_note(&mut h, key, if error { Notice::error(text) } else { Notice::info(text) });
                 assert_eq!(top_of(&h, below), below_before, "{key} {text} at {width}: the row below stays put");
                 assert_eq!(top_of(&h, label), label_before, "{key} {text} at {width}: its own label stays put");
-                assert!(accesskit_nodes(&h).iter().any(|(_, n)| n.value() == Some(text)), "{key} {text} at {width}: the note is there");
+                if !row_beside(width) {
+                    continue; // below the window's least width the label may take the whole line: no room for a note
+                }
                 let note = note_rect(&h, text);
                 let label_rect = h.text_rect(label).unwrap();
                 assert!(
@@ -12272,6 +12274,41 @@ mod tests {
                 assert!(note.right() <= move_rect.left() && note.center().y > move_rect.top() && note.center().y < move_rect.bottom());
             }
         }
+    }
+
+    // #428 round 1: a note takes no room from the row: at the least width the window has, with none showing, nothing is cut
+    #[test]
+    fn at_the_least_width_the_rows_keep_their_full_labels_and_folder() {
+        let label = "When a file changes in both places";
+        let mut wide = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        wide.resize_zoomed(Vec2::new(1440.0, 2400.0), 1.0);
+        wide.frames(4);
+        let (label_w, path_w) = (wide.text_rect(label).unwrap().width(), wide.text_rect("/home/u/ProtonDrive").unwrap().width());
+        let mut h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        h.resize_zoomed(Vec2::new(840.0, 2400.0), 1.0);
+        h.frames(4);
+        assert_eq!(h.text_rect(label).expect("painted").width(), label_w, "the picker's label is whole");
+        assert_eq!(h.text_rect("/home/u/ProtonDrive").expect("painted").width(), path_w, "the folder is whole");
+        let picker = accesskit_nodes(&h).into_iter().find(|(_, n)| n.role() == egui::accesskit::Role::ComboBox).map(|(_, n)| node_rect(&n)).unwrap();
+        assert!(picker.width() >= 190.0, "the picker keeps its room: {picker:?}");
+    }
+
+    // #428 round 1: with no room for words, the note is its icon alone, and says its words to screen readers
+    #[test]
+    fn a_note_with_no_room_for_words_is_its_icon_with_the_words_for_screen_readers() {
+        use egui::accesskit::Live;
+        let mut h = settings_tall(None, None);
+        h.resize_zoomed(Vec2::new(840.0, 2400.0), 1.0);
+        put_note(&mut h, "conflictStrategy", Notice::info("Saved"));
+        assert!(h.text_rect("Saved").is_none(), "the words aren't painted");
+        let node = accesskit_nodes(&h)
+            .into_iter()
+            .map(|(_, n)| n)
+            .find(|n| says(n) == "Saved" && n.bounds().is_some())
+            .expect("the icon carries the words");
+        assert_eq!(node.live(), Some(Live::Polite));
+        assert!(node_rect(&node).width() <= 20.0, "just the icon");
+        assert!(h.text_rect(icons::CHECK).is_some(), "the check icon is painted");
     }
 
     #[test]
