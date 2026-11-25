@@ -3,7 +3,7 @@
 import path from 'node:path';
 
 import { launchDesktopWindow } from '../gui/launcher';
-import { ensureSystemTrayIndicator } from '../linux/notifications';
+import { ensureSystemTrayIndicator, sendDesktopNotification } from '../linux/notifications';
 import { DEFAULT_DAEMON_HOST, DEFAULT_DAEMON_PORT, startSyncDaemon } from '../daemon/daemonServer';
 import {
     DEFAULT_APP_VERSION,
@@ -20,6 +20,7 @@ import {
     THIRD_PARTY_DISCLOSURE,
     uploadLocalFileToDrive,
 } from '../sdk';
+import { openDoc } from './openDoc';
 import { DAEMON_NOT_RUNNING_MESSAGE, runAvailabilityCommand } from './availabilityCommands';
 import { controlSocketDirProblem, daemonRunning, MOVING_FILES_MESSAGE, pendingMoveMarker, syncPassError } from './daemonProbe';
 import { defaultControlSocketPath } from '../daemon/controlServer';
@@ -151,6 +152,7 @@ Direct Cloud File Commands (@protontech/drive-sdk):
   upload <localFile> <remoteDir> Upload a local file to Proton Drive
   download <remoteFile> <local>  Download a file from Proton Drive
   trash <remotePath>             Move a remote file or folder to Trash
+  open-doc <file>   Open a Proton Docs or Sheets placeholder in the browser
   version                        Display client and SDK versions
   help                           Show this help message
 `);
@@ -604,6 +606,22 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
             console.log(`Moved '${remotePath}' (${node.uid}) to Proton Drive Trash.`);
         } finally {
             await runtime.dispose();
+        }
+        return;
+    }
+
+    if (cmd === 'open-doc') {
+        const file = args[1];
+        if (!file) {
+            throw new Error('Usage: protondrive open-doc <file>');
+        }
+        // No runtime, daemon or sign-in: the file holds the whole link
+        const code = await openDoc(file, {
+            open: openBrowserUrl,
+            notify: (title, body) => sendDesktopNotification({ title, body }),
+        });
+        if (code !== 0) {
+            process.exit(code);
         }
         return;
     }
