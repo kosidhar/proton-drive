@@ -466,6 +466,11 @@ pub struct SharedPage {
 }
 
 impl SharedPage {
+    /// Whether there is a list with something in it to show.
+    pub fn has_rows(&self) -> bool {
+        self.items.as_ref().is_some_and(|items| !items.is_empty())
+    }
+
     /// Screenshot-only: sets the page as `--fake-shared <state>` shows it. A list, empty or offline is answered, as
     /// `fake_shared` has it; loading is a first read still out; refreshing is the list answered and read again.
     /// False for an unknown state.
