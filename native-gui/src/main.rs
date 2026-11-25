@@ -1989,6 +1989,9 @@ impl ProtonDriveNativeApp {
 
     /// A folder was chosen to move the drive to (#425): a different one is asked about first, never moved to at once.
     fn folder_chosen(&mut self, chosen: &str) {
+        if self.is_pending("syncDir") {
+            return;
+        }
         let to = chosen.trim();
         if !to.is_empty() && to != self.status.sync_dir.trim() {
             self.pending_confirm = Some(PendingConfirm::MoveFolder { to: to.to_string() });
@@ -2205,6 +2208,10 @@ impl ProtonDriveNativeApp {
     /// Shows a section, closing the account menu; Settings and Shared read their lists on entry unless one is already running (#268).
     fn open_tab(&mut self, tab: NavTab) {
         self.account_menu_open = false;
+        // Leaving Settings with ignore text typed and not applied: the box may never get to say it lost focus
+        if self.tab == NavTab::Settings && tab != NavTab::Settings {
+            self.apply_ignore_patterns();
+        }
         if tab == NavTab::Settings && self.tab != NavTab::Settings {
             self.load_hidden();
         }
@@ -3331,10 +3338,14 @@ impl ProtonDriveNativeApp {
             ui.add_space(10.0);
 
             let dir = self.status.sync_dir.clone();
+            let moving = self.is_pending("syncDir");
             settings::setting_row(ui, "Proton Drive folder", None, None, |ui| {
                 // Move… at the right edge, the folder before it, cut short to the room there is (whole on hover)
-                let button = action_button(ui, ButtonKind::Secondary, Some(icons::FOLDER_OPEN), "Move…", 32.0);
-                move_folder = button.clicked();
+                // Not while a move is out: it takes minutes, and a second one is refused as busy
+                let button = ui
+                    .add_enabled_ui(!moving, |ui| action_button(ui, ButtonKind::Secondary, Some(icons::FOLDER_OPEN), "Move…", 32.0))
+                    .inner;
+                move_folder = button.clicked() && !moving;
                 ui.add_space(6.0);
                 let shown = if dir.is_empty() { "Not set up yet" } else { dir.as_str() };
                 let path = ui.add(egui::Label::new(RichText::new(shown).size(13.0).color(TEXT_MUTED())).truncate());
@@ -3343,7 +3354,13 @@ impl ProtonDriveNativeApp {
                 }
                 button
             });
-            self.show_setting_note(ui, "syncDir");
+            if moving {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    ui.add(egui::Label::new(RichText::new("Moving…").size(12.5).color(TEXT_MUTED())));
+                });
+            } else {
+                self.show_setting_note(ui, "syncDir");
+            }
             ui.add_space(settings::ROW_GAP);
 
             if settings::switch_row(ui, "Desktop notifications", None, None, self.edit_notifications) {
@@ -3422,13 +3439,29 @@ impl ProtonDriveNativeApp {
     /// The ignore box lost focus: its patterns are sent if they differ from what was sent last, or else from what the
     /// daemon holds.
     fn apply_ignore_patterns(&mut self) {
+        if let Some(patterns) = self.unsent_ignore_patterns() {
+            self.apply_setting("ignorePatterns", serde_json::Value::from(patterns));
+        }
+    }
+
+    /// The ignore box's patterns, when they differ from what was sent last, or else from what the daemon holds.
+    fn unsent_ignore_patterns(&self) -> Option<Vec<String>> {
         let patterns = parse_ignore_patterns(&self.ignore_patterns_text);
         let known = match self.pending_settings.iter().find(|p| p.key == "ignorePatterns") {
             Some(sent) => serde_json::from_value(sent.value.clone()).unwrap_or_default(),
             None => parse_ignore_patterns(&self.loaded_settings.ignore_patterns.join("\n")),
         };
-        if patterns != known {
-            self.apply_setting("ignorePatterns", serde_json::Value::from(patterns));
+        (patterns != known).then_some(patterns)
+    }
+
+    /// On exit (never in a screenshot): the ignore text typed and not applied is handed to `send`, as the change a
+    /// save would carry. The window may close with no press inside the app, so the box never loses focus.
+    fn flush_ignore_on_exit(&self, send: impl FnOnce(serde_json::Value)) {
+        if self.screenshot_target.is_some() {
+            return;
+        }
+        if let Some(patterns) = self.unsent_ignore_patterns() {
+            send(serde_json::json!({ "ignorePatterns": patterns }));
         }
     }
 
@@ -3601,6 +3634,14 @@ impl eframe::App for ProtonDriveNativeApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if self.screenshot_target.is_none() {
             save_window_geometry(&self.window_geometry);
+            // Synchronous, with a short wait: a background thread would die with the process
+            self.flush_ignore_on_exit(|changes| {
+                let (done, answer) = mpsc::channel();
+                thread::spawn(move || {
+                    let _ = done.send(save_settings_at(&control_socket_path(), &changes));
+                });
+                let _ = answer.recv_timeout(Duration::from_secs(3));
+            });
             self.handoff_pending_shares_on_exit();
         }
     }
@@ -11723,6 +11764,60 @@ mod tests {
         assert!(h.text_at("The new folder must be empty").is_some());
         assert!(h.text_at("Saved").is_none());
         assert!(h.text_at("/home/u/ProtonDrive").is_some());
+    }
+
+    // #425 review: ignore text typed and not applied is sent when Settings is left without the box losing focus
+    #[test]
+    fn leaving_settings_applies_unsent_ignore_text() {
+        let mut h = settings_tall(None, None);
+        h.app.ignore_patterns_text = ".git\n*.part\n*.log".into();
+        h.app.open_tab(NavTab::Home);
+        assert_eq!(h.sent(), vec![r#"save {"ignorePatterns":[".git","*.part","*.log"]}"#.to_string()]);
+        // Unchanged text sends nothing
+        let mut h = settings_tall(None, None);
+        h.app.open_tab(NavTab::Home);
+        assert_eq!(h.sent(), Vec::<String>::new());
+    }
+
+    // #425 review: closing the window flushes it, but never in a screenshot, and never when unchanged
+    #[test]
+    fn exiting_sends_unsent_ignore_text_only_if_changed_and_not_in_a_screenshot() {
+        let mut h = settings_tall(None, None);
+        let flushed = |h: &Harness| {
+            let mut out = Vec::new();
+            h.app.flush_ignore_on_exit(|c| out.push(c));
+            out
+        };
+        assert!(flushed(&h).is_empty(), "unchanged");
+        h.app.ignore_patterns_text = ".git\n*.part\n*.log\n".into();
+        assert_eq!(flushed(&h), vec![serde_json::json!({ "ignorePatterns": [".git", "*.part", "*.log"] })]);
+        h.app.screenshot_target = Some("x.png".into());
+        assert!(flushed(&h).is_empty(), "a screenshot sends nothing");
+    }
+
+    // #425 review: a move takes minutes; Move… waits and the row says so
+    #[test]
+    fn a_move_in_progress_disables_move_and_says_so() {
+        let mut h = settings_tall(None, None);
+        h.app.folder_chosen("/mnt/b/ProtonDrive");
+        h.frames(2);
+        h.click(h.text_at("Move").expect("the dialog's Move"));
+        assert_eq!(h.sent(), vec![r#"save {"syncDir":"/mnt/b/ProtonDrive"}"#.to_string()]);
+        assert!(h.text_at("Moving…").is_some());
+        let button = h.nodes_named("Move…").into_iter().next().expect("the button is painted");
+        assert!(button.is_disabled(), "Move… is disabled while moving");
+        h.click(h.text_at("Move…").unwrap());
+        assert_eq!(h.sent(), Vec::<String>::new());
+        assert_eq!(h.app.pending_confirm, None);
+        h.app.folder_chosen("/mnt/c/ProtonDrive");
+        assert_eq!(h.app.pending_confirm, None, "no second move is asked about");
+
+        let stored = SyncSettings { sync_dir: "/mnt/b/ProtonDrive".into(), ..loaded_settings() };
+        h.event(saved(h.app.settings_seq, "syncDir", stored));
+        assert!(h.text_at("Moving…").is_none());
+        assert!(h.text_at("Saved").is_some());
+        let button = h.nodes_named("Move…").into_iter().next().unwrap();
+        assert!(!button.is_disabled(), "Move… is enabled again");
     }
 
     // #425: Saved goes after a few seconds
