@@ -75,3 +75,16 @@ describe('the built-in ignore patterns (#425)', () => {
         expect(problemWithIgnorePatterns(['*'])).not.toBeNull();
     });
 });
+
+describe('a trailing slash in an ignore pattern (#425)', () => {
+    test('build/ matches a folder named build and everything under it, as build does', () => {
+        for (const p of ['a/build/x.o', 'build', 'build/x']) expect([p, matchesIgnorePatterns(p, ['build/'])]).toEqual([p, true]);
+        expect(matchesIgnorePatterns('builder/x', ['build/'])).toBe(false);
+        expect(matchesIgnorePatterns('a/b', ['build/'])).toBe(false);
+    });
+
+    test('a list that hides everything is still refused with a slash', () => {
+        expect(problemWithIgnorePatterns(['*/'])).not.toBeNull();
+        expect(problemWithIgnorePatterns(['build/', '*.log'])).toBeNull();
+    });
+});

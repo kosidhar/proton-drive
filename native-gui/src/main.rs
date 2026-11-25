@@ -858,7 +858,12 @@ struct SettingNote {
     notice: Notice,
     /// When it goes; None stays until the setting is changed again
     until: Option<Instant>,
+    /// When it was set
+    since: Instant,
 }
+
+/// How long an error beside a switch or choice that went back stays before a status refresh that agrees clears it.
+const STALE_NOTE_AFTER: Duration = Duration::from_secs(8);
 
 /// How long "Saved" stays beside a control.
 const SAVED_NOTE_FOR: Duration = Duration::from_secs(3);
@@ -1944,7 +1949,7 @@ impl ProtonDriveNativeApp {
                 newest.push(self.pending_settings.remove(i));
             }
         }
-        let note = |notice: Notice, until| SettingNote { notice, until };
+        let note = |notice: Notice, until| SettingNote { notice, until, since: Instant::now() };
         match result {
             Ok(reply) => {
                 let problem = reply.problem();
@@ -1989,7 +1994,7 @@ impl ProtonDriveNativeApp {
 
     /// A folder was chosen to move the drive to (#425): a different one is asked about first, never moved to at once.
     fn folder_chosen(&mut self, chosen: &str) {
-        if self.is_pending("syncDir") {
+        if self.move_in_progress() {
             return;
         }
         let to = chosen.trim();
@@ -2032,6 +2037,7 @@ impl ProtonDriveNativeApp {
                         }
                         // What was chosen and isn't answered yet stays as it is (see load_settings_form)
                         self.load_settings_form(&s.settings);
+                        self.clear_agreed_error_notes(&s.settings);
                         if s.logged_in {
                             self.login_url = None;
                         }
@@ -3317,7 +3323,41 @@ impl ProtonDriveNativeApp {
         let Some(note) = self.setting_notes.get(key) else { return };
         let color = if note.notice.error { DANGER_TEXT() } else { TEXT_MUTED() };
         ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-            ui.add(egui::Label::new(RichText::new(&note.notice.text).size(12.5).color(color)).wrap());
+            let label = ui.add(egui::Label::new(RichText::new(&note.notice.text).size(12.5).color(color)).wrap());
+            // Announced as it appears, as the Working… lines are (#370)
+            ui.ctx().accesskit_node_builder(label.id, |node| node.set_live(egui::accesskit::Live::Polite));
+        });
+    }
+
+    /// A move of the drive is out or reported by the daemon: the folder can't be moved again until it is over.
+    fn move_in_progress(&self) -> bool {
+        let reported = self.status.vfs.as_ref().is_some_and(|v| v.reason.as_deref() == Some("moving") || v.drive_move.is_some());
+        self.is_pending("syncDir") || reported
+    }
+
+    /// An error beside a control that has no expiry goes once a status refresh shows the control agreeing with the
+    /// daemon: a switch or choice that went back (after a while, or the reason would vanish as it appears), or the
+    /// ignore text once it equals the stored list.
+    fn clear_agreed_error_notes(&mut self, held: &SyncSettings) {
+        let text = parse_ignore_patterns(&self.ignore_patterns_text);
+        let stored = parse_ignore_patterns(&held.ignore_patterns.join("\n"));
+        let now = Instant::now();
+        let (strategy, notifications, login) =
+            (self.edit_conflict_strategy == held.conflict_strategy, self.edit_notifications == held.notifications_enabled, self.edit_start_at_login == held.start_at_login);
+        let pending: Vec<String> = self.pending_settings.iter().map(|p| p.key.clone()).collect();
+        self.setting_notes.retain(|key, note| {
+            if !note.notice.error || note.until.is_some() || pending.contains(key) {
+                return true;
+            }
+            let old = now.saturating_duration_since(note.since) >= STALE_NOTE_AFTER;
+            let agrees = match key.as_str() {
+                "conflictStrategy" => strategy && old,
+                "notificationsEnabled" => notifications && old,
+                "startAtLogin" => login && old,
+                "ignorePatterns" => text == stored,
+                _ => false,
+            };
+            !agrees
         });
     }
 
@@ -3331,6 +3371,7 @@ impl ProtonDriveNativeApp {
         }
         let mut move_folder = false;
         let mut ignore_blurred = false;
+        let mut ignore_escaped = false;
         let mut chosen_strategy = None;
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -3338,12 +3379,15 @@ impl ProtonDriveNativeApp {
             ui.add_space(10.0);
 
             let dir = self.status.sync_dir.clone();
-            let moving = self.is_pending("syncDir");
+            let moving = self.move_in_progress();
+            let moving_here = self.is_pending("syncDir");
             settings::setting_row(ui, "Proton Drive folder", None, None, |ui| {
                 // Move… at the right edge, the folder before it, cut short to the room there is (whole on hover)
                 // Not while a move is out: it takes minutes, and a second one is refused as busy
                 let button = ui
-                    .add_enabled_ui(!moving, |ui| action_button(ui, ButtonKind::Secondary, Some(icons::FOLDER_OPEN), "Move…", 32.0))
+                    .add_enabled_ui(!moving, |ui| {
+                        action_button_named(ui, ButtonKind::Secondary, Some(icons::FOLDER_OPEN), "Move…", "Move Proton Drive folder…", 32.0)
+                    })
                     .inner;
                 move_folder = button.clicked() && !moving;
                 ui.add_space(6.0);
@@ -3354,10 +3398,8 @@ impl ProtonDriveNativeApp {
                 }
                 button
             });
-            if moving {
-                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                    ui.add(egui::Label::new(RichText::new("Moving…").size(12.5).color(TEXT_MUTED())));
-                });
+            if moving_here {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| working_line(ui, "Moving…"));
             } else {
                 self.show_setting_note(ui, "syncDir");
             }
@@ -3387,7 +3429,7 @@ impl ProtonDriveNativeApp {
                 ui,
                 "When a file changes in both places",
                 None,
-                Some("Keep both copies saves the other copy next to the file, with the time in its name. Ask me each time waits for your choice in Home's Needs attention. Either way, both versions are kept."),
+                Some("Keep both copies saves the other copy next to the file, with the time in its name. Ask me each time waits for your choice in Home's Needs attention. Nothing is replaced until you choose."),
                 |ui| {
                     let choices = [("keep-both", "Keep both copies"), ("prompt", "Ask me each time")];
                     let shown = if self.edit_conflict_strategy == "prompt" { choices[1].1 } else { choices[0].1 };
@@ -3419,6 +3461,8 @@ impl ProtonDriveNativeApp {
                         .font(FontId::new(13.0, FontFamily::Monospace));
                     let editor = ui.add(editor);
                     ignore_blurred = editor.lost_focus();
+                    // Escape drops the focus too, but it cancels
+                    ignore_escaped = ignore_blurred && ui.input(|i| i.key_pressed(Key::Escape));
                     editor
                 },
             );
@@ -3428,7 +3472,9 @@ impl ProtonDriveNativeApp {
             self.edit_conflict_strategy = choice.to_string();
             self.apply_setting("conflictStrategy", serde_json::Value::from(choice));
         }
-        if ignore_blurred {
+        if ignore_escaped {
+            self.revert_ignore_text();
+        } else if ignore_blurred {
             self.apply_ignore_patterns();
         }
         if move_folder {
@@ -3442,6 +3488,15 @@ impl ProtonDriveNativeApp {
         if let Some(patterns) = self.unsent_ignore_patterns() {
             self.apply_setting("ignorePatterns", serde_json::Value::from(patterns));
         }
+    }
+
+    /// Escape in the ignore box: the text goes back to what was sent last, or else what the daemon holds; nothing is sent.
+    fn revert_ignore_text(&mut self) {
+        let known: Vec<String> = match self.pending_settings.iter().find(|p| p.key == "ignorePatterns") {
+            Some(sent) => serde_json::from_value(sent.value.clone()).unwrap_or_default(),
+            None => parse_ignore_patterns(&self.loaded_settings.ignore_patterns.join("\n")),
+        };
+        self.ignore_patterns_text = known.join("\n");
     }
 
     /// The ignore box's patterns, when they differ from what was sent last, or else from what the daemon holds.
@@ -11804,7 +11859,7 @@ mod tests {
         h.click(h.text_at("Move").expect("the dialog's Move"));
         assert_eq!(h.sent(), vec![r#"save {"syncDir":"/mnt/b/ProtonDrive"}"#.to_string()]);
         assert!(h.text_at("Moving…").is_some());
-        let button = h.nodes_named("Move…").into_iter().next().expect("the button is painted");
+        let button = h.nodes_named("Move Proton Drive folder…").into_iter().next().expect("the button is painted");
         assert!(button.is_disabled(), "Move… is disabled while moving");
         h.click(h.text_at("Move…").unwrap());
         assert_eq!(h.sent(), Vec::<String>::new());
@@ -11816,8 +11871,98 @@ mod tests {
         h.event(saved(h.app.settings_seq, "syncDir", stored));
         assert!(h.text_at("Moving…").is_none());
         assert!(h.text_at("Saved").is_some());
-        let button = h.nodes_named("Move…").into_iter().next().unwrap();
+        let button = h.nodes_named("Move Proton Drive folder…").into_iter().next().unwrap();
         assert!(!button.is_disabled(), "Move… is enabled again");
+    }
+
+    // #425 final review: the notes are announced as they appear
+    #[test]
+    fn the_notes_beside_controls_are_announced_politely() {
+        use egui::accesskit::Live;
+        let mut h = settings_tall(None, None);
+        h.click(h.text_at("Desktop notifications").unwrap());
+        h.event(saved(h.app.settings_seq, "notificationsEnabled", with_notifications(false)));
+        assert_eq!(label_live(&h, "Saved"), Some(Live::Polite));
+        h.click(h.text_at("Desktop notifications").unwrap());
+        h.event(WorkerEvent::SettingsSaved {
+            seq: h.app.settings_seq,
+            keys: vec!["notificationsEnabled".into()],
+            result: Err("Can't reach the daemon".into()),
+        });
+        assert_eq!(label_live(&h, "Can't reach the daemon"), Some(Live::Polite));
+        h.app.folder_chosen("/mnt/b/ProtonDrive");
+        h.frames(2);
+        h.click(h.text_at("Move").unwrap());
+        assert_eq!(label_live(&h, "Moving…"), Some(Live::Polite));
+    }
+
+    // #425 final review: no second move while the daemon reports one, and the button has a full name
+    #[test]
+    fn move_waits_for_a_move_the_daemon_reports_and_is_named_in_full() {
+        let mut h = settings_tall(Some(vfs("virtual", true, Some("moving"))), Some(true));
+        let button = h.nodes_named("Move Proton Drive folder…").into_iter().next().expect("named in full");
+        assert!(button.is_disabled());
+        h.app.folder_chosen("/mnt/b/ProtonDrive");
+        assert_eq!(h.app.pending_confirm, None);
+
+        let mut stopped = vfs("virtual", true, Some("move-failed"));
+        stopped.drive_move = Some(drive_move("relocation", None, &["move-back", "retry"]));
+        let mut h = settings_tall(Some(stopped), Some(true));
+        assert!(h.nodes_named("Move Proton Drive folder…")[0].is_disabled());
+        h.app.folder_chosen("/mnt/b/ProtonDrive");
+        assert_eq!(h.app.pending_confirm, None);
+
+        let h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
+        assert!(!h.nodes_named("Move Proton Drive folder…")[0].is_disabled());
+        assert!(h.text_at("Move…").is_some(), "the visible text stays Move…");
+    }
+
+    // #425 final review: an error beside a control goes once a refresh agrees with the daemon
+    #[test]
+    fn a_stale_error_note_clears_when_a_refresh_agrees() {
+        let mut h = settings_tall(None, None);
+        h.click(h.text_at("Desktop notifications").unwrap());
+        h.event(WorkerEvent::SettingsSaved {
+            seq: h.app.settings_seq,
+            keys: vec!["notificationsEnabled".into()],
+            result: Err("Can't reach the daemon".into()),
+        });
+        h.event(status_holding(&h, loaded_settings()));
+        assert!(h.text_at("Can't reach the daemon").is_some(), "kept while it is new, or it would vanish as it appears");
+        for note in h.app.setting_notes.values_mut() {
+            note.since = Instant::now() - Duration::from_secs(60);
+        }
+        h.event(status_holding(&h, loaded_settings()));
+        assert!(h.text_at("Can't reach the daemon").is_none());
+
+        // The ignore row's error goes once the text equals the stored list
+        h.app.ignore_patterns_text = "*".into();
+        h.frames(2);
+        h.click(ignore_box(&h));
+        press_key(&mut h, Key::Tab);
+        h.event(WorkerEvent::SettingsSaved {
+            seq: h.app.settings_seq,
+            keys: vec!["ignorePatterns".into()],
+            result: Err("That would hide everything".into()),
+        });
+        h.event(status_holding(&h, loaded_settings()));
+        assert!(h.text_at("That would hide everything").is_some(), "the text still differs");
+        h.app.ignore_patterns_text = ".git\n*.part".into();
+        h.event(status_holding(&h, loaded_settings()));
+        assert!(h.text_at("That would hide everything").is_none());
+    }
+
+    // #425 final review: Escape in the ignore box cancels, where Tab applies
+    #[test]
+    fn escape_in_the_ignore_box_cancels() {
+        let mut h = settings_tall(None, None);
+        h.click(ignore_box(&h));
+        h.frame(vec![egui::Event::Text("*.log".into())]);
+        h.frames(2);
+        assert_ne!(h.app.ignore_patterns_text, ".git\n*.part");
+        press_key(&mut h, Key::Escape);
+        assert_eq!(h.app.ignore_patterns_text, ".git\n*.part", "back to what the daemon holds");
+        assert_eq!(h.sent(), Vec::<String>::new());
     }
 
     // #425: Saved goes after a few seconds
@@ -12346,7 +12491,7 @@ mod tests {
         out
     }
 
-    const CONFLICT_INFO: &str = "Keep both copies saves the other copy next to the file, with the time in its name. Ask me each time waits for your choice in Home's Needs attention. Either way, both versions are kept.";
+    const CONFLICT_INFO: &str = "Keep both copies saves the other copy next to the file, with the time in its name. Ask me each time waits for your choice in Home's Needs attention. Nothing is replaced until you choose.";
     const IGNORE_INFO: &str = "Matching files and folders are skipped during sync. The app's own temporary files are always skipped, so they aren't listed here.";
     const AT_LOGIN_INFO: &str = "Syncs and mounts the drive at login, with the tray icon, without opening this window";
     const DRIVE_INFO: &str = "Files you haven't downloaded appear in Files and download when you open them.";

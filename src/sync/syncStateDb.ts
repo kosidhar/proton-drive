@@ -2,6 +2,7 @@ import { Database } from 'bun:sqlite';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
+import { BUILTIN_IGNORE_PATTERNS } from './ignoreDefaults';
 import { selfOrDescendant, selfOrDescendantWhere } from './pathRange';
 import { type ConflictStrategy, isConflictStrategy, problemWithBlockedApps, RETIRED_CONFLICT_STRATEGIES, usableIgnorePatterns } from './settingsRules';
 
@@ -117,10 +118,7 @@ export interface SyncSettings {
     blockedApps: string[];
 }
 
-// The app's own temporary and junk files. They are not a setting: matchesIgnorePatterns always applies them, because
-// the app's own temporary files (and a browser's half-downloaded ones) must never sync, whatever the user's list says.
-// They are not in the stored list, so the user can neither remove them by mistake nor see them as theirs to edit.
-export const BUILTIN_IGNORE_PATTERNS: readonly string[] = ['.proton-drive-tmp-*', '*.part', '*.crdownload', '.DS_Store', '.Trash-*'];
+export { BUILTIN_IGNORE_PATTERNS };
 
 // What a new install starts the user's own, editable list with
 export const DEFAULT_IGNORE_PATTERNS = ['.git', '.git/**', 'node_modules', 'node_modules/**', '*~'];
