@@ -4609,7 +4609,8 @@ OPTIONS:
   --confirm-stop-sharing <NAME>  with --screenshot and --fake-shared list: show the Stop sharing confirmation for that row
   --fake-cut-short <S>  with --screenshot: list files held because the disk guard cut them short (one | many)
   --fake-disk-full      with --screenshot: show Home's notice that the computer's disk is almost full
-  --fake-shared <S>     with --screenshot: show the Shared section (--tab shared) as S (list | empty | offline | loading | refreshing)
+  --fake-shared <S>     with --screenshot: show the Shared section (--tab shared) as S
+                        (list | empty | offline | loading | refreshing)
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --zoom <F>            with --screenshot: render at zoom factor F (0.5 to 3, e.g. 1.2), as Ctrl+= would
   --version             print the version
@@ -5503,6 +5504,8 @@ mod tests {
         screen: Vec2,
         /// What a frame shows instead of the app, to test a widget on its own (see `Harness::widget`)
         scene: Option<Scene>,
+        /// Whether the window tells egui it is minimized
+        minimized: bool,
     }
 
     /// Widgets added to a bare panel, frame after frame
@@ -5591,7 +5594,7 @@ mod tests {
             apply_proton_visuals(&ctx, false);
             // Widgets then say what they are, and `widget_at` finds them by name, as a screen reader would
             ctx.enable_accesskit();
-            let mut h = Self { ctx, app, commands, events, last: None, screen: Vec2::new(1440.0, 900.0), scene: None };
+            let mut h = Self { ctx, app, commands, events, last: None, screen: Vec2::new(1440.0, 900.0), scene: None, minimized: false };
             h.frames(3);
             h
         }
@@ -5626,11 +5629,14 @@ mod tests {
         }
 
         fn frame(&mut self, events: Vec<egui::Event>) {
-            let input = egui::RawInput {
+            let mut input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.screen)),
                 events,
                 ..Default::default()
             };
+            if self.minimized {
+                input.viewports.entry(egui::ViewportId::ROOT).or_default().minimized = Some(true);
+            }
             let app = &mut self.app;
             let scene = &mut self.scene;
             self.last = Some(self.ctx.run(input, |ctx| match scene {
@@ -9616,6 +9622,29 @@ mod tests {
             .collect()
     }
 
+    /// The live setting of the label node the last frame gave screen readers with exactly this text.
+    fn label_live(h: &Harness, text: &str) -> Option<egui::accesskit::Live> {
+        accesskit_nodes(h)
+            .into_iter()
+            .map(|(_, n)| n)
+            .find(|n| n.role() == egui::accesskit::Role::Label && n.value() == Some(text))
+            .unwrap_or_else(|| panic!("expected Label node with value {text:?}"))
+            .live()
+    }
+
+    // #410: a minimized window isn't asked to draw every 33 ms for arrows nobody sees
+    #[test]
+    fn shared_first_load_asks_for_no_quick_repaints_while_minimized() {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared").unwrap());
+        h.frames(3);
+        assert!(repaint_in(&h) <= home::TURN_FRAME, "visible: the arrows turn");
+        h.minimized = true;
+        h.frames(3);
+        assert!(h.text_at(shared::LOADING).is_some());
+        assert!(repaint_in(&h) > home::TURN_FRAME, "{:?}", repaint_in(&h));
+    }
+
     // #410: the first read shows the arrows turning in the empty picture's circle, the words under it, and no Refresh
     #[test]
     fn shared_first_load_turns_the_arrows_in_the_pictures_circle() {
@@ -9634,6 +9663,7 @@ mod tests {
         let words = h.text_rect(shared::LOADING).expect("the loading words");
         assert!((words.center().x - centre.x).abs() < 2.0 && words.top() > centre.y + radius, "centred under the circle");
         assert!(h.widget_at("Refresh").is_none() && h.text_at(shared::REFRESHING).is_none());
+        assert_eq!(label_live(&h, shared::LOADING), Some(egui::accesskit::Live::Polite), "announced as it appears");
         assert!(h.nodes_named(icons::SYNC).is_empty(), "the arrows aren't announced");
     }
 
@@ -9664,6 +9694,7 @@ mod tests {
         h.click(refresh);
         h.frames(3);
         let words = h.text_rect(shared::REFRESHING).expect("Refreshing…");
+        assert_eq!(label_live(&h, shared::REFRESHING), Some(egui::accesskit::Live::Polite), "announced as it appears");
         let arrows = shared_arrows(&h, 16.0);
         assert_eq!(arrows.len(), 1, "{arrows:?}");
         assert!(arrows[0].0 > 0.0, "turned");
@@ -9714,6 +9745,22 @@ mod tests {
         assert!(centre.y - radius >= shared_content_top(), "nothing above the toolbar");
         let words = h.text_rect(shared::LOADING).expect("the loading words");
         assert!(words.top() >= centre.y + radius, "under the circle");
+    }
+
+    #[test]
+    fn shared_error_fits_a_short_zoomed_window() {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared").unwrap());
+        let offline = "Proton Drive is offline: try again when you are connected";
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Err(offline.into())));
+        h.resize_zoomed(Vec2::new(840.0, 380.0), 1.2);
+        let toolbar = shared_content_top();
+        let said = h.text_rect(offline).expect("the message");
+        assert!(said.top() >= toolbar, "nothing above the toolbar: {said:?}");
+        h.scroll(egui::pos2(SIDEBAR_EDGE + 200.0, toolbar + 100.0), 400.0);
+        let said = h.text_rect(offline).expect("the message, scrolled");
+        let retry = h.widget_at("Retry").expect("Retry is reachable by scrolling");
+        assert!(retry.y > said.bottom() && retry.y <= h.screen.y, "{retry:?} under {said:?}");
     }
 
     #[test]
@@ -10398,7 +10445,7 @@ mod tests {
         assert!(photos.bottom() <= h.screen.y && link.bottom() <= h.screen.y && photos.top() >= toolbar, "{photos:?} {link:?}");
         // The centred Refresh is reachable too: under the how line (it may start below the fold; reachable is the rule)
         let refresh = h.widget_at("Refresh").expect("Refresh is reachable by scrolling");
-        let how = h.text_rect(shared::EMPTY_HOW).map_or(f32::MIN, |r| r.bottom());
+        let how = h.text_rect(shared::EMPTY_HOW).expect("the how line, scrolled").bottom();
         assert!(refresh.y <= h.screen.y && refresh.y >= toolbar && refresh.y > how, "{refresh:?} under the how line {how}");
     }
 
@@ -10412,6 +10459,11 @@ mod tests {
         let nodes = h.nodes_named("Refresh");
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].role(), egui::accesskit::Role::Button);
+        // At the toolbar's right end: right of the page's middle, its right edge at the rows' actions' right end
+        let button = nodes[0].bounds().expect("its box");
+        assert!(button.x0 as f32 > (SIDEBAR_EDGE + h.screen.x) / 2.0, "{button:?}");
+        let stop = on_row(&h, "report.pdf", "Stop sharing");
+        assert!((button.x1 as f32 - stop.x).abs() < 24.0, "{button:?} ends by the actions' end ({stop:?})");
         h.click(h.widget_at("Refresh").unwrap());
         assert_eq!(h.sent(), ["shared list"]);
     }

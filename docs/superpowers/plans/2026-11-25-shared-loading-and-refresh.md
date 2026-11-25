@@ -61,8 +61,8 @@ placement helper for its centred groups. `shared.rs` gains the new words and the
     paints `icon` turned `angle` clockwise, with the middle of its shape (`galley.mesh_bounds.center()`) at
     `centre`. Use `turned_pos`.
 - Produces in `shared_view.rs`:
-  - `fn place_above_middle(ui: &mut egui::Ui, id: &str, viewport: f32, add: impl FnOnce(&mut egui::Ui)) -> egui::Response`:
-    lays `add` out top-down and centred, starting `((viewport - last_height) * 0.4).max(0.0)` down. `last_height` is
+  - `fn place_above_middle(ui: &mut egui::Ui, id: &str, viewport: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R`:
+    lays `add` out top-down and centred (giving back what `add` returns), starting `((viewport - last_height) * 0.4).max(0.0)` down. `last_height` is
     the group's height last frame, kept under `id`. When it changes, the frame is discarded with `request_discard`.
     This is `render_shared_empty`'s placement, moved out unchanged; the empty page uses it with id
     `"shared_empty_h"`.
