@@ -102,6 +102,8 @@ describe('Docs and Sheets file types', () => {
         expect(sh).toContain('packaging/linux/io.github.kosidhar.ProtonDrive.OpenDoc.desktop');
         expect(sh).toContain('update-mime-database -n "$PREFIX/share/mime"');
         expect(sh).toContain('Exec=$PREFIX/bin/protondrive open-doc %f');
+        // the handler's sed runs only when its file was installed (an older tarball may not carry it)
+        expect(sh).toMatch(/if \[ -f "\$OPENDOC_DESKTOP" \]; then\s+sed -i [^\n]*open-doc %f[^\n]*"\$OPENDOC_DESKTOP"/);
         // the main entry's sed must not touch the handler
         const mainSed = sh.split('\n').find((l) => l.includes('Exec=$PREFIX/bin/protondrive-gui'))!;
         expect(mainSed).not.toContain('OpenDoc');

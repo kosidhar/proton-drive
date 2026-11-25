@@ -3510,7 +3510,7 @@ export class ProtonDriveSyncEngine {
         if (event.type === DriveEventType.NodeDeleted) {
             this.forgetHeldNodes(event.nodeUid);
             this.index.removeSubtree(event.nodeUid);
-            this.docs.remove(event.nodeUid);
+            this.touchDocFolders([this.docs.remove(event.nodeUid)]);
             const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
             // One with a rename or move through the drive on its way is left to its replay, which keeps its local copy
             if (tracked && !this.awaitsRemoteOp(tracked.localRelPath, event.nodeUid)) {
@@ -3523,7 +3523,7 @@ export class ProtonDriveSyncEngine {
             if (event.isTrashed) {
                 this.forgetHeldNodes(event.nodeUid);
                 this.index.removeSubtree(event.nodeUid);
-                this.docs.remove(event.nodeUid);
+                this.touchDocFolders([this.docs.remove(event.nodeUid)]);
                 const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
                 if (tracked && !this.awaitsRemoteOp(tracked.localRelPath, event.nodeUid)) {
                     await this.removeAfterCloudDelete(tracked.localRelPath, 'trashed');
@@ -4687,6 +4687,36 @@ export class ProtonDriveSyncEngine {
         return doc;
     }
 
+    // Tells the file manager that the documents of these folders changed (their placeholders came, went or changed). A
+    // folder the index doesn't know is the top, which the index doesn't hold.
+    private touchDocFolders(uids: Array<string | null>, known: Map<string, string> = new Map()): void {
+        for (const uid of uids) {
+            if (uid !== null) {
+                this.stateEvents.touch(known.get(uid) ?? this.index.getByUid(uid)?.relPath ?? '');
+            }
+        }
+    }
+
+    // The documents of a folder whose placeholders the drive shows: not those whose name a real item holds (logged once per
+    // path: the user may wonder where a document went) nor those an ignore pattern leaves out
+    private shownPlaceholders(folderUid: string, rel: string, taken: Set<string>, ignorePatterns: string[]): DocRecord[] {
+        const shown: DocRecord[] = [];
+        for (const doc of this.docNodes.listChildren(folderUid)) {
+            const path = childRel(rel, placeholderName(doc));
+            if (taken.has(placeholderName(doc))) {
+                if (!this.loggedPlaceholderClashes.has(path)) {
+                    this.loggedPlaceholderClashes.add(path);
+                    this.logger.info(`A file named ${path} hides the placeholder of the Proton ${doc.kind === 'doc' ? 'Doc' : 'Sheet'} ${doc.name}`);
+                }
+            } else if (!matchesIgnorePatterns(path, ignorePatterns)) {
+                shown.push(doc);
+            }
+        }
+        return shown;
+    }
+
+    private readonly loggedPlaceholderClashes = new Set<string>();
+
     private refusePlaceholder(rel: string): void {
         if (this.placeholderAt(rel)) {
             throw new DriveOpError('EPERM', "Proton Docs and Sheets open in the browser; they can't be changed here");
@@ -4739,11 +4769,8 @@ export class ProtonDriveSyncEngine {
             );
         }
         if (this.inBackingStore()) {
-            for (const doc of this.docNodes.listChildren(folder.uid)) {
+            for (const doc of this.shownPlaceholders(folder.uid, rel, taken, ignorePatterns)) {
                 const name = placeholderName(doc);
-                if (taken.has(name) || matchesIgnorePatterns(childRel(rel, name), ignorePatterns)) {
-                    continue;
-                }
                 const content = placeholderContent(doc);
                 entries.push({
                     name,
@@ -4815,6 +4842,18 @@ export class ProtonDriveSyncEngine {
                 // Local-only item waiting to upload (syncing), or worse if cut short (#300); pending uploads seen by
                 // the watcher, VFS writes, or a sync pass also roll up to ancestor folders via transfersBelow (#53)
                 children[name] = this.localOnlyState(childRel(rel, name), ignorePatterns, transfers.get(name));
+            }
+        }
+        // Docs and Sheets are listed as placeholders, which no action applies to: no state, so the menu offers nothing
+        if (folder && folder.type === 'folder' && this.inBackingStore()) {
+            const taken = new Set(localNames ?? []);
+            for (const child of this.index.listChildren(rel)) {
+                if (!takesAway(latest.get(child.uid), child)) {
+                    taken.add(child.name);
+                }
+            }
+            for (const doc of this.shownPlaceholders(folder.uid, rel, taken, ignorePatterns)) {
+                children[placeholderName(doc)] = null;
             }
         }
         let below: Transfer = this.pendingUploads.has(rel) || this.hasActiveTransferAt(rel) ? 'syncing' : null;
@@ -7571,11 +7610,12 @@ export class ProtonDriveSyncEngine {
             if (relPath !== '' && this.index.getByUid(folder.uid)?.relPath !== relPath) {
                 return false;
             }
+            let docFolders: string[] = [];
             this.indexWrite(() => {
                 this.index.replaceChildren(folder.uid, relPath, this.indexEntries(children, relPath));
                 // Docs and Sheets are not synced files, so the index leaves them out; they are recorded beside it, keyed by uid
                 // (a document listed under a new folder leaves its old one), for the virtual drive's placeholders.
-                this.docs.replaceChildren(
+                docFolders = this.docs.replaceChildren(
                     folder.uid,
                     children.flatMap((child) => {
                         const rec = docRecordOf(child, folder.uid);
@@ -7583,6 +7623,8 @@ export class ProtonDriveSyncEngine {
                     }),
                 );
             });
+            // A change among the documents shows in an open file manager window like any other (#408)
+            this.touchDocFolders(docFolders, new Map([[folder.uid, relPath]]));
             return true;
         } catch (error: unknown) {
             this.logger.warn(`Failed to update the remote index for ${relPath || '/'}: ${error}`);

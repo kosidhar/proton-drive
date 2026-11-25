@@ -68,12 +68,16 @@ export class DocNodes {
     }
 
     // Makes `docs` the folder's documents. Each is keyed by uid, so one listed here leaves any other folder it was in.
-    replaceChildren(parentUid: string, docs: DocRecord[]): void {
+    // Returns the uids of the folders whose documents changed (this one, and the old folder of a moved document), none
+    // when the listing holds just what was recorded.
+    replaceChildren(parentUid: string, docs: DocRecord[]): string[] {
+        const changed = new Set<string>();
         this.db.transaction(() => {
             const keep = new Set(docs.map((d) => d.uid));
             for (const row of this.listChildren(parentUid)) {
                 if (!keep.has(row.uid)) {
                     this.remove(row.uid);
+                    changed.add(parentUid);
                 }
             }
             const upsert = this.db.query(
@@ -81,13 +85,29 @@ export class DocNodes {
                  ON CONFLICT(uid) DO UPDATE SET parentUid = $parentUid, name = $name, kind = $kind, mtimeMs = $mtimeMs`,
             );
             for (const d of docs) {
+                const before = this.get(d.uid);
+                if (before && before.parentUid === parentUid && before.name === d.name && before.kind === d.kind && before.mtimeMs === d.mtimeMs) {
+                    continue;
+                }
+                changed.add(parentUid);
+                if (before) {
+                    changed.add(before.parentUid);
+                }
                 upsert.run({ $uid: d.uid, $parentUid: parentUid, $name: d.name, $kind: d.kind, $mtimeMs: d.mtimeMs });
             }
         })();
+        return [...changed];
     }
 
-    remove(uid: string): void {
+    // Forgets a document; returns the uid of the folder it was in, or null when none was recorded.
+    remove(uid: string): string | null {
+        const before = this.get(uid);
         this.db.query('DELETE FROM doc_nodes WHERE uid = $uid').run({ $uid: uid });
+        return before?.parentUid ?? null;
+    }
+
+    private get(uid: string): DocRecord | null {
+        return (this.db.query('SELECT uid, parentUid, name, kind, mtimeMs FROM doc_nodes WHERE uid = $uid').get({ $uid: uid }) as DocRecord | null) ?? null;
     }
 
     listChildren(parentUid: string): DocRecord[] {

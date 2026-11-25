@@ -9178,6 +9178,25 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 expect(e.size).not.toBe(e.placeholder!.content.length);
             });
 
+            test('the Files menu gets no state for a placeholder, and a real item holding its name is logged once', async () => {
+                const d = setup();
+                await withDocs(d);
+                expect(d.engine.itemStates('Docs')!.children['Plan.protondoc']).toBeNull();
+                expect('Plan.protondoc' in d.engine.itemStates('Docs')!.children).toBe(true);
+                stateDb.setMeta('driveLayout', 'plain');
+                expect('Plan.protondoc' in d.engine.itemStates('Docs')!.children).toBe(false);
+                stateDb.setMeta('driveLayout', 'virtual');
+                const infos: string[] = [];
+                const info = spyOn(d.logger as any, 'info').mockImplementation((m: unknown) => void infos.push(String(m)));
+                await mkdir(d.local('Docs'), { recursive: true });
+                await writeFile(d.local('Docs/Plan.protondoc'), 'mine');
+                d.engine.vfsChildren('Docs');
+                d.engine.vfsChildren('Docs');
+                d.engine.itemStates('Docs');
+                info.mockRestore();
+                expect(infos.filter((m) => m.includes('Docs/Plan.protondoc'))).toHaveLength(1);
+            });
+
             test('placeholders follow the ignore and hidden rules of their folder', async () => {
                 const d = setup();
                 await withDocs(d);
@@ -11831,6 +11850,33 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             };
             return { ...drive, engine, flush };
         };
+
+        test('a document added, renamed, moved or trashed on the web touches its folder, and an unchanged listing touches nothing (#430)', async () => {
+            const d = setup({ virtual: true });
+            d.add('Docs/a.txt', 'a');
+            d.add('Other/b.txt', 'b');
+            await d.engine.reconcileNow();
+            d.flush();
+            const doc = (name: string) => {
+                const node = makeMockNode({ uid: 'vol~plan', parentUid: 'vol~Docs', nameStr: name, type: NodeType.File });
+                Object.assign(node, { mediaType: 'application/vnd.proton.doc' });
+                return node;
+            };
+            const list = (uid: string, rel: string, children: NodeEntity[]) =>
+                (d.engine as any).recordListing(d.nodes.get(uid)!, rel, children);
+            const paths = () => (d.flush() as Array<{ paths: string[] }>).flatMap((c) => c.paths ?? []);
+
+            list('vol~Docs', 'Docs', [doc('Plan')]); // added
+            expect(paths()).toContain('Docs');
+            list('vol~Docs', 'Docs', [doc('Plan')]); // the same again
+            expect(d.flush()).toEqual([]);
+            list('vol~Docs', 'Docs', [doc('Plan v2')]); // renamed
+            expect(paths()).toContain('Docs');
+            list('vol~Other', 'Other', [{ ...doc('Plan v2'), parentUid: 'vol~Other' } as NodeEntity]); // moved: both folders
+            expect(paths()).toEqual(expect.arrayContaining(['Docs', 'Other']));
+            await (d.engine as any).handleRemoteDriveEventNow({ type: DriveEventType.NodeDeleted, nodeUid: 'vol~plan' }); // trashed
+            expect(paths()).toContain('Other');
+        });
 
         test('Free up space on a folder sends its subtree, and a download sends the file and its folders', async () => {
             const d = setup();

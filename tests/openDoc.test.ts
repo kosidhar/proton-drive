@@ -88,3 +88,28 @@ test('openDoc refuses a missing file, a directory and a file over 64 KiB', async
     expect(h.opened).toEqual([]);
     expect(h.notes).toHaveLength(3);
 });
+
+test('the opened URL is rebuilt from the checked parts: extra parameters are dropped', () => {
+    const r = rec('doc');
+    const link = docUrl(r.uid, 'doc');
+    expect(parseDocLink(asContent(`${link}&redirect=https://evil.example`))?.url).toBe(link);
+    expect(parseDocLink(asContent(`${link}&foo=1#frag`))?.url).toBe(link);
+});
+
+test('a link that names type, volumeId or linkId twice is refused', () => {
+    const link = docUrl(rec('doc').uid, 'doc');
+    for (const extra of ['type=sheet', 'volumeId=other', 'linkId=other', 'type=doc']) {
+        expect(parseDocLink(asContent(`${link}&${extra}`))).toBeNull();
+    }
+});
+
+test('a file of exactly 64 KiB is read, one byte more is refused', async () => {
+    const h = harness();
+    const head = placeholderContent(rec('doc')).trimEnd();
+    const exact = path.join(dir, 'exact.protondoc');
+    writeFileSync(exact, head + ' '.repeat(64 * 1024 - Buffer.byteLength(head)));
+    expect(await openDoc(exact, h.deps)).toBe(0);
+    const over = path.join(dir, 'over.protondoc');
+    writeFileSync(over, head + ' '.repeat(64 * 1024 - Buffer.byteLength(head) + 1));
+    expect(await openDoc(over, h.deps)).toBe(1);
+});

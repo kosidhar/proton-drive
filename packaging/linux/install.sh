@@ -209,8 +209,11 @@ if [ "$MODE" = "user" ]; then
   sed -i "s|^Exec=.*|Exec=$PREFIX/bin/protondrive-gui|; s|^TryExec=.*|TryExec=$PREFIX/bin/protondrive-gui|; s|^Icon=.*|Icon=$PREFIX/share/icons/hicolor/256x256/apps/io.github.kosidhar.ProtonDrive.png|" \
     "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.desktop"
   # The same for the document handler: its Exec is absolute, so Files finds it however it was started
-  sed -i "s|^Exec=.*|Exec=$PREFIX/bin/protondrive open-doc %f|" \
-    "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop"
+  # (an older tarball may not carry it, and a missing file must not stop the install)
+  OPENDOC_DESKTOP="$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop"
+  if [ -f "$OPENDOC_DESKTOP" ]; then
+    sed -i "s|^Exec=.*|Exec=$PREFIX/bin/protondrive open-doc %f|" "$OPENDOC_DESKTOP"
+  fi
 fi
 
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$PREFIX/share/applications" 2>/dev/null || true

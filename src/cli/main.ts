@@ -135,6 +135,9 @@ Daemon & Desktop GUI Commands:
   pause                          Pause background synchronization
   resume                         Resume background synchronization
 
+Files Commands:
+  open-doc <file>                Open a Proton Docs or Sheets placeholder in the browser
+
 Authentication Commands (OS Keyring / XDG Fallback):
   auth login                     Sign in via web browser (stores session in OS Keyring)
   auth logout                    Sign out and clear local caches
@@ -152,7 +155,6 @@ Direct Cloud File Commands (@protontech/drive-sdk):
   upload <localFile> <remoteDir> Upload a local file to Proton Drive
   download <remoteFile> <local>  Download a file from Proton Drive
   trash <remotePath>             Move a remote file or folder to Trash
-  open-doc <file>   Open a Proton Docs or Sheets placeholder in the browser
   version                        Display client and SDK versions
   help                           Show this help message
 `);

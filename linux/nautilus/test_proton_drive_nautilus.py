@@ -478,6 +478,8 @@ class MenuTest(unittest.TestCase):
         self.assertEqual(self.h.files.actions_for([f"{ROOT}/Elsewhere/x"]), ["pin", "free", "hide"])
         self.assertEqual(self.actions(".git"), [])  # local only: Sync Now and Open only
         self.assertEqual(self.actions(".git", "a.txt"), ["free", "hide"])
+        # no state (what a Docs or Sheets placeholder has too): no Share or Copy Link either
+        self.assertEqual(self.h.files.share_items_for([f"{ROOT}/Docs/.git"]), [])
 
     def test_what_kind_of_selection(self):
         self.assertEqual(self.h.files.selection([f"{ROOT}/Docs/a.txt"]), "items")
