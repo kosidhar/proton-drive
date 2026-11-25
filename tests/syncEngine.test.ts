@@ -8325,6 +8325,35 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                         expect(d.calls.trashed).toEqual([]);
                     });
 
+                    // Both sides mismatched: a local file over a cloud folder renamed onto another local file over another
+                    // cloud folder. Before #453 this journalled a trash of the folder at X and recorded Y as the folder at Y
+                    test('renaming such a file onto another such file touches neither cloud folder', async () => {
+                        const d = await fileOverFolder();
+                        d.add('Y/inner2.txt', 'inner2');
+                        await d.engine.reconcileNow();
+                        await d.files.writeLocal('Y', 'also mine');
+
+                        await d.engine.renameItem('X', 'Y');
+
+                        expect(d.journalled()).toEqual([]);
+                        expect(await d.files.exists('X')).toBe(false);
+                        expect(await readFile(d.local('Y'), 'utf8')).toBe('mine');
+                        expect(stateDb.getItemByNodeUid('vol~X')).toBeNull();
+                        expect(stateDb.getItemByNodeUid('vol~Y')).toBeNull();
+                        d.expectNoRecordOfTheOtherKind();
+                        await d.engine.replayRemoteOps();
+                        await d.engine.reconcileNow();
+                        expect(d.calls.trashed).toEqual([]);
+                        expect(d.calls.renamed).toEqual([]);
+                        expect(d.calls.moved).toEqual([]);
+                        expect(d.nodes.get('vol~X')).toMatchObject({ type: 'folder', name: { ok: true, value: 'X' } });
+                        expect(d.nodes.get('vol~Y')).toMatchObject({ type: 'folder', name: { ok: true, value: 'Y' } });
+                        expect(d.engine.remoteIndex.getByPath('X')).toMatchObject({ uid: 'vol~X', type: 'folder' });
+                        expect(d.engine.remoteIndex.getByPath('Y')).toMatchObject({ uid: 'vol~Y', type: 'folder' });
+                        expectFolderContentKept(d);
+                        await d.expectEveryRecordHasItsFile();
+                    });
+
                     // An editor's save: the new content is written to a temp file, which is renamed over the file. What
                     // replaces the local file is a new item, as it would be over a file only here: it doesn't take the
                     // cloud folder's identity. It stays here, beside the folder in Proton Drive, until the sync can put
