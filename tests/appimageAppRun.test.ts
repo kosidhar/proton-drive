@@ -139,8 +139,8 @@ describe('AppImage AppRun', () => {
         expect(existsSync(iconPath(env, 'doc'))).toBe(true);
         expect(existsSync(iconPath(env, 'sheet'))).toBe(true);
         const d = readFileSync(desktopPath(env), 'utf8');
-        // Desktop Entry spec: a literal backslash is four, " ` $ get one.
-        const escaped = ai.replace(/\\/g, '\\\\\\\\').replace(/["`$]/g, (c) => '\\' + c);
+        // The file's string escaping comes first: a literal backslash is four, " ` $ get two.
+        const escaped = ai.replace(/\\/g, '\\\\\\\\').replace(/["`$]/g, (c) => '\\\\' + c);
         expect(d).toContain(`Exec="${escaped}" open-doc %f\n`);
         expect(d).toContain('X-Kosidhar-AppImage=true');
         expect(d).not.toMatch(/^TryExec=(?!.*kosidhar)/m);
@@ -151,16 +151,43 @@ describe('AppImage AppRun', () => {
         ]);
     });
 
-    test('(b2) percent signs in the path are doubled', () => {
+    test('(b2) a path with a percent sign is skipped (GLib rejects it) and the app still starts', () => {
         const env = fakeAppDir();
         const d = path.join(tmp(), '100%');
         mkdirSync(d);
         const ai = path.join(d, 'a.AppImage');
-        writeFileSync(ai, 'x');
+        writeFileSync(ai, 'x', { mode: 0o755 });
+        const r = run(env, ['open-doc', 'x'], { APPIMAGE: ai });
+        expect(r.out).toBe('cli:open-doc x');
+        expect(existsSync(desktopPath(env))).toBe(false);
+        expect(existsSync(mimePath(env))).toBe(false);
+        expect(callLines(env)).toEqual([]);
+    });
+
+    const hasGio =
+        Bun.spawnSync([
+            'python3',
+            '-I',
+            '-c',
+            'import gi; gi.require_version("Gio","2.0")',
+        ]).exitCode === 0;
+    if (!hasGio) console.log('skipping the GLib check: python3 gi (Gio 2.0) is not available');
+    test.skipIf(!hasGio)('(g) GLib loads the written entry and reads back the exact path', () => {
+        const env = fakeAppDir();
+        const ai = path.join(tmp(), 'My Apps', 'kosidhar "q" $x `y` \\z.AppImage');
+        mkdirSync(path.dirname(ai));
+        writeFileSync(ai, 'x', { mode: 0o755 });
         run(env, [], { APPIMAGE: ai });
-        expect(readFileSync(desktopPath(env), 'utf8')).toContain(
-            `Exec="${d.replace(/%/g, '%%')}/a.AppImage" open-doc %f\n`,
-        );
+        const script = [
+            'import sys',
+            'import gi',
+            'gi.require_version("Gio", "2.0")',
+            'from gi.repository import Gio, GLib',
+            'a = Gio.DesktopAppInfo.new_from_filename(sys.argv[1])',
+            'print("NULL" if a is None else GLib.shell_parse_argv(a.get_commandline())[1][0])',
+        ].join('\n');
+        const p = Bun.spawnSync(['python3', '-I', '-W', 'ignore', '-c', script, desktopPath(env)]);
+        expect(p.stdout.toString().replace(/\n$/, '')).toBe(ai);
     });
 
     test('(c) a second run with the same AppImage writes nothing', () => {

@@ -9,8 +9,9 @@ export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/s
 # folder. Best effort: any failure is ignored and the app always starts.
 integrate() {
   [ -n "$APPIMAGE" ] && [ -f "$APPIMAGE" ] || return 0
+  # A newline cannot go in Exec, and GLib refuses any entry whose Exec path has a %.
   case "$APPIMAGE" in *'
-'*) return 0 ;; esac
+'* | *%*) return 0 ;; esac
   id=io.github.kosidhar.ProtonDrive
   data="${XDG_DATA_HOME:-$HOME/.local/share}"
   share="$HERE/usr/share"
@@ -28,18 +29,19 @@ integrate() {
     put "$share/$f" "$data/$f"
   done
 
-  # The open handler runs this AppImage. Quote the path for Exec: a literal
-  # backslash is written as four (string escape, then quoting), " ` $ get one
-  # backslash, and % is doubled. An entry without our marker belongs to
-  # install.sh or a package and is never touched.
+  # The open handler runs this AppImage. Quote the path for Exec. The file's
+  # string escaping is applied before the quoting rules, so a literal backslash
+  # is written as four, and " ` $ as two backslashes plus the character. There is
+  # no TryExec (it is not quoted, a second escaping trap). An entry without our
+  # marker belongs to install.sh or a package and is never touched.
   desktop="$data/applications/$id.OpenDoc.desktop"
   if [ ! -e "$desktop" ] || grep -qx 'X-Kosidhar-AppImage=true' "$desktop"; then
-    q="$(printf '%s' "$APPIMAGE" | sed -e 's/\\/\\\\\\\\/g' -e 's/["`$]/\\&/g' -e 's/%/%%/g')"
+    q="$(printf '%s' "$APPIMAGE" | sed -e 's/\\/\\\\\\\\/g' -e 's/["`$]/\\\\&/g')"
     mkdir -p "${desktop%/*}" || return 0
     {
       while IFS= read -r line; do
         case "$line" in
-          Exec=*) printf 'Exec="%s" open-doc %%f\n' "$q" ;;
+          Exec=*) printf 'Exec="%s" open-doc %%f\n' "$q" ;;  # %s: the path has no %
           TryExec=*) ;;
           *) printf '%s\n' "$line" ;;
         esac
