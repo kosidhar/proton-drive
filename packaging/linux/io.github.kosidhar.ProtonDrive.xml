@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/vnd.proton.doc">
+    <comment>Proton Docs document</comment>
+    <glob pattern="*.protondoc"/>
+    <generic-icon name="x-office-document"/>
+  </mime-type>
+  <mime-type type="application/vnd.proton.sheet">
+    <comment>Proton Sheets spreadsheet</comment>
+    <glob pattern="*.protonsheet"/>
+    <generic-icon name="x-office-spreadsheet"/>
+  </mime-type>
+</mime-info>

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Proton Drive
+Comment=Opens a Proton Docs or Sheets document in the browser
+Exec=protondrive open-doc %f
+Icon=io.github.kosidhar.ProtonDrive
+Terminal=false
+NoDisplay=true
+MimeType=application/vnd.proton.doc;application/vnd.proton.sheet;
+Categories=Network;FileTransfer;

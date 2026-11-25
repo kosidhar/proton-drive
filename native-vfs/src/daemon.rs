@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -308,6 +308,8 @@ fn errno_of_code(code: Option<&str>) -> i32 {
         Some("EXDEV") => libc::EXDEV,
         Some("ENOTEMPTY") => libc::ENOTEMPTY,
         Some("ENOSPC") => libc::ENOSPC,
+        // A Docs or Sheets placeholder, which can't be changed (#430)
+        Some("EPERM") => libc::EPERM,
         _ => libc::EIO,
     }
 }
@@ -325,6 +327,13 @@ struct WireEntry {
     size: f64,
     #[serde(rename = "mtimeMs")]
     mtime_ms: f64,
+    /// A Docs or Sheets document: the content of the read-only file the drive shows for it (#430)
+    placeholder: Option<WirePlaceholder>,
+}
+
+#[derive(Deserialize)]
+struct WirePlaceholder {
+    content: String,
 }
 
 fn parse_children(body: serde_json::Value) -> Result<Vec<Entry>, DaemonError> {
@@ -345,7 +354,13 @@ fn parse_children(body: serde_json::Value) -> Result<Vec<Entry>, DaemonError> {
             }
             // `as` saturates: a negative or NaN number is 0
             let mtime = UNIX_EPOCH + Duration::from_millis(e.mtime_ms as u64);
-            Some(Entry { name: e.name.into(), kind, size: e.size as u64, mtime, local: false })
+            // Only a file can be a placeholder; its size is its content's, whatever the daemon says
+            let placeholder: Option<Arc<[u8]>> = match (kind, e.placeholder) {
+                (Kind::File, Some(p)) => Some(p.content.into_bytes().into()),
+                _ => None,
+            };
+            let size = placeholder.as_ref().map_or(e.size as u64, |p| p.len() as u64);
+            Some(Entry { name: e.name.into(), kind, size, mtime, local: false, placeholder })
         })
         .collect())
 }
@@ -538,6 +553,20 @@ mod tests {
     }
 
     #[test]
+    fn a_placeholder_in_a_listing_carries_its_content() {
+        let content = "{\"url\":\"https://docs.proton.me/doc?type=doc\"}\n";
+        let body = serde_json::json!({ "entries": [
+            { "name": "Plan.protondoc", "type": "file", "size": content.len(), "mtimeMs": 5000,
+              "placeholder": { "kind": "doc", "content": content } },
+            { "name": "a.txt", "type": "file", "size": 3, "mtimeMs": 0 },
+        ] });
+        let entries = parse_children(body).unwrap();
+        assert_eq!(entries[0].placeholder.as_deref(), Some(content.as_bytes()));
+        assert_eq!(entries[0].size, content.len() as u64);
+        assert_eq!(entries[1].placeholder, None);
+    }
+
+    #[test]
     fn error_codes_map_to_errnos() {
         assert_eq!(errno_of_code(Some("ENOENT")), libc::ENOENT);
         assert_eq!(errno_of_code(Some("EEXIST")), libc::EEXIST);
@@ -545,6 +574,8 @@ mod tests {
         assert_eq!(errno_of_code(Some("EIO")), libc::EIO);
         assert_eq!(errno_of_code(Some("EXDEV")), libc::EXDEV);
         assert_eq!(errno_of_code(Some("ENOTEMPTY")), libc::ENOTEMPTY);
+        // A Docs or Sheets placeholder, which can't be changed (#430)
+        assert_eq!(errno_of_code(Some("EPERM")), libc::EPERM);
         // A download for an open that would leave the system disk under the reserve (#301)
         assert_eq!(errno_of_code(Some("ENOSPC")), libc::ENOSPC);
         assert_eq!(errno_of_code(Some("EWHAT")), libc::EIO);

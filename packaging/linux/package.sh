@@ -66,6 +66,8 @@ install -Dm755 "$ROOT/release/protondrive-vfs" "$STAGE/usr/bin/protondrive-vfs"
 strip "$STAGE/usr/bin/protondrive-gui" "$STAGE/usr/bin/protondrive-vfs" 2>/dev/null || true
 
 install -Dm644 "$HERE/$APP_ID.desktop" "$STAGE/usr/share/applications/$APP_ID.desktop"
+install -Dm644 "$HERE/$APP_ID.OpenDoc.desktop" "$STAGE/usr/share/applications/$APP_ID.OpenDoc.desktop"
+install -Dm644 "$HERE/$APP_ID.xml" "$STAGE/usr/share/mime/packages/$APP_ID.xml"
 mkdir -p "$STAGE/usr/share/metainfo"
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@DATE@/$BUILD_DATE/g" \
   "$HERE/$APP_ID.metainfo.xml.in" > "$STAGE/usr/share/metainfo/$APP_ID.metainfo.xml"
@@ -109,6 +111,7 @@ EOF
 
 if command -v desktop-file-validate >/dev/null 2>&1; then
   desktop-file-validate "$STAGE/usr/share/applications/$APP_ID.desktop"
+  desktop-file-validate "$STAGE/usr/share/applications/$APP_ID.OpenDoc.desktop"
 fi
 if command -v appstreamcli >/dev/null 2>&1; then
   appstreamcli validate --no-net --explain "$STAGE/usr/share/metainfo/$APP_ID.metainfo.xml" || true

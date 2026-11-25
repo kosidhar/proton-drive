@@ -21,6 +21,8 @@ modules:
       # protondrive-vfs (the virtual drive helper) is deliberately not bundled: FUSE is not
       # available inside the sandbox, so the Flatpak build always runs in plain-folder mode.
       - install -Dm644 share/applications/io.github.kosidhar.ProtonDrive.desktop /app/share/applications/io.github.kosidhar.ProtonDrive.desktop
+      - install -Dm644 share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop /app/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop
+      - install -Dm644 share/mime/packages/io.github.kosidhar.ProtonDrive.xml /app/share/mime/packages/io.github.kosidhar.ProtonDrive.xml
       - install -Dm644 share/metainfo/io.github.kosidhar.ProtonDrive.metainfo.xml /app/share/metainfo/io.github.kosidhar.ProtonDrive.metainfo.xml
       - mkdir -p /app/share/icons && cp -R share/icons/hicolor /app/share/icons/
     sources:

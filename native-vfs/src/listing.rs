@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,6 +22,8 @@ pub struct Entry {
     pub mtime: SystemTime,
     /// In the backing store (or served by the helper itself) rather than online-only
     pub local: bool,
+    /// A Proton Docs or Sheets document the helper serves read-only from memory: the bytes of its file (#430)
+    pub placeholder: Option<Arc<[u8]>>,
 }
 
 /// The file GNOME reads the sidebar name from; the helper serves it read-only at the root.
@@ -51,6 +54,7 @@ pub fn read_local(dir: &Path) -> Vec<Entry> {
             size: meta.len(),
             mtime: meta.modified().unwrap_or(UNIX_EPOCH),
             local: true,
+            placeholder: None,
         })
     })
     .collect()
@@ -72,6 +76,7 @@ pub fn merge_listing(local: Vec<Entry>, remote: Vec<Entry>, is_root: bool) -> Ve
             size: VOLUME_INFO_CONTENT.len() as u64,
             mtime: UNIX_EPOCH,
             local: true,
+            placeholder: None,
         });
     }
     merged
@@ -82,11 +87,11 @@ mod tests {
     use super::*;
 
     fn file(name: &str, size: u64, local: bool) -> Entry {
-        Entry { name: name.into(), kind: Kind::File, size, mtime: UNIX_EPOCH, local }
+        Entry { name: name.into(), kind: Kind::File, size, mtime: UNIX_EPOCH, local, placeholder: None }
     }
 
     fn folder(name: &str, local: bool) -> Entry {
-        Entry { name: name.into(), kind: Kind::Folder, size: 0, mtime: UNIX_EPOCH, local }
+        Entry { name: name.into(), kind: Kind::Folder, size: 0, mtime: UNIX_EPOCH, local, placeholder: None }
     }
 
     fn names(entries: &[Entry]) -> Vec<&str> {
