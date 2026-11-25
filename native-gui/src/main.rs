@@ -850,6 +850,15 @@ struct PendingSetting {
     /// The number it was sent as: only the answer to the newest send for a key settles it
     seq: u64,
     value: serde_json::Value,
+    /// A newer value, held until the answer to the one in flight comes (#426): only the latest is kept
+    held: Option<serde_json::Value>,
+}
+
+impl PendingSetting {
+    /// The user's latest choice for the key: the held value, or else the one in flight
+    fn latest(&self) -> &serde_json::Value {
+        self.held.as_ref().unwrap_or(&self.value)
+    }
 }
 
 /// What a setting's row says beside its control (#425).
@@ -1931,12 +1940,21 @@ impl ProtonDriveNativeApp {
     /// Sends one setting, at once (#425). It is pending until the daemon answers, and a newer send for the same key
     /// takes its place: only the newest one's answer settles the control.
     fn apply_setting(&mut self, key: &'static str, value: serde_json::Value) {
+        self.setting_notes.remove(key);
+        // One save per key in flight (#426): a newer value waits for the answer to the older one, so the daemon can't
+        // take them in reverse order. Only the latest waiting value is kept.
+        if let Some(p) = self.pending_settings.iter_mut().find(|p| p.key == key) {
+            p.held = Some(value);
+            return;
+        }
+        self.send_setting(key.to_string(), value);
+    }
+
+    fn send_setting(&mut self, key: String, value: serde_json::Value) {
         self.settings_seq += 1;
         let seq = self.settings_seq;
-        self.pending_settings.retain(|p| p.key != key);
-        self.pending_settings.push(PendingSetting { key: key.to_string(), seq, value: value.clone() });
-        self.setting_notes.remove(key);
-        let changes = serde_json::json!({ key: value });
+        let changes = serde_json::json!({ key.as_str(): value.clone() });
+        self.pending_settings.push(PendingSetting { key, seq, value, held: None });
         let _ = self.tx.send(WorkerCommand::SaveSettings { seq, changes });
     }
 
@@ -1946,7 +1964,14 @@ impl ProtonDriveNativeApp {
         let mut newest = Vec::new();
         for key in keys {
             if let Some(i) = self.pending_settings.iter().position(|p| p.key == key && p.seq == seq) {
-                newest.push(self.pending_settings.remove(i));
+                let mut sent = self.pending_settings.remove(i);
+                // A value was held meanwhile (#426): send it now, ok or failed, and say nothing about this one. Its own
+                // answer settles the control, so "Saved" shows once and an error only if the last send fails.
+                if let Some(next) = sent.held.take() {
+                    self.send_setting(sent.key, next);
+                    continue;
+                }
+                newest.push(sent);
             }
         }
         let note = |notice: Notice, until| SettingNote { notice, until, since: Instant::now() };
@@ -3495,7 +3520,7 @@ impl ProtonDriveNativeApp {
     /// Escape in the ignore box: the text goes back to what was sent last, or else what the daemon holds; nothing is sent.
     fn revert_ignore_text(&mut self) {
         let known: Vec<String> = match self.pending_settings.iter().find(|p| p.key == "ignorePatterns") {
-            Some(sent) => serde_json::from_value(sent.value.clone()).unwrap_or_default(),
+            Some(sent) => serde_json::from_value(sent.latest().clone()).unwrap_or_default(),
             None => parse_ignore_patterns(&self.loaded_settings.ignore_patterns.join("\n")),
         };
         self.ignore_patterns_text = known.join("\n");
@@ -3505,7 +3530,7 @@ impl ProtonDriveNativeApp {
     fn unsent_ignore_patterns(&self) -> Option<Vec<String>> {
         let patterns = parse_ignore_patterns(&self.ignore_patterns_text);
         let known = match self.pending_settings.iter().find(|p| p.key == "ignorePatterns") {
-            Some(sent) => serde_json::from_value(sent.value.clone()).unwrap_or_default(),
+            Some(sent) => serde_json::from_value(sent.latest().clone()).unwrap_or_default(),
             None => parse_ignore_patterns(&self.loaded_settings.ignore_patterns.join("\n")),
         };
         (patterns != known).then_some(patterns)
@@ -11713,31 +11738,134 @@ mod tests {
         assert!(h.app.edit_notifications);
     }
 
-    // #425, review focus 2: the last change wins, in whatever order the answers come
+    // #425, review focus 2: the last change wins. Since #426 the second is sent only once the first is answered, so the
+    // answers can only come in order.
     #[test]
     fn two_quick_changes_end_on_the_last() {
-        for in_order in [true, false] {
-            let mut h = settings_tall(None, None);
-            h.click(h.text_at("Desktop notifications").unwrap());
-            let first = h.app.settings_seq;
-            h.click(h.text_at("Desktop notifications").unwrap());
-            let second = h.app.settings_seq;
-            assert_ne!(first, second);
-            assert_eq!(
-                h.sent(),
-                vec![r#"save {"notificationsEnabled":false}"#.to_string(), r#"save {"notificationsEnabled":true}"#.to_string()]
-            );
-            assert!(h.app.edit_notifications);
-            let answers = [saved(first, "notificationsEnabled", with_notifications(false)), saved(second, "notificationsEnabled", with_notifications(true))];
-            let [a, b] = answers;
-            let (one, two) = if in_order { (a, b) } else { (b, a) };
-            h.event(one);
-            assert!(h.app.edit_notifications, "in_order={in_order}: still on after the first answer");
-            h.event(two);
-            assert!(h.app.edit_notifications, "in_order={in_order}: on once both answered");
-            assert!(h.app.loaded_settings.notifications_enabled, "in_order={in_order}");
-            assert!(h.app.pending_settings.is_empty());
-        }
+        let mut h = settings_tall(None, None);
+        h.click(h.text_at("Desktop notifications").unwrap());
+        let first = h.app.settings_seq;
+        h.click(h.text_at("Desktop notifications").unwrap());
+        assert_eq!(h.sent(), vec![r#"save {"notificationsEnabled":false}"#.to_string()]);
+        assert!(h.app.edit_notifications);
+        h.event(saved(first, "notificationsEnabled", with_notifications(false)));
+        assert_eq!(h.sent(), vec![r#"save {"notificationsEnabled":true}"#.to_string()]);
+        let second = h.app.settings_seq;
+        assert_ne!(first, second);
+        assert!(h.app.edit_notifications, "still on after the first answer");
+        h.event(saved(second, "notificationsEnabled", with_notifications(true)));
+        assert!(h.app.edit_notifications, "on once both answered");
+        assert!(h.app.loaded_settings.notifications_enabled);
+        assert!(h.app.pending_settings.is_empty());
+    }
+
+    fn flip_notifications(h: &mut Harness) -> u64 {
+        h.click(h.text_at("Desktop notifications").unwrap());
+        h.app.settings_seq
+    }
+
+    fn save_notifications(on: bool) -> String {
+        format!(r#"save {{"notificationsEnabled":{on}}}"#)
+    }
+
+    // #426: one save per setting in flight; the next value waits for the answer
+    #[test]
+    fn a_newer_value_waits_for_the_save_in_flight() {
+        let mut h = settings_tall(None, None);
+        flip_notifications(&mut h);
+        let first = h.app.settings_seq;
+        flip_notifications(&mut h);
+        assert_eq!(h.sent(), vec![save_notifications(false)], "only the first is sent");
+        assert!(h.app.edit_notifications, "the switch shows the latest choice");
+
+        h.event(saved(first, "notificationsEnabled", with_notifications(false)));
+        assert_eq!(h.sent(), vec![save_notifications(true)], "the held value goes next");
+        let second = h.app.settings_seq;
+        assert_ne!(first, second);
+        assert!(h.app.edit_notifications);
+        h.event(status_holding(&h, with_notifications(false)));
+        assert!(h.app.edit_notifications, "a refresh doesn't undo it");
+        h.frames(2);
+        assert!(h.text_at("Saved").is_none(), "no Saved before the last answer");
+
+        h.event(saved(second, "notificationsEnabled", with_notifications(true)));
+        h.frames(2);
+        assert!(h.text_at("Saved").is_some());
+        assert!(h.app.edit_notifications);
+        assert!(h.app.pending_settings.is_empty());
+    }
+
+    #[test]
+    fn three_quick_changes_send_the_first_and_the_last() {
+        let mut h = settings_tall(None, None);
+        flip_notifications(&mut h);
+        let first = h.app.settings_seq;
+        flip_notifications(&mut h);
+        flip_notifications(&mut h);
+        assert_eq!(h.sent(), vec![save_notifications(false)]);
+        assert!(!h.app.edit_notifications);
+        h.event(saved(first, "notificationsEnabled", with_notifications(false)));
+        assert_eq!(h.sent(), vec![save_notifications(false)], "the middle value is dropped");
+    }
+
+    #[test]
+    fn a_failed_save_still_sends_the_held_value() {
+        let mut h = settings_tall(None, None);
+        flip_notifications(&mut h);
+        let first = h.app.settings_seq;
+        flip_notifications(&mut h);
+        h.event(WorkerEvent::SettingsSaved {
+            seq: first,
+            keys: vec!["notificationsEnabled".into()],
+            result: Err("Can't reach the Proton Drive daemon".into()),
+        });
+        assert_eq!(h.sent(), vec![save_notifications(false), save_notifications(true)]);
+        assert!(h.app.edit_notifications);
+        h.frames(2);
+        assert!(h.text_at("Can't reach the Proton Drive daemon").is_none(), "the first failure isn't shown");
+        let second = h.app.settings_seq;
+        h.event(saved(second, "notificationsEnabled", with_notifications(true)));
+        h.frames(2);
+        assert!(h.text_at("Saved").is_some());
+        assert!(h.text_at("Can't reach the Proton Drive daemon").is_none());
+    }
+
+    #[test]
+    fn the_error_shows_when_the_last_send_fails() {
+        let mut h = settings_tall(None, None);
+        flip_notifications(&mut h);
+        let first = h.app.settings_seq;
+        flip_notifications(&mut h);
+        h.event(saved(first, "notificationsEnabled", with_notifications(false)));
+        let second = h.app.settings_seq;
+        h.event(WorkerEvent::SettingsSaved {
+            seq: second,
+            keys: vec!["notificationsEnabled".into()],
+            result: Err("Can't reach the Proton Drive daemon".into()),
+        });
+        h.frames(2);
+        assert!(h.text_at("Can't reach the Proton Drive daemon").is_some());
+        assert!(h.text_at("Saved").is_none());
+    }
+
+    #[test]
+    fn a_stale_answer_does_not_release_the_held_value() {
+        let mut h = settings_tall(None, None);
+        flip_notifications(&mut h);
+        let first = h.app.settings_seq;
+        flip_notifications(&mut h);
+        // An answer with a number nothing is waiting for
+        h.event(saved(first + 100, "notificationsEnabled", with_notifications(false)));
+        assert_eq!(h.sent(), vec![save_notifications(false)], "the held value stays held");
+        h.event(saved(first, "notificationsEnabled", with_notifications(false)));
+        assert_eq!(h.sent(), vec![save_notifications(true)]);
+        let second = h.app.settings_seq;
+        // The first's answer again, now old: it neither settles nor releases anything
+        h.event(saved(first, "notificationsEnabled", with_notifications(false)));
+        assert_eq!(h.sent(), Vec::<String>::new());
+        assert!(h.app.is_pending("notificationsEnabled"));
+        h.event(saved(second, "notificationsEnabled", with_notifications(true)));
+        assert!(!h.app.is_pending("notificationsEnabled"));
     }
 
     // #425, review focus 3: a refused change goes back and says why; the ignore box keeps its text
