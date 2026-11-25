@@ -53,6 +53,8 @@ pub struct SharedItem {
 
 pub const WEB_SHARED_URL: &str = "https://drive.proton.me/shared";
 pub const LOADING: &str = "Loading what you've shared…";
+/// The toolbar's words, beside the turning arrows, while a list that shows is read again
+pub const REFRESHING: &str = "Refreshing…";
 /// Under the list: the daemon never asks for Photos shares (#256)
 pub const PHOTOS_NOTE: &str = "Photos and albums you share from Photos may not be listed here.";
 pub const PHOTOS_LINK: &str = "See them on drive.proton.me";
@@ -415,6 +417,32 @@ mod tests {
         assert_eq!(fake_shared("offline", NOW), Some(Err(share::DAEMON_UNREACHABLE.to_string())));
         assert_eq!(fake_shared("bogus", NOW), None);
     }
+
+    #[test]
+    fn the_screenshot_states_set_the_page() {
+        let mut page = SharedPage::default();
+        assert!(page.fake("loading", NOW));
+        assert!(page.items.is_none() && page.loading && page.error.is_none());
+
+        let mut page = SharedPage::default();
+        assert!(page.fake("refreshing", NOW));
+        assert_eq!(page.items.as_ref().map(Vec::len), Some(6));
+        assert!(page.loading);
+
+        for state in ["list", "empty", "offline"] {
+            let mut page = SharedPage::default();
+            assert!(page.fake(state, NOW), "{state}");
+            assert!(!page.loading, "{state}");
+            match fake_shared(state, NOW).unwrap() {
+                Ok(items) => assert_eq!((page.items.as_ref(), page.error.as_ref()), (Some(&items), None), "{state}"),
+                Err(message) => assert_eq!((page.items.as_ref(), page.error.as_ref()), (None, Some(&message)), "{state}"),
+            }
+        }
+
+        let mut page = SharedPage::default();
+        assert!(!page.fake("nope", NOW));
+        assert!(page.items.is_none() && !page.loading);
+    }
 }
 
 /// What the Shared section shows: the list as last read (kept while the next read is out), whether one is out, and why
@@ -438,6 +466,32 @@ pub struct SharedPage {
 }
 
 impl SharedPage {
+    /// Whether there is a list with something in it to show.
+    pub fn has_rows(&self) -> bool {
+        self.items.as_ref().is_some_and(|items| !items.is_empty())
+    }
+
+    /// Screenshot-only: sets the page as `--fake-shared <state>` shows it. A list, empty or offline is answered, as
+    /// `fake_shared` has it; loading is a first read still out; refreshing is the list answered and read again.
+    /// False for an unknown state.
+    pub fn fake(&mut self, state: &str, now_ms: i64) -> bool {
+        match state {
+            "loading" => {
+                self.begin_load();
+            }
+            "refreshing" => {
+                self.fake("list", now_ms);
+                self.begin_load();
+            }
+            _ => {
+                let Some(result) = fake_shared(state, now_ms) else { return false };
+                let seq = self.begin_load();
+                self.loaded(seq, result);
+            }
+        }
+        true
+    }
+
     /// A read goes out: the rows shown stay until it answers. Returns its number.
     pub fn begin_load(&mut self) -> u64 {
         self.seq += 1;
