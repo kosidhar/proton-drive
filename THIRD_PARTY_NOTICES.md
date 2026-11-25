@@ -16,7 +16,7 @@ This app bundles the following third-party parts. Each keeps its own license.
 - What it is: the app's interface typeface.
 - Where: `assets/fonts/Inter-*.ttf`
 - License: SIL Open Font License 1.1
-- Copyright: The Inter Project Authors (https://github.com/rsms/inter)
+- Copyright: (c) 2016 The Inter Project Authors (https://github.com/rsms/inter)
 - License text: `assets/fonts/OFL-Inter.txt`
 
 ## JetBrains Mono
@@ -24,7 +24,7 @@ This app bundles the following third-party parts. Each keeps its own license.
 - What it is: the app's monospace typeface.
 - Where: `assets/fonts/JetBrainsMono-Regular.ttf`
 - License: SIL Open Font License 1.1
-- Copyright: The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)
+- Copyright: (c) 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)
 - License text: `assets/fonts/OFL-JetBrainsMono.txt`
 
 ## Phosphor icons
@@ -32,7 +32,11 @@ This app bundles the following third-party parts. Each keeps its own license.
 - What it is: the app's icons, used through the `egui-phosphor` crate.
 - Where: built into the GUI through the crate; the license text is in `assets/fonts/`
 - License: MIT
-- Copyright: Phosphor Icons
+- Copyright: (c) 2020 Phosphor Icons
 - License text: `assets/fonts/MIT-Phosphor.txt`
+
+## App icon and tray icons
+
+The app icon (`assets/app-icon/hicolor/`) and the tray icons (`assets/app-icon/tray/`) are based on the Proton Drive logo. The logo is Proton AG's artwork and trademark; it is not covered by this repository's MIT license, and is used only so the app looks like Proton Drive. To redistribute or modify this project without it, replace these icons with your own.
 
 Dependencies installed by the package managers (npm/bun, cargo) carry their own licenses in their packages.
