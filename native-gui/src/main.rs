@@ -3132,7 +3132,9 @@ impl ProtonDriveNativeApp {
             let moving = self.move_in_progress();
             let moving_here = self.is_pending("syncDir");
             let shown = if sync_dir.is_empty() { "Not set up yet".to_string() } else { shown_folder(&sync_dir) };
-            settings::setting_row(ui, "Location", Some(home::drive_kind(vfs)), None, |ui| {
+            // No kind before a reachable daemon has answered: no virtual drive yet is not a plain folder
+            let kind = (vfs.is_some() || (self.daemon_online && !self.initial_connecting)).then(|| home::drive_kind(vfs));
+            settings::setting_row(ui, "Location", kind, None, |ui| {
                 // Move… at the right edge, the folder before it, cut short to the room there is (whole on hover)
                 // Not while a move is out: it takes minutes, and a second one is refused as busy
                 let button = ui
@@ -11895,6 +11897,38 @@ mod tests {
         }
         let h = settings_tall(Some(vfs("virtual", true, None)), Some(true));
         assert!(h.text_at("Virtual drive · mounted").is_some(), "the row keeps its detail");
+    }
+
+    // #427 round 1: an older daemon answers with no virtual drive: a plain folder, no switch, Move… all the same
+    #[test]
+    fn an_older_daemon_without_a_virtual_drive_shows_a_plain_folder_and_moves_it() {
+        let mut h = settings_tall(None, None);
+        assert!(h.text_at("Plain folder").is_some());
+        assert!(h.text_at(SWITCH).is_none());
+        assert!(h.text_at("Move…").is_some());
+        assert!(!h.nodes_named("Move Proton Drive folder…")[0].is_disabled());
+        h.app.folder_chosen("/mnt/b/ProtonDrive");
+        h.frames(2);
+        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::MoveFolder { to: "/mnt/b/ProtonDrive".into() }));
+        h.click(h.text_at("Move").expect("the dialog's Move"));
+        assert_eq!(h.sent(), vec![r#"save {"syncDir":"/mnt/b/ProtonDrive"}"#.to_string()]);
+    }
+
+    // #427 round 1: before the daemon has answered (or while it can't be reached) nothing claims a folder kind
+    #[test]
+    fn no_plain_folder_is_claimed_before_the_daemon_has_answered() {
+        let mut h = Harness::settings(None, None);
+        h.app.initial_connecting = true;
+        h.frames(3);
+        assert!(h.text_at("Plain folder").is_none(), "while connecting");
+        assert!(h.text_at("Move…").is_some());
+        h.app.initial_connecting = false;
+        h.app.daemon_online = false;
+        h.frames(3);
+        assert!(h.text_at("Plain folder").is_none(), "while the daemon is unreachable");
+        h.app.daemon_online = true;
+        h.frames(3);
+        assert!(h.text_at("Plain folder").is_some(), "once an older daemon has answered");
     }
 
     // #425 final review: the notes are announced as they appear
