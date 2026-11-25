@@ -52,6 +52,16 @@ export class SecretsSessionStore implements CredentialsStore {
             }
             throw error;
         }
+        // Only reached once the keyring holds the session: drop any plaintext
+        // copy left from an earlier keyring outage. Never fails the save.
+        if (this.fallbackStore) {
+            try {
+                await this.fallbackStore.remove();
+            } catch (error: unknown) {
+                const message = error instanceof Error ? error.message : String(error);
+                this.logger.debug(`Could not remove the stale fallback session: ${message}`);
+            }
+        }
     }
 
     async remove(): Promise<void> {
