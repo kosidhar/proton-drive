@@ -4609,7 +4609,7 @@ OPTIONS:
   --confirm-stop-sharing <NAME>  with --screenshot and --fake-shared list: show the Stop sharing confirmation for that row
   --fake-cut-short <S>  with --screenshot: list files held because the disk guard cut them short (one | many)
   --fake-disk-full      with --screenshot: show Home's notice that the computer's disk is almost full
-  --fake-shared <S>     with --screenshot: show the Shared section (--tab shared) as S (list | empty | offline)
+  --fake-shared <S>     with --screenshot: show the Shared section (--tab shared) as S (list | empty | offline | loading | refreshing)
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --zoom <F>            with --screenshot: render at zoom factor F (0.5 to 3, e.g. 1.2), as Ctrl+= would
   --version             print the version
@@ -4826,11 +4826,13 @@ fn main() -> eframe::Result {
     };
     let fake_shared = match cli_fake_shared {
         Some(state) if screenshot_target.is_some() => {
-            let list = shared::fake_shared(&state, home::now_ms());
-            if list.is_none() {
-                eprintln!("protondrive-gui: ignoring unknown --fake-shared {state:?} (list | empty | offline)");
+            // Checked on a scratch page: the real one is set once the app exists
+            if shared::SharedPage::default().fake(&state, home::now_ms()) {
+                Some(state)
+            } else {
+                eprintln!("protondrive-gui: ignoring unknown --fake-shared {state:?} (list | empty | offline | loading | refreshing)");
+                None
             }
-            list
         }
         _ => None,
     };
@@ -5016,9 +5018,8 @@ fn main() -> eframe::Result {
                 }
                 if app.tab == NavTab::Shared {
                     // The worker doesn't read the list in a screenshot: show the fake one, or an empty one, rather than
-                    // loading forever
-                    let seq = app.shared.seq;
-                    app.shared.loaded(seq, fake_shared.unwrap_or_else(|| Ok(Vec::new())));
+                    // loading forever (unless loading is what is asked for)
+                    app.shared.fake(fake_shared.as_deref().unwrap_or("empty"), home::now_ms());
                     if let (Some(name), Some(items)) = (&cli_confirm_stop_sharing, &app.shared.items) {
                         app.pending_confirm = items.iter().find(|i| &i.name == name && i.unreadable.is_none()).and_then(|i| {
                             Some(PendingConfirm::StopSharing { rel_path: i.rel_path.clone()?, uid: i.uid.clone(), question: shared::stop_question(i, home::now_ms()) })
@@ -9602,6 +9603,119 @@ mod tests {
         assert_eq!(h.sent(), ["shared list"]);
     }
 
+    /// The top of the Shared page's content: under the top bar, the toolbar's row and its gap.
+    fn shared_content_top() -> f32 {
+        chrome::TOP_BAR_HEIGHT + 34.0 + 8.0
+    }
+
+    /// The Shared arrows (`size` points) the last frame painted: how far each is turned, and where it is.
+    fn shared_arrows(h: &Harness, size: f32) -> Vec<(f32, egui::Pos2)> {
+        h.texts(|t| t.galley.job.text == icons::SYNC && t.galley.job.sections.iter().all(|s| s.format.font_id.size == size))
+            .iter()
+            .map(|t| (t.angle, t.pos + egui::emath::Rot2::from_angle(t.angle) * t.galley.mesh_bounds.center().to_vec2()))
+            .collect()
+    }
+
+    // #410: the first read shows the arrows turning in the empty picture's circle, the words under it, and no Refresh
+    #[test]
+    fn shared_first_load_turns_the_arrows_in_the_pictures_circle() {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared").unwrap());
+        h.frames(3);
+        let circles: Vec<_> = h.circles_filled(share_picture_colors(palette()).circle).into_iter().filter(|c| c.1 >= 40.0).collect();
+        assert_eq!(circles.len(), 1, "{circles:?}");
+        let (centre, radius) = circles[0];
+        // The arrows' painted middle is the circle's centre, and they're turned
+        let arrows = shared_arrows(&h, 44.0);
+        assert_eq!(arrows.len(), 1, "{arrows:?}");
+        assert!(arrows[0].1.distance(centre) < 2.0, "{:?} in {centre:?}", arrows[0].1);
+        assert!(arrows[0].0 > 0.0);
+        assert!(repaint_in(&h) <= home::TURN_FRAME);
+        let words = h.text_rect(shared::LOADING).expect("the loading words");
+        assert!((words.center().x - centre.x).abs() < 2.0 && words.top() > centre.y + radius, "centred under the circle");
+        assert!(h.widget_at("Refresh").is_none() && h.text_at(shared::REFRESHING).is_none());
+        assert!(h.nodes_named(icons::SYNC).is_empty(), "the arrows aren't announced");
+    }
+
+    // #410: Refresh on the empty page shows the same loading group
+    #[test]
+    fn shared_refresh_from_the_empty_page_shows_the_loading_group() {
+        let mut h = empty_shared();
+        h.sent();
+        h.app.load_shared();
+        h.frames(3);
+        let circles: Vec<_> = h.circles_filled(share_picture_colors(palette()).circle).into_iter().filter(|c| c.1 >= 40.0).collect();
+        assert_eq!(circles.len(), 1, "{circles:?}");
+        let arrows = shared_arrows(&h, 44.0);
+        assert_eq!(arrows.len(), 1, "{arrows:?}");
+        assert!(arrows[0].1.distance(circles[0].0) < 2.0 && arrows[0].0 > 0.0);
+        assert!(h.text_at(shared::LOADING).is_some());
+        assert!(h.text_at(shared::EMPTY_TITLE).is_none());
+    }
+
+    // #410: reloading a list greys its rows and turns the arrows in the toolbar, where Refresh was, at the same height
+    #[test]
+    fn shared_reload_turns_the_arrows_in_the_toolbar_and_keeps_the_rows_still() {
+        let mut h = shared_with_rows();
+        let name = shared_rows()[0].name.clone();
+        let before = h.text_rect(&name).expect("the first row").top();
+        let refresh = h.widget_at("Refresh").unwrap();
+        h.sent();
+        h.click(refresh);
+        h.frames(3);
+        let words = h.text_rect(shared::REFRESHING).expect("Refreshing…");
+        let arrows = shared_arrows(&h, 16.0);
+        assert_eq!(arrows.len(), 1, "{arrows:?}");
+        assert!(arrows[0].0 > 0.0, "turned");
+        assert!(arrows[0].1.x < words.left() && (arrows[0].1.y - words.center().y).abs() < 4.0, "{:?} left of {words:?}", arrows[0].1);
+        assert!((arrows[0].1.y - refresh.y).abs() < 4.0, "where Refresh was");
+        assert!(h.widget_at("Refresh").is_none() && h.text_at(shared::LOADING).is_none());
+        assert_eq!(h.text_rect(&name).unwrap().top(), before, "the rows stay put");
+        assert!(repaint_in(&h) <= home::TURN_FRAME);
+
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(shared_rows())));
+        h.frames(3);
+        assert!(h.text_at(shared::REFRESHING).is_none());
+        assert!(h.widget_at("Refresh").is_some());
+        assert_eq!(h.text_rect(&name).unwrap().top(), before, "the rows stay put");
+    }
+
+    // #410: still arrows and no fast frames with Reduce animation and in a screenshot
+    #[test]
+    fn shared_loading_arrows_are_still_in_a_screenshot_and_with_reduce_animation() {
+        let first_load = || {
+            let mut h = Harness::new();
+            h.click(h.text_at("Shared").unwrap());
+            h.frames(3);
+            h
+        };
+        home::AS_SCREENSHOT.with(|s| s.set(true));
+        let h = first_load();
+        home::AS_SCREENSHOT.with(|s| s.set(false));
+        let angles: Vec<f32> = shared_arrows(&h, 44.0).iter().map(|a| a.0).collect();
+        assert_eq!(angles, vec![0.0], "a screenshot");
+        assert!(repaint_in(&h) > home::TURN_FRAME);
+
+        home::NO_MOTION.with(|s| s.set(true));
+        let h = first_load();
+        home::NO_MOTION.with(|s| s.set(false));
+        let angles: Vec<f32> = shared_arrows(&h, 44.0).iter().map(|a| a.0).collect();
+        assert_eq!(angles, vec![0.0], "Reduce animation");
+        assert!(repaint_in(&h) > home::TURN_FRAME);
+    }
+
+    // #410: in a short zoomed window the loading group starts below the toolbar
+    #[test]
+    fn shared_loading_fits_a_short_zoomed_window() {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared").unwrap());
+        h.resize_zoomed(Vec2::new(840.0, 380.0), 1.2);
+        let (centre, radius) = h.circles_filled(share_picture_colors(palette()).circle).into_iter().find(|c| c.1 >= 40.0).expect("the picture");
+        assert!(centre.y - radius >= shared_content_top(), "nothing above the toolbar");
+        let words = h.text_rect(shared::LOADING).expect("the loading words");
+        assert!(words.top() >= centre.y + radius, "under the circle");
+    }
+
     #[test]
     fn a_reload_keeps_the_list_until_the_new_one_comes() {
         let mut h = Harness::new();
@@ -9613,11 +9727,12 @@ mod tests {
         h.click(h.widget_at("Refresh").unwrap());
         assert_eq!(h.sent(), ["shared list"]);
         h.frames(3);
-        assert!(h.text_at(shared::LOADING).is_some());
+        assert!(h.text_at(shared::REFRESHING).is_some());
+        assert!(h.text_at(shared::LOADING).is_none());
         assert!(h.text_at(&rows[0].name).is_some());
         h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(rows.clone())));
         h.frames(3);
-        assert!(h.text_at(shared::LOADING).is_none());
+        assert!(h.text_at(shared::REFRESHING).is_none());
     }
 
     #[test]
@@ -9699,12 +9814,13 @@ mod tests {
         h.click(h.text_at("Shared").unwrap());
         let older = new;
         h.event(WorkerEvent::SharedLoaded(older, Ok(vec![])));
+        h.frames(3);
         assert!(h.app.shared.loading);
-        assert!(h.text_at(shared::LOADING).is_some());
+        assert!(h.text_at(shared::REFRESHING).is_some());
     }
 
     #[test]
-    fn refresh_does_nothing_while_a_read_is_out() {
+    fn refresh_is_not_offered_while_a_read_is_out() {
         let mut h = Harness::new();
         h.click(h.text_at("Shared").unwrap());
         h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(shared_rows())));
@@ -9715,7 +9831,7 @@ mod tests {
         h.click(h.widget_at("Refresh").unwrap());
         assert_eq!(h.sent(), ["shared list"]);
         h.frames(3);
-        h.click(h.widget_at("Refresh").unwrap());
+        assert!(h.widget_at("Refresh").is_none(), "no Refresh while the read is out");
         assert_eq!(h.sent(), Vec::<String>::new());
     }
 
@@ -10227,7 +10343,7 @@ mod tests {
         for p in &people {
             assert!(p.distance(centre) < radius + 20.0, "{p:?} by {centre:?}");
         }
-        let top = h.widget_at("Refresh").expect("Refresh").y + 20.0;
+        let top = shared_content_top();
         let share = (centre.y - top) / (h.screen.y - top);
         assert!((0.25..=0.60).contains(&share), "{share} of the way down");
         // The group as a whole sits above the middle: that is what measuring its height gets (unmeasured, it is at 0.5)
@@ -10269,7 +10385,7 @@ mod tests {
         }
         // Too short for all of it: the group starts below the toolbar, in order, and the page scrolls to the rest
         h.resize_zoomed(Vec2::new(840.0, 380.0), 1.2);
-        let toolbar = h.widget_at("Refresh").expect("Refresh").y + 20.0;
+        let toolbar = shared_content_top();
         let picture = h.circles_filled(share_picture_colors(palette()).circle).into_iter().find(|c| c.1 >= 40.0).expect("the picture");
         let title = h.text_rect(shared::EMPTY_TITLE).unwrap();
         let how = h.text_rect(shared::EMPTY_HOW).unwrap();

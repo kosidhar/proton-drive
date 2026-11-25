@@ -546,13 +546,35 @@ fn turned_pos(min: egui::Pos2, centre: Vec2, angle: f32) -> egui::Pos2 {
 
 /// `decoration`, turned `angle` radians clockwise around the glyph's own middle, in the same place and size, so that
 /// it turns without wobbling.
-fn turning_decoration(ui: &mut egui::Ui, icon: &str, size: f32, color: Color32, angle: f32) -> egui::Response {
+pub(crate) fn turning_decoration(ui: &mut egui::Ui, icon: &str, size: f32, color: Color32, angle: f32) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(icon.to_owned(), icons::font(size), color);
     let (rect, response) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
     // The middle of the glyph's own shape, which needn't be the middle of its line's box
     let pos = turned_pos(rect.min, galley.mesh_bounds.center().to_vec2(), angle);
     ui.painter().add(egui::epaint::TextShape::new(pos, galley, color).with_angle(angle));
     response
+}
+
+/// Paints `icon` turned `angle` radians clockwise with the middle of its shape at `centre`, for a glyph that sits in
+/// something of its own (a circle) rather than taking up room in a row.
+pub(crate) fn paint_turned_glyph(painter: &egui::Painter, centre: egui::Pos2, icon: &str, size: f32, color: Color32, angle: f32) {
+    let galley = painter.layout_no_wrap(icon.to_owned(), icons::font(size), color);
+    let middle = galley.mesh_bounds.center().to_vec2();
+    let pos = turned_pos(centre - middle, middle, angle);
+    painter.add(egui::epaint::TextShape::new(pos, galley, color).with_angle(angle));
+}
+
+/// The angle for the arrows this frame. When they may move, it is how far they have turned, and the next frame is asked
+/// for soon enough to look smooth (unless the window is minimized, which no one sees). Otherwise they are still and
+/// nothing is asked for.
+pub(crate) fn turning_angle(ui: &egui::Ui) -> f32 {
+    if !glyph_may_turn() {
+        return 0.0;
+    }
+    if !ui.ctx().input(|i| i.viewport().minimized == Some(true)) {
+        ui.ctx().request_repaint_after(TURN_FRAME);
+    }
+    turn_angle(ui.input(|i| i.time))
 }
 
 /// The status card's glyph, one per state, in the headline's colour.
@@ -903,11 +925,7 @@ impl ProtonDriveNativeApp {
         // The headline says it for screen readers: the glyph is only painted
         let (glyph, color) = status_icon(summary);
         if status_glyph_turns(summary) && glyph_may_turn() {
-            turning_decoration(ui, glyph, 32.0, color, turn_angle(ui.input(|i| i.time)));
-            // The next turn's frame, unless no one can see it
-            if !ui.ctx().input(|i| i.viewport().minimized == Some(true)) {
-                ui.ctx().request_repaint_after(TURN_FRAME);
-            }
+            turning_decoration(ui, glyph, 32.0, color, turning_angle(ui));
         } else {
             decoration(ui, glyph, 32.0, color);
         }
