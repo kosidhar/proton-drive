@@ -16,15 +16,7 @@ export function openBrowserUrl(rawUrl: string, spawnFn: typeof spawn = spawn): P
     return new Promise((resolve) => {
         const options = { detached: true, stdio: 'ignore' } as const;
         try {
-            const child =
-                process.platform === 'darwin'
-                    ? spawnFn('open', [url], options)
-                    : process.platform === 'win32'
-                      ? // /d: skip auto run
-                        // /s: make quoting rules more strict
-                        // /c: execute command and exit
-                        spawnFn('start', ['', url], { ...options, windowsHide: true })
-                      : spawnFn('xdg-open', [url], options);
+            const child = spawnFn('xdg-open', [url], options);
 
             child.once('error', (err) => resolve({ ok: false, reason: err.message }));
             child.once('spawn', () => resolve({ ok: true }));
