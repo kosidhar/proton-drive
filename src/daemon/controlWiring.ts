@@ -1,4 +1,4 @@
-import { syncLoginEntry } from '../linux/autostart';
+import { autostartEntryPath, syncLoginEntry } from '../linux/autostart';
 import type { ProtonDriveSyncEngine } from '../sync/syncEngine';
 import type { SyncStateDatabase } from '../sync/syncStateDb';
 import type { ControlServerOptions } from './controlServer';
@@ -50,7 +50,7 @@ export function controlServerOptions(deps: {
                     const result = syncLoginEntry(stateDb, { explicit: true });
                     if (result === 'unsupported') throw new Error('Proton Drive can not start itself at login from inside Flatpak');
                     if (result === 'not-ours') {
-                        throw new Error('~/.config/autostart/proton-drive.desktop is your own entry: Proton Drive leaves it alone');
+                        throw new Error(`${autostartEntryPath()} is your own entry: Proton Drive leaves it alone`);
                     }
                 },
             }),

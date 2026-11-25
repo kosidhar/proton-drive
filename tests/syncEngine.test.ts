@@ -55,7 +55,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
     let stateDb: SyncStateDatabase;
 
     beforeEach(async () => {
-        tempDir = await mkdtemp(path.join(tmpdir(), 'proton-drive-ubuntu-test-'));
+        tempDir = await mkdtemp(path.join(tmpdir(), 'protondrive-test-'));
         stateDb = new SyncStateDatabase(path.join(tempDir, 'state.sqlite'));
         stateDb.updateSettings({
             syncDir: path.join(tempDir, 'ProtonDrive'),

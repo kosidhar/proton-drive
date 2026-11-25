@@ -29,8 +29,8 @@ const setup = () => {
 
 describe('the login entry', () => {
     test('lives in $XDG_CONFIG_HOME/autostart, or ~/.config/autostart', () => {
-        expect(autostartEntryPath({ XDG_CONFIG_HOME: '/x/cfg', HOME: '/home/u' })).toBe('/x/cfg/autostart/proton-drive.desktop');
-        expect(autostartEntryPath({ HOME: '/home/u' })).toBe('/home/u/.config/autostart/proton-drive.desktop');
+        expect(autostartEntryPath({ XDG_CONFIG_HOME: '/x/cfg', HOME: '/home/u' })).toBe('/x/cfg/autostart/kosidhar-protondrive.desktop');
+        expect(autostartEntryPath({ HOME: '/home/u' })).toBe('/home/u/.config/autostart/kosidhar-protondrive.desktop');
     });
 
     test('runs the daemon itself, a process that stays: the installed binary, the AppImage, or bun and the script', () => {
@@ -58,6 +58,7 @@ describe('the login entry', () => {
         expect(entry).toContain('Exec="/opt/Proton Drive/100%%/pro\\\\"ton\\\\$" daemon\n');
         expect(entry).toContain('TryExec=/opt/Proton Drive/100%/pro"ton$\n');
         expect(entry).toContain('X-ProtonDrive-Autostart=true\n');
+        expect(entry).toContain('\nIcon=io.github.kosidhar.ProtonDrive\n');
         expect(desktopEntry(['/usr/bin/protondrive', 'daemon'])).toContain('Exec=/usr/bin/protondrive daemon\n');
         // A newline or a backslash never breaks the line: escaped as a string value, in Exec and TryExec
         const odd = desktopEntry(['/a b/x\\y\nz', 'daemon']);
@@ -146,7 +147,7 @@ describe('the login entry follows the setting', () => {
 
     test('inside Flatpak nothing is written: the session never reads the sandbox', () => {
         const { stateDb, file } = setup();
-        const env = { XDG_CONFIG_HOME: path.dirname(path.dirname(file)), FLATPAK_ID: 'ch.proton.drive' };
+        const env = { XDG_CONFIG_HOME: path.dirname(path.dirname(file)), FLATPAK_ID: 'io.github.kosidhar.ProtonDrive' };
         expect(syncLoginEntry(stateDb, { command: ['/app/bin/protondrive', 'daemon'], env, explicit: false })).toBe('unsupported');
         expect(existsSync(file)).toBe(false);
         stateDb.close();

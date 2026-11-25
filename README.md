@@ -10,10 +10,10 @@ Built to work out-of-the-box across all major Linux distributions and desktop en
 
 | Format | Output Artifact (`dist/release/`) | Target Distributions |
 | :--- | :--- | :--- |
-| **AppImage** | `protondrive-0.1.0-linux-x86_64.AppImage` | **Universal** — runs on any Linux distro (Ubuntu, Fedora, Arch, openSUSE, Mint, NixOS, SteamOS) without installation |
-| **Debian / Ubuntu (`.deb`)** | `protondrive-0.1.0-linux-amd64.deb` | Debian, Ubuntu, Linux Mint, Pop!\_OS, Zorin OS, Elementary OS, Kali |
-| **Fedora / RHEL / SUSE (`.rpm`)** | `protondrive-0.1.0-linux-x86_64.rpm` | Fedora, RHEL, CentOS Stream, Rocky Linux, AlmaLinux, openSUSE Tumbleweed / Leap |
-| **Portable Tarball (`.tar.gz`)** | `protondrive-0.1.0-linux-x86_64.tar.gz` | Any Linux distro — includes FHS tree (`bin/`, `share/`, `lib/systemd/user/`) and universal `install.sh` (`--user` or `--system`) |
+| **AppImage** | `kosidhar-protondrive-0.1.0-linux-x86_64.AppImage` | **Universal** — runs on any Linux distro (Ubuntu, Fedora, Arch, openSUSE, Mint, NixOS, SteamOS) without installation |
+| **Debian / Ubuntu (`.deb`)** | `kosidhar-protondrive-0.1.0-linux-amd64.deb` | Debian, Ubuntu, Linux Mint, Pop!\_OS, Zorin OS, Elementary OS, Kali |
+| **Fedora / RHEL / SUSE (`.rpm`)** | `kosidhar-protondrive-0.1.0-linux-x86_64.rpm` | Fedora, RHEL, CentOS Stream, Rocky Linux, AlmaLinux, openSUSE Tumbleweed / Leap |
+| **Portable Tarball (`.tar.gz`)** | `kosidhar-protondrive-0.1.0-linux-x86_64.tar.gz` | Any Linux distro — includes FHS tree (`bin/`, `share/`, `lib/systemd/user/`) and universal `install.sh` (`--user` or `--system`) |
 | **Arch Linux (`PKGBUILD`)** | `packaging/linux/arch/PKGBUILD` | Arch Linux, Manjaro, EndeavourOS, Garuda (`makepkg -si`) |
 | **Flatpak Bundle (`.flatpak`)** | `packaging/linux/flatpak-bundle.sh` | Sandboxed Flatpak bundle for Flathub / Fedora Silverblue / immutable distros |
 
@@ -23,10 +23,10 @@ Built to work out-of-the-box across all major Linux distributions and desktop en
 
 - **Native Rust Desktop App (`protondrive-gui`)**:
   - Built with `eframe`/`egui` in Rust using Proton's **Carbon Dark** design palette and embedded `Inter` + `JetBrains Mono` typography.
-  - Proper Freedesktop reverse-DNS App ID (`ch.proton.drive`), `StartupWMClass=ch.proton.drive`, AppStream metainfo, and complete `hicolor` icon theme (`16x16` through `512x512` + `scalable` SVG) so docks and taskbars display the official Proton Drive icon across X11 and Wayland.
+  - Proper Freedesktop reverse-DNS App ID (`io.github.kosidhar.ProtonDrive`), `StartupWMClass=io.github.kosidhar.ProtonDrive`, AppStream metainfo, and complete `hicolor` icon theme (`16x16` through `512x512` + `scalable` SVG) so docks and taskbars display the app's icon across X11 and Wayland.
   - **Home, Activity and Settings:** **Home** shows whether everything is in sync, what needs you (signed in to another Proton account than your files were synced with, conflicts, missing files, a drive that isn't mounted), what is uploading or downloading, and your drive with **Open in Files** and **Free up space…** for the whole drive. **Activity** lists what was synced, with a search. **Settings** holds your account, the virtual drive switch, blocked apps, what is hidden from this computer, and the sync preferences, with **Start Proton Drive when I log in**. Keeping files on this device and freeing up space are done from the right-click menu in Files.
   - **Self-Starting Companion Daemon**: Launching the GUI automatically spawns `protondrive daemon` in the background if it is not already running.
-  - **Starts at login**: Proton Drive starts when you log in (the daemon, so syncing and the drive, and the tray icon), without opening the window. Turn it off in Settings with **Start Proton Drive when I log in**, or with your desktop's own startup-apps settings. It is an XDG autostart entry, `~/.config/autostart/proton-drive.desktop`, which runs `protondrive daemon`; `install.sh --uninstall` removes it. If you enabled the systemd unit instead, that starts Proton Drive and no entry is written. Not available in the Flatpak build.
+  - **Starts at login**: Proton Drive starts when you log in (the daemon, so syncing and the drive, and the tray icon), without opening the window. Turn it off in Settings with **Start Proton Drive when I log in**, or with your desktop's own startup-apps settings. It is an XDG autostart entry, `~/.config/autostart/kosidhar-protondrive.desktop`, which runs `protondrive daemon`; `install.sh --uninstall` removes it. If you enabled the systemd unit instead, that starts Proton Drive and no entry is written. Not available in the Flatpak build.
 - **Event-Driven Two-Way Folder Synchronization (`~/ProtonDrive`)**:
   - Real-time remote changes via Proton Drive SDK event subscriptions (`subscribeToDriveEvents` & `subscribeToTreeEvents`) with persisted cursors.
   - Real-time local filesystem watching via Linux `inotify` (`fs.watch`) with debouncing and atomic writes.
@@ -69,10 +69,10 @@ Proton Drive shows up in your file manager's sidebar as **Proton Drive**. It lis
 ```
 
 This outputs all 4 universal release artifacts to `./dist/release/`:
-- `dist/release/protondrive-0.1.0-linux-x86_64.AppImage`
-- `dist/release/protondrive-0.1.0-linux-amd64.deb`
-- `dist/release/protondrive-0.1.0-linux-x86_64.rpm`
-- `dist/release/protondrive-0.1.0-linux-x86_64.tar.gz`
+- `dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.AppImage`
+- `dist/release/kosidhar-protondrive-0.1.0-linux-amd64.deb`
+- `dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.rpm`
+- `dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.tar.gz`
 
 ### Option A: Universal Per-User Install (Any Distro, No Root Needed)
 
@@ -86,22 +86,22 @@ Install `fuse3` from your distro first if you want the virtual drive.
 ### Option B: Debian / Ubuntu / Mint / Pop!\_OS (`.deb`)
 
 ```bash
-sudo dpkg -i ./dist/release/protondrive-0.1.0-linux-amd64.deb
+sudo dpkg -i ./dist/release/kosidhar-protondrive-0.1.0-linux-amd64.deb
 systemctl --user enable --now protondrive.service
 ```
 
 ### Option C: Fedora / RHEL / openSUSE (`.rpm`)
 
 ```bash
-sudo dnf install ./dist/release/protondrive-0.1.0-linux-x86_64.rpm
+sudo dnf install ./dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.rpm
 systemctl --user enable --now protondrive.service
 ```
 
 ### Option D: Universal AppImage (Zero Installation)
 
 ```bash
-chmod +x ./dist/release/protondrive-0.1.0-linux-x86_64.AppImage
-./dist/release/protondrive-0.1.0-linux-x86_64.AppImage
+chmod +x ./dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.AppImage
+./dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.AppImage
 ```
 
 ---

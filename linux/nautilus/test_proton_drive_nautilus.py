@@ -772,6 +772,14 @@ class CopyLinkTest(unittest.TestCase):
             )
 
 
+class NotificationIconTest(unittest.TestCase):
+    # #413: the app's own ID
+    def test_the_notification_carries_the_apps_icon(self):
+        with mock.patch.object(ext, "_spawn_detached") as spawn:
+            ext._notify("t", "b")
+        self.assertIn("--icon=io.github.kosidhar.ProtonDrive", spawn.call_args.args[0])
+
+
 class OtherFileManagersTest(unittest.TestCase):
     """#212: Nemo and Dolphin, which have no file actions yet, keep their app item, named for what it opens."""
 
@@ -784,7 +792,7 @@ class OtherFileManagersTest(unittest.TestCase):
         with open(os.path.join(linux, "dolphin", "protondrive.desktop")) as f:
             dolphin = f.read()
         # Dolphin groups the actions under a "Proton Drive" submenu, so the item needs no prefix there
-        self.assertIn("Name=Status & Settings…\nIcon=ch.proton.drive\nExec=protondrive-gui --tab home", dolphin)
+        self.assertIn("Name=Status & Settings…\nIcon=io.github.kosidhar.ProtonDrive\nExec=protondrive-gui --tab home", dolphin)
         self.assertNotIn("Name=Open Proton Drive", dolphin)
 
 

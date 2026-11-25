@@ -101,13 +101,12 @@ WARNING
 if [ "$UNINSTALL" -eq 1 ]; then
   echo "==> Uninstalling Proton Drive from $PREFIX..."
   systemctl --user disable --now protondrive.service 2>/dev/null || true
-  systemctl --user disable --now proton-drive-ubuntu.service 2>/dev/null || true
-  rm -f "$PREFIX/bin/protondrive" "$PREFIX/bin/protondrive-gui" "$PREFIX/bin/protondrive-vfs" "$PREFIX/bin/proton-drive-ubuntu"
-  rm -f "$PREFIX/share/applications/ch.proton.drive.desktop" "$PREFIX/share/applications/proton-drive.desktop"
-  rm -f "$PREFIX/share/metainfo/ch.proton.drive.metainfo.xml"
+  rm -f "$PREFIX/bin/protondrive" "$PREFIX/bin/protondrive-gui" "$PREFIX/bin/protondrive-vfs"
+  rm -f "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.desktop"
+  rm -f "$PREFIX/share/metainfo/io.github.kosidhar.ProtonDrive.metainfo.xml"
   rm -f "$SYSTEMD_USER_DIR/protondrive.service"
   # The login entry the daemon wrote (#92), only if it is ours: a user's own entry of that name stays
-  autostart_entry="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/proton-drive.desktop"
+  autostart_entry="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/kosidhar-protondrive.desktop"
   if [ "$(id -u)" -ne 0 ] && grep -qx 'X-ProtonDrive-Autostart=true' "$autostart_entry" 2>/dev/null; then
     rm -f "$autostart_entry"
     # Forget it was written, so a reinstall starts at login again rather than reading this as the user turning it off
@@ -118,13 +117,12 @@ if [ "$UNINSTALL" -eq 1 ]; then
   fi
   rm -f "$PREFIX/share/icons/hicolor/scalable/emblems/emblem-protondrive-"*.svg
   # The file manager integrations and the tray, so Files, Nemo and Dolphin stop offering Proton Drive (#54)
-  rm -f "$PREFIX/share/nautilus-python/extensions/ch_proton_drive_nautilus.py" \
-    "$PREFIX/share/nautilus-python/extensions/proton_drive_nautilus.py" \
+  rm -f "$PREFIX/share/nautilus-python/extensions/kosidhar_protondrive_nautilus.py" \
     "$PREFIX/share/nemo-python/extensions/proton_drive_nemo.py" \
     "$PREFIX/share/kio/servicemenus/protondrive.desktop"
   rm -rf "$PREFIX/share/protondrive"
   # The parentheses matter: without them -delete applies to the last name only (#54)
-  find "$PREFIX/share/icons/hicolor" \( -name "ch.proton.drive.*" -o -name "protondrive.*" -o -name "protondrive-tray-*" \) \
+  find "$PREFIX/share/icons/hicolor" \( -name "io.github.kosidhar.ProtonDrive.*" -o -name "protondrive.*" -o -name "protondrive-tray-*" \) \
     -delete 2>/dev/null || true
   command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$PREFIX/share/applications" 2>/dev/null || true
   command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f "$PREFIX/share/icons/hicolor" 2>/dev/null || true
@@ -150,24 +148,21 @@ if [ -d "$SRC_Root/bin" ]; then
   install -Dm755 "$SRC_Root/bin/protondrive-gui" "$PREFIX/bin/protondrive-gui"
   # The virtual drive helper must sit next to protondrive (the daemon looks beside itself first)
   install -Dm755 "$SRC_Root/bin/protondrive-vfs" "$PREFIX/bin/protondrive-vfs"
-  ln -sf protondrive "$PREFIX/bin/proton-drive-ubuntu"
   cp -R "$SRC_Root/share/icons/hicolor" "$PREFIX/share/icons/"
   [ -d "$SRC_Root/share/protondrive" ] && cp -R "$SRC_Root/share/protondrive/"* "$PREFIX/share/protondrive/"
-  install -Dm644 "$SRC_Root/share/applications/ch.proton.drive.desktop" "$PREFIX/share/applications/ch.proton.drive.desktop"
-  [ -f "$SRC_Root/share/metainfo/ch.proton.drive.metainfo.xml" ] && \
-    install -Dm644 "$SRC_Root/share/metainfo/ch.proton.drive.metainfo.xml" "$PREFIX/share/metainfo/ch.proton.drive.metainfo.xml"
-  rm -f "$PREFIX/share/nautilus-python/extensions/proton_drive_nautilus.py"
-  [ -f "$SRC_Root/share/nautilus-python/extensions/ch_proton_drive_nautilus.py" ] && \
-    install -Dm644 "$SRC_Root/share/nautilus-python/extensions/ch_proton_drive_nautilus.py" "$PREFIX/share/nautilus-python/extensions/ch_proton_drive_nautilus.py"
+  install -Dm644 "$SRC_Root/share/applications/io.github.kosidhar.ProtonDrive.desktop" "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.desktop"
+  [ -f "$SRC_Root/share/metainfo/io.github.kosidhar.ProtonDrive.metainfo.xml" ] && \
+    install -Dm644 "$SRC_Root/share/metainfo/io.github.kosidhar.ProtonDrive.metainfo.xml" "$PREFIX/share/metainfo/io.github.kosidhar.ProtonDrive.metainfo.xml"
+  [ -f "$SRC_Root/share/nautilus-python/extensions/kosidhar_protondrive_nautilus.py" ] && \
+    install -Dm644 "$SRC_Root/share/nautilus-python/extensions/kosidhar_protondrive_nautilus.py" "$PREFIX/share/nautilus-python/extensions/kosidhar_protondrive_nautilus.py"
   [ -f "$SRC_Root/share/nemo-python/extensions/proton_drive_nemo.py" ] && \
     install -Dm644 "$SRC_Root/share/nemo-python/extensions/proton_drive_nemo.py" "$PREFIX/share/nemo-python/extensions/proton_drive_nemo.py"
   [ -f "$SRC_Root/share/kio/servicemenus/protondrive.desktop" ] && \
     install -Dm644 "$SRC_Root/share/kio/servicemenus/protondrive.desktop" "$PREFIX/share/kio/servicemenus/protondrive.desktop"
 else
-  install -Dm755 "$SRC_Root/release/proton-drive-ubuntu" "$PREFIX/bin/protondrive"
+  install -Dm755 "$SRC_Root/release/protondrive" "$PREFIX/bin/protondrive"
   install -Dm755 "$SRC_Root/release/protondrive-gui" "$PREFIX/bin/protondrive-gui"
   install -Dm755 "$SRC_Root/release/protondrive-vfs" "$PREFIX/bin/protondrive-vfs"
-  ln -sf protondrive "$PREFIX/bin/proton-drive-ubuntu"
   cp -R "$SRC_Root/assets/app-icon/hicolor" "$PREFIX/share/icons/"
   cp -R "$SRC_Root/assets/app-icon/tray/"*.png "$PREFIX/share/protondrive/tray/"
   cp -R "$SRC_Root/assets/app-icon/tray/"*.png "$PREFIX/share/icons/hicolor/64x64/apps/"
@@ -175,9 +170,8 @@ else
   for emblem in "$SRC_Root"/linux/icons/emblems/emblem-protondrive-*.svg; do
     install -Dm644 "$emblem" "$PREFIX/share/icons/hicolor/scalable/emblems/$(basename "$emblem")"
   done
-  install -Dm644 "$SRC_Root/packaging/linux/ch.proton.drive.desktop" "$PREFIX/share/applications/ch.proton.drive.desktop"
-  rm -f "$PREFIX/share/nautilus-python/extensions/proton_drive_nautilus.py"
-  install -Dm644 "$SRC_Root/linux/nautilus/proton_drive_nautilus.py" "$PREFIX/share/nautilus-python/extensions/ch_proton_drive_nautilus.py"
+  install -Dm644 "$SRC_Root/packaging/linux/io.github.kosidhar.ProtonDrive.desktop" "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.desktop"
+  install -Dm644 "$SRC_Root/linux/nautilus/proton_drive_nautilus.py" "$PREFIX/share/nautilus-python/extensions/kosidhar_protondrive_nautilus.py"
   install -Dm644 "$SRC_Root/linux/nemo/proton_drive_nemo.py" "$PREFIX/share/nemo-python/extensions/proton_drive_nemo.py"
   install -Dm644 "$SRC_Root/linux/dolphin/protondrive.desktop" "$PREFIX/share/kio/servicemenus/protondrive.desktop"
 fi
@@ -201,9 +195,8 @@ EOF
 
 if [ "$MODE" = "user" ]; then
   # Rewrite Exec= and Icon= in user desktop entry so it works even if ~/.local/bin is not in the display manager's PATH
-  sed -i "s|^Exec=.*|Exec=$PREFIX/bin/protondrive-gui|; s|^TryExec=.*|TryExec=$PREFIX/bin/protondrive-gui|; s|^Icon=.*|Icon=$PREFIX/share/icons/hicolor/256x256/apps/ch.proton.drive.png|" \
-    "$PREFIX/share/applications/ch.proton.drive.desktop"
-  rm -f "$PREFIX/share/applications/proton-drive.desktop"
+  sed -i "s|^Exec=.*|Exec=$PREFIX/bin/protondrive-gui|; s|^TryExec=.*|TryExec=$PREFIX/bin/protondrive-gui|; s|^Icon=.*|Icon=$PREFIX/share/icons/hicolor/256x256/apps/io.github.kosidhar.ProtonDrive.png|" \
+    "$PREFIX/share/applications/io.github.kosidhar.ProtonDrive.desktop"
 fi
 
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$PREFIX/share/applications" 2>/dev/null || true

@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { APP_ID } from './appId';
 
 export type NotificationUrgency = 'low' | 'normal' | 'critical';
 
@@ -45,7 +46,7 @@ export function sendDesktopNotification(options: {
     }
 
     const urgency = options.urgency ?? 'normal';
-    const icon = options.icon ?? 'ch.proton.drive';
+    const icon = options.icon ?? APP_ID;
 
     try {
         const child = spawn(
@@ -92,7 +93,7 @@ export async function sendActionNotification(options: {
         options.command ?? 'notify-send',
         '--app-name=Proton Drive',
         `--urgency=${options.urgency ?? 'normal'}`,
-        `--icon=${options.icon ?? 'ch.proton.drive'}`,
+        `--icon=${options.icon ?? APP_ID}`,
         '--wait',
         ...options.actions.map((action) => `--action=${action.key}=${action.label}`),
         options.title,
@@ -112,7 +113,7 @@ export async function sendActionNotification(options: {
     }
 }
 
-export async function getSystemdServiceStatus(serviceName = 'proton-drive-ubuntu.service'): Promise<{
+export async function getSystemdServiceStatus(serviceName = 'protondrive.service'): Promise<{
     installed: boolean;
     enabled: boolean;
     active: boolean;

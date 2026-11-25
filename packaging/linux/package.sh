@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Build and package Proton Drive for Linux (<arch> is x86_64 or aarch64):
 #
-#   $DIST/protondrive-<version>-linux-<arch>.AppImage  any distro with glibc >= host
-#   $DIST/protondrive-<version>-linux-<deb_arch>.deb   Debian, Ubuntu, Mint, Pop!_OS, Zorin, ...
-#   $DIST/protondrive-<version>-linux-<arch>.rpm       Fedora, openSUSE, RHEL, Rocky, Alma, ...
-#   $DIST/protondrive-<version>-linux-<arch>.tar.gz    portable FHS tree + universal install.sh
+#   $DIST/kosidhar-protondrive-<version>-linux-<arch>.AppImage  any distro with glibc >= host
+#   $DIST/kosidhar-protondrive-<version>-linux-<deb_arch>.deb   Debian, Ubuntu, Mint, Pop!_OS, Zorin, ...
+#   $DIST/kosidhar-protondrive-<version>-linux-<arch>.rpm       Fedora, openSUSE, RHEL, Rocky, Alma, ...
+#   $DIST/kosidhar-protondrive-<version>-linux-<arch>.tar.gz    portable FHS tree + universal install.sh
 #
 # Usage: packaging/linux/package.sh [--skip-build] [--formats "appimage deb rpm tar"]
 set -euo pipefail
@@ -13,7 +13,7 @@ export PATH="$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.local/bin:$PATH"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HERE="$ROOT/packaging/linux"
-APP_ID="ch.proton.drive"
+APP_ID="io.github.kosidhar.ProtonDrive"
 VERSION="0.1.0"
 BUILD_DATE="$(date -u +%Y-%m-%d)"
 DIST="$ROOT/dist/release"
@@ -38,7 +38,7 @@ case "$ARCH" in
 esac
 
 export PROTONDRIVE_MAINTAINER="${PROTONDRIVE_MAINTAINER:-Gautam Chauhan <gautam@linux.local>}"
-BASENAME="protondrive-$VERSION-linux-$ARCH"
+BASENAME="kosidhar-protondrive-$VERSION-linux-$ARCH"
 mkdir -p "$DIST" "$ROOT/release" "$CARGO_TARGET_DIR"
 
 echo "==> Proton Drive $VERSION for Linux $ARCH ($FORMATS)"
@@ -60,10 +60,9 @@ rm -rf "$WORK"
 mkdir -p "$STAGE"
 
 # ---- Stage shared FHS tree (used by tar, deb, rpm, AppImage, Flatpak, Arch) ----
-install -Dm755 "$ROOT/release/proton-drive-ubuntu" "$STAGE/usr/bin/protondrive"
+install -Dm755 "$ROOT/release/protondrive" "$STAGE/usr/bin/protondrive"
 install -Dm755 "$ROOT/release/protondrive-gui" "$STAGE/usr/bin/protondrive-gui"
 install -Dm755 "$ROOT/release/protondrive-vfs" "$STAGE/usr/bin/protondrive-vfs"
-ln -sf protondrive "$STAGE/usr/bin/proton-drive-ubuntu"
 strip "$STAGE/usr/bin/protondrive-gui" "$STAGE/usr/bin/protondrive-vfs" 2>/dev/null || true
 
 install -Dm644 "$HERE/$APP_ID.desktop" "$STAGE/usr/share/applications/$APP_ID.desktop"
@@ -83,7 +82,7 @@ done
 
 # File manager integrations (GNOME Nautilus, Cinnamon Nemo, KDE Dolphin)
 install -Dm644 "$ROOT/linux/nautilus/proton_drive_nautilus.py" \
-  "$STAGE/usr/share/nautilus-python/extensions/ch_proton_drive_nautilus.py"
+  "$STAGE/usr/share/nautilus-python/extensions/kosidhar_protondrive_nautilus.py"
 install -Dm644 "$ROOT/linux/nemo/proton_drive_nemo.py" \
   "$STAGE/usr/share/nemo-python/extensions/proton_drive_nemo.py"
 install -Dm644 "$ROOT/linux/dolphin/protondrive.desktop" \
@@ -107,7 +106,6 @@ Environment=NODE_ENV=production
 [Install]
 WantedBy=default.target
 EOF
-ln -sf protondrive.service "$STAGE/usr/lib/systemd/user/proton-drive-ubuntu.service"
 
 if command -v desktop-file-validate >/dev/null 2>&1; then
   desktop-file-validate "$STAGE/usr/share/applications/$APP_ID.desktop"
@@ -148,9 +146,8 @@ if has deb || has rpm; then
   export NFPM_ARCH="$DEB_ARCH"
   sed "s|\${STAGE}|$STAGE|g" "$HERE/nfpm.yaml" > "$WORK/nfpm.yaml"
   if has deb; then
-    (cd "$ROOT" && "$NFPM_TOOL" package -f "$WORK/nfpm.yaml" -p deb -t "$DIST/protondrive-${VERSION}-linux-${DEB_ARCH}.deb")
-    cp -f "$DIST/protondrive-${VERSION}-linux-${DEB_ARCH}.deb" "$ROOT/release/proton-drive-ubuntu_${VERSION}_${DEB_ARCH}.deb"
-    echo "wrote $DIST/protondrive-${VERSION}-linux-${DEB_ARCH}.deb"
+    (cd "$ROOT" && "$NFPM_TOOL" package -f "$WORK/nfpm.yaml" -p deb -t "$DIST/kosidhar-protondrive-${VERSION}-linux-${DEB_ARCH}.deb")
+    echo "wrote $DIST/kosidhar-protondrive-${VERSION}-linux-${DEB_ARCH}.deb"
   fi
   if has rpm; then
     (cd "$ROOT" && "$NFPM_TOOL" package -f "$WORK/nfpm.yaml" -p rpm -t "$DIST/$BASENAME.rpm")

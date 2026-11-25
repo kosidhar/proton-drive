@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # Repackage a Proton Drive Linux tarball as a single-file Flatpak bundle:
-#   dist/release/protondrive-<version>-linux-<arch>.flatpak
+#   dist/release/kosidhar-protondrive-<version>-linux-<arch>.flatpak
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HERE="$ROOT/packaging/linux"
-APP_ID="ch.proton.drive"
+APP_ID="io.github.kosidhar.ProtonDrive"
 VERSION="0.1.0"
 DIST="$ROOT/dist/release"
 CARGO_TARGET_DIR="$ROOT/native-gui/target"
 FLATHUB="https://dl.flathub.org/repo/flathub.flatpakrepo"
 
 ARCH="$(uname -m)"
-BASENAME="protondrive-$VERSION-linux-$ARCH"
+BASENAME="kosidhar-protondrive-$VERSION-linux-$ARCH"
 TARBALL="${1:-$DIST/$BASENAME.tar.gz}"
 
 [ -f "$TARBALL" ] || { echo "error: $TARBALL not found (run packaging/linux/package.sh --formats tar first)" >&2; exit 1; }

@@ -7,10 +7,10 @@ X-KDE-Submenu=Proton Drive
 
 [Desktop Action ProtonDriveSyncNow]
 Name=Sync Now
-Icon=ch.proton.drive
+Icon=io.github.kosidhar.ProtonDrive
 Exec=protondrive sync
 
 [Desktop Action ProtonDriveOpenGui]
 Name=Status & Settings…
-Icon=ch.proton.drive
+Icon=io.github.kosidhar.ProtonDrive
 Exec=protondrive-gui --tab home
