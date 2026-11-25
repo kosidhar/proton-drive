@@ -5597,13 +5597,26 @@ export class ProtonDriveSyncEngine {
         // A local file in an unresolved collision stands for no node: the cloud file at its path is another device's,
         // which stays where it is (#29)
         const sourceCollides = !ignoredFrom && source?.isFile() === true && (await this.collidingLocalFile(fromRel, sourceEntry)) !== null;
-        const sourceUid =
-            ignoredFrom || sourceCollides
-                ? null
-                : (this.stateDb.getItemByPath(fromRel)?.nodeUid ?? this.stateDb.getEditBaseline(fromRel)?.nodeUid ?? nodeUidOf(sourceEntry));
+        // A local item of the other kind than the cloud item at its path (see otherKindAt) stands for no node of that
+        // item, whatever its record or edit baseline says: only it moves, as a new item, and the cloud item stays where it
+        // is, listed again there once the local one has gone (#453, as a delete, #447). A record of another node is
+        // still what it was synced as.
+        const sourceOtherKind = otherKindAt(source, sourceEntry);
+        const sourceOwnUid =
+            this.stateDb.getItemByPath(fromRel)?.nodeUid ??
+            this.stateDb.getEditBaseline(fromRel)?.nodeUid ??
+            nodeUidOf(sourceOtherKind ? null : sourceEntry);
+        const sourceDisowned = sourceOtherKind !== null && sourceOwnUid !== null && this.isAtOrIn(sourceOwnUid, sourceOtherKind);
+        const sourceUid = ignoredFrom || sourceCollides || sourceDisowned ? null : sourceOwnUid;
         const target = lstatSync(path.join(root, toRel), { throwIfNoEntry: false });
         const targetRecord = this.stateDb.getItemByPath(toRel);
         const targetEntry = ignoredTo ? null : this.liveIndexEntry(toRel);
+        // Nor is a local item that is replaced the cloud item of the other kind at its path (only a file replaces: a file
+        // here where Proton Drive has a folder). What replaces it takes none of that item's identity, and is a new item,
+        // as over a file only here (#453). A record of another node is still the replaced file's.
+        const targetOtherKind = otherKindAt(target, targetEntry);
+        const targetOwnUid = targetRecord?.nodeUid ?? nodeUidOf(targetOtherKind ? null : targetEntry);
+        const targetDisowned = targetOtherKind !== null && targetOwnUid !== null && this.isAtOrIn(targetOwnUid, targetOtherKind);
         const parentRel = parentOf(toRel);
         const parent = parentRel === '' ? null : lstatSync(path.join(root, parentRel), { throwIfNoEntry: false });
         if (parentRel !== '' && (parent ? !parent.isDirectory() : this.liveIndexEntry(parentRel)?.type !== 'folder')) {
@@ -5620,7 +5633,7 @@ export class ProtonDriveSyncEngine {
         if (targetCollides && sourceUid !== null) {
             throw new DriveOpError('EEXIST', `Already exists: ${toRel}`);
         }
-        const targetUid = !replacing || ignoredTo || targetCollides ? null : (targetRecord?.nodeUid ?? nodeUidOf(targetEntry));
+        const targetUid = !replacing || ignoredTo || targetCollides || targetDisowned ? null : targetOwnUid;
         if (replacing) {
             // Only a file on this computer replaces, and only a file
             const targetIsFile = target ? target.isFile() : (targetRecord?.type ?? targetEntry?.type) === 'file';
@@ -5649,7 +5662,7 @@ export class ProtonDriveSyncEngine {
                 ? this.topmostRecordedUnder(fromRel).filter((item) => item.localRelPath !== fromRel && !pendingUids.has(item.nodeUid))
                 : [];
         this.watcher.suppressPath(fromRel);
-        if (!keepsTarget && !sourceCollides && (sourceUid !== null || this.stateDb.hasItemsUnder(fromRel))) {
+        if (!keepsTarget && !sourceCollides && !sourceDisowned && (sourceUid !== null || this.stateDb.hasItemsUnder(fromRel))) {
             this.watcher.suppressPath(toRel); // Its records go with it: reported as something new, it would upload again
         }
         // Not toRel when the target is kept: its new content is reported, and uploads as a new revision
@@ -5693,6 +5706,10 @@ export class ProtonDriveSyncEngine {
                             for (const conflict of this.unresolvedConflictsAt(fromRel)) {
                                 this.stateDb.markConflictResolved(conflict.id, 'keep-both');
                             }
+                        } else if (sourceDisowned) {
+                            // Its record names the cloud item of the other kind at its old path, which stays: the local
+                            // item goes on as a new one (#453)
+                            this.stateDb.removeItemByPath(fromRel);
                         } else if (ignoredTo || !source) {
                             // Into an ignored name nothing follows it; and records with no local copy would read as deletes
                             this.stateDb.removeItemByPath(fromRel);
@@ -5742,7 +5759,7 @@ export class ProtonDriveSyncEngine {
                 // what is synced
                 // A colliding file goes on as a new one: what it was an edit of stays where it is (#65). A colliding target
                 // keeps its own baseline, if any: what replaces it is judged by it, as an edit of what the drive showed
-                if (keepsTarget || ignoredTo || sourceCollides || targetCollides) {
+                if (keepsTarget || ignoredTo || sourceCollides || sourceDisowned || targetCollides) {
                     this.stateDb.dropEditBaselines(fromRel);
                 } else {
                     this.stateDb.moveEditBaselines(fromRel, toRel);
@@ -5765,11 +5782,18 @@ export class ProtonDriveSyncEngine {
         );
         // Once the item is where it goes, so a folder made here is found holding it
         this.applyPendingOpsToIndex(kept);
+        const renamed = keepsTarget ? `Replaced on this computer by ${fromRel}` : `Renamed on this computer: ${fromRel} → ${toRel}`;
         this.stateDb.logActivity({
             action: 'sync',
             localRelPath: toRel,
-            details: keepsTarget ? `Replaced on this computer by ${fromRel}` : `Renamed on this computer: ${fromRel} → ${toRel}`,
+            details: sourceOtherKind ? `${renamed}; the ${sourceOtherKind.type} Proton Drive has at ${fromRel} stays` : renamed,
         });
+    }
+
+    // Whether a node is the cloud item at entry's path, or anything in it, as the index has them
+    private isAtOrIn(uid: string, entry: RemoteIndexEntry): boolean {
+        const node = this.index.getByUid(uid);
+        return node !== null && isSameOrUnder(node.relPath, entry.relPath);
     }
 
     // A drive rename of a file open for writing through the drive, or of a folder holding some (#64): each keeps its mark
@@ -5840,11 +5864,10 @@ export class ProtonDriveSyncEngine {
                 }
             }
         }
-        // A local item of the other kind than the cloud item at its path (a file here where Proton Drive has a folder,
-        // made by another device before the file uploaded, or the reverse) is not that item, whatever a record says:
-        // the drive shows the local one, and only it goes. The cloud item stays, in Proton Drive and in the index, with
-        // everything in it, and is listed again once the local one is gone (#447). When unsure, keep both.
-        const otherKind = shown && entry && shown.isDirectory() !== (entry.type === 'folder') ? entry : null;
+        // A local item of the other kind than the cloud item at its path (see otherKindAt): the drive shows the local
+        // one, and only it goes. The cloud item stays, in Proton Drive and in the index, with everything in it, and is
+        // listed again once the local one is gone (#447). When unsure, keep both.
+        const otherKind = otherKindAt(local, entry);
         const ownEntry = otherKind ? null : entry;
         // A local file in an unresolved collision is what the drive shows there (#29): only it goes, and the other file
         // Proton Drive has at that name stays (with the folders it is in), listed again once the local one is gone.
@@ -6188,17 +6211,22 @@ export class ProtonDriveSyncEngine {
     // moved into it whose move hasn't reached Proton Drive yet (it isn't in the item there yet). A folder made here that
     // never reached Proton Drive holds only such things, or things that are still where they were there. A pending move
     // to relPath itself is no reason: its node is the item (then it is that already), or is hidden behind it, as the
-    // cloud has another node at that name, which is what the user deleted.
+    // cloud has another node at that name, which is what the user deleted. A recorded node another device has moved away
+    // from where it is recorded is not the item there (see movedAwayFrom, #454).
     private trashTargets(relPath: string, entry: RemoteIndexEntry | null): Map<string, string> {
         const targets = new Map<string, string>();
         // A file being edited through the drive with no record yet stands for its baseline's node, not for another node
         // the index may hold at its path since
         const own = this.stateDb.getItemByPath(relPath)?.nodeUid ?? this.stateDb.getEditBaseline(relPath)?.nodeUid ?? nodeUidOf(entry);
         if (own !== null) {
-            targets.set(own, relPath);
+            if (!this.movedAwayFrom(own, relPath)) {
+                targets.set(own, relPath);
+            }
         } else {
             for (const item of this.topmostRecordedUnder(relPath)) {
-                targets.set(item.nodeUid, item.localRelPath);
+                if (!this.movedAwayFrom(item.nodeUid, item.localRelPath)) {
+                    targets.set(item.nodeUid, item.localRelPath);
+                }
             }
         }
         for (const op of this.latestOpPerNode()) {
@@ -6207,6 +6235,34 @@ export class ProtonDriveSyncEngine {
             }
         }
         return targets;
+    }
+
+    // Whether the remote index has a recorded (or baselined) node somewhere else than at relPath, where this computer has
+    // it: another device renamed or moved it, or a folder it is in, and the index has heard before the local copy
+    // followed. A delete through the drive at relPath is then of the local copy only, which is all the drive shows there:
+    // trashing the node would trash it at its new place, with whatever the other device put in it (#454). When unsure,
+    // keep both. A node the index has no entry for is gone from Proton Drive or not indexed yet, and is trashed as before.
+    // Nor has a node moved away that this computer's own pending rename or move (of it, or of a folder above it) puts at
+    // relPath: the index keeps it where the cloud has it while another node holds that place (see
+    // applyPendingOpsToIndex), but the replay takes it there all the same. Left alone, it would come back under a
+    // conflict name, undoing the delete (#454).
+    private movedAwayFrom(uid: string, relPath: string): boolean {
+        const now = this.index.getByUid(uid);
+        return now !== null && now.relPath !== relPath && this.pendingPlaceOf(now) !== relPath;
+    }
+
+    // Where this computer's pending renames and moves put an indexed node once they reach Proton Drive: the target of
+    // its own latest one, or else of the nearest folder above it with one, with the node's path below that folder there
+    // (null: none of them is pending)
+    private pendingPlaceOf(entry: RemoteIndexEntry): string | null {
+        const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
+        for (let e: RemoteIndexEntry | null = entry; e; e = e.parentUid ? this.index.getByUid(e.parentUid) : null) {
+            const op = latest.get(e.uid);
+            if (op !== undefined && op.kind !== 'trash') {
+                return op.toPath + entry.relPath.slice(e.relPath.length);
+            }
+        }
+        return null;
     }
 
     // The records at or under a path that aren't under another of them
@@ -8232,6 +8288,16 @@ function seenAs(st: Stats): string {
 // The node an index entry stands for; none for a provisional one
 function nodeUidOf(entry: RemoteIndexEntry | null): string | null {
     return entry && !isProvisional(entry.uid) ? entry.uid : null;
+}
+
+// The cloud item at a path when the local item there is of the other kind (a file here where Proton Drive has a folder,
+// made by another device before the file uploaded, or the reverse), else null. That cloud item, and everything in it, is
+// not the local item, whatever a record says: a delete or rename through the drive is of the local one only (#447, #453).
+// Only a file or a folder here counts: the drive doesn't show anything else of its backing store (a symlink, say), and
+// shows the cloud item at that name instead, which is then what the user acts on.
+function otherKindAt(local: Stats | undefined, entry: RemoteIndexEntry | null): RemoteIndexEntry | null {
+    const shown = local !== undefined && (local.isFile() || local.isDirectory());
+    return shown && entry && local.isDirectory() !== (entry.type === 'folder') ? entry : null;
 }
 
 function parentOf(relPath: string): string {
