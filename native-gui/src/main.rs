@@ -2249,6 +2249,10 @@ impl ProtonDriveNativeApp {
         if tab == NavTab::Shared && self.tab != NavTab::Shared && (!self.shared.loading || self.shared.stale) {
             self.load_shared();
         }
+        if tab != NavTab::Shared {
+            // A read that ends after this must not take the focus (#411)
+            self.shared.refocus = false;
+        }
         self.tab = tab;
     }
 
@@ -10186,6 +10190,83 @@ mod tests {
         h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(rows.clone())));
         h.frames(3);
         assert!(h.text_at(shared::REFRESHING).is_none());
+    }
+
+    // #411: a Refresh pressed from the keyboard goes while the list is read; the one that shows after has the focus
+    fn says_focused(h: &Harness, what: &str) -> bool {
+        focused(h).is_some_and(|n| says(&n) == what)
+    }
+
+    #[test]
+    fn a_keyboard_refresh_on_shared_gets_the_focus_back_when_the_read_ends() {
+        let mut h = shared_with_rows();
+        tab_to(&mut h, "Refresh");
+        h.sent();
+        press_key(&mut h, Key::Enter);
+        assert_eq!(h.sent(), ["shared list"]);
+        assert!(h.widget_at("Refresh").is_none(), "gone while the list is read");
+        assert!(focused(&h).is_none_or(|n| says(&n) != "Refresh"));
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(shared_rows())));
+        h.frames(3);
+        assert!(says_focused(&h, "Refresh"), "{:?}", focused(&h).map(|n| says(&n)));
+    }
+
+    #[test]
+    fn a_keyboard_refresh_on_the_empty_shared_page_gets_the_focus_back_when_the_read_ends() {
+        let mut h = empty_shared();
+        tab_to(&mut h, "Refresh");
+        h.sent();
+        press_key(&mut h, Key::Enter);
+        assert_eq!(h.sent(), ["shared list"]);
+        assert!(h.text_at(shared::LOADING).is_some());
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(vec![])));
+        h.frames(3);
+        assert!(says_focused(&h, "Refresh"), "{:?}", focused(&h).map(|n| says(&n)));
+    }
+
+    #[test]
+    fn a_keyboard_refresh_that_fails_gives_the_focus_to_retry() {
+        let mut h = shared_with_rows();
+        tab_to(&mut h, "Refresh");
+        press_key(&mut h, Key::Enter);
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Err("You're offline".into())));
+        h.frames(3);
+        assert!(h.widget_at("Retry").is_some());
+        assert!(says_focused(&h, "Retry"), "{:?}", focused(&h).map(|n| says(&n)));
+    }
+
+    #[test]
+    fn a_mouse_refresh_on_shared_leaves_the_focus_alone() {
+        let mut h = shared_with_rows();
+        h.click(h.widget_at("Refresh").unwrap());
+        h.frames(3);
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(shared_rows())));
+        h.frames(3);
+        assert!(h.widget_at("Refresh").is_some());
+        assert!(!says_focused(&h, "Refresh"), "{:?}", focused(&h).map(|n| says(&n)));
+        // Nor does a mouse Retry, or one after a keyboard Refresh was left behind
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Err("You're offline".into())));
+        h.frames(3);
+        assert!(!says_focused(&h, "Retry"));
+    }
+
+    #[test]
+    fn leaving_shared_before_a_keyboard_refresh_ends_never_takes_the_focus_later() {
+        let mut h = shared_with_rows();
+        tab_to(&mut h, "Refresh");
+        press_key(&mut h, Key::Enter);
+        h.click(h.text_at("Activity").unwrap());
+        h.frames(3);
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(shared_rows())));
+        h.frames(3);
+        assert!(!says_focused(&h, "Refresh") && !says_focused(&h, "Retry"), "{:?}", focused(&h).map(|n| says(&n)));
+        // Back on Shared (entering reads again), the new read's end doesn't grab the focus either
+        h.click(h.text_at("Shared").unwrap());
+        h.frames(3);
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(shared_rows())));
+        h.frames(3);
+        assert!(h.widget_at("Refresh").is_some());
+        assert!(!says_focused(&h, "Refresh"), "{:?}", focused(&h).map(|n| says(&n)));
     }
 
     #[test]

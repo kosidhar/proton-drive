@@ -463,6 +463,9 @@ pub struct SharedPage {
     pub stop_error: Option<String>,
     /// Set when sharing may have changed off-page while a read is already running, so entering Shared starts a fresh read
     pub stale: bool,
+    /// Set when a Refresh or Retry was pressed from the keyboard: the one that shows when the read ends takes the focus
+    /// back, the one pressed having gone while the list was read (#411). Cleared on leaving the page.
+    pub refocus: bool,
 }
 
 impl SharedPage {
