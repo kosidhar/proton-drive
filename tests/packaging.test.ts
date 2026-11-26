@@ -263,3 +263,48 @@ describe('Docs and Sheets file types', () => {
         });
     });
 });
+
+describe('recommends for the Files extension and the tray (#506)', () => {
+    const root = path.join(import.meta.dir, '..');
+    const nfpm = readFileSync(path.join(root, 'packaging', 'linux', 'nfpm.yaml'), 'utf8');
+    const recommendsOf = (format: 'deb' | 'rpm'): string[] => {
+        const block = nfpm.split(new RegExp(`^  ${format}:$`, 'm'))[1]?.split(/^  \w+:$|^\S/m)[0] ?? '';
+        const list = block.split(/^    recommends:$/m)[1] ?? '';
+        return [...list.matchAll(/^      - (.+)$/gm)].map((m) => m[1]!.trim());
+    };
+
+    test('the deb recommends python3-nautilus and the tray libraries', () => {
+        const rec = recommendsOf('deb');
+        for (const p of ['python3-nautilus', 'python3-gi', 'gir1.2-gtk-3.0', 'gir1.2-ayatanaappindicator3-0.1']) {
+            expect(rec).toContain(p);
+        }
+        expect(rec).toContain('libsecret-1-0');
+    });
+
+    test('the rpm recommends nautilus-python and the tray libraries', () => {
+        const rec = recommendsOf('rpm');
+        for (const p of ['nautilus-python', 'python3-gobject', 'gtk3', 'libayatana-appindicator-gtk3']) {
+            expect(rec).toContain(p);
+        }
+        expect(rec).toContain('libsecret');
+    });
+
+    test('the Arch package lists the Files extension and the tray library as optional', () => {
+        const pkgbuild = readFileSync(PKGBUILD, 'utf8');
+        expect(pkgbuild).toMatch(/'nautilus-python:/);
+        expect(pkgbuild).not.toContain('python-nautilus');
+        expect(pkgbuild).toMatch(/'libayatana-appindicator:/);
+    });
+
+    test('the README tells deb and rpm users what the Files extension and the tray need', () => {
+        const readme = readFileSync(path.join(root, 'README.md'), 'utf8');
+        const install = readme.slice(readme.indexOf('### Option B'), readme.indexOf('### Option D'));
+        expect(install).toContain('python3-nautilus');
+        expect(install).toContain('apt install ./dist/release/kosidhar-protondrive-<version>-linux-amd64.deb');
+        expect(install).not.toContain('dpkg -i');
+        expect(install).toContain('nautilus-python');
+        expect(install).toContain('nautilus -q');
+        expect(install).toContain('gir1.2-ayatanaappindicator3-0.1');
+        expect(install).toContain('AppIndicator and KStatusNotifierItem Support');
+    });
+});

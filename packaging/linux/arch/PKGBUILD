@@ -12,6 +12,7 @@ optdepends=(
   'libsecret: OS Keyring credential storage via Freedesktop Secret Service'
   'libnotify: Desktop sync and conflict notifications'
   'nautilus-python: GNOME Files (Nautilus) context menu and sync emblem integration'
+  'libayatana-appindicator: Tray icon (AppIndicator support)'
   'nemo-python: Cinnamon (Nemo) context menu and sync emblem integration'
   'dolphin: KDE Plasma Dolphin service menu integration'
 )

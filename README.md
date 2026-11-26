@@ -89,9 +89,11 @@ Install `fuse3` from your distro first if you want the virtual drive.
 ### Option B: Debian / Ubuntu / Mint / Pop!\_OS (`.deb`)
 
 ```bash
-sudo dpkg -i ./dist/release/kosidhar-protondrive-<version>-linux-amd64.deb
+sudo apt install ./dist/release/kosidhar-protondrive-<version>-linux-amd64.deb
 systemctl --user enable --now protondrive.service
 ```
+
+`apt` installs the recommended `python3-nautilus` and `gir1.2-ayatanaappindicator3-0.1`, so the Files status icons and right-click menu and the tray icon work right away. Restart Files once (`nautilus -q`) to load the extension. On GNOME without Ubuntu's extension, enable "AppIndicator and KStatusNotifierItem Support" for the tray icon.
 
 ### Option C: Fedora / RHEL / openSUSE (`.rpm`)
 
@@ -99,6 +101,8 @@ systemctl --user enable --now protondrive.service
 sudo dnf install ./dist/release/kosidhar-protondrive-<version>-linux-x86_64.rpm
 systemctl --user enable --now protondrive.service
 ```
+
+For status icons and the right-click menu in Files, install `nautilus-python`, then restart Files once (`nautilus -q`). For the tray icon, install `libayatana-appindicator-gtk3`; on GNOME, also enable the "AppIndicator and KStatusNotifierItem Support" extension.
 
 ### Option D: Universal AppImage (Zero Installation)
 
