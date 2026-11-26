@@ -85,13 +85,19 @@ pub const PERSON: &str = ph::USER;
 pub const INFO: &str = ph::INFO;
 pub const FOLDER: &str = ph::FOLDER;
 pub const FILE: &str = ph::FILE;
+/// A Proton Docs document
+pub const DOC: &str = ph::FILE_TEXT;
+/// A Proton Sheets spreadsheet
+pub const SHEET: &str = ph::TABLE;
+/// More actions on a row
+pub const MORE: &str = ph::DOTS_THREE;
 
 /// Every icon, for the tests
 #[cfg(test)]
-pub const ALL: [&str; 36] = [
+pub const ALL: [&str; 39] = [
     HOME, SHARED, ACTIVITY, SETTINGS, FOLDER_OPEN, TRASH, SYNC, PAUSE, RESUME, CHECK, WARNING, OFFLINE, LINK,
     LINK_BROKEN, LOCK, CLOCK, PEOPLE, COPY, MANAGE, WEB, REFRESH, SEARCH, INFO, SIGN_OUT, SIGN_IN, REMOVE, FOLDER, FILE,
-    ONLINE_ONLY, MOUNT, RESTART, MOVE_BACK, KEEP_BOTH, KEEP_LOCAL, KEEP_REMOTE, PERSON,
+    ONLINE_ONLY, MOUNT, RESTART, MOVE_BACK, KEEP_BOTH, KEEP_LOCAL, KEEP_REMOTE, PERSON, DOC, SHEET, MORE,
 ];
 
 #[cfg(test)]

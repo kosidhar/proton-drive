@@ -6,6 +6,7 @@ mod settings;
 mod share;
 mod shared;
 mod shared_with_me;
+mod shared_with_me_view;
 mod shared_view;
 mod single_instance;
 
@@ -275,6 +276,7 @@ const STATUS_DANGER_HOVER: Color32 = Color32::from_rgb(196, 43, 71); // #C42B47
 enum NavTab {
     Home,
     Shared,
+    SharedWithMe,
     Activity,
     Settings,
 }
@@ -286,6 +288,7 @@ fn parse_tab(name: &str) -> NavTab {
         "activity" | "overview" => NavTab::Activity,
         "settings" => NavTab::Settings,
         "shared" => NavTab::Shared,
+        "shared-with-me" => NavTab::SharedWithMe,
         _ => NavTab::Home,
     }
 }
@@ -1770,6 +1773,12 @@ impl ProtonDriveNativeApp {
             let seq = shared.begin_load();
             let _ = cmd_tx.send(WorkerCommand::SharedLoad { seq });
         }
+        // Opened on Shared with me (--tab shared-with-me): likewise
+        let mut shared_with_me = shared_with_me::SharedWithMePage::default();
+        if initial_tab == NavTab::SharedWithMe {
+            let seq = shared_with_me.begin_load();
+            let _ = cmd_tx.send(WorkerCommand::ListSharedWithMe(seq));
+        }
 
         let edit_conflict_strategy = if initial_status.settings.conflict_strategy.is_empty() {
             "keep-both".to_string()
@@ -1850,7 +1859,7 @@ impl ProtonDriveNativeApp {
             last_poll: Instant::now(),
             share: None,
             shared,
-            shared_with_me: shared_with_me::SharedWithMePage::default(),
+            shared_with_me,
             share_left: Vec::new(),
             share_notices: Vec::new(),
             exit_shares: None,
@@ -2311,9 +2320,15 @@ impl ProtonDriveNativeApp {
         if tab == NavTab::Shared && self.tab != NavTab::Shared && (!self.shared.loading || self.shared.stale) {
             self.load_shared();
         }
+        if tab == NavTab::SharedWithMe && self.tab != NavTab::SharedWithMe && (!self.shared_with_me.loading || self.shared_with_me.stale) {
+            self.load_shared_with_me();
+        }
         if tab != NavTab::Shared {
             // A read that ends after this must not take the focus (#411)
             self.shared.refocus = false;
+        }
+        if tab != NavTab::SharedWithMe {
+            self.shared_with_me.refocus = false;
         }
         self.tab = tab;
     }
@@ -2323,6 +2338,13 @@ impl ProtonDriveNativeApp {
     fn load_shared(&mut self) {
         let seq = self.shared.begin_load();
         let _ = self.tx.send(WorkerCommand::SharedLoad { seq });
+    }
+
+    /// Asks for what others shared with the account. Refresh, Retry and entering the page ask again; only the newest
+    /// read's answer is shown.
+    fn load_shared_with_me(&mut self) {
+        let seq = self.shared_with_me.begin_load();
+        let _ = self.tx.send(WorkerCommand::ListSharedWithMe(seq));
     }
 
     /// Asks for what is hidden from this computer, unless a read is already out.
@@ -3168,6 +3190,7 @@ impl ProtonDriveNativeApp {
                 match self.tab {
                     NavTab::Home => self.render_home(ui),
                     NavTab::Shared => self.render_shared(ui),
+                    NavTab::SharedWithMe => self.render_shared_with_me(ui),
                     NavTab::Activity => self.render_activity(ui),
                     NavTab::Settings => self.render_settings_tab(ui),
                 }
@@ -5009,6 +5032,8 @@ OPTIONS:
   --fake-disk-full      with --screenshot: show Home's notice that the computer's disk is almost full
   --fake-shared <S>     with --screenshot: show the Shared section (--tab shared) as S
                         (list | empty | offline | loading | refreshing)
+  --fake-shared-with-me <S>  with --screenshot: show the Shared with me page (--tab shared-with-me) as S
+                        (list | invitations | empty | offline | loading | refreshing)
   --show-unofficial-notice  with --screenshot: show the first-run unofficial-app notice
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --zoom <F>            with --screenshot: render at zoom factor F (0.5 to 3, e.g. 1.2), as Ctrl+= would
@@ -5057,6 +5082,7 @@ fn main() -> eframe::Result {
     let mut cli_account_menu = false;
     let mut cli_fake_share: Option<String> = None;
     let mut cli_fake_shared: Option<String> = None;
+    let mut cli_fake_shared_with_me: Option<String> = None;
     let mut cli_fake_cut_short: Option<String> = None;
     let mut cli_fake_disk_full = false;
     let mut cli_confirm_stop_sharing: Option<String> = None;
@@ -5131,6 +5157,9 @@ fn main() -> eframe::Result {
             "--fake-shared" => {
                 cli_fake_shared = text(args.next());
             }
+            "--fake-shared-with-me" => {
+                cli_fake_shared_with_me = text(args.next());
+            }
             "--hidden-items" => {
                 cli_hidden_items = true;
             }
@@ -5194,6 +5223,7 @@ fn main() -> eframe::Result {
             || cli_account_menu
             || cli_fake_share.is_some()
             || cli_fake_shared.is_some()
+            || cli_fake_shared_with_me.is_some()
             || cli_fake_cut_short.is_some()
             || cli_fake_disk_full
             || cli_show_unofficial_notice
@@ -5202,7 +5232,7 @@ fn main() -> eframe::Result {
             || cli_zoom.is_some())
     {
         eprintln!(
-            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --account-menu, --fake-share, --fake-shared, --fake-cut-short, --fake-disk-full, --confirm-stop-sharing, --fake-pinned, --show-unofficial-notice and --zoom only apply together with --screenshot; ignoring them"
+            "protondrive-gui: --fake-attention, --fake-transfers, --signed-out, --account-mismatch, --paused-until-min, --pause-choices, --account-menu, --fake-share, --fake-shared, --fake-shared-with-me, --fake-cut-short, --fake-disk-full, --confirm-stop-sharing, --fake-pinned, --show-unofficial-notice and --zoom only apply together with --screenshot; ignoring them"
         );
     }
     let fake_share = match cli_fake_share {
@@ -5218,6 +5248,10 @@ fn main() -> eframe::Result {
     if screenshot_target.is_some() && initial_tab != NavTab::Shared && (cli_fake_shared.is_some() || cli_confirm_stop_sharing.is_some()) {
         eprintln!("protondrive-gui: --fake-shared and --confirm-stop-sharing only show with --tab shared; ignoring them");
         cli_confirm_stop_sharing = None;
+    }
+    if screenshot_target.is_some() && initial_tab != NavTab::SharedWithMe && cli_fake_shared_with_me.is_some() {
+        eprintln!("protondrive-gui: --fake-shared-with-me only shows with --tab shared-with-me; ignoring it");
+        cli_fake_shared_with_me = None;
     }
     let fake_cut_short = match cli_fake_cut_short {
         Some(state) if screenshot_target.is_some() => {
@@ -5236,6 +5270,18 @@ fn main() -> eframe::Result {
                 Some(state)
             } else {
                 eprintln!("protondrive-gui: ignoring unknown --fake-shared {state:?} (list | empty | offline | loading | refreshing)");
+                None
+            }
+        }
+        _ => None,
+    };
+    let fake_shared_with_me = match cli_fake_shared_with_me {
+        Some(state) if screenshot_target.is_some() => {
+            // Checked on a scratch page: the real one is set once the app exists
+            if shared_with_me::SharedWithMePage::default().fake(&state, home::now_ms()) {
+                Some(state)
+            } else {
+                eprintln!("protondrive-gui: ignoring unknown --fake-shared-with-me {state:?} (list | invitations | empty | offline | loading | refreshing)");
                 None
             }
         }
@@ -5431,6 +5477,10 @@ fn main() -> eframe::Result {
                             Some(PendingConfirm::StopSharing { rel_path: i.rel_path.clone()?, uid: i.uid.clone(), question: shared::stop_question(i, home::now_ms()) })
                         });
                     }
+                }
+                if app.tab == NavTab::SharedWithMe {
+                    // As Shared: the worker doesn't read the list in a screenshot
+                    app.shared_with_me.fake(fake_shared_with_me.as_deref().unwrap_or("empty"), home::now_ms());
                 }
                 if let Some(info) = fake_share {
                     // The item --share names, or one in the drive (as the startup cache knows it)
@@ -6285,6 +6335,7 @@ mod tests {
                     WorkerCommand::StartLogin => Some("sign in".to_string()),
                     WorkerCommand::StartFresh => Some("start fresh".to_string()),
                     WorkerCommand::SharedLoad { .. } => Some("shared list".to_string()),
+                    WorkerCommand::ListSharedWithMe(_) => Some("shared with me list".to_string()),
                     WorkerCommand::SharedStop { rel_path, uid } => Some(format!("stop sharing {rel_path:?} {uid}")),
                     WorkerCommand::Logout => Some("sign out".to_string()),
                     WorkerCommand::ShareLoad { rel_path, .. } => Some(format!("share info {rel_path}")),
@@ -9456,8 +9507,8 @@ mod tests {
                         );
                     }
                 }
-                // At 1.7x and 1.8x, all four sections still fit in the window without scrolling
-                if zoom <= 1.8 {
+                // At 1.7x, all five sections still fit in the window without scrolling (Shared with me made them five)
+                if zoom <= 1.7 {
                     assert!(
                         settings.bottom() <= h.screen.y,
                         "signed_in={signed_in} zoom={zoom}: Settings {settings:?} should stay visible in {:?}",
@@ -10285,6 +10336,294 @@ mod tests {
         let said = h.text_rect(offline).expect("the message, scrolled");
         let retry = h.widget_at("Retry").expect("Retry is reachable by scrolling");
         assert!(retry.y > said.bottom() && retry.y <= h.screen.y, "{retry:?} under {said:?}");
+    }
+
+    // #487: the Shared with me page
+    fn swm_listing(state: &str) -> shared_with_me::Listing {
+        shared_with_me::fake_shared_with_me(state, home::now_ms()).unwrap().unwrap()
+    }
+
+    /// The app on Shared with me, its list answered with `listing`.
+    fn swm_with(listing: shared_with_me::Listing) -> Harness {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared with me").unwrap());
+        assert_eq!(h.sent(), ["shared with me list"]);
+        h.event(WorkerEvent::SharedWithMeLoaded(h.app.shared_with_me.seq, Ok(listing)));
+        h.frames(3);
+        h
+    }
+
+    fn swm_state(state: &str) -> Harness {
+        swm_with(swm_listing(state))
+    }
+
+    #[test]
+    fn the_sidebar_has_shared_with_me_between_shared_and_activity() {
+        let h = Harness::new();
+        let in_sidebar = |text: &str| h.text_at_all(text).into_iter().find(|p| p.x < SIDEBAR_EDGE);
+        let shared = in_sidebar("Shared").expect("Shared");
+        let with_me = in_sidebar("Shared with me").expect("Shared with me is in the sidebar");
+        let activity = in_sidebar("Activity").expect("Activity");
+        assert!(shared.y < with_me.y && with_me.y < activity.y, "{shared:?} {with_me:?} {activity:?}");
+        let glyph = in_sidebar(icons::PEOPLE).expect("its icon is painted in the sidebar");
+        assert!(glyph.x < with_me.x && (glyph.y - with_me.y).abs() < 4.0, "{glyph:?} before {with_me:?}");
+    }
+
+    #[test]
+    fn clicking_shared_with_me_opens_the_page_and_asks_for_the_list_each_time() {
+        let mut h = Harness::new();
+        h.sent();
+        h.click(h.text_at("Shared with me").unwrap());
+        assert_eq!(h.app.tab, NavTab::SharedWithMe);
+        assert_eq!(h.sent(), ["shared with me list"]);
+        let title: Vec<_> = h.text_at_all("Shared with me").into_iter().filter(|p| p.x > SIDEBAR_EDGE).collect();
+        assert_eq!(title.len(), 1, "the top bar's title: {title:?}");
+        h.event(WorkerEvent::SharedWithMeLoaded(h.app.shared_with_me.seq, Ok(shared_with_me::Listing::default())));
+        h.frames(30);
+        assert_eq!(h.sent(), Vec::<String>::new(), "never on a timer");
+        h.click(h.text_at("Home").unwrap());
+        h.sent();
+        h.click(h.text_at("Shared with me").unwrap());
+        assert_eq!(h.sent(), ["shared with me list"]);
+    }
+
+    #[test]
+    fn the_tab_flag_names_shared_with_me() {
+        assert_eq!(parse_tab("shared-with-me"), NavTab::SharedWithMe);
+        assert_eq!(parse_tab("shared"), NavTab::Shared);
+    }
+
+    #[test]
+    fn shared_with_me_shows_its_loading_picture_with_words_announced_politely() {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared with me").unwrap());
+        assert!(h.text_at(shared_with_me::LOADING).is_some());
+        assert_eq!(label_live(&h, shared_with_me::LOADING), Some(egui::accesskit::Live::Polite));
+        assert!(h.widget_at("Refresh").is_none(), "a first read has no Refresh");
+        h.event(WorkerEvent::SharedWithMeLoaded(h.app.shared_with_me.seq, Ok(swm_listing("list"))));
+        assert!(h.text_at(shared_with_me::LOADING).is_none());
+    }
+
+    #[test]
+    fn shared_with_me_empty_says_so_with_refresh_and_the_web_note() {
+        let h = swm_state("empty");
+        let said = h.text_at(shared_with_me::EMPTY).expect("the web's words, verbatim");
+        assert_eq!(painted_color(&h, shared_with_me::EMPTY, said), Some(TEXT_MUTED()));
+        let refresh = h.widget_at("Refresh").expect("a centred Refresh");
+        assert!(refresh.y > said.y);
+        let note = h.text_at(shared_with_me::WEB_NOTE).expect("the note under the empty state");
+        assert!(note.y > refresh.y);
+        assert!(h.text_at(shared_with_me::INVITATIONS).is_none());
+        assert!(h.text_at("Name").is_none(), "no columns without rows");
+    }
+
+    #[test]
+    fn shared_with_me_offline_says_why_with_retry() {
+        let mut h = Harness::new();
+        h.click(h.text_at("Shared with me").unwrap());
+        let offline = "Proton Drive is offline: try again when you are connected";
+        h.event(WorkerEvent::SharedWithMeLoaded(h.app.shared_with_me.seq, Err(offline.into())));
+        let said = h.text_at(offline).expect("the reason");
+        assert_eq!(painted_color(&h, offline, said), Some(DANGER_TEXT()));
+        assert!(h.widget_at("Refresh").is_none(), "Retry is the action here");
+        assert!(h.text_at(shared_with_me::EMPTY).is_none());
+        h.sent();
+        h.click(h.text_at("Retry").unwrap());
+        assert_eq!(h.sent(), ["shared with me list"]);
+    }
+
+    #[test]
+    fn shared_with_me_lists_each_row_under_its_columns() {
+        let h = swm_state("list");
+        let listing = swm_listing("list");
+        assert!(h.text_at(shared_with_me::INVITATIONS).is_none(), "Invitations show only when there are some");
+        let header = |title: &str| {
+            h.text_rects_all(title).into_iter().find(|r| r.left() > SIDEBAR_EDGE).unwrap_or_else(|| panic!("the {title} column")).left()
+        };
+        let (name_x, by_x, date_x, access_x) = (header("Name"), header("Shared by"), header("Shared"), header("Access"));
+        assert!(name_x < by_x && by_x < date_x && date_x < access_x);
+        for title in ["Name", "Shared by", "Shared", "Access"] {
+            assert!(!h.widgets_at_all(title).is_empty(), "{title} is a column header for screen readers");
+        }
+        let budget = listing.items.iter().find(|i| i.name.as_deref() == Some("Budget.xlsx")).unwrap();
+        let y = h.text_at("Budget.xlsx").expect("the name").y;
+        let on_row = |text: &str| on_line(&h, text, y).unwrap_or_else(|| panic!("{text:?} on Budget.xlsx's row"));
+        assert!(on_row("sam@proton.me").left() >= by_x - 4.0 && on_row("sam@proton.me").right() <= date_x - 4.0);
+        let date = shared_with_me_view::date_text(budget.shared_at.unwrap());
+        assert!((on_row(&date).left() - date_x).abs() < 6.0, "{date} under Shared");
+        assert!((on_row("Editor").left() - access_x).abs() < 6.0, "Editor under Access");
+        for (name, role) in [("Design review", "Viewer"), ("Team photos", "Admin")] {
+            let y = h.text_at(name).unwrap_or_else(|| panic!("{name}")).y;
+            assert!(on_line(&h, role, y).is_some(), "{name}: {role}");
+        }
+        // No date: a dash, not "1970"
+        let y = h.text_at("report.pdf").unwrap().y;
+        assert!(on_line(&h, "—", y).is_some());
+        let last = h.text_at("An item").expect("an unreadable row's name").y;
+        let note = h.text_at(shared_with_me::WEB_NOTE).expect("the note under the list");
+        assert!(note.y > last, "{note:?} under {last}");
+        assert!(h.widget_at("Refresh").is_some());
+    }
+
+    #[test]
+    fn shared_with_me_rows_have_a_kind_icon_each() {
+        let h = swm_state("list");
+        for (name, icon) in [
+            ("Budget.xlsx", icons::SHEET),
+            ("Design review", icons::DOC),
+            ("Team photos", icons::FOLDER),
+            ("report.pdf", icons::FILE),
+        ] {
+            let y = h.text_at(name).unwrap().y;
+            assert!(on_line(&h, icon, y).is_some(), "{name} has {icon:?}");
+        }
+    }
+
+    #[test]
+    fn shared_with_me_orders_dated_rows_first_as_the_daemon_gave_them() {
+        let h = swm_state("list");
+        let ys: Vec<f32> = ["Budget.xlsx", "Design review", "Team photos", "report.pdf", "An item"].iter().map(|n| h.text_at(n).unwrap().y).collect();
+        assert!(ys.windows(2).all(|w| w[0] < w[1]), "{ys:?}");
+    }
+
+    #[test]
+    fn shared_with_me_invitations_show_above_the_list_with_accept_and_decline() {
+        let h = swm_state("invitations");
+        let invitations = h.text_at(shared_with_me::INVITATIONS).expect("the section");
+        assert!(painted_bold(&h, shared_with_me::INVITATIONS, f32::MAX));
+        let listing = swm_listing("invitations");
+        let now = home::now_ms();
+        let [trip, contract, hidden] = &listing.invitations[..] else { panic!("three invitations") };
+        let line = shared_with_me_view::invitation_line(trip, now);
+        assert_eq!(line, "sam@proton.me invited you as Viewer · 1 day ago");
+        assert!(h.text_at(&line).is_some_and(|p| p.y > invitations.y));
+        let unverified = shared_with_me_view::invitation_line(contract, now);
+        assert_eq!(unverified, "Sender not verified · Editor · 1 day ago");
+        let y = h.text_at("Contract.pdf").expect("its name").y;
+        assert!(on_line(&h, &unverified, y + 10.0).is_some(), "the unverified line");
+        assert!(on_line(&h, icons::WARNING, y + 10.0).is_some(), "with the warning mark");
+        assert!(h.text_at_all("lee@example.com").is_empty(), "an unverified claim isn't shown on the row");
+        assert!(h.text_at("An item").is_some(), "{hidden:?} is named An item");
+        for name in ["Trip photos", "Contract.pdf", "An item"] {
+            let accept = h.widget_at(&format!("Accept {name}")).unwrap_or_else(|| panic!("Accept {name}"));
+            let decline = h.widget_at(&format!("Decline {name}")).unwrap_or_else(|| panic!("Decline {name}"));
+            assert!(decline.x < accept.x && (decline.y - accept.y).abs() < 2.0, "Decline then Accept, one line");
+            assert!(accept.y < h.text_at("Name").unwrap().y, "above the list's columns");
+        }
+        assert!(h.text_at("Budget.xlsx").is_some(), "the list is under the invitations");
+        assert!(h.text_at(shared_with_me::WEB_NOTE).is_some());
+    }
+
+    #[test]
+    fn an_unverified_sharer_shows_the_warning_with_its_tooltip() {
+        let mut listing = swm_listing("list");
+        listing.items[0].shared_by_verified = false;
+        let mut h = swm_with(listing);
+        tooltips_at_once(&h);
+        let y = h.text_at("Budget.xlsx").unwrap().y;
+        let mark = on_line(&h, icons::WARNING, y).expect("⚠ on the row");
+        assert!(on_line(&h, "sam@proton.me", y).is_some(), "the claimed address stays beside it");
+        // The other rows have none
+        let other = h.text_at("Design review").unwrap().y;
+        assert!(on_line(&h, icons::WARNING, other).is_none());
+        hover(&mut h, mark.center());
+        assert!(h.text_at(shared_with_me_view::UNVERIFIED_SHARER).is_some(), "the tooltip says why");
+    }
+
+    #[test]
+    fn an_unreadable_item_is_an_item_with_only_open() {
+        let h = swm_state("list");
+        let y = h.text_at("An item").expect("named An item").y;
+        assert!(h.widget_at("Open An item").is_some_and(|p| (p.y - y).abs() < 12.0), "Open is on the same row");
+        assert!(h.widget_at("More actions for An item").is_none(), "nothing else is offered");
+        assert!(h.text_at("Proton Drive couldn't load this item").is_some(), "and says why");
+        // A known name is used
+        let mut listing = swm_listing("list");
+        let last = listing.items.last_mut().unwrap();
+        last.name = Some("Old photo".into());
+        let h = swm_with(listing);
+        assert!(h.text_at("Old photo").is_some() && h.widget_at("Open Old photo").is_some());
+        assert!(h.widget_at("More actions for Old photo").is_none());
+    }
+
+    #[test]
+    fn shared_with_me_buttons_are_named_with_their_item() {
+        let h = swm_state("list");
+        for name in ["Budget.xlsx", "Design review", "Team photos", "report.pdf"] {
+            let open = h.widget_at(&format!("Open {name}")).unwrap_or_else(|| panic!("Open {name}"));
+            assert!((open.y - h.text_at(name).unwrap().y).abs() < 4.0);
+            assert!(h.text_at_all("Open").iter().any(|p| (p.y - open.y).abs() < 4.0), "its label is Open");
+        }
+        // ⋯ only where it would hold something: Download (a file) or Leave (canLeave)
+        assert!(h.widget_at("More actions for Budget.xlsx").is_some(), "can leave");
+        assert!(h.widget_at("More actions for report.pdf").is_some(), "a file");
+        assert!(h.widget_at("More actions for Team photos").is_none(), "a folder it can't leave has nothing to hold");
+        // Open keeps its place whether or not ⋯ follows it
+        let open_x = |name: &str| h.widget_at(&format!("Open {name}")).unwrap().x;
+        assert_eq!(open_x("Budget.xlsx"), open_x("Team photos"));
+    }
+
+    #[test]
+    fn a_keyboard_refresh_on_shared_with_me_gets_the_focus_back_when_the_read_ends() {
+        let mut h = swm_state("list");
+        tab_to(&mut h, "Refresh");
+        h.sent();
+        press_key(&mut h, Key::Enter);
+        assert_eq!(h.sent(), ["shared with me list"]);
+        assert!(h.text_at(shared::REFRESHING).is_some(), "the rows stay while they are read again");
+        assert!(h.text_at("Budget.xlsx").is_some());
+        h.event(WorkerEvent::SharedWithMeLoaded(h.app.shared_with_me.seq, Ok(swm_listing("list"))));
+        h.frames(3);
+        assert!(says_focused(&h, "Refresh"), "{:?}", focused(&h).map(|n| says(&n)));
+        // A failure hands it to Retry
+        press_key(&mut h, Key::Enter);
+        h.event(WorkerEvent::SharedWithMeLoaded(h.app.shared_with_me.seq, Err("You're offline".into())));
+        h.frames(3);
+        assert!(says_focused(&h, "Retry"), "{:?}", focused(&h).map(|n| says(&n)));
+    }
+
+    #[test]
+    fn a_mouse_refresh_on_shared_with_me_leaves_the_focus_alone() {
+        let mut h = swm_state("list");
+        h.click(h.widget_at("Refresh").unwrap());
+        h.event(WorkerEvent::SharedWithMeLoaded(h.app.shared_with_me.seq, Ok(swm_listing("list"))));
+        h.frames(3);
+        assert!(!says_focused(&h, "Refresh"));
+    }
+
+    #[test]
+    fn an_older_answer_for_shared_with_me_is_ignored() {
+        let mut h = swm_state("list");
+        let old = h.app.shared_with_me.seq;
+        h.click(h.widget_at("Refresh").unwrap());
+        h.event(WorkerEvent::SharedWithMeLoaded(old, Err("late".into())));
+        assert!(h.text_at("late").is_none());
+        assert!(h.text_at("Budget.xlsx").is_some());
+    }
+
+    #[test]
+    fn shared_with_me_fits_the_least_width_with_its_buttons_inside() {
+        let mut h = swm_state("invitations");
+        h.resize_zoomed(Vec2::new(840.0, 700.0), 1.0);
+        let by_x = h.text_at("Shared by").unwrap().x;
+        let name = "Budget.xlsx";
+        let y = h.text_at(name).unwrap().y;
+        let rect = node_rect(&h.nodes_named(&format!("Open {name}"))[0]);
+        assert!(rect.right() <= h.screen.x, "Open is inside the window: {rect:?}");
+        let access = on_line(&h, "Editor", y).expect("Access");
+        assert!(access.right() < rect.left(), "Access {access:?} clear of Open {rect:?}");
+        assert!(on_line(&h, name, y).unwrap().right() < by_x, "the name stays in its column");
+        for name in ["Trip photos", "Contract.pdf"] {
+            let accept = node_rect(&h.nodes_named(&format!("Accept {name}"))[0]);
+            let decline = node_rect(&h.nodes_named(&format!("Decline {name}"))[0]);
+            assert!(accept.right() <= h.screen.x && decline.right() < accept.left());
+            let line = h.text_rect_starting("sam@proton.me invited").or_else(|| h.text_rect_starting("Sender not verified")).unwrap();
+            assert!(line.right() < accept.right());
+        }
+        // Zoomed in too
+        h.resize_zoomed(Vec2::new(840.0, 700.0), 1.5);
+        let open = node_rect(&h.nodes_named("Open Budget.xlsx")[0]);
+        assert!(open.right() <= h.screen.x, "{open:?}");
     }
 
     #[test]

@@ -3,9 +3,6 @@
 //! it goes through the daemon's `/share/with-me` routes on the control socket, off the UI thread. Nothing here logs an
 //! address or a name.
 
-// The page that draws this and the actions that use the rest are the next tasks'
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -109,10 +106,14 @@ pub const EMPTY: &str = "Files and folders that others shared with you will appe
 pub const WEB_NOTE: &str = "Saved links and shared photos are on drive.proton.me";
 /// Where Open goes when the daemon has no address for the item
 pub const WEB_URL: &str = "https://drive.proton.me/shared-with-me";
+#[allow(dead_code, reason = "the actions that use it come next (#487)")]
 pub const DOWNLOADING: &str = "Downloading…";
+#[allow(dead_code, reason = "the actions that use it come next (#487)")]
 pub const SAVED: &str = "Saved to Downloads";
+#[allow(dead_code, reason = "the actions that use it come next (#487)")]
 pub const ACCEPTED: &str = "Accepted, it will appear shortly";
 /// How long after an accept the page reads once more
+#[allow(dead_code, reason = "the actions that use it come next (#487)")]
 pub const RELOAD_AFTER_ACCEPT_SECS: u64 = 5;
 pub const LOADING: &str = "Loading what others shared with you…";
 const LIST_TIMED_OUT: &str = "Listing what others shared with you took too long. Try again.";
@@ -123,6 +124,7 @@ pub fn display_name(name: &Option<String>) -> String {
 }
 
 /// The question before accepting an invitation the sender of which Proton couldn't verify; None for a verified one.
+#[allow(dead_code, reason = "the actions that use it come next (#487)")]
 pub fn accept_question(inv: &Invitation) -> Option<String> {
     if inv.from_verified {
         return None;
@@ -134,6 +136,7 @@ pub fn accept_question(inv: &Invitation) -> Option<String> {
 }
 
 /// The question before leaving an item.
+#[allow(dead_code, reason = "the actions that use it come next (#487)")]
 pub fn leave_question(item: &Item) -> String {
     format!(
         "Leave {}? It will no longer be shared with you. Only the person who shared it can share it again.",
@@ -142,15 +145,19 @@ pub fn leave_question(item: &Item) -> String {
 }
 
 /// The activity lines: a name, never an address.
+#[allow(dead_code, reason = "the actions that use it come next (#487)")]
 pub fn accepted_activity(name: &Option<String>) -> String {
     format!("Accepted an invitation to {}", display_name(name))
 }
+#[allow(dead_code, reason = "the actions that use it come next (#487)")]
 pub fn declined_activity(name: &Option<String>) -> String {
     format!("Declined an invitation to {}", display_name(name))
 }
+#[allow(dead_code, reason = "the actions that use it come next (#487)")]
 pub fn left_activity(name: &Option<String>) -> String {
     format!("Left {}", display_name(name))
 }
+#[allow(dead_code, reason = "the actions that use it come next (#487)")]
 pub fn downloaded_activity(name: &Option<String>) -> String {
     format!("Downloaded {} to Downloads", display_name(name))
 }
