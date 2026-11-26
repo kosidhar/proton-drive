@@ -130,6 +130,7 @@ protondrive selective-sync list            # List top-level folders with their a
 protondrive selective-sync exclude <path>  # Same as hide
 protondrive selective-sync include <path>  # Same as unhide
 protondrive ls [/my-files]                 # Browse remote Proton Drive files
+protondrive ls /shared-with-me             # Browse what others shared with you
 protondrive upload <local> <remoteDir>     # Upload a file directly
 protondrive download <remote> <local>      # Download a file directly
 protondrive mkdir <remoteDir> <name>       # Create a remote folder

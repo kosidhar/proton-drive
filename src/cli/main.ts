@@ -2,6 +2,7 @@
 
 import path from 'node:path';
 
+import type { NodeEntity } from '@protontech/drive-sdk';
 import { launchDesktopWindow } from '../gui/launcher';
 import { ensureSystemTrayIndicator, sendDesktopNotification } from '../linux/notifications';
 import { DEFAULT_DAEMON_HOST, DEFAULT_DAEMON_PORT, startSyncDaemon } from '../daemon/daemonServer';
@@ -492,12 +493,16 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
             if (!runtime.auth.isLoggedIn()) {
                 throw new Error('Not signed in. Run `protondrive auth login` first.');
             }
-            const node = await runtime.paths.getNode(remotePath, [
-                PathType.MyFiles,
-                PathType.SharedWithMe,
-                PathType.Devices,
-            ]);
-            const children = await listFolderChildren(runtime.sdk, node);
+            runtime.paths.getPath(remotePath, [PathType.MyFiles, PathType.SharedWithMe, PathType.Devices]);
+            let children: NodeEntity[];
+            if (runtime.paths.isSharedWithMeRoot(remotePath)) {
+                children = await runtime.paths.listSharedWithMe((uid) =>
+                    console.error(`Skipped a shared item that could not be loaded: ${uid}`),
+                );
+            } else {
+                const node = await runtime.paths.getNode(remotePath);
+                children = await listFolderChildren(runtime.sdk, node);
+            }
             const items = children.map((c) => ({
                 uid: c.uid,
                 name: getName(c),

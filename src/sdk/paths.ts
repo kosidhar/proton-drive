@@ -1,6 +1,6 @@
 import path from 'node:path';
 
-import { NodeEntity, NodeType, ProtonDriveClient, ValidationError } from '@protontech/drive-sdk';
+import { ConnectionError, NodeEntity, NodeType, ProtonDriveClient, ValidationError } from '@protontech/drive-sdk';
 import { ProtonDrivePhotosClient } from '@protontech/drive-sdk/protonDrivePhotosClient';
 import { ProtonDrivePublicLinkClient } from '@protontech/drive-sdk/protonDrivePublicLinkClient';
 
@@ -61,6 +61,20 @@ export class Paths {
             nodes.push(await path.getNode());
         }
         return nodes;
+    }
+
+    // True for the bare /shared-with-me (or /photos-shared-with-me), which has no node of its own: it is the list of items
+    isSharedWithMeRoot(pathString: string): boolean {
+        const path = this.getPath(pathString);
+        return (
+            (path.type === PathType.SharedWithMe || path.type === PathType.PhotosSharedWithMe) &&
+            splitPathSegments(path.fullPath).filter((s) => s !== '').length === 1
+        );
+    }
+
+    // The items shared with the user, for `ls /shared-with-me`. A node that can't be loaded is skipped and given to onSkip
+    async listSharedWithMe(onSkip?: (uid: string) => void): Promise<NodeEntity[]> {
+        return loadSharedWithMe(this.sdk, onSkip);
     }
 
     getPaths(pathStrings: string[], supportedTypes?: PathType[], unsupportedTypeMessage?: string): Path[] {
@@ -256,9 +270,10 @@ export class Path {
     }
 
     private async getSharedWithMeRootFolder() {
-        for await (const maybeNode of this.sdk.iterateSharedNodesWithMe()) {
-            if (getName(maybeNode) === this.sectionRootNodeName) {
-                return maybeNode;
+        // Two shared items may share a name: the first found is taken
+        for (const node of await loadSharedWithMe(this.sdk)) {
+            if (getName(node) === this.sectionRootNodeName) {
+                return node;
             }
         }
         throw new ValidationError('Root node not found');
@@ -368,6 +383,41 @@ export class Path {
         }
         throw new ValidationError(`Album not found: ${name}`);
     }
+}
+
+// The nodes shared with the user, loaded from their uids. A node the SDK reports missing, or can't load (a parent's key, say:
+// its batch loader throws after the nodes it could load), is skipped and given to onSkip. The ones the batch didn't
+// reach are loaded again one at a time. A lost connection fails the whole list.
+async function loadSharedWithMe(
+    sdk: ProtonDriveClient | ProtonDrivePhotosClient,
+    onSkip?: (uid: string) => void,
+): Promise<NodeEntity[]> {
+    const uids = await Array.fromAsync(sdk.iterateSharedWithMeNodeUids());
+    const nodes: NodeEntity[] = [];
+    const seen = new Set<string>();
+    const take = (n: { missingUid: string } | NodeEntity) => {
+        if ('missingUid' in n) {
+            seen.add(n.missingUid);
+            onSkip?.(n.missingUid);
+        } else {
+            seen.add(n.uid);
+            nodes.push(n);
+        }
+    };
+    try {
+        for await (const n of sdk.iterateNodes(uids)) take(n);
+    } catch (e) {
+        if (e instanceof ConnectionError) throw e;
+        for (const uid of uids.filter((u) => !seen.has(u))) {
+            try {
+                for await (const n of sdk.iterateNodes([uid])) take(n);
+            } catch (e2) {
+                if (e2 instanceof ConnectionError) throw e2;
+            }
+            if (!seen.has(uid)) onSkip?.(uid);
+        }
+    }
+    return nodes;
 }
 
 export class PublicLinkPath {
