@@ -92,7 +92,15 @@ It installs the app, the service and the Files extension, but not their dependen
 
 1. Open **Proton Drive** from your app menu. It starts the background service.
 2. Sign in. Proton's sign-in page opens in your browser, so the app never sees your password. Your session is kept in
-   the system keyring, or, where there's no keyring, in a file in the app's data folder that only you can read.
+   the system keyring, or, where there's no keyring, in a file in the app's data folder
+   (`~/.local/share/proton-drive-ubuntu/auth-session.json`) that only you can read. Anything running as you can read
+   that file too, so a keyring is better: install GNOME Keyring or KWallet (or any Secret Service provider) and sign in
+   again. The app tells you when it's using the file: Settings > Account shows a line about it, `protondrive auth
+   login` and `protondrive auth status` say where the session is, and the log has a warning.
+   If you'd rather have no stored session than a file, set `PROTONDRIVE_NO_FILE_SESSION=1` in the environment of
+   `protondrive daemon` and `protondrive auth login` (for the service, in a systemd drop-in `Environment=` line): with
+   no keyring, sign-in then fails with a clear error and you stay signed out. A session file that already exists is
+   still read.
 3. Proton Drive appears in Files' sidebar and starts syncing.
 
 From then on, Proton Drive starts when you log in, without opening its window. To change that, use **Start Proton
