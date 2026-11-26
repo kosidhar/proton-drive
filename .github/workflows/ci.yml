@@ -30,6 +30,9 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: ${{ env.BUN_VERSION }}
+      - name: Install the tools the tests call
+        # xmllint: the Docs and Sheets icons must be well-formed XML (#439)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libxml2-utils
       - run: bun install --frozen-lockfile
       - run: bunx tsc --noEmit
       - run: bun test tests
