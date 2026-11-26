@@ -5901,6 +5901,10 @@ export class ProtonDriveSyncEngine {
         // listed again once the local one is gone (#447). When unsure, keep both.
         const otherKind = otherKindAt(local, entry);
         const ownEntry = otherKind ? null : entry;
+        // Another cloud node sits at relPath when this computer's local record (or edit baseline) names a different
+        // node (#462): that other device's node and its subtree are neither trashed nor dropped from the index.
+        const otherNode =
+            ownEntry !== null && !isProvisional(ownEntry.uid) && this.ownNodeAt(relPath, ownEntry) !== ownEntry.uid ? ownEntry : null;
         if (onlyIfEmpty) {
             if (shown ? !shown.isDirectory() : entry?.type !== 'folder') {
                 throw new DriveOpError('EIO', `Not a folder: ${relPath}`);
@@ -5927,12 +5931,14 @@ export class ProtonDriveSyncEngine {
         // Everything else in a folder being deleted goes to the Proton Drive trash, item by item.
         const collisions = ignored || onlyIfEmpty ? [] : await this.collisionsAt(relPath, entry, local);
         const collision = collisions.length > 0;
-        const toTrash = ignored
-            ? new Map<string, string>()
-            : collision
-              ? this.trashTargetsKeeping(relPath, collisions)
-              : this.trashTargets(relPath, ownEntry);
-        for (const kept of otherKind ? this.index.listSubtree(otherKind.relPath) : []) {
+        const toTrash =
+            ignored || (collision && otherNode)
+                ? new Map<string, string>()
+                : collision
+                  ? this.trashTargetsKeeping(relPath, collisions)
+                  : this.trashTargets(relPath, otherNode ? null : ownEntry);
+        const keptCloud = otherKind ?? otherNode;
+        for (const kept of keptCloud ? this.index.listSubtree(keptCloud.relPath) : []) {
             toTrash.delete(kept.uid);
         }
         this.watcher.suppressPath(relPath);
@@ -5964,11 +5970,13 @@ export class ProtonDriveSyncEngine {
                     if (collision) {
                         // Nothing is left of this computer's side: what stays is the cloud's version
                         this.endConflictsAsKeepRemote(collisions);
-                        for (const uid of toTrash.keys()) {
-                            this.index.removeSubtree(uid);
-                        }
-                    } else if (ownEntry) {
-                        this.index.removeSubtree(ownEntry.uid);
+                    }
+                    // Drop only nodes actually being trashed: another node the index holds at relPath (e.g. made by
+                    // another device after this item's recorded node moved away) is neither trashed nor dropped from
+                    // the index, so it doesn't vanish and come back (#462). Unneeded provisional folders are cleaned
+                    // up by applyPendingOpsToIndex below.
+                    for (const uid of toTrash.keys()) {
+                        this.index.removeSubtree(uid);
                     }
                     for (const [uid, where] of toTrash) {
                         this.journal.enqueue({ kind: 'trash', nodeUid: uid, path: where }, cloudPaths.get(uid));
