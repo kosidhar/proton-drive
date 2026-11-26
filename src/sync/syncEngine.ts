@@ -300,6 +300,10 @@ export class ProtonDriveSyncEngine {
     // Local paths known to be waiting to upload (watcher, VFS writes, or sync pass scan), cleared once synced, deleted,
     // or cut short. Rolled up into folder emblems so ancestor folders show syncing while children wait to upload (#53).
     private readonly pendingUploads = new Set<string>();
+    // Nodes whose move or rename was given up on (or refused) and whose remote index entry has yet to follow Proton
+    // Drive: until the index reflects the cloud again, an rmdir whose listing started while the move was pending still
+    // counts the child in its old folder (#466).
+    private readonly givenUpMoves = new Set<string>();
     private watcher: LocalFolderWatcher;
     private unsubscribeDriveEvents: (() => void) | null = null;
     private reconcileRunning = false;
@@ -3513,6 +3517,7 @@ export class ProtonDriveSyncEngine {
 
         if (event.type === DriveEventType.NodeDeleted) {
             this.forgetHeldNodes(event.nodeUid);
+            this.givenUpMoves.delete(event.nodeUid);
             this.index.removeSubtree(event.nodeUid);
             this.touchDocFolders([this.docs.remove(event.nodeUid)]);
             const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
@@ -3526,6 +3531,7 @@ export class ProtonDriveSyncEngine {
         if (event.type === DriveEventType.NodeCreated || event.type === DriveEventType.NodeUpdated) {
             if (event.isTrashed) {
                 this.forgetHeldNodes(event.nodeUid);
+                this.givenUpMoves.delete(event.nodeUid);
                 this.index.removeSubtree(event.nodeUid);
                 this.touchDocFolders([this.docs.remove(event.nodeUid)]);
                 const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
@@ -4596,6 +4602,7 @@ export class ProtonDriveSyncEngine {
             })();
             this.keepBothCopies.clear(); // the index, journal and policy are read from their tables: nothing else to drop
             this.pendingUploads.clear();
+            this.givenUpMoves.clear();
         });
         this.accountMismatch = null;
         this.accountVerified = true;
@@ -6181,7 +6188,8 @@ export class ProtonDriveSyncEngine {
     // Whether a fresh listing of the folder at relPath has anything in it that is to stay there: a Proton Doc or Sheet, or
     // any item that no trash or move elsewhere through the drive takes away. Such an operation can still be pending, or
     // can have been pending when the listing was asked for and have reached Proton Drive since (the listing may still
-    // have the item then): that item counts only while the remote index still has it in the folder.
+    // have the item then): that item counts only while the remote index still has it in the folder, or while a given-up
+    // move has yet to put the index back (#466).
     private listingHoldsAnything(relPath: string, listing: RmdirListing): boolean {
         const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
         const takesOut = (op: RemoteOp | undefined) => op !== undefined && (op.kind === 'trash' || !op.toPath.startsWith(`${relPath}/`));
@@ -6191,7 +6199,7 @@ export class ProtonDriveSyncEngine {
                 return !takesOut(now);
             }
             if (takesOut(listing.latestOpBefore.get(child.uid))) {
-                return this.index.getByUid(child.uid)?.parentUid === listing.uid;
+                return this.givenUpMoves.has(child.uid) || this.index.getByUid(child.uid)?.parentUid === listing.uid;
             }
             return true;
         });
@@ -6494,6 +6502,9 @@ export class ProtonDriveSyncEngine {
                     this.index.removeSubtree(node.uid);
                 }
             });
+            if (entry || node.trashTime) {
+                this.givenUpMoves.delete(node.uid);
+            }
         } catch (error: unknown) {
             this.logger.warn(`Failed to update the remote index for ${getName(node)}: ${error}`);
         }
@@ -6716,6 +6727,7 @@ export class ProtonDriveSyncEngine {
             if (await this.alreadyTrashed(op.nodeUid, error)) {
                 // In the Proton Drive trash already, or gone (a trash sent before a restart, say): done (#179)
                 this.journal.complete(op.id);
+                this.givenUpMoves.delete(op.nodeUid);
                 this.indexWrite(() => this.index.removeSubtree(op.nodeUid));
                 this.stateDb.logActivity({
                     action: 'trash-remote',
@@ -6737,6 +6749,7 @@ export class ProtonDriveSyncEngine {
             return this.replayFailed(op, op.path, error);
         }
         this.journal.complete(op.id);
+        this.givenUpMoves.delete(op.nodeUid);
         this.indexWrite(() => this.index.removeSubtree(op.nodeUid));
         this.stateDb.logActivity({
             action: 'trash-remote',
@@ -6791,6 +6804,7 @@ export class ProtonDriveSyncEngine {
             const missing = this.missingCloudFolders(parentRel);
             if (missing === null) {
                 // Its folder is gone from here since, or is never synced (ignored): Proton Drive keeps it where it is
+                this.givenUpMoves.add(op.nodeUid);
                 this.journal.complete(op.id);
                 this.indexFromCloud(node);
                 this.stateDb.logActivity({
@@ -6821,6 +6835,7 @@ export class ProtonDriveSyncEngine {
                 if (gone === false) {
                     // Refused (a name Proton Drive doesn't take, say): the next sync puts the local copy back where the
                     // cloud has it
+                    this.givenUpMoves.add(op.nodeUid);
                     this.journal.complete(op.id);
                     this.indexFromCloud(node);
                     this.tellUser(
@@ -6956,6 +6971,9 @@ export class ProtonDriveSyncEngine {
             }
         } else if (isTransient(error) || op.attempts + 1 < MAX_UNEXPECTED_FAILURES) {
             return keep();
+        }
+        if (op.kind !== 'trash') {
+            this.givenUpMoves.add(op.nodeUid);
         }
         this.journal.complete(op.id);
         this.tellUser(
@@ -7128,6 +7146,7 @@ export class ProtonDriveSyncEngine {
                 this.journal.setCloudPathAfter(op.id, op.nodeUid, joinRel(parentOf(op.toPath), placedAs));
                 this.journal.complete(op.id);
             })();
+            this.givenUpMoves.delete(op.nodeUid);
             return renamed;
         });
         try {
@@ -7188,6 +7207,7 @@ export class ProtonDriveSyncEngine {
                 this.journal.complete(op.id);
                 this.indexWrite(() => this.index.removeSubtree(op.nodeUid));
             })();
+            this.givenUpMoves.delete(op.nodeUid);
             if (hasLocalCopy) {
                 this.stateDb.logActivity({
                     action: 'sync',
@@ -7819,6 +7839,9 @@ export class ProtonDriveSyncEngine {
                     }),
                 );
             });
+            for (const child of children) {
+                this.givenUpMoves.delete(child.uid);
+            }
             // A change among the documents shows in an open file manager window like any other (#408)
             this.touchDocFolders(docFolders, new Map([[folder.uid, relPath]]));
             return true;
