@@ -678,7 +678,11 @@ describe('moveToLayout: virtual to plain', () => {
                 if (entry.startsWith('dir')) continue;
                 expect([rel, left[rel] ?? moved[rel]]).toEqual([rel, entry]);
             }
-            expect(Object.keys(moved).filter((rel) => rel.includes('.proton-drive-tmp-'))).toEqual([]);
+            // Only the move's own partial copies: the tree also holds an ordinary .proton-drive-tmp-hydrate-* file, which
+            // is moved like any other and may already be in the sync folder, depending on readdir order (#531)
+            const partial = (snap: Record<string, string>) => Object.keys(snap).filter((rel) => rel.includes('.proton-drive-tmp-move-'));
+            expect(partial(moved)).toEqual([]);
+            expect(partial(left)).toEqual([]);
         });
 
         test('a file already copied by an earlier run counts as moved; a different one there steps aside', async () => {
