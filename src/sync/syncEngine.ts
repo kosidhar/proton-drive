@@ -5967,6 +5967,28 @@ export class ProtonDriveSyncEngine {
         for (const kept of keptCloud ? this.index.listSubtree(keptCloud.relPath) : []) {
             toTrash.delete(kept.uid);
         }
+        // Note where Proton Drive still keeps any recorded/baselined node(s) skipped because another device moved them
+        // away (#454, #465), before the transaction below drops the local records and edit baselines.
+        const movedPlaces: string[] = [];
+        if (!ignored) {
+            const addMoved = (uid: string, atRel: string) => {
+                if (otherKind !== null && this.isAtOrIn(uid, otherKind)) {
+                    return;
+                }
+                const at = this.movedAwayTo(uid, atRel);
+                if (at !== null && !movedPlaces.includes(at)) {
+                    movedPlaces.push(at);
+                }
+            };
+            const own = this.ownNodeAt(relPath, otherNode ? null : ownEntry);
+            if (own !== null) {
+                addMoved(own, relPath);
+            } else {
+                for (const item of this.topmostRecordedUnder(relPath)) {
+                    addMoved(item.nodeUid, item.localRelPath);
+                }
+            }
+        }
         this.watcher.suppressPath(relPath);
         // For a Move to Trash, what is only here is told apart from unchanged synced copies while the records still say
         // which those are
@@ -6054,14 +6076,25 @@ export class ProtonDriveSyncEngine {
         if (kept.stayed > 0) {
             told.push(this.keptHere(kept.stayed, relPath));
         }
-        const deleted =
-            toTrash.size > 0
-                ? 'Deleted on this computer; it goes to Proton Drive Trash'
-                : collision
-                  ? 'Deleted on this computer; the other file Proton Drive has at that name stays'
-                  : otherKind
-                    ? `Deleted on this computer; the ${otherKind.type} Proton Drive has at that name stays`
-                    : 'Deleted on this computer';
+        const notes: string[] = [];
+        if (toTrash.size > 0) {
+            notes.push('it goes to Proton Drive Trash');
+        }
+        if (movedPlaces.length > 0) {
+            notes.push(
+                toTrash.size > 0
+                    ? `Proton Drive keeps ${listNames(movedPlaces)}`
+                    : `Proton Drive keeps ${movedPlaces.length === 1 ? 'it' : 'them'} at ${listNames(movedPlaces)}`,
+            );
+        }
+        if (otherKind) {
+            notes.push(`the ${otherKind.type} Proton Drive has at that name stays`);
+        } else if (otherNode) {
+            notes.push(`the other ${otherNode.type} Proton Drive has at that name stays`);
+        } else if (collision) {
+            notes.push('the other file Proton Drive has at that name stays');
+        }
+        const deleted = notes.length > 0 ? `Deleted on this computer; ${notes.join('; ')}` : 'Deleted on this computer';
         this.stateDb.logActivity({
             action: 'delete-local',
             localRelPath: relPath,
@@ -6345,9 +6378,22 @@ export class ProtonDriveSyncEngine {
     // relPath: the index keeps it where the cloud has it while another node holds that place (see
     // applyPendingOpsToIndex), but the replay takes it there all the same. Left alone, it would come back under a
     // conflict name, undoing the delete (#454).
-    private movedAwayFrom(uid: string, relPath: string): boolean {
+    // Where the remote index has a recorded (or baselined) node when another device moved it away from relPath (#454,
+    // #465), or null when it is still at relPath (including via this computer's own pending move) or not indexed.
+    private movedAwayTo(uid: string, relPath: string): string | null {
         const now = this.index.getByUid(uid);
-        return now !== null && now.relPath !== relPath && this.pendingPlaceOf(now) !== relPath;
+        if (now === null || now.relPath === relPath) {
+            return null;
+        }
+        const pending = this.pendingPlaceOf(now);
+        if (pending === relPath) {
+            return null;
+        }
+        return pending ?? now.relPath;
+    }
+
+    private movedAwayFrom(uid: string, relPath: string): boolean {
+        return this.movedAwayTo(uid, relPath) !== null;
     }
 
     // Where this computer's pending renames and moves put an indexed node once they reach Proton Drive: the target of
