@@ -10517,6 +10517,225 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     await d.expectEveryRecordHasItsFile();
                 });
             });
+
+            // #465: when a delete through the drive leaves a cloud item alone (moved away, other kind, or another
+            // cloud node at that path), the activity log says so rather than only "Deleted on this computer".
+            describe('activity wording when a drive delete keeps the cloud item (#465)', () => {
+                const deleteActivities = () =>
+                    stateDb
+                        .listActivity(50)
+                        .filter((a) => a.action === 'delete-local')
+                        .map((a) => ({ localRelPath: a.localRelPath, details: a.details }));
+
+                test('Move to Trash of a folder moved away to Z logs where Proton Drive keeps it', async () => {
+                    const d = setup();
+                    d.add('X/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('X').uid);
+                    movedByAnotherDevice(d, 'vol~X', { name: 'Z' });
+
+                    await d.engine.deleteItem('X', { trash: true });
+
+                    expect(deleteActivities()).toContainEqual({
+                        localRelPath: 'X',
+                        details: 'Deleted on this computer; Proton Drive keeps it at Z',
+                    });
+                });
+
+                test('unlink of a file moved away to Docs/b.txt logs where Proton Drive keeps it', async () => {
+                    const d = setup();
+                    d.add('Docs/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('Docs').uid);
+                    movedByAnotherDevice(d, 'vol~Docs/a.txt', { name: 'b.txt' });
+
+                    await d.engine.deleteItem('Docs/a.txt');
+
+                    expect(deleteActivities()).toContainEqual({
+                        localRelPath: 'Docs/a.txt',
+                        details: 'Deleted on this computer; Proton Drive keeps it at Docs/b.txt',
+                    });
+                });
+
+                test('unlink of a baselined file moved away logs where Proton Drive keeps it', async () => {
+                    const d = setup();
+                    d.add('Docs/doc.txt', 'old');
+                    await d.engine.reconcileNow();
+                    await d.engine.truncateItem('Docs/doc.txt');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    movedByAnotherDevice(d, 'vol~Docs/doc.txt', { name: 'theirs.txt' });
+
+                    await d.engine.deleteItem('Docs/doc.txt');
+
+                    expect(deleteActivities()).toContainEqual({
+                        localRelPath: 'Docs/doc.txt',
+                        details: 'Deleted on this computer; Proton Drive keeps it at Docs/theirs.txt',
+                    });
+                });
+
+                test('Move to Trash of an unrecorded folder holding a baselined file whose folder moved away logs where Proton Drive keeps it', async () => {
+                    const d = setup();
+                    d.add('X/doc.txt', 'old');
+                    await d.engine.reconcileNow();
+                    await d.engine.truncateItem('X/doc.txt');
+                    await writeFile(d.local('X/doc.txt'), 'mine');
+                    movedByAnotherDevice(d, 'vol~X', { name: 'Z' });
+
+                    await d.engine.deleteItem('X', { trash: true });
+
+                    expect(deleteActivities()[0]).toMatchObject({
+                        localRelPath: 'X',
+                        details: expect.stringContaining('Deleted on this computer; Proton Drive keeps it at Z/doc.txt'),
+                    });
+                });
+
+                test('Move to Trash of an unrecorded folder holding two moved-away hydrated files lists both places', async () => {
+                    const d = setup();
+                    d.add('X/a.txt', 'a');
+                    d.add('X/b.txt', 'b');
+                    await d.engine.reconcileNow();
+                    await d.engine.hydrate('X/a.txt');
+                    await d.engine.hydrate('X/b.txt');
+                    movedByAnotherDevice(d, 'vol~X', { name: 'Z' });
+
+                    await d.engine.deleteItem('X', { trash: true });
+
+                    expect(deleteActivities()).toContainEqual({
+                        localRelPath: 'X',
+                        details: 'Deleted on this computer; Proton Drive keeps them at Z/a.txt and Z/b.txt',
+                    });
+                });
+
+                test('Move to Trash of an in-place folder whose child moved out to Other/a.txt notes both the trash and the kept child', async () => {
+                    const d = setup();
+                    d.add('X/a.txt', 'a');
+                    d.add('X/b.txt', 'b');
+                    d.add('Other');
+                    await pinnedAndSynced(d, d.add('X').uid);
+                    movedByAnotherDevice(d, 'vol~X/a.txt', { parentUid: 'vol~Other' });
+
+                    await d.engine.deleteItem('X', { trash: true });
+
+                    expect(deleteActivities()).toContainEqual({
+                        localRelPath: 'X',
+                        details: 'Deleted on this computer; it goes to Proton Drive Trash; Proton Drive keeps Other/a.txt',
+                    });
+                });
+
+                test('control: Move to Trash of an in-place folder whose child was renamed inside it does not claim Proton Drive keeps that child', async () => {
+                    const d = setup();
+                    d.add('X/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('X').uid);
+                    movedByAnotherDevice(d, 'vol~X/a.txt', { name: 'b.txt' });
+
+                    await d.engine.deleteItem('X', { trash: true });
+
+                    expect(deleteActivities()).toContainEqual({
+                        localRelPath: 'X',
+                        details: 'Deleted on this computer; it goes to Proton Drive Trash',
+                    });
+                });
+
+                test('Move to Trash of a moved-away folder over another cloud folder G notes both the moved node and the folder at that name', async () => {
+                    const d = setup();
+                    d.add('X/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('X').uid);
+                    movedByAnotherDevice(d, 'vol~X', { name: 'Z' });
+                    const g = makeMockNode({ uid: 'vol~G', parentUid: d.root.uid, nameStr: 'X', type: NodeType.Folder });
+                    d.nodes.set('vol~G', g);
+                    indexed(d, 'vol~G');
+
+                    await d.engine.deleteItem('X', { trash: true });
+
+                    expect(deleteActivities()).toContainEqual({
+                        localRelPath: 'X',
+                        details: 'Deleted on this computer; Proton Drive keeps it at Z; the other folder Proton Drive has at that name stays',
+                    });
+                });
+
+                test('Move to Trash of a local folder over a cloud file says the cloud file stays', async () => {
+                    const d = setup();
+                    d.add('X', 'theirs');
+                    await d.engine.reconcileNow();
+                    await mkdir(d.local('X'));
+
+                    await d.engine.deleteItem('X', { trash: true });
+
+                    expect(deleteActivities()).toContainEqual({
+                        localRelPath: 'X',
+                        details: 'Deleted on this computer; the file Proton Drive has at that name stays',
+                    });
+                });
+
+                test('unlink of a local file with a stale record inside the cloud folder at its path does not also report it as moved away', async () => {
+                    const d = setup();
+                    d.add('X/inner.txt', 'inner');
+                    await d.engine.reconcileNow();
+                    await d.files.writeLocal('X', 'mine');
+                    stateDb.upsertItem({
+                        localRelPath: 'X',
+                        nodeUid: 'vol~X/inner.txt',
+                        parentNodeUid: 'vol~X',
+                        type: 'file',
+                        localSha1: null,
+                        remoteSha1: null,
+                        localMtimeMs: 0,
+                        remoteMtimeMs: 0,
+                        size: 0,
+                        syncStatus: 'synced',
+                        lastError: null,
+                    });
+
+                    await d.engine.deleteItem('X');
+
+                    expect(deleteActivities()).toContainEqual({
+                        localRelPath: 'X',
+                        details: 'Deleted on this computer; the folder Proton Drive has at that name stays',
+                    });
+                });
+
+                test('unlink of a local file recorded as another node over a cloud folder notes both the trash and the staying folder', async () => {
+                    const d = setup();
+                    d.add('X/inner.txt', 'inner');
+                    await d.engine.reconcileNow();
+                    await d.files.writeLocal('X', 'mine');
+                    stateDb.upsertItem({
+                        localRelPath: 'X',
+                        nodeUid: 'vol~Elsewhere/mine.txt',
+                        parentNodeUid: null,
+                        type: 'file',
+                        localSha1: null,
+                        remoteSha1: null,
+                        localMtimeMs: 0,
+                        remoteMtimeMs: 0,
+                        size: 0,
+                        syncStatus: 'synced',
+                        lastError: null,
+                    });
+
+                    await d.engine.deleteItem('X');
+
+                    expect(deleteActivities()).toContainEqual({
+                        localRelPath: 'X',
+                        details: 'Deleted on this computer; it goes to Proton Drive Trash; the folder Proton Drive has at that name stays',
+                    });
+                });
+
+                test('Move to Trash of a folder holding a colliding file names that file in the activity line', async () => {
+                    const d = setup();
+                    d.add('X/a.txt', 'a');
+                    d.add('X/c.txt', 'cloud-c');
+                    await d.engine.reconcileNow();
+                    await d.files.writeLocal('X/c.txt', 'local-c');
+
+                    await d.engine.deleteItem('X', { trash: true });
+
+                    expect(deleteActivities()[0]).toMatchObject({
+                        localRelPath: 'X',
+                        details: expect.stringContaining(
+                            'Deleted on this computer; it goes to Proton Drive Trash; the other file Proton Drive has at X/c.txt stays',
+                        ),
+                    });
+                });
+            });
         });
 
         test('moving a downloaded folder to the Trash trashes it once in Proton Drive, uploads nothing of an ignored .git, and does not bring it back', async () => {
