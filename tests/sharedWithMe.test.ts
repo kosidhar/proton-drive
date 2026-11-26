@@ -78,6 +78,12 @@ function make(
                 yield n && !n.fails ? n : { missingUid: uid };
             }
         },
+        // A folder's listing, recorded: nothing in Shared with me lists one today (#536)
+        async *iterateFolderChildren(parent: any) {
+            const parentUid = typeof parent === 'string' ? parent : parent.uid;
+            calls.push(['list', parentUid]);
+            yield* nodes.filter((n) => n.parentUid === parentUid);
+        },
         async acceptInvitation(uid: string) {
             calls.push(['accept', uid]);
             if (opts.failWith) throw opts.failWith;
@@ -502,6 +508,43 @@ describe('shared with me: download', () => {
         expect(fetched).toEqual([]);
         expect(await readdir(dir)).toEqual([]);
         expect(logs).toEqual([]);
+    });
+
+    // #536: a folder shared with the user is never downloaded, so no name inside it ever reaches the disk: it isn't even
+    // listed. Were folders ever downloaded, each child's name would have to go through safeName as the file's does.
+    test("a shared folder's children, whatever their names, are never listed or written", async () => {
+        const parent = tmp();
+        const downloads = path.join(parent, 'Downloads');
+        await mkdir(downloads);
+        const children = ['../x', 'a/b', '..', '.'].map((name, i) =>
+            node(`child${i}`, { name: ok(name), parentUid: 'folder', activeRevision: { claimedSize: 1 } }),
+        );
+        const folder = node('folder', { name: ok('Shared folder'), type: NodeType.Folder });
+        const { service, calls, fetched, logs } = make({ downloads, nodes: [folder, ...children] });
+        await expect(service.download('folder')).rejects.toBeInstanceOf(ShareError);
+        expect(calls).toEqual([]);
+        expect(fetched).toEqual([]);
+        expect(await readdir(parent)).toEqual(['Downloads']);
+        expect(await readdir(downloads)).toEqual([]);
+        expect(logs).toEqual([]);
+    });
+
+    test('a file named like ../x, a/b, .. or . is saved inside Downloads under a safe name', async () => {
+        const cases: Array<[string, string]> = [
+            ['../x', '.._x'],
+            ['a/b', 'a_b'],
+            ['..', 'Shared file'],
+            ['.', 'Shared file'],
+        ];
+        for (const [name, expected] of cases) {
+            const parent = tmp();
+            const downloads = path.join(parent, 'Downloads');
+            await mkdir(downloads);
+            const { service } = make({ downloads, nodes: [node('n1', { name: ok(name), activeRevision: { claimedSize: 1 } })] });
+            const { path: result } = await service.download('n1');
+            expect([name, result]).toEqual([name, path.join(downloads, expected)]);
+            expect(await readdir(parent)).toEqual(['Downloads']);
+        }
     });
 
     test('an item that is gone is a ShareError', async () => {

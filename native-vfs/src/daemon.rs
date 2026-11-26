@@ -559,6 +559,26 @@ mod tests {
         assert_eq!(parse_children(serde_json::json!({ "nope": [] })).unwrap_err().errno, libc::EIO);
     }
 
+    /// #536: a name from Proton Drive that would lead out of its folder, or name no entry in it, is never listed, file,
+    /// folder or Docs placeholder alike, whatever else the listing holds; the names around it still are
+    #[test]
+    fn children_named_to_climb_out_or_name_nothing_are_dropped() {
+        let bad = ["", ".", "..", "../../.config/autostart/x.desktop", "a/b", "/", "a\0b", "\0", "dir/"];
+        let mut wire = Vec::new();
+        for (i, name) in bad.iter().enumerate() {
+            let kind = if i % 2 == 0 { "file" } else { "folder" };
+            wire.push(serde_json::json!({ "name": name, "type": kind, "size": 1, "mtimeMs": 0 }));
+        }
+        wire.push(serde_json::json!({ "name": "../plan.protondoc", "type": "file", "size": 1, "mtimeMs": 0,
+            "placeholder": { "kind": "doc", "content": "{}" } }));
+        for name in ["...", ".hidden", "..a", "a..", "ok.txt"] {
+            wire.push(serde_json::json!({ "name": name, "type": "file", "size": 1, "mtimeMs": 0 }));
+        }
+        let entries = parse_children(serde_json::json!({ "entries": wire })).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.to_str().unwrap()).collect();
+        assert_eq!(names, ["...", ".hidden", "..a", "a..", "ok.txt"]);
+    }
+
     #[test]
     fn a_placeholder_in_a_listing_carries_its_content() {
         let content = "{\"url\":\"https://docs.proton.me/doc?type=doc\"}\n";
