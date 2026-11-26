@@ -2595,6 +2595,8 @@ impl ProtonDriveNativeApp {
                                 activity::ActivityKind::RemovedLocally | activity::ActivityKind::FreedUp | activity::ActivityKind::Hidden
                             );
                             let is_folder_act = act.action == "mkdir" || taken_away && !act.local_rel_path.contains('.');
+                            // Its path, or the name of an item shared with the account, which has none
+                            let file_text = activity::file_column(&act.action, &act.local_rel_path, &act.details);
                             // Phosphor's folder (orange, as Shared's, or grey once taken away) or file
                             let (icon, icon_color) = match (is_folder_act, taken_away) {
                                 (true, false) => (icons::FOLDER, FOLDER_ICON()),
@@ -2621,11 +2623,10 @@ impl ProtonDriveNativeApp {
                             // Names stop at Details, or at Time when zoomed in so far that Details collapses
                             let name_max_w = (r_details_x - col_gap).min(time_left_x) - name_x;
                             let details_max_w = time_left_x - r_details_x;
-                            let name_text =
-                                truncate_middle_to_width(ui.painter(), &act.local_rel_path, &name_font, name_max_w);
+                            let name_text = truncate_middle_to_width(ui.painter(), file_text, &name_font, name_max_w);
                             let details_text =
                                 truncate_middle_to_width(ui.painter(), &act.details, &details_font, details_max_w);
-                            let truncated = name_text != act.local_rel_path || details_text != act.details;
+                            let truncated = name_text != file_text || details_text != act.details;
 
                             ui.painter().text(
                                 egui::pos2(name_x, cy),
@@ -2648,12 +2649,12 @@ impl ProtonDriveNativeApp {
                                 time_font,
                                 TEXT_MUTED(),
                             );
-                            let row_label = format!("{pill_label}: {}, {time_str}", act.local_rel_path);
+                            let row_label = format!("{pill_label}: {file_text}, {time_str}");
                             let enabled = ui.is_enabled();
                             row_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &row_label));
                             // Cut short: the whole text shows on hover; it shows in the row a click opens, too
                             let row_resp = if truncated {
-                                row_resp.on_hover_text(format!("{}\n{}", act.local_rel_path, act.details))
+                                row_resp.on_hover_text(format!("{file_text}\n{}", act.details))
                             } else {
                                 row_resp
                             }
@@ -2665,10 +2666,12 @@ impl ProtonDriveNativeApp {
                                     None
                                 } else {
                                     let sync_dir = &self.status.sync_dir;
+                                    // An item shared with the account isn't in the sync folder: nothing to show or open
+                                    let here = !activity::is_shared_with_me(&act.action, &act.local_rel_path);
                                     Some(ExpandedActivity {
                                         key: key.clone(),
-                                        show: activity::show_target(sync_dir, &act.local_rel_path),
-                                        open: activity::open_target(sync_dir, &act.local_rel_path),
+                                        show: here.then(|| activity::show_target(sync_dir, &act.local_rel_path)).flatten(),
+                                        open: here.then(|| activity::open_target(sync_dir, &act.local_rel_path)).flatten(),
                                     })
                                 };
                                 ui.ctx().request_repaint();
@@ -2692,7 +2695,7 @@ impl ProtonDriveNativeApp {
                                 resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, enabled, value));
                             };
                             cell(ui, "status", pill_rect.left(), pill_rect.right(), status_header, pill_label);
-                            cell(ui, "file", r_file_x, (r_details_x - col_gap).min(time_left_x), file_header, &act.local_rel_path);
+                            cell(ui, "file", r_file_x, (r_details_x - col_gap).min(time_left_x), file_header, file_text);
                             if !act.details.is_empty() {
                                 cell(ui, "details", r_details_x, time_left_x, details_header, &act.details);
                             }
@@ -2714,7 +2717,8 @@ impl ProtonDriveNativeApp {
             .inner_margin(Margin::symmetric(14, 10))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                ui.add(egui::Label::new(RichText::new(&act.local_rel_path).size(13.0).strong().color(TEXT_PRIMARY())).wrap());
+                let file_text = activity::file_column(&act.action, &act.local_rel_path, &act.details);
+                ui.add(egui::Label::new(RichText::new(file_text).size(13.0).strong().color(TEXT_PRIMARY())).wrap());
                 ui.add_space(2.0);
                 ui.add(egui::Label::new(RichText::new(&act.details).size(12.5).color(TEXT_MUTED())).wrap());
                 let (show, open) = self.expanded_activity.as_ref().map(|e| (e.show.clone(), e.open.clone())).unwrap_or_default();
@@ -6998,6 +7002,54 @@ mod tests {
         assert!(h.text_at("Open").is_none());
         h.click(h.text_at("Show in Files").unwrap());
         assert_eq!(launched(), vec![format!("show:{}", dir.display())]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // #487 review: what is shared with the account isn't in the sync folder. Its entries name the item from their
+    // details, and offer no Show in Files or Open, which would show the drive's folder or a same-named file of My files
+    #[test]
+    fn a_shared_with_me_entry_names_its_item_and_offers_no_show_in_files_or_open() {
+        let dir = std::env::temp_dir().join(format!("pd-activity-swm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file of My files with the shared item's name
+        std::fs::write(dir.join("Report.pdf"), "mine").unwrap();
+        let launched = || home::LAUNCHED.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        launched();
+        let mut h = Harness::new();
+        h.app.tab = NavTab::Activity;
+        h.app.status.sync_dir = dir.to_string_lossy().into_owned();
+        let record = |ts: u64, path: &str, details: &str| ActivityRecord {
+            id: Some(ts),
+            timestamp: ts,
+            action: "share".into(),
+            local_rel_path: path.into(),
+            details: details.into(),
+        };
+        h.app.activities = vec![
+            record(1, "", "Downloaded Report.pdf to Downloads"),
+            record(2, "Docs/plan.txt", "Shared with a link"),
+        ];
+        h.frames(2);
+        let details = h.text_at("Downloaded Report.pdf to Downloads").expect("the details");
+        let name = h.text_at("Report.pdf").expect("the File column names the item");
+        assert!((name.y - details.y).abs() < 2.0 && name.x < details.x, "{name:?} in the File column of {details:?}'s row");
+        // Screen readers hear the name too, in the row and in its File / Folder cell
+        let nodes = accesskit_nodes(&h);
+        assert!(nodes.iter().any(|(_, n)| n.role() == egui::accesskit::Role::Button && says(n).starts_with("Shared: Report.pdf, ")));
+        assert!(nodes.iter().any(|(_, n)| n.role() == egui::accesskit::Role::Label
+            && n.value() == Some("Report.pdf")
+            && labelled_by(&h, n) == vec!["File / Folder".to_string()]));
+        h.click(name);
+        h.frames(2);
+        assert!(h.app.expanded_activity.as_ref().is_some_and(|e| e.show.is_none() && e.open.is_none()));
+        assert!(h.text_at("Show in Files").is_none(), "not the drive's folder");
+        assert!(h.text_at("Open").is_none(), "not My files' Report.pdf");
+        assert!(launched().is_empty());
+        // An item shared from My files keeps its path, and Show in Files
+        h.click(h.text_at("Docs/plan.txt").unwrap());
+        h.frames(2);
+        assert!(h.text_at("Show in Files").is_some());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
