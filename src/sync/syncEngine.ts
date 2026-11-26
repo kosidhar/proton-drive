@@ -300,9 +300,9 @@ export class ProtonDriveSyncEngine {
     // Local paths known to be waiting to upload (watcher, VFS writes, or sync pass scan), cleared once synced, deleted,
     // or cut short. Rolled up into folder emblems so ancestor folders show syncing while children wait to upload (#53).
     private readonly pendingUploads = new Set<string>();
-    // Nodes whose move or rename was given up on (or refused) and whose remote index entry has yet to follow Proton
-    // Drive: until the index reflects the cloud again, an rmdir whose listing started while the move was pending still
-    // counts the child in its old folder (#466).
+    // Nodes whose move or rename was given up on (or refused), or whose trash was skipped because the node moved
+    // elsewhere (#460), while the remote index has yet to follow Proton Drive: until the index reflects the cloud
+    // again, an rmdir whose listing started while the op was pending still counts the child in its old folder (#466).
     private readonly givenUpMoves = new Set<string>();
     private watcher: LocalFolderWatcher;
     private unsubscribeDriveEvents: (() => void) | null = null;
@@ -5703,7 +5703,10 @@ export class ProtonDriveSyncEngine {
                             });
                         }
                         if (sourceUid !== null && sourceUid !== targetUid) {
-                            this.journal.enqueue({ kind: 'trash', nodeUid: sourceUid, path: fromRel }, this.cloudPathInPending(sourceUid) ?? undefined);
+                            this.journal.enqueue(
+                                { kind: 'trash', nodeUid: sourceUid, path: fromRel },
+                                this.cloudPathInPending(sourceUid, fromRel) ?? undefined,
+                            );
                         }
                     } else {
                         this.stateDb.removeItemByPath(toRel); // Only something that exists only here (or nothing) is there
@@ -5734,7 +5737,7 @@ export class ProtonDriveSyncEngine {
                                         toPath: toRel,
                                         fromPath: fromRel,
                                     },
-                                    this.cloudPathInPending(sourceUid) ?? undefined,
+                                    this.cloudPathInPending(sourceUid, fromRel) ?? undefined,
                                 );
                             }
                             for (const item of carried) {
@@ -5745,7 +5748,7 @@ export class ProtonDriveSyncEngine {
                                         toPath: toRel + item.localRelPath.slice(fromRel.length),
                                         fromPath: item.localRelPath,
                                     },
-                                    this.cloudPathInPending(item.nodeUid) ?? undefined,
+                                    this.cloudPathInPending(item.nodeUid, item.localRelPath) ?? undefined,
                                 );
                             }
                         }
@@ -5917,7 +5920,7 @@ export class ProtonDriveSyncEngine {
                 // are gone leaves them unrecorded, to upload again as new items (nothing lost), never recorded without
                 // their files
                 this.stateDb.connection.transaction(() => {
-                    const cloudPaths = new Map([...toTrash.keys()].map((uid) => [uid, this.cloudPathInPending(uid) ?? undefined]));
+                    const cloudPaths = new Map([...toTrash].map(([uid, where]) => [uid, this.cloudPathInPending(uid, where) ?? undefined]));
                     this.stateDb.removeItemByPath(relPath);
                     this.stateDb.dropEditBaselines(relPath);
                     // Not the holds of files cut short (#300): a Move to Trash keeps here what the desktop Trash refuses,
@@ -6293,22 +6296,43 @@ export class ProtonDriveSyncEngine {
 
     // Where Proton Drive currently has `uid` when a pending rename or move of it (or of a folder above it) hasn't
     // reached Proton Drive yet; null when neither it nor any ancestor has a pending move with a known cloud path.
-    private cloudPathInPending(uid: string): string | null {
-        const entry = this.index.getByUid(uid);
-        if (!entry) {
-            return null;
-        }
+    private cloudPathInPending(uid: string, localRelPath?: string): string | null {
         const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
-        for (let e: RemoteIndexEntry | null = entry; e; e = e.parentUid ? this.index.getByUid(e.parentUid) : null) {
-            const op = latest.get(e.uid);
-            if (op !== undefined && op.kind !== 'trash') {
-                const cloudAt = this.journal.cloudPathOf(op.id);
-                if (cloudAt !== null) {
-                    return cloudAt + entry.relPath.slice(e.relPath.length);
-                }
+        const ownOp = latest.get(uid);
+        if (ownOp !== undefined && ownOp.kind !== 'trash') {
+            const cloudAt = this.journal.cloudPathOf(ownOp.id);
+            if (cloudAt !== null) {
+                return cloudAt;
             }
         }
-        return null;
+        const entry = this.index.getByUid(uid);
+        if (entry) {
+            for (let e: RemoteIndexEntry | null = entry; e; e = e.parentUid ? this.index.getByUid(e.parentUid) : null) {
+                const op = latest.get(e.uid);
+                if (op !== undefined && op.kind !== 'trash') {
+                    const cloudAt = this.journal.cloudPathOf(op.id);
+                    if (cloudAt !== null) {
+                        return cloudAt + entry.relPath.slice(e.relPath.length);
+                    }
+                }
+            }
+            return null;
+        }
+        if (localRelPath === undefined) {
+            return null;
+        }
+        // Not in the remote index (dropped between listings, say): fall back to the deepest pending folder move above it
+        let best: { toPath: string; cloudAt: string } | null = null;
+        for (const op of latest.values()) {
+            if (op.kind === 'trash' || !isWithin(localRelPath, op.toPath)) {
+                continue;
+            }
+            const cloudAt = this.journal.cloudPathOf(op.id);
+            if (cloudAt !== null && (best === null || op.toPath.length > best.toPath.length)) {
+                best = { toPath: op.toPath, cloudAt };
+            }
+        }
+        return best ? best.cloudAt + localRelPath.slice(best.toPath.length) : null;
     }
 
     // The records at or under a path that aren't under another of them
@@ -6777,9 +6801,18 @@ export class ProtonDriveSyncEngine {
             return 'next';
         }
         if (livePath !== op.path) {
+            if (livePath !== null) {
+                this.givenUpMoves.add(op.nodeUid);
+            } else {
+                this.givenUpMoves.delete(op.nodeUid);
+            }
             this.journal.complete(op.id);
             this.onlineOnlyCrawlDue = true;
-            this.indexFromCloud(node);
+            if (livePath !== null) {
+                this.indexFromCloud(node);
+            } else {
+                this.indexWrite(() => this.index.removeSubtree(op.nodeUid));
+            }
             this.logger.warn(
                 livePath !== null
                     ? `Not trashing ${op.path}: it is now at ${livePath} in Proton Drive, so it stays there`
@@ -6927,7 +6960,7 @@ export class ProtonDriveSyncEngine {
             }
             return this.replayFailed(op, op.toPath, error);
         }
-        await this.afterMoveReplayed(op, placedAs);
+        await this.afterMoveReplayed(op, parentUid, placedAs);
         return 'next';
     }
 
@@ -7206,7 +7239,7 @@ export class ProtonDriveSyncEngine {
     // again here meanwhile, which a later operation brings to the cloud), and the user is told. The operations on the
     // node after it (a trash, say) take where it put the node, not where the node has gone here since. Then the remote
     // index takes what the cloud says.
-    private async afterMoveReplayed(op: Exclude<RemoteOp, { kind: 'trash' }>, placedAs: string): Promise<void> {
+    private async afterMoveReplayed(op: Exclude<RemoteOp, { kind: 'trash' }>, parentUid: string, placedAs: string): Promise<void> {
         const wanted = path.posix.basename(op.toPath);
         const conflict = await this.inAvailabilityRun(async () => {
             // As it is now: a folder above it may have been renamed here meanwhile
@@ -7220,8 +7253,11 @@ export class ProtonDriveSyncEngine {
                     this.logger.warn(`Could not rename ${renamed.from} to ${renamed.to} here as in Proton Drive: ${error}`);
                 }
             }
+            const rootUid = this.resolveFolderUid('');
+            const freshParent = parentOf(fresh && fresh.kind !== 'trash' ? fresh.toPath : op.toPath);
+            const cloudParent = parentUid === rootUid ? '' : (this.cloudPathInPending(parentUid, freshParent) ?? parentOf(op.toPath));
             this.stateDb.connection.transaction(() => {
-                this.journal.setCloudPathAfter(op.id, op.nodeUid, joinRel(parentOf(op.toPath), placedAs));
+                this.journal.setCloudPathAfter(op.id, op.nodeUid, joinRel(cloudParent, placedAs));
                 this.journal.complete(op.id);
             })();
             this.givenUpMoves.delete(op.nodeUid);
