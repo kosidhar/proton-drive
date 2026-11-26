@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
     accessSync,
     constants,
+    copyFileSync,
     existsSync,
     readFileSync,
     lstatSync,
@@ -70,16 +71,16 @@ describe('Docs and Sheets file types', () => {
     const dir = path.join(import.meta.dir, '..', 'packaging', 'linux');
     const read = (name: string): string => readFileSync(path.join(dir, name), 'utf8');
 
-    test('the MIME package declares both types with their globs and generic icons', () => {
+    test('the MIME package declares both types with their globs and Proton icons', () => {
         const xml = read('io.github.kosidhar.ProtonDrive.xml');
         const types = [...xml.matchAll(/<mime-type type="([^"]+)">([\s\S]*?)<\/mime-type>/g)];
         expect(types.map((t) => t[1])).toEqual(['application/vnd.proton.doc', 'application/vnd.proton.sheet']);
         expect(types[0]![2]).toContain('<comment>Proton Docs document</comment>');
         expect(types[0]![2]).toContain('<glob pattern="*.protondoc"/>');
-        expect(types[0]![2]).toContain('<generic-icon name="x-office-document"/>');
+        expect(types[0]![2]).toContain('<generic-icon name="application-vnd.proton.doc"/>');
         expect(types[1]![2]).toContain('<comment>Proton Sheets spreadsheet</comment>');
         expect(types[1]![2]).toContain('<glob pattern="*.protonsheet"/>');
-        expect(types[1]![2]).toContain('<generic-icon name="x-office-spreadsheet"/>');
+        expect(types[1]![2]).toContain('<generic-icon name="application-vnd.proton.sheet"/>');
     });
 
     test('the open handler is hidden, takes both types, and runs protondrive open-doc', () => {
@@ -145,12 +146,46 @@ describe('Docs and Sheets file types', () => {
             expect(text.split('\n')[0]).toContain('ProtonMail/WebClients');
         });
 
-        test('the MIME package names both icons and keeps the generic fallback', () => {
+        // GTK looks every name up in the current theme (and its parents) before hicolor, where the Proton icons are, so
+        // any generic name a theme has (Yaru's x-office-document, Adwaita's application-x-generic) would win (#471).
+        // The generic icon is therefore the Proton icon itself: the only names offered are Proton's.
+        test('the MIME package names only the Proton icons, as the icon and as the generic icon', () => {
             const xml = read('io.github.kosidhar.ProtonDrive.xml');
-            expect(xml).toContain('<icon name="application-vnd.proton.doc"/>');
-            expect(xml).toContain('<icon name="application-vnd.proton.sheet"/>');
-            expect(xml).toContain('<generic-icon name="x-office-document"/>');
-            expect(xml).toContain('<generic-icon name="x-office-spreadsheet"/>');
+            for (const name of icons) {
+                expect(xml).toContain(`<icon name="${name}"/>`);
+                expect(xml).toContain(`<generic-icon name="${name}"/>`);
+            }
+            expect(xml).not.toMatch(/<generic-icon name="(?!application-vnd\.proton\.)/);
+        });
+
+        const hasGio = Bun.spawnSync(['python3', '-c', 'import gi; gi.require_version("Gio", "2.0")']).exitCode === 0;
+        test.skipIf(!hasGio)('GIO offers Files only the Proton icon names for both types', () => {
+            const tmp = mkdtempSync(path.join(os.tmpdir(), 'pd-mime-'));
+            try {
+                mkdirSync(path.join(tmp, 'mime', 'packages'), { recursive: true });
+                copyFileSync(
+                    path.join(dir, 'io.github.kosidhar.ProtonDrive.xml'),
+                    path.join(tmp, 'mime', 'packages', 'io.github.kosidhar.ProtonDrive.xml'),
+                );
+                expect(Bun.spawnSync(['update-mime-database', path.join(tmp, 'mime')]).exitCode).toBe(0);
+                const script = [
+                    'import gi, json',
+                    'gi.require_version("Gio", "2.0")',
+                    'from gi.repository import Gio',
+                    'print(json.dumps({t: Gio.content_type_get_icon(t).get_names() for t in ("application/vnd.proton.doc", "application/vnd.proton.sheet")}))',
+                ].join('\n');
+                const p = Bun.spawnSync(['python3', '-I', '-W', 'ignore', '-c', script], {
+                    env: { ...process.env, XDG_DATA_HOME: tmp },
+                });
+                const names = JSON.parse(p.stdout.toString()) as Record<string, string[]>;
+                expect(names['application/vnd.proton.doc']).toEqual(['application-vnd.proton.doc', 'application-vnd.proton.doc-symbolic']);
+                expect(names['application/vnd.proton.sheet']).toEqual([
+                    'application-vnd.proton.sheet',
+                    'application-vnd.proton.sheet-symbolic',
+                ]);
+            } finally {
+                rmSync(tmp, { recursive: true, force: true });
+            }
         });
 
         test('install.sh installs and removes both, from the tarball and the source tree', () => {
