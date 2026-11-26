@@ -9985,6 +9985,76 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(d.calls.renamed).toEqual([]);
                     expect(d.nodes.get('vol~X/a.txt')?.parentUid).toBe('vol~X');
                     expect(d.nameOf(d.nodes.get('vol~X')!)).toBe('Z');
+                    const yFolder = d.named(d.root.uid, 'Y');
+                    expect(yFolder).toHaveLength(1);
+                    expect(yFolder[0]!.uid).not.toBe('vol~X');
+                    expect(d.named(yFolder[0]!.uid, 'a.txt').map((n) => n.content)).toEqual(['a']);
+                    await d.expectEveryRecordHasItsFile();
+                });
+
+                test('renaming a folder holding a moved-away cut-short child clears its hold nodeUid', async () => {
+                    const d = setup();
+                    d.add('X/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('X').uid);
+                    const st = lstatSync(d.local('X/a.txt'));
+                    stateDb.holdCutShort({
+                        relPath: 'X/a.txt',
+                        nodeUid: 'vol~X/a.txt',
+                        size: st.size,
+                        mtimeMs: st.mtimeMs,
+                        detectedAt: Date.now(),
+                    });
+                    movedByAnotherDevice(d, 'vol~X', { name: 'Z' });
+
+                    await d.engine.renameItem('X', 'Y');
+
+                    expect(stateDb.getCutShort('X/a.txt')).toBeNull();
+                    expect(stateDb.getCutShort('Y/a.txt')).toMatchObject({ relPath: 'Y/a.txt', nodeUid: null });
+                    await expect(d.engine.putBackCutShort(['Y/a.txt'])).rejects.toMatchObject({ code: 'EINVAL' });
+                });
+
+                test('renaming an in-place folder drops stale record, baseline and cut-short nodeUid for a moved-away child', async () => {
+                    const d = setup();
+                    d.add('X/a.txt', 'a');
+                    d.add('X/b.txt', 'b');
+                    d.add('X/c.txt', 'c');
+                    d.add('Other');
+                    await pinnedAndSynced(d, d.add('X').uid);
+                    // Put a cut-short hold on a.txt and an edit baseline on c.txt
+                    const st = lstatSync(d.local('X/a.txt'));
+                    stateDb.holdCutShort({
+                        relPath: 'X/a.txt',
+                        nodeUid: 'vol~X/a.txt',
+                        size: st.size,
+                        mtimeMs: st.mtimeMs,
+                        detectedAt: Date.now(),
+                    });
+                    stateDb.removeItemByPath('X/c.txt');
+                    stateDb.recordEditBaseline({
+                        relPath: 'X/c.txt',
+                        nodeUid: 'vol~X/c.txt',
+                        parentUid: 'vol~X',
+                        sha1: null,
+                        mtimeMs: 0,
+                        size: 1,
+                    });
+                    movedByAnotherDevice(d, 'vol~X/a.txt', { parentUid: 'vol~Other' });
+                    movedByAnotherDevice(d, 'vol~X/c.txt', { parentUid: 'vol~Other' });
+                    const w = journalling(d);
+
+                    await d.engine.renameItem('X', 'Y');
+
+                    expect(w.journalled()).toMatchObject([{ kind: 'rename', nodeUid: 'vol~X', toPath: 'Y' }]);
+                    expect(stateDb.getItemByPath('Y/a.txt')).toBeNull();
+                    expect(stateDb.getItemByPath('Y/b.txt')?.nodeUid).toBe('vol~X/b.txt');
+                    expect(stateDb.getEditBaseline('Y/c.txt')).toBeNull();
+                    expect(stateDb.getCutShort('Y/a.txt')).toMatchObject({ relPath: 'Y/a.txt', nodeUid: null });
+                    await d.engine.replayRemoteOps();
+                    await d.engine.reconcileNow();
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.nodes.get('vol~X/a.txt')?.parentUid).toBe('vol~Other');
+                    expect(d.nodes.get('vol~X/c.txt')?.parentUid).toBe('vol~Other');
+                    expect(d.nameOf(d.nodes.get('vol~X')!)).toBe('Y');
                     await d.expectEveryRecordHasItsFile();
                 });
 

@@ -5771,11 +5771,24 @@ export class ProtonDriveSyncEngine {
                     }
                     // A hold of a file cut short goes with it (#300), with its record, before it moves: never left behind
                     // for the file to upload from its new path. One at what it replaces goes: that content is gone. A
-                    // file that now stands for the replaced one's node is an edit of it; a colliding one, of none
+                    // file that now stands for the replaced one's node is an edit of it; a colliding, disowned or
+                    // moved-away one, of none
+                    const movedCutShorts = new Set(
+                        this.stateDb
+                            .listCutShort()
+                            .filter((hold) => isSameOrUnder(hold.relPath, fromRel) && hold.nodeUid !== null && this.movedAwayFrom(hold.nodeUid, hold.relPath))
+                            .map((hold) => toRel + hold.relPath.slice(fromRel.length)),
+                    );
                     this.stateDb.moveCutShort(fromRel, toRel);
-                    const carriedHold = keepsTarget || sourceCollides || sourceDisowned || sourceMovedAway ? this.stateDb.getCutShort(toRel) : null;
-                    if (carriedHold) {
-                        this.stateDb.holdCutShort({ ...carriedHold, nodeUid: keepsTarget ? targetUid : null });
+                    for (const hold of this.stateDb.listCutShort()) {
+                        if (!isSameOrUnder(hold.relPath, toRel)) {
+                            continue;
+                        }
+                        if (keepsTarget && hold.relPath === toRel) {
+                            this.stateDb.holdCutShort({ ...hold, nodeUid: targetUid });
+                        } else if (sourceCollides || sourceDisowned || sourceMovedAway || movedCutShorts.has(hold.relPath)) {
+                            this.stateDb.holdCutShort({ ...hold, nodeUid: null });
+                        }
                     }
                     if (source) {
                         this.stateDb.setMeta(LOCAL_MOVE_IN_PROGRESS, this.moveIntent(fromRel, toRel, replacing));
