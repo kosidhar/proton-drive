@@ -714,6 +714,23 @@ impl ProtonDriveNativeApp {
             if let Some(cmd) = account_command {
                 self.send_account_command(cmd);
             }
+            // The session is a plain file, not in the keyring (#537): said quietly, with the file on hover
+            if logged_in && self.status.session_storage.as_deref() == Some("file") {
+                ui.add_space(10.0);
+                let hover = match self.status.session_path.as_deref() {
+                    Some(path) => format!(
+                        "No Secret Service keyring (GNOME Keyring, KWallet…) was found, so the session is kept in {path}, \
+                         readable by anything running as you. Install and unlock a keyring, then sign in again to keep it there."
+                    ),
+                    None => "No Secret Service keyring (GNOME Keyring, KWallet…) was found, so the session is kept in a file only you can \
+                         read, though anything running as you can. Install and unlock a keyring, then sign in again to keep it there."
+                        .to_string(),
+                };
+                ui.add(egui::Label::new(
+                    RichText::new("Your session is saved in a file because no keyring was found").size(12.0).color(TEXT_MUTED()),
+                ).wrap())
+                .on_hover_text(hover);
+            }
             if let Some(s) = storage(account.as_ref()) {
                 ui.add_space(12.0);
                 ui.separator();
