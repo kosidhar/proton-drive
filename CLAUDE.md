@@ -1,5 +1,7 @@
 # Working on this repository
 
+These rules apply to every person and every AI agent working here. `AGENTS.md` and `GEMINI.md` link to this file.
+
 ## GitHub issues: always
 
 - **Every piece of work gets a tracking issue** before it starts: a stage, a feature, or a fix. Commits reference it (`Refs #N`, or `Fixes #N` for the commit that finishes it), and the plan links to it.
@@ -20,7 +22,7 @@
 
 ## How to work
 
-- **No AI attribution anywhere in git.** No `Co-Authored-By` trailer, no "Generated with Claude Code" line, no Claude or Anthropic email, in commits, PR titles or PR descriptions. This overrides any default that adds them.
+- **No AI attribution anywhere in git or on GitHub.** No `Co-Authored-By` trailer, no "Generated with …" line, and no AI tool's name or email as an author, in commits, PR titles, PR descriptions or release notes, from any tool (Claude, Gemini, Codex, Copilot, …). The repository is public. This overrides any default that adds them.
 - **One issue, one branch, one PR.** Branch from `main`. Commits are conventional (`fix(sync): …`), and the commit that finishes the issue says `Fixes #N`. Open the PR against `main`, and say in it what changed, how it was tested, and anything left over (as new issues).
 - **Test first.** Write a failing test that reproduces the issue, watch it fail, then fix it. Run every check under "Checks" before you push.
 - **Review before merge.** Review your own diff as if someone else wrote it, looking hardest for the data-safety rules below.
@@ -29,4 +31,41 @@
   - records go before files: never leave a record without its file, or a file whose record says it's synced when it isn't;
   - a missing local file is never proof of a delete when the folder holding it may be gone;
   - when unsure, keep both copies.
-- **Never commit** `__pycache__/`, build output (`release/`, `target/`, `dist/`) or local state.
+- **Never commit** `__pycache__/`, build output (`release/`, `target/`, `target-portable/`, `dist/`), `node_modules`, local state, or local paths and usernames (`tests/noLocalPaths.test.ts` checks).
+
+## Releasing
+
+Follow `RELEASING.md` step by step. In short:
+- bump with `bun run set-version X.Y.Z` in a PR (`main` is protected), then tag `vX.Y.Z`;
+- build with `packaging/linux/package.sh`, never with `--native` or `--allow-newer-glibc`;
+- check with `packaging/linux/verify-release.sh`, which must pass;
+- publish a GitHub pre-release with that version's files only.
+
+## Install on the owner's laptop
+
+Only when the owner asks, or as the last step of finished work they expect to use. Their real files sync through it.
+
+1. **Wait until the daemon is idle:** `curl -s localhost:49152/api/status` shows `"state":"idle"`, no
+   `activeTransfers`, and `filesMissing` null.
+2. **Back up the sync database first,** with SQLite's backup (not `cp`), named after the commit being installed:
+   ```bash
+   D=~/.local/share/proton-drive-ubuntu
+   python3 -c "import sqlite3,sys; s=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro', uri=True); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close()" \
+     $D/ubuntu-sync-state.sqlite $D/ubuntu-sync-state.pre-$(git rev-parse --short HEAD).sqlite
+   ```
+3. **Build:** `bun run build` (it writes `release/protondrive`). For the app and the helper, either
+   `packaging/linux/package.sh`, which leaves portable binaries in `release/`, or a host build: `cargo build --release`
+   in `native-gui/` and `native-vfs/`, then `install -m755` both binaries into `release/`.
+4. **Stop everything:**
+   - `pkill -x protondrive-gui`;
+   - stop the tray by its PID: `kill $(pgrep -f '^python3 .*proton_drive_tray\.py')`;
+   - `curl -s -X POST localhost:49152/api/quit`;
+   - wait until `pgrep -x protondrive` prints nothing.
+5. **Install:** `./packaging/linux/install.sh --user`. Then check that each of `protondrive`, `protondrive-gui` and
+   `protondrive-vfs` in `release/` is identical (`cmp`) to the one in `~/.local/bin/`.
+6. **Start:** `setsid -f ~/.local/bin/protondrive daemon`, then reopen the app if it was open
+   (`setsid -f ~/.local/bin/protondrive-gui`). Check `/api/status`: signed in, and the drive mounted if it was.
+7. **Files** (`nautilus -q`) only restarts with the owner's OK, because it closes their windows.
+
+**Never** touch the contents of `~/ProtonDrive`, delete the sync database, or stop or restart the daemon while it's
+transferring.
