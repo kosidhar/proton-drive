@@ -5686,6 +5686,16 @@ export class ProtonDriveSyncEngine {
         }
         // Not toRel when the target is kept: its new content is reported, and uploads as a new revision
         const kept = this.keptForPendingOps();
+        const movedCutShorts = new Set(
+            this.stateDb
+                .listCutShort()
+                .filter((hold) => isSameOrUnder(hold.relPath, fromRel) && hold.nodeUid !== null && this.movedAwayFrom(hold.nodeUid, hold.relPath))
+                .map((hold) => toRel + hold.relPath.slice(fromRel.length)),
+        );
+        const movedBaselines = this.stateDb
+            .listEditBaselines()
+            .filter((baseline) => isSameOrUnder(baseline.relPath, fromRel) && this.movedAwayFrom(baseline.nodeUid, baseline.relPath))
+            .map((baseline) => baseline.relPath);
         await this.whileRemoving(
             async (records) => {
                 const snapshot = this.snapshotLocalStep([fromRel, toRel], sourceUid === null ? [] : [sourceUid]);
@@ -5773,12 +5783,6 @@ export class ProtonDriveSyncEngine {
                     // for the file to upload from its new path. One at what it replaces goes: that content is gone. A
                     // file that now stands for the replaced one's node is an edit of it; a colliding, disowned or
                     // moved-away one, of none
-                    const movedCutShorts = new Set(
-                        this.stateDb
-                            .listCutShort()
-                            .filter((hold) => isSameOrUnder(hold.relPath, fromRel) && hold.nodeUid !== null && this.movedAwayFrom(hold.nodeUid, hold.relPath))
-                            .map((hold) => toRel + hold.relPath.slice(fromRel.length)),
-                    );
                     this.stateDb.moveCutShort(fromRel, toRel);
                     for (const hold of this.stateDb.listCutShort()) {
                         if (!isSameOrUnder(hold.relPath, toRel)) {
@@ -5808,10 +5812,8 @@ export class ProtonDriveSyncEngine {
                 if (keepsTarget || ignoredTo || sourceCollides || sourceDisowned || sourceMovedAway || targetCollides) {
                     this.stateDb.dropEditBaselines(fromRel);
                 } else {
-                    for (const baseline of this.stateDb.listEditBaselines()) {
-                        if (isSameOrUnder(baseline.relPath, fromRel) && this.movedAwayFrom(baseline.nodeUid, baseline.relPath)) {
-                            this.stateDb.dropEditBaselines(baseline.relPath);
-                        }
+                    for (const relPath of movedBaselines) {
+                        this.stateDb.dropEditBaselines(relPath);
                     }
                     this.stateDb.moveEditBaselines(fromRel, toRel);
                 }

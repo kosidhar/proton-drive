@@ -10058,6 +10058,40 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     await d.expectEveryRecordHasItsFile();
                 });
 
+                test('renaming a stuck-renamed folder keeps its in-place children cut-short nodeUid and edit baseline', async () => {
+                    const d = setup();
+                    d.add('Old/a.txt', 'a');
+                    d.add('Old/doc.txt', 'old');
+                    await pinnedAndSynced(d, d.add('Old').uid);
+                    d.down.add('renameNode');
+                    await d.engine.renameItem('Old', 'X');
+                    d.add('X'); // another device took X so index keeps vol~Old at Old while pending op puts it at X
+                    await d.engine.reconcileNow();
+                    expect(d.engine.remoteIndex.getByUid('vol~Old')?.relPath).toBe('Old');
+                    const st = lstatSync(d.local('X/a.txt'));
+                    stateDb.holdCutShort({
+                        relPath: 'X/a.txt',
+                        nodeUid: 'vol~Old/a.txt',
+                        size: st.size,
+                        mtimeMs: st.mtimeMs,
+                        detectedAt: Date.now(),
+                    });
+                    stateDb.removeItemByPath('X/doc.txt');
+                    stateDb.recordEditBaseline({
+                        relPath: 'X/doc.txt',
+                        nodeUid: 'vol~Old/doc.txt',
+                        parentUid: 'vol~Old',
+                        sha1: null,
+                        mtimeMs: 0,
+                        size: 3,
+                    });
+
+                    await d.engine.renameItem('X', 'Y');
+
+                    expect(stateDb.getCutShort('Y/a.txt')).toMatchObject({ relPath: 'Y/a.txt', nodeUid: 'vol~Old/a.txt' });
+                    expect(stateDb.getEditBaseline('Y/doc.txt')).toMatchObject({ relPath: 'Y/doc.txt', nodeUid: 'vol~Old/doc.txt' });
+                });
+
                 test('control: a replacing rename when the source node is still at the source path trashes it as before', async () => {
                     const d = setup();
                     d.add('Docs/a.txt', 'a');
