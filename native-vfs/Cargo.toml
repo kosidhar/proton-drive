@@ -1,6 +1,6 @@
 [package]
 name = "protondrive-vfs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "FUSE view of the Proton Drive folder, with online-only files downloaded on open"
 
