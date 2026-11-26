@@ -5625,6 +5625,15 @@ export class ProtonDriveSyncEngine {
         // A local file over a cloud folder can never have real children under fromRel/, even if recorded as another file
         // node: any stale record, baseline, cut-short hold or queued move strictly under fromRel/ stays behind (#463)
         const sourceOverCloudFolder = sourceOtherKind?.type === 'folder';
+        // But a local folder of the other kind with no node of its own can hold what this computer moved or renamed into
+        // it, still queued (see ownQueuedUnder). That is no stale record: it goes on with the folder to toRel, with its
+        // records, queued operations, edit baselines and cut-short holds, as before #485. Dropped, the move was given up
+        // and the item came back at its old place, with a copy of it uploading at the new one (#490). Only what is stale
+        // stays behind. A local file over a cloud folder holds nothing, and into an ignored name nothing follows.
+        const ownQueued =
+            sourceOtherKind !== null && sourceUid === null && !ignoredTo && source?.isDirectory() === true
+                ? this.ownQueuedUnder(fromRel, sourceOtherKind.uid).map((from) => ({ from, to: toRel + from.slice(fromRel.length) }))
+                : [];
         const target = lstatSync(path.join(root, toRel), { throwIfNoEntry: false });
         const targetRecord = this.stateDb.getItemByPath(toRel);
         const targetEntry = ignoredTo ? null : this.liveIndexEntry(toRel);
@@ -5682,11 +5691,12 @@ export class ProtonDriveSyncEngine {
                 : [];
         this.watcher.suppressPath(fromRel);
         if (
-            !keepsTarget &&
-            !sourceCollides &&
-            !sourceOtherUnowned &&
-            !sourceMovedAway &&
-            (sourceUid !== null || this.stateDb.getItemsUnder(fromRel).some((i) => !this.movedAwayFrom(i.nodeUid, i.localRelPath)))
+            ownQueued.length > 0 ||
+            (!keepsTarget &&
+                !sourceCollides &&
+                !sourceOtherUnowned &&
+                !sourceMovedAway &&
+                (sourceUid !== null || this.stateDb.getItemsUnder(fromRel).some((i) => !this.movedAwayFrom(i.nodeUid, i.localRelPath))))
         ) {
             this.watcher.suppressPath(toRel); // Its records go with it: reported as something new, it would upload again
         }
@@ -5751,7 +5761,16 @@ export class ProtonDriveSyncEngine {
                         } else if (sourceOtherUnowned || sourceMovedAway) {
                             // Local item of the other kind with no cloud node of its own (#453, #463), or whose
                             // recorded node moved away (#461): drop any records at or under fromRel so stale records
-                            // never follow it to toRel
+                            // never follow it to toRel. What this computer queued into it goes on, with the records
+                            // under it that have their item here (#490)
+                            for (const own of ownQueued) {
+                                for (const item of this.stateDb.getItemsUnder(own.from)) {
+                                    if (!this.hasItsLocalItem(item) || this.movedAwayFrom(item.nodeUid, item.localRelPath)) {
+                                        this.stateDb.removeItemByPath(item.localRelPath);
+                                    }
+                                }
+                                this.stateDb.renameItemPath(own.from, own.to);
+                            }
                             this.stateDb.removeItemByPath(fromRel);
                         } else if (ignoredTo || !source) {
                             // Into an ignored name nothing follows it; and records with no local copy would read as deletes
@@ -5776,6 +5795,12 @@ export class ProtonDriveSyncEngine {
                                 if (op.kind !== 'trash' && op.nodeUid === sourceUid && op.toPath === fromRel) {
                                     this.journal.setTarget(op.id, toRel);
                                 }
+                            }
+                        } else {
+                            // Local folder of the other kind with no node of its own: only what this computer queued into
+                            // it follows, as its records do (#490)
+                            for (const own of ownQueued) {
+                                this.journal.retarget(own.from, own.to);
                             }
                         }
                         if (!ignoredTo) {
@@ -5806,17 +5831,22 @@ export class ProtonDriveSyncEngine {
                     // A hold of a file cut short goes with it (#300), with its record, before it moves: never left behind
                     // for the file to upload from its new path. One at what it replaces goes: that content is gone. A
                     // file that now stands for the replaced one's node is an edit of it; a colliding, disowned or
-                    // moved-away one, of none
+                    // moved-away one, of none. One in what this computer queued into a local folder of the other kind
+                    // is still an edit of its node (#490)
                     this.stateDb.moveCutShort(fromRel, toRel);
                     for (const hold of this.stateDb.listCutShort()) {
                         if (!isSameOrUnder(hold.relPath, toRel)) {
                             continue;
                         }
+                        const inOwnQueued = ownQueued.some((own) => isSameOrUnder(hold.relPath, own.to));
                         if (sourceOverCloudFolder && hold.relPath !== toRel) {
                             this.stateDb.dropCutShort(hold.relPath);
                         } else if (keepsTarget && hold.relPath === toRel) {
                             this.stateDb.holdCutShort({ ...hold, nodeUid: targetUid });
-                        } else if (sourceCollides || sourceOtherUnowned || sourceMovedAway || movedCutShorts.has(hold.relPath)) {
+                        } else if (
+                            (!inOwnQueued && (sourceCollides || sourceOtherUnowned || sourceMovedAway)) ||
+                            movedCutShorts.has(hold.relPath)
+                        ) {
                             this.stateDb.holdCutShort({ ...hold, nodeUid: null });
                         }
                     }
@@ -5836,6 +5866,14 @@ export class ProtonDriveSyncEngine {
                 // A colliding file goes on as a new one: what it was an edit of stays where it is (#65). A colliding target
                 // keeps its own baseline, if any: what replaces it is judged by it, as an edit of what the drive showed
                 if (keepsTarget || ignoredTo || sourceCollides || sourceOtherUnowned || sourceMovedAway || targetCollides) {
+                    // But what this computer queued into a local folder of the other kind keeps its own, as its records
+                    // do (#490)
+                    for (const own of ownQueued) {
+                        for (const relPath of droppedBaselines.filter((p) => isSameOrUnder(p, own.from))) {
+                            this.stateDb.dropEditBaselines(relPath);
+                        }
+                        this.stateDb.moveEditBaselines(own.from, own.to);
+                    }
                     this.stateDb.dropEditBaselines(fromRel);
                 } else {
                     for (const relPath of droppedBaselines) {
@@ -5873,6 +5911,36 @@ export class ProtonDriveSyncEngine {
     private isAtOrIn(uid: string, entry: RemoteIndexEntry): boolean {
         const node = this.index.getByUid(uid);
         return node !== null && isSameOrUnder(node.relPath, entry.relPath);
+    }
+
+    // What this computer itself put into a local folder of the other kind with no node of its own, its rename or move
+    // still queued (#490): the topmost records strictly under folderRel whose node's latest pending rename or move puts it
+    // right there, with its item here, of the kind recorded. That is the user's own work, not a stale record (#463): it
+    // goes on with the folder when it is renamed, as before #485. The cloud item at folderRel (cloudUid) never does.
+    private ownQueuedUnder(folderRel: string, cloudUid: string): string[] {
+        const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
+        const roots: string[] = [];
+        // In path order, so a folder comes before what is in it
+        for (const item of this.stateDb.getItemsUnder(folderRel)) {
+            if (item.localRelPath === folderRel || roots.some((root) => isSameOrUnder(item.localRelPath, root))) {
+                continue;
+            }
+            const op = latest.get(item.nodeUid);
+            if (op && op.kind !== 'trash' && op.toPath === item.localRelPath && item.nodeUid !== cloudUid && this.hasItsLocalItem(item)) {
+                roots.push(item.localRelPath);
+            }
+        }
+        return roots;
+    }
+
+    // Whether a record's item is here, of the kind recorded. Any failure to look (ENOTDIR, EACCES, …) counts as not.
+    private hasItsLocalItem(item: SyncedItemRecord): boolean {
+        try {
+            const local = lstatSync(path.join(this.localRoot(), item.localRelPath), { throwIfNoEntry: false });
+            return item.type === 'folder' ? local?.isDirectory() === true : local?.isFile() === true;
+        } catch {
+            return false;
+        }
     }
 
     // A drive rename of a file open for writing through the drive, or of a folder holding some (#64): each keeps its mark
