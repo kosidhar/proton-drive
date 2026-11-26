@@ -673,6 +673,11 @@ const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// What a read timeout means: the daemon accepted the request and is still busy with it.
 const STILL_WORKING: &str = "Still working on it in the background. Refresh to see the result.";
 
+/// What a failed connect to the control socket says (no socket yet, or nobody listening on it)
+const UNREACHABLE: &str = "Can't reach the Proton Drive background service";
+/// What the Shared pages say instead, while the app is still making its first connection
+const DAEMON_STARTING: &str = "Proton Drive is starting…";
+
 /// One HTTP/1.1 request to the daemon's user-only control socket. Pin, free, hide and unhide go only through here,
 /// never through the TCP API.
 fn control_request_at(
@@ -696,7 +701,6 @@ fn control_request_with_timeout_message(
     timeout_message: &str,
 ) -> Result<serde_json::Value, String> {
     use std::io::{Read, Write};
-    const UNREACHABLE: &str = "Can't reach the Proton Drive background service";
     // Every request on the socket goes through here: a screenshot never calls it, so it can't change anything
     if SCREENSHOT_MODE.load(AtomicOrdering::SeqCst) {
         return Err("Screenshots never call the Proton Drive background service".to_string());
@@ -704,8 +708,11 @@ fn control_request_with_timeout_message(
     if let Some(problem) = socket_dir_problem(socket, own_uid()) {
         return Err(problem);
     }
-    let mut stream =
-        std::os::unix::net::UnixStream::connect(socket).map_err(|e| format!("{UNREACHABLE} ({e})"))?;
+    // No socket yet, or nobody listening on it: the daemon isn't up, which needs no OS error to be understood (#496)
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => UNREACHABLE.to_string(),
+        _ => format!("{UNREACHABLE} ({e})"),
+    })?;
     let _ = stream.set_read_timeout(Some(read_timeout));
     let _ = stream.set_write_timeout(Some(CONTROL_WRITE_TIMEOUT));
 
@@ -2125,6 +2132,8 @@ impl ProtonDriveNativeApp {
                 WorkerEvent::StatusAndActivity { status, activity } => match *status {
                     Ok(mut s) => {
                         let was_offline = !self.daemon_online;
+                        // The daemon is known to be up now, and wasn't a moment ago (or hasn't answered yet)
+                        let came_online = was_offline || self.initial_connecting;
                         self.daemon_online = true;
                         self.initial_connecting = false;
                         self.apply_fake_drive(&mut s);
@@ -2161,6 +2170,10 @@ impl ProtonDriveNativeApp {
                         if home::should_reload_cut_short(was_offline, self.cut_short_asked_at, s.stats.cut_short_files) {
                             self.cut_short_asked_at = s.stats.cut_short_files;
                             let _ = self.tx.send(WorkerCommand::LoadCutShort);
+                        }
+                        // A Shared page that opened before the daemon was up is stuck on its error: read again (#496)
+                        if came_online {
+                            self.reload_failed_shared_page();
                         }
                         self.status = s;
                         self.activities = activity;
@@ -2351,6 +2364,18 @@ impl ProtonDriveNativeApp {
     fn load_shared(&mut self) {
         let seq = self.shared.begin_load();
         let _ = self.tx.send(WorkerCommand::SharedLoad { seq });
+    }
+
+    /// The daemon just came online: the open page, if it is Shared or Shared with me and shows a read error or never
+    /// loaded, asks again. A page showing a list, one still reading and the other tabs are left as they are.
+    fn reload_failed_shared_page(&mut self) {
+        match self.tab {
+            NavTab::Shared if !self.shared.loading && self.shared.items.is_none() => self.load_shared(),
+            NavTab::SharedWithMe if !self.shared_with_me.loading && self.shared_with_me.listing.is_none() => {
+                self.load_shared_with_me()
+            }
+            _ => {}
+        }
     }
 
     /// Asks for what others shared with the account. Refresh, Retry and entering the page ask again; only the newest
@@ -5983,6 +6008,22 @@ mod tests {
         );
         let only_temp = AvailabilityResult { state: "x".into(), kept: vec!["a/.proton-drive-tmp-1".into(), "a".into()], refused: None };
         assert_eq!(availability_notice(&only_temp), None);
+    }
+
+    #[test]
+    fn a_connect_failure_reads_in_plain_words_without_the_os_error() {
+        let err = control_request_at(std::path::Path::new("/nonexistent/control.sock"), "GET", "/shared", None, SHORT).unwrap_err();
+        assert_eq!(err, "Can't reach the Proton Drive background service");
+        assert!(!err.contains("os error"), "{err}");
+        // A socket file nobody listens on: ECONNREFUSED
+        let dir = std::env::temp_dir().join(format!("pd-496-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let sock = dir.join("control.sock");
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        let err = control_request_at(&sock, "GET", "/shared", None, SHORT).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(err, "Can't reach the Proton Drive background service");
     }
 
     #[test]
@@ -10201,6 +10242,108 @@ mod tests {
         assert_eq!(h.sent(), Vec::<String>::new());
     }
 
+    /// The app opened on `tab` while the daemon wasn't up yet: its first read failed and the first status hasn't come.
+    fn opened_before_the_daemon(tab: NavTab, read_failed: bool) -> Harness {
+        let mut h = Harness::new();
+        h.app.daemon_online = false;
+        h.app.initial_connecting = true;
+        h.sent();
+        h.app.open_tab(tab);
+        h.frames(2);
+        let unreachable = "Can't reach the Proton Drive background service";
+        if read_failed {
+            match tab {
+                NavTab::Shared => h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Err(unreachable.into()))),
+                _ => h.event(WorkerEvent::SharedWithMeLoaded(h.app.shared_with_me.seq, Err(unreachable.into()))),
+            }
+        }
+        h.sent();
+        h
+    }
+
+    fn daemon_answers(h: &mut Harness) {
+        let status = DaemonStatus { state: "idle".into(), logged_in: true, ..Default::default() };
+        h.event(WorkerEvent::StatusAndActivity { status: Box::new(Ok(status)), activity: Vec::new() });
+    }
+
+    // #496: the Shared pages read again by themselves once the daemon is up
+    // #496: while the first connection is being made, a failed read isn't a red error
+    #[test]
+    fn the_shared_pages_say_starting_in_muted_words_while_the_app_first_connects() {
+        for tab in [NavTab::Shared, NavTab::SharedWithMe] {
+            let h = opened_before_the_daemon(tab, true);
+            let said = h.text_at(DAEMON_STARTING).unwrap_or_else(|| panic!("{tab:?} says it is starting"));
+            assert_eq!(painted_color(&h, DAEMON_STARTING, said), Some(TEXT_MUTED()), "{tab:?}");
+            assert!(h.text_at(UNREACHABLE).is_none(), "{tab:?}");
+            assert!(h.widget_at("Retry").is_some(), "{tab:?} keeps Retry");
+        }
+    }
+
+    #[test]
+    fn the_shared_pages_say_plainly_they_cant_reach_the_service_once_connected_before() {
+        for tab in [NavTab::Shared, NavTab::SharedWithMe] {
+            let mut h = opened_before_the_daemon(tab, true);
+            h.app.initial_connecting = false;
+            h.frames(2);
+            let said = h.text_at(UNREACHABLE).unwrap_or_else(|| panic!("{tab:?} says it can't reach"));
+            assert_eq!(painted_color(&h, UNREACHABLE, said), Some(DANGER_TEXT()), "{tab:?}");
+            assert!(h.text_at(DAEMON_STARTING).is_none(), "{tab:?}");
+            assert!(h.widget_at("Retry").is_some(), "{tab:?}");
+        }
+    }
+
+    #[test]
+    fn shared_opened_before_the_daemon_reads_again_when_the_first_status_comes() {
+        let mut h = opened_before_the_daemon(NavTab::Shared, true);
+        assert!(h.app.shared.error.is_some());
+        daemon_answers(&mut h);
+        let sent = h.sent();
+        assert_eq!(sent.iter().filter(|c| *c == "shared list").count(), 1, "{sent:?}");
+        assert!(h.app.shared.loading);
+    }
+
+    #[test]
+    fn shared_reads_again_when_the_daemon_comes_back_while_it_shows_an_error() {
+        let mut h = opened_before_the_daemon(NavTab::Shared, true);
+        h.app.initial_connecting = false;
+        daemon_answers(&mut h);
+        h.sent();
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Err("Can't reach the Proton Drive background service".into())));
+        h.event(WorkerEvent::StatusAndActivity { status: Box::new(Err("refused".into())), activity: Vec::new() });
+        h.sent();
+        daemon_answers(&mut h);
+        assert_eq!(h.sent().iter().filter(|c| *c == "shared list").count(), 1);
+    }
+
+    #[test]
+    fn shared_with_an_error_is_not_read_again_by_a_status_while_the_daemon_stays_up() {
+        let mut h = opened_before_the_daemon(NavTab::Shared, true);
+        h.app.initial_connecting = false;
+        h.app.daemon_online = true;
+        daemon_answers(&mut h);
+        assert!(!h.sent().iter().any(|c| c == "shared list"), "a poll every few seconds must not become a read loop");
+    }
+
+    #[test]
+    fn shared_showing_a_list_is_not_read_again_when_the_daemon_comes_online() {
+        let mut h = opened_before_the_daemon(NavTab::Shared, false);
+        h.event(WorkerEvent::SharedLoaded(h.app.shared.seq, Ok(vec![])));
+        h.sent();
+        daemon_answers(&mut h);
+        assert!(!h.sent().iter().any(|c| c == "shared list"));
+    }
+
+    #[test]
+    fn another_open_tab_does_not_read_shared_when_the_daemon_comes_online() {
+        let mut h = opened_before_the_daemon(NavTab::Shared, true);
+        h.app.open_tab(NavTab::Home);
+        h.frames(2);
+        h.sent();
+        daemon_answers(&mut h);
+        let sent = h.sent();
+        assert!(!sent.iter().any(|c| c == "shared list" || c == "shared with me list"), "{sent:?}");
+    }
+
     #[test]
     fn opening_shared_asks_for_the_list_each_time_and_never_on_a_timer() {
         let mut h = Harness::new();
@@ -10495,6 +10638,46 @@ mod tests {
         h.sent();
         h.click(h.text_at("Shared with me").unwrap());
         assert_eq!(h.sent(), ["shared with me list"]);
+    }
+
+    // #496
+    #[test]
+    fn shared_with_me_opened_before_the_daemon_reads_again_when_the_first_status_comes() {
+        let mut h = opened_before_the_daemon(NavTab::SharedWithMe, true);
+        assert!(h.app.shared_with_me.error.is_some());
+        daemon_answers(&mut h);
+        let sent = h.sent();
+        assert_eq!(sent.iter().filter(|c| *c == "shared with me list").count(), 1, "{sent:?}");
+        assert!(h.app.shared_with_me.loading);
+    }
+
+    #[test]
+    fn shared_with_me_with_an_error_is_not_read_again_by_a_status_while_the_daemon_stays_up() {
+        let mut h = opened_before_the_daemon(NavTab::SharedWithMe, true);
+        h.app.initial_connecting = false;
+        h.app.daemon_online = true;
+        daemon_answers(&mut h);
+        assert!(!h.sent().iter().any(|c| c == "shared with me list"));
+    }
+
+    #[test]
+    fn shared_with_me_showing_a_list_is_not_read_again_when_the_daemon_comes_online() {
+        let mut h = opened_before_the_daemon(NavTab::SharedWithMe, false);
+        h.event(WorkerEvent::SharedWithMeLoaded(h.app.shared_with_me.seq, Ok(swm_listing("list"))));
+        h.sent();
+        daemon_answers(&mut h);
+        assert!(!h.sent().iter().any(|c| c == "shared with me list"));
+    }
+
+    #[test]
+    fn another_open_tab_does_not_read_shared_with_me_when_the_daemon_comes_online() {
+        let mut h = opened_before_the_daemon(NavTab::SharedWithMe, true);
+        h.app.open_tab(NavTab::Activity);
+        h.frames(2);
+        h.sent();
+        daemon_answers(&mut h);
+        let sent = h.sent();
+        assert!(!sent.iter().any(|c| c == "shared list" || c == "shared with me list"), "{sent:?}");
     }
 
     #[test]
