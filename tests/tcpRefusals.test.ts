@@ -24,6 +24,7 @@ describe('What the TCP API refuses, and how the daemon is wired (#32, #33, #36)'
         '/share/with-me/decline': 'Manage what is shared with you from the Proton Drive app',
         '/share/with-me/leave': 'Manage what is shared with you from the Proton Drive app',
         '/share/with-me/open-url': 'Manage what is shared with you from the Proton Drive app',
+        '/share/with-me/download': 'Manage what is shared with you from the Proton Drive app',
     };
 
     test('the refusal table is exactly the routes that moved to the socket', () => {

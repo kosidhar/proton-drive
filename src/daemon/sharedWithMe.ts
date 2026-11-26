@@ -1,7 +1,12 @@
+import { randomBytes } from 'node:crypto';
+import { link, mkdir, rm, unlink } from 'node:fs/promises';
+import path from 'node:path';
+
 import { MemberRole, NodeType, type NodeEntity, type ProtonDriveClient } from '@protontech/drive-sdk';
 import { isProtonDocument, isProtonSheet } from '@protontech/drive-sdk/internal/nodes/mediaTypes';
 
 import { loadSharedWithMe } from '../sdk/paths';
+import { LOCAL_RESERVE_BYTES } from '../sync/syncEngine';
 import { plainError, ShareError } from './shareService';
 
 // What other people share with the owner: the invitations waiting for an answer, and the items already shared. The
@@ -51,6 +56,11 @@ export interface SharedWithMeDeps {
     >;
     logActivity(entry: { action: 'share'; localRelPath: string; details: string }): void;
     now(): number;
+    // The folder a download goes to: the user's Downloads (the service creates it when it is missing)
+    downloadsDir(): Promise<string>;
+    freeBytes(dir: string): Promise<number>;
+    // Downloads the file to toPath, a path nothing is at
+    fetchFile(node: NodeEntity, toPath: string): Promise<void>;
 }
 
 const SHARED_WITH_ME_PAGE = 'https://drive.proton.me/shared-with-me';
@@ -74,6 +84,36 @@ const nameOf = (name: { ok: boolean; value?: string }): string | null => (name.o
 
 // Names are the sender's text, and may hold an address: the activity log keeps none
 const forLog = (name: string | null) => (name ?? 'a shared item').replace(EMAIL, 'an address');
+
+const FALLBACK_NAME = 'Shared file';
+// Room for " (n)" and the temp prefix inside the 255 bytes a file name may have
+const MAX_NAME_BYTES = 150;
+const MAX_NAME_TRIES = 10_000;
+export const TEMP_PREFIX = '.proton-drive-tmp-';
+
+function safeName(name: string): string {
+    // A name is the sender's text: no folder, no control character, never . or ..
+    let safe = name.replace(/[\u0000-\u001f\u007f]/g, '').replace(/\//g, '_').trim();
+    if (safe === '' || /^\.+$/.test(safe)) return FALLBACK_NAME;
+    if (Buffer.byteLength(safe) > MAX_NAME_BYTES) {
+        const ext = path.extname(safe);
+        const keep = ext.length > 0 && Buffer.byteLength(ext) <= 20 ? ext : '';
+        let stem = safe.slice(0, safe.length - keep.length);
+        while (Buffer.byteLength(stem) + Buffer.byteLength(keep) > MAX_NAME_BYTES) stem = stem.slice(0, -1);
+        safe = (stem + keep).trim();
+        if (safe === '' || /^\.+$/.test(safe)) return FALLBACK_NAME;
+    }
+    return safe;
+}
+
+// The names to try for a download: the safe name, then `name (1).ext`, `name (2).ext` and so on
+export function* downloadNames(name: string): Generator<string> {
+    const safe = safeName(name);
+    yield safe;
+    const ext = path.extname(safe);
+    const stem = safe.slice(0, safe.length - ext.length);
+    for (let n = 1; ; n++) yield `${stem} (${n})${ext}`;
+}
 
 const byDateThenName = (a: SharedWithMeItem, b: SharedWithMeItem) => {
     if (a.sharedAt !== b.sharedAt) {
@@ -206,8 +246,56 @@ export function createSharedWithMeService(deps: SharedWithMeDeps): SharedWithMeS
             }
         },
 
-        async download() {
-            throw new ShareError('Not yet');
+        async download(uid) {
+            let node: NodeEntity;
+            try {
+                const [found] = await Array.fromAsync(sdk.iterateNodes([uid]));
+                if (!found || 'missingUid' in found) throw new ShareError("This item isn't shared with you any more");
+                node = found;
+            } catch (e) {
+                throw plainError(e);
+            }
+            if (kindOf(node) !== 'file') throw new ShareError('Only files can be downloaded: open this one on drive.proton.me');
+            const name = nameOf(node.name);
+            const size = node.activeRevision?.claimedSize ?? node.totalStorageSize ?? 0;
+
+            let dir: string;
+            try {
+                dir = await deps.downloadsDir();
+                await mkdir(dir, { recursive: true });
+                if (size > (await deps.freeBytes(dir)) - LOCAL_RESERVE_BYTES) {
+                    throw new ShareError("There isn't enough free space on this computer to download this file");
+                }
+            } catch (e) {
+                throw e instanceof ShareError ? e : new ShareError("Your Downloads folder can't be used");
+            }
+
+            // A fresh name nothing is at, so the download's own rename can't replace anything; placed with link(), which
+            // fails where a file exists instead of replacing it, so a file of the user's is never overwritten, even by
+            // a second download racing for the same name
+            const temp = path.join(dir, `${TEMP_PREFIX}${randomBytes(8).toString('hex')}-${safeName(name ?? FALLBACK_NAME)}`);
+            let placed: string | undefined;
+            try {
+                await deps.fetchFile(node, temp);
+                let tries = 0;
+                for (const candidate of downloadNames(name ?? FALLBACK_NAME)) {
+                    if (++tries > MAX_NAME_TRIES) throw new ShareError('Too many files with this name in Downloads');
+                    const target = path.join(dir, candidate);
+                    try {
+                        await link(temp, target);
+                        placed = target;
+                        break;
+                    } catch (e) {
+                        if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+                    }
+                }
+            } catch (e) {
+                await rm(temp, { force: true }).catch(() => {});
+                throw plainError(e);
+            }
+            await unlink(temp).catch(() => {});
+            log(`Downloaded ${forLog(name)} to Downloads`);
+            return { path: placed! };
         },
     };
 }

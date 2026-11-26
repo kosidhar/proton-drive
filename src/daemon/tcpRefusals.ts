@@ -14,6 +14,7 @@ export const REFUSED_ON_TCP: ReadonlyMap<string, string> = new Map([
     ['/share/with-me/decline', 'Manage what is shared with you from the Proton Drive app'],
     ['/share/with-me/leave', 'Manage what is shared with you from the Proton Drive app'],
     ['/share/with-me/open-url', 'Manage what is shared with you from the Proton Drive app'],
+    ['/share/with-me/download', 'Manage what is shared with you from the Proton Drive app'],
 ]);
 
 // 403 { error, code: 'EACCES' } for a POST to a route that moved to the control socket, null for anything else

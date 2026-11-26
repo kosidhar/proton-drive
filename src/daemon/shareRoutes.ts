@@ -158,6 +158,7 @@ const WITH_ME_ROUTES: Record<string, Partial<Record<string, WithMeHandler>>> = {
         },
     },
     '/share/with-me/open-url': { POST: async (w, r) => w.openUrl(uidOf((await bodyOf(r)).uid)) },
+    '/share/with-me/download': { POST: async (w, r) => w.download(uidOf((await bodyOf(r)).uid)) },
 };
 
 export async function shareRoute(

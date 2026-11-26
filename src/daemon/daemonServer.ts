@@ -1,3 +1,4 @@
+import { statfs } from 'node:fs/promises';
 import path from 'node:path';
 
 import { syncLoginEntry } from '../linux/autostart';
@@ -6,6 +7,7 @@ import {
     DEFAULT_APP_VERSION,
     DEFAULT_CLIENT_UID_PREFIX,
     DEFAULT_SDK_VERSION,
+    downloadDriveNodeToLocal,
     getClaimedSize,
     getName,
     init as initSdkRuntime,
@@ -21,6 +23,7 @@ import { SyncStateDatabase } from '../sync/syncStateDb';
 import type { Logger } from '@protontech/drive-sdk';
 import { defaultControlSocketPath, startControlServer } from './controlServer';
 import { controlServerOptions } from './controlWiring';
+import { resolveDownloadsDir } from './downloadsDir';
 import { DriveController } from './driveController';
 import { pauseRoute } from './pauseRoute';
 import { withAvailability } from './remoteListing';
@@ -560,6 +563,15 @@ export async function startSyncDaemon(options: {
                     sdk: runtime.sdk,
                     logActivity: (entry) => stateDb.logActivity(entry),
                     now: Date.now,
+                    downloadsDir: () => resolveDownloadsDir(),
+                    freeBytes: async (dir) => {
+                        const fs = await statfs(dir);
+                        return Number(fs.bavail) * Number(fs.bsize);
+                    },
+                    fetchFile: async (node, toPath) => {
+                        const result = await downloadDriveNodeToLocal({ sdk: runtime.sdk, logger: runtime.logger, remoteNode: node, localPath: toPath });
+                        if (result.status !== 'downloaded') throw new Error('This file can only be opened on drive.proton.me');
+                    },
                 }),
                 shareSignedIn: () => runtime.auth.isLoggedIn(),
                 shareLog: (line) => runtime.logger.error(line),

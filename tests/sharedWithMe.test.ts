@@ -1,8 +1,14 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, existsSync } from 'node:fs';
+import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { MemberRole, NodeType } from '@protontech/drive-sdk';
 
 import { ShareError } from '../src/daemon/shareService';
-import { createSharedWithMeService } from '../src/daemon/sharedWithMe';
+import { resolveDownloadsDir } from '../src/daemon/downloadsDir';
+import { createSharedWithMeService, downloadNames } from '../src/daemon/sharedWithMe';
+import { LOCAL_RESERVE_BYTES } from '../src/sync/syncEngine';
 
 const DOC = 'application/vnd.proton.doc';
 const SHEET = 'application/vnd.proton.sheet';
@@ -33,7 +39,27 @@ function node(uid: string, over: Record<string, unknown> = {}) {
     };
 }
 
-function make(opts: { invitations?: any[]; nodes?: any[]; failWith?: Error; urlFails?: boolean } = {}) {
+const tmpDirs: string[] = [];
+afterEach(async () => {
+    while (tmpDirs.length) await rm(tmpDirs.pop()!, { recursive: true, force: true });
+});
+const tmp = () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'swm-'));
+    tmpDirs.push(dir);
+    return dir;
+};
+
+function make(
+    opts: {
+        invitations?: any[];
+        nodes?: any[];
+        failWith?: Error;
+        urlFails?: boolean;
+        downloads?: string;
+        free?: number;
+        fetchFile?: (node: any, toPath: string) => Promise<void>;
+    } = {},
+) {
     const calls: Array<[string, ...unknown[]]> = [];
     const logs: Array<{ action: string; localRelPath: string; details: string }> = [];
     const nodes = opts.nodes ?? [];
@@ -69,8 +95,21 @@ function make(opts: { invitations?: any[]; nodes?: any[]; failWith?: Error; urlF
             },
         },
     };
-    const service = createSharedWithMeService({ sdk, logActivity: (e) => logs.push(e), now: () => 1000 });
-    return { service, calls, logs };
+    const fetched: string[] = [];
+    const service = createSharedWithMeService({
+        sdk,
+        logActivity: (e) => logs.push(e),
+        now: () => 1000,
+        downloadsDir: async () => opts.downloads ?? tmp(),
+        freeBytes: async () => opts.free ?? LOCAL_RESERVE_BYTES * 10,
+        fetchFile:
+            opts.fetchFile ??
+            (async (n: any, toPath: string) => {
+                fetched.push(toPath);
+                await writeFile(toPath, `content of ${n.uid}`);
+            }),
+    });
+    return { service, calls, logs, fetched };
 }
 
 describe('shared with me: the list', () => {
@@ -186,10 +225,6 @@ describe('shared with me: acting', () => {
         expect(await make({ urlFails: true }).service.openUrl('n1')).toEqual({ url: 'https://drive.proton.me/shared-with-me' });
     });
 
-    test('download is not there yet', async () => {
-        await expect(make().service.download('n1')).rejects.toThrow('Not yet');
-    });
-
     test('no logged detail contains an email address', async () => {
         const { service, logs } = make({
             invitations: [invitation('i1', { addedByEmail: ok('ann@proton.me') }, { name: ok('report for me@proton.me') })],
@@ -200,5 +235,188 @@ describe('shared with me: acting', () => {
         await service.leave('n1');
         expect(logs.length).toBe(3);
         for (const l of logs) expect(l.details + l.localRelPath).not.toMatch(/\S+@\S+\.\S+/);
+    });
+});
+
+describe('shared with me: download', () => {
+    const file = (uid: string, name: string, over: Record<string, unknown> = {}) =>
+        node(uid, { name: ok(name), activeRevision: { claimedSize: 10 }, ...over });
+
+    test('downloads a file into Downloads under its own name and logs Downloaded <name> to Downloads', async () => {
+        const dir = tmp();
+        const { service, logs, fetched } = make({ downloads: dir, nodes: [file('n1', 'Report.pdf')] });
+        const { path: result } = await service.download('n1');
+        expect(result).toBe(path.join(dir, 'Report.pdf'));
+        expect(await readFile(result, 'utf8')).toBe('content of n1');
+        expect(await readdir(dir)).toEqual(['Report.pdf']);
+        expect(fetched).toHaveLength(1);
+        expect(path.basename(fetched[0]!).startsWith('.proton-drive-tmp-')).toBe(true);
+        expect(logs.map((l) => [l.action, l.details])).toEqual([['share', 'Downloaded Report.pdf to Downloads']]);
+    });
+
+    test('the activity never carries an address from the name', async () => {
+        const { service, logs } = make({ nodes: [file('n1', 'from ann@proton.me.txt')] });
+        await service.download('n1');
+        expect(logs[0]!.details).toBe('Downloaded from an address to Downloads');
+    });
+
+    test('a taken name gets (1), (2): an existing file is never overwritten', async () => {
+        const dir = tmp();
+        await writeFile(path.join(dir, 'Report.pdf'), 'mine 0');
+        await writeFile(path.join(dir, 'Report (1).pdf'), 'mine 1');
+        const { service } = make({ downloads: dir, nodes: [file('n1', 'Report.pdf')] });
+        const { path: result } = await service.download('n1');
+        expect(result).toBe(path.join(dir, 'Report (2).pdf'));
+        expect(await readFile(path.join(dir, 'Report.pdf'), 'utf8')).toBe('mine 0');
+        expect(await readFile(path.join(dir, 'Report (1).pdf'), 'utf8')).toBe('mine 1');
+        expect(await readFile(result, 'utf8')).toBe('content of n1');
+        expect((await readdir(dir)).sort()).toEqual(['Report (1).pdf', 'Report (2).pdf', 'Report.pdf']);
+    });
+
+    test('two downloads of the same name at once end as two files', async () => {
+        const dir = tmp();
+        const { service } = make({ downloads: dir, nodes: [file('a', 'Same.txt'), file('b', 'Same.txt')] });
+        const [x, y] = await Promise.all([service.download('a'), service.download('b')]);
+        expect(x.path).not.toBe(y.path);
+        expect([x.path, y.path].sort()).toEqual([path.join(dir, 'Same (1).txt'), path.join(dir, 'Same.txt')]);
+        expect(await readFile(x.path, 'utf8')).toBe('content of a');
+        expect(await readFile(y.path, 'utf8')).toBe('content of b');
+        expect(await readdir(dir)).toHaveLength(2);
+    });
+
+    test('unsafe names are made safe and stay inside Downloads', async () => {
+        const cases: Array<[string, string]> = [
+            ['..', 'Shared file'],
+            ['.', 'Shared file'],
+            ['a/b', 'a_b'],
+            ['../../etc/passwd', '.._.._etc_passwd'],
+            ['a\0b.txt', 'ab.txt'],
+            ['', 'Shared file'],
+            ['.hidden', '.hidden'],
+        ];
+        for (const [name, expected] of cases) {
+            const dir = tmp();
+            const { service } = make({ downloads: dir, nodes: [file('n1', name)] });
+            const { path: result } = await service.download('n1');
+            expect([name, path.dirname(result), path.basename(result)]).toEqual([name, dir, expected]);
+            expect(await readFile(result, 'utf8')).toBe('content of n1');
+        }
+    });
+
+    test('an unreadable name is saved as Shared file', async () => {
+        const dir = tmp();
+        const { service } = make({ downloads: dir, nodes: [file('n1', 'x', { name: { ok: false, error: { name: 'x' } } })] });
+        expect((await service.download('n1')).path).toBe(path.join(dir, 'Shared file'));
+    });
+
+    test('a very long name is shortened and keeps its extension', async () => {
+        const dir = tmp();
+        const { service } = make({ downloads: dir, nodes: [file('n1', `${'x'.repeat(400)}.pdf`)] });
+        const { path: result } = await service.download('n1');
+        expect(result.endsWith('.pdf')).toBe(true);
+        expect(Buffer.byteLength(path.basename(result))).toBeLessThanOrEqual(150);
+    });
+
+    test('the names go name, name (1), name (2) with the extension last', () => {
+        const names = downloadNames('Report.tar.gz');
+        expect([names.next().value, names.next().value, names.next().value]).toEqual(['Report.tar.gz', 'Report.tar (1).gz', 'Report.tar (2).gz']);
+        const plain = downloadNames('README');
+        expect([plain.next().value, plain.next().value]).toEqual(['README', 'README (1)']);
+        const dot = downloadNames('.bashrc');
+        expect([dot.next().value, dot.next().value]).toEqual(['.bashrc', '.bashrc (1)']);
+    });
+
+    test('the Downloads folder is created if missing', async () => {
+        const dir = path.join(tmp(), 'not', 'yet', 'Downloads');
+        const { service } = make({ downloads: dir, nodes: [file('n1', 'a.txt')] });
+        expect((await service.download('n1')).path).toBe(path.join(dir, 'a.txt'));
+        expect(existsSync(path.join(dir, 'a.txt'))).toBe(true);
+    });
+
+    test('refused when it would leave less than LOCAL_RESERVE_BYTES free, and nothing is written', async () => {
+        const dir = tmp();
+        const { service, fetched, logs } = make({
+            downloads: dir,
+            free: LOCAL_RESERVE_BYTES + 99,
+            nodes: [file('n1', 'big.bin', { activeRevision: { claimedSize: 100 } })],
+        });
+        const err = await service.download('n1').catch((e) => e);
+        expect(err).toBeInstanceOf(ShareError);
+        expect(err.message).toBe("There isn't enough free space on this computer to download this file");
+        expect(fetched).toEqual([]);
+        expect(await readdir(dir)).toEqual([]);
+        expect(logs).toEqual([]);
+    });
+
+    test('exactly the reserve left is allowed; the size falls back to totalStorageSize', async () => {
+        const ok1 = make({ free: LOCAL_RESERVE_BYTES + 100, nodes: [file('n1', 'a', { activeRevision: { claimedSize: 100 } })] });
+        await ok1.service.download('n1');
+        const tight = make({ free: LOCAL_RESERVE_BYTES + 100, nodes: [file('n1', 'a', { activeRevision: undefined, totalStorageSize: 101 })] });
+        await expect(tight.service.download('n1')).rejects.toBeInstanceOf(ShareError);
+    });
+
+    test('refused for folders, Docs and Sheets', async () => {
+        const dir = tmp();
+        const { service, fetched, logs } = make({
+            downloads: dir,
+            nodes: [
+                file('folder', 'F', { type: NodeType.Folder }),
+                file('doc', 'D', { mediaType: DOC }),
+                file('sheet', 'S', { mediaType: SHEET }),
+            ],
+        });
+        for (const uid of ['folder', 'doc', 'sheet']) await expect(service.download(uid)).rejects.toBeInstanceOf(ShareError);
+        expect(fetched).toEqual([]);
+        expect(await readdir(dir)).toEqual([]);
+        expect(logs).toEqual([]);
+    });
+
+    test('an item that is gone is a ShareError', async () => {
+        await expect(make({ nodes: [] }).service.download('nope')).rejects.toBeInstanceOf(ShareError);
+    });
+
+    test('a failed fetch leaves no temp file and no target, and logs nothing', async () => {
+        const dir = tmp();
+        const { service, logs } = make({
+            downloads: dir,
+            nodes: [file('n1', 'a.txt')],
+            fetchFile: async (_n, toPath) => {
+                await writeFile(toPath, 'half');
+                throw new Error('connection lost');
+            },
+        });
+        await expect(service.download('n1')).rejects.toBeInstanceOf(ShareError);
+        expect(await readdir(dir)).toEqual([]);
+        expect(logs).toEqual([]);
+    });
+
+    test('a failed placing leaves no temp file', async () => {
+        const dir = tmp();
+        await writeFile(path.join(dir, 'unrelated'), 'keep');
+        // The fetched file is gone before placing: the link fails with ENOENT
+        const { service } = make({
+            downloads: dir,
+            nodes: [file('n1', 'a.txt')],
+            fetchFile: async (_n, toPath) => {
+                await writeFile(toPath, 'x');
+                await rm(toPath);
+            },
+        });
+        await expect(service.download('n1')).rejects.toBeInstanceOf(ShareError);
+        expect(await readdir(dir)).toEqual(['unrelated']);
+        expect(await readFile(path.join(dir, 'unrelated'), 'utf8')).toBe('keep');
+    });
+});
+
+describe('the Downloads folder', () => {
+    const home = '/home/u';
+    test('is what xdg-user-dir says', async () => {
+        expect(await resolveDownloadsDir(home, async () => '/data/Incoming\n'.trim())).toBe('/data/Incoming');
+    });
+    test('falls back to ~/Downloads when xdg-user-dir is missing, fails, prints $HOME or a relative path', async () => {
+        for (const asked of [null, '', home, `${home}/`, 'Downloads']) {
+            expect([asked, await resolveDownloadsDir(home, async () => asked)]).toEqual([asked, '/home/u/Downloads']);
+        }
+        expect(await resolveDownloadsDir(home, async () => Promise.reject(new Error('no')))).toBe('/home/u/Downloads');
     });
 });

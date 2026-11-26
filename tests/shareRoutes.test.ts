@@ -293,12 +293,13 @@ describe('shared with me routes', () => {
         expect(await goWith(withMe, 'POST', '/share/with-me/decline', { invitationUid: 'i2' })).toEqual({ status: 200, json: { ok: true } });
         expect(await goWith(withMe, 'POST', '/share/with-me/leave', { uid: 'n1' })).toEqual({ status: 200, json: { ok: true } });
         expect(await goWith(withMe, 'POST', '/share/with-me/open-url', { uid: 'n2' })).toEqual({ status: 200, json: { url: 'https://x/y' } });
-        expect(calls).toEqual([['list', expect.any(AbortSignal)], ['accept', 'i1'], ['decline', 'i2'], ['leave', 'n1'], ['openUrl', 'n2']]);
+        expect(await goWith(withMe, 'POST', '/share/with-me/download', { uid: 'n3' })).toEqual({ status: 200, json: { path: '/p' } });
+        expect(calls).toEqual([['list', expect.any(AbortSignal)], ['accept', 'i1'], ['decline', 'i2'], ['leave', 'n1'], ['openUrl', 'n2'], ['download', 'n3']]);
     });
 
     test('a missing uid is a 400 before the service', async () => {
         const { withMe, calls } = fakeWithMe();
-        for (const [route, field] of [['accept', 'invitationUid'], ['decline', 'invitationUid'], ['leave', 'uid'], ['open-url', 'uid']] as const) {
+        for (const [route, field] of [['accept', 'invitationUid'], ['decline', 'invitationUid'], ['leave', 'uid'], ['open-url', 'uid'], ['download', 'uid']] as const) {
             for (const body of [{}, { [field]: '' }, { [field]: 3 }]) {
                 const r = await goWith(withMe, 'POST', `/share/with-me/${route}`, body);
                 expect([route, r.status, String(r.json.error)]).toEqual([route, 400, expect.stringContaining('uid')]);
@@ -317,7 +318,7 @@ describe('shared with me routes', () => {
     });
 
     test('the acting routes are refused on TCP', async () => {
-        for (const route of ['accept', 'decline', 'leave', 'open-url']) {
+        for (const route of ['accept', 'decline', 'leave', 'open-url', 'download']) {
             const res = refuseOnTcp(new Request(`http://127.0.0.1:49152/share/with-me/${route}`, { method: 'POST', body: '{}' }));
             expect([route, res?.status]).toEqual([route, 403]);
         }
