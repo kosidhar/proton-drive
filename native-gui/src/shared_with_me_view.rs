@@ -66,22 +66,26 @@ fn kind_icon(kind: Kind) -> (&'static str, Color32) {
         Kind::File => (icons::FILE, TEXT_MUTED()),
         Kind::Doc => (icons::DOC, TEXT_MUTED()),
         Kind::Sheet => (icons::SHEET, TEXT_MUTED()),
+        Kind::Other => (icons::FILE, TEXT_MUTED()),
     }
 }
 
 /// Whether ⋯ would hold anything: Download (a file) or Leave (an item shared with the account directly). An item
-/// that couldn't be read offers only Open.
+/// that couldn't be read, or of a kind this app doesn't know, offers only Open.
 fn has_more(item: &Item) -> bool {
-    item.unreadable.is_none() && (item.kind == Kind::File || item.can_leave)
+    item.unreadable.is_none() && item.kind != Kind::Other && (item.kind == Kind::File || item.can_leave)
 }
 
-/// The Shared by column's words: the address, or that it is unknown, and whether to mark it ⚠.
+/// The Shared by column's words: the address, or that it is unknown, and whether to mark it ⚠. Without an address,
+/// only an item shared with the account directly (one it can leave) has a sharer Proton checked: when that check
+/// failed, it says so; otherwise who shared it isn't known.
 fn sharer_text(item: &Item) -> (String, bool) {
     let by = item.shared_by.as_deref().filter(|b| !b.is_empty());
     match (by, item.shared_by_verified) {
         (Some(by), true) => (by.to_string(), false),
         (Some(by), false) => (by.to_string(), true),
-        (None, _) => (if item.unreadable.is_some() { NONE } else { "unverified" }.to_string(), item.unreadable.is_none()),
+        (None, false) if item.can_leave && item.unreadable.is_none() => ("unverified".to_string(), true),
+        (None, _) => (NONE.to_string(), false),
     }
 }
 
@@ -507,7 +511,7 @@ impl ProtonDriveNativeApp {
             PageAction::Accept(uid) => {
                 let Some(inv) = self.listing_invitation(&uid) else { return };
                 match model::accept_question(&inv) {
-                    Some(question) => self.pending_confirm = Some(PendingConfirm::AcceptUnverified { invitation_uid: uid, question }),
+                    Some(question) => self.pending_confirm = Some(PendingConfirm::AcceptUnverified { invitation_uid: uid, title: model::accept_title(&inv), question }),
                     None => self.send_accept(uid),
                 }
             }
@@ -517,7 +521,7 @@ impl ProtonDriveNativeApp {
                 }
             }
             PageAction::Open(uid) => {
-                if self.begin_row_action(&uid) {
+                if self.begin_open(&uid) {
                     let _ = self.tx.send(WorkerCommand::OpenSharedUrl(uid));
                 }
             }
@@ -541,13 +545,21 @@ impl ProtonDriveNativeApp {
     /// An action on a row starts: its last note and failure go, and it waits for the daemon. False when the row is
     /// already waiting for one.
     fn begin_row_action(&mut self, uid: &str) -> bool {
+        if !self.begin_open(uid) {
+            return false;
+        }
+        self.shared_with_me.notes.remove(uid);
+        self.shared_with_me.saved.remove(uid);
+        true
+    }
+
+    /// Open starts: as any action, but a download's note (and its Show in Files) stays, as opening changes nothing.
+    fn begin_open(&mut self, uid: &str) -> bool {
         let page = &mut self.shared_with_me;
         if !page.working.insert(uid.to_string()) {
             return false;
         }
-        page.notes.remove(uid);
         page.row_errors.remove(uid);
-        page.saved.remove(uid);
         true
     }
 
@@ -555,7 +567,7 @@ impl ProtonDriveNativeApp {
     pub(crate) fn send_accept(&mut self, invitation_uid: String) {
         let Some(inv) = self.listing_invitation(&invitation_uid) else { return };
         if self.begin_row_action(&invitation_uid) {
-            self.shared_with_me.accepting.insert(invitation_uid.clone(), model::Accepted { name: inv.name, kind: inv.kind });
+            self.shared_with_me.accepting.insert(invitation_uid.clone(), model::Accepted { node_uid: inv.node_uid, name: inv.name, kind: inv.kind });
             let _ = self.tx.send(WorkerCommand::AcceptInvitation(invitation_uid));
         }
     }
@@ -611,11 +623,19 @@ impl ProtonDriveNativeApp {
                         let url = if url.starts_with("https://") { url } else { model::WEB_URL.to_string() };
                         home::open_externally(std::ffi::OsStr::new(&url), self.screenshot_target.is_some());
                     }
-                    Err(why) => fail(&mut self.shared_with_me, uid, why),
+                    // Shown over the note, which stays: a download saved before is still there
+                    Err(why) => {
+                        self.shared_with_me.row_errors.insert(uid, why);
+                    }
                 }
             }
             WorkerEvent::SharedDownloaded(uid, result) => {
                 let page = &mut self.shared_with_me;
+                // Not done: the daemon goes on with it, and the row stays busy until the list is read again
+                if result.as_ref().is_err_and(|why| why == model::STILL_DOWNLOADING) {
+                    page.still_downloading(&uid);
+                    return;
+                }
                 page.working.remove(&uid);
                 match result {
                     Ok(path) => {
@@ -685,5 +705,28 @@ mod tests {
         assert_eq!(format_date(1_793_750_400_000, 0), "4 Nov 2026");
         assert_eq!(format_date(1_793_750_400_000, -3600), "3 Nov 2026", "by the local calendar");
         assert_eq!(format_date(1_798_675_200_000, 0), "31 Dec 2026");
+    }
+
+    #[test]
+    fn a_sharer_that_isnt_known_is_a_dash_and_only_an_unverified_one_is_marked() {
+        let item = |shared_by: Option<&str>, verified: bool, can_leave: bool, unreadable: bool| Item {
+            uid: "v~1".into(),
+            name: Some("a.txt".into()),
+            kind: Kind::File,
+            shared_by: shared_by.map(String::from),
+            shared_by_verified: verified,
+            shared_at: can_leave.then_some(1),
+            role: crate::shared_with_me::Role::Viewer,
+            can_leave,
+            unreadable: unreadable.then(|| "Proton Drive couldn't load this item".to_string()),
+        };
+        let text = |i: Item| sharer_text(&i);
+        assert_eq!(text(item(Some("sam@proton.me"), true, true, false)), ("sam@proton.me".into(), false));
+        assert_eq!(text(item(Some("lee@example.com"), false, true, false)), ("lee@example.com".into(), true));
+        // Shared with the account, by someone Proton couldn't verify, who claims no address
+        assert_eq!(text(item(None, false, true, false)), ("unverified".into(), true));
+        // No membership (so it can't be left): who shared it isn't known, which isn't a failed check
+        assert_eq!(text(item(None, false, false, false)), (NONE.into(), false));
+        assert_eq!(text(item(None, false, false, true)), (NONE.into(), false));
     }
 }

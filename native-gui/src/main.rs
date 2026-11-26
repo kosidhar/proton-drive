@@ -1031,8 +1031,8 @@ enum PendingConfirm {
     StartFresh,
     /// Stop all sharing of an item of the Shared page: `question` is what it asks, naming what is lost (#253)
     StopSharing { rel_path: String, uid: String, question: String },
-    /// Accept an invitation from a sender Proton couldn't verify: `question` is what it asks (#487)
-    AcceptUnverified { invitation_uid: String, question: String },
+    /// Accept an invitation from a sender Proton couldn't verify: `title` names the item, `question` is what it asks (#487)
+    AcceptUnverified { invitation_uid: String, title: String, question: String },
     /// Leave an item shared with the account: `question` is what it asks (#487)
     LeaveShared { uid: String, question: String },
     /// Move the whole Proton Drive folder to `to` (#425): the folder only moves after this is answered
@@ -1187,8 +1187,8 @@ fn confirm_copy(confirm: &PendingConfirm, virtual_drive: bool) -> ConfirmCopy {
             // Not an availability action: render_confirm_modal sends the stop instead
             action: "stop-sharing",
         },
-        PendingConfirm::AcceptUnverified { question, .. } => ConfirmCopy {
-            title: "Accept this invitation?".to_string(),
+        PendingConfirm::AcceptUnverified { title, question, .. } => ConfirmCopy {
+            title: title.clone(),
             body: question.clone(),
             detail: "Nothing in your own files changes.",
             button: "Accept",
@@ -5521,7 +5521,11 @@ fn main() -> eframe::Result {
                         let by_name = |name: &Option<String>, wanted: &str| name.as_deref() == Some(wanted);
                         if let Some(wanted) = &cli_confirm_accept_unverified {
                             app.pending_confirm = listing.invitations.iter().find(|i| by_name(&i.name, wanted)).and_then(|i| {
-                                Some(PendingConfirm::AcceptUnverified { invitation_uid: i.invitation_uid.clone(), question: shared_with_me::accept_question(i)? })
+                                Some(PendingConfirm::AcceptUnverified {
+                                    invitation_uid: i.invitation_uid.clone(),
+                                    title: shared_with_me::accept_title(i),
+                                    question: shared_with_me::accept_question(i)?,
+                                })
                             });
                         }
                         if let Some(wanted) = &cli_confirm_leave {
@@ -10699,8 +10703,16 @@ mod tests {
         let mut h = swm_state("invitations");
         let question = "Proton couldn't verify that this invitation is from lee@example.com. Accept it only if you expected it.";
         swm_click_named(&mut h, "Accept Contract.pdf");
-        assert_eq!(h.app.pending_confirm, Some(PendingConfirm::AcceptUnverified { invitation_uid: "fake~Contract.pdf".into(), question: question.into() }));
+        assert_eq!(
+            h.app.pending_confirm,
+            Some(PendingConfirm::AcceptUnverified {
+                invitation_uid: "fake~Contract.pdf".into(),
+                title: "Accept the invitation to Contract.pdf?".into(),
+                question: question.into()
+            })
+        );
         h.frames(2);
+        assert!(h.text_at("Accept the invitation to Contract.pdf?").is_some(), "the title names the item");
         assert!(h.text_at(question).is_some(), "the question, verbatim");
         assert_eq!(h.sent(), Vec::<String>::new());
         h.click(h.text_at("Cancel").expect("Cancel"));
@@ -10721,6 +10733,7 @@ mod tests {
         let mut h = swm_state("invitations");
         swm_click_named(&mut h, "Accept An item");
         h.frames(2);
+        assert!(h.text_at("Accept the invitation to An item?").is_some());
         assert!(h.text_at("Proton couldn't verify who sent this invitation. Accept it only if you expected it.").is_some());
         assert_eq!(h.sent(), Vec::<String>::new());
     }
@@ -10739,10 +10752,11 @@ mod tests {
     /// The list as the daemon gives it once the invitation to Trip photos is gone and Trip photos isn't there yet.
     fn swm_after_accept(with_item: bool) -> shared_with_me::Listing {
         let mut listing = swm_listing("invitations");
+        let invitation = listing.invitations.iter().find(|i| i.name.as_deref() == Some("Trip photos")).unwrap().clone();
         listing.invitations.retain(|i| i.name.as_deref() != Some("Trip photos"));
         if with_item {
             let mut trip = listing.items[0].clone();
-            trip.uid = "fake~trip".into();
+            trip.uid = invitation.node_uid;
             trip.name = Some("Trip photos".into());
             trip.kind = shared_with_me::Kind::Folder;
             listing.items.push(trip);
@@ -10960,6 +10974,88 @@ mod tests {
         assert!(h.widget_at("More actions for An item").is_none());
         swm_click_named(&mut h, "Open An item");
         assert_eq!(h.sent(), ["open url fake~unreadable"]);
+    }
+
+    // #487 review: a download longer than the app waits is still going on in the daemon: it says so, quietly, and its
+    // row stays busy, so a second copy can't be started, until a read of the list frees it
+    #[test]
+    fn a_download_that_outlasts_the_apps_wait_says_it_goes_on_and_keeps_its_row_busy_until_a_read() {
+        let mut h = swm_state("list");
+        swm_menu(&mut h, "report.pdf", "Download");
+        h.sent();
+        h.event(WorkerEvent::SharedDownloaded("fake~report.pdf".into(), Err(shared_with_me::STILL_DOWNLOADING.into())));
+        h.frames(2);
+        assert_eq!(shared_with_me::STILL_DOWNLOADING, "Still downloading: it will be in Downloads");
+        assert!(h.text_at(shared_with_me::STILL_DOWNLOADING).is_some());
+        assert_eq!(h.text_color_at(shared_with_me::STILL_DOWNLOADING), Some(TEXT_MUTED()), "a note, not a failure");
+        assert!(h.text_at(shared_with_me::DOWNLOADING).is_none());
+        assert!(h.app.shared_with_me.row_errors.is_empty());
+        assert!(h.app.shared_with_me.working.contains("fake~report.pdf"));
+        assert!(h.nodes_named("More actions for report.pdf")[0].is_disabled(), "no second Download");
+        swm_click_named(&mut h, "More actions for report.pdf");
+        h.frames(2);
+        assert!(h.text_at("Download").is_none());
+        assert_eq!(h.sent(), Vec::<String>::new());
+        // A read of the list frees the row
+        h.click(h.widget_at("Refresh").unwrap());
+        assert_eq!(h.sent(), ["shared with me list"]);
+        h.event(WorkerEvent::SharedWithMeLoaded(h.app.shared_with_me.seq, Ok(swm_listing("list"))));
+        h.frames(2);
+        assert!(h.text_at(shared_with_me::STILL_DOWNLOADING).is_none());
+        assert!(h.app.shared_with_me.working.is_empty());
+        assert!(!h.nodes_named("More actions for report.pdf")[0].is_disabled());
+    }
+
+    #[test]
+    fn open_keeps_a_finished_downloads_note_and_show_in_files() {
+        let mut h = swm_state("list");
+        swm_menu(&mut h, "report.pdf", "Download");
+        h.sent();
+        h.event(WorkerEvent::SharedDownloaded("fake~report.pdf".into(), Ok("/home/me/Downloads/report.pdf".into())));
+        h.frames(2);
+        swm_click_named(&mut h, "Open report.pdf");
+        assert_eq!(h.sent(), ["open url fake~report.pdf"]);
+        h.frames(2);
+        assert!(h.text_at(shared_with_me::SAVED).is_some(), "Open says nothing of the download");
+        assert!(h.text_at("Show in Files").is_some());
+        h.event(WorkerEvent::SharedUrl("fake~report.pdf".into(), Ok("https://drive.proton.me/urls/abc".into())));
+        h.frames(2);
+        assert!(h.text_at(shared_with_me::SAVED).is_some());
+        h.click(h.text_at("Show in Files").expect("Show in Files"));
+        assert_eq!(home::LAUNCHED.with(|l| l.borrow().clone()), ["https://drive.proton.me/urls/abc", "show:/home/me/Downloads/report.pdf"]);
+    }
+
+    #[test]
+    fn a_successful_refresh_clears_the_rows_failures() {
+        let mut h = swm_state("list");
+        swm_click_named(&mut h, "Open report.pdf");
+        h.sent();
+        h.event(WorkerEvent::SharedUrl("fake~report.pdf".into(), Err(SWM_FAILED.into())));
+        h.frames(2);
+        assert!(h.text_at(SWM_FAILED).is_some());
+        h.click(h.widget_at("Refresh").unwrap());
+        assert_eq!(h.sent(), ["shared with me list"]);
+        h.event(WorkerEvent::SharedWithMeLoaded(h.app.shared_with_me.seq, Ok(swm_listing("list"))));
+        h.frames(2);
+        assert!(h.text_at(SWM_FAILED).is_none());
+    }
+
+    #[test]
+    fn an_item_of_a_kind_the_app_doesnt_know_shows_a_file_and_offers_only_open() {
+        let mut listing = swm_listing("list");
+        let mut album = listing.items[3].clone();
+        album.uid = "fake~album".into();
+        album.name = Some("Summer album".into());
+        album.kind = shared_with_me::Kind::Other;
+        album.can_leave = true;
+        listing.items.push(album);
+        let mut h = swm_with(listing);
+        let y = h.text_at("Summer album").expect("the row").y;
+        assert!(on_line(&h, icons::FILE, y).is_some(), "the generic icon");
+        assert!(h.widget_at("Open Summer album").is_some());
+        assert!(h.widget_at("More actions for Summer album").is_none(), "no Download, no Leave");
+        swm_click_named(&mut h, "Open Summer album");
+        assert_eq!(h.sent(), ["open url fake~album"]);
     }
 
     #[test]

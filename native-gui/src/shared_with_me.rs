@@ -20,6 +20,9 @@ pub enum Kind {
     Folder,
     Doc,
     Sheet,
+    /// A kind this app doesn't know (a newer daemon's): shown as a file, with Open only
+    #[serde(other)]
+    Other,
 }
 
 /// What the account may do with an item.
@@ -46,6 +49,8 @@ impl Role {
 #[serde(rename_all = "camelCase")]
 pub struct Invitation {
     pub invitation_uid: String,
+    /// The uid of the item it shares: the item it is listed as once accepted
+    pub node_uid: String,
     /// None when the name can't be decrypted
     pub name: Option<String>,
     pub kind: Kind,
@@ -111,6 +116,11 @@ pub const WEB_URL: &str = "https://drive.proton.me/shared-with-me";
 pub const DOWNLOADING: &str = "Downloading…";
 pub const SAVED: &str = "Saved to Downloads";
 pub const ACCEPTED: &str = "Accepted, it will appear shortly";
+/// A download that outlasted `DOWNLOAD_TIMEOUT`: the daemon is still at it, so its row stays busy until the list is read
+/// again (a second Download would fetch it twice)
+pub const STILL_DOWNLOADING: &str = "Still downloading: it will be in Downloads";
+/// How long the app waits for a download: a big file over a slow line takes hours
+pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
 /// How long after an accept the page reads once more
 pub const RELOAD_AFTER_ACCEPT_SECS: u64 = 5;
 pub const LOADING: &str = "Loading what others shared with you…";
@@ -132,6 +142,11 @@ pub fn accept_question(inv: &Invitation) -> Option<String> {
     })
 }
 
+/// The title of the question before accepting from an unverified sender: what it is an invitation to.
+pub fn accept_title(inv: &Invitation) -> String {
+    format!("Accept the invitation to {}?", display_name(&inv.name))
+}
+
 /// The question before leaving an item.
 pub fn leave_question(item: &Item) -> String {
     format!(
@@ -140,9 +155,11 @@ pub fn leave_question(item: &Item) -> String {
     )
 }
 
-/// An invitation that was accepted, whose item the list may not show yet (Proton's list can lag).
+/// An invitation that was accepted, whose item the list may not show yet (Proton's list can lag). Known in the list by
+/// its item's uid: two items can share a name and kind, and one that can't be read has none.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Accepted {
+    pub node_uid: String,
     pub name: Option<String>,
     pub kind: Kind,
 }
@@ -161,9 +178,9 @@ pub struct SharedWithMePage {
     pub refocus: bool,
     /// The uids (an invitation's or an item's) whose action waits for the daemon's answer
     pub working: HashSet<String>,
-    /// A line under a row (`DOWNLOADING`, `SAVED`, `ACCEPTED`), by uid
+    /// A line under a row (`DOWNLOADING`, `STILL_DOWNLOADING`, `SAVED`), by uid
     pub notes: HashMap<String, String>,
-    /// Why an action on a row failed, by uid
+    /// Why an action on a row failed, by uid, until the list is read again
     pub row_errors: HashMap<String, String>,
     /// What each invitation being accepted is, by its uid, until the daemon answers
     pub accepting: HashMap<String, Accepted>,
@@ -175,21 +192,36 @@ pub struct SharedWithMePage {
     pub reload_at: Option<Instant>,
     /// Where each downloaded item was saved, by uid, for Show in Files
     pub saved: HashMap<String, String>,
+    /// The items whose download outlasted the app's wait: their rows stay busy, saying `STILL_DOWNLOADING`, until the
+    /// next read of the list
+    pub outlasted: HashSet<String>,
     /// The ⋯ menu that is open: the uid of its item, and the button it hangs from
     pub menu: Option<(String, egui::Rect)>,
 }
 
 impl SharedWithMePage {
+    /// A download outlasted the app's wait: the daemon goes on with it, so it isn't a failure, and its row stays busy.
+    pub fn still_downloading(&mut self, uid: &str) {
+        self.notes.insert(uid.to_string(), STILL_DOWNLOADING.to_string());
+        self.outlasted.insert(uid.to_string());
+    }
+
     pub fn has_rows(&self) -> bool {
         self.listing.as_ref().is_some_and(|l| !l.is_empty())
     }
 
-    /// A read goes out: the rows shown stay until it answers. Returns its number.
+    /// A read goes out: the rows shown stay until it answers. Why their last actions failed goes (a failure that comes
+    /// while it is out stays), and a download that outlasted the wait frees its row. Returns its number.
     pub fn begin_load(&mut self) -> u64 {
         self.seq += 1;
         self.loading = true;
         self.stale = false;
         self.error = None;
+        self.row_errors.clear();
+        for uid in std::mem::take(&mut self.outlasted) {
+            self.working.remove(&uid);
+            self.notes.remove(&uid);
+        }
         self.seq
     }
 
@@ -217,7 +249,7 @@ impl SharedWithMePage {
     /// `RELOAD_AFTER_ACCEPT_SECS` after the first that lacked it.
     fn settle_accepted(&mut self) {
         let Some(listing) = &self.listing else { return };
-        self.accepted.retain(|a| !listing.items.iter().any(|i| i.name == a.name && i.kind == a.kind));
+        self.accepted.retain(|a| !listing.items.iter().any(|i| i.uid == a.node_uid));
         if self.accepted.is_empty() {
             self.retry_armed = false;
             self.reload_at = None;
@@ -286,14 +318,19 @@ pub fn open_url_at(socket: &Path, uid: &str) -> Result<String, String> {
     decode::<Reply>(reply).map(|r| r.url)
 }
 
-/// Downloads a file to the Downloads folder; the path it was saved at. A big file takes minutes.
+/// Downloads a file to the Downloads folder; the path it was saved at. A big file takes minutes, or hours: after
+/// `DOWNLOAD_TIMEOUT` it is `STILL_DOWNLOADING`.
 pub fn download_at(socket: &Path, uid: &str) -> Result<String, String> {
+    download_at_with_timeout(socket, uid, DOWNLOAD_TIMEOUT)
+}
+
+fn download_at_with_timeout(socket: &Path, uid: &str, timeout: Duration) -> Result<String, String> {
     #[derive(Deserialize)]
     struct Reply {
         path: String,
     }
     let body = serde_json::json!({ "uid": uid });
-    let reply = share::share_request(socket, "POST", "/share/with-me/download", Some(&body), crate::DRIVE_READ_TIMEOUT)?;
+    let reply = share::share_request_with_timeout_message(socket, "POST", "/share/with-me/download", Some(&body), timeout, STILL_DOWNLOADING)?;
     decode::<Reply>(reply).map(|r| r.path)
 }
 
@@ -303,6 +340,7 @@ pub fn fake_shared_with_me(state: &str, now_ms: i64) -> Option<Result<Listing, S
     const DAY: i64 = 86_400_000;
     let invitation = |uid: &str, name: Option<&str>, kind, from: Option<&str>, from_verified, role| Invitation {
         invitation_uid: format!("fake~{uid}"),
+        node_uid: format!("fake~{uid}~item"),
         name: name.map(String::from),
         kind,
         from: from.map(String::from),
@@ -360,6 +398,7 @@ mod tests {
     fn inv(from: Option<&str>, verified: bool) -> Invitation {
         Invitation {
             invitation_uid: "v~i1".into(),
+            node_uid: "v~n1".into(),
             name: Some("Trip".into()),
             kind: Kind::Folder,
             from: from.map(String::from),
@@ -387,13 +426,14 @@ mod tests {
     fn the_daemons_json_is_read_with_its_nulls() {
         let json = r#"{
           "invitations": [
-            { "invitationUid": "v~i1", "name": "Trip photos", "kind": "folder", "from": "sam@proton.me", "fromVerified": true, "role": "viewer", "invitedAt": 1793750400000 },
-            { "invitationUid": "v~i2", "name": null, "kind": "file", "from": null, "fromVerified": false, "role": "editor", "invitedAt": 1793750500000 }
+            { "invitationUid": "v~i1", "nodeUid": "v~n1", "name": "Trip photos", "kind": "folder", "from": "sam@proton.me", "fromVerified": true, "role": "viewer", "invitedAt": 1793750400000 },
+            { "invitationUid": "v~i2", "nodeUid": "v~n2", "name": null, "kind": "album", "from": null, "fromVerified": false, "role": "editor", "invitedAt": 1793750500000 }
           ],
           "items": [
             { "uid": "v~1", "name": "Budget", "kind": "sheet", "sharedBy": "sam@proton.me", "sharedByVerified": true, "sharedAt": 1793750400000, "role": "admin", "canLeave": true },
             { "uid": "v~2", "name": null, "kind": "file", "sharedBy": null, "sharedByVerified": false, "sharedAt": null, "role": "viewer", "canLeave": false, "unreadable": "Proton Drive couldn't load this item" },
-            { "uid": "v~3", "name": "Notes", "kind": "doc", "sharedBy": null, "sharedByVerified": false, "sharedAt": null, "role": "editor", "canLeave": false }
+            { "uid": "v~3", "name": "Notes", "kind": "doc", "sharedBy": null, "sharedByVerified": false, "sharedAt": null, "role": "editor", "canLeave": false },
+            { "uid": "v~4", "name": "Trip", "kind": "photo-album", "sharedBy": null, "sharedByVerified": false, "sharedAt": null, "role": "viewer", "canLeave": true }
           ]
         }"#;
         let l: Listing = serde_json::from_str(json).unwrap();
@@ -403,6 +443,9 @@ mod tests {
         assert_eq!(l.invitations[0].from.as_deref(), Some("sam@proton.me"));
         assert!(l.invitations[0].from_verified);
         assert_eq!(l.invitations[0].invited_at, 1_793_750_400_000);
+        assert_eq!((l.invitations[0].node_uid.as_str(), l.invitations[1].node_uid.as_str()), ("v~n1", "v~n2"));
+        // A kind the app doesn't know yet doesn't fail the page
+        assert_eq!((l.invitations[1].kind, l.items[3].kind), (Kind::Other, Kind::Other));
         assert_eq!((l.invitations[1].name.clone(), l.invitations[1].from.clone()), (None, None));
         assert_eq!(l.invitations[1].role, Role::Editor);
         assert_eq!(l.items[0].kind, Kind::Sheet);
@@ -431,6 +474,58 @@ mod tests {
         }
         assert_eq!(accept_question(&inv(Some("sam@proton.me"), true)), None);
         assert_eq!(accept_question(&inv(None, true)), None);
+    }
+
+    #[test]
+    fn the_accept_dialog_names_the_invitations_item() {
+        assert_eq!(accept_title(&inv(None, false)), "Accept the invitation to Trip?");
+        assert_eq!(accept_title(&Invitation { name: None, ..inv(None, false) }), "Accept the invitation to An item?");
+    }
+
+    #[test]
+    fn an_accepted_invitation_is_known_by_its_items_uid_not_by_its_name() {
+        let accepted = Accepted { node_uid: "v~n1".into(), name: None, kind: Kind::File };
+        let mut page = SharedWithMePage { accepted: vec![accepted.clone()], ..Default::default() };
+        // An unreadable item of the same kind, unnamed too, is another item
+        let mut other = item(None, None);
+        other.unreadable = Some("Proton Drive couldn't load this item".into());
+        let seq = page.begin_load();
+        page.loaded(seq, Ok(Listing { invitations: vec![], items: vec![other.clone()] }));
+        assert_eq!(page.accepted, vec![accepted]);
+        // Its own item, whatever its name
+        let mut mine = item(Some("Trip photos"), Some(5));
+        mine.uid = "v~n1".into();
+        let seq = page.begin_load();
+        page.loaded(seq, Ok(Listing { invitations: vec![], items: vec![other, mine] }));
+        assert!(page.accepted.is_empty());
+    }
+
+    #[test]
+    fn a_read_clears_why_the_rows_actions_failed() {
+        let mut page = SharedWithMePage::default();
+        page.row_errors.insert("v~a".into(), "Proton Drive couldn't do that. Try again.".into());
+        let seq = page.begin_load();
+        page.loaded(seq, Ok(Listing::default()));
+        assert!(page.row_errors.is_empty());
+        // One that comes while the read is out was never seen: it stays
+        let seq = page.begin_load();
+        page.row_errors.insert("v~b".into(), "Proton Drive couldn't do that. Try again.".into());
+        page.loaded(seq, Ok(Listing::default()));
+        assert_eq!(page.row_errors.keys().collect::<Vec<_>>(), ["v~b"]);
+    }
+
+    #[test]
+    fn a_download_that_outlasts_the_wait_keeps_its_row_busy_until_the_next_read() {
+        let mut page = SharedWithMePage::default();
+        page.working.insert("v~a".into());
+        page.working.insert("v~b".into());
+        page.still_downloading("v~a");
+        assert_eq!(page.notes.get("v~a").map(String::as_str), Some(STILL_DOWNLOADING));
+        assert!(page.working.contains("v~a") && page.row_errors.is_empty());
+        let seq = page.begin_load();
+        page.loaded(seq, Ok(Listing::default()));
+        assert!(!page.working.contains("v~a") && !page.notes.contains_key("v~a"), "the read frees the row");
+        assert!(page.working.contains("v~b"), "an action still waiting for its answer keeps its row busy");
     }
 
     #[test]
@@ -583,6 +678,28 @@ mod tests {
         let (sock, server) = serve_once("dl", path);
         assert_eq!(download_at(&sock, "u1").unwrap(), "/d/Notes.txt");
         assert!(server.join().unwrap().starts_with("POST /share/with-me/download HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn a_download_waits_hours_and_then_says_it_goes_on_in_the_background() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(DOWNLOAD_TIMEOUT, Duration::from_secs(6 * 3600));
+        let dir = std::env::temp_dir().join(format!("pd-gui-swm-{}-slow", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let sock = dir.join("c.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let _ = done_rx.recv();
+            drop(conn);
+        });
+        assert_eq!(download_at_with_timeout(&sock, "u1", Duration::from_millis(50)).unwrap_err(), STILL_DOWNLOADING);
+        drop(done_tx);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
     }
 
     #[test]
