@@ -8723,6 +8723,162 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                         expect(d.nodes.get('vol~Other/m.txt')?.parentUid).toBe('vol~Other');
                         await d.expectEveryRecordHasItsFile();
                     });
+
+                    // #490: a move of this computer's own, still queued into the folder (its record and its local copy
+                    // there), is no stale record: it follows the rename, as before #485, and the one node ends in the
+                    // renamed folder. Beside it, a record with no file, one with a file but no queued operation that put
+                    // its node there, and a queued move with no record or file there are stale: they stay behind (#463).
+                    // So does a stale record of the folder itself that names the cloud file (#453).
+                    for (const withStaleFolderRecord of [false, true]) {
+                        test(`local folder over cloud file (${withStaleFolderRecord ? 'with' : 'without'} stale folder record): a move of this computer queued into it follows the rename to Y, stale records and moves stay behind (#490)`, async () => {
+                            const d = await folderOverFile('child.txt');
+                            d.add('Other/m.txt', 'moved');
+                            d.add('Other/n.txt', 'not moved');
+                            await pinnedAndSynced(d, d.add('Other').uid);
+                            stateDb.updateSettings({ paused: true }); // the move stays queued, as when offline
+                            await d.engine.renameItem('Other/m.txt', 'X/m.txt');
+                            expect(stateDb.getItemByPath('X/m.txt')?.nodeUid).toBe('vol~Other/m.txt');
+                            // Stale: a record with no file, a record with a file that no queued operation put there, and a
+                            // queued move under X/ with no record or file there
+                            recordAt('X/ghost.txt', 'vol~Ghost', 'file');
+                            recordAt('X/child.txt', 'vol~Stale', 'file');
+                            if (withStaleFolderRecord) {
+                                recordX('vol~X', 'file');
+                            }
+                            (d.engine as any).journal.enqueue({
+                                kind: 'move',
+                                nodeUid: 'vol~Other/n.txt',
+                                toPath: 'X/n.txt',
+                                fromPath: 'Other/n.txt',
+                            });
+
+                            await d.engine.renameItem('X', 'Y');
+
+                            expect(stateDb.getItemsUnder('X')).toEqual([]);
+                            expect(stateDb.getItemByPath('Y/m.txt')).toMatchObject({ nodeUid: 'vol~Other/m.txt', type: 'file' });
+                            // Its records went with it: reported as something new, it would upload again
+                            expect((d.engine as any).watcher.isSuppressed('Y')).toBe(true);
+                            expect(stateDb.getItemByPath('Y/ghost.txt')).toBeNull();
+                            expect(stateDb.getItemByPath('Y/child.txt')).toBeNull();
+                            expect(stateDb.getItemByPath('Y')).toBeNull();
+                            expect(d.journal()).toMatchObject([
+                                { kind: 'move', nodeUid: 'vol~Other/m.txt', toPath: 'Y/m.txt' },
+                                { kind: 'move', nodeUid: 'vol~Other/n.txt', toPath: 'X/n.txt' },
+                            ]);
+                            stateDb.updateSettings({ paused: false });
+                            await expectCloudItemStays(d, 'file');
+                            await d.engine.reconcileNow();
+                            // One node, the one moved, ends at Y/m.txt: nothing is back at Other/, nothing uploaded as a copy
+                            const [y, ...moreY] = d.named(d.root.uid, 'Y');
+                            expect(moreY).toEqual([]);
+                            expect(y).toMatchObject({ type: NodeType.Folder });
+                            expect(d.nodes.get('vol~Other/m.txt')?.parentUid).toBe(y!.uid);
+                            expect(d.named(y!.uid, 'm.txt').map((n) => n.uid)).toEqual(['vol~Other/m.txt']);
+                            expect(d.named('vol~Other', 'm.txt')).toEqual([]);
+                            expect(await d.files.exists('Other/m.txt')).toBe(false);
+                            expect(await readFile(d.local('Y/m.txt'), 'utf8')).toBe('moved');
+                            expect(stateDb.getItemByPath('Y/m.txt')?.nodeUid).toBe('vol~Other/m.txt');
+                            expect(d.calls.uploads).toEqual(['Y/child.txt']);
+                            // The stale ones: their nodes stay where Proton Drive has them, and no record names them
+                            expect(d.nodes.get('vol~Other/n.txt')?.parentUid).toBe('vol~Other');
+                            expect(stateDb.getItemByNodeUid('vol~Stale')).toBeNull();
+                            expect(stateDb.getItemByNodeUid('vol~Ghost')).toBeNull();
+                            expect(stateDb.getItemByPath('Y/child.txt')?.nodeUid).toBe(d.named(y!.uid, 'child.txt')[0]!.uid);
+                            await d.expectEveryRecordHasItsFile();
+                        });
+                    }
+
+                    // #490: a rename inside the folder of what this computer moved into it, both still queued, follows too
+                    test('local folder over cloud file: a queued move into it and a queued rename of it there follow the rename to Y (#490)', async () => {
+                        const d = await folderOverFile();
+                        d.add('Other/a.txt', 'a');
+                        await pinnedAndSynced(d, d.add('Other').uid);
+                        stateDb.updateSettings({ paused: true });
+                        await d.engine.renameItem('Other/a.txt', 'X/a.txt');
+                        await d.engine.renameItem('X/a.txt', 'X/b.txt');
+                        expect(stateDb.getItemByPath('X/b.txt')?.nodeUid).toBe('vol~Other/a.txt');
+
+                        await d.engine.renameItem('X', 'Y');
+
+                        expect(stateDb.getItemsUnder('X')).toEqual([]);
+                        expect(stateDb.getItemByPath('Y/b.txt')?.nodeUid).toBe('vol~Other/a.txt');
+                        expect(d.journal().map((op) => [op.nodeUid, op.kind === 'trash' ? null : op.toPath])).toEqual([
+                            ['vol~Other/a.txt', 'Y/b.txt'],
+                            ['vol~Other/a.txt', 'Y/b.txt'],
+                        ]);
+                        stateDb.updateSettings({ paused: false });
+                        await expectCloudItemStays(d, 'file');
+                        await d.engine.reconcileNow();
+                        const [y, ...moreY] = d.named(d.root.uid, 'Y');
+                        expect(moreY).toEqual([]);
+                        expect(d.named(y!.uid, 'b.txt').map((n) => n.uid)).toEqual(['vol~Other/a.txt']);
+                        expect(d.named('vol~Other', 'a.txt')).toEqual([]);
+                        expect(await d.files.exists('Other/a.txt')).toBe(false);
+                        expect(await readFile(d.local('Y/b.txt'), 'utf8')).toBe('a');
+                        expect(d.calls.uploads).toEqual([]);
+                        await d.expectEveryRecordHasItsFile();
+                    });
+
+                    // #490: a folder this computer moved into it goes on with what is in it, under its records
+                    test('local folder over cloud file: a folder moved into it, still queued, follows the rename to Y with what is in it (#490)', async () => {
+                        const d = await folderOverFile();
+                        d.add('Other/sub/c.txt', 'c');
+                        await pinnedAndSynced(d, d.add('Other').uid);
+                        stateDb.updateSettings({ paused: true });
+                        await d.engine.renameItem('Other/sub', 'X/sub');
+                        expect(stateDb.getItemByPath('X/sub/c.txt')?.nodeUid).toBe('vol~Other/sub/c.txt');
+
+                        await d.engine.renameItem('X', 'Y');
+
+                        expect(stateDb.getItemsUnder('X')).toEqual([]);
+                        expect(stateDb.getItemByPath('Y/sub')?.nodeUid).toBe('vol~Other/sub');
+                        expect(stateDb.getItemByPath('Y/sub/c.txt')?.nodeUid).toBe('vol~Other/sub/c.txt');
+                        expect(d.journal()).toMatchObject([{ kind: 'move', nodeUid: 'vol~Other/sub', toPath: 'Y/sub' }]);
+                        stateDb.updateSettings({ paused: false });
+                        await expectCloudItemStays(d, 'file');
+                        await d.engine.reconcileNow();
+                        const [y, ...moreY] = d.named(d.root.uid, 'Y');
+                        expect(moreY).toEqual([]);
+                        expect(d.nodes.get('vol~Other/sub')?.parentUid).toBe(y!.uid);
+                        expect(d.named('vol~Other/sub', 'c.txt').map((n) => n.uid)).toEqual(['vol~Other/sub/c.txt']);
+                        expect(d.named('vol~Other', 'sub')).toEqual([]);
+                        expect(await readFile(d.local('Y/sub/c.txt'), 'utf8')).toBe('c');
+                        expect(d.calls.uploads).toEqual([]);
+                        await d.expectEveryRecordHasItsFile();
+                    });
+
+                    // #490: an edit baseline or a cut-short hold in what this computer queued into the folder still names
+                    // its node, as its record does; one in the folder outside it names none (#463)
+                    test('local folder over cloud file: edit baselines and cut-short holds in a folder moved into it keep their nodes on the rename to Y (#490)', async () => {
+                        const d = await folderOverFile('child.txt');
+                        d.add('Other/sub/c.txt', 'c');
+                        d.add('Other/sub/e.txt', 'e');
+                        await pinnedAndSynced(d, d.add('Other').uid);
+                        stateDb.updateSettings({ paused: true });
+                        await d.engine.renameItem('Other/sub', 'X/sub');
+                        const hold = (relPath: string, nodeUid: string) => {
+                            const st = lstatSync(d.local(relPath));
+                            stateDb.holdCutShort({ relPath, nodeUid, size: st.size, mtimeMs: st.mtimeMs, detectedAt: Date.now() });
+                        };
+                        const baseline = (relPath: string, nodeUid: string, parentUid: string) =>
+                            stateDb.recordEditBaseline({ relPath, nodeUid, parentUid, sha1: null, mtimeMs: 0, size: 1 });
+                        hold('X/sub/c.txt', 'vol~Other/sub/c.txt');
+                        // Being edited through the drive with no record yet
+                        stateDb.removeItemByPath('X/sub/e.txt');
+                        baseline('X/sub/e.txt', 'vol~Other/sub/e.txt', 'vol~Other/sub');
+                        // Stale: in the folder, outside what this computer queued into it
+                        hold('X/child.txt', 'vol~Stale');
+                        baseline('X/child.txt', 'vol~Stale', 'vol~Other');
+
+                        await d.engine.renameItem('X', 'Y');
+
+                        expect(stateDb.getCutShort('Y/sub/c.txt')).toMatchObject({ nodeUid: 'vol~Other/sub/c.txt' });
+                        expect(stateDb.getEditBaseline('Y/sub/e.txt')).toMatchObject({ nodeUid: 'vol~Other/sub/e.txt' });
+                        expect(stateDb.getCutShort('Y/child.txt')).toMatchObject({ nodeUid: null });
+                        expect(stateDb.getEditBaseline('Y/child.txt')).toBeNull();
+                        expect(stateDb.listEditBaselines().filter((b) => b.relPath.startsWith('X/'))).toEqual([]);
+                        expect(stateDb.listCutShort().filter((h) => h.relPath.startsWith('X/'))).toEqual([]);
+                    });
                 });
 
                 // Controls: the local item of the same kind as the cloud item at its path, with no record either, is that
