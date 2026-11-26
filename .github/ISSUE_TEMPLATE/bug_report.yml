@@ -1,0 +1,88 @@
+name: Bug report
+description: Something doesn't work as it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please check that you're on the [latest release](https://github.com/kosidhar/proton-drive/releases) first.
+
+        **A security problem?** Don't post it here: [report it privately](https://github.com/kosidhar/proton-drive/security/advisories/new).
+
+        Logs and file names can be personal. Remove anything you don't want public before you submit.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The first line of `protondrive --version`.
+      placeholder: protondrive 0.1.1
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution and version
+      placeholder: Ubuntu 24.04
+    validations:
+      required: true
+  - type: dropdown
+    id: desktop
+    attributes:
+      label: Desktop
+      options:
+        - GNOME
+        - KDE Plasma
+        - Cinnamon
+        - Xfce
+        - MATE
+        - COSMIC
+        - Other (say below)
+  - type: dropdown
+    id: install
+    attributes:
+      label: How you installed it
+      options:
+        - .deb package
+        - .rpm package
+        - AppImage
+        - Tarball (install.sh)
+        - Arch (PKGBUILD)
+        - Flatpak bundle
+        - Built from source
+    validations:
+      required: true
+  - type: dropdown
+    id: drive
+    attributes:
+      label: Proton Drive in Files is
+      description: Settings › "Show online-only files in Files (virtual drive)" says which.
+      options:
+        - A virtual drive (online-only files)
+        - A plain folder
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        If Proton Drive runs as a systemd service: `journalctl --user -u protondrive --since "1 hour ago"`.
+        Otherwise quit Proton Drive (tray › Quit Proton Drive), run `protondrive daemon` in a terminal, make the problem happen again, and paste what it printed.
+      render: text
