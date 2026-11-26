@@ -91,7 +91,6 @@ shot shared-with-me dark --tab shared-with-me --fake-shared-with-me readme
 shot activity dark --tab activity
 shot settings dark --tab settings
 shot share dark --fake-share readme --share "/home/user/ProtonDrive/Documents/Lease agreement.pdf"
-shot home-light light --tab home
 
 # The demo daemon logs what it was asked and doesn't know: show it, to find what a page needs
 if [[ -s "$TMP/demo.err" ]]; then

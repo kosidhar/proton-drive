@@ -459,12 +459,13 @@ describe('recommends for the Files extension and the tray (#506)', () => {
         expect(pkgbuild).toMatch(/'libayatana-appindicator:/);
     });
 
-    test('the README tells deb and rpm users what the Files extension and the tray need', () => {
-        const readme = readFileSync(path.join(root, 'README.md'), 'utf8');
-        const install = readme.slice(readme.indexOf('### Option B'), readme.indexOf('### Option D'));
+    test('the install guide tells deb and rpm users what the Files extension and the tray need', () => {
+        const guide = readFileSync(path.join(root, 'docs/INSTALL.md'), 'utf8');
+        const install = guide.slice(guide.indexOf('## Debian'), guide.indexOf('## Arch Linux'));
+        expect(install.length).toBeGreaterThan(0);
         expect(install).toContain('python3-nautilus');
-        expect(install).toContain('apt install ./dist/release/kosidhar-protondrive-<version>-linux-amd64.deb');
-        expect(install).not.toContain('dpkg -i');
+        expect(install).toContain('sudo apt install ./kosidhar-protondrive-<version>-linux-amd64.deb');
+        expect(install).not.toMatch(/sudo dpkg -i/); // it may say to use apt rather than dpkg -i, but never to run it
         expect(install).toContain('nautilus-python');
         expect(install).toContain('nautilus -q');
         expect(install).toContain('gir1.2-ayatanaappindicator3-0.1');
