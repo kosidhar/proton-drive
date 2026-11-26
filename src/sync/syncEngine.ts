@@ -5964,10 +5964,14 @@ export class ProtonDriveSyncEngine {
                     if (collision) {
                         // Nothing is left of this computer's side: what stays is the cloud's version
                         this.endConflictsAsKeepRemote(collisions);
-                        for (const uid of toTrash.keys()) {
-                            this.index.removeSubtree(uid);
-                        }
-                    } else if (ownEntry) {
+                    }
+                    // Drop only nodes actually being trashed (plus a provisional folder here): another node the index
+                    // holds at relPath (e.g. made by another device after this item's recorded node moved away) is
+                    // neither trashed nor dropped from the index, so it doesn't vanish and come back (#462).
+                    for (const uid of toTrash.keys()) {
+                        this.index.removeSubtree(uid);
+                    }
+                    if (ownEntry && isProvisional(ownEntry.uid)) {
                         this.index.removeSubtree(ownEntry.uid);
                     }
                     for (const [uid, where] of toTrash) {
