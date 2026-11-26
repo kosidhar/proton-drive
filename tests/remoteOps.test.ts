@@ -153,6 +153,20 @@ describe('RemoteOpsJournal', () => {
         expect(journal.guard().paths.sort()).toEqual(['Docs/b.txt', 'Docs/z.txt']);
     });
 
+    test('setCloudPathAfter also updates later operations on descendants under the old cloud path', () => {
+        const journal = new RemoteOpsJournal(stateDb.connection);
+        const folder = journal.enqueue({ kind: 'rename', nodeUid: 'vol~docs', toPath: 'Papers', fromPath: 'Docs' });
+        const child = journal.enqueue({ kind: 'trash', nodeUid: 'vol~a', path: 'Papers/a.txt' }, 'Docs/a.txt');
+        const lookAlike = journal.enqueue({ kind: 'trash', nodeUid: 'vol~x', path: 'Docs2/x.txt' });
+        expect(journal.get(child)).toMatchObject({ path: 'Docs/a.txt' });
+
+        journal.setCloudPathAfter(folder, 'vol~docs', 'Papers (conflict)');
+        journal.complete(folder);
+
+        expect(journal.get(child)).toMatchObject({ kind: 'trash', path: 'Papers (conflict)/a.txt' });
+        expect(journal.get(lookAlike)).toMatchObject({ kind: 'trash', path: 'Docs2/x.txt' });
+    });
+
     test('a later local rename takes the targets of pending moves along, and leaves look-alike paths alone', () => {
         const journal = new RemoteOpsJournal(stateDb.connection);
         const intoNew = journal.enqueue({ kind: 'move', nodeUid: 'vol~x', toPath: 'New/x.txt' });

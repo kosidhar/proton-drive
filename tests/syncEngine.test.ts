@@ -9598,9 +9598,9 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 });
             });
 
-            // A node the index has no entry for is either gone from Proton Drive or not indexed yet: the delete trashes it
-            // as before (here another device deleted it, the index heard, and the local copy hadn't gone yet), and the
-            // replay finds nothing more to do
+            // A node the index has no entry for is either gone from Proton Drive or not indexed yet: the delete journals
+            // its trash as before (here another device deleted it, the index heard, and the local copy hadn't gone yet),
+            // and the replay sees it is already gone (#179, #460) and finds nothing more to do
             test('Move to Trash of a folder whose node the index has no entry for journals its trash, as before', async () => {
                 const d = setup();
                 d.add('X/a.txt', 'a');
@@ -9614,8 +9614,239 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
 
                 expect(w.journalled()).toMatchObject([{ kind: 'trash', nodeUid: 'vol~X', path: 'X' }]);
                 expect(await d.files.exists('X')).toBe(false);
-                await afterReplayAndSync(d, 'X', { trashed: [['vol~X']] });
+                await afterReplayAndSync(d, 'X', { trashed: [] });
                 expect(d.engine.vfsChildren('')).toEqual([]);
+            });
+
+            // #460: even when the remote index has briefly lost a moved node (between listing its old folder and
+            // listing its new one) or has not heard of the move at all, replayTrash checks the node's live path in
+            // Proton Drive before trashing it and skips the trash if it moved.
+            describe('replay checks the cloud path before trashing (#460)', () => {
+                const moveInCloudOnly = (d: ReturnType<typeof setup>, uid: string, change: { name?: string; parentUid?: string }) => {
+                    const node = d.nodes.get(uid)!;
+                    d.nodes.set(uid, {
+                        ...node,
+                        ...(change.name === undefined ? {} : { name: { ok: true as const, value: change.name } }),
+                        ...(change.parentUid === undefined ? {} : { parentUid: change.parentUid }),
+                    });
+                };
+
+                test('a folder moved into another folder while briefly absent from the index is not trashed at replay', async () => {
+                    const d = setup();
+                    d.add('X/a.txt', 'a');
+                    d.add('Q');
+                    await pinnedAndSynced(d, d.add('X').uid);
+                    moveInCloudOnly(d, 'vol~X', { parentUid: 'vol~Q' });
+                    // Listing of root dropped vol~X before Q was listed
+                    d.engine.remoteIndex.removeSubtree('vol~X');
+                    const w = journalling(d);
+
+                    await d.engine.deleteItem('X', { trash: true });
+
+                    expect(w.journalled()).toMatchObject([{ kind: 'trash', nodeUid: 'vol~X', path: 'X' }]);
+                    await afterReplayAndSync(d, 'X', { trashed: [], downloadsAt: 'Q/X' });
+                    expect(d.nodes.has('vol~X')).toBe(true);
+                    expect(d.nodes.get('vol~X')?.parentUid).toBe('vol~Q');
+                    expect(d.nodes.get('vol~X/a.txt')?.content).toBe('a');
+                    expect(d.engine.remoteIndex.getByPath('Q/X')?.uid).toBe('vol~X');
+                    expect(d.engine.remoteIndex.getByPath('Q/X/a.txt')?.uid).toBe('vol~X/a.txt');
+                });
+
+                test('a folder renamed in Proton Drive when the index has not heard at all is not trashed at replay', async () => {
+                    const d = setup();
+                    d.add('X/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('X').uid);
+                    moveInCloudOnly(d, 'vol~X', { name: 'Z' });
+                    d.add('Z/new.txt', 'theirs');
+                    // Index still believes vol~X is at X
+                    expect(d.engine.remoteIndex.getByPath('X')?.uid).toBe('vol~X');
+
+                    await d.engine.deleteItem('X', { trash: true });
+
+                    await afterReplayAndSync(d, 'X', { trashed: [], downloadsAt: 'Z' });
+                    expect(d.nodes.has('vol~X')).toBe(true);
+                    expect(d.nameOf(d.nodes.get('vol~X')!)).toBe('Z');
+                    expect(d.nodes.get('vol~X/a.txt')?.content).toBe('a');
+                    expect(d.nodes.get('vol~Z/new.txt')?.content).toBe('theirs');
+                    expect(d.engine.remoteIndex.getByPath('Z')?.uid).toBe('vol~X');
+                    expect(d.engine.remoteIndex.getByPath('Z/a.txt')?.uid).toBe('vol~X/a.txt');
+                    expect(d.engine.remoteIndex.getByPath('Z/new.txt')).not.toBeNull();
+                });
+
+                test('a file whose parent folder was renamed in Proton Drive without the index hearing is not trashed at replay', async () => {
+                    const d = setup();
+                    d.add('Docs/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('Docs').uid);
+                    moveInCloudOnly(d, 'vol~Docs', { name: 'Papers' });
+                    expect(d.engine.remoteIndex.getByPath('Docs/a.txt')?.uid).toBe('vol~Docs/a.txt');
+
+                    await d.engine.deleteItem('Docs/a.txt');
+
+                    await afterReplayAndSync(d, 'Docs/a.txt', { trashed: [], downloadsAt: 'Papers' });
+                    expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('a');
+                    expect(d.engine.remoteIndex.getByPath('Papers/a.txt')?.uid).toBe('vol~Docs/a.txt');
+                });
+
+                test('control: a node absent from the index that is still at the deleted path in Proton Drive is trashed', async () => {
+                    const d = setup();
+                    d.add('X/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('X').uid);
+                    d.engine.remoteIndex.removeSubtree('vol~X');
+
+                    await d.engine.deleteItem('X', { trash: true });
+
+                    await afterReplayAndSync(d, 'X', { trashed: [['vol~X']] });
+                    expect(d.nodes.has('vol~X')).toBe(false);
+                });
+
+                test('control: a node absent from the index that really is gone completes cleanly (#179)', async () => {
+                    const d = setup();
+                    d.add('X/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('X').uid);
+                    d.nodes.delete('vol~X/a.txt');
+                    d.nodes.delete('vol~X');
+                    d.engine.remoteIndex.removeSubtree('vol~X');
+
+                    await d.engine.deleteItem('X', { trash: true });
+
+                    await afterReplayAndSync(d, 'X', { trashed: [] });
+                    expect(activity()).toContain('Already in Proton Drive Trash');
+                });
+
+                test('a network error while checking the node keeps the trash pending and retries later', async () => {
+                    const d = setup();
+                    d.add('Docs/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('Docs').uid);
+                    d.down.add('getNode');
+
+                    await d.engine.deleteItem('Docs/a.txt');
+                    await d.engine.replayRemoteOps();
+
+                    expect(d.journal()).toMatchObject([{ kind: 'trash', nodeUid: 'vol~Docs/a.txt', path: 'Docs/a.txt' }]);
+                    expect(d.calls.trashed).toEqual([]);
+                    d.down.delete('getNode');
+                    await afterReplayAndSync(d, 'Docs/a.txt', { trashed: [['vol~Docs/a.txt']] });
+                    expect(d.nodes.has('vol~Docs/a.txt')).toBe(false);
+                });
+
+                test('a file deleted inside a folder renamed twice while offline is still trashed at replay', async () => {
+                    const d = setup();
+                    d.add('Docs/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('Docs').uid);
+                    d.down.add('renameNode');
+                    await d.engine.renameItem('Docs', 'Papers');
+                    await d.engine.deleteItem('Papers/a.txt');
+                    await d.engine.renameItem('Papers', 'Notes');
+                    d.down.clear();
+
+                    await d.engine.replayRemoteOps();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+                    expect(d.nodes.has('vol~Docs/a.txt')).toBe(false);
+                    expect(d.nameOf(d.nodes.get('vol~Docs')!)).toBe('Notes');
+                    await d.expectEveryRecordHasItsFile();
+                });
+
+                test('a file deleted under an inner folder rename whose outer folder rename was superseded is still trashed', async () => {
+                    const d = setup();
+                    d.add('Docs/Sub/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('Docs').uid);
+                    d.down.add('renameNode');
+                    await d.engine.renameItem('Docs', 'Papers');
+                    await d.engine.renameItem('Papers/Sub', 'Papers/Sub2');
+                    await d.engine.deleteItem('Papers/Sub2/a.txt');
+                    await d.engine.renameItem('Papers', 'Notes');
+                    d.down.clear();
+
+                    await d.engine.replayRemoteOps();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(d.calls.trashed).toEqual([['vol~Docs/Sub/a.txt']]);
+                    expect(d.nodes.has('vol~Docs/Sub/a.txt')).toBe(false);
+                    expect(d.nameOf(d.nodes.get('vol~Docs')!)).toBe('Notes');
+                    expect(d.nameOf(d.nodes.get('vol~Docs/Sub')!)).toBe('Sub2');
+                    await d.expectEveryRecordHasItsFile();
+                });
+
+                test('a file deleted after inner then outer folder renames, where the outer folder gets a conflict name, is still trashed', async () => {
+                    const d = setup();
+                    d.add('A/B/c.txt', 'c');
+                    await pinnedAndSynced(d, d.add('A').uid);
+                    d.add('A2'); // taken in Proton Drive -> vol~A gets a conflict name
+                    d.down.add('renameNode');
+                    await d.engine.renameItem('A/B', 'A/B2');
+                    await d.engine.renameItem('A', 'A2');
+                    await d.engine.deleteItem('A2/B2/c.txt');
+                    d.down.clear();
+
+                    await d.engine.replayRemoteOps();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(d.calls.trashed).toEqual([['vol~A/B/c.txt']]);
+                    expect(d.nodes.has('vol~A/B/c.txt')).toBe(false);
+                    expect(d.nameOf(d.nodes.get('vol~A')!)).toMatch(/^A2 \(conflict .+\)$/);
+                    await d.expectEveryRecordHasItsFile();
+                });
+
+                test('an unindexed file deleted inside a folder with a pending rename is still trashed when that rename gets a conflict name', async () => {
+                    const d = setup();
+                    d.add('Docs/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('Docs').uid);
+                    d.add('Papers'); // forces conflict name for vol~Docs
+                    d.down.add('renameNode');
+                    await d.engine.renameItem('Docs', 'Papers');
+                    d.engine.remoteIndex.removeSubtree('vol~Docs/a.txt');
+                    await d.engine.deleteItem('Papers/a.txt');
+                    d.down.clear();
+
+                    await d.engine.replayRemoteOps();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+
+                    expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+                    expect(d.nodes.has('vol~Docs/a.txt')).toBe(false);
+                    await d.expectEveryRecordHasItsFile();
+                });
+
+                test('rmdir keeps a folder absent from the index when a child trash is skipped during its listing because the child was renamed in place', async () => {
+                    const d = setup();
+                    d.add('Docs/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('Docs').uid);
+                    moveInCloudOnly(d, 'vol~Docs/a.txt', { name: 'b.txt' });
+                    d.engine.remoteIndex.removeSubtree('vol~Docs');
+                    d.down.add('getNode');
+                    await d.engine.deleteItem('Docs/a.txt');
+                    expect(d.journal()).toMatchObject([{ kind: 'trash', nodeUid: 'vol~Docs/a.txt', path: 'Docs/a.txt' }]);
+
+                    const realList = (d.sdk as any).iterateFolderChildren;
+                    let once = true;
+                    (d.sdk as any).iterateFolderChildren = async function* (parent: unknown) {
+                        const listed: unknown[] = [];
+                        for await (const child of realList(parent)) listed.push(child);
+                        if (once) {
+                            once = false;
+                            await d.engine.replayRemoteOps();
+                            expect(d.journal()).toEqual([]);
+                            expect(d.calls.trashed).toEqual([]);
+                        }
+                        yield* listed;
+                    };
+                    d.down.delete('getNode');
+
+                    const code = await d.engine.deleteItem('Docs', { onlyIfEmpty: true }).then(
+                        () => null,
+                        (e: unknown) => (e instanceof DriveOpError ? e.code : e),
+                    );
+                    expect(code).toBe('ENOTEMPTY');
+                    await d.engine.replayRemoteOps();
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.nodes.has('vol~Docs')).toBe(true);
+                    expect(d.nodes.has('vol~Docs/a.txt')).toBe(true);
+                });
             });
         });
 
