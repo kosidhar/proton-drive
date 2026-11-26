@@ -30,7 +30,7 @@ import {
     type UploadResult,
     uploadLocalFileToDrive,
 } from '../sdk/fileOps';
-import { getClaimedSize, getName } from '../sdk/node';
+import { getClaimedSize, getName, quotedName, remoteNameProblem, syncableName } from '../sdk/node';
 import { AvailabilityPolicy, type ItemAvailability } from './availability';
 import { DownloadWatch } from './downloadWatch';
 import { problemWithBlockedApps } from './settingsRules';
@@ -45,6 +45,7 @@ import { LAYOUT_MOVING, type MoveSeams, relocateFiles, SYNC_DIR_MOVING } from '.
 import { DriveOpError, type VfsEntry } from './driveOps';
 import { HYDRATE_STAGING_PREFIX, isEngineTempName, removeScannedEntries, type ScanEntry, scanLocalCopies } from './localCopies';
 import { moveWithoutReplacing } from './localMove';
+import { isSafeRelPath, localPathIn, relPathProblem } from './localPath';
 import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
 import { pathsOverlap } from './mountPoint';
 import { DocNodes, docRecordOf, placeholderContent, placeholderName, type DocRecord } from './docNodes';
@@ -136,6 +137,9 @@ const ROOM_REFUSAL_LOGGED_EVERY_MS = 30_000;
 // Uid prefix of the remote index entries that stand for folders made here that Proton Drive doesn't have yet, holding
 // what a pending move puts in them (see applyPendingOpsToIndex). Never a node: never resolved, moved or trashed.
 const PROVISIONAL = 'provisional:';
+// What currentRemotePath answers for a node Proton Drive still has, under a name (its own, or a folder's above it) that
+// can't be one on this computer (#536)
+const UNSYNCABLE: unique symbol = Symbol('unsyncable name');
 // How long a download for the virtual drive (an app opening an online-only file) may take before the user is told
 // (those downloads are staged at the root of the backing store: see HYDRATE_STAGING_PREFIX in localCopies)
 const SLOW_DOWNLOAD_NOTICE_MS = 2000;
@@ -215,10 +219,11 @@ function isFolderAt(dir: string): boolean {
 }
 
 // Whether an item (a path relative to a folder that is there) is in it; a link counts as there. Any failure to look
-// (ENOTDIR, EACCES, …) counts as not there: this only ever holds back.
+// (ENOTDIR, EACCES, …), and a path that could lead outside the folder (#536), counts as not there: this only ever holds
+// back.
 function itemIn(root: string, relPath: string): boolean {
     try {
-        return lstatSync(path.join(root, relPath), { throwIfNoEntry: false }) !== undefined;
+        return lstatSync(localPathIn(root, relPath), { throwIfNoEntry: false }) !== undefined;
     } catch {
         return false;
     }
@@ -529,6 +534,71 @@ export class ProtonDriveSyncEngine {
         return this.inBackingStore() && this.options.backingDir ? this.options.backingDir : this.stateDb.getSettings().syncDir;
     }
 
+    // The path on disk of an item of the local root. Every path made from a record's, the remote index's or Proton
+    // Drive's relative path comes through here (or localPathIn, with the root taken once): one that could lead outside the
+    // root, or names no item in it, throws UnsafeLocalPathError (#536). Whoever asked skips the item, and the error is
+    // logged: it is never taken for the item being gone, here or in Proton Drive.
+    private localPath(relPath: string): string {
+        return localPathIn(this.localRoot(), relPath);
+    }
+
+    // Whether a node's name can't be one on this computer (see remoteNameProblem, #536): such a node, and everything in
+    // it, is left out of what is synced, indexed, listed in the drive and downloaded. Said once per node, by its uid, in
+    // the log and in the activity (the name only quoted: it is someone else's text). `folderRel` is where it was found,
+    // when known.
+    private skipsName(node: NodeEntity, folderRel?: string): boolean {
+        const name = getName(node);
+        const problem = remoteNameProblem(name);
+        if (problem === null) {
+            return false;
+        }
+        if (!this.unsafeNamesTold.has(node.uid)) {
+            this.unsafeNamesTold.add(node.uid);
+            const kind = node.type === NodeType.Folder ? 'folder' : 'file';
+            const where = folderRel === undefined ? '' : ` in ${folderRel === '' ? 'My files' : folderRel}`;
+            this.logger.warn(
+                `Skipping a ${kind}${where} (${node.uid}) named ${quotedName(name)}: ${problem}, so it can't be a ${kind} on this computer. It stays in Proton Drive`,
+            );
+            this.stateDb.logActivity({
+                action: 'error',
+                localRelPath: folderRel || '/',
+                details: `Not synced: a ${kind} in Proton Drive is named ${quotedName(name)}, which can't be a name on this computer (${problem}). It stays in Proton Drive; rename it there to sync it`,
+            });
+        }
+        return true;
+    }
+
+    // Records, remote index entries and Docs records whose path or name can't be one on this computer, as a sync before
+    // #536 could leave them (a folder in Proton Drive named `..`, say): dropped, so nothing ever acts on them. Only rows go:
+    // nothing on disk is looked at or touched for them, and nothing in Proton Drive. Whatever they stood for that is still
+    // in Proton Drive under a good name is synced afresh. Run before anything reads the records at a start and each pass.
+    private dropUnsafePaths(): void {
+        let records: SyncedItemRecord[] = [];
+        let entries: RemoteIndexEntry[] = [];
+        let docs: DocRecord[] = [];
+        try {
+            this.stateDb.connection.transaction(() => {
+                records = this.stateDb.dropUnsafeItems();
+                entries = this.index.dropUnsafe();
+                docs = this.docs.dropUnsafe();
+            })();
+        } catch (error: unknown) {
+            this.logger.warn(`Could not drop the records of paths that can't be on this computer: ${error}`);
+            return;
+        }
+        for (const record of records) {
+            this.logger.warn(
+                `Dropped the record of ${quotedName(record.localRelPath)} (${record.nodeUid}): that path can't be inside ${this.localRoot()}, so nothing is done with it`,
+            );
+        }
+        for (const entry of entries) {
+            this.logger.warn(`Dropped ${quotedName(entry.relPath)} (${entry.uid}) from what is known of Proton Drive: its name can't be one on this computer`);
+        }
+        for (const doc of docs) {
+            this.logger.warn(`Dropped the Proton ${doc.kind === 'doc' ? 'Doc' : 'Sheet'} ${quotedName(doc.name)} (${doc.uid}): its name can't be one on this computer`);
+        }
+    }
+
     // The file Proton Drive has at a path, as far as this computer knows: the node of its edit baseline, or else of its
     // index entry, if it is still there. A network failure isn't an answer: it throws.
     private async cloudFileAt(relPath: string): Promise<NodeEntity | null> {
@@ -652,6 +722,7 @@ export class ProtonDriveSyncEngine {
 
     private async startNow(options: { backgroundInitialReconcile?: boolean }): Promise<void> {
         this.resumeIfPauseEnded();
+        this.dropUnsafePaths(); // Before anything reads the records: whether the files are there, say (#536)
         const settings = this.stateDb.getSettings();
         // Made only on a fresh install (no records): a missing folder with records is the files missing (see filesGone)
         if (!this.filesGone(true)) {
@@ -1340,6 +1411,7 @@ export class ProtonDriveSyncEngine {
             this.reconcileQueued = true;
             return;
         }
+        this.dropUnsafePaths(); // Before the pass reads the records (#536)
         if (this.filesGone(true)) {
             return; // Looked at again at the next pass
         }
@@ -1481,7 +1553,7 @@ export class ProtonDriveSyncEngine {
         if (this.awaitsRemoteOp(relPath, remoteNode?.uid)) {
             return; // A rename, move or delete through the drive is on its way to Proton Drive: looked at once it is there
         }
-        const localFullPath = path.join(this.localRoot(), relPath);
+        const localFullPath = this.localPath(relPath);
         const hiddenBy = this.policy.hiddenBy(relPath);
         if (hiddenBy?.hide === 'hidden') {
             return; // Hidden: never downloaded, uploaded or trashed from here
@@ -1986,7 +2058,7 @@ export class ProtonDriveSyncEngine {
             copyRelPath = earlier.relPath;
         } else if (earlier) {
             const parentNode = await this.ensureParentFolderNode(earlier.relPath, remoteMap, since);
-            const fullPath = path.join(this.localRoot(), earlier.relPath);
+            const fullPath = this.localPath(earlier.relPath);
             // Moved or deleted by the user as it uploads: no earlier copy then, and a new one is made below (#137)
             const gone = async () =>
                 lstat(fullPath).then(
@@ -2023,7 +2095,7 @@ export class ProtonDriveSyncEngine {
         const copyHost = os.hostname();
         const madeAs = path.relative(this.localRoot(), await createLocalConflictCopy(localFullPath, copyWhen, copyHost)).split(path.sep).join('/');
         // What the copy holds, which may be newer than localSha1 (read before): the local file must still be that
-        const copySha1 = await computeLocalFileSha1(path.join(this.localRoot(), madeAs));
+        const copySha1 = await computeLocalFileSha1(this.localPath(madeAs));
         const copied = await snapshot(copySha1);
         this.keepBothCopies.set(relPath, { copyRelPath: madeAs, sha1: copySha1 });
         if (!(await this.downloadRemoteToLocal(relPath, remoteNode, localFullPath, since, unchangedSince(copied)))) {
@@ -2040,7 +2112,7 @@ export class ProtonDriveSyncEngine {
     // Removes a conflict copy just made, while nothing tracks it (no record, no index entry) and it still holds what it
     // was made with; otherwise it stays, as a file of its own
     private async dropUntrackedCopy(copyRelPath: string, sha1: string): Promise<void> {
-        const fullPath = path.join(this.localRoot(), copyRelPath);
+        const fullPath = this.localPath(copyRelPath);
         if (this.stateDb.getItemByPath(copyRelPath) || this.index.getByPath(copyRelPath)) {
             return;
         }
@@ -2061,7 +2133,7 @@ export class ProtonDriveSyncEngine {
             return null;
         }
         const copyRelPath = earlier.copyRelPath;
-        const fullPath = path.join(this.localRoot(), copyRelPath);
+        const fullPath = this.localPath(copyRelPath);
         const st = lstatSync(fullPath, { throwIfNoEntry: false });
         if (!st?.isFile() || (await computeLocalFileSha1(fullPath).catch(() => null)) !== localSha1) {
             return null;
@@ -2099,7 +2171,7 @@ export class ProtonDriveSyncEngine {
         }
         for (let attempt = 0; attempt < 10; attempt++) {
             const parentNode = await this.ensureParentFolderNode(relPath, remoteMap, since);
-            const fullPath = path.join(root, relPath);
+            const fullPath = localPathIn(root, relPath);
             // Only a copy that isn't there: one that can't be looked at (EACCES, EIO) is still the user's edit, uploaded
             const gone = async () =>
                 lstat(fullPath).then(
@@ -2150,7 +2222,7 @@ export class ProtonDriveSyncEngine {
             } while (await this.existsLocally(next));
             this.watcher.suppressPath(relPath);
             this.watcher.suppressPath(next);
-            if (moveWithoutReplacing(path.join(root, relPath), path.join(root, next))) {
+            if (moveWithoutReplacing(localPathIn(root, relPath), localPathIn(root, next))) {
                 relPath = next;
             }
         }
@@ -2221,7 +2293,7 @@ export class ProtonDriveSyncEngine {
         choice: 'keep-both' | 'keep-local' | 'keep-remote',
     ): Promise<void> {
         const conflictId = conflict.id;
-        const localFullPath = path.join(this.localRoot(), conflict.localRelPath);
+        const localFullPath = this.localPath(conflict.localRelPath);
         const remoteMap = new Map<string, NodeEntity>();
 
         await this.observingLocal(async (since) => {
@@ -2592,13 +2664,14 @@ export class ProtonDriveSyncEngine {
 
     // A node's path in My files now, from the root down, looking up each folder above it in Proton Drive (`folders`
     // keeps what was looked up, for the next item). Null when a folder above it is gone or in the trash, or the chain
-    // doesn't reach the root. A name that can't be read stands as the node's uid, so it matches no path here.
+    // doesn't reach the root. A name that can't be read stands as the node's uid, so it matches no path here. Null too
+    // when it or a folder above it has a name that can't be one on this computer (#536): it is at no path here.
     private async livePathOf(node: NodeEntity, rootUid: string, folders: Map<string, NodeEntity | null>): Promise<string | null> {
-        const names = [getName(node)];
+        const names = [syncableName(node)];
         let parentUid = node.parentUid;
         for (let depth = 0; depth < 512 && parentUid; depth++) {
             if (parentUid === rootUid) {
-                return names.reverse().join('/');
+                return names.some((name) => name === null) ? null : names.reverse().join('/');
             }
             let parent = folders.get(parentUid);
             if (parent === undefined) {
@@ -2608,7 +2681,7 @@ export class ProtonDriveSyncEngine {
             if (parent === null) {
                 return null;
             }
-            names.push(getName(parent));
+            names.push(syncableName(parent));
             parentUid = parent.parentUid;
         }
         return null;
@@ -2968,7 +3041,7 @@ export class ProtonDriveSyncEngine {
         if (this.stateDb.getItemByPath(relPath)) {
             return;
         }
-        const local = lstatSync(path.join(this.localRoot(), relPath), { throwIfNoEntry: false });
+        const local = lstatSync(this.localPath(relPath), { throwIfNoEntry: false });
         const item: Omit<SyncedItemRecord, 'updatedAt'> = {
             localRelPath: relPath,
             nodeUid: folder.uid,
@@ -2987,10 +3060,12 @@ export class ProtonDriveSyncEngine {
         }
     }
 
-    // Any failure to look (ENOTDIR, EACCES, …) counts as gone: this only ever decides against writing a record.
+    // Any failure to look (ENOTDIR, EACCES, …) counts as gone: this only ever decides against writing a record. A path
+    // that could lead outside the local root throws (#536).
     private localItemExists(relPath: string): boolean {
+        const fullPath = this.localPath(relPath);
         try {
-            return lstatSync(path.join(this.localRoot(), relPath), { throwIfNoEntry: false }) !== undefined;
+            return lstatSync(fullPath, { throwIfNoEntry: false }) !== undefined;
         } catch {
             return false;
         }
@@ -3049,7 +3124,7 @@ export class ProtonDriveSyncEngine {
     }
 
     private existsLocally(relPath: string): Promise<boolean> {
-        return lstat(path.join(this.localRoot(), relPath)).then(
+        return lstat(this.localPath(relPath)).then(
             () => true,
             () => false,
         );
@@ -3136,7 +3211,7 @@ export class ProtonDriveSyncEngine {
         }
 
         const task = this.observingLocal(async (since) => {
-            const fullPath = path.join(this.localRoot(), relPath);
+            const fullPath = this.localPath(relPath);
             const st = await stat(fullPath).catch(() => null);
             const dbRecord = this.stateDb.getItemByPath(relPath);
 
@@ -3673,7 +3748,7 @@ export class ProtonDriveSyncEngine {
     // (never the virtual drive's backing store): they upload again, as new items, except files cut short (#300), which
     // stay held here until the user chooses on Home (see holdsAfterRemoval)
     private keptHere(stayed: number, relPath: string): string {
-        const where = path.join(this.stateDb.getSettings().syncDir, relPath);
+        const where = localPathIn(this.stateDb.getSettings().syncDir, relPath);
         const held = this.stateDb.listCutShort().filter((hold) => isWithin(hold.relPath, relPath)).length;
         return held === 0
             ? `${stayed} item(s) that existed only on this computer were kept at ${where} and will upload again.`
@@ -3697,7 +3772,7 @@ export class ProtonDriveSyncEngine {
         const scannedAsFile = new Set(entries.filter((e) => e.signature.startsWith('file:')).map((e) => e.relPath));
         const isOurDownload = (rel: string) => scannedAsFile.has(rel) && isEngineTempName(path.posix.basename(rel));
         for (const rel of kept.filter(isOurDownload)) {
-            await unlink(path.join(root, rel)).catch(() => {});
+            await unlink(localPathIn(root, rel)).catch(() => {});
         }
         const stillKept = new Set(kept.filter((rel) => !isOurDownload(rel)));
         // The folders above `rel`, up to and including relPath (everything scanned is relPath or inside it)
@@ -3719,14 +3794,14 @@ export class ProtonDriveSyncEngine {
         let moved = 0;
         let stayed = 0;
         for (const rel of topmost.sort()) {
-            const fullPath = path.join(root, rel);
+            const fullPath = localPathIn(root, rel);
             const st = await lstat(fullPath).catch(() => null);
             if (!st || (st.isDirectory() && (await readdir(fullPath).catch(() => null))?.length === 0)) {
                 continue; // Gone meanwhile, or an empty folder: nothing in it to keep
             }
             let wasMoved = false;
             // In the virtual layout the item is in the hidden store, but the user knows it under the drive (#40)
-            const shownPath = this.inBackingStore() ? path.join(this.stateDb.getSettings().syncDir, rel) : undefined;
+            const shownPath = this.inBackingStore() ? localPathIn(this.stateDb.getSettings().syncDir, rel) : undefined;
             try {
                 wasMoved = await this.moveToDesktopTrash(fullPath, shownPath);
             } catch {
@@ -3740,7 +3815,7 @@ export class ProtonDriveSyncEngine {
         }
         // Folders left empty, deepest first (kept lists what is in a folder before the folder)
         for (const rel of kept) {
-            const fullPath = path.join(root, rel);
+            const fullPath = localPathIn(root, rel);
             if ((await lstat(fullPath).catch(() => null))?.isDirectory()) {
                 await rmdir(fullPath).catch(() => {}); // Fails, as it should, while anything is still in it
             }
@@ -3772,20 +3847,55 @@ export class ProtonDriveSyncEngine {
             // left as it is for the next pass, as removing it could lose what that one would follow
             return;
         }
+        if (now === UNSYNCABLE) {
+            await this.keepAfterUnsyncableName(relPath, record.nodeUid);
+            return;
+        }
         if (now !== null && (await this.followRemoteMove(record.nodeUid, relPath, now))) {
             return;
         }
         await this.removeAfterCloudDelete(relPath, 'deleted');
     }
 
+    // A synced item that Proton Drive now has under a name that can't be one on this computer, or in a folder that has one
+    // (#536): renamed or moved there by someone the folder is shared with, say. Its local copy can't follow it, and it is
+    // never removed for it: it stays where it is, and its records go (records before files, and no file goes), so it is
+    // no longer that node's, and syncs from where it is as a new item. Both are kept; nothing here or in Proton Drive is
+    // moved, deleted or trashed. In its turn on availabilityRun, like the removals, and only while its record is still
+    // that node's.
+    private async keepAfterUnsyncableName(relPath: string, nodeUid: string): Promise<void> {
+        const kept = await this.inAvailabilityRun(async () => {
+            if (this.stateDb.getItemByPath(relPath)?.nodeUid !== nodeUid) {
+                return false; // Changed meanwhile: the next look decides
+            }
+            await this.whileRemoving(async (records) => {
+                records.dropSubtree(relPath);
+            });
+            return true;
+        });
+        if (!kept) {
+            return;
+        }
+        this.logger.warn(
+            `${relPath} (${nodeUid}) was renamed or moved in Proton Drive to a name that can't be one on this computer: it stays here, and uploads again as a new item`,
+        );
+        this.stateDb.logActivity({
+            action: 'sync',
+            localRelPath: relPath,
+            details: "Renamed or moved in Proton Drive to a name that can't be used on this computer: kept here, and uploads again as a new item. Nothing was deleted",
+        });
+    }
+
     // Where a node is in My files now, for one the listing of `notAt`'s folder no longer shows there: from the remote
     // index, or else from the cloud, as the index drops a node whose old folder was listed before its new one. Null when
     // it is gone (the cloud says it isn't there, or that it is trashed), or its folder is one the index doesn't hold;
-    // undefined when the cloud couldn't say (offline, rate limited, unreadable).
-    private async currentRemotePath(uid: string, notAt: string): Promise<string | null | undefined> {
+    // undefined when the cloud couldn't say (offline, rate limited, unreadable). UNSYNCABLE when its name, or the name of
+    // a folder above it that the index doesn't hold, can't be one on this computer (#536): it is still in Proton Drive,
+    // at no path here.
+    private async currentRemotePath(uid: string, notAt: string): Promise<string | null | undefined | typeof UNSYNCABLE> {
         const indexed = this.index.getByUid(uid);
         if (indexed && indexed.relPath !== notAt) {
-            return indexed.relPath;
+            return relPathProblem(indexed.relPath) === null ? indexed.relPath : UNSYNCABLE;
         }
         let node: NodeEntity;
         try {
@@ -3798,11 +3908,50 @@ export class ProtonDriveSyncEngine {
             this.logger.warn(`Could not ask Proton Drive where ${notAt} went; looking again next sync: ${error}`);
             return undefined;
         }
-        const parent = node.parentUid ? this.index.getByUid(node.parentUid) : null;
-        if (node.trashTime || !parent || parent.type !== 'folder') {
+        if (node.trashTime) {
             return null;
         }
-        return parent.relPath === '' ? getName(node) : `${parent.relPath}/${getName(node)}`;
+        const name = syncableName(node);
+        if (name === null) {
+            this.skipsName(node);
+            return UNSYNCABLE;
+        }
+        const parent = node.parentUid ? this.index.getByUid(node.parentUid) : null;
+        if (!parent) {
+            return node.parentUid ? this.underUnsyncableName(node.parentUid) : null;
+        }
+        if (parent.type !== 'folder') {
+            return null;
+        }
+        return childRel(parent.relPath, name);
+    }
+
+    // For a node in a folder the index doesn't hold: UNSYNCABLE when that folder, or one above it up to the first the
+    // index holds, has a name that can't be one on this computer (#536); otherwise null, as for any folder the index
+    // doesn't hold (gone from where this computer can follow); undefined when the cloud couldn't say.
+    private async underUnsyncableName(folderUid: string): Promise<null | undefined | typeof UNSYNCABLE> {
+        const seen = new Set<string>();
+        for (let uid: string | undefined = folderUid; uid && !this.index.getByUid(uid); ) {
+            if (seen.has(uid) || seen.size >= 512) {
+                return null;
+            }
+            seen.add(uid);
+            let folder: NodeEntity;
+            try {
+                folder = await this.sdk.getNode(uid);
+            } catch (error: unknown) {
+                return error instanceof ValidationError ? null : undefined;
+            }
+            if (folder.trashTime) {
+                return null;
+            }
+            if (syncableName(folder) === null) {
+                this.skipsName(folder);
+                return UNSYNCABLE;
+            }
+            uid = folder.parentUid;
+        }
+        return null;
     }
 
     // A synced item renamed or moved in the cloud: its local copy moves to match, with everything in it (ignored and
@@ -3813,7 +3962,11 @@ export class ProtonDriveSyncEngine {
     // created to hold it; the next pass records it.
     // It takes its turn on availabilityRun, like the removals, so it never interleaves with one on the same items, and
     // local change handling waits for it.
+    // A path that could lead outside the local root (#536) throws UnsafeLocalPathError, moving nothing: false would have
+    // the caller take the item for gone.
     private async followRemoteMove(nodeUid: string, fromRel: string, toRel: string): Promise<boolean> {
+        this.localPath(fromRel);
+        this.localPath(toRel);
         if (fromRel === '' || toRel === '' || toRel === fromRel || toRel.startsWith(`${fromRel}/`)) {
             return false;
         }
@@ -3837,13 +3990,16 @@ export class ProtonDriveSyncEngine {
                 for (let slash = toRel.indexOf('/'); slash !== -1; slash = toRel.indexOf('/', slash + 1)) {
                     this.watcher.suppressPath(toRel.slice(0, slash));
                 }
+                const parentPath = localPathIn(root, parentRel);
                 try {
-                    await mkdir(path.join(root, parentRel), { recursive: true });
+                    await mkdir(parentPath, { recursive: true });
                 } catch (error: unknown) {
                     this.logger.warn(`Could not make ${parentRel} to move ${fromRel} into: ${error}`);
                     return false;
                 }
             }
+            const fromPath = localPathIn(root, fromRel);
+            const toPath = localPathIn(root, toRel);
             this.watcher.suppressPath(fromRel);
             this.watcher.suppressPath(toRel);
             const moved = await this.whileRemoving(async (records) => {
@@ -3851,7 +4007,7 @@ export class ProtonDriveSyncEngine {
                 // seen with a record but no file, which reads as the user deleting it. Something that appeared at toRel
                 // since the look above is never replaced.
                 try {
-                    if (!moveWithoutReplacing(path.join(root, fromRel), path.join(root, toRel))) {
+                    if (!moveWithoutReplacing(fromPath, toPath)) {
                         return false;
                     }
                 } catch (error: unknown) {
@@ -3866,7 +4022,7 @@ export class ProtonDriveSyncEngine {
                     this.logger.warn(`Could not move the records of ${fromRel} to ${toRel}, so it goes back: ${error}`);
                     let back = false;
                     try {
-                        back = moveWithoutReplacing(path.join(root, toRel), path.join(root, fromRel));
+                        back = moveWithoutReplacing(toPath, fromPath);
                     } catch {
                         // Counts as not back
                     }
@@ -4133,7 +4289,7 @@ export class ProtonDriveSyncEngine {
     private holdIfCutShort(rel: string): void {
         this.forgetSettling(rel); // Held, not looked at once settled
         this.clearPendingUpload(rel);
-        const fullPath = path.join(this.localRoot(), rel);
+        const fullPath = this.localPath(rel);
         let st: Stats | undefined;
         try {
             st = statSync(fullPath, { throwIfNoEntry: false });
@@ -4302,7 +4458,7 @@ export class ProtonDriveSyncEngine {
     private async putBackNow(rel: string, why: 'asked' | 'changed in Proton Drive'): Promise<string | null> {
         const hold = this.stateDb.getCutShort(rel);
         const root = this.localRoot();
-        const fullPath = path.join(root, rel);
+        const fullPath = localPathIn(root, rel);
         if (!hold || !lstatSync(fullPath, { throwIfNoEntry: false })?.isFile()) {
             return null;
         }
@@ -4327,7 +4483,7 @@ export class ProtonDriveSyncEngine {
                 let moved = false;
                 let failure: unknown = null;
                 try {
-                    moved = moveWithoutReplacing(fullPath, path.join(root, candidate));
+                    moved = moveWithoutReplacing(fullPath, localPathIn(root, candidate));
                 } catch (error: unknown) {
                     failure = error;
                 }
@@ -4438,7 +4594,7 @@ export class ProtonDriveSyncEngine {
     // between two sessions, never while one replaces it. The time a replacing session held it isn't part of a run: a
     // copy that took 10 minutes starts its run at its close.
     private async settleClosed(rel: string): Promise<void> {
-        const st = await stat(path.join(this.localRoot(), rel)).catch(() => null);
+        const st = await stat(this.localPath(rel)).catch(() => null);
         const earlier = this.settlingFiles.get(rel);
         this.forgetSettling(rel); // its wait, and one that a report began meanwhile
         if (!st?.isFile()) {
@@ -4627,7 +4783,7 @@ export class ProtonDriveSyncEngine {
         if (rel !== '' && this.policy.hiddenBy(rel) !== null) {
             throw new DriveOpError('EACCES', `Hidden: ${rel}`);
         }
-        const fullPath = path.join(this.localRoot(), rel);
+        const fullPath = this.localPath(rel);
         if (rel !== '' && lstatSync(fullPath, { throwIfNoEntry: false })) {
             throw new DriveOpError('EEXIST', `Already exists: ${rel}`);
         }
@@ -4664,10 +4820,11 @@ export class ProtonDriveSyncEngine {
         this.stateDb.dropStaleCutShort((rel) => this.heldBack(rel) || this.localFileExists(rel));
     }
 
-    // Whether a path of the local root is a file. Any failure to look counts as not
+    // Whether a path of the local root is a file. Any failure to look counts as not, as does a path that could lead
+    // outside the local root (#536)
     private localFileExists(relPath: string): boolean {
         try {
-            return lstatSync(path.join(this.localRoot(), relPath), { throwIfNoEntry: false })?.isFile() === true;
+            return lstatSync(this.localPath(relPath), { throwIfNoEntry: false })?.isFile() === true;
         } catch {
             return false;
         }
@@ -4677,7 +4834,7 @@ export class ProtonDriveSyncEngine {
     // is a new one. Takes its turn on availabilityRun, so it never races truncateItem.
     private dropStaleEditBaselines(): void {
         for (const baseline of this.stateDb.listEditBaselines()) {
-            if (!this.localItemExists(baseline.relPath)) {
+            if (!isSafeRelPath(baseline.relPath) || !this.localItemExists(baseline.relPath)) {
                 this.stateDb.dropEditBaselines(baseline.relPath);
             }
         }
@@ -4728,11 +4885,14 @@ export class ProtonDriveSyncEngine {
     private shownPlaceholders(folderUid: string, rel: string, taken: Set<string>, ignorePatterns: string[]): DocRecord[] {
         const shown: DocRecord[] = [];
         for (const doc of this.docNodes.listChildren(folderUid)) {
+            if (remoteNameProblem(doc.name) !== null || remoteNameProblem(placeholderName(doc)) !== null) {
+                continue; // Never recorded since #536: one a listing before it recorded is dropped at the next pass
+            }
             const path = childRel(rel, placeholderName(doc));
             if (taken.has(placeholderName(doc))) {
                 if (!this.loggedPlaceholderClashes.has(path)) {
                     this.loggedPlaceholderClashes.add(path);
-                    this.logger.info(`A file named ${path} hides the placeholder of the Proton ${doc.kind === 'doc' ? 'Doc' : 'Sheet'} ${doc.name}`);
+                    this.logger.info(`A file named ${path} hides the placeholder of the Proton ${doc.kind === 'doc' ? 'Doc' : 'Sheet'} ${quotedName(doc.name)}`);
                 }
             } else if (!matchesIgnorePatterns(path, ignorePatterns)) {
                 shown.push(doc);
@@ -4742,6 +4902,8 @@ export class ProtonDriveSyncEngine {
     }
 
     private readonly loggedPlaceholderClashes = new Set<string>();
+    // Nodes skipped for a name that can't be one on this computer, already said (see skipsName)
+    private readonly unsafeNamesTold = new Set<string>();
 
     private refusePlaceholder(rel: string): void {
         if (this.placeholderAt(rel)) {
@@ -4776,6 +4938,9 @@ export class ProtonDriveSyncEngine {
         // A real item holds its name even when hidden or ignored (placeholderAt agrees): no placeholder takes its place
         const taken = new Set(localNames);
         for (const child of this.index.listChildren(rel)) {
+            if (remoteNameProblem(child.name) !== null) {
+                continue; // Never indexed since #536: one a listing before it recorded is dropped at the next pass
+            }
             if (!takesAway(latest.get(child.uid), child)) {
                 taken.add(child.name);
             }
@@ -4853,6 +5018,7 @@ export class ProtonDriveSyncEngine {
         for (const child of this.index.listChildren(rel)) {
             const state = availability.get(child.name);
             if (
+                remoteNameProblem(child.name) !== null ||
                 takesAway(latest.get(child.uid), child) ||
                 matchesIgnorePatterns(child.relPath, ignorePatterns) ||
                 state === undefined ||
@@ -4922,7 +5088,7 @@ export class ProtonDriveSyncEngine {
     private clearMissingPendingUploadsWithin(relPath: string): void {
         let cleared = false;
         for (const p of [...this.pendingUploads]) {
-            if ((relPath === '' || isWithin(p, relPath)) && !this.localItemExists(p)) {
+            if ((relPath === '' || isWithin(p, relPath)) && (!isSafeRelPath(p) || !this.localItemExists(p))) {
                 this.pendingUploads.delete(p);
                 cleared = true;
             }
@@ -4980,7 +5146,7 @@ export class ProtonDriveSyncEngine {
         }
         let st: Stats | undefined;
         try {
-            st = statSync(path.join(this.localRoot(), relPath), { throwIfNoEntry: false });
+            st = statSync(this.localPath(relPath), { throwIfNoEntry: false });
         } catch {
             this.clearPendingUploadsWithin(relPath);
             return;
@@ -5016,7 +5182,7 @@ export class ProtonDriveSyncEngine {
     // The names in a folder of the local root (engine temp files left out), or null when it isn't a folder here
     private localChildNames(rel: string): string[] | null {
         try {
-            return readdirSync(path.join(this.localRoot(), rel)).filter((name) => !isEngineTempName(name));
+            return readdirSync(this.localPath(rel)).filter((name) => !isEngineTempName(name));
         } catch {
             return null;
         }
@@ -5305,7 +5471,7 @@ export class ProtonDriveSyncEngine {
         if (size > counted) {
             await this.roomToDownload(rel, size, counted);
         }
-        const staging = path.join(this.localRoot(), `${HYDRATE_STAGING_PREFIX}${randomUUID()}`);
+        const staging = this.localPath(`${HYDRATE_STAGING_PREFIX}${randomUUID()}`);
         const transferId = `dl:${rel}`;
         this.hydrateStaging.add(staging);
         this.activeTransfers.set(transferId, {
@@ -5384,7 +5550,7 @@ export class ProtonDriveSyncEngine {
         }
         stillThere();
         const root = this.localRoot();
-        const target = path.join(root, rel);
+        const target = localPathIn(root, rel);
         const madeFrom = await this.firstMissingAncestor(rel);
         for (let slash = rel.indexOf('/'); slash !== -1; slash = rel.indexOf('/', slash + 1)) {
             this.watcher.suppressPath(rel.slice(0, slash));
@@ -5461,8 +5627,11 @@ export class ProtonDriveSyncEngine {
     private async sweepHydrateStaging(): Promise<void> {
         const root = this.localRoot();
         for (const name of await readdir(root).catch(() => [] as string[])) {
-            const fullPath = path.join(root, name);
-            if (name.startsWith(HYDRATE_STAGING_PREFIX) && !this.hydrateStaging.has(fullPath)) {
+            if (!name.startsWith(HYDRATE_STAGING_PREFIX)) {
+                continue;
+            }
+            const fullPath = localPathIn(root, name);
+            if (!this.hydrateStaging.has(fullPath)) {
                 await unlink(fullPath).catch(() => {});
             }
         }
@@ -5483,7 +5652,7 @@ export class ProtonDriveSyncEngine {
     private async removeEmptyFolders(from: string, upTo: string): Promise<void> {
         for (let folder = from; isWithin(folder, upTo); folder = parentOf(folder)) {
             try {
-                await rmdir(path.join(this.localRoot(), folder));
+                await rmdir(this.localPath(folder));
             } catch {
                 return; // Not empty (something was put there meanwhile), or gone already
             }
@@ -5494,11 +5663,11 @@ export class ProtonDriveSyncEngine {
     }
 
     private async forgetFailedThumbnailOf(rel: string): Promise<void> {
-        const mountFullPath = path.join(this.stateDb.getSettings().syncDir, rel);
         try {
+            const mountFullPath = localPathIn(this.stateDb.getSettings().syncDir, rel);
             await (this.options.forgetFailedThumbnail ?? forgetFailedThumbnail)(mountFullPath);
         } catch (error: unknown) {
-            this.logger.warn(`Could not clear the failed thumbnail of ${mountFullPath}: ${error}`);
+            this.logger.warn(`Could not clear the failed thumbnail of ${rel}: ${error}`);
         }
     }
 
@@ -5593,7 +5762,7 @@ export class ProtonDriveSyncEngine {
         const ignorePatterns = this.stateDb.getSettings().ignorePatterns;
         const ignoredFrom = matchesIgnorePatterns(fromRel, ignorePatterns);
         const ignoredTo = matchesIgnorePatterns(toRel, ignorePatterns);
-        const source = lstatSync(path.join(root, fromRel), { throwIfNoEntry: false });
+        const source = lstatSync(localPathIn(root, fromRel), { throwIfNoEntry: false });
         // An ignored item is never in Proton Drive, whatever the cloud holds at its path; and an entry that a pending
         // operation takes elsewhere isn't what is at its path here
         const sourceEntry = ignoredFrom ? null : this.liveIndexEntry(fromRel);
@@ -5634,7 +5803,7 @@ export class ProtonDriveSyncEngine {
             sourceOtherKind !== null && sourceUid === null && !ignoredTo && source?.isDirectory() === true
                 ? this.ownQueuedUnder(fromRel, sourceOtherKind.uid).map((from) => ({ from, to: toRel + from.slice(fromRel.length) }))
                 : [];
-        const target = lstatSync(path.join(root, toRel), { throwIfNoEntry: false });
+        const target = lstatSync(localPathIn(root, toRel), { throwIfNoEntry: false });
         const targetRecord = this.stateDb.getItemByPath(toRel);
         const targetEntry = ignoredTo ? null : this.liveIndexEntry(toRel);
         // Nor is a local item that is replaced the cloud item of the other kind at its path (only a file replaces: a file
@@ -5644,7 +5813,7 @@ export class ProtonDriveSyncEngine {
         const targetOwnUid = targetRecord?.nodeUid ?? nodeUidOf(targetOtherKind ? null : targetEntry);
         const targetDisowned = targetOtherKind !== null && targetOwnUid !== null && this.isAtOrIn(targetOwnUid, targetOtherKind);
         const parentRel = parentOf(toRel);
-        const parent = parentRel === '' ? null : lstatSync(path.join(root, parentRel), { throwIfNoEntry: false });
+        const parent = parentRel === '' ? null : lstatSync(localPathIn(root, parentRel), { throwIfNoEntry: false });
         if (parentRel !== '' && (parent ? !parent.isDirectory() : this.liveIndexEntry(parentRel)?.type !== 'folder')) {
             throw new DriveOpError('ENOENT', `Not found: ${parentRel}`);
         }
@@ -5676,7 +5845,7 @@ export class ProtonDriveSyncEngine {
             for (let slash = toRel.indexOf('/'); slash !== -1; slash = toRel.indexOf('/', slash + 1)) {
                 this.watcher.suppressPath(toRel.slice(0, slash));
             }
-            await mkdir(path.join(root, parentRel), { recursive: true });
+            await mkdir(localPathIn(root, parentRel), { recursive: true });
         }
         // The user's replace of a file with an identity in Proton Drive keeps that identity: the replacing file's own node
         // goes to the trash. Otherwise the item itself moves to toRel.
@@ -5933,10 +6102,11 @@ export class ProtonDriveSyncEngine {
         return roots;
     }
 
-    // Whether a record's item is here, of the kind recorded. Any failure to look (ENOTDIR, EACCES, …) counts as not.
+    // Whether a record's item is here, of the kind recorded. Any failure to look (ENOTDIR, EACCES, …) counts as not, as
+    // does a path that could lead outside the local root (#536).
     private hasItsLocalItem(item: SyncedItemRecord): boolean {
         try {
-            const local = lstatSync(path.join(this.localRoot(), item.localRelPath), { throwIfNoEntry: false });
+            const local = lstatSync(this.localPath(item.localRelPath), { throwIfNoEntry: false });
             return item.type === 'folder' ? local?.isDirectory() === true : local?.isFile() === true;
         } catch {
             return false;
@@ -5974,8 +6144,9 @@ export class ProtonDriveSyncEngine {
             throw new DriveOpError('EACCES', `Hidden: ${relPath}`);
         }
         const root = this.localRoot();
+        const fullPath = localPathIn(root, relPath);
         const ignored = matchesIgnorePatterns(relPath, this.stateDb.getSettings().ignorePatterns);
-        const local = lstatSync(path.join(root, relPath), { throwIfNoEntry: false });
+        const local = lstatSync(fullPath, { throwIfNoEntry: false });
         const entry = ignored ? null : this.liveIndexEntry(relPath);
         if (!local && !entry) {
             throw new DriveOpError('ENOENT', `Not found: ${relPath}`);
@@ -6123,10 +6294,10 @@ export class ProtonDriveSyncEngine {
                 if (local && !shown && onlyIfEmpty) {
                     // The cloud folder is what goes (trashed above); of the backing store only the link itself, not its
                     // target (#456)
-                    await rm(path.join(root, relPath), { force: true });
+                    await rm(fullPath, { force: true });
                 } else if (local && onlyIfEmpty) {
                     // Never what was put in it since the look above: that stays, and syncs as new, folder and all
-                    await rmdir(path.join(root, relPath)).catch((error: NodeJS.ErrnoException) => {
+                    await rmdir(fullPath).catch((error: NodeJS.ErrnoException) => {
                         throw error.code === 'ENOTEMPTY' || error.code === 'EEXIST'
                             ? new DriveOpError('ENOTEMPTY', `Not empty: ${relPath}`, { cause: error })
                             : error;
@@ -6143,7 +6314,7 @@ export class ProtonDriveSyncEngine {
                     });
                     kept = await this.clearKeptAfterCloudDelete(root, relPath, scan.entries, removal.kept);
                 } else if (local) {
-                    await rm(path.join(root, relPath), { recursive: true, force: true });
+                    await rm(fullPath, { recursive: true, force: true });
                 }
             },
             { from: relPath, to: null },
@@ -6212,7 +6383,7 @@ export class ProtonDriveSyncEngine {
         if (!entry || entry.type !== 'file' || isProvisional(entry.uid)) {
             return null;
         }
-        const local = lstatSync(path.join(this.localRoot(), relPath), { throwIfNoEntry: false });
+        const local = lstatSync(this.localPath(relPath), { throwIfNoEntry: false });
         if (!local?.isFile()) {
             return null;
         }
@@ -6240,7 +6411,7 @@ export class ProtonDriveSyncEngine {
         if (!local || !entry?.sha1 || this.stateDb.getItemByPath(relPath)) {
             return local;
         }
-        const localSha1 = await computeLocalFileSha1(path.join(this.localRoot(), relPath)).catch(() => null);
+        const localSha1 = await computeLocalFileSha1(this.localPath(relPath)).catch(() => null);
         return localSha1 === entry.sha1 ? null : local;
     }
 
@@ -6256,7 +6427,7 @@ export class ProtonDriveSyncEngine {
         const conflictPaths = new Set(this.stateDb.listConflicts().map((conflict) => conflict.localRelPath));
         const found: string[] = [];
         const walk = async (dirRel: string) => {
-            const children = await readdir(path.join(this.localRoot(), dirRel), { withFileTypes: true }).catch(() => []);
+            const children = await readdir(this.localPath(dirRel), { withFileTypes: true }).catch(() => []);
             for (const child of children) {
                 const rel = `${dirRel}/${child.name}`;
                 if (isEngineTempName(child.name) || matchesIgnorePatterns(rel, ignorePatterns)) {
@@ -6339,7 +6510,7 @@ export class ProtonDriveSyncEngine {
     // Whether a folder holds anything: on this computer, in Proton Drive as this computer sees it (hidden and ignored items
     // included, not what a pending operation takes elsewhere), or what a pending move puts in it
     private async holdsAnything(relPath: string, local: boolean, entry: RemoteIndexEntry | null): Promise<boolean> {
-        if (local && (await readdir(path.join(this.localRoot(), relPath))).length > 0) {
+        if (local && (await readdir(this.localPath(relPath))).length > 0) {
             return true;
         }
         const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
@@ -6704,7 +6875,7 @@ export class ProtonDriveSyncEngine {
         if (relPath === '' || matchesIgnorePatterns(relPath, this.stateDb.getSettings().ignorePatterns)) {
             return null;
         }
-        const local = lstatSync(path.join(this.localRoot(), relPath), { throwIfNoEntry: false });
+        const local = lstatSync(this.localPath(relPath), { throwIfNoEntry: false });
         const parent = local?.isDirectory() ? this.indexedFolderFor(parentOf(relPath), needed) : null;
         if (!local || !parent) {
             return null;
@@ -6762,7 +6933,7 @@ export class ProtonDriveSyncEngine {
                 this.givenUpMoves.delete(node.uid);
             }
         } catch (error: unknown) {
-            this.logger.warn(`Failed to update the remote index for ${getName(node)}: ${error}`);
+            this.logger.warn(`Failed to update the remote index for ${node.uid}: ${error}`);
         }
     }
 
@@ -6829,13 +7000,17 @@ export class ProtonDriveSyncEngine {
         return { paths, records, cutShort, ops: this.journal.snapshot(), indexRoots, index };
     }
 
+    // A record or an index entry of a path that can't be one on this computer (#536), which the snapshot can hold only if
+    // one got past the drop at the start of the pass, isn't put back: refused, it would undo the whole restore.
     private restoreLocalStep(snapshot: LocalStepSnapshot): void {
         this.stateDb.connection.transaction(() => {
             for (const p of snapshot.paths) {
                 this.stateDb.removeItemByPath(p);
             }
             for (const record of snapshot.records) {
-                this.stateDb.upsertItem(record);
+                if (isSafeRelPath(record.localRelPath)) {
+                    this.stateDb.upsertItem(record);
+                }
             }
             for (const p of snapshot.paths) {
                 this.stateDb.dropCutShort(p);
@@ -6854,7 +7029,7 @@ export class ProtonDriveSyncEngine {
                 }
             }
             for (const entry of snapshot.index) {
-                if (!isProvisional(entry.uid)) {
+                if (!isProvisional(entry.uid) && (entry.relPath === '' || (isSafeRelPath(entry.relPath) && remoteNameProblem(entry.name) === null))) {
                     this.index.upsert(entry);
                 }
             }
@@ -6878,11 +7053,14 @@ export class ProtonDriveSyncEngine {
         let moved = false;
         let failure: unknown = null;
         try {
+            // Made inside the try: a path that could lead outside the root (#536) fails the step, which puts the records back
+            const from = localPathIn(root, fromRel);
+            const to = localPathIn(root, toRel);
             if (replace) {
-                renameSync(path.join(root, fromRel), path.join(root, toRel));
+                renameSync(from, to);
                 moved = true;
             } else {
-                moved = moveWithoutReplacing(path.join(root, fromRel), path.join(root, toRel));
+                moved = moveWithoutReplacing(from, to);
             }
         } catch (error: unknown) {
             failure = error;
@@ -6904,7 +7082,7 @@ export class ProtonDriveSyncEngine {
     // keeps, and which a new file never has both of), so that a move found done already is never done again over what
     // was put at its old path since (#153)
     private moveIntent(fromRel: string, toRel: string, replace: boolean): string {
-        const st = lstatSync(path.join(this.localRoot(), fromRel), { throwIfNoEntry: false, bigint: true });
+        const st = lstatSync(this.localPath(fromRel), { throwIfNoEntry: false, bigint: true });
         return JSON.stringify({
             from: fromRel,
             to: toRel,
@@ -6926,8 +7104,17 @@ export class ProtonDriveSyncEngine {
         }
         if (typeof intent.from === 'string' && typeof intent.to === 'string' && intent.from && intent.to) {
             const root = this.localRoot();
-            const from = path.join(root, intent.from);
-            const to = path.join(root, intent.to);
+            let from: string;
+            let to: string;
+            try {
+                from = localPathIn(root, intent.from);
+                to = localPathIn(root, intent.to);
+            } catch (error: unknown) {
+                // Never a move made through the drive, whose paths are checked (#536): nothing is moved or dropped for it
+                this.logger.warn(`Not finishing a move after an interruption: ${error}`);
+                this.stateDb.deleteMeta(LOCAL_MOVE_IN_PROGRESS);
+                return;
+            }
             const exists = (fullPath: string) => lstatSync(fullPath, { throwIfNoEntry: false }) !== undefined;
             // The item the move was about is at its target already: the move happened, and only clearing the marker
             // didn't. Whatever is at the source now was put there since, and is never moved over it. Only this firm sign
@@ -7174,7 +7361,7 @@ export class ProtonDriveSyncEngine {
     private missingCloudFolders(relPath: string): string[] | null {
         const missing: string[] = [];
         for (let p = relPath; p !== '' && this.resolveFolderUid(p) === null; p = parentOf(p)) {
-            const local = lstatSync(path.join(this.localRoot(), p), { throwIfNoEntry: false });
+            const local = lstatSync(this.localPath(p), { throwIfNoEntry: false });
             if (
                 !local?.isDirectory() ||
                 matchesIgnorePatterns(p, this.stateDb.getSettings().ignorePatterns) ||
@@ -7666,12 +7853,12 @@ export class ProtonDriveSyncEngine {
         return this.policy.stateOf(relPath);
     }
 
-    // Like existsLocally, for a path from outside the engine: one that climbs out of the sync folder is not in it.
+    // Like existsLocally, for a path from outside the engine: one that could lead out of the sync folder is not in it.
     private async existsInSyncFolder(relPath: string): Promise<boolean> {
-        const root = path.resolve(this.localRoot());
-        const fullPath = path.resolve(root, relPath);
-        const fromRoot = path.relative(root, fullPath);
-        if (fromRoot === '..' || fromRoot.startsWith(`..${path.sep}`) || path.isAbsolute(fromRoot)) {
+        let fullPath: string;
+        try {
+            fullPath = this.localPath(relPath);
+        } catch {
             return false;
         }
         return lstat(fullPath).then(
@@ -7769,7 +7956,7 @@ export class ProtonDriveSyncEngine {
             for (let slash = relPath.indexOf('/'); slash !== -1; slash = relPath.indexOf('/', slash + 1)) {
                 this.watcher.suppressPath(relPath.slice(0, slash));
             }
-            const localFullPath = path.join(this.localRoot(), relPath);
+            const localFullPath = this.localPath(relPath);
             await mkdir(path.dirname(localFullPath), { recursive: true });
             const st = await stat(localFullPath).catch(() => null);
             const localInfo = st
@@ -8140,10 +8327,15 @@ export class ProtonDriveSyncEngine {
 
     // The index is a cache: a listing is written only for a folder the index still holds at that path (so no orphan rows),
     // and a failed write is logged without aborting the sync.
+    // A child whose name can't be one on this computer is left out, as entryFromNode and docRecordOf leave it out, and said
+    // once (#536).
     private recordListing(folder: NodeEntity, relPath: string, children: NodeEntity[]): boolean {
         try {
             if (relPath !== '' && this.index.getByUid(folder.uid)?.relPath !== relPath) {
                 return false;
+            }
+            for (const child of children) {
+                this.skipsName(child, relPath);
             }
             let docFolders: string[] = [];
             this.indexWrite(() => {
@@ -8173,7 +8365,8 @@ export class ProtonDriveSyncEngine {
     // Lists and records a remote folder's subtree in the index without touching disk or sync state. Returns whether the
     // whole subtree was recorded: false when paused, when the folder is not indexed at relPath, or when a listing failed
     // (that is logged, and the rest is still crawled). Nothing is listed below a hidden folder. The index leaves out
-    // Proton Docs and Sheets, so the folders whose listing holds one are added to `unsupportedIn` when given.
+    // Proton Docs and Sheets, and nodes whose name can't be one on this computer (with what is in them, #536), so the
+    // folders whose listing holds one are added to `unsupportedIn` when given.
     // With replayFirst (the sync pass's crawl of online-only folders), the drive changes asked for during the pass are sent
     // before each folder is listed: between two listings, never while one is on its way, so no listing asked for before a
     // change is sent is recorded after it (#235). As one may have renamed, moved or deleted the folder, it is then taken
@@ -8217,13 +8410,15 @@ export class ProtonDriveSyncEngine {
         if (!this.recordListing(node, relPath, children)) {
             return false;
         }
+        // A child whose name can't be one on this computer (#536) is left out like a Doc: what holds one is never all here
         if (unsupportedIn && children.some((child) => entryFromNode(child, relPath) === null)) {
             unsupportedIn.add(relPath);
         }
         let complete = true;
         for (const child of children) {
-            if (child.type === NodeType.Folder) {
-                complete = (await this.indexRemoteSubtree(child, `${relPath}/${getName(child)}`, opts)) && complete;
+            const name = syncableName(child);
+            if (child.type === NodeType.Folder && name !== null) {
+                complete = (await this.indexRemoteSubtree(child, childRel(relPath, name), opts)) && complete;
             }
         }
         return complete;
@@ -8251,7 +8446,7 @@ export class ProtonDriveSyncEngine {
             return;
         }
 
-        const localDirFullPath = prefix ? path.join(this.localRoot(), prefix) : this.localRoot();
+        const localDirFullPath = this.localPath(prefix);
         this.watcher.suppressPath(prefix || '.');
         await mkdir(localDirFullPath, { recursive: true });
 
@@ -8262,6 +8457,11 @@ export class ProtonDriveSyncEngine {
         const freshSettings = this.stateDb.getSettings();
         const remoteChildByName = new Map<string, NodeEntity>();
         for (const child of remoteChildren) {
+            // Never synced, nor anything in it: its name would lead elsewhere than an item of this folder (#536). Like
+            // anything else Proton Drive has that isn't here, it never reads as gone from here either
+            if (this.skipsName(child, prefix)) {
+                continue;
+            }
             const name = getName(child);
             const relPath = prefix ? `${prefix}/${name}` : name;
             if (!matchesIgnorePatterns(relPath, freshSettings.ignorePatterns)) {
@@ -8277,7 +8477,7 @@ export class ProtonDriveSyncEngine {
             if (matchesIgnorePatterns(relPath, freshSettings.ignorePatterns)) {
                 continue;
             }
-            const fullPath = path.join(localDirFullPath, entry.name);
+            const fullPath = localPathIn(localDirFullPath, entry.name);
             const st = await stat(fullPath).catch(() => null);
             if (st && (st.isDirectory() || st.isFile())) {
                 localChildByName.set(entry.name, {
@@ -8293,6 +8493,9 @@ export class ProtonDriveSyncEngine {
         const allDbItems = this.stateDb.getAllItems();
         const dbChildByName = new Map<string, SyncedItemRecord>();
         for (const item of allDbItems) {
+            if (relPathProblem(item.localRelPath) !== null) {
+                continue; // Never acted on (#536): dropped at the start of the pass
+            }
             const itemDir = path.posix.dirname(item.localRelPath);
             const expectedDir = prefix || '.';
             if (itemDir === expectedDir) {
@@ -8385,7 +8588,7 @@ export class ProtonDriveSyncEngine {
             }
 
             const resolvedFolderNode = remoteMap.get(relPath) ?? remoteChild;
-            const localStillExists = await stat(path.join(this.localRoot(), relPath))
+            const localStillExists = await stat(this.localPath(relPath))
                 .then((s) => s.isDirectory())
                 .catch(() => false);
             if (resolvedFolderNode && resolvedFolderNode.type === NodeType.Folder && localStillExists) {
@@ -8567,7 +8770,7 @@ function childRel(parentRel: string, name: string): string {
 
 function normalizeDrivePath(relPath: string): string {
     const trimmed = relPath.replace(/^\/+|\/+$/g, '');
-    if (trimmed.includes('\0') || trimmed.split('/').some((s) => s === '.' || s === '..' || (s === '' && trimmed !== ''))) {
+    if (relPathProblem(trimmed) !== null) {
         throw new Error(`Invalid path: ${relPath}`);
     }
     return trimmed;

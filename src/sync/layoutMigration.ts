@@ -26,6 +26,7 @@ import type { Logger } from '@protontech/drive-sdk';
 
 import { type DriveLayout, readDriveLayout } from './driveMode';
 import { joinBytes, mergeInto, type MergeOptions, nameOf, parentOf, sameBytes } from './localMerge';
+import { isSafeRelPath, localPathIn } from './localPath';
 import { moveWithoutReplacing } from './localMove';
 import { canonicalPath, mountsAt, pathsOverlap, readMountInfo } from './mountPoint';
 import type { SyncStateDatabase } from './syncStateDb';
@@ -188,7 +189,10 @@ export async function relocateFiles(opts: {
     if (left.length > 0) {
         logger.warn(`Left in ${from}, as they can't move to another disk: ${left.join(', ')}`);
     }
-    const gone = stateDb.getAllItems().filter((item) => !lstatSync(path.join(to, item.localRelPath), { throwIfNoEntry: false }));
+    // A record of a path that could lead outside the folder is left as it is, never looked up: the engine drops it (#536)
+    const gone = stateDb
+        .getAllItems()
+        .filter((item) => isSafeRelPath(item.localRelPath) && !lstatSync(localPathIn(to, item.localRelPath), { throwIfNoEntry: false }));
     stateDb.connection.transaction(() => {
         for (const item of gone) {
             stateDb.removeItemByPath(item.localRelPath);

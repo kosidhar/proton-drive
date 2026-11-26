@@ -2,6 +2,7 @@ import type { Stats } from 'node:fs';
 import { lstat, readdir, rmdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 
+import { localPathIn } from './localPath';
 import { matchesIgnorePatterns } from './localWatcher';
 
 // Something in a folder that only exists on this computer, so removing the folder's local copy would lose it
@@ -33,7 +34,8 @@ export function treeEntrySignature(st: { isFile(): boolean; isDirectory(): boole
 // Walks an item whose local copy is about to go (a folder, a single file, or '' for the whole sync folder, which is
 // never itself removed). It notes everything that exists only on this computer, since removing it would lose it:
 // with stopAtFirst it stops at the first such item, otherwise it reports them all (an ignored folder once, without
-// walking into it). It also returns what it saw, the item itself first and then in walk order, to remove from.
+// walking into it). It also returns what it saw, the item itself first and then in walk order, to remove from. A path
+// that could lead outside the sync folder throws UnsafeLocalPathError before anything is looked at (#536).
 export async function scanLocalCopies(opts: {
     syncDir: string;
     relPath: string;
@@ -49,7 +51,7 @@ export async function scanLocalCopies(opts: {
         return opts.stopAtFirst;
     };
     const visit = async (relPath: string): Promise<boolean> => {
-        const fullPath = path.join(opts.syncDir, relPath);
+        const fullPath = localPathIn(opts.syncDir, relPath);
         const st = await lstat(fullPath).catch(() => null);
         if (!st) {
             return false; // Deleted since the listing, or never here
@@ -96,7 +98,8 @@ export async function scanLocalCopies(opts: {
 // - 'all-or-nothing' stops at the first item in `keep`, changed since the scan, or not empty; what is left keeps its
 //   records and is looked at again later.
 // - 'keep-changed' leaves those in place and carries on with the rest.
-// `kept` lists what was left in place on purpose; `complete` says whether everything went.
+// `kept` lists what was left in place on purpose; `complete` says whether everything went. An entry whose path could lead
+// outside the sync folder (never one a scan saw) throws UnsafeLocalPathError, touching nothing of it (#536).
 export async function removeScannedEntries(opts: {
     syncDir: string;
     entries: ScanEntry[];
@@ -132,7 +135,7 @@ export async function removeScannedEntries(opts: {
             }
             continue;
         }
-        const fullPath = path.join(opts.syncDir, relPath);
+        const fullPath = localPathIn(opts.syncDir, relPath);
         const st = await lstat(fullPath).catch(() => null);
         if (!st) {
             opts.dropRecord(relPath); // Already gone, and its local copy was going anyway

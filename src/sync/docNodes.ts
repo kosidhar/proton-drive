@@ -4,7 +4,7 @@ import type { NodeEntity } from '@protontech/drive-sdk';
 import { isProtonDocument, isProtonSheet } from '@protontech/drive-sdk/internal/nodes/mediaTypes';
 import { splitNodeUid } from '@protontech/drive-sdk/internal/uids';
 
-import { getName } from '../sdk/node';
+import { remoteNameProblem, syncableName } from '../sdk/node';
 
 // Proton Docs and Sheets are not synced files: the remote index leaves them out and they never reach the local store.
 // They are only recorded here, so the virtual drive can show a read-only placeholder for each.
@@ -28,14 +28,17 @@ export function docKindOf(node: NodeEntity): DocKind | null {
     return null;
 }
 
-// The document's record, or null for anything else. The parent is the listing's folder when the node does not name it.
+// The document's record, or null for anything else, and for a document whose name can't be one on this computer (see
+// remoteNameProblem, #536): the drive shows no placeholder for it. The parent is the listing's folder when the node does
+// not name it.
 export function docRecordOf(node: NodeEntity, parentUid: string): DocRecord | null {
     const kind = docKindOf(node);
-    if (!kind) {
+    const name = syncableName(node);
+    if (!kind || name === null) {
         return null;
     }
     const mtime = node.activeRevision?.claimedModificationTime ?? node.modificationTime;
-    return { uid: node.uid, parentUid, name: getName(node), kind, mtimeMs: mtime.getTime() };
+    return { uid: node.uid, parentUid, name, kind, mtimeMs: mtime.getTime() };
 }
 
 // The same URL the SDK's getNodeUrl builds (a test pins the SDK's format), without a network call.
@@ -124,6 +127,24 @@ export class DocNodes {
         return this.db
             .query('SELECT uid, parentUid, name, kind, mtimeMs FROM doc_nodes WHERE parentUid = $parentUid ORDER BY name, uid')
             .all({ $parentUid: parentUid }) as DocRecord[];
+    }
+
+    // Forgets the documents whose name can't be one on this computer, as a listing before #536 could record them, and
+    // returns them
+    dropUnsafe(): DocRecord[] {
+        const rows = this.db
+            .query(
+                `SELECT uid, parentUid, name, kind, mtimeMs FROM doc_nodes
+                  WHERE name IN ('', '.', '..') OR instr(name, '/') > 0 OR instr(name, char(0)) > 0`,
+            )
+            .all() as DocRecord[];
+        const unsafe = rows.filter((row) => remoteNameProblem(row.name) !== null);
+        this.db.transaction(() => {
+            for (const row of unsafe) {
+                this.remove(row.uid);
+            }
+        })();
+        return unsafe;
     }
 
     anyChildren(parentUid: string): boolean {
