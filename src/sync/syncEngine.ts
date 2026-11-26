@@ -3517,6 +3517,7 @@ export class ProtonDriveSyncEngine {
 
         if (event.type === DriveEventType.NodeDeleted) {
             this.forgetHeldNodes(event.nodeUid);
+            this.givenUpMoves.delete(event.nodeUid);
             this.index.removeSubtree(event.nodeUid);
             this.touchDocFolders([this.docs.remove(event.nodeUid)]);
             const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
@@ -3530,6 +3531,7 @@ export class ProtonDriveSyncEngine {
         if (event.type === DriveEventType.NodeCreated || event.type === DriveEventType.NodeUpdated) {
             if (event.isTrashed) {
                 this.forgetHeldNodes(event.nodeUid);
+                this.givenUpMoves.delete(event.nodeUid);
                 this.index.removeSubtree(event.nodeUid);
                 this.touchDocFolders([this.docs.remove(event.nodeUid)]);
                 const tracked = this.stateDb.getItemByNodeUid(event.nodeUid);
@@ -4600,6 +4602,7 @@ export class ProtonDriveSyncEngine {
             })();
             this.keepBothCopies.clear(); // the index, journal and policy are read from their tables: nothing else to drop
             this.pendingUploads.clear();
+            this.givenUpMoves.clear();
         });
         this.accountMismatch = null;
         this.accountVerified = true;
@@ -6185,7 +6188,8 @@ export class ProtonDriveSyncEngine {
     // Whether a fresh listing of the folder at relPath has anything in it that is to stay there: a Proton Doc or Sheet, or
     // any item that no trash or move elsewhere through the drive takes away. Such an operation can still be pending, or
     // can have been pending when the listing was asked for and have reached Proton Drive since (the listing may still
-    // have the item then): that item counts only while the remote index still has it in the folder.
+    // have the item then): that item counts only while the remote index still has it in the folder, or while a given-up
+    // move has yet to put the index back (#466).
     private listingHoldsAnything(relPath: string, listing: RmdirListing): boolean {
         const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
         const takesOut = (op: RemoteOp | undefined) => op !== undefined && (op.kind === 'trash' || !op.toPath.startsWith(`${relPath}/`));
