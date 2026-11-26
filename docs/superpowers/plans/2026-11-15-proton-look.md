@@ -180,7 +180,7 @@ Expected: compile errors (`LIGHT`, `contrast`, `icon_button`… not defined).
   - **Icon font:**
     - Add the crate.
     - In `configure_proton_theme`, call `egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular)` (or `Light`). Do it after Inter is inserted, so text stays Inter and the glyphs fall back to Phosphor.
-    - **Pick the weight:** screenshot the sidebar with each weight, and keep the one closer to Proton's strokes in `/tmp/claude-1000/-home-gautam-chauhan-projects-proton-drive/83ab53f0-fea2-45b0-a976-56dd433d1865/images/28.png`. Say which in the report.
+    - **Pick the weight:** screenshot the sidebar with each weight, and keep the one closer to Proton's strokes in the owner's reference screenshot of Proton's web app. Say which in the report.
   - **AccessKit:** egui 0.31 is already built with `accesskit` (it's in `Cargo.lock`). If `enable_accesskit` isn't reachable, add `features = ["accesskit"]` to the `egui` dependency.
 
 - [ ] **Step 4: Run the new tests and the whole suite**
@@ -195,7 +195,7 @@ Expected: all pass. Existing tests that compare fills with token functions still
 **Files:**
 - Create: `native-gui/src/chrome.rs` (`impl ProtonDriveNativeApp { pub(crate) fn render_sidebar(&mut self, ctx: &egui::Context) }`, moved from `main.rs` ~1825-1990).
 - Create: `assets/app-icon/protondrive-mark.svg`, the folder's two paths and gradients from `assets/app-icon/protondrive.svg`, without the white tile, on a square transparent canvas.
-- Create: `assets/app-icon/protondrive-mark-128.png`, rendered from that SVG. Use the resvg CLI installed into the scratchpad, not `~/.cargo/bin`: `cargo install resvg --locked --root /tmp/claude-1000/-home-gautam-chauhan-projects-proton-drive/83ab53f0-fea2-45b0-a976-56dd433d1865/scratchpad/tools`.
+- Create: `assets/app-icon/protondrive-mark-128.png`, rendered from that SVG. Use the resvg CLI installed into the scratchpad, not `~/.cargo/bin`: `cargo install resvg --locked --root <scratchpad>/tools`.
 - Modify: `native-gui/src/main.rs`:
   - `load_glyph_texture` now loads the mark;
   - remove `draw_nav_icon`, `draw_gear_icon` and `jump_to_account`, if unused afterwards.

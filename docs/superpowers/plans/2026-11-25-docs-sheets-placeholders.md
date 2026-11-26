@@ -19,7 +19,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-25-docs-sheets-placeholders-design.md` (issue #430)
 
-**Code map, for implementers:** `/tmp/claude-1000/-home-gautam-chauhan-projects-proton-drive/83ab53f0-fea2-45b0-a976-56dd433d1865/scratchpad/docs-placeholders-map.md`
+**Code map, for implementers:** `<scratchpad>/docs-placeholders-map.md`
 
 ## Global Constraints
 

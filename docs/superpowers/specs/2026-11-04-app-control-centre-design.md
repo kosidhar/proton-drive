@@ -63,7 +63,7 @@ Home, and the gear and account block to Settings.
 │              │  [Open in Files]                             │
 │              │  Proton storage  ▓░░░░░░░  13.6 of 510 GB    │
 │              │  On this computer  169 MB  [Free up space…]  │
-│ GC Gautam    │                                              │
+│ TU Test User │                                              │
 └──────────────┴──────────────────────────────────────────────┘
 ```
 
