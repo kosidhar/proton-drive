@@ -60,11 +60,11 @@ export class RemoteOpsJournal {
         }
     }
 
-    enqueue(op: NewRemoteOp): number {
+    enqueue(op: NewRemoteOp, cloudPath?: string): number {
         const earliest = this.db
             .query('SELECT path FROM remote_ops WHERE nodeUid = $nodeUid AND path IS NOT NULL ORDER BY id ASC LIMIT 1')
             .get({ $nodeUid: op.nodeUid }) as { path: string } | null;
-        const given = op.kind === 'trash' ? op.path : (op.fromPath ?? null);
+        const given = cloudPath ?? (op.kind === 'trash' ? op.path : (op.fromPath ?? null));
         const result = this.db
             .query(
                 `INSERT INTO remote_ops (kind, nodeUid, path, toPath, createdAt)
@@ -112,9 +112,20 @@ export class RemoteOpsJournal {
     }
 
     // A rename or move that reached Proton Drive put the node at `path` there: the operations on it after that one keep
-    // it as where Proton Drive has the node (a trash after a rename, say, is of the item under its new name)
+    // it as where Proton Drive has the node (a trash after a rename, say, is of the item under its new name), and any
+    // later operations on descendants that kept its old cloud path move with it too.
     setCloudPathAfter(id: number, nodeUid: string, path: string): void {
+        const oldPath = this.cloudPathOf(id);
         this.db.query('UPDATE remote_ops SET path = $path WHERE nodeUid = $nodeUid AND id > $id').run({ $nodeUid: nodeUid, $id: id, $path: path });
+        if (oldPath !== null && oldPath !== path) {
+            const { $lo, $hi } = selfOrDescendant(oldPath);
+            this.db
+                .query(
+                    `UPDATE remote_ops SET path = $path || substr(path, length($oldPath) + 1)
+                     WHERE id > $id AND path IS NOT NULL AND path >= $lo AND path < $hi`,
+                )
+                .run({ $id: id, $oldPath: oldPath, $path: path, $lo, $hi });
+        }
     }
 
     // The id the latest operation journalled was given, pending or not (0 before any). Ids only grow, so an operation with

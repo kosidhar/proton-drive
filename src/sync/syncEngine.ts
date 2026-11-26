@@ -5703,7 +5703,7 @@ export class ProtonDriveSyncEngine {
                             });
                         }
                         if (sourceUid !== null && sourceUid !== targetUid) {
-                            this.journal.enqueue({ kind: 'trash', nodeUid: sourceUid, path: fromRel });
+                            this.journal.enqueue({ kind: 'trash', nodeUid: sourceUid, path: fromRel }, this.cloudPathInPending(sourceUid) ?? undefined);
                         }
                     } else {
                         this.stateDb.removeItemByPath(toRel); // Only something that exists only here (or nothing) is there
@@ -5727,20 +5727,26 @@ export class ProtonDriveSyncEngine {
                         this.journal.retarget(fromRel, toRel);
                         if (!ignoredTo) {
                             if (sourceUid !== null) {
-                                this.journal.enqueue({
-                                    kind: parentOf(fromRel) === parentRel ? 'rename' : 'move',
-                                    nodeUid: sourceUid,
-                                    toPath: toRel,
-                                    fromPath: fromRel,
-                                });
+                                this.journal.enqueue(
+                                    {
+                                        kind: parentOf(fromRel) === parentRel ? 'rename' : 'move',
+                                        nodeUid: sourceUid,
+                                        toPath: toRel,
+                                        fromPath: fromRel,
+                                    },
+                                    this.cloudPathInPending(sourceUid) ?? undefined,
+                                );
                             }
                             for (const item of carried) {
-                                this.journal.enqueue({
-                                    kind: 'move',
-                                    nodeUid: item.nodeUid,
-                                    toPath: toRel + item.localRelPath.slice(fromRel.length),
-                                    fromPath: item.localRelPath,
-                                });
+                                this.journal.enqueue(
+                                    {
+                                        kind: 'move',
+                                        nodeUid: item.nodeUid,
+                                        toPath: toRel + item.localRelPath.slice(fromRel.length),
+                                        fromPath: item.localRelPath,
+                                    },
+                                    this.cloudPathInPending(item.nodeUid) ?? undefined,
+                                );
                             }
                         }
                     }
@@ -5911,6 +5917,7 @@ export class ProtonDriveSyncEngine {
                 // are gone leaves them unrecorded, to upload again as new items (nothing lost), never recorded without
                 // their files
                 this.stateDb.connection.transaction(() => {
+                    const cloudPaths = new Map([...toTrash.keys()].map((uid) => [uid, this.cloudPathInPending(uid) ?? undefined]));
                     this.stateDb.removeItemByPath(relPath);
                     this.stateDb.dropEditBaselines(relPath);
                     // Not the holds of files cut short (#300): a Move to Trash keeps here what the desktop Trash refuses,
@@ -5925,7 +5932,7 @@ export class ProtonDriveSyncEngine {
                         this.index.removeSubtree(ownEntry.uid);
                     }
                     for (const [uid, where] of toTrash) {
-                        this.journal.enqueue({ kind: 'trash', nodeUid: uid, path: where });
+                        this.journal.enqueue({ kind: 'trash', nodeUid: uid, path: where }, cloudPaths.get(uid));
                     }
                     this.applyPendingOpsToIndex();
                 })();
@@ -6279,6 +6286,26 @@ export class ProtonDriveSyncEngine {
             const op = latest.get(e.uid);
             if (op !== undefined && op.kind !== 'trash') {
                 return op.toPath + entry.relPath.slice(e.relPath.length);
+            }
+        }
+        return null;
+    }
+
+    // Where Proton Drive currently has `uid` when a pending rename or move of it (or of a folder above it) hasn't
+    // reached Proton Drive yet; null when neither it nor any ancestor has a pending move with a known cloud path.
+    private cloudPathInPending(uid: string): string | null {
+        const entry = this.index.getByUid(uid);
+        if (!entry) {
+            return null;
+        }
+        const latest = new Map(this.latestOpPerNode().map((op) => [op.nodeUid, op]));
+        for (let e: RemoteIndexEntry | null = entry; e; e = e.parentUid ? this.index.getByUid(e.parentUid) : null) {
+            const op = latest.get(e.uid);
+            if (op !== undefined && op.kind !== 'trash') {
+                const cloudAt = this.journal.cloudPathOf(op.id);
+                if (cloudAt !== null) {
+                    return cloudAt + entry.relPath.slice(e.relPath.length);
+                }
             }
         }
         return null;
@@ -6717,6 +6744,57 @@ export class ProtonDriveSyncEngine {
     }
 
     private async replayTrash(op: Extract<RemoteOp, { kind: 'trash' }>): Promise<'next' | 'stop'> {
+        // Before trashing, confirm the node is still in Proton Drive at the path the op was journalled for (#460):
+        // another device may have moved or renamed it while the index had dropped it between listings or had not heard
+        // of the move at all. A node already gone or trashed completes as today (#179); one that moved stays where it is.
+        let rootUid = this.resolveFolderUid('');
+        if (rootUid === null) {
+            try {
+                rootUid = (await this.getRootFolder()).uid;
+            } catch (error: unknown) {
+                return this.replayFailed(op, op.path, error);
+            }
+        }
+        let node: NodeEntity | null;
+        let livePath: string | null = null;
+        try {
+            node = await this.liveNode(op.nodeUid);
+            if (node !== null) {
+                livePath = await this.livePathOf(node, rootUid, new Map());
+            }
+        } catch (error: unknown) {
+            return this.replayFailed(op, op.path, error);
+        }
+        if (node === null) {
+            this.journal.complete(op.id);
+            this.givenUpMoves.delete(op.nodeUid);
+            this.indexWrite(() => this.index.removeSubtree(op.nodeUid));
+            this.stateDb.logActivity({
+                action: 'trash-remote',
+                localRelPath: op.path,
+                details: 'Already in Proton Drive Trash',
+            });
+            return 'next';
+        }
+        if (livePath !== op.path) {
+            this.journal.complete(op.id);
+            this.onlineOnlyCrawlDue = true;
+            this.indexFromCloud(node);
+            this.logger.warn(
+                livePath !== null
+                    ? `Not trashing ${op.path}: it is now at ${livePath} in Proton Drive, so it stays there`
+                    : `Not trashing ${op.path}: it is no longer at that path in Proton Drive`,
+            );
+            this.stateDb.logActivity({
+                action: 'sync',
+                localRelPath: op.path,
+                details:
+                    livePath !== null
+                        ? `Not moved to Proton Drive Trash: it is now at ${livePath} in Proton Drive, so it stays there`
+                        : 'Not moved to Proton Drive Trash: it is no longer at that path in Proton Drive',
+            });
+            return 'next';
+        }
         try {
             for await (const result of this.sdk.trashNodes([op.nodeUid])) {
                 if (result.uid === op.nodeUid && !result.ok) {
