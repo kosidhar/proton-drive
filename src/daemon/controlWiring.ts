@@ -27,6 +27,7 @@ export function controlServerOptions(deps: {
     makeRemoteFolder: NonNullable<ControlServerOptions['remoteMkdir']>;
     space?: ControlServerOptions['space'];
     share?: ControlServerOptions['share'];
+    sharedWithMe?: ControlServerOptions['sharedWithMe'];
     shareSignedIn?: ControlServerOptions['shareSignedIn'];
     shareLog?: ControlServerOptions['shareLog'];
 }): ControlServerOptions {
@@ -37,6 +38,7 @@ export function controlServerOptions(deps: {
         mountAgain: () => drive.mountAgain(),
         space: deps.space,
         share: deps.share,
+        sharedWithMe: deps.sharedWithMe,
         shareSignedIn: deps.shareSignedIn,
         shareLog: deps.shareLog,
         driveMove: (action, from, to) => drive.resolveMove(action, from, to),

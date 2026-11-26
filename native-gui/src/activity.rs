@@ -65,6 +65,28 @@ pub(crate) fn shows_cloud(kind: ActivityKind) -> bool {
     matches!(kind, ActivityKind::FreedUp | ActivityKind::Hidden)
 }
 
+/// Whether an entry is about something shared with the account (#487): its item isn't in the sync folder, so it has no
+/// path. Its row names the item from its details, and offers no Show in Files (which would show the sync folder) or
+/// Open (a name is no path: it could open a file of My files that only has the same name).
+pub(crate) fn is_shared_with_me(action: &str, rel_path: &str) -> bool {
+    action == "share" && rel_path.is_empty()
+}
+
+/// What the File column says of an entry: its path; for one about something shared with the account, the item's name
+/// as its details give it, or the details whole when they are worded otherwise.
+pub(crate) fn file_column<'a>(action: &str, rel_path: &'a str, details: &'a str) -> &'a str {
+    if !is_shared_with_me(action, rel_path) {
+        return rel_path;
+    }
+    // As the daemon words them (src/daemon/sharedWithMe.ts)
+    let name = details
+        .strip_prefix("Accepted an invitation to ")
+        .or_else(|| details.strip_prefix("Declined an invitation to "))
+        .or_else(|| details.strip_prefix("Downloaded ").and_then(|rest| rest.strip_suffix(" to Downloads")))
+        .or_else(|| details.strip_prefix("Left "));
+    name.filter(|n| !n.is_empty()).unwrap_or(details)
+}
+
 /// The Activity filter
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ActivityFilter {
@@ -224,6 +246,27 @@ mod tests {
         assert_eq!(show_target("", "Docs/a.txt"), None);
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(show_target(root, "Docs/a.txt"), None, "not even the sync folder is there");
+    }
+
+    #[test]
+    fn a_shared_with_me_entry_names_its_item_from_its_details() {
+        for (details, name) in [
+            ("Accepted an invitation to Trip photos", "Trip photos"),
+            ("Declined an invitation to Budget.xlsx", "Budget.xlsx"),
+            ("Left Design review", "Design review"),
+            ("Downloaded report.pdf to Downloads", "report.pdf"),
+            ("Downloaded Copied to Downloads to Downloads", "Copied to Downloads"),
+            // Worded otherwise: the details, whole
+            ("Something else happened", "Something else happened"),
+            ("Left ", "Left "),
+        ] {
+            assert_eq!(file_column("share", "", details), name, "{details}");
+        }
+        // An item shared from My files has its path; other entries are as they were
+        assert_eq!(file_column("share", "Docs/a.txt", "Shared with a link"), "Docs/a.txt");
+        assert_eq!(file_column("upload", "", "Uploaded"), "");
+        assert!(is_shared_with_me("share", ""));
+        assert!(!is_shared_with_me("share", "Docs/a.txt") && !is_shared_with_me("upload", ""));
     }
 
     #[test]

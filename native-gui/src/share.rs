@@ -96,14 +96,14 @@ pub const SHARE_NEEDS_RESTART: &str = "Restart Proton Drive to share from here";
 pub const LINK_EXPIRED: &str = "This link has expired: set a new date, or remove the expiry, to use it again";
 /// Shown when GET /share/list hits its read timeout: the daemon aborts the listing once the app hangs up (#257, #270).
 pub const LIST_TIMED_OUT: &str = "Listing what you've shared took too long. Try again.";
-const UNREADABLE: &str = "Unreadable reply from the Proton Drive background service";
+pub(crate) const UNREADABLE: &str = "Unreadable reply from the Proton Drive background service";
 /// As many addresses as the daemon takes in one invitation
 const MAX_INVITES: usize = 50;
 /// How far ahead an expiry may be, as the daemon takes it
 const MAX_EXPIRY_YEARS: i64 = 10;
 
 /// Reading how an item is shared asks Proton's servers, through the daemon.
-const SHARE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const SHARE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// A change can take longer: inviting many people is a request for each.
 pub(crate) const SHARE_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -170,7 +170,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 }
 
 /// The date (year, month, day) of a day since 1970-01-01.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -280,7 +280,7 @@ pub(crate) fn share_request(
     share_request_with_timeout_message(socket, method, path_and_query, body, read_timeout, STILL_WORKING)
 }
 
-fn share_request_with_timeout_message(
+pub(crate) fn share_request_with_timeout_message(
     socket: &Path,
     method: &str,
     path_and_query: &str,

@@ -388,8 +388,8 @@ export class Path {
 // The nodes shared with the user, loaded from their uids. A node the SDK reports missing, or can't load (a parent's key, say:
 // its batch loader throws after the nodes it could load), is skipped and given to onSkip. The ones the batch didn't
 // reach are loaded again one at a time. A lost connection fails the whole list.
-async function loadSharedWithMe(
-    sdk: ProtonDriveClient | ProtonDrivePhotosClient,
+export async function loadSharedWithMe(
+    sdk: Pick<ProtonDriveClient | ProtonDrivePhotosClient, 'iterateSharedWithMeNodeUids' | 'iterateNodes'>,
     onSkip?: (uid: string) => void,
 ): Promise<NodeEntity[]> {
     const uids = await Array.fromAsync(sdk.iterateSharedWithMeNodeUids());

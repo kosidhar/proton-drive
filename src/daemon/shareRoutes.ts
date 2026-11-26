@@ -1,3 +1,4 @@
+import type { SharedWithMeService } from './sharedWithMe';
 import { ShareError, type ShareRole, type ShareService } from './shareService';
 
 // The share routes on the control socket (see ShareService). `path` is the item's path inside My files, as for
@@ -20,6 +21,11 @@ function pathOf(value: unknown): string {
 
 function uidOf(value: unknown): string {
     if (typeof value !== 'string' || value === '') throw new BadRequest('uid must be the uid of the listed item');
+    return value;
+}
+
+function invitationUidOf(value: unknown): string {
+    if (typeof value !== 'string' || value === '') throw new BadRequest('invitationUid must be the uid of the listed invitation');
     return value;
 }
 
@@ -128,21 +134,50 @@ const ROUTES: Record<string, Partial<Record<string, Handler>>> = {
     },
 };
 
+type WithMeHandler = (withMe: SharedWithMeService, req: Request) => Promise<unknown>;
+
+// What is shared with the user (see SharedWithMeService): the app lists it and acts on an invitation or an item by its uid
+const WITH_ME_ROUTES: Record<string, Partial<Record<string, WithMeHandler>>> = {
+    '/share/with-me': { GET: (w, r) => w.list(r.signal) },
+    '/share/with-me/accept': {
+        POST: async (w, r) => {
+            await w.accept(invitationUidOf((await bodyOf(r)).invitationUid));
+            return { ok: true };
+        },
+    },
+    '/share/with-me/decline': {
+        POST: async (w, r) => {
+            await w.decline(invitationUidOf((await bodyOf(r)).invitationUid));
+            return { ok: true };
+        },
+    },
+    '/share/with-me/leave': {
+        POST: async (w, r) => {
+            await w.leave(uidOf((await bodyOf(r)).uid));
+            return { ok: true };
+        },
+    },
+    '/share/with-me/open-url': { POST: async (w, r) => w.openUrl(uidOf((await bodyOf(r)).uid)) },
+    '/share/with-me/download': { POST: async (w, r) => w.download(uidOf((await bodyOf(r)).uid)) },
+};
+
 export async function shareRoute(
     req: Request,
     url: URL,
     share: ShareService | undefined,
     signedIn: () => boolean,
     log: (line: string) => void = () => {},
+    sharedWithMe?: SharedWithMeService,
 ): Promise<Response> {
-    if (!share) return bad('Not found', 404);
-    const methods = ROUTES[url.pathname];
-    if (!methods) return bad('Not found', 404);
-    const handler = methods[req.method];
-    if (!handler) return bad('Method not allowed', 405);
+    const withMe = WITH_ME_ROUTES[url.pathname]?.[req.method];
+    const own = ROUTES[url.pathname]?.[req.method];
+    const known = WITH_ME_ROUTES[url.pathname] ?? ROUTES[url.pathname];
+    if (!known || (WITH_ME_ROUTES[url.pathname] ? !sharedWithMe : !share)) return bad('Not found', 404);
+    if (!withMe && !own) return bad('Method not allowed', 405);
     if (!signedIn()) return bad('Sign in to share');
     try {
-        return Response.json(await handler(share, req, url));
+        if (withMe) return Response.json(await withMe(sharedWithMe!, req));
+        return Response.json(await own!(share!, req, url));
     } catch (e) {
         if (e instanceof BadRequest || e instanceof ShareError) return bad(e.message);
         log(`Sharing failed: ${e instanceof Error ? e.name : typeof e}`);

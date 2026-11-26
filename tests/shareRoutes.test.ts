@@ -3,6 +3,8 @@ import { NodeType } from '@protontech/drive-sdk';
 
 import { createShareService, ListCancelled, ShareError, type ShareInfo, type ShareService } from '../src/daemon/shareService';
 import { shareRoute } from '../src/daemon/shareRoutes';
+import type { SharedWithMeService } from '../src/daemon/sharedWithMe';
+import { refuseOnTcp } from '../src/daemon/tcpRefusals';
 
 const INFO: ShareInfo = { link: null, people: [] };
 
@@ -253,5 +255,72 @@ describe('share routes', () => {
             json: { error: 'Sign in to share' },
         });
         expect(calls).toEqual([]);
+    });
+});
+
+describe('shared with me routes', () => {
+    const LIST = { invitations: [], items: [] };
+    function fakeWithMe(fail?: Error) {
+        const calls: Array<[string, ...unknown[]]> = [];
+        const rec =
+            <T>(name: string, result: T) =>
+            async (...args: unknown[]) => {
+                calls.push([name, ...args]);
+                if (fail) throw fail;
+                return result;
+            };
+        const withMe: SharedWithMeService = {
+            list: rec('list', LIST),
+            accept: rec('accept', undefined),
+            decline: rec('decline', undefined),
+            leave: rec('leave', undefined),
+            openUrl: rec('openUrl', { url: 'https://x/y' }),
+            download: rec('download', { path: '/p' }),
+        };
+        return { withMe, calls };
+    }
+    async function goWith(withMe: SharedWithMeService | undefined, method: string, route: string, body?: unknown, signedIn = true) {
+        const url = new URL(`http://localhost${route}`);
+        const req = new Request(url, { method, body: body === undefined ? undefined : JSON.stringify(body) });
+        const res = await shareRoute(req, url, undefined, () => signedIn, undefined, withMe);
+        return { status: res.status, json: (await res.json()) as Record<string, unknown> };
+    }
+
+    test('each route maps to the service and returns its JSON', async () => {
+        const { withMe, calls } = fakeWithMe();
+        expect(await goWith(withMe, 'GET', '/share/with-me')).toEqual({ status: 200, json: LIST });
+        expect(await goWith(withMe, 'POST', '/share/with-me/accept', { invitationUid: 'i1' })).toEqual({ status: 200, json: { ok: true } });
+        expect(await goWith(withMe, 'POST', '/share/with-me/decline', { invitationUid: 'i2' })).toEqual({ status: 200, json: { ok: true } });
+        expect(await goWith(withMe, 'POST', '/share/with-me/leave', { uid: 'n1' })).toEqual({ status: 200, json: { ok: true } });
+        expect(await goWith(withMe, 'POST', '/share/with-me/open-url', { uid: 'n2' })).toEqual({ status: 200, json: { url: 'https://x/y' } });
+        expect(await goWith(withMe, 'POST', '/share/with-me/download', { uid: 'n3' })).toEqual({ status: 200, json: { path: '/p' } });
+        expect(calls).toEqual([['list', expect.any(AbortSignal)], ['accept', 'i1'], ['decline', 'i2'], ['leave', 'n1'], ['openUrl', 'n2'], ['download', 'n3']]);
+    });
+
+    test('a missing uid is a 400 before the service', async () => {
+        const { withMe, calls } = fakeWithMe();
+        for (const [route, field] of [['accept', 'invitationUid'], ['decline', 'invitationUid'], ['leave', 'uid'], ['open-url', 'uid'], ['download', 'uid']] as const) {
+            for (const body of [{}, { [field]: '' }, { [field]: 3 }]) {
+                const r = await goWith(withMe, 'POST', `/share/with-me/${route}`, body);
+                expect([route, r.status, String(r.json.error)]).toEqual([route, 400, expect.stringContaining('uid')]);
+            }
+        }
+        expect(calls).toEqual([]);
+    });
+
+    test('a ShareError is 400 with its message, signed out is refused, and the routes are absent without the service', async () => {
+        expect(await goWith(fakeWithMe(new ShareError('Nope')).withMe, 'POST', '/share/with-me/leave', { uid: 'n' })).toEqual({ status: 400, json: { error: 'Nope' } });
+        const { withMe, calls } = fakeWithMe();
+        expect((await goWith(withMe, 'GET', '/share/with-me', undefined, false)).status).toBe(400);
+        expect(calls).toEqual([]);
+        expect((await goWith(undefined, 'GET', '/share/with-me')).status).toBe(404);
+        expect((await goWith(withMe, 'GET', '/share/with-me/accept')).status).toBe(405);
+    });
+
+    test('the acting routes are refused on TCP', async () => {
+        for (const route of ['accept', 'decline', 'leave', 'open-url', 'download']) {
+            const res = refuseOnTcp(new Request(`http://127.0.0.1:49152/share/with-me/${route}`, { method: 'POST', body: '{}' }));
+            expect([route, res?.status]).toEqual([route, 403]);
+        }
     });
 });

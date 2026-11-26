@@ -61,6 +61,7 @@ pub(crate) fn tab_title(tab: NavTab) -> &'static str {
     match tab {
         NavTab::Home => "Home",
         NavTab::Shared => "Shared",
+        NavTab::SharedWithMe => crate::shared_with_me::TITLE,
         NavTab::Activity => "Activity",
         NavTab::Settings => "Settings",
     }
@@ -147,12 +148,13 @@ impl ProtonDriveNativeApp {
         }
     }
 
-    /// Home, Shared, Activity and Settings. Home counts what needs the user.
+    /// Home, Shared, Shared with me, Activity and Settings. Home counts what needs the user.
     fn render_sections(&mut self, ui: &mut egui::Ui) {
         let count = (!self.attention.is_empty()).then(|| self.attention.len().to_string());
         let sections = [
             (NavTab::Home, icons::HOME, "Home", count),
             (NavTab::Shared, icons::SHARED, "Shared", None),
+            (NavTab::SharedWithMe, icons::PEOPLE, crate::shared_with_me::TITLE, None),
             (NavTab::Activity, icons::ACTIVITY, "Activity", None),
             (NavTab::Settings, icons::SETTINGS, "Settings", None),
         ];

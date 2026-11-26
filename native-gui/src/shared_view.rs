@@ -26,13 +26,13 @@ pub(crate) fn shared_columns(room: f32, name_want: f32, sharing_need: f32, shari
 }
 
 /// A Shared row's height.
-const SHARED_ROW_HEIGHT: f32 = 44.0;
+pub(crate) const SHARED_ROW_HEIGHT: f32 = 44.0;
 /// The room between the Shared list's columns.
-const SHARED_COLUMN_GAP: f32 = 12.0;
+pub(crate) const SHARED_COLUMN_GAP: f32 = 12.0;
 /// The room between a row's actions.
-const SHARED_ACTION_GAP: f32 = 4.0;
+pub(crate) const SHARED_ACTION_GAP: f32 = 4.0;
 /// The room after a row's actions, before the end of its line.
-const SHARED_ROW_END: f32 = 4.0;
+pub(crate) const SHARED_ROW_END: f32 = 4.0;
 
 /// Something the Sharing column paints: a glyph (in the icons' font) or words.
 struct SharingPiece {
@@ -339,7 +339,7 @@ const PHOTOS_SIZE: f32 = 12.0;
 const PHOTOS_GAP: f32 = 4.0;
 
 /// The soft circle of the empty Shared page's picture, in the 128 x 112 room it has, and the circle's centre.
-fn allocate_picture_circle(ui: &mut egui::Ui) -> (egui::Response, egui::Pos2) {
+pub(crate) fn allocate_picture_circle(ui: &mut egui::Ui) -> (egui::Response, egui::Pos2) {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(128.0, 112.0), Sense::hover());
     let centre = rect.center();
     ui.painter().circle_filled(centre, 48.0, share_picture_colors(palette()).circle);
@@ -349,15 +349,20 @@ fn allocate_picture_circle(ui: &mut egui::Ui) -> (egui::Response, egui::Pos2) {
 /// The Shared page while its list is first read: the empty picture's circle with the sync arrows turning in it, and
 /// the words under it. Only the words are for screen readers.
 fn paint_share_loading(ui: &mut egui::Ui) {
+    paint_loading(ui, shared::LOADING);
+}
+
+/// `paint_share_loading` with other words under it.
+pub(crate) fn paint_loading(ui: &mut egui::Ui, words: &str) {
     let (_, centre) = allocate_picture_circle(ui);
     home::paint_turned_glyph(ui.painter(), centre, icons::SYNC, 44.0, share_picture_colors(palette()).glyph, home::turning_angle(ui));
     ui.add_space(20.0);
-    let words = ui.label(RichText::new(shared::LOADING).size(13.0).color(TEXT_MUTED()));
+    let words = ui.label(RichText::new(words).size(13.0).color(TEXT_MUTED()));
     announce_politely(ui, &words);
 }
 
 /// Has screen readers say `label` as it appears, without taking the focus (as `working_line` does, #370).
-fn announce_politely(ui: &egui::Ui, label: &egui::Response) {
+pub(crate) fn announce_politely(ui: &egui::Ui, label: &egui::Response) {
     ui.ctx().accesskit_node_builder(label.id, |node| node.set_live(egui::accesskit::Live::Polite));
 }
 
@@ -379,7 +384,7 @@ fn paint_share_picture(ui: &mut egui::Ui) -> egui::Response {
 /// Lays `add` out top-down and centred, a little above the middle of a page `viewport` tall: it starts
 /// `(viewport - its height) * 0.4` down, and its height is last frame's, kept under `id`. When that changes, the frame
 /// is drawn again with the new one. Gives back what `add` gave.
-fn place_above_middle<R>(ui: &mut egui::Ui, id: &str, viewport: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+pub(crate) fn place_above_middle<R>(ui: &mut egui::Ui, id: &str, viewport: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let id = egui::Id::new(id);
     let last: f32 = ui.ctx().data_mut(|d| d.get_temp(id)).unwrap_or(0.0);
     ui.add_space(((viewport - last) * 0.4).max(0.0));
@@ -391,6 +396,24 @@ fn place_above_middle<R>(ui: &mut egui::Ui, id: &str, viewport: f32, add: impl F
         ui.ctx().request_discard("shared group height");
     }
     group.inner
+}
+
+/// `shared_button_pressed`, for any page that keeps its own `refocus` and `loading`.
+pub(crate) fn refresh_pressed(refocus: &mut bool, loading: bool, ui: &egui::Ui, button: &egui::Response) -> bool {
+    if *refocus && !loading {
+        // Spent when the read ends, but only given if the user hasn't gone to something else meanwhile
+        *refocus = false;
+        if ui.memory(|m| m.focused().is_none()) {
+            button.request_focus();
+        }
+    }
+    let pressed = button.clicked();
+    if pressed {
+        // An activation from a screen reader (AccessKit) has no pointer click, so it deliberately counts as the
+        // keyboard
+        *refocus = !ui.input(|i| i.pointer.any_click());
+    }
+    pressed
 }
 
 impl ProtonDriveNativeApp {
@@ -483,20 +506,7 @@ impl ProtonDriveNativeApp {
     /// Whether a Refresh or Retry was pressed. One pressed from the keyboard is remembered, and the focus it loses
     /// while the page reads is given to the one that shows when the read ends; a mouse click moves no focus (#411).
     fn shared_button_pressed(&mut self, ui: &egui::Ui, button: &egui::Response) -> bool {
-        if self.shared.refocus && !self.shared.loading {
-            // Spent when the read ends, but only given if the user hasn't gone to something else meanwhile
-            self.shared.refocus = false;
-            if ui.memory(|m| m.focused().is_none()) {
-                button.request_focus();
-            }
-        }
-        let pressed = button.clicked();
-        if pressed {
-            // An activation from a screen reader (AccessKit) has no pointer click, so it deliberately counts as the
-            // keyboard
-            self.shared.refocus = !ui.input(|i| i.pointer.any_click());
-        }
-        pressed
+        refresh_pressed(&mut self.shared.refocus, self.shared.loading, ui, button)
     }
 
     /// Nothing shared yet: a picture, a heading and the one way to share, a little above the middle of the page (the

@@ -16,6 +16,7 @@ import type { ConflictRecord } from '../sync/syncStateDb';
 import { type FileManagerSource, FM_ROUTES, fileManagerRoute } from './fileManagerRoutes';
 import { parseSettingsRequest, type SettingsChange } from './settingsValidation';
 import { shareRoute } from './shareRoutes';
+import type { SharedWithMeService } from './sharedWithMe';
 import type { ShareService } from './shareService';
 import type { DriveMoveAction } from './vfsSupervisor';
 
@@ -72,6 +73,8 @@ export interface ControlServerOptions {
     driveSettings?: (change: SettingsChange) => Promise<Response>;
     // Sharing an item (see ShareService, shareRoutes.ts), while signed in: absent, the /share routes are not found
     share?: ShareService;
+    // What is shared with the user (see SharedWithMeService), on the /share/with-me routes
+    sharedWithMe?: SharedWithMeService;
     shareSignedIn?: () => boolean;
     // Where a share route's unexpected failure is logged (only the error's class)
     shareLog?: (line: string) => void;
@@ -495,7 +498,7 @@ export async function startControlServer(opts: ControlServerOptions): Promise<{ 
                 return spaceRoute(req, opts.space);
             }
             if (url.pathname.startsWith('/share/')) {
-                return shareRoute(req, url, opts.share, opts.shareSignedIn ?? (() => false), opts.shareLog);
+                return shareRoute(req, url, opts.share, opts.shareSignedIn ?? (() => false), opts.shareLog, opts.sharedWithMe);
             }
             if (url.pathname === '/drive/move') {
                 return driveMoveRoute(req, opts.driveMove);
