@@ -1,15 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <!-- The generic icon is the Proton icon itself (#471). GTK looks every icon name up in the current theme and its
+       parents before hicolor, where the Proton icons are installed, so a generic name the theme has (Yaru's
+       x-office-document, Adwaita's application-x-generic) would win over them. -->
   <mime-type type="application/vnd.proton.doc">
     <comment>Proton Docs document</comment>
     <glob pattern="*.protondoc"/>
     <icon name="application-vnd.proton.doc"/>
-    <generic-icon name="x-office-document"/>
+    <generic-icon name="application-vnd.proton.doc"/>
   </mime-type>
   <mime-type type="application/vnd.proton.sheet">
     <comment>Proton Sheets spreadsheet</comment>
     <glob pattern="*.protonsheet"/>
     <icon name="application-vnd.proton.sheet"/>
-    <generic-icon name="x-office-spreadsheet"/>
+    <generic-icon name="application-vnd.proton.sheet"/>
   </mime-type>
 </mime-info>
