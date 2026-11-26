@@ -24,9 +24,10 @@ downloaded, online only, or syncing.</sub>
 ## What it does
 
 **Your Drive in Files**
-- **Everything is listed:** all of your Proton Drive shows in Files' sidebar. Files that aren't on this computer take
+- **Everything is listed:** all of your My files shows up as a drive in Files. Files that aren't on this computer take
   no space and download when an app opens them.
-- **Status icons** on every file: kept on this device, downloaded, online only, syncing, or needs attention.
+- **Status icons** on your files and folders: kept on this device, downloaded, partly here, online only, syncing, or
+  needs attention.
 - **The right-click menu:** **Always keep on this device**, **Free up space**, **Hide from this computer**,
   **Share…** and **Copy Link**.
 - **Proton Docs and Sheets** show up as files that open in your browser.
@@ -60,21 +61,24 @@ and a Proton account with Drive. Download your package from the
 | :--- | :--- | :--- |
 | Ubuntu, Debian, Mint, Pop!_OS | `.deb` | `sudo apt install ./kosidhar-protondrive-<version>-linux-amd64.deb` |
 | Fedora | `.rpm` | `sudo dnf install ./kosidhar-protondrive-<version>-linux-x86_64.rpm` |
-| Arch, Manjaro | `.tar.gz` | `makepkg -si` with the [PKGBUILD](packaging/linux/arch/PKGBUILD) |
+| Arch, Manjaro | `.tar.gz` | `makepkg -si` with that release's PKGBUILD ([how](docs/INSTALL.md#arch-linux-and-manjaro)) |
 | Anything else | `.AppImage` | `chmod +x` it, then run it |
 | Anything else, installed | `.tar.gz` | `./install.sh --user` from the extracted folder |
 
 Then open **Proton Drive** from your app menu and sign in. Restart Files once (`nautilus -q`, or log out and back in)
 so it shows the status icons and the right-click menu. From then on, Proton Drive starts when you log in.
 
-[docs/INSTALL.md](docs/INSTALL.md) has the details for each package, and how to uninstall safely.
+The `.deb` and `.rpm` also install what the Files integration and the tray icon need. The tarball doesn't, and the
+AppImage has no Files integration: [docs/INSTALL.md](docs/INSTALL.md) says what to add.
+
+The install guide also covers each package in detail, and how to uninstall safely.
 
 ## Works best with
 
 | Desktop | What you get |
 | :--- | :--- |
 | GNOME (Files) | Everything: the drive, the status icons and the right-click menu |
-| Cinnamon (Nemo), KDE Plasma (Dolphin) | The drive and the app, with a smaller right-click menu (Sync Now, Status & Settings). Nemo's check marks don't show the real status yet (#530) |
+| Cinnamon (Nemo), KDE Plasma (Dolphin) | The drive and the app, with a smaller right-click menu (Sync Now, Status & Settings). Nemo's check marks don't show the real status yet ([#530](https://github.com/kosidhar/proton-drive/issues/530)) |
 | Anything else | The drive as a folder, the app, and the tray icon where the desktop supports one |
 
 It's used every day on GNOME. Other desktops are less tested, so reports are very welcome.
@@ -117,15 +121,15 @@ Four rules come before everything else:
 
 ## Status
 
-This is an early pre-release (`0.x`). It has been in daily use on a real account since early November 2026. Each
-release's `.deb` is installed and started on clean Ubuntu 22.04 and Debian 12 before it's published, and about 2,500
-automated tests run on every change. It was built with a lot of help from AI coding tools; every change goes through
-those tests and a review.
+This is an early pre-release (`0.x`). It has been in daily use on a real account since early November 2026. Before
+each release is published, its `.deb` is installed on clean Ubuntu 22.04 and Debian 12 and its programs are run there,
+and about 2,500 automated tests run on every change. It was built with a lot of help from AI coding tools; every
+change goes through those tests and a review.
 
 **Not there yet:**
-- version history (#515);
-- streaming large files (#516);
-- backing up other folders as a computer (#514);
+- version history ([#515](https://github.com/kosidhar/proton-drive/issues/515));
+- streaming large files ([#516](https://github.com/kosidhar/proton-drive/issues/516));
+- backing up other folders as a computer ([#514](https://github.com/kosidhar/proton-drive/issues/514));
 - an ARM build;
 - shared items in the drive itself.
 

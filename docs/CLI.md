@@ -3,28 +3,49 @@
 `protondrive` runs the background service and does the everyday things from a terminal: status, sync, pause, keeping or freeing files, conflicts, and direct uploads and downloads. `protondrive --help` lists every command.
 
 ```bash
-protondrive gui                            # Open native Rust Proton Drive desktop app
-protondrive daemon                         # Run two-way sync daemon & local API server
-protondrive status [--json]                # Show sync status & statistics
-protondrive status <path>                  # Show whether an item is kept, downloaded, online only or hidden
+# The app and the background service
+protondrive gui                            # Open the app (starts the service if needed)
+protondrive daemon                         # Run the background service: sync, the drive and the local API
+
+# Status and syncing
+protondrive status [--json]                # Sync status, the sync folder and file counts
+protondrive status <path>                  # Whether an item is kept, downloaded, online only or hidden
+protondrive sync                           # Sync now
+protondrive pause / resume                 # Pause or resume syncing
+
+# What's on this computer
 protondrive pin <path>                     # Always keep a file or folder on this device
 protondrive free <path>                    # Free up space: make downloaded files online only
 protondrive hide <path>                    # Hide a file or folder from this computer
 protondrive unhide <path>                  # Unhide it (it becomes online only)
-protondrive sync                           # Trigger immediate two-way sync pass
-protondrive pause / resume                 # Pause or resume background sync
-protondrive auth login / logout / status   # Manage Proton account session
-protondrive conflicts                      # List or resolve file conflicts
-protondrive selective-sync list            # List top-level folders with their availability
+protondrive selective-sync list            # Top-level folders and their availability
 protondrive selective-sync exclude <path>  # Same as hide
 protondrive selective-sync include <path>  # Same as unhide
-protondrive ls [/my-files]                 # Browse remote Proton Drive files
-protondrive ls /shared-with-me             # Browse what others shared with you
-protondrive upload <local> <remoteDir>     # Upload a file directly
-protondrive download <remote> <local>      # Download a file directly
-protondrive mkdir <remoteDir> <name>       # Create a remote folder
-protondrive trash <remotePath>             # Move a remote node to Trash
+
+# Conflicts
+protondrive conflicts                      # List conflicts
+protondrive conflicts resolve <id> <mode>  # Resolve one: keep-both, keep-local or keep-remote
+
+# Your account
+protondrive auth login                     # Sign in, in your browser
+protondrive auth logout                    # Sign out and clear the local caches
+protondrive auth status                    # Whether you're signed in
+
+# Proton Drive directly, without the sync folder
+protondrive ls [/my-files]                 # List a folder in Proton Drive
+protondrive ls /shared-with-me             # List what others shared with you
+protondrive upload <local> <remoteDir>     # Upload a file
+protondrive download <remote> <local>      # Download a file
+protondrive mkdir <remoteDir> <name>       # Create a folder
+protondrive trash <remotePath>             # Move an item to the Proton Drive trash
+
+# Other
+protondrive open-doc <file>                # Open a Proton Docs or Sheets file in your browser
+protondrive version                        # The app and SDK versions (also --version)
+protondrive help                           # This list
 ```
+
+`--json` (or `-j`) gives machine-readable output where a command supports it, and `--verbose` (or `-v`) logs more.
 
 **Paths for `pin`, `free`, `hide`, `unhide` and `status <path>`:**
 - A path inside your sync folder (`~/ProtonDrive/Docs/report.pdf`) or a My files path (`/my-files/Docs/report.pdf`).

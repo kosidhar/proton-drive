@@ -26,6 +26,7 @@ away.
 - **Files:** restart it once (`nautilus -q`, or log out and back in) so it loads the extension.
 - **The tray icon:** Ubuntu shows it out of the box. On other GNOME desktops, enable the "AppIndicator and
   KStatusNotifierItem Support" extension.
+- **Cinnamon:** for Nemo's right-click menu, also install `nemo-python`.
 
 To update, install the new version's `.deb` the same way.
 
@@ -45,9 +46,10 @@ The `.rpm` is built and checked less often than the `.deb`. Please report anythi
 
 ## Arch Linux and Manjaro
 
-Download the release's `.tar.gz` and put it in a folder with
-[`packaging/linux/arch/PKGBUILD`](../packaging/linux/arch/PKGBUILD), then run `makepkg -si` there. For the Files
-integration and the tray icon, install `nautilus-python` and `libayatana-appindicator`.
+Download the release's `.tar.gz`, and the PKGBUILD from the same release's tag:
+`https://github.com/kosidhar/proton-drive/raw/v<version>/packaging/linux/arch/PKGBUILD`. The one on `main` may already
+be for a newer version ([#535](https://github.com/kosidhar/proton-drive/issues/535)). Put both in one folder and run `makepkg -si` there. For the Files integration and the
+tray icon, install `nautilus-python` and `libayatana-appindicator`.
 
 ## AppImage (any distribution, nothing to install)
 
@@ -67,7 +69,9 @@ rm ~/.local/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop \
 update-mime-database ~/.local/share/mime
 ```
 
-The Files extension isn't part of the AppImage.
+The AppImage doesn't include the Files extension, so there are no status icons or right-click menu in Files. For
+online-only files it needs FUSE 3 (`fuse3`) installed on your system. Before deleting the AppImage, turn off **Start
+Proton Drive when I log in** in Settings, or delete `~/.config/autostart/kosidhar-protondrive.desktop`.
 
 ## Tarball (any distribution, installed for your user)
 
@@ -77,14 +81,18 @@ cd kosidhar-protondrive-<version>-linux-x86_64
 ./install.sh --user          # into ~/.local; no root needed
 ```
 
-Install FUSE 3 (`fuse3`) from your distribution first if you want online-only files. `./install.sh --system` installs
-into `/usr` instead (as root), and `--uninstall` removes either.
+It installs the app, the service and the Files extension, but not their dependencies. From your distribution, install:
+- FUSE 3 (`fuse3`), for online-only files;
+- the Python bindings for Files (`python3-nautilus` or `nautilus-python`), for the status icons and right-click menu;
+- an AppIndicator library (`gir1.2-ayatanaappindicator3-0.1` or `libayatana-appindicator-gtk3`), for the tray icon.
+
+`./install.sh --system` installs into `/usr` instead (as root), and `--uninstall` removes either.
 
 ## The first run
 
 1. Open **Proton Drive** from your app menu. It starts the background service.
 2. Sign in. Proton's sign-in page opens in your browser, so the app never sees your password. Your session is kept in
-   the system keyring.
+   the system keyring, or, where there's no keyring, in a file in the app's data folder that only you can read.
 3. Proton Drive appears in Files' sidebar and starts syncing.
 
 From then on, Proton Drive starts when you log in, without opening its window. To change that, use **Start Proton
@@ -103,11 +111,15 @@ uninstall leaves them there. An older version, which knows nothing of that folde
 
 1. **Switch the virtual drive off first:** in Settings, turn off **Show online-only files in Files (virtual drive)**.
    That moves your files back into your sync folder.
-2. **Quit Proton Drive:** **Quit Proton Drive** in the tray menu. Check that `pgrep -a protondrive` prints nothing.
-3. **Uninstall:** `sudo apt remove kosidhar-protondrive`, `sudo dnf remove kosidhar-protondrive`,
+2. **If you're leaving for good, sign out:** use **Sign out** in Settings, so your session doesn't stay in the keyring.
+3. **Quit Proton Drive:** **Quit Proton Drive** in the tray menu. Without a tray, run
+   `curl -s -X POST http://127.0.0.1:49152/api/quit`. Check that `pgrep -a protondrive` prints nothing.
+4. **Uninstall:** `sudo apt remove kosidhar-protondrive`, `sudo dnf remove kosidhar-protondrive`,
    `sudo pacman -R kosidhar-protondrive`, or `./install.sh --uninstall` for the tarball.
 
-Your files in `~/ProtonDrive` and in Proton Drive are left alone.
+Your files in `~/ProtonDrive` and in Proton Drive are left alone. So is the app's own data: the sync database and
+caches, in `~/.local/share/proton-drive-ubuntu`, and its logs, in `~/.local/state/proton-drive-ubuntu`. Delete those
+folders yourself if you won't install it again.
 
 ## Building the packages yourself
 

@@ -17,8 +17,10 @@ Proton Drive shows up in your file manager's sidebar as **Proton Drive**, at `~/
 lists everything in your Proton Drive's My files, including files that aren't on this computer, and a file downloads
 the moment an app opens it.
 
-**Nothing downloads in the background.** Thumbnailers and desktop search never trigger a download, so browsing a
-folder of online-only photos shows generic icons and costs no bandwidth.
+**Nothing downloads in the background on GNOME.** GNOME's thumbnailers and desktop search never trigger a download, so
+browsing a folder of online-only photos shows generic icons and costs no bandwidth. Other desktops' thumbnailers and
+indexers, such as KDE's or Xfce's, aren't recognised yet ([#534](https://github.com/kosidhar/proton-drive/issues/534)): they count as ordinary apps, so they can download
+files. If one does, block it (see [Apps that download many files](#apps-that-download-many-files)).
 
 **Files you change sync both ways,** usually within seconds. When the same file changed on both sides, both versions
 are kept, so nothing is overwritten.
@@ -29,13 +31,14 @@ are kept, so nothing is overwritten.
 | :--- | :--- |
 | Solid green check | **Always keep on this device**: always here, even offline |
 | Green ring | **Downloaded**: here now, and its space can be freed |
-| Grey cloud | **Online only**: downloads when opened |
+| Grey cloud | **Online only**: downloads when opened. On a folder: nothing inside it is here |
+| Cloud with a small green check | A folder that's **partly here**: some of what's inside is on this computer |
 | Sync arrows | Syncing |
 | Warning | An error or a conflict: the app's Home says what to do |
+| Lock | A Proton Docs or Sheets file, which is read-only |
 
-A folder shows a cloud when anything inside it is online only. The icons update by themselves within a couple of
-seconds. They appear in GNOME Files. Cinnamon's Nemo and KDE's Dolphin have a smaller integration: see the
-[README](../README.md#works-best-with).
+The icons update by themselves within a couple of seconds. They appear in GNOME Files. Cinnamon's Nemo and KDE's
+Dolphin have a smaller integration: see the [README](../README.md#works-best-with).
 
 **After installing or upgrading,** restart Files once (`nautilus -q`) so it loads the new extension.
 
@@ -78,8 +81,8 @@ Sheets icon. A double-click opens it at docs.proton.me in your browser.
   **Retry**.
 - **In a plain folder,** Move to Trash also leaves a copy in your desktop Trash.
 
-**Open Proton Drive Trash** (on the app's Home, in Settings › Account, or in the tray menu) opens the Proton Drive
-trash in your browser, where you can restore items.
+The **Trash** button on the app's Home and in Settings › Account, and **Open Proton Drive Trash** in the tray menu,
+open the Proton Drive trash in your browser, where you can restore items.
 
 ## Apps that download many files
 
@@ -109,7 +112,8 @@ Files downloads more than 20 files in a minute, for example a code indexer or `r
   - blocked apps, and what's hidden from this computer;
   - **Start Proton Drive when I log in**.
 
-**Pausing:** **Pause** on Home stops syncing until you resume. `protondrive pause` does the same from a terminal.
+**Pausing:** **Pause** on Home stops syncing **for 1 hour**, **until tomorrow** or **until I resume**. `protondrive
+pause` pauses until you resume.
 
 ## The tray menu
 
@@ -117,7 +121,9 @@ The tray menu shows the same status as Home and your Proton storage, plus a line
 needs you. It has:
 - **Open Proton Drive:** opens the drive in Files.
 - **View Online** and **Open Proton Drive Trash:** open Proton Drive in your browser.
+- **Mount Proton Drive,** when the drive isn't mounted.
 - **Status & Settings…:** opens the app.
+- **Sync Now**, **Pause Sync** (for 1 hour, until tomorrow, or until you resume) and **Resume Sync.**
 - **Quit Proton Drive.**
 
 **Ejecting:** Eject in Files unmounts the drive. **Mount again** on Home, or **Mount Proton Drive** in the tray, brings
@@ -129,13 +135,14 @@ With the virtual drive (the default), downloaded files are kept in a hidden stor
 `~/.local/share/proton-drive-ubuntu/files`, and `~/ProtonDrive` is a FUSE view of it. The `protondrive-vfs` helper,
 installed next to `protondrive`, serves that view.
 
-Proton Drive stays an ordinary folder, with every file downloaded, when:
+Proton Drive is set up as an ordinary folder, with every file downloaded, when:
 - FUSE isn't available: no `/dev/fuse`, no `fusermount3`, or no helper;
 - you're running the Flatpak build;
 - **Show online-only files in Files (virtual drive)** is off in Settings;
 - the sync folder is on a different disk from `~/.local/share`.
 
-Settings shows which applies.
+Settings shows which applies. If FUSE goes away later on a computer that already uses the virtual drive, Home says the
+drive isn't mounted, rather than switching to a plain folder.
 
 **Before uninstalling or going back to an older version, switch the virtual drive off.** [INSTALL.md](INSTALL.md#uninstalling-or-going-back-to-an-older-version)
 explains why.
