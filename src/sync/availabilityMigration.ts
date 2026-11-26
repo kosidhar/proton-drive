@@ -1,8 +1,8 @@
 import { existsSync } from 'node:fs';
 import { lstat, rename, rm } from 'node:fs/promises';
-import path from 'node:path';
 
 import type { AvailabilityPolicy } from './availability';
+import { isSafeRelPath, localPathIn } from './localPath';
 import type { SyncStateDatabase } from './syncStateDb';
 
 const MIGRATED = 'availabilityMigrated';
@@ -38,8 +38,12 @@ export async function migrateExcludedFolders(
     const root = localRoot;
     const orphaned: string[] = [];
     for (const item of stateDb.getAllItems()) {
+        // A record of a path that could lead outside the folder is left as it is: the engine drops it, touching nothing (#536)
+        if (!isSafeRelPath(item.localRelPath)) {
+            continue;
+        }
         const top = item.localRelPath.split('/')[0]!;
-        if (cloudOnly.has(top) && !(await lstat(path.join(root, item.localRelPath)).then(() => true, () => false))) {
+        if (cloudOnly.has(top) && !(await lstat(localPathIn(root, item.localRelPath)).then(() => true, () => false))) {
             orphaned.push(item.localRelPath);
         }
     }
@@ -50,7 +54,7 @@ export async function migrateExcludedFolders(
             stateDb.removeItemByPath(relPath);
         }
         for (const item of stateDb.getAllItems()) {
-            if (!item.localRelPath.includes('/') && !cloudOnly.has(item.localRelPath)) {
+            if (!item.localRelPath.includes('/') && !cloudOnly.has(item.localRelPath) && isSafeRelPath(item.localRelPath)) {
                 policy.setPin(item.nodeUid, 'pinned', false);
             }
         }

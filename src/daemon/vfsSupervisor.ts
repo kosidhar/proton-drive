@@ -20,6 +20,7 @@ import type { Logger } from '@protontech/drive-sdk';
 import type { DriveLayout } from '../sync/driveMode';
 import { makeUserFolder } from '../sync/layoutMigration';
 import { mergeInto } from '../sync/localMerge';
+import { localPathIn } from '../sync/localPath';
 import { canonicalPath, mountsAt, mountsUnder, pathsOverlap, readMountInfo } from '../sync/mountPoint';
 
 export { mountsAt } from '../sync/mountPoint';
@@ -200,7 +201,7 @@ export function mergeStrayInto(
     if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
         throw new Error(`${strayPath} isn't inside ${mountpoint}`);
     }
-    return mergeInto(strayPath, path.join(backingDir, rel), { now, beforeRmdir });
+    return mergeInto(strayPath, localPathIn(backingDir, rel), { now, beforeRmdir });
 }
 
 // Runs a command, killed after 10 s, and answers its exit code. A failure is logged with what the command said, unless

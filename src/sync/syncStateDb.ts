@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 
 import { BUILTIN_IGNORE_PATTERNS } from './ignoreDefaults';
+import { relPathProblem, UNSAFE_PATH_SQL, UnsafeLocalPathError } from './localPath';
 import { selfOrDescendant, selfOrDescendantWhere } from './pathRange';
 import { type ConflictStrategy, isConflictStrategy, problemWithBlockedApps, RETIRED_CONFLICT_STRATEGIES, usableIgnorePatterns } from './settingsRules';
 
@@ -419,8 +420,10 @@ export class SyncStateDatabase {
         }
     }
 
-    // A record written for a path consumes the edit baseline there: the record is what it syncs by from then on
+    // A record written for a path consumes the edit baseline there: the record is what it syncs by from then on. A path
+    // that could lead outside the folder, or names no item in it, is refused (#536)
     upsertItem(item: Omit<SyncedItemRecord, 'updatedAt'> & { updatedAt?: number }): void {
+        refuseUnsafePath(item.localRelPath);
         this.topLevelNames = null;
         const updatedAt = item.updatedAt ?? Date.now();
         this.db.query('DELETE FROM drive_edit_baselines WHERE relPath = $relPath').run({ $relPath: item.localRelPath });
@@ -525,6 +528,7 @@ export class SyncStateDatabase {
         if (toRel.startsWith(`${fromRel}/`)) {
             throw new Error(`Can't move ${fromRel} into itself`);
         }
+        refuseUnsafePath(toRel);
         this.topLevelNames = null;
         this.db.transaction(() => {
             if (this.hasItemsUnder(toRel)) {
@@ -682,6 +686,25 @@ export class SyncStateDatabase {
                 this.onChange?.(relPath, false);
             }
         }
+    }
+
+    // Drops the records whose path could lead outside the folder, or names no item in it, as a sync before #536 could
+    // leave them (a folder named `..` in Proton Drive, say), and returns them. Only the records go: whatever is on disk
+    // is never looked at or touched for them
+    dropUnsafeItems(): SyncedItemRecord[] {
+        const unsafe = (
+            this.db.query(`SELECT * FROM synced_items WHERE ${UNSAFE_PATH_SQL('localRelPath')}`).all() as SyncedItemRecord[]
+        ).filter((item) => relPathProblem(item.localRelPath) !== null);
+        if (unsafe.length > 0) {
+            this.topLevelNames = null;
+            const drop = this.db.query('DELETE FROM synced_items WHERE localRelPath = $localRelPath');
+            this.db.transaction(() => {
+                for (const item of unsafe) {
+                    drop.run({ $localRelPath: item.localRelPath });
+                }
+            })();
+        }
+        return unsafe;
     }
 
     hasItemsUnder(localRelPath: string): boolean {
@@ -962,5 +985,13 @@ export class SyncStateDatabase {
 
     close(): void {
         this.db.close();
+    }
+}
+
+// A record's path is never one that could lead outside the folder, nor one that names no item in it (#536)
+function refuseUnsafePath(localRelPath: string): void {
+    const problem = localRelPath === '' ? 'it is the folder itself' : relPathProblem(localRelPath);
+    if (problem !== null) {
+        throw new UnsafeLocalPathError('the sync folder', localRelPath, problem);
     }
 }

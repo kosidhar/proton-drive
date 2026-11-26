@@ -3,7 +3,8 @@ import type { Database } from 'bun:sqlite';
 import { type NodeEntity, NodeType } from '@protontech/drive-sdk';
 
 import { isUnsupportedRemoteNode } from '../sdk/fileOps';
-import { getClaimedSize, getName } from '../sdk/node';
+import { getClaimedSize, remoteNameProblem, syncableName } from '../sdk/node';
+import { relPathProblem, UNSAFE_PATH_SQL, UnsafeLocalPathError } from './localPath';
 import { selfOrDescendant, selfOrDescendantWhere } from './pathRange';
 
 export interface RemoteIndexEntry {
@@ -17,12 +18,13 @@ export interface RemoteIndexEntry {
     sha1: string | null;
 }
 
-// Null for nodes the client does not sync (Proton Docs and Sheets).
+// Null for nodes the client does not sync: Proton Docs and Sheets, and a node whose name can't be one on this computer
+// (see remoteNameProblem, #536), which is left out with everything in it.
 export function entryFromNode(node: NodeEntity, parentRelPath: string): RemoteIndexEntry | null {
-    if (isUnsupportedRemoteNode(node)) {
+    const name = syncableName(node);
+    if (isUnsupportedRemoteNode(node) || name === null) {
         return null;
     }
-    const name = getName(node);
     const mtime = node.activeRevision?.claimedModificationTime ?? node.modificationTime;
     return {
         uid: node.uid,
@@ -110,8 +112,13 @@ export class RemoteIndex {
         })();
     }
 
-    // A node that already exists at another path takes its whole subtree along.
+    // A node that already exists at another path takes its whole subtree along. An entry whose path or name can't be
+    // one on this computer is refused (#536): nothing may ever find it, or make a path of it.
     upsert(entry: RemoteIndexEntry): void {
+        const problem = entry.relPath === '' ? null : (relPathProblem(entry.relPath) ?? remoteNameProblem(entry.name));
+        if (problem !== null) {
+            throw new UnsafeLocalPathError('My files', entry.relPath, problem);
+        }
         this.db.transaction(() => {
             const previous = this.getByUid(entry.uid);
             if (previous && sameEntry(previous, entry)) {
@@ -196,6 +203,27 @@ export class RemoteIndex {
             this.onFoldersRemoved?.(folders.map((f) => f.uid));
         })();
         this.onChange?.(node.relPath, true);
+    }
+
+    // Drops the entries, with everything under them, whose path or name can't be one on this computer, as a listing
+    // before #536 could record them (a node named `..`, say), and returns them. Nothing else is touched.
+    dropUnsafe(): RemoteIndexEntry[] {
+        const candidates = this.db
+            .query(
+                `SELECT * FROM remote_nodes WHERE relPath != '' AND (${UNSAFE_PATH_SQL('relPath')} OR name IN ('', '.', '..')
+                     OR instr(name, '/') > 0 OR instr(name, char(0)) > 0)`,
+            )
+            .all() as RemoteIndexEntry[];
+        const dropped: RemoteIndexEntry[] = [];
+        this.db.transaction(() => {
+            for (const entry of candidates) {
+                if (this.getByUid(entry.uid) && (relPathProblem(entry.relPath) !== null || remoteNameProblem(entry.name) !== null)) {
+                    dropped.push(entry);
+                    this.removeSubtree(entry.uid);
+                }
+            }
+        })();
+        return dropped;
     }
 
     getByUid(uid: string): RemoteIndexEntry | null {

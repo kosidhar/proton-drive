@@ -96,6 +96,22 @@ describe('withAvailability (#83)', () => {
         ]);
     });
 
+    // #536: a name from Proton Drive that can't be one on this computer is never made into a path, not even to look up
+    test('an item whose name would lead elsewhere is listed as it is, with no availability, and never looked up', () => {
+        const stateOf = spyOn(policy, 'stateOf');
+        try {
+            const names = ['../x', 'a/b', '..', '.', 'nul\0', ''];
+            const out = withAvailability(policy, '/my-files/Small', [{ name: 'f1.txt' }, ...names.map((name) => ({ name }))]);
+            expect(out.map((i) => ({ ...i }))).toEqual([
+                { name: 'f1.txt', availability: policy.stateOf('Small/f1.txt') },
+                ...names.map((name) => ({ name })),
+            ]);
+            expect(stateOf.mock.calls.map(([rel]) => rel).filter((rel) => rel !== 'Small/f1.txt')).toEqual([]);
+        } finally {
+            stateOf.mockRestore();
+        }
+    });
+
     test('the top of My files, and listings outside it', () => {
         const top = withAvailability(policy, '/my-files', [{ name: 'Big' }, { name: 'Small' }]);
         expect(top.map((i) => (i as { availability: string }).availability)).toEqual([policy.stateOf('Big'), policy.stateOf('Small')]);

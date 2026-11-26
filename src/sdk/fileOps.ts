@@ -13,7 +13,7 @@ import {
 } from '@protontech/drive-sdk';
 import { isProtonDocument, isProtonSheet } from '@protontech/drive-sdk/internal/nodes/mediaTypes';
 
-import { getName } from './node';
+import { getName, quotedName } from './node';
 
 export const THIRD_PARTY_DISCLOSURE = 'This is a third-party application not officially supported by Proton.';
 export const DEFAULT_APP_VERSION = process.env.PROTON_DRIVE_APP_VERSION || 'external-drive-ubuntu_sync@0.1.0-alpha';
@@ -257,7 +257,7 @@ export async function downloadDriveNodeToLocal(options: {
 
     const revision = options.revision ?? remoteNode.activeRevision;
     if (!revision) {
-        throw new Error(`Remote file ${getName(remoteNode)} (${remoteNode.uid}) has no active revision`);
+        throw new Error(`Remote file ${quotedName(getName(remoteNode))} (${remoteNode.uid}) has no active revision`);
     }
     const expectedSha1 = revision.claimedDigests?.sha1;
 
@@ -301,7 +301,7 @@ export async function downloadDriveNodeToLocal(options: {
     try {
         await rename(tempPath, localPath);
     } catch (error) {
-        logger.error(`Failed downloading ${getName(remoteNode)} to ${localPath}`, error);
+        logger.error(`Failed downloading ${quotedName(getName(remoteNode))} to ${localPath}`, error);
         await unlink(tempPath).catch(() => {});
         throw error;
     }
@@ -342,11 +342,11 @@ export async function downloadRevisionToFile(options: {
 }): Promise<{ sha1: string; size: number; mtimeMs: number }> {
     const { sdk, logger, remoteNode, filePath, onStart, onProgress } = options;
     if (isUnsupportedRemoteNode(remoteNode)) {
-        throw new Error(`${getName(remoteNode)} is a Proton Docs or Sheets document, which only opens on the web`);
+        throw new Error(`${quotedName(getName(remoteNode))} is a Proton Docs or Sheets document, which only opens on the web`);
     }
     const revision = options.revision ?? remoteNode.activeRevision;
     if (!revision) {
-        throw new Error(`Remote file ${getName(remoteNode)} (${remoteNode.uid}) has no active revision`);
+        throw new Error(`Remote file ${quotedName(getName(remoteNode))} (${remoteNode.uid}) has no active revision`);
     }
     const expectedSha1 = revision.claimedDigests?.sha1;
     const sha1Verified = Boolean(revision.claimedDigests?.sha1Verified);
@@ -390,7 +390,7 @@ export async function downloadRevisionToFile(options: {
         }
         return { sha1: expectedSha1 ?? actualSha1, size: (await stat(filePath)).size, mtimeMs };
     } catch (error) {
-        logger.error(`Failed downloading ${getName(remoteNode)} to ${filePath}`, error);
+        logger.error(`Failed downloading ${quotedName(getName(remoteNode))} to ${filePath}`, error);
         try {
             await writer.end(); // closes the file if the stream left it open
         } catch {
