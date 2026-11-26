@@ -263,3 +263,166 @@ describe('Docs and Sheets file types', () => {
         });
     });
 });
+
+// The release binaries are built for Ubuntu 22.04's glibc 2.35, and the packages declare the glibc they need (#505)
+describe('portable release binaries and their glibc minimum', () => {
+    const root = path.join(import.meta.dir, '..');
+    const dir = path.join(root, 'packaging', 'linux');
+    const read = (name: string): string => readFileSync(path.join(dir, name), 'utf8');
+    const GLIBC_MIN_SH = path.join(dir, 'glibc-min.sh');
+
+    function glibcMin(files: string[], env: Record<string, string> = {}): { code: number; out: string; err: string } {
+        const p = Bun.spawnSync(['bash', GLIBC_MIN_SH, ...files], {
+            env: { ...process.env, ...env },
+            stdout: 'pipe',
+            stderr: 'pipe',
+        });
+        return { code: p.exitCode, out: p.stdout.toString(), err: p.stderr.toString() };
+    }
+
+    test('the build image is Ubuntu 22.04 with a pinned Rust from a minimal rustup', () => {
+        const dockerfile = read('build-env/Dockerfile');
+        const instructions = dockerfile.split('\n').filter((l) => l.trim() !== '' && !l.trimStart().startsWith('#'));
+        expect(instructions[0]).toBe('FROM ubuntu:22.04');
+        const install = dockerfile.match(/apt-get install[^\n]*/)?.[0] ?? '';
+        for (const pkg of ['build-essential', 'pkg-config', 'ca-certificates', 'curl']) {
+            expect(install.split(/\s+/)).toContain(pkg);
+        }
+        expect(dockerfile).toContain('https://sh.rustup.rs');
+        expect(dockerfile).toContain('--profile minimal');
+        expect(dockerfile).toMatch(/^ARG RUST_VERSION=\d+\.\d+\.\d+$/m);
+        expect(dockerfile).toContain('--default-toolchain "$RUST_VERSION"');
+    });
+
+    test('build-portable.sh builds both crates locked, as the calling user, into their own target dirs', () => {
+        const sh = read('build-portable.sh');
+        expect(sh).toContain('--user "$(id -u):$(id -g)"');
+        expect(sh).toContain('cargo build --release --locked');
+        for (const crate of ['native-gui', 'native-vfs']) {
+            expect(sh).toContain(`${crate}/target-portable`);
+        }
+        expect(sh).toContain('"$ROOT/release/protondrive-gui"');
+        expect(sh).toContain('"$ROOT/release/protondrive-vfs"');
+        // only the repository and the cargo cache are mounted, never the home folder
+        expect(sh).not.toMatch(/(-v|--volume|--mount)[ =][^\n]*\$HOME/);
+        const ignore = readFileSync(path.join(root, '.gitignore'), 'utf8').split('\n');
+        expect(ignore).toContain('native-gui/target-portable/');
+        expect(ignore).toContain('native-vfs/target-portable/');
+    });
+
+    test('package.sh builds the Rust binaries portably by default, and keeps --native for a host build', () => {
+        const sh = read('package.sh');
+        expect(sh).toContain('"$HERE/build-portable.sh"');
+        expect(sh).toMatch(/^NATIVE=0$/m);
+        expect(sh).toMatch(/^\s+--native\) NATIVE=1; shift ;;$/m);
+        // the host build is still there, behind --native
+        expect(sh).toContain('(cd "$ROOT/native-gui" && cargo build --release)');
+        expect(sh).toContain('(cd "$ROOT/native-vfs" && cargo build --release)');
+    });
+
+    test('package.sh stops at once, naming --native, when docker is missing', () => {
+        const tmp = mkdtempSync(path.join(os.tmpdir(), 'pd-nodocker-'));
+        try {
+            // A PATH with only what package.sh needs before it builds: no docker, and no mkdir, so nothing is written
+            const bin = path.join(tmp, 'bin');
+            mkdirSync(bin);
+            for (const tool of ['dirname', 'python3', 'date', 'uname']) {
+                symlinkSync(Bun.which(tool)!, path.join(bin, tool));
+            }
+            const run = (args: string[]) => {
+                const p = Bun.spawnSync(['/bin/bash', path.join(dir, 'package.sh'), ...args], {
+                    env: { PATH: bin, HOME: tmp },
+                    stdout: 'pipe',
+                    stderr: 'pipe',
+                });
+                return { code: p.exitCode, err: p.stderr.toString() };
+            };
+            const portable = run(['--formats', 'deb']);
+            expect(portable.code).toBe(1);
+            expect(portable.err).toContain('docker');
+            expect(portable.err).toContain('--native');
+            // --native needs no docker: it goes on, as far as the mkdir this PATH lacks
+            const native = run(['--native', '--formats', 'deb']);
+            expect(native.code).toBe(127);
+            expect(native.err).toContain('mkdir');
+            expect(native.err).not.toContain('docker');
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+        }
+    });
+
+    test('nfpm takes the glibc minimum from the build, for the deb and the rpm', () => {
+        const nfpm = read('nfpm.yaml');
+        expect(nfpm).toContain('- libc6 (>= ${GLIBC_MIN})');
+        expect(nfpm).toContain('- glibc >= ${GLIBC_MIN}');
+        expect(nfpm).not.toMatch(/libc6 \(>= \d/);
+    });
+
+    test('package.sh computes the minimum from every bundled binary and refuses one newer than 2.35', () => {
+        const sh = read('package.sh');
+        expect(sh).toContain(
+            'GLIBC_MIN="$("$HERE/glibc-min.sh" "$STAGE/usr/bin/protondrive" "$STAGE/usr/bin/protondrive-gui" "$STAGE/usr/bin/protondrive-vfs")"',
+        );
+        expect(sh).toMatch(/^GLIBC_LIMIT=2\.35$/m);
+        expect(sh).toMatch(/^\s+--allow-newer-glibc\) ALLOW_NEWER_GLIBC=1; shift ;;$/m);
+        expect(sh).toContain('export GLIBC_MIN');
+    });
+
+    test('glibc-min.sh prints the newest glibc a real binary needs', () => {
+        const r = glibcMin(['/bin/true']);
+        expect(r.code).toBe(0);
+        expect(r.out).toMatch(/^2\.\d+(\.\d+)?\n$/);
+    });
+
+    test('glibc-min.sh takes the newest version across binaries, by version and not by text', () => {
+        const tmp = mkdtempSync(path.join(os.tmpdir(), 'pd-glibc-'));
+        try {
+            // A stand-in objdump: a needs 2.2.5, 2.9 and 2.17 (GLIBC_PRIVATE and GLIBCXX_ aren't glibc versions);
+            // b needs 2.14; none names no version at all
+            writeFileSync(
+                path.join(tmp, 'objdump'),
+                [
+                    '#!/bin/sh',
+                    'case "$2" in',
+                    '  */a) printf "%s\\n" "DYNAMIC SYMBOL TABLE:" \\',
+                    '    "0000000000000000      DF *UND*  0000000000000000 (GLIBC_2.2.5) malloc" \\',
+                    '    "0000000000000000      DF *UND*  0000000000000000 (GLIBC_2.9)  pipe2" \\',
+                    '    "0000000000000000      DF *UND*  0000000000000000 (GLIBC_2.17) clock_gettime" \\',
+                    '    "0000000000000000      DF *UND*  0000000000000000 (GLIBC_PRIVATE) _dl_x" \\',
+                    '    "0000000000000000      DF *UND*  0000000000000000 (GLIBCXX_3.4.30) _ZSt4cout" ;;',
+                    '  */b) printf "%s\\n" "0000000000000000      DF *UND*  0000000000000000  GLIBC_2.14  memcpy" ;;',
+                    '  */none) printf "%s\\n" "DYNAMIC SYMBOL TABLE:" ;;',
+                    'esac',
+                ].join('\n') + '\n',
+                { mode: 0o755 },
+            );
+            const env = { PATH: `${tmp}:${process.env.PATH}` };
+            const at = (name: string): string => path.join(tmp, name);
+            expect(glibcMin([at('a')], env)).toMatchObject({ code: 0, out: '2.17\n' });
+            expect(glibcMin([at('b'), at('a')], env)).toMatchObject({ code: 0, out: '2.17\n' });
+            expect(glibcMin([at('b')], env)).toMatchObject({ code: 0, out: '2.14\n' });
+            // a binary that names no glibc version can't be measured: never guess a minimum for it
+            const none = glibcMin([at('a'), at('none')], env);
+            expect(none.code).not.toBe(0);
+            expect(none.out).toBe('');
+            expect(none.err).toContain(at('none'));
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+        }
+    });
+
+    test('glibc-min.sh fails, printing nothing, without binaries or on a file that is not one', () => {
+        expect(glibcMin([]).code).not.toBe(0);
+        const tmp = mkdtempSync(path.join(os.tmpdir(), 'pd-glibc-'));
+        try {
+            const text = path.join(tmp, 'notes.txt');
+            writeFileSync(text, 'not a binary\n');
+            const r = glibcMin(['/bin/true', text]);
+            expect(r.code).not.toBe(0);
+            expect(r.out).toBe('');
+            expect(glibcMin([path.join(tmp, 'missing')]).code).not.toBe(0);
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+        }
+    });
+});

@@ -20,7 +20,7 @@ description: |-
 overrides:
   deb:
     depends:
-      - libc6 (>= 2.35)
+      - libc6 (>= ${GLIBC_MIN})
       - libgcc-s1
       - libxkbcommon0
       - libvulkan1 | libegl1
@@ -39,6 +39,7 @@ overrides:
       - xdg-desktop-portal
   rpm:
     depends:
+      - glibc >= ${GLIBC_MIN}
       - libxkbcommon
       - (vulkan-loader or libglvnd-egl)
       - fuse3

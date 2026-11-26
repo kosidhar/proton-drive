@@ -4,6 +4,9 @@ release/
 build/
 native-gui/target/
 native-vfs/target/
+# the portable (Ubuntu 22.04) builds, see packaging/linux/build-portable.sh
+native-gui/target-portable/
+native-vfs/target-portable/
 *.deb
 *.sqlite
 *.sqlite-shm

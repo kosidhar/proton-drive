@@ -77,6 +77,8 @@ This outputs all 4 universal release artifacts to `./dist/release/`:
 - `dist/release/kosidhar-protondrive-<version>-linux-x86_64.rpm`
 - `dist/release/kosidhar-protondrive-<version>-linux-x86_64.tar.gz`
 
+It needs docker: the app and the drive helper are built in an Ubuntu 22.04 container (`packaging/linux/build-portable.sh`), so the packages run on glibc 2.35 and newer (Ubuntu 22.04, Debian 12 and later). The packages declare the newest glibc their binaries need, and the build stops if that is newer than 2.35. For a quick local build without docker, pass `--native` (and `--allow-newer-glibc` if your system's glibc is newer than 2.35): those packages only run on systems as new as yours.
+
 ### Option A: Universal Per-User Install (Any Distro, No Root Needed)
 
 ```bash

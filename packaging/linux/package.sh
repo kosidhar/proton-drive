@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 # Build and package Proton Drive for Linux (<arch> is x86_64 or aarch64):
 #
-#   $DIST/kosidhar-protondrive-<version>-linux-<arch>.AppImage  any distro with glibc >= host
+#   $DIST/kosidhar-protondrive-<version>-linux-<arch>.AppImage  any distro with glibc 2.35 or newer
 #   $DIST/kosidhar-protondrive-<version>-linux-<deb_arch>.deb   Debian, Ubuntu, Mint, Pop!_OS, Zorin, ...
 #   $DIST/kosidhar-protondrive-<version>-linux-<arch>.rpm       Fedora, openSUSE, RHEL, Rocky, Alma, ...
 #   $DIST/kosidhar-protondrive-<version>-linux-<arch>.tar.gz    portable FHS tree + universal install.sh
 #
-# Usage: packaging/linux/package.sh [--skip-build] [--formats "appimage deb rpm tar"]
+# Usage: packaging/linux/package.sh [--skip-build] [--native] [--allow-newer-glibc] [--formats "appimage deb rpm tar"]
+#
+# The app (protondrive-gui) and the drive helper (protondrive-vfs) are built in an Ubuntu 22.04 container
+# (build-portable.sh, needs docker), so the packages run on glibc 2.35 and newer: Ubuntu 22.04, Debian 12 and later.
+# The packages declare the newest glibc their binaries need, and the build stops if that is newer than 2.35.
+#
+#   --native             build them on this machine instead, for local testing: they then need this machine's glibc
+#   --allow-newer-glibc  package binaries that need a glibc newer than 2.35 anyway (as a --native build may)
 set -euo pipefail
 
 export PATH="$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.local/bin:$PATH"
@@ -18,14 +25,20 @@ VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["vers
 BUILD_DATE="$(date -u +%Y-%m-%d)"
 DIST="$ROOT/dist/release"
 CARGO_TARGET_DIR="$ROOT/native-gui/target"
+# The newest glibc a release package may need: Ubuntu 22.04's (#505)
+GLIBC_LIMIT=2.35
 
 SKIP_BUILD=0
+NATIVE=0
+ALLOW_NEWER_GLIBC=0
 FORMATS="appimage deb rpm tar"
 while [ $# -gt 0 ]; do
   case "$1" in
     --skip-build) SKIP_BUILD=1; shift ;;
+    --native) NATIVE=1; shift ;;
+    --allow-newer-glibc) ALLOW_NEWER_GLIBC=1; shift ;;
     --formats) FORMATS="$2"; shift 2 ;;
-    -h | --help) sed -n '2,10p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -37,6 +50,14 @@ case "$ARCH" in
   *) echo "unsupported architecture $ARCH" >&2; exit 2 ;;
 esac
 
+# The portable build runs in docker: say so before building anything
+if [ "$SKIP_BUILD" = 0 ] && [ "$NATIVE" = 0 ] && ! command -v docker >/dev/null 2>&1; then
+  echo "error: docker is needed to build the app and the drive helper for glibc $GLIBC_LIMIT (Ubuntu 22.04)." >&2
+  echo "       Install docker, or pass --native to build them on this machine for local testing" \
+    "(the packages then need this machine's glibc, so add --allow-newer-glibc if it is newer)." >&2
+  exit 1
+fi
+
 export PROTONDRIVE_MAINTAINER="${PROTONDRIVE_MAINTAINER:-Gautam Chauhan <gautam@linux.local>}"
 BASENAME="kosidhar-protondrive-$VERSION-linux-$ARCH"
 mkdir -p "$DIST" "$ROOT/release" "$CARGO_TARGET_DIR"
@@ -46,12 +67,17 @@ echo "==> Proton Drive $VERSION for Linux $ARCH ($FORMATS)"
 if [ "$SKIP_BUILD" = 0 ]; then
   echo "==> Building sync daemon & CLI (Bun standalone binary)..."
   (cd "$ROOT" && bun "$ROOT/scripts/build.ts")
-  echo "==> Building native Rust desktop GUI (protondrive-gui)..."
-  (cd "$ROOT/native-gui" && cargo build --release)
-  install -Dm755 "$CARGO_TARGET_DIR/release/protondrive-gui" "$ROOT/release/protondrive-gui"
-  echo "==> Building virtual drive helper (protondrive-vfs)..."
-  (cd "$ROOT/native-vfs" && cargo build --release)
-  install -Dm755 "$ROOT/native-vfs/target/release/protondrive-vfs" "$ROOT/release/protondrive-vfs"
+  if [ "$NATIVE" = 1 ]; then
+    echo "==> Building native Rust desktop GUI (protondrive-gui) on this machine..."
+    (cd "$ROOT/native-gui" && cargo build --release)
+    install -Dm755 "$CARGO_TARGET_DIR/release/protondrive-gui" "$ROOT/release/protondrive-gui"
+    echo "==> Building virtual drive helper (protondrive-vfs) on this machine..."
+    (cd "$ROOT/native-vfs" && cargo build --release)
+    install -Dm755 "$ROOT/native-vfs/target/release/protondrive-vfs" "$ROOT/release/protondrive-vfs"
+  else
+    echo "==> Building native Rust desktop GUI and virtual drive helper for glibc $GLIBC_LIMIT..."
+    "$HERE/build-portable.sh"
+  fi
 fi
 
 WORK="$CARGO_TARGET_DIR/linux-package"
@@ -64,6 +90,19 @@ install -Dm755 "$ROOT/release/protondrive" "$STAGE/usr/bin/protondrive"
 install -Dm755 "$ROOT/release/protondrive-gui" "$STAGE/usr/bin/protondrive-gui"
 install -Dm755 "$ROOT/release/protondrive-vfs" "$STAGE/usr/bin/protondrive-vfs"
 strip "$STAGE/usr/bin/protondrive-gui" "$STAGE/usr/bin/protondrive-vfs" 2>/dev/null || true
+
+# The packages declare the newest glibc any of their binaries needs (nfpm.yaml), which must not pass $GLIBC_LIMIT
+GLIBC_MIN="$("$HERE/glibc-min.sh" "$STAGE/usr/bin/protondrive" "$STAGE/usr/bin/protondrive-gui" "$STAGE/usr/bin/protondrive-vfs")"
+if [ "$(printf '%s\n' "$GLIBC_MIN" "$GLIBC_LIMIT" | sort -V | tail -n 1)" != "$GLIBC_LIMIT" ]; then
+  if [ "$ALLOW_NEWER_GLIBC" = 0 ]; then
+    echo "error: the binaries need glibc $GLIBC_MIN, newer than the $GLIBC_LIMIT (Ubuntu 22.04) release packages support." >&2
+    echo "       Build them without --native, or pass --allow-newer-glibc for packages that need glibc $GLIBC_MIN." >&2
+    exit 1
+  fi
+  echo "warning: the packages need glibc $GLIBC_MIN, newer than $GLIBC_LIMIT (--allow-newer-glibc)" >&2
+fi
+echo "==> The binaries need glibc $GLIBC_MIN or newer"
+export GLIBC_MIN
 
 install -Dm644 "$HERE/$APP_ID.desktop" "$STAGE/usr/share/applications/$APP_ID.desktop"
 install -Dm644 "$HERE/$APP_ID.OpenDoc.desktop" "$STAGE/usr/share/applications/$APP_ID.OpenDoc.desktop"
