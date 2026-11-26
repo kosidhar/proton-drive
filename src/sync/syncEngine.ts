@@ -5931,11 +5931,12 @@ export class ProtonDriveSyncEngine {
         // Everything else in a folder being deleted goes to the Proton Drive trash, item by item.
         const collisions = ignored || onlyIfEmpty ? [] : await this.collisionsAt(relPath, entry, local);
         const collision = collisions.length > 0;
-        const toTrash = ignored
-            ? new Map<string, string>()
-            : collision && !otherNode
-              ? this.trashTargetsKeeping(relPath, collisions)
-              : this.trashTargets(relPath, otherNode ? null : ownEntry);
+        const toTrash =
+            ignored || (collision && otherNode)
+                ? new Map<string, string>()
+                : collision
+                  ? this.trashTargetsKeeping(relPath, collisions)
+                  : this.trashTargets(relPath, otherNode ? null : ownEntry);
         const keptCloud = otherKind ?? otherNode;
         for (const kept of keptCloud ? this.index.listSubtree(keptCloud.relPath) : []) {
             toTrash.delete(kept.uid);

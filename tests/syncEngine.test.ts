@@ -10312,6 +10312,29 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(d.nodes.has('vol~Docs/E')).toBe(true);
                     await d.expectEveryRecordHasItsFile();
                 });
+
+                test('unlink of a conflicted file whose recorded node is unindexed while a new cloud file G sits at its path trashes neither node', async () => {
+                    const d = setup();
+                    d.add('Docs/a.txt', 'cloud-f');
+                    await pinnedAndSynced(d, d.add('Docs').uid);
+                    const rec = stateDb.getItemByPath('Docs/a.txt')!;
+                    stateDb.upsertItem({ ...rec, syncStatus: 'conflict' });
+                    // vol~Docs/a.txt is temporarily absent from remoteIndex while vol~G sits at Docs/a.txt
+                    d.engine.remoteIndex.removeSubtree('vol~Docs/a.txt');
+                    addOtherNode(d, 'vol~G', 'vol~Docs', 'a.txt', 'cloud-g');
+                    const w = journalling(d);
+
+                    await d.engine.deleteItem('Docs/a.txt');
+
+                    expect(w.journalled()).toEqual([]);
+                    expect(await d.files.exists('Docs/a.txt')).toBe(false);
+                    expect(d.engine.remoteIndex.getByPath('Docs/a.txt')?.uid).toBe('vol~G');
+                    await d.engine.replayRemoteOps();
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('cloud-f');
+                    expect(d.nodes.get('vol~G')?.content).toBe('cloud-g');
+                    await d.expectEveryRecordHasItsFile();
+                });
             });
         });
 
