@@ -1,0 +1,71 @@
+# Every check from CLAUDE.md, on each pull request and on pushes to main (#518). main's protection requires these jobs.
+# The helper's real-mount tests stay off: they need /dev/fuse and fusermount3.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The Rust version the release container builds with (packaging/linux/build-env/Dockerfile)
+  RUST_VERSION: 1.99.1
+  BUN_VERSION: 1.4.3
+  CARGO_TERM_COLOR: always
+
+jobs:
+  daemon:
+    name: Daemon (bun test, tsc)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Install the tools the tests call
+        # xmllint: the Docs and Sheets icons must be well-formed XML (#439)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libxml2-utils
+      - run: bun install --frozen-lockfile
+      - run: bunx tsc --noEmit
+      - run: bun test tests
+
+  rust:
+    name: Rust (${{ matrix.crate }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [native-gui, native-vfs]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy
+          rustup default "$RUST_VERSION"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: ${{ matrix.crate }}
+      - name: cargo test
+        working-directory: ${{ matrix.crate }}
+        run: cargo test
+      - name: cargo clippy
+        working-directory: ${{ matrix.crate }}
+        run: cargo clippy --all-targets -- -D warnings
+
+  python:
+    name: Files extension and tray (python)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 linux/nautilus/test_proton_drive_nautilus.py
+      - run: python3 linux/tray/test_proton_drive_tray.py
