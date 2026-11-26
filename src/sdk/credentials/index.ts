@@ -8,6 +8,8 @@ import { PassSessionStore } from './passCredentialsStore';
 import { SecretsSessionStore } from './secretCredentialsStore';
 
 export type { Credentials } from './credentials';
+export { describeSessionFields, describeSessionLocation, NO_FILE_SESSION_ENV, sessionFields } from './sessionLocation';
+export type { SessionLocation } from './sessionLocation';
 
 export function initCredentials(config: Config, logger: Logger): Credentials {
     const credentialsStore = createAuthSessionStore(config, logger);
@@ -22,7 +24,7 @@ function createAuthSessionStore(config: Config, logger: Logger): CredentialsStor
         case 'pass':
             return new PassSessionStore(logger);
         case 'keychain':
-            return new SecretsSessionStore(logger, fileFallback);
+            return new SecretsSessionStore(logger, fileFallback, { refuseFile: config.noFileSession });
         default:
             throw new Error(`Invalid credentials store: ${config.credentialsStore}`);
     }

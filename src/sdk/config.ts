@@ -58,6 +58,8 @@ export interface Config {
 
     /** Where to persist the authenticated session. */
     credentialsStore: CredentialsStoreType;
+    /** PROTONDRIVE_NO_FILE_SESSION: with no keyring, refuse to save the session to a file. */
+    noFileSession: boolean;
     /** Only for testing: store cryptographic cache unencrypted. */
     unsafeCache: boolean;
 }
@@ -92,6 +94,7 @@ export function getConfig(options: InitConfig): Config {
         logLevel,
         sdkLogLevel,
         credentialsStore: parseCredentialsStore(process.env.PROTON_DRIVE_CREDENTIALS_STORE),
+        noFileSession: parseBooleanEnv(process.env.PROTONDRIVE_NO_FILE_SESSION),
         unsafeCache: parseBooleanEnv(process.env.PROTON_DRIVE_UNSAFE_CACHE),
     };
 }

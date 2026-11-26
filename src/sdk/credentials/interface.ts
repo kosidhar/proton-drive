@@ -1,5 +1,7 @@
 import type { SessionInfo } from 'proton-drive-sdk-account';
 
+import type { SessionLocation } from './sessionLocation';
+
 export type { SessionInfo };
 
 export type Credentials = {
@@ -13,6 +15,8 @@ export type Credentials = {
 };
 
 export interface CredentialsStore {
+    /** Where the session is kept now, once known (after a load or save that touched it); absent means the keyring. */
+    location?(): SessionLocation | null;
     load(): Promise<Credentials | null>;
     save(snapshot: Credentials): Promise<void>;
     remove(): Promise<void>;

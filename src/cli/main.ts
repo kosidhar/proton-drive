@@ -18,6 +18,9 @@ import {
     listFolderChildren,
     openBrowserUrl,
     PathType,
+    describeSessionFields,
+    describeSessionLocation,
+    sessionFields,
     THIRD_PARTY_DISCLOSURE,
     uploadLocalFileToDrive,
 } from '../sdk';
@@ -115,6 +118,12 @@ async function createStandaloneRuntime(verbose = false) {
         enableConsoleLog: verbose,
         enableMetrics: false,
     });
+}
+
+// The line under "Account:" saying where the session is kept; nothing when signed out or unknown
+function printSessionNote(storage: string | null | undefined, filePath: string | null | undefined, indent = '              '): void {
+    const note = describeSessionFields(storage, filePath);
+    if (note) console.log(`${indent}${note}`);
 }
 
 function printHelp(): void {
@@ -248,6 +257,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
                 console.log(`Notice:       ${THIRD_PARTY_DISCLOSURE}`);
                 console.log(`Daemon:       Running (${DAEMON_BASE_URL})`);
                 console.log(`Account:      ${status.loggedIn ? 'Signed In' : 'Not Signed In'}`);
+                printSessionNote(status.sessionStorage, status.sessionPath);
                 console.log(`Sync State:   ${status.state}`);
                 console.log(`Sync Folder:  ${status.syncDir}`);
                 console.log(`Synced Files: ${status.stats.totalFiles} (${formatBytes(status.stats.totalBytes)})`);
@@ -263,9 +273,11 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
             const settings = stateDb.getSettings();
             const stats = stateDb.getSummaryStats();
             const loggedIn = runtime.auth.isLoggedIn();
+            const location = loggedIn ? runtime.credentials.sessionLocation() : null;
             const payload = {
                 daemonRunning: false,
                 loggedIn,
+                ...sessionFields(location),
                 syncDir: settings.syncDir,
                 paused: settings.paused,
                 stats,
@@ -277,6 +289,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
                 console.log(`Notice:       ${THIRD_PARTY_DISCLOSURE}`);
                 console.log(`Daemon:       Stopped (run 'protondrive daemon' to start)`);
                 console.log(`Account:      ${loggedIn ? 'Signed In' : 'Not Signed In'}`);
+                printSessionNote(payload.sessionStorage, payload.sessionPath);
                 console.log(`Sync Folder:  ${settings.syncDir}`);
                 console.log(`Synced Files: ${stats.totalFiles} (${formatBytes(stats.totalBytes)})`);
                 console.log(`Folders:      ${stats.totalFolders}`);
@@ -373,11 +386,13 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
         try {
             if (sub === 'status') {
                 const loggedIn = runtime.auth.isLoggedIn();
+                const fields = sessionFields(loggedIn ? runtime.credentials.sessionLocation() : null);
                 if (jsonFlag) {
-                    console.log(JSON.stringify({ loggedIn, disclosure: THIRD_PARTY_DISCLOSURE }, null, 2));
+                    console.log(JSON.stringify({ loggedIn, ...fields, disclosure: THIRD_PARTY_DISCLOSURE }, null, 2));
                 } else {
                     console.log(`Notice: ${THIRD_PARTY_DISCLOSURE}`);
-                    console.log(`Status: ${loggedIn ? 'Signed In (OS Keyring)' : 'Signed Out'}`);
+                    console.log(`Status: ${loggedIn ? (fields.sessionStorage === 'file' ? 'Signed In (session in a file)' : 'Signed In (OS Keyring)') : 'Signed Out'}`);
+                    printSessionNote(fields.sessionStorage, fields.sessionPath, '');
                 }
                 return;
             }
@@ -392,7 +407,13 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
                     console.log('Complete sign-in in your browser. Waiting for authentication...');
                     console.log(`If the browser did not open, visit:\n${signInUrl}`);
                 });
-                console.log('Authentication successful! Session saved to OS secret store.');
+                const saved = runtime.credentials.sessionLocation();
+                console.log(
+                    saved?.storage === 'file'
+                        ? 'Authentication successful! Session saved to a file.'
+                        : 'Authentication successful! Session saved to OS secret store.',
+                );
+                if (saved) console.log(describeSessionLocation(saved));
                 return;
             }
             if (sub === 'logout') {

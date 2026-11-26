@@ -14,6 +14,7 @@ import {
     listFolderChildren,
     openBrowserUrl,
     PathType,
+    sessionFields,
     THIRD_PARTY_DISCLOSURE,
 } from '../sdk';
 import { migrateExcludedFolders } from '../sync/availabilityMigration';
@@ -419,6 +420,8 @@ export async function startSyncDaemon(options: {
                         vfs: drive.status(),
                         virtualDriveWanted: virtualDriveWanted(stateDb),
                         account: cachedAccount,
+                        // Where the session is kept: 'keyring' or 'file' (with its path), null when signed out (#537)
+                        ...sessionFields(runtime.auth.isLoggedIn() ? runtime.credentials.sessionLocation() : null),
                         appVersion: runtime.config.appVersion,
                         sdkVersion: runtime.config.sdkVersion,
                         disclosure: THIRD_PARTY_DISCLOSURE,

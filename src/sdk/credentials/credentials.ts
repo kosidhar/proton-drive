@@ -1,10 +1,12 @@
 import { randomBytes } from 'node:crypto';
+import { SessionFileRefusedError } from './sessionLocation';
 
 import { Logger } from '@protontech/drive-sdk';
 
 import type { SessionCredentials, SessionInfo } from 'proton-drive-sdk-account';
 
 import type { CredentialsStore } from './interface';
+import type { SessionLocation } from './sessionLocation';
 
 export class Credentials implements SessionCredentials {
     private cachePassword?: string;
@@ -25,6 +27,11 @@ export class Credentials implements SessionCredentials {
 
     isLoggedIn(): boolean {
         return !!this.userKeyPassword && !!this.sessionInfo;
+    }
+
+    /** Where the session is kept; null when there is none. A store that does not say is the keyring. */
+    sessionLocation(): SessionLocation | null {
+        return this.store.location ? this.store.location() : { storage: 'keyring' };
     }
 
     isTelemetryEnabled(): boolean {
@@ -101,10 +108,25 @@ export class Credentials implements SessionCredentials {
         if (!this.userKeyPassword || !this.sessionInfo) {
             return;
         }
+        try {
+            await this.saveSnapshot(this.userKeyPassword, this.sessionInfo);
+        } catch (error) {
+            // The user chose no stored session over a file (PROTONDRIVE_NO_FILE_SESSION) and there's no keyring: the
+            // session must not live on in memory either, or the app would say signed in after saying it is not (#537)
+            if (error instanceof SessionFileRefusedError) {
+                this.userKeyPassword = undefined;
+                this.sessionInfo = undefined;
+                this.notifySessionInfoChanged();
+            }
+            throw error;
+        }
+    }
+
+    private async saveSnapshot(userKeyPassword: string, session: SessionInfo): Promise<void> {
         await this.store.save({
             cachePassword: this.cachePassword,
-            userKeyPassword: this.userKeyPassword,
-            session: this.sessionInfo,
+            userKeyPassword,
+            session,
             telemetryEnabled: this.telemetryEnabled,
         });
     }

@@ -16,7 +16,9 @@ one is ready. You'll be credited in the release notes unless you'd rather not be
 ## What counts
 
 - **Your Proton session:** how the app gets it, stores it (the system keyring, or a file only you can read when
-  there's no keyring) and uses it.
+  there's no keyring) and uses it. Without a keyring the session is a plain file that anything running as you can
+  read; the app says so (in the log, in Settings, and in `protondrive auth status`), and `PROTONDRIVE_NO_FILE_SESSION=1`
+  makes it refuse the file and stay signed out instead.
 - **The app's local interfaces:** the daemon's API on `127.0.0.1` and its control socket. That means anything that lets
   a web page, another program or another user on the computer read your files or account, or act on them.
 - **The virtual drive helper, and the Files and tray extensions.**

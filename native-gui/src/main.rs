@@ -388,6 +388,12 @@ struct DaemonStatus {
     /// clears it itself. Older daemons send none.
     #[serde(default)]
     disk_full: Option<DiskFull>,
+    /// Where the daemon keeps the session: "keyring" or "file" (#537); absent from older daemons, and null signed out
+    #[serde(default)]
+    session_storage: Option<String>,
+    /// With "file": the file's path
+    #[serde(default)]
+    session_path: Option<String>,
 }
 
 /// `diskFull` in /api/status: when the drive last refused a write or open for the disk's sake, epoch milliseconds.
@@ -10141,6 +10147,44 @@ mod tests {
         h.event(WorkerEvent::StatusAndActivity { status: Box::new(Ok(status)), activity: Vec::new() });
         assert!(!h.app.account_menu_open);
         assert!(h.text_at("Sign out").is_none());
+    }
+
+    #[test]
+    fn settings_says_when_the_session_is_kept_in_a_file() {
+        const NOTE: &str = "Your session is saved in a file because no keyring was found";
+        let mut h = Harness::new();
+        h.app.status.logged_in = true;
+        h.app.status.account = Some(gautam());
+        h.app.open_tab(NavTab::Settings);
+        h.frames(3);
+        // An older daemon sends nothing, and the keyring is the quiet case: no line
+        assert!(h.text_rect_starting("Your session is saved").is_none());
+        h.app.status.session_storage = Some("keyring".into());
+        h.frames(3);
+        assert!(h.text_rect_starting("Your session is saved").is_none());
+        // A file: the line shows, once
+        h.app.status.session_storage = Some("file".into());
+        h.app.status.session_path = Some("/home/u/.local/share/proton-drive-ubuntu/auth-session.json".into());
+        h.frames(3);
+        assert_eq!(h.text_rects_all(NOTE).len(), 1);
+        // Signed out: the session is gone, so the line is too
+        h.app.status.logged_in = false;
+        h.app.status.account = None;
+        h.frames(3);
+        assert!(h.text_rect_starting("Your session is saved").is_none());
+    }
+
+    #[test]
+    fn the_session_fields_are_optional_in_the_status() {
+        let base = r#"{"state":"idle","loggedIn":true,"syncDir":"/x","activeTransfers":[],"stats":{"totalFiles":0,"totalFolders":0,"totalBytes":0,"unresolvedConflicts":0,"errorItems":0},"settings":{}"#;
+        let old: DaemonStatus = serde_json::from_str(&format!("{base}}}")).unwrap();
+        assert!(old.session_storage.is_none() && old.session_path.is_none());
+        let new: DaemonStatus =
+            serde_json::from_str(&format!(r#"{base},"sessionStorage":"file","sessionPath":"/p/auth-session.json"}}"#)).unwrap();
+        assert_eq!(new.session_storage.as_deref(), Some("file"));
+        assert_eq!(new.session_path.as_deref(), Some("/p/auth-session.json"));
+        let signed_out: DaemonStatus = serde_json::from_str(&format!(r#"{base},"sessionStorage":null,"sessionPath":null}}"#)).unwrap();
+        assert!(signed_out.session_storage.is_none());
     }
 
     #[test]
