@@ -41,9 +41,9 @@ The app icon (`assets/app-icon/hicolor/`), the tray icons (`assets/app-icon/tray
 
 ## Proton Docs and Sheets icons
 
-- What it is: the icons Files shows for Proton Docs (`*.protondoc`) and Proton Sheets (`*.protonsheet`) placeholder files, the blue Docs icon and the green Sheets icon.
+- What it is: the icons Files shows for Proton Docs (`*.protondoc`) and Proton Sheets (`*.protonsheet`) placeholder files: Proton's square blue Docs and green Sheets logos, as Proton's apps menu shows them.
 - Where: `assets/mimetypes/application-vnd.proton.doc.svg` and `assets/mimetypes/application-vnd.proton.sheet.svg`, installed to `share/icons/hicolor/scalable/mimetypes/`
-- Source: the `mime-lg-proton-doc` and `mime-lg-proton-sheet` symbols of `packages/file-icons/assets/file-icons.svg` in https://github.com/ProtonMail/WebClients
+- Source: the logo glyphs in `packages/components/components/logo/DocsLogo.tsx` (its `glyph-only` variant) and `packages/components/components/logo/SheetsLogo.tsx` in https://github.com/ProtonMail/WebClients, converted from JSX to standalone SVG with the path data unchanged, each cropped to a square with the same margin
 - License: GPL-3.0 (the license of that repository); the text is at `assets/mimetypes/LICENSE`
 - These icons are Proton AG's artwork and trademark. They are not covered by this repository's MIT license, and they are the reason the packages declare `MIT AND GPL-3.0-only`. To redistribute or modify this project without them, delete `assets/mimetypes/` and the lines that install it.
 

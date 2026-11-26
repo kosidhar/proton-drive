@@ -1,4 +1,4 @@
-The two Proton icons in this folder come from ProtonMail/WebClients packages/file-icons and are Proton AG's artwork, used under GPL-3.0 (text below).
+The two Proton icons in this folder are the Docs and Sheets logo glyphs from ProtonMail/WebClients packages/components/components/logo (DocsLogo.tsx, SheetsLogo.tsx), converted to SVG, and are Proton AG's artwork, used under GPL-3.0 (text below).
 
                     GNU GENERAL PUBLIC LICENSE
                        Version 3, 29 June 2007

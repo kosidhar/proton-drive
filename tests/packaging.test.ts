@@ -208,13 +208,15 @@ describe('Docs and Sheets file types', () => {
             }
         });
 
+        // Proton's square Docs and Sheets logo glyphs (#473), as the website's app switcher shows them, converted from
+        // JSX to SVG with their path data unchanged
         test('the icons stay byte for byte what was taken from upstream', () => {
             const sha = (name: string): string =>
                 new Bun.CryptoHasher('sha256')
                     .update(readFileSync(path.join(root, 'assets', 'mimetypes', `${name}.svg`)))
                     .digest('hex');
-            expect(sha('application-vnd.proton.doc')).toBe('9b008fcefc5d19247dc5032352205afaf38db795eb8ce9948a6a26fe248d5e59');
-            expect(sha('application-vnd.proton.sheet')).toBe('81ec64f5420e9a4ff5324e6d5c9a1a02cc5aecccf8a4a142cb89b39672391c0f');
+            expect(sha('application-vnd.proton.doc')).toBe('f2d4c1f66c11fa86ea567be7bd610d34b80c8203991aba6bb374eb49c067f4a8');
+            expect(sha('application-vnd.proton.sheet')).toBe('18b9a2ca8bfd4a7c5f97cd197ac604a20cd246a7932d7e5e769ede150de9d951');
         });
 
         describe('the license texts ship with every package', () => {
