@@ -9020,6 +9020,200 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(d.calls.trashed).toEqual([['vol~Cloud/a.txt']]);
                 });
             });
+
+            // #466: a move of a child out of the folder that is given up on while the rmdir's listing is on its way
+            // leaves the child in the folder in Proton Drive, even while followCloudAfterGivingUp's getNode is still
+            // running or if that getNode fails. The folder must be kept (ENOTEMPTY) and nothing trashed.
+            describe('a move that is given up on while the listing is on its way (#466)', () => {
+                // Online-only Cloud/a.txt and Other; user moves Cloud/a.txt to Other/a.txt while moveNodes refuses it,
+                // leaving it at 2 failed attempts so the next replayRemoteOps gives up on the 3rd attempt.
+                const pendingMoveAboutToGiveUp = async () => {
+                    const d = setup();
+                    d.add('Cloud/a.txt', 'a');
+                    d.add('Other');
+                    await d.engine.reconcileNow();
+                    const realMoveNodes = (d.sdk as any).moveNodes;
+                    let refusals = 0;
+                    (d.sdk as any).moveNodes = async function* () {
+                        refusals += 1;
+                        yield { uid: 'vol~Cloud/a.txt', ok: false, error: new APIHTTPError('Unprocessable Entity', 422) };
+                    };
+                    await d.engine.renameItem('Cloud/a.txt', 'Other/a.txt');
+                    await (d.engine as any).replayRun; // let renameItem's replay settle (attempt 1)
+                    while ((d.journal()[0]?.attempts ?? 0) < 2) {
+                        await d.engine.replayRemoteOps();
+                    }
+                    expect(d.journal()).toMatchObject([{ kind: 'move', nodeUid: 'vol~Cloud/a.txt', toPath: 'Other/a.txt', attempts: 2 }]);
+                    expect(d.engine.remoteIndex.getByUid('vol~Cloud/a.txt')?.parentUid).toBe('vol~Other');
+                    return Object.assign(d, { refusals: () => refusals, restoreMoveNodes: () => ((d.sdk as any).moveNodes = realMoveNodes) });
+                };
+
+                test('given up on while followCloudAfterGivingUp is still awaiting getNode: ENOTEMPTY and nothing trashed', async () => {
+                    const d = await pendingMoveAboutToGiveUp();
+                    const realGetNode = d.sdk.getNode.bind(d.sdk);
+                    let releaseGetNode!: () => void;
+                    let getNodeStarted!: () => void;
+                    const getNodeInFlight = new Promise<void>((resolve) => {
+                        getNodeStarted = resolve;
+                    });
+                    const gate = new Promise<void>((resolve) => {
+                        releaseGetNode = resolve;
+                    });
+                    d.sdk.getNode = async (uid: string) => {
+                        if (d.refusals() >= 3 && uid === 'vol~Cloud/a.txt') {
+                            getNodeStarted();
+                            await gate;
+                        }
+                        return realGetNode(uid);
+                    };
+
+                    const realList = (d.sdk as any).iterateFolderChildren;
+                    let replayPromise: Promise<void> | null = null;
+                    let once = true;
+                    (d.sdk as any).iterateFolderChildren = async function* (parent: unknown) {
+                        const listed: unknown[] = [];
+                        for await (const child of realList(parent)) listed.push(child);
+                        if (once) {
+                            once = false;
+                            // Triggers the 3rd attempt: journal.complete runs, then followCloudAfterGivingUp pauses on getNode
+                            replayPromise = d.engine.replayRemoteOps();
+                            await getNodeInFlight;
+                            expect(d.journal()).toEqual([]);
+                            expect(d.engine.remoteIndex.getByUid('vol~Cloud/a.txt')?.parentUid).toBe('vol~Other');
+                        }
+                        yield* listed;
+                    };
+
+                    try {
+                        expect(await rmdir(d)).toBe('ENOTEMPTY');
+                    } finally {
+                        releaseGetNode();
+                        await replayPromise;
+                    }
+
+                    expect(d.journal()).toEqual([]);
+                    await d.engine.replayRemoteOps();
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.nodes.has('vol~Cloud')).toBe(true);
+                    expect(d.nodes.get('vol~Cloud/a.txt')?.parentUid).toBe('vol~Cloud');
+                    expect(d.engine.remoteIndex.getByUid('vol~Cloud/a.txt')?.parentUid).toBe('vol~Cloud');
+                });
+
+                test('given up on and followCloudAfterGivingUp getNode fails: ENOTEMPTY and nothing trashed', async () => {
+                    const d = await pendingMoveAboutToGiveUp();
+                    const realGetNode = d.sdk.getNode.bind(d.sdk);
+                    d.sdk.getNode = async (uid: string) => {
+                        if (d.refusals() >= 3 && uid === 'vol~Cloud/a.txt') {
+                            throw new Error('network down');
+                        }
+                        return realGetNode(uid);
+                    };
+
+                    const realList = (d.sdk as any).iterateFolderChildren;
+                    let once = true;
+                    (d.sdk as any).iterateFolderChildren = async function* (parent: unknown) {
+                        const listed: unknown[] = [];
+                        for await (const child of realList(parent)) listed.push(child);
+                        if (once) {
+                            once = false;
+                            // Give up on the move; getNode fails inside followCloudAfterGivingUp, leaving index at Other
+                            await d.engine.replayRemoteOps();
+                            expect(d.journal()).toEqual([]);
+                            expect(d.engine.remoteIndex.getByUid('vol~Cloud/a.txt')?.parentUid).toBe('vol~Other');
+                        }
+                        yield* listed;
+                    };
+
+                    expect(await rmdir(d)).toBe('ENOTEMPTY');
+
+                    expect(d.journal()).toEqual([]);
+                    await d.engine.replayRemoteOps();
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.nodes.has('vol~Cloud')).toBe(true);
+                    expect(d.nodes.get('vol~Cloud/a.txt')?.parentUid).toBe('vol~Cloud');
+                });
+
+                test('after a give-up whose getNode failed, once a crawl catches up and the child is moved out, rmdir succeeds', async () => {
+                    const d = await pendingMoveAboutToGiveUp();
+                    const realGetNode = d.sdk.getNode.bind(d.sdk);
+                    let failChildGetNode = true;
+                    d.sdk.getNode = async (uid: string) => {
+                        if (failChildGetNode && d.refusals() >= 3 && uid === 'vol~Cloud/a.txt') {
+                            throw new Error('network down');
+                        }
+                        return realGetNode(uid);
+                    };
+
+                    const realList = (d.sdk as any).iterateFolderChildren;
+                    let once = true;
+                    (d.sdk as any).iterateFolderChildren = async function* (parent: unknown) {
+                        const listed: unknown[] = [];
+                        for await (const child of realList(parent)) listed.push(child);
+                        if (once) {
+                            once = false;
+                            await d.engine.replayRemoteOps();
+                        }
+                        yield* listed;
+                    };
+
+                    expect(await rmdir(d)).toBe('ENOTEMPTY');
+                    expect(d.calls.trashed).toEqual([]);
+
+                    // Network recovers: crawl puts a.txt back in Cloud, then a real move succeeds during rmdir's listing
+                    failChildGetNode = false;
+                    (d.sdk as any).iterateFolderChildren = realList;
+                    await d.engine.reconcileNow();
+                    expect(d.engine.remoteIndex.getByUid('vol~Cloud/a.txt')?.parentUid).toBe('vol~Cloud');
+
+                    d.restoreMoveNodes();
+                    d.down.add('moveNodes');
+                    await d.engine.renameItem('Cloud/a.txt', 'Other/a.txt');
+                    let replayOnce = true;
+                    (d.sdk as any).iterateFolderChildren = async function* (parent: unknown) {
+                        const listed: unknown[] = [];
+                        for await (const child of realList(parent)) listed.push(child);
+                        if (replayOnce) {
+                            replayOnce = false;
+                            d.down.delete('moveNodes');
+                            await d.engine.replayRemoteOps();
+                        }
+                        yield* listed;
+                    };
+
+                    expect(await rmdir(d)).toBeNull();
+                    await d.engine.replayRemoteOps();
+                    expect(d.calls.trashed).toEqual([['vol~Cloud']]);
+                    expect(d.nodes.get('vol~Cloud/a.txt')?.parentUid).toBe('vol~Other');
+                });
+
+                test('control: a move that succeeds while the listing is on its way does not keep the folder', async () => {
+                    const d = setup();
+                    d.add('Cloud/a.txt', 'a');
+                    d.add('Other');
+                    await d.engine.reconcileNow();
+                    d.down.add('moveNodes');
+                    await d.engine.renameItem('Cloud/a.txt', 'Other/a.txt');
+                    const realList = (d.sdk as any).iterateFolderChildren;
+                    let once = true;
+                    (d.sdk as any).iterateFolderChildren = async function* (parent: unknown) {
+                        const listed: unknown[] = [];
+                        for await (const child of realList(parent)) listed.push(child);
+                        if (once) {
+                            once = false;
+                            d.down.delete('moveNodes');
+                            await d.engine.replayRemoteOps();
+                            expect(d.calls.moved).toEqual([{ uid: 'vol~Cloud/a.txt', parentUid: 'vol~Other' }]);
+                        }
+                        yield* listed;
+                    };
+
+                    expect(await rmdir(d)).toBeNull();
+
+                    await d.engine.replayRemoteOps();
+                    expect(d.calls.trashed).toEqual([['vol~Cloud']]);
+                    expect(d.nodes.get('vol~Cloud/a.txt')?.parentUid).toBe('vol~Other');
+                });
+            });
         });
 
         // #454: a delete through the drive trashes the node a record (or an edit baseline) names only where the remote
