@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { link, mkdir, rm, unlink } from 'node:fs/promises';
+import { link, lstat, mkdir, readdir, rm, unlink } from 'node:fs/promises';
 import path from 'node:path';
 
 import { MemberRole, NodeType, type Logger, type NodeEntity, type ProtonDriveClient } from '@protontech/drive-sdk';
@@ -17,6 +17,8 @@ type Role = 'viewer' | 'editor' | 'admin';
 
 export interface Invitation {
     invitationUid: string;
+    // The uid of the item it shares: the item it becomes once accepted
+    nodeUid: string;
     // null when the name can't be decrypted
     name: string | null;
     kind: SharedWithMeKind;
@@ -131,6 +133,24 @@ const FALLBACK_NAME = 'Shared file';
 const MAX_NAME_BYTES = 150;
 const MAX_NAME_TRIES = 10_000;
 export const TEMP_PREFIX = '.proton-drive-tmp-';
+// A download's temp in Downloads: a prefix of its own (the sync's temps share TEMP_PREFIX), then 16 hex digits
+export const DOWNLOAD_TEMP_PREFIX = `${TEMP_PREFIX}download-`;
+const DOWNLOAD_TEMP = /^\.proton-drive-tmp-download-[0-9a-f]{16}-./;
+// The temp downloadDriveNodeToLocal writes first, beside its target (src/sdk/fileOps.ts): its process's pid, then a uuid.
+// The sync's downloads are named so too
+const INNER_TEMP = /^\.proton-drive-tmp-([0-9]+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+// Whether no process has this pid. Only "no such process" says so: a process of another user, or a pid that can't be
+// asked about, keeps its files
+function processGone(pid: number): boolean {
+    if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+    try {
+        process.kill(pid, 0);
+        return false;
+    } catch (e) {
+        return (e as NodeJS.ErrnoException).code === 'ESRCH';
+    }
+}
 
 function safeName(name: string): string {
     // A name is the sender's text: no folder, no control character, never . or ..
@@ -169,6 +189,28 @@ const byDateThenName = (a: SharedWithMeItem, b: SharedWithMeItem) => {
 
 export function createSharedWithMeService(deps: SharedWithMeDeps): SharedWithMeService {
     const { sdk } = deps;
+    // The temps of this daemon's downloads under way, by path, and their sizes added up
+    const downloading = new Set<string>();
+    let bytesToCome = 0;
+
+    // The temps a daemon stopped mid-download left in Downloads (#492): in that folder only, never in one below it.
+    // Downloads may be in the sync folder, where the sync's temps share the prefix: a download's own temp goes when no
+    // download of this daemon is writing it, an inner one only when the process that wrote it is gone, and nothing else
+    // ever does. A failure leaves the file for the next sweep
+    async function sweepTemps(dir: string): Promise<void> {
+        const names = await readdir(dir).catch(() => [] as string[]);
+        for (const name of names) {
+            const full = path.join(dir, name);
+            const inner = INNER_TEMP.exec(name);
+            const stale = DOWNLOAD_TEMP.test(name) ? !downloading.has(full) : inner !== null && processGone(Number(inner[1]));
+            if (!stale) continue;
+            try {
+                if ((await lstat(full)).isFile()) await unlink(full);
+            } catch {
+                // Left for the next sweep
+            }
+        }
+    }
 
     const log = (details: string) => {
         try {
@@ -184,6 +226,7 @@ export function createSharedWithMeService(deps: SharedWithMeDeps): SharedWithMeS
             const { who, verified } = authorOf(i.addedByEmail);
             out.push({
                 invitationUid: i.uid,
+                nodeUid: i.node.uid,
                 name: nameOf(i.node.name),
                 kind: kindOf(i.node),
                 from: who,
@@ -300,13 +343,19 @@ export function createSharedWithMeService(deps: SharedWithMeDeps): SharedWithMeS
             }
             if (kindOf(node) !== 'file') throw new ShareError('Only files can be downloaded: open this one on drive.proton.me');
             const name = nameOf(node.name);
-            const size = node.activeRevision?.claimedSize ?? node.totalStorageSize ?? 0;
+            // The claimed size is the sender's word, and the stored one a little over the file's: the larger counts.
+            // Only the active revision's, which is what is downloaded (totalStorageSize counts every revision)
+            const revision = node.activeRevision;
+            const size = Math.max(revision?.claimedSize ?? 0, revision?.storageSize ?? 0);
 
             let dir: string;
             try {
                 dir = await deps.downloadsDir();
                 await mkdir(dir, { recursive: true });
-                if (size > (await deps.freeBytes(dir)) - LOCAL_RESERVE_BYTES) {
+                await sweepTemps(dir);
+                // The other downloads under way count in full, as if none of them were written yet: once they have
+                // begun, a little too much is counted, never too little
+                if (size > (await deps.freeBytes(dir)) - LOCAL_RESERVE_BYTES - bytesToCome) {
                     throw new ShareError("There isn't enough free space on this computer to download this file");
                 }
             } catch (e) {
@@ -319,32 +368,41 @@ export function createSharedWithMeService(deps: SharedWithMeDeps): SharedWithMeS
             // A fresh name nothing is at, so the download's own rename can't replace anything; placed with link(), which
             // fails where a file exists instead of replacing it, so a file of the user's is never overwritten, even by
             // a second download racing for the same name
-            const temp = path.join(dir, `${TEMP_PREFIX}${randomBytes(8).toString('hex')}-${safeName(name ?? FALLBACK_NAME)}`);
+            const temp = path.join(dir, `${DOWNLOAD_TEMP_PREFIX}${randomBytes(8).toString('hex')}-${safeName(name ?? FALLBACK_NAME)}`);
             let placed: string | undefined;
+            // Taken with no wait since the check, so a download checked after this one counts it; given back once the
+            // file is placed (then its bytes are on the disk) or its temp removed
+            bytesToCome += size;
+            downloading.add(temp);
             try {
-                await deps.fetchFile(node, temp);
-                let tries = 0;
-                for (const candidate of downloadNames(name ?? FALLBACK_NAME)) {
-                    if (++tries > MAX_NAME_TRIES) throw new ShareError('Too many files with this name in Downloads');
-                    const target = path.join(dir, candidate);
-                    try {
-                        await link(temp, target);
-                        placed = target;
-                        break;
-                    } catch (e) {
-                        if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+                try {
+                    await deps.fetchFile(node, temp);
+                    let tries = 0;
+                    for (const candidate of downloadNames(name ?? FALLBACK_NAME)) {
+                        if (++tries > MAX_NAME_TRIES) throw new ShareError('Too many files with this name in Downloads');
+                        const target = path.join(dir, candidate);
+                        try {
+                            await link(temp, target);
+                            placed = target;
+                            break;
+                        } catch (e) {
+                            if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+                        }
                     }
+                } catch (e) {
+                    await rm(temp, { force: true }).catch(() => {});
+                    const local = localFailure(e);
+                    if (local) {
+                        deps.logError?.(`Download: saving failed (${local.code})`);
+                        throw local.error;
+                    }
+                    throw plainError(e);
                 }
-            } catch (e) {
-                await rm(temp, { force: true }).catch(() => {});
-                const local = localFailure(e);
-                if (local) {
-                    deps.logError?.(`Download: saving failed (${local.code})`);
-                    throw local.error;
-                }
-                throw plainError(e);
+                await unlink(temp).catch(() => {});
+            } finally {
+                bytesToCome -= size;
+                downloading.delete(temp);
             }
-            await unlink(temp).catch(() => {});
             log(`Downloaded ${forLog(name)} to Downloads`);
             return { path: placed! };
         },

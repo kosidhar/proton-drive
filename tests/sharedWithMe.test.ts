@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, existsSync } from 'node:fs';
 import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { MemberRole, NodeType } from '@protontech/drive-sdk';
@@ -125,15 +126,16 @@ describe('shared with me: the list', () => {
         });
         const { invitations } = await service.list();
         expect(invitations).toEqual([
-            { invitationUid: 'unverified', name: 'Name unverified', kind: 'folder', from: 'x@proton.me', fromVerified: false, role: 'editor', invitedAt: Date.parse('2026-03-01T00:00:00Z') },
-            { invitationUid: 'anon', name: 'Name anon', kind: 'file', from: null, fromVerified: false, role: 'admin', invitedAt: Date.parse('2026-02-01T00:00:00Z') },
-            { invitationUid: 'old', name: 'Name old', kind: 'file', from: 'ann@proton.me', fromVerified: true, role: 'viewer', invitedAt: Date.parse('2026-01-01T00:00:00Z') },
+            { invitationUid: 'unverified', nodeUid: 'n-unverified', name: 'Name unverified', kind: 'folder', from: 'x@proton.me', fromVerified: false, role: 'editor', invitedAt: Date.parse('2026-03-01T00:00:00Z') },
+            { invitationUid: 'anon', nodeUid: 'n-anon', name: 'Name anon', kind: 'file', from: null, fromVerified: false, role: 'admin', invitedAt: Date.parse('2026-02-01T00:00:00Z') },
+            { invitationUid: 'old', nodeUid: 'n-old', name: 'Name old', kind: 'file', from: 'ann@proton.me', fromVerified: true, role: 'viewer', invitedAt: Date.parse('2026-01-01T00:00:00Z') },
         ]);
     });
 
-    test("an invitation whose name can't be decrypted has name null", async () => {
+    test("an invitation whose name can't be decrypted has name null, and still its item's node uid", async () => {
         const { service } = make({ invitations: [invitation('i', {}, { name: { ok: false, error: new Error('decrypt') } })] });
-        expect((await service.list()).invitations[0]!.name).toBeNull();
+        const [inv] = (await service.list()).invitations;
+        expect([inv!.name, inv!.nodeUid]).toEqual([null, 'n-i']);
     });
 
     test('kind is doc/sheet from the Proton Docs/Sheets media types, else file/folder by type', async () => {
@@ -252,7 +254,7 @@ describe('shared with me: download', () => {
         expect(await readFile(result, 'utf8')).toBe('content of n1');
         expect(await readdir(dir)).toEqual(['Report.pdf']);
         expect(fetched).toHaveLength(1);
-        expect(path.basename(fetched[0]!).startsWith('.proton-drive-tmp-')).toBe(true);
+        expect(path.basename(fetched[0]!).startsWith('.proton-drive-tmp-download-')).toBe(true);
         expect(logs.map((l) => [l.action, l.details])).toEqual([['share', 'Downloaded Report.pdf to Downloads']]);
     });
 
@@ -434,11 +436,56 @@ describe('shared with me: download', () => {
         expect(logs).toEqual([]);
     });
 
-    test('exactly the reserve left is allowed; the size falls back to totalStorageSize', async () => {
-        const ok1 = make({ free: LOCAL_RESERVE_BYTES + 100, nodes: [file('n1', 'a', { activeRevision: { claimedSize: 100 } })] });
+    test("exactly the reserve left is allowed; the size is the active revision's, never every revision's", async () => {
+        const ok1 = make({ free: LOCAL_RESERVE_BYTES + 100, nodes: [file('n1', 'a', { activeRevision: { claimedSize: 100, storageSize: 100 } })] });
         await ok1.service.download('n1');
-        const tight = make({ free: LOCAL_RESERVE_BYTES + 100, nodes: [file('n1', 'a', { activeRevision: undefined, totalStorageSize: 101 })] });
-        await expect(tight.service.download('n1')).rejects.toBeInstanceOf(ShareError);
+        // totalStorageSize counts the old revisions too: what is downloaded is the active one
+        const old = make({ free: LOCAL_RESERVE_BYTES + 100, nodes: [file('n1', 'a', { activeRevision: { claimedSize: 100, storageSize: 100 }, totalStorageSize: 10 ** 12 })] });
+        await old.service.download('n1');
+    });
+
+    test("a small claimed size doesn't beat the reserve: the larger of the claimed and stored sizes counts", async () => {
+        for (const activeRevision of [{ claimedSize: 10, storageSize: 101 }, { storageSize: 101 }, { claimedSize: 101, storageSize: 10 }]) {
+            const dir = tmp();
+            const { service, fetched } = make({ downloads: dir, free: LOCAL_RESERVE_BYTES + 100, nodes: [file('n1', 'big.bin', { activeRevision })] });
+            const err = await service.download('n1').catch((e) => e);
+            expect([activeRevision, err.message]).toEqual([activeRevision, "There isn't enough free space on this computer to download this file"]);
+            expect(fetched).toEqual([]);
+            expect(await readdir(dir)).toEqual([]);
+        }
+    });
+
+    test('downloads at once count against the reserve together, and a download gives its bytes back when it ends', async () => {
+        const dir = tmp();
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => (release = resolve));
+        let fetching!: () => void;
+        const started = new Promise<void>((resolve) => (fetching = resolve));
+        const { service } = make({
+            downloads: dir,
+            free: LOCAL_RESERVE_BYTES + 150,
+            nodes: [file('a', 'a.bin', { activeRevision: { claimedSize: 100, storageSize: 100 } }), file('b', 'b.bin', { activeRevision: { claimedSize: 100, storageSize: 100 } }), file('c', 'c.bin', { activeRevision: { claimedSize: 100, storageSize: 100 } }), file('d', 'd.bin', { activeRevision: { claimedSize: 100, storageSize: 100 } })],
+            fetchFile: async (n, toPath) => {
+                if (n.uid === 'a') {
+                    fetching();
+                    await held;
+                }
+                if (n.uid === 'c') throw new Error('connection lost');
+                await writeFile(toPath, `content of ${n.uid}`);
+            },
+        });
+        const first = service.download('a');
+        await started;
+        // Alone, b would fit; with a's 100 bytes still to come, it doesn't
+        const err = await service.download('b').catch((e) => e);
+        expect(err).toBeInstanceOf(ShareError);
+        expect(err.message).toBe("There isn't enough free space on this computer to download this file");
+        release();
+        expect(path.basename((await first).path)).toBe('a.bin');
+        // a's bytes are back: c fits, fails, and gives its bytes back too, so d fits
+        await expect(service.download('c')).rejects.toBeInstanceOf(ShareError);
+        expect(path.basename((await service.download('d')).path)).toBe('d.bin');
+        expect((await readdir(dir)).sort()).toEqual(['a.bin', 'd.bin']);
     });
 
     test('refused for folders, Docs and Sheets', async () => {
@@ -491,6 +538,77 @@ describe('shared with me: download', () => {
         await expect(service.download('n1')).rejects.toBeInstanceOf(ShareError);
         expect(await readdir(dir)).toEqual(['unrelated']);
         expect(await readFile(path.join(dir, 'unrelated'), 'utf8')).toBe('keep');
+    });
+});
+
+describe('shared with me: temps a stopped daemon left in Downloads (#492)', () => {
+    const file = (uid: string, name: string) => node(uid, { name: ok(name), activeRevision: { claimedSize: 10, storageSize: 10 } });
+    // The pid of a process that has ended
+    const deadPid = () => {
+        const child = spawnSync('true');
+        expect(child.pid).toBeGreaterThan(0);
+        return child.pid;
+    };
+
+    test("before a download, a download's own temp and a dead process's inner temp go; nothing else does", async () => {
+        const dir = tmp();
+        const dead = deadPid();
+        const uuid = '6f1c2a8e-0b1d-4c55-9d0e-3c2b1a0f9e8d';
+        const gone = ['.proton-drive-tmp-download-0123456789abcdef-Report.pdf', '.proton-drive-tmp-download-fedcba9876543210-Shared file', `.proton-drive-tmp-${dead}-${uuid}`];
+        const kept = [
+            // This process's inner temp: the sync's own downloads are named so too
+            `.proton-drive-tmp-${process.pid}-${uuid}`,
+            // Other temps of the drive and the sync, names only like them, and the user's own files
+            '.proton-drive-tmp-hydrate-6f1c2a8e',
+            '.proton-drive-tmp-move-0123456789abcdef',
+            '.proton-drive-tmp-x',
+            `.proton-drive-tmp-${dead}`,
+            `.proton-drive-tmp-${dead}-not-a-uuid`,
+            `.proton-drive-tmp-${dead}x-${uuid}`,
+            '.proton-drive-tmp-download-',
+            '.proton-drive-tmp-download-0123-x',
+            'Report.pdf',
+        ];
+        for (const name of [...gone, ...kept]) await writeFile(path.join(dir, name), 'mine');
+        // Only files, and only in Downloads itself
+        await mkdir(path.join(dir, '.proton-drive-tmp-download-0123456789abcdef-Folder'));
+        await mkdir(path.join(dir, 'Inner'));
+        const inner = ['.proton-drive-tmp-download-0123456789abcdef-x', `.proton-drive-tmp-${dead}-${uuid}`].sort();
+        for (const name of inner) await writeFile(path.join(dir, 'Inner', name), 'mine');
+
+        const { service } = make({ downloads: dir, nodes: [file('n1', 'New.txt')] });
+        await service.download('n1');
+        expect((await readdir(dir)).sort()).toEqual([...kept, '.proton-drive-tmp-download-0123456789abcdef-Folder', 'Inner', 'New.txt'].sort());
+        for (const name of kept) expect([name, await readFile(path.join(dir, name), 'utf8')]).toEqual([name, 'mine']);
+        expect((await readdir(path.join(dir, 'Inner'))).sort()).toEqual(inner);
+    });
+
+    test('a download in progress keeps its temp while another one sweeps', async () => {
+        const dir = tmp();
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => (release = resolve));
+        let written!: (toPath: string) => void;
+        const started = new Promise<string>((resolve) => (written = resolve));
+        const { service } = make({
+            downloads: dir,
+            nodes: [file('a', 'a.txt'), file('b', 'b.txt')],
+            fetchFile: async (n, toPath) => {
+                await writeFile(toPath, `content of ${n.uid}`);
+                if (n.uid === 'a') {
+                    written(toPath);
+                    await held;
+                }
+            },
+        });
+        const first = service.download('a');
+        const temp = await started;
+        expect(path.basename(temp).startsWith('.proton-drive-tmp-download-')).toBe(true);
+        await service.download('b');
+        expect(existsSync(temp)).toBe(true);
+        release();
+        const { path: placed } = await first;
+        expect(await readFile(placed, 'utf8')).toBe('content of a');
+        expect((await readdir(dir)).sort()).toEqual(['a.txt', 'b.txt']);
     });
 });
 

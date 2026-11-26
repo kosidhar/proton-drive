@@ -62,7 +62,8 @@ be saved to Downloads.
 
 - **`GET /share/with-me`** returns `{ invitations: [...], items: [...] }`.
   - **Invitations** come from `sdk.iterateInvitations()`:
-    `{ invitationUid, name, kind: 'file'|'folder'|'doc'|'sheet', from: string|null, fromVerified: boolean, role, invitedAt }`.
+    `{ invitationUid, nodeUid, name, kind: 'file'|'folder'|'doc'|'sheet', from: string|null, fromVerified: boolean, role, invitedAt }`.
+    `nodeUid` is the shared item's: the app knows an accepted invitation's item by it.
     - `from` is `addedByEmail`. When the sender is unverified, it is the error's `claimedAuthor` if there is one, else
       null, and `fromVerified` is false.
     - An invitation whose name can't be decrypted shows as "An item".
@@ -86,8 +87,13 @@ be saved to Downloads.
   (`xdg-user-dir DOWNLOAD`, or `~/Downloads`), as `name`, or `name (1).ext`, `name (2).ext` and so on if taken. It never
   overwrites. It uses `downloadDriveNodeToLocal` (`src/sdk/fileOps.ts`).
   - It is refused when the file's size would leave less than `LOCAL_RESERVE_BYTES` free on that disk, with the reason in
-    plain words. The size is the active revision's claimed size, or the node's total storage size if there isn't one.
-  - It writes to a hidden temp name (`.proton-drive-tmp-*`) in the same folder, removed on any failure.
+    plain words. The size is the larger of the active revision's claimed and storage sizes, and the other downloads
+    under way count as used, in full.
+  - It writes to a hidden temp name (`.proton-drive-tmp-download-*`) in the same folder, removed on any failure.
+  - Before each download, it removes from that folder (not below it) the temps a stopped daemon left (#492): its own
+    `.proton-drive-tmp-download-*` that no download of this daemon is writing, and `downloadDriveNodeToLocal`'s
+    `.proton-drive-tmp-<pid>-<uuid>` only when no process has that pid. Nothing else, since the sync's temps there look
+    alike.
   - It is placed without ever replacing a file: `link(temp, chosen)`, which fails if the name exists (then the next
     `name (n).ext` is tried), then the temp is unlinked. `downloadDriveNodeToLocal`'s own rename-over is not used for the
     final step.
