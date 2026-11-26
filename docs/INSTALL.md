@@ -97,10 +97,12 @@ It installs the app, the service and the Files extension, but not their dependen
    that file too, so a keyring is better: install GNOME Keyring or KWallet (or any Secret Service provider) and sign in
    again. The app tells you when it's using the file: Settings > Account shows a line about it, `protondrive auth
    login` and `protondrive auth status` say where the session is, and the log has a warning.
-   If you'd rather have no stored session than a file, set `PROTONDRIVE_NO_FILE_SESSION=1` in the environment of
-   `protondrive daemon` and `protondrive auth login` (for the service, in a systemd drop-in `Environment=` line): with
-   no keyring, sign-in then fails with a clear error and you stay signed out. A session file that already exists is
-   still read.
+   If you'd rather have no stored session than a file, sign out first (**Sign out** in Settings, which deletes the
+   file), then set `PROTONDRIVE_NO_FILE_SESSION=1` for your whole session: put that line in
+   `~/.config/environment.d/protondrive.conf` and log out and back in. On desktops that start through systemd, such as
+   GNOME and KDE Plasma, that reaches the app, the login autostart and the systemd service alike. With no keyring,
+   signing in then fails with a clear error and you stay signed out. A session file that already exists is still
+   read, which is why you sign out first.
 3. Proton Drive appears in Files' sidebar and starts syncing.
 
 From then on, Proton Drive starts when you log in, without opening its window. To change that, use **Start Proton
