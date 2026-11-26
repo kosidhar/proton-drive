@@ -10203,9 +10203,12 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(d.engine.remoteIndex.getByPath('Docs/a.txt')?.uid).toBe('vol~G');
                     expect(d.engine.vfsChildren('Docs').map((e) => e.name).sort()).toEqual(['a.txt', 'old.txt']);
                     await d.engine.replayRemoteOps();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
                     expect(d.calls.trashed).toEqual([]);
                     expect(d.nodes.get('vol~G')?.content).toBe('theirs');
                     expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('a');
+                    expect(d.engine.remoteIndex.getByPath('Docs/a.txt')?.uid).toBe('vol~G');
                     await d.expectEveryRecordHasItsFile();
                 });
 
@@ -10226,9 +10229,12 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(stateDb.getEditBaseline('Docs/doc.txt')).toBeNull();
                     expect(d.engine.remoteIndex.getByPath('Docs/doc.txt')?.uid).toBe('vol~G');
                     await d.engine.replayRemoteOps();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
                     expect(d.calls.trashed).toEqual([]);
                     expect(d.nodes.get('vol~G')?.content).toBe('theirs');
                     expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('old');
+                    expect(d.engine.remoteIndex.getByPath('Docs/doc.txt')?.uid).toBe('vol~G');
                     await d.expectEveryRecordHasItsFile();
                 });
 
@@ -10241,14 +10247,70 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     d.engine.remoteIndex.removeSubtree('vol~X');
                     addOtherNode(d, 'vol~G', d.root.uid, 'X');
                     addOtherNode(d, 'vol~G/g.txt', 'vol~G', 'g.txt', 'theirs');
+                    const w = journalling(d);
 
                     await d.engine.deleteItem('X', { trash: true });
 
+                    expect(w.journalled()).toMatchObject([{ kind: 'trash', nodeUid: 'vol~X', path: 'X' }]);
                     expect(d.engine.remoteIndex.getByPath('X')?.uid).toBe('vol~G');
                     expect(d.engine.remoteIndex.getByPath('X/g.txt')?.uid).toBe('vol~G/g.txt');
                     await afterReplayAndSync(d, 'X', { trashed: [] });
                     expect(d.nodes.has('vol~G')).toBe(true);
                     expect(d.nodes.get('vol~G/g.txt')?.content).toBe('theirs');
+                });
+
+                test('Move to Trash of a moved-away recorded folder over a new cloud folder G with a colliding local file never trashes G or its children', async () => {
+                    const d = setup();
+                    const desktopTrash = path.join(tempDir, 'DesktopTrash');
+                    (d.engine as any).options.moveToDesktopTrash = async (fullPath: string) => {
+                        d.handedToTrash.push(fullPath);
+                        await mkdir(desktopTrash, { recursive: true });
+                        await rename(fullPath, path.join(desktopTrash, `${d.handedToTrash.length}-${path.basename(fullPath)}`));
+                        return true;
+                    };
+                    d.add('X/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('X').uid);
+                    movedByAnotherDevice(d, 'vol~X', { name: 'Z' });
+                    addOtherNode(d, 'vol~G', d.root.uid, 'X');
+                    addOtherNode(d, 'vol~G/g.txt', 'vol~G', 'g.txt', 'theirs');
+                    addOtherNode(d, 'vol~G/c.txt', 'vol~G', 'c.txt', 'cloud-c');
+                    await d.files.writeLocal('X/c.txt', 'local-c'); // unrecorded colliding file
+                    const w = journalling(d);
+
+                    await d.engine.deleteItem('X', { trash: true });
+
+                    expect(w.journalled()).toEqual([]);
+                    expect(await d.files.exists('X')).toBe(false);
+                    expect(d.handedToTrash.map((p) => path.relative(path.join(tempDir, 'files'), p))).toEqual(['X/c.txt']);
+                    expect(d.engine.remoteIndex.getByPath('X')?.uid).toBe('vol~G');
+                    expect(d.engine.remoteIndex.getByPath('X/g.txt')?.uid).toBe('vol~G/g.txt');
+                    expect(d.engine.remoteIndex.getByPath('X/c.txt')?.uid).toBe('vol~G/c.txt');
+                    await afterReplayAndSync(d, 'X', { trashed: [], downloadsAt: 'Z' });
+                    expect(d.nodes.get('vol~G/g.txt')?.content).toBe('theirs');
+                    expect(d.nodes.get('vol~G/c.txt')?.content).toBe('cloud-c');
+                    expect(d.nodes.get('vol~X/a.txt')?.content).toBe('a');
+                });
+
+                test('rmdir of an empty moved-away recorded folder over an empty new cloud folder G keeps G indexed and untrashed', async () => {
+                    const d = setup();
+                    d.add('Docs/E');
+                    await pinnedAndSynced(d, d.add('Docs').uid);
+                    movedByAnotherDevice(d, 'vol~Docs/E', { name: 'E2' });
+                    addOtherNode(d, 'vol~G', 'vol~Docs', 'E');
+                    const w = journalling(d);
+
+                    await d.engine.deleteItem('Docs/E', { onlyIfEmpty: true });
+
+                    expect(w.journalled()).toEqual([]);
+                    expect(await d.files.exists('Docs/E')).toBe(false);
+                    expect(stateDb.getItemByPath('Docs/E')).toBeNull();
+                    expect(d.engine.remoteIndex.getByPath('Docs/E')?.uid).toBe('vol~G');
+                    expect(d.engine.remoteIndex.getByUid('vol~Docs/E')?.relPath).toBe('Docs/E2');
+                    await d.engine.replayRemoteOps();
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.nodes.has('vol~G')).toBe(true);
+                    expect(d.nodes.has('vol~Docs/E')).toBe(true);
+                    await d.expectEveryRecordHasItsFile();
                 });
             });
         });
