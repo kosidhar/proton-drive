@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -31,6 +31,8 @@ function occurrences(pattern: RegExp, allowed: (file: string, line: string) => b
     const found: string[] = [];
     for (const file of scannedFiles()) {
         if (file === SELF) continue;
+        // A link (AGENTS.md, GEMINI.md → CLAUDE.md) is scanned through the file it points to (#512)
+        if (lstatSync(path.join(ROOT, file), { throwIfNoEntry: false })?.isSymbolicLink()) continue;
         let text: string;
         try {
             text = readFileSync(path.join(ROOT, file), 'utf8');
@@ -52,6 +54,7 @@ const DATA_FOLDER_ALLOWED: Array<[file: string, line: RegExp, why: string]> = [
     ['packaging/linux/install.sh', /^# \/proton-drive-ubuntu; under sudo, the invoking user's$/, 'proton_app_dir: the data folder (comment)'],
     ['packaging/linux/install.sh', /^  echo "\$\{data:-\$home\/\.local\/share\}\/proton-drive-ubuntu"$/, 'proton_app_dir: the data folder (echo)'],
     ['README.md', /~\/\.local\/share\/proton-drive-ubuntu\/files/, 'the data folder, where the store lives'],
+    ['CLAUDE.md', /^   D=~\/\.local\/share\/proton-drive-ubuntu$/, "the data folder, in the owner's-laptop install steps (backing up the sync database)"],
 ];
 
 describe('names after #413', () => {
