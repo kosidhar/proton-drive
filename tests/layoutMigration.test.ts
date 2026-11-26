@@ -228,13 +228,20 @@ describe('moveToLayout: plain to virtual', () => {
     test('a cross-device refusal after an identical copy was dropped is never taken for nothing moved', async () => {
         const s = setup();
         for (const n of ['a', 'b', 'c', 'd', 'e', 'f']) s.put(path.join(s.syncDir, `${n}.txt`), `content ${n}`);
+        // The first name the move meets (it walks in readdir order), so its copy is dropped before the refusal
         const first = readdirSync(s.syncDir)[0]!;
+        // An interrupted move leaves the store copy with the original's times. A copy written later (the 5 ms wait
+        // makes it later for certain) would come back with its own time and fail the snapshot (#526)
+        Bun.sleepSync(5);
         s.put(path.join(s.backingDir, first), `content ${first[0]}`);
+        const sameTime = new Date('2026-01-02T03:04:05Z'); // whole seconds, which every disk keeps exactly
+        for (const copy of [path.join(s.syncDir, first), path.join(s.backingDir, first)]) utimesSync(copy, sameTime, sameTime);
         s.record(first);
         s.stateDb.setMeta(LAYOUT_MOVING, 'virtual'); // a resume: a fresh move refuses a name the store already holds
         const before = snapshot(s.syncDir);
 
         await expect(s.move('virtual', { moveSameDisk: () => { throw exdev(); } })).rejects.toBeInstanceOf(DifferentDiskError);
+        expect(existsSync(path.join(s.syncDir, first))).toBe(false); // dropped for the identical copy, before the refusal
         expect(s.stateDb.getMeta(LAYOUT_MOVING)).toBe('virtual');
         expect(await s.move('plain')).toBe('moved');
         expect(snapshot(s.syncDir)).toEqual(before);
