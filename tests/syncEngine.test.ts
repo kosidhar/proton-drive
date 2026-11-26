@@ -8544,6 +8544,187 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     });
                 });
 
+                // #463: renaming a local item of the other kind drops stale records under the old path and never
+                // retargets queued moves aimed under it; a local folder over a cloud file keeps its children's
+                // records consistent whether or not a stale record exists at the folder path.
+                describe('stale records and queued moves under an other-kind source (#463)', () => {
+                    const recordAt = (localRelPath: string, nodeUid: string, type: 'file' | 'folder') =>
+                        stateDb.upsertItem({
+                            localRelPath,
+                            nodeUid,
+                            parentNodeUid: null,
+                            type,
+                            localSha1: null,
+                            remoteSha1: null,
+                            localMtimeMs: 0,
+                            remoteMtimeMs: 0,
+                            size: 0,
+                            syncStatus: 'synced',
+                            lastError: null,
+                        });
+
+                    test('local file over cloud folder: stale record and queued move under X/ do not follow the rename to Y/', async () => {
+                        const d = await fileOverFolder();
+                        d.add('Other/m.txt', 'moved');
+                        await d.engine.reconcileNow();
+                        // Stale record under X/ and a queued move aimed into the cloud folder X/
+                        recordAt('X/inner.txt', 'vol~X/inner.txt', 'file');
+                        (d.engine as any).journal.enqueue({
+                            kind: 'move',
+                            nodeUid: 'vol~Other/m.txt',
+                            toPath: 'X/m.txt',
+                            fromPath: 'Other/m.txt',
+                        });
+
+                        await d.engine.renameItem('X', 'Y');
+
+                        expect(stateDb.getItemByPath('X/inner.txt')).toBeNull();
+                        expect(stateDb.getItemByPath('Y/inner.txt')).toBeNull();
+                        // Queued move aimed into cloud folder X/ was not retargeted to Y/m.txt
+                        expect(d.journal()).toMatchObject([{ kind: 'move', nodeUid: 'vol~Other/m.txt', toPath: 'X/m.txt' }]);
+                        await expectCloudItemStays(d, 'folder');
+                        await d.engine.reconcileNow();
+                        expect(stateDb.getItemByPath('Y/inner.txt')).toBeNull();
+                        expect(d.nodes.get('vol~Other/m.txt')?.parentUid).toBe('vol~X');
+                        expect(uploadedAt(d, 'Y')).toEqual(['mine']);
+                        await d.expectEveryRecordHasItsFile();
+                    });
+
+                    test('local file recorded as another node over cloud folder: stale record and queued move under X/ still do not follow to Y/', async () => {
+                        const d = await fileOverFolder();
+                        d.add('Elsewhere/mine.txt', 'mine');
+                        d.add('Other/m.txt', 'moved');
+                        await d.engine.reconcileNow();
+                        recordAt('X', 'vol~Elsewhere/mine.txt', 'file');
+                        recordAt('X/inner.txt', 'vol~X/inner.txt', 'file');
+                        // Pending move of vol~Elsewhere/mine.txt itself targeting X, plus a queued move under cloud folder X/
+                        const ownOpId = (d.engine as any).journal.enqueue({
+                            kind: 'move',
+                            nodeUid: 'vol~Elsewhere/mine.txt',
+                            toPath: 'X',
+                            fromPath: 'Elsewhere/mine.txt',
+                        });
+                        (d.engine as any).journal.enqueue({
+                            kind: 'move',
+                            nodeUid: 'vol~Other/m.txt',
+                            toPath: 'X/m.txt',
+                            fromPath: 'Other/m.txt',
+                        });
+
+                        stateDb.updateSettings({ paused: true });
+                        await d.engine.renameItem('X', 'Y');
+
+                        expect(stateDb.getItemByPath('Y')?.nodeUid).toBe('vol~Elsewhere/mine.txt');
+                        expect(stateDb.getItemByPath('X/inner.txt')).toBeNull();
+                        expect(stateDb.getItemByPath('Y/inner.txt')).toBeNull();
+                        // The pending move of vol~Elsewhere/mine.txt itself was retargeted to Y; X/m.txt stayed at X/m.txt
+                        expect((d.engine as any).journal.get(ownOpId)).toMatchObject({
+                            kind: 'move',
+                            nodeUid: 'vol~Elsewhere/mine.txt',
+                            toPath: 'Y',
+                        });
+                        expect(d.journal().find((op) => op.nodeUid === 'vol~Other/m.txt')).toMatchObject({
+                            kind: 'move',
+                            toPath: 'X/m.txt',
+                        });
+                        stateDb.updateSettings({ paused: false });
+                        await expectCloudItemStays(d, 'folder');
+                        await d.engine.reconcileNow();
+                        expect(d.nodes.get('vol~Elsewhere/mine.txt')?.parentUid).toBe(d.root.uid);
+                        expect(d.nameOf(d.nodes.get('vol~Elsewhere/mine.txt')!)).toBe('Y');
+                        expect(d.nodes.get('vol~Other/m.txt')?.parentUid).toBe('vol~X');
+                        await d.expectEveryRecordHasItsFile();
+                    });
+
+                    test('local folder with its own cloud folder renamed onto a cloud file and then to Y keeps its children records and pending moves', async () => {
+                        const d = setup();
+                        d.add('A/child.txt', 'child');
+                        d.add('Other/m.txt', 'moved');
+                        await pinnedAndSynced(d, d.add('A').uid);
+                        await pinnedAndSynced(d, d.add('Other').uid);
+                        d.down.add('renameNode');
+                        d.down.add('moveNodes');
+                        await d.engine.renameItem('A', 'X');
+                        await d.engine.renameItem('Other/m.txt', 'X/m.txt');
+                        await d.files.writeLocal('X/child.txt', 'child edited');
+                        // Another device creates a cloud file at X while the renames are still pending
+                        d.add('X', 'theirs');
+                        await d.engine.reconcileNow();
+                        expect(d.engine.remoteIndex.getByPath('X')).toMatchObject({ uid: 'vol~X', type: 'file' });
+                        const w = journalling(d);
+
+                        await d.engine.renameItem('X', 'Y');
+
+                        expect(stateDb.getItemByPath('Y')?.nodeUid).toBe('vol~A');
+                        expect(stateDb.getItemByPath('Y/child.txt')?.nodeUid).toBe('vol~A/child.txt');
+                        expect(stateDb.getItemByPath('Y/m.txt')?.nodeUid).toBe('vol~Other/m.txt');
+                        expect(d.journal().find((op) => op.nodeUid === 'vol~Other/m.txt')).toMatchObject({
+                            kind: 'move',
+                            toPath: 'Y/m.txt',
+                        });
+                        d.down.clear();
+                        await expectCloudItemStays(w, 'file');
+                        await d.engine.reconcileNow();
+                        expect(d.nameOf(d.nodes.get('vol~A')!)).toBe('Y');
+                        expect(d.nodes.get('vol~A/child.txt')?.content).toBe('child edited');
+                        expect(d.nodes.get('vol~Other/m.txt')?.parentUid).toBe('vol~A');
+                        expect(d.named('vol~A', 'child.txt')).toHaveLength(1);
+                        expect(d.named('vol~A', 'm.txt')).toHaveLength(1);
+                        await d.expectEveryRecordHasItsFile();
+                    });
+
+                    for (const withStaleFolderRecord of [false, true]) {
+                        test(`local folder over cloud file (${withStaleFolderRecord ? 'with' : 'without'} stale folder record): children records are handled consistently`, async () => {
+                            const d = await folderOverFile('child.txt');
+                            d.add('Other/orig.txt', 'orig');
+                            await d.engine.reconcileNow();
+                            if (withStaleFolderRecord) {
+                                recordAt('X', 'vol~X', 'file');
+                            }
+                            recordAt('X/child.txt', 'vol~Other/orig.txt', 'file');
+                            // Make vol~Other/orig.txt not look moved away (e.g. absent from index) so #463's rule is tested directly
+                            d.engine.remoteIndex.removeSubtree('vol~Other/orig.txt');
+
+                            await d.engine.renameItem('X', 'Y');
+
+                            expect(d.journalled()).toEqual([]);
+                            expect(stateDb.getItemByPath('X')).toBeNull();
+                            expect(stateDb.getItemByPath('X/child.txt')).toBeNull();
+                            expect(stateDb.getItemByPath('Y')).toBeNull();
+                            expect(stateDb.getItemByPath('Y/child.txt')).toBeNull();
+                            await expectCloudItemStays(d, 'file');
+                            expect(d.calls.uploads).toEqual(['Y/child.txt']);
+                            expect(d.nodes.get('vol~Other/orig.txt')?.parentUid).toBe('vol~Other');
+                            expect(stateDb.getItemByPath('Y/child.txt')?.nodeUid).not.toBe('vol~Other/orig.txt');
+                            await d.expectEveryRecordHasItsFile();
+                        });
+                    }
+
+                    test('local folder over cloud file: stale child record with no file and queued move under X/ are not carried to Y/', async () => {
+                        const d = await folderOverFile('mine.txt');
+                        d.add('Other/m.txt', 'moved');
+                        await d.engine.reconcileNow();
+                        recordAt('X/ghost.txt', 'vol~Ghost', 'file');
+                        (d.engine as any).journal.enqueue({
+                            kind: 'move',
+                            nodeUid: 'vol~Other/m.txt',
+                            toPath: 'X/m.txt',
+                            fromPath: 'Other/m.txt',
+                        });
+
+                        await d.engine.renameItem('X', 'Y');
+
+                        expect(stateDb.getItemByPath('X/ghost.txt')).toBeNull();
+                        expect(stateDb.getItemByPath('Y/ghost.txt')).toBeNull();
+                        expect(d.journal()).toMatchObject([{ kind: 'move', nodeUid: 'vol~Other/m.txt', toPath: 'X/m.txt' }]);
+                        await expectCloudItemStays(d, 'file');
+                        await d.engine.reconcileNow();
+                        expect(stateDb.getItemByPath('Y/ghost.txt')).toBeNull();
+                        expect(d.nodes.get('vol~Other/m.txt')?.parentUid).toBe('vol~Other');
+                        await d.expectEveryRecordHasItsFile();
+                    });
+                });
+
                 // Controls: the local item of the same kind as the cloud item at its path, with no record either, is that
                 // item, as before
                 describe('the same kind here and in Proton Drive', () => {
