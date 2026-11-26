@@ -5,6 +5,7 @@ mod icons;
 mod settings;
 mod share;
 mod shared;
+mod shared_with_me;
 mod shared_view;
 mod single_instance;
 
@@ -1242,6 +1243,19 @@ enum WorkerCommand {
     SharedLoad { seq: u64 },
     /// Stop all sharing of the item at `rel_path` (DELETE /share/all)
     SharedStop { rel_path: String, uid: String },
+    /// What is shared with the account, for the Shared with me page (#487); `seq` numbers the read
+    #[allow(dead_code)] // sent once the page is drawn (#487)
+    ListSharedWithMe(u64),
+    #[allow(dead_code)] // sent once the page is drawn (#487)
+    AcceptInvitation(String),
+    #[allow(dead_code)] // sent once the page is drawn (#487)
+    DeclineInvitation(String),
+    #[allow(dead_code)] // sent once the page is drawn (#487)
+    LeaveShared(String),
+    #[allow(dead_code)] // sent once the page is drawn (#487)
+    OpenSharedUrl(String),
+    #[allow(dead_code)] // sent once the page is drawn (#487)
+    DownloadShared(String),
     /// The Share window (#216), each over the control socket for the item at `rel_path` (inside My files), and
     /// answered to the `window` that asked: how it is shared (a read)
     ShareLoad { window: share::WindowId, seq: u64, rel_path: String },
@@ -1397,6 +1411,22 @@ enum WorkerEvent {
     SharedLoaded(u64, Result<Vec<shared::SharedItem>, String>),
     /// Stopping all sharing of the item at that rel_path went through, or why not
     SharedStopped(String, Result<(), String>),
+    /// What Shared with me lists, or why that couldn't be read (#487)
+    SharedWithMeLoaded(u64, Result<shared_with_me::Listing, String>),
+    /// An invitation's uid, and whether it was accepted
+    #[allow(dead_code)] // read once the page's actions are drawn (#487)
+    InvitationAccepted(String, Result<(), String>),
+    #[allow(dead_code)] // read once the page's actions are drawn (#487)
+    InvitationDeclined(String, Result<(), String>),
+    /// An item's uid, and whether it was left
+    #[allow(dead_code)] // read once the page's actions are drawn (#487)
+    SharedLeft(String, Result<(), String>),
+    /// An item's uid, and the address to open it at
+    #[allow(dead_code)] // read once the page's actions are drawn (#487)
+    SharedUrl(String, Result<String, String>),
+    /// An item's uid, and the path it was saved at
+    #[allow(dead_code)] // read once the page's actions are drawn (#487)
+    SharedDownloaded(String, Result<String, String>),
     /// How the item of the Share window that asked is shared, or why that couldn't be read (#216)
     ShareLoaded(share::WindowId, u64, Result<share::ShareInfo, String>),
     /// A change made in that Share window went through, or why not
@@ -1682,6 +1712,8 @@ struct ProtonDriveNativeApp {
     share: Option<share::ShareWindow>,
     /// What the Shared section lists (#253)
     shared: shared::SharedPage,
+    /// What Shared with me lists (#487)
+    shared_with_me: shared_with_me::SharedWithMePage,
     /// Changes sent from Share windows closed or replaced before they were answered: a failure goes to `share_notices`
     share_left: Vec<share::LeftChange>,
     /// Failed share changes shown across every section until dismissed (#228)
@@ -1818,6 +1850,7 @@ impl ProtonDriveNativeApp {
             last_poll: Instant::now(),
             share: None,
             shared,
+            shared_with_me: shared_with_me::SharedWithMePage::default(),
             share_left: Vec::new(),
             share_notices: Vec::new(),
             exit_shares: None,
@@ -2203,6 +2236,13 @@ impl ProtonDriveNativeApp {
                     let _ = self.tx.send(WorkerCommand::RefreshAll);
                 }
                 WorkerEvent::SharedLoaded(seq, result) => self.shared.loaded(seq, result),
+                WorkerEvent::SharedWithMeLoaded(seq, result) => self.shared_with_me.loaded(seq, result),
+                // The page's actions (#487) answer here once they are drawn
+                WorkerEvent::InvitationAccepted(..)
+                | WorkerEvent::InvitationDeclined(..)
+                | WorkerEvent::SharedLeft(..)
+                | WorkerEvent::SharedUrl(..)
+                | WorkerEvent::SharedDownloaded(..) => {}
                 WorkerEvent::SharedStopped(rel_path, result) => {
                     if self.shared.stopping.as_deref() == Some(rel_path.as_str()) {
                         self.shared.stopping = None;
@@ -4815,6 +4855,29 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>, ctx: egui::
             WorkerCommand::SharedLoad { seq } => {
                 off_thread(&tx, &ctx, move || WorkerEvent::SharedLoaded(seq, share::list_at(&control_socket_path())))
             }
+            WorkerCommand::ListSharedWithMe(seq) => off_thread(&tx, &ctx, move || {
+                WorkerEvent::SharedWithMeLoaded(seq, shared_with_me::list_at(&control_socket_path()))
+            }),
+            WorkerCommand::AcceptInvitation(uid) => off_thread(&tx, &ctx, move || {
+                let result = shared_with_me::accept_at(&control_socket_path(), &uid);
+                WorkerEvent::InvitationAccepted(uid, result)
+            }),
+            WorkerCommand::DeclineInvitation(uid) => off_thread(&tx, &ctx, move || {
+                let result = shared_with_me::decline_at(&control_socket_path(), &uid);
+                WorkerEvent::InvitationDeclined(uid, result)
+            }),
+            WorkerCommand::LeaveShared(uid) => off_thread(&tx, &ctx, move || {
+                let result = shared_with_me::leave_at(&control_socket_path(), &uid);
+                WorkerEvent::SharedLeft(uid, result)
+            }),
+            WorkerCommand::OpenSharedUrl(uid) => off_thread(&tx, &ctx, move || {
+                let result = shared_with_me::open_url_at(&control_socket_path(), &uid);
+                WorkerEvent::SharedUrl(uid, result)
+            }),
+            WorkerCommand::DownloadShared(uid) => off_thread(&tx, &ctx, move || {
+                let result = shared_with_me::download_at(&control_socket_path(), &uid);
+                WorkerEvent::SharedDownloaded(uid, result)
+            }),
             WorkerCommand::SharedStop { rel_path, uid } => off_thread(&tx, &ctx, move || {
                 let result = share::stop_sharing_at(&control_socket_path(), &rel_path, &uid);
                 WorkerEvent::SharedStopped(rel_path, result)
@@ -5939,6 +6002,7 @@ mod tests {
                 last_poll: Instant::now(),
                 share: None,
                 shared: shared::SharedPage::default(),
+                shared_with_me: shared_with_me::SharedWithMePage::default(),
                 share_left: Vec::new(),
                 share_notices: Vec::new(),
                 exit_shares: None,
@@ -9020,6 +9084,13 @@ mod tests {
             // The Shared section's read and its Stop sharing (#253)
             WorkerCommand::SharedLoad { seq: 1 },
             WorkerCommand::SharedStop { rel_path: "a.pdf".into(), uid: "vol~a".into() },
+            // Shared with me: a read, and its changes, all over the control socket (#487)
+            WorkerCommand::ListSharedWithMe(1),
+            WorkerCommand::AcceptInvitation("v~i".into()),
+            WorkerCommand::DeclineInvitation("v~i".into()),
+            WorkerCommand::LeaveShared("v~a".into()),
+            WorkerCommand::OpenSharedUrl("v~a".into()),
+            WorkerCommand::DownloadShared("v~a".into()),
             WorkerCommand::SharePassword { window, seq: 1, rel_path: "a.pdf".into() },
             WorkerCommand::ShareEnsureLink { window, rel_path: "a.pdf".into() },
             WorkerCommand::ShareSettings { window, rel_path: "a.pdf".into(), password: Some(None), expires_at: None },
