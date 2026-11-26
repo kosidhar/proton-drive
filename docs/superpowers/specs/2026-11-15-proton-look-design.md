@@ -67,7 +67,7 @@ The emoji in this document stand for Phosphor glyphs.
 
 ```
 ┌──────────────────────┬───────────────────────────────────────────────────┐
-│ ▰ Proton Drive       │ Home                         ⚙   Gautam Chauhan  [GC] │
+│ ▰ Proton Drive       │ Home                         ⚙   Test User       [TU] │
 │                      │                                  name@proton.me         │
 │ [📂 Open in Files ]  ├───────────────────────────────────────────────────┤
 │                      │                                                       │

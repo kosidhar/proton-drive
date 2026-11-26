@@ -183,7 +183,7 @@ fn move_asks_first_and_moves_only_on_move()                                 // R
   - In `native-gui/`: `timeout 900 cargo test --release` and `cargo clippy --release --all-targets` (0 warnings).
   - At the repo root: `bun test tests` and `bunx tsc --noEmit`.
   - Screenshots, light and dark at 1180×940, using
-    `/tmp/claude-1000/-home-gautam-chauhan-projects-proton-drive/83ab53f0-fea2-45b0-a976-56dd433d1865/scratchpad/fakedaemon/shoot.sh <png> <theme> 1180x940 normal --tab settings`.
+    `<scratchpad>/fakedaemon/shoot.sh <png> <theme> 1180x940 normal --tab settings`.
     Scroll to the Sync card if needed: an existing screenshot flag may help, otherwise a larger `--size`.
 
 - [ ] **Step 5: Commit.** This commit also adds the spec and this plan.
