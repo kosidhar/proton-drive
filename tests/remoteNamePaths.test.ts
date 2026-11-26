@@ -33,6 +33,13 @@ describe('remoteNameProblem (#536)', () => {
         }
     });
 
+    test('a name longer than 255 bytes, the most a name can be on Linux, is refused; 255 bytes is fine', () => {
+        expect(remoteNameProblem('é'.repeat(128))).toEqual(expect.any(String)); // 256 bytes, 128 characters
+        expect(remoteNameProblem('é'.repeat(200))).toEqual(expect.any(String)); // the SDK allows 255 characters
+        expect(remoteNameProblem(`${'é'.repeat(127)}a`)).toBeNull(); // 255 bytes
+        expect(remoteNameProblem('a'.repeat(255))).toBeNull();
+    });
+
     test('any other name is fine, dots and odd characters included', () => {
         for (const name of ['a.txt', '...', '.hidden', '..a', 'a..', ' spaced ', 'é', '\\', 'a\\..\\b', 'C:', '\n']) {
             expect([name, remoteNameProblem(name)]).toEqual([name, null]);
@@ -361,6 +368,7 @@ describe('names from Proton Drive that would leave the sync folder (#536)', () =
                 d.add('Docs/a.txt', 'a');
                 d.add('Folder/f.txt', 'f');
                 d.add('Other/o.txt', 'o');
+                d.add('Long/l.txt', 'l');
                 d.engine.availability.setPin(d.root.uid, 'pinned', false);
                 await d.engine.reconcileNow();
                 expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('a');
@@ -369,6 +377,8 @@ describe('names from Proton Drive that would leave the sync folder (#536)', () =
                 d.rename(d.uid('Docs/a.txt'), '../../evil.txt');
                 d.rename(d.uid('Folder'), '..');
                 d.rename(d.uid('Other/o.txt'), 'x/o.txt');
+                // 400 bytes: within the SDK's 255 characters, but too long for a name here, so following it would fail
+                d.rename(d.uid('Long/l.txt'), 'é'.repeat(200));
                 await d.engine.reconcileNow();
                 await d.engine.reconcileNow();
 
@@ -376,13 +386,14 @@ describe('names from Proton Drive that would leave the sync folder (#536)', () =
                 expect(await readFile(d.local('Docs/a.txt'), 'utf8')).toBe('a');
                 expect(await readFile(d.local('Folder/f.txt'), 'utf8')).toBe('f');
                 expect(await readFile(d.local('Other/o.txt'), 'utf8')).toBe('o');
+                expect(await readFile(d.local('Long/l.txt'), 'utf8')).toBe('l');
                 expect(d.calls.trashed).toEqual([]);
                 expect(d.desktopTrash).toEqual([]);
-                for (const uid of [d.uid('Docs/a.txt'), d.uid('Folder'), d.uid('Folder/f.txt'), d.uid('Other/o.txt')]) {
+                for (const uid of [d.uid('Docs/a.txt'), d.uid('Folder'), d.uid('Folder/f.txt'), d.uid('Other/o.txt'), d.uid('Long/l.txt')]) {
                     expect(d.nodes.has(uid)).toBe(true);
                 }
                 // Both copies are kept: the local ones are no longer the renamed nodes', so they upload as new items
-                expect(d.calls.uploads.sort()).toEqual(['Docs/a.txt', 'Folder/f.txt', 'Other/o.txt']);
+                expect(d.calls.uploads.sort()).toEqual(['Docs/a.txt', 'Folder/f.txt', 'Long/l.txt', 'Other/o.txt']);
                 expect(d.engine.getStatus().lastError).toBeNull();
                 await d.engine.stop();
             });
