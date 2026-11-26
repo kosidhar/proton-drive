@@ -5,7 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
+use eframe::egui;
 use serde::Deserialize;
 
 use crate::share::{self, SHARE_READ_TIMEOUT, SHARE_WRITE_TIMEOUT, UNREADABLE};
@@ -106,14 +108,10 @@ pub const EMPTY: &str = "Files and folders that others shared with you will appe
 pub const WEB_NOTE: &str = "Saved links and shared photos are on drive.proton.me";
 /// Where Open goes when the daemon has no address for the item
 pub const WEB_URL: &str = "https://drive.proton.me/shared-with-me";
-#[allow(dead_code, reason = "the actions that use it come next (#487)")]
 pub const DOWNLOADING: &str = "Downloading…";
-#[allow(dead_code, reason = "the actions that use it come next (#487)")]
 pub const SAVED: &str = "Saved to Downloads";
-#[allow(dead_code, reason = "the actions that use it come next (#487)")]
 pub const ACCEPTED: &str = "Accepted, it will appear shortly";
 /// How long after an accept the page reads once more
-#[allow(dead_code, reason = "the actions that use it come next (#487)")]
 pub const RELOAD_AFTER_ACCEPT_SECS: u64 = 5;
 pub const LOADING: &str = "Loading what others shared with you…";
 const LIST_TIMED_OUT: &str = "Listing what others shared with you took too long. Try again.";
@@ -124,7 +122,6 @@ pub fn display_name(name: &Option<String>) -> String {
 }
 
 /// The question before accepting an invitation the sender of which Proton couldn't verify; None for a verified one.
-#[allow(dead_code, reason = "the actions that use it come next (#487)")]
 pub fn accept_question(inv: &Invitation) -> Option<String> {
     if inv.from_verified {
         return None;
@@ -136,7 +133,6 @@ pub fn accept_question(inv: &Invitation) -> Option<String> {
 }
 
 /// The question before leaving an item.
-#[allow(dead_code, reason = "the actions that use it come next (#487)")]
 pub fn leave_question(item: &Item) -> String {
     format!(
         "Leave {}? It will no longer be shared with you. Only the person who shared it can share it again.",
@@ -144,22 +140,11 @@ pub fn leave_question(item: &Item) -> String {
     )
 }
 
-/// The activity lines: a name, never an address.
-#[allow(dead_code, reason = "the actions that use it come next (#487)")]
-pub fn accepted_activity(name: &Option<String>) -> String {
-    format!("Accepted an invitation to {}", display_name(name))
-}
-#[allow(dead_code, reason = "the actions that use it come next (#487)")]
-pub fn declined_activity(name: &Option<String>) -> String {
-    format!("Declined an invitation to {}", display_name(name))
-}
-#[allow(dead_code, reason = "the actions that use it come next (#487)")]
-pub fn left_activity(name: &Option<String>) -> String {
-    format!("Left {}", display_name(name))
-}
-#[allow(dead_code, reason = "the actions that use it come next (#487)")]
-pub fn downloaded_activity(name: &Option<String>) -> String {
-    format!("Downloaded {} to Downloads", display_name(name))
+/// An invitation that was accepted, whose item the list may not show yet (Proton's list can lag).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Accepted {
+    pub name: Option<String>,
+    pub kind: Kind,
 }
 
 /// The page: the listing, and what is going on in its rows. Each read has a number; only the newest one's answer counts.
@@ -180,6 +165,18 @@ pub struct SharedWithMePage {
     pub notes: HashMap<String, String>,
     /// Why an action on a row failed, by uid
     pub row_errors: HashMap<String, String>,
+    /// What each invitation being accepted is, by its uid, until the daemon answers
+    pub accepting: HashMap<String, Accepted>,
+    /// Accepted invitations whose item the list doesn't show yet: each says `ACCEPTED` until it does
+    pub accepted: Vec<Accepted>,
+    /// An accept went through and the read it caused hasn't answered yet: if it still lacks an item, one more read follows
+    pub retry_armed: bool,
+    /// When that one more read goes out
+    pub reload_at: Option<Instant>,
+    /// Where each downloaded item was saved, by uid, for Show in Files
+    pub saved: HashMap<String, String>,
+    /// The ⋯ menu that is open: the uid of its item, and the button it hangs from
+    pub menu: Option<(String, egui::Rect)>,
 }
 
 impl SharedWithMePage {
@@ -207,11 +204,26 @@ impl SharedWithMePage {
             Ok(listing) => {
                 self.listing = Some(listing);
                 self.error = None;
+                self.settle_accepted();
             }
             Err(message) => {
                 self.listing = None;
                 self.error = Some(message);
             }
+        }
+    }
+
+    /// After a read: an accepted invitation whose item is listed now needs no note. One that isn't gets one more read,
+    /// `RELOAD_AFTER_ACCEPT_SECS` after the first that lacked it.
+    fn settle_accepted(&mut self) {
+        let Some(listing) = &self.listing else { return };
+        self.accepted.retain(|a| !listing.items.iter().any(|i| i.name == a.name && i.kind == a.kind));
+        if self.accepted.is_empty() {
+            self.retry_armed = false;
+            self.reload_at = None;
+        } else if self.retry_armed {
+            self.retry_armed = false;
+            self.reload_at = Some(Instant::now() + Duration::from_secs(RELOAD_AFTER_ACCEPT_SECS));
         }
     }
 
@@ -434,16 +446,6 @@ mod tests {
         assert_eq!(display_name(&None), "An item");
         assert_eq!(display_name(&Some(String::new())), "An item");
         assert_eq!(display_name(&Some("a.txt".into())), "a.txt");
-    }
-
-    #[test]
-    fn the_activity_texts_name_the_item_and_never_an_address() {
-        let name = Some("Trip".to_string());
-        assert_eq!(accepted_activity(&name), "Accepted an invitation to Trip");
-        assert_eq!(declined_activity(&name), "Declined an invitation to Trip");
-        assert_eq!(left_activity(&name), "Left Trip");
-        assert_eq!(downloaded_activity(&name), "Downloaded Trip to Downloads");
-        assert_eq!(left_activity(&None), "Left An item");
     }
 
     #[test]
