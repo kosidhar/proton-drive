@@ -50,8 +50,9 @@ The repo's general rules in `CLAUDE.md` apply too.
    ```bash
    packaging/linux/verify-release.sh
    ```
-   - It installs the `.deb` with `apt` in clean Ubuntu 22.04 and Debian 12 containers and starts the daemon, the app
-     and the drive helper.
+   - It installs the `.deb` with `apt` in clean Ubuntu 22.04 and Debian 12 containers, and the `.rpm` with `dnf` in
+     Fedora next to the packages that own the shared icon and MIME folders (checking it owns only its own folders),
+     and starts the daemon, the app and the drive helper.
    - It must end with `is ready to publish` and exit 0. If anything says FAIL, stop and fix it; don't publish.
 6. **Checksums,** for this version's files only: `dist/release/` also keeps older builds.
    ```bash
