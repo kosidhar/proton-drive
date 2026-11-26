@@ -4,6 +4,9 @@ release/
 build/
 native-gui/target/
 native-vfs/target/
+# the portable (Ubuntu 22.04) builds, see packaging/linux/build-portable.sh
+native-gui/target-portable/
+native-vfs/target-portable/
 *.deb
 *.sqlite
 *.sqlite-shm
@@ -16,3 +19,5 @@ native-vfs/target/
 # Python bytecode caches
 __pycache__/
 *.pyc
+# also a node_modules symlink (agent worktrees link the main checkout's)
+node_modules
