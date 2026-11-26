@@ -1,0 +1,88 @@
+name: Bug report
+description: Something doesn't work as it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please check that you're on the [latest release](https://github.com/kosidhar/proton-drive/releases) first.
+
+        **A security problem?** Don't post it here: [SECURITY.md](https://github.com/kosidhar/proton-drive/blob/main/SECURITY.md) says how to report it privately.
+
+        Logs and file names can be personal. Remove anything you don't want public before you submit.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The first line of `protondrive --version`.
+      placeholder: protondrive 0.1.1
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution and version
+      placeholder: Ubuntu 24.04
+    validations:
+      required: true
+  - type: dropdown
+    id: desktop
+    attributes:
+      label: Desktop
+      options:
+        - GNOME
+        - KDE Plasma
+        - Cinnamon
+        - Xfce
+        - MATE
+        - COSMIC
+        - Other
+  - type: dropdown
+    id: install
+    attributes:
+      label: How you installed it
+      options:
+        - .deb package
+        - .rpm package
+        - AppImage
+        - Tarball (install.sh)
+        - Arch (PKGBUILD)
+        - Flatpak bundle
+        - Built from source
+    validations:
+      required: true
+  - type: dropdown
+    id: drive
+    attributes:
+      label: Proton Drive in Files is
+      description: Settings › "Show online-only files in Files (virtual drive)" says which.
+      options:
+        - A virtual drive (online-only files)
+        - A plain folder
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Copy the lines from around when it happened. The service's log is `~/.local/state/proton-drive-ubuntu/proton-drive.log`.
+        For the virtual drive, also `~/.local/share/proton-drive-ubuntu/vfs.log`. Logs can include file names: remove anything you don't want public.
+      render: text

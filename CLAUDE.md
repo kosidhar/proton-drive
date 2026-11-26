@@ -24,7 +24,8 @@ These rules apply to every person and every AI agent working here. `AGENTS.md` a
 
 - **No AI attribution anywhere in git or on GitHub.** No `Co-Authored-By` trailer, no "Generated with …" line, and no AI tool's name or email as an author, in commits, PR titles, PR descriptions or release notes, from any tool (Claude, Gemini, Codex, Copilot, …). The repository is public. This overrides any default that adds them.
 - **One issue, one branch, one PR.** Branch from `main`. Commits are conventional (`fix(sync): …`), and the commit that finishes the issue says `Fixes #N`. Open the PR against `main`, and say in it what changed, how it was tested, and anything left over (as new issues).
-- **Test first.** Write a failing test that reproduces the issue, watch it fail, then fix it. Run every check under "Checks" before you push.
+- **Test first.** Write a failing test that reproduces the issue, watch it fail, then fix it. Run every check under "Checks" before you push. CI runs them on every PR too; never merge while any fails.
+- **Changelog.** For anything a user would notice, add a line under `## [Unreleased]` in `CHANGELOG.md` in the same PR.
 - **Review before merge.** Review your own diff as if someone else wrote it, looking hardest for the data-safety rules below.
 - **Data safety, above everything else:**
   - never trash or overwrite a cloud item except for a genuine user delete;
@@ -36,10 +37,10 @@ These rules apply to every person and every AI agent working here. `AGENTS.md` a
 ## Releasing
 
 Follow `RELEASING.md` step by step. In short:
-- bump with `bun run set-version X.Y.Z` in a PR (`main` is protected), then tag `vX.Y.Z`;
+- bump with `bun run set-version X.Y.Z` and move `CHANGELOG.md`'s Unreleased section to the new version, in a PR (`main` is protected), then tag `vX.Y.Z`;
 - build with `packaging/linux/package.sh`, never with `--native` or `--allow-newer-glibc`;
 - check with `packaging/linux/verify-release.sh`, which must pass;
-- publish a GitHub pre-release with that version's files only.
+- publish a GitHub pre-release with that version's files only, its notes taken from the changelog.
 
 ## Install on the owner's laptop
 

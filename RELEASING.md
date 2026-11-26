@@ -15,11 +15,19 @@ The repo's general rules in `CLAUDE.md` apply too.
 ## Steps
 
 1. **Issue.** Open a tracking issue for the release (CLAUDE.md: every piece of work gets one).
-2. **Bump the version in a PR.** `main` is protected, so even this goes through a pull request.
+2. **Bump the version and the changelog in a PR.** `main` is protected, so even this goes through a pull request.
+   In `CHANGELOG.md`:
+   - rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` (today's date);
+   - add a new, empty `## [Unreleased]` above it;
+   - at the bottom, add `[X.Y.Z]: https://github.com/kosidhar/proton-drive/releases/tag/vX.Y.Z` and point the
+     `[Unreleased]` link at `compare/vX.Y.Z...HEAD`.
+
+   Read the section through: it becomes the release notes, so every line should make sense to someone using the app.
    ```bash
    git checkout -b chore/release-X.Y.Z
    bun run set-version X.Y.Z          # package.json, both Cargo.toml + Cargo.lock, PKGBUILD
-   bun test tests/version.test.ts     # every place agrees
+   # …edit CHANGELOG.md as above…
+   bun test tests/version.test.ts tests/projectFiles.test.ts   # every place agrees; the changelog has X.Y.Z
    git commit -am "chore: release X.Y.Z"
    git push -u origin chore/release-X.Y.Z
    gh pr create --base main --title "chore: release X.Y.Z" --body "…"
@@ -58,7 +66,9 @@ The repo's general rules in `CLAUDE.md` apply too.
    The release notes:
    - start with the notice: *Not made by or affiliated with Proton AG. Proton Drive is a trademark of Proton AG. This
      is early software that syncs your files: keep backups.*
-   - say what changed, with issue numbers, and how to install (`sudo apt install ./…deb`, `sudo dnf install ./…rpm`).
+   - say what changed: this version's section of `CHANGELOG.md`, with its Added / Changed / Fixed headings and issue
+     numbers;
+   - say how to install (`sudo apt install ./…deb`, `sudo dnf install ./…rpm`).
    - contain no local paths, usernames or personal details.
 8. **Close the release issue** with the release link.
 9. **Optional:** install the new build on the owner's laptop, following "Install on the owner's laptop" in
