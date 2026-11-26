@@ -53,14 +53,17 @@ describe('one version for the whole app', () => {
         }
     });
 
-    test('the README has no literal version in package file names', () => {
-        const readme = read(ROOT, 'README.md');
-        expect(readme).not.toMatch(/kosidhar-protondrive-\d/);
-        expect(readme).toContain('kosidhar-protondrive-<version>-linux-amd64.deb');
+    test('the README and the install guide have no literal version in package file names', () => {
+        for (const doc of ['README.md', 'docs/INSTALL.md']) {
+            const text = read(ROOT, doc);
+            expect(text).not.toMatch(/kosidhar-protondrive-\d/);
+            expect(text).toContain('kosidhar-protondrive-<version>-linux-amd64.deb');
+        }
     });
 
-    test('the README has a Releasing section', () => {
-        expect(read(ROOT, 'README.md')).toMatch(/^## Releasing/m);
+    test('the release steps are in RELEASING.md, which CONTRIBUTING.md points to', () => {
+        expect(read(ROOT, 'RELEASING.md')).toMatch(/bun run set-version X\.Y\.Z/);
+        expect(read(ROOT, 'CONTRIBUTING.md')).toContain('(RELEASING.md)');
     });
 });
 

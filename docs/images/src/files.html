@@ -1,0 +1,121 @@
+<!doctype html>
+<!--
+  An illustration of Proton Drive in GNOME Files, with made-up files (#521). It is not a screenshot: a README must
+  not show a real drive's file names. It mirrors the layout of GNOME Files 49 with the Yaru theme, and uses the app's
+  own emblems (linux/icons/emblems) and Proton Docs/Sheets icons (assets/mimetypes), plus GNOME's syncing and
+  read-only emblems, the ones Files shows for those states.
+
+  Render it with scripts/files-illustration.sh, which needs Google Chrome and the Yaru and Adwaita icon themes.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 1280px; height: 480px; overflow: hidden; }
+  body { font-family: "Ubuntu Sans", "Cantarell", sans-serif; font-size: 14px; color: #303030; background: #fafafa;
+         display: flex; -webkit-font-smoothing: antialiased; }
+  img.sym { width: 16px; height: 16px; opacity: .8; }
+
+  /* Sidebar */
+  .sidebar { width: 240px; height: 100%; background: #ebebeb; display: flex; flex-direction: column; }
+  .sidebar .head { height: 46px; display: flex; align-items: center; justify-content: space-between; padding: 0 12px; }
+  .sidebar .head b { font-weight: 700; font-size: 14px; }
+  .places { padding: 4px 6px; }
+  .row { height: 34px; display: flex; align-items: center; gap: 12px; padding: 0 12px; border-radius: 6px; }
+  .row.sel { background: #dcdcdc; }
+  .row .grow { flex: 1; }
+  .sep { height: 1px; background: #d6d6d6; margin: 6px 6px; }
+
+  /* Main */
+  .main { flex: 1; display: flex; flex-direction: column; }
+  .bar { height: 46px; display: flex; align-items: center; padding: 0 8px 0 14px; gap: 8px; }
+  .nav { display: flex; gap: 22px; padding: 0 10px 0 4px; }
+  .path { flex: 1; max-width: 660px; margin: 0 auto; height: 32px; background: #e6e6e6; border-radius: 8px;
+          display: flex; align-items: center; gap: 8px; padding: 0 12px; font-weight: 700; }
+  .path .grow { flex: 1; }
+  .tools { display: flex; align-items: center; gap: 18px; padding: 0 6px; }
+  .win { display: flex; gap: 12px; margin-left: 10px; }
+  .win span { width: 24px; height: 24px; border-radius: 50%; background: #e2e2e2; display: flex;
+              align-items: center; justify-content: center; }
+  .win span img { width: 12px; height: 12px; }
+
+  .grid { display: grid; grid-template-columns: repeat(6, 160px); row-gap: 14px; padding: 22px 0 0 24px; }
+  .item { display: flex; flex-direction: column; align-items: center; text-align: center; }
+  .icon { position: relative; width: 96px; height: 96px; display: flex; align-items: center; justify-content: center; }
+  .icon > img.big { width: 96px; height: 96px; }
+  .icon > img.doc { width: 80px; height: 80px; }
+  .icon > img.emblem { position: absolute; top: -2px; right: -22px; width: 18px; height: 18px; }
+  /* Files draws the read-only lock grey, as on a real drive */
+  .icon > img.emblem.ro { filter: grayscale(1) brightness(.72); }
+  .label { margin-top: 6px; width: 150px; line-height: 17px; font-size: 14px; overflow-wrap: anywhere; }
+
+</style>
+</head>
+<body>
+  <div class="sidebar">
+    <div class="head">
+      <img class="sym" src="file:///usr/share/icons/Yaru/scalable/actions/system-search-symbolic.svg">
+      <b>Files</b>
+      <img class="sym" src="file:///usr/share/icons/Yaru/scalable/actions/open-menu-symbolic.svg">
+    </div>
+    <div class="places">
+      <div class="row"><img class="sym" src="file:///usr/share/icons/Yaru/scalable/places/user-home-symbolic.svg">Home</div>
+      <div class="row"><img class="sym" src="file:///usr/share/icons/Adwaita/symbolic/actions/document-open-recent-symbolic.svg">Recent</div>
+      <div class="row"><img class="sym" src="file:///usr/share/icons/Adwaita/symbolic/status/starred-symbolic.svg">Starred</div>
+      <div class="row"><img class="sym" src="file:///usr/share/icons/Yaru/scalable/places/network-workgroup-symbolic.svg">Network</div>
+      <div class="row"><img class="sym" src="file:///usr/share/icons/Yaru/scalable/places/user-trash-symbolic.svg">Trash</div>
+      <div class="sep"></div>
+      <div class="row"><img class="sym" src="file:///usr/share/icons/Yaru/scalable/places/folder-documents-symbolic.svg">Documents</div>
+      <div class="row"><img class="sym" src="file:///usr/share/icons/Yaru/scalable/places/folder-music-symbolic.svg">Music</div>
+      <div class="row"><img class="sym" src="file:///usr/share/icons/Yaru/scalable/places/folder-pictures-symbolic.svg">Pictures</div>
+      <div class="row"><img class="sym" src="file:///usr/share/icons/Yaru/scalable/places/folder-videos-symbolic.svg">Videos</div>
+      <div class="row"><img class="sym" src="file:///usr/share/icons/Yaru/scalable/places/folder-download-symbolic.svg">Downloads</div>
+      <div class="sep"></div>
+      <div class="row sel"><img class="sym" src="file:///usr/share/icons/Yaru/scalable/devices/drive-harddisk-symbolic.svg"><span class="grow">Proton Drive</span><img class="sym" src="file:///usr/share/icons/Yaru/scalable/actions/media-eject-symbolic.svg"></div>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="bar">
+      <div class="nav">
+        <img class="sym" src="file:///usr/share/icons/Yaru/scalable/actions/go-previous-symbolic.svg">
+        <img class="sym" style="opacity:.35" src="file:///usr/share/icons/Yaru/scalable/actions/go-next-symbolic.svg">
+      </div>
+      <div class="path">
+        <img class="sym" src="file:///usr/share/icons/Yaru/scalable/devices/drive-harddisk-symbolic.svg">
+        <span class="grow">Proton Drive</span>
+        <img class="sym" src="file:///usr/share/icons/Yaru/scalable/actions/view-more-symbolic.svg">
+      </div>
+      <div class="tools">
+        <img class="sym" src="file:///usr/share/icons/Yaru/scalable/actions/edit-find-symbolic.svg">
+        <img class="sym" src="file:///usr/share/icons/Yaru/scalable/actions/view-list-symbolic.svg">
+      </div>
+      <div class="win">
+        <span><img src="file:///usr/share/icons/Adwaita/symbolic/ui/window-minimize-symbolic.svg"></span>
+        <span><img src="file:///usr/share/icons/Adwaita/symbolic/ui/window-maximize-symbolic.svg"></span>
+        <span><img src="file:///usr/share/icons/Adwaita/symbolic/ui/window-close-symbolic.svg"></span>
+      </div>
+    </div>
+
+    <div class="grid">
+      <!-- Folders: Downloaded, partly here, online only, always kept, syncing -->
+      <div class="item"><div class="icon"><img class="big" src="file:///usr/share/icons/Yaru/256x256/places/folder.png"><img class="emblem" src="../../../linux/icons/emblems/emblem-protondrive-local.svg"></div><div class="label">Documents</div></div>
+      <div class="item"><div class="icon"><img class="big" src="file:///usr/share/icons/Yaru/256x256/places/folder.png"><img class="emblem" src="../../../linux/icons/emblems/emblem-protondrive-partial.svg"></div><div class="label">Photos</div></div>
+      <div class="item"><div class="icon"><img class="big" src="file:///usr/share/icons/Yaru/256x256/places/folder.png"><img class="emblem" src="../../../linux/icons/emblems/emblem-protondrive-cloud.svg"></div><div class="label">Projects</div></div>
+      <div class="item"><div class="icon"><img class="big" src="file:///usr/share/icons/Yaru/256x256/places/folder.png"><img class="emblem" src="../../../linux/icons/emblems/emblem-protondrive-pinned.svg"></div><div class="label">Taxes</div></div>
+      <div class="item"><div class="icon"><img class="big" src="file:///usr/share/icons/Yaru/256x256/places/folder.png"><img class="emblem" src="file:///usr/share/icons/Yaru/scalable/emblems/emblem-synchronizing-symbolic.svg"></div><div class="label">Work</div></div>
+      <div class="item"><div class="icon"><img class="big" src="file:///usr/share/icons/Yaru/256x256/places/folder.png"><img class="emblem" src="../../../linux/icons/emblems/emblem-protondrive-cloud.svg"></div><div class="label">Music</div></div>
+
+      <!-- Proton Docs and Sheets: read-only placeholders that open in the browser -->
+      <div class="item"><div class="icon"><img class="doc" src="../../../assets/mimetypes/application-vnd.proton.sheet.svg"><img class="emblem ro" src="file:///usr/share/icons/Yaru/scalable/emblems/emblem-readonly-symbolic.svg"></div><div class="label">Household budget.protonsheet</div></div>
+      <div class="item"><div class="icon"><img class="doc" src="../../../assets/mimetypes/application-vnd.proton.doc.svg"><img class="emblem ro" src="file:///usr/share/icons/Yaru/scalable/emblems/emblem-readonly-symbolic.svg"></div><div class="label">Recipes.protondoc</div></div>
+      <!-- Files: always kept, online only, downloaded -->
+      <div class="item"><div class="icon"><img class="big" src="file:///usr/share/icons/Yaru/256x256/mimetypes/application-pdf.png"><img class="emblem" src="../../../linux/icons/emblems/emblem-protondrive-pinned.svg"></div><div class="label">Lease agreement.pdf</div></div>
+      <div class="item"><div class="icon"><img class="big" src="file:///usr/share/icons/Yaru/256x256/mimetypes/application-pdf.png"><img class="emblem" src="../../../linux/icons/emblems/emblem-protondrive-cloud.svg"></div><div class="label">Garden plans.pdf</div></div>
+      <div class="item"><div class="icon"><img class="big" src="file:///usr/share/icons/Yaru/256x256/mimetypes/image-x-generic.png"><img class="emblem" src="../../../linux/icons/emblems/emblem-protondrive-cloud.svg"></div><div class="label">Lisbon sunset.jpg</div></div>
+      <div class="item"><div class="icon"><img class="big" src="file:///usr/share/icons/Yaru/256x256/mimetypes/text-x-generic.png"><img class="emblem" src="../../../linux/icons/emblems/emblem-protondrive-local.svg"></div><div class="label">To do.txt</div></div>
+    </div>
+  </div>
+</body>
+</html>

@@ -47,4 +47,17 @@ The app icon (`assets/app-icon/hicolor/`), the tray icons (`assets/app-icon/tray
 - License: GPL-3.0 (the license of that repository); the text is at `assets/mimetypes/LICENSE`
 - These icons are Proton AG's artwork and trademark. They are not covered by this repository's MIT license, and they are the reason the packages declare `MIT AND GPL-3.0-only`. To redistribute or modify this project without them, delete `assets/mimetypes/` and the lines that install it.
 
+## Icons in the README's Files illustration
+
+- What it is: `docs/images/files.png`, a drawing of Proton Drive in GNOME Files with made-up files, rendered from
+  `docs/images/src/files.html` by `scripts/files-illustration.sh`.
+- What it shows from elsewhere:
+  - the folder, file-type and window icons of the Yaru icon theme (Canonical Ltd. and Sam Hewitt; GPL-3.0+,
+    LGPL-2.1 and CC-BY-SA-4.0; https://github.com/ubuntu/yaru);
+  - a few symbolic icons from GNOME's Adwaita icon theme (the GNOME Project; CC-BY-SA-3.0 or LGPL-3, and
+    CC-BY-SA-4.0; https://gitlab.gnome.org/GNOME/adwaita-icon-theme);
+  - this project's own emblems, and the Proton Docs and Sheets icons above.
+- License: the image is not covered by this repository's MIT license. It is shared under the terms of the icons it
+  shows. The page loads the theme icons from the system and doesn't copy them into the repository.
+
 Dependencies installed by the package managers (npm/bun, cargo) carry their own licenses in their packages.

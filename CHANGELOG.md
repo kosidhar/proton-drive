@@ -12,6 +12,8 @@ pre-release.
   Debian 12 before it's published (#510).
 - Every pull request now runs all the tests automatically (#518).
 - This changelog, a security policy, a contributor guide, and issue templates (#519).
+- A README for people installing the app, with screenshots, and an install guide, a user guide and a command-line
+  reference in `docs/` (#521).
 
 ## [0.1.1] - 2026-11-26
 
