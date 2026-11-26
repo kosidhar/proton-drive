@@ -41,7 +41,8 @@ Ubuntu 22.04 container so they run on older systems too. [RELEASING.md](RELEASIN
 
 ## Checks
 
-Run all of these before you push. CI runs them on every pull request, and a PR can't merge while any fails.
+Run all of these before you push. CI runs them on every pull request too, and a pull request is merged only when they
+all pass.
 
 ```bash
 bun test tests

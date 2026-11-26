@@ -8,6 +8,17 @@ const ROOT = path.resolve(import.meta.dir, '..');
 const read = (rel: string) => readFileSync(path.join(ROOT, rel), 'utf8');
 const version = () => JSON.parse(read('package.json')).version as string;
 const ADVISORIES = 'https://github.com/kosidhar/proton-drive/security/advisories/new';
+const SECURITY_POLICY = 'https://github.com/kosidhar/proton-drive/blob/main/SECURITY.md';
+/** Positive when a is newer than b. MAJOR.MINOR.PATCH, then a release after its own -pre.N, and pre.N by number. */
+function versionOrder(a: string, b: string): number {
+    const parse = (v: string) => {
+        const [, major, minor, patch, pre] = v.match(/^(\d+)\.(\d+)\.(\d+)(?:-pre\.(\d+))?$/)!;
+        return [Number(major), Number(minor), Number(patch), pre === undefined ? Infinity : Number(pre)];
+    };
+    const [x, y] = [parse(a), parse(b)];
+    for (let i = 0; i < 4; i++) if (x[i] !== y[i]) return x[i]! > y[i]! ? 1 : -1;
+    return 0;
+}
 // The repository is public: these files name no one's email address (example.com is fine)
 const EMAIL = /[A-Za-z0-9._%+-]+@(?!example\.com\b)[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
 
@@ -21,13 +32,18 @@ describe('CHANGELOG.md (#519)', () => {
         expect(versions().map((m) => m[1])).toContain(version());
     });
 
+    test('orders versions the way set-version writes them: a release comes after its own pre-releases', () => {
+        expect(versionOrder('0.1.1', '0.1.0')).toBeGreaterThan(0);
+        expect(versionOrder('0.10.0', '0.9.9')).toBeGreaterThan(0);
+        expect(versionOrder('0.2.0', '0.2.0-pre.1')).toBeGreaterThan(0);
+        expect(versionOrder('0.2.0-pre.10', '0.2.0-pre.9')).toBeGreaterThan(0);
+        expect(versionOrder('0.2.0-pre.1', '0.1.9')).toBeGreaterThan(0);
+        expect(versionOrder('0.2.0', '0.2.0')).toBe(0);
+    });
+
     test('lists versions newest first', () => {
-        const listed = versions().map((m) => m[1]!.split(/[.-]/).slice(0, 3).map(Number));
-        for (let i = 1; i < listed.length; i++) {
-            const [a, b] = [listed[i - 1]!, listed[i]!];
-            const newer = a[0]! - b[0]! || a[1]! - b[1]! || a[2]! - b[2]!;
-            expect(newer).toBeGreaterThan(0);
-        }
+        const listed = versions().map((m) => m[1]!);
+        for (let i = 1; i < listed.length; i++) expect(versionOrder(listed[i - 1]!, listed[i]!)).toBeGreaterThan(0);
     });
 
     test('groups changes only under the Keep a Changelog headings', () => {
@@ -46,19 +62,30 @@ describe('CHANGELOG.md (#519)', () => {
 describe('RELEASING.md uses the changelog (#519)', () => {
     test('the bump moves Unreleased into the new version, and the notes come from that section', () => {
         const releasing = read('RELEASING.md');
-        expect(releasing).toMatch(/CHANGELOG\.md/);
-        expect(releasing).toMatch(/Unreleased/);
-        expect(releasing).toMatch(/git commit -am "chore: release X\.Y\.Z"/);
-        // The changelog edit comes before the bump's commit
-        expect(releasing.indexOf('CHANGELOG.md')).toBeLessThan(releasing.indexOf('git commit -am "chore: release X.Y.Z"'));
+        const commit = releasing.indexOf('git commit -am "chore: release X.Y.Z"');
+        expect(commit).toBeGreaterThan(0);
+        // Each changelog instruction comes before the bump's commit
+        for (const step of [
+            'rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`',
+            'add a new, empty `## [Unreleased]` above it',
+            '`[X.Y.Z]: https://github.com/kosidhar/proton-drive/releases/tag/vX.Y.Z`',
+            '`compare/vX.Y.Z...HEAD`',
+        ]) {
+            const at = releasing.indexOf(step);
+            expect(at).toBeGreaterThan(0);
+            expect(at).toBeLessThan(commit);
+        }
+        // and the notes are that section
+        expect(releasing).toMatch(/this version's section of `CHANGELOG\.md`/);
     });
 });
 
 describe('SECURITY.md and CONTRIBUTING.md (#519)', () => {
-    test('SECURITY.md says to report privately, through GitHub', () => {
+    test('SECURITY.md says to report privately, through GitHub, and what to do if that form is off', () => {
         const security = read('SECURITY.md');
         expect(security).toContain(ADVISORIES);
-        expect(security).toMatch(/not .*public issue|don't open a public issue/i);
+        expect(security).toMatch(/don't open a public issue/i);
+        expect(security).toMatch(/Security contact/); // the fallback: a public issue asking for a private channel
     });
 
     test('CONTRIBUTING.md lists every check and points to CLAUDE.md for the full rules', () => {
@@ -102,13 +129,14 @@ describe('issue and PR templates (#519)', () => {
         expect(feature.body.some((f) => f.id === 'problem' && f.validations?.required)).toBe(true);
     });
 
-    test('blank issues stay allowed, and security reports go to the private form', () => {
+    test('blank issues stay allowed, and security reports go to SECURITY.md', () => {
         const config = Bun.YAML.parse(read('.github/ISSUE_TEMPLATE/config.yml')) as {
             blank_issues_enabled: boolean;
             contact_links: { url: string }[];
         };
         expect(config.blank_issues_enabled).toBe(true);
-        expect(config.contact_links.map((l) => l.url)).toContain(ADVISORIES);
+        expect(config.contact_links.map((l) => l.url)).toContain(SECURITY_POLICY);
+        expect(read('.github/ISSUE_TEMPLATE/bug_report.yml')).toContain(SECURITY_POLICY);
     });
 
     test('the PR template asks for the issue, the testing and the data-safety review', () => {

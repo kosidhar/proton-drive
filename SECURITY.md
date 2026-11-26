@@ -6,6 +6,9 @@
 [report a vulnerability](https://github.com/kosidhar/proton-drive/security/advisories/new). Only the maintainer sees
 it.
 
+If that page isn't available, open an issue titled **Security contact**, with no details in it, and you'll be given a
+private way to send them.
+
 Say which version you used (`protondrive --version`), what someone could do with the problem, and how to reproduce
 it. This is a small project with one maintainer: expect an answer within a week, and a fix in a new release as soon as
 one is ready. You'll be credited in the release notes unless you'd rather not be.

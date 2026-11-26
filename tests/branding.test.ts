@@ -55,6 +55,8 @@ const DATA_FOLDER_ALLOWED: Array<[file: string, line: RegExp, why: string]> = [
     ['packaging/linux/install.sh', /^  echo "\$\{data:-\$home\/\.local\/share\}\/proton-drive-ubuntu"$/, 'proton_app_dir: the data folder (echo)'],
     ['README.md', /~\/\.local\/share\/proton-drive-ubuntu\/files/, 'the data folder, where the store lives'],
     ['CLAUDE.md', /^   D=~\/\.local\/share\/proton-drive-ubuntu$/, "the data folder, in the owner's-laptop install steps (backing up the sync database)"],
+    ['.github/ISSUE_TEMPLATE/bug_report.yml', /`~\/\.local\/state\/proton-drive-ubuntu\/proton-drive\.log`/, "the service's log, in the data folders, for bug reports"],
+    ['.github/ISSUE_TEMPLATE/bug_report.yml', /`~\/\.local\/share\/proton-drive-ubuntu\/vfs\.log`/, "the drive helper's log, in the data folder, for bug reports"],
 ];
 
 describe('names after #413', () => {
