@@ -19,3 +19,5 @@ native-vfs/target-portable/
 # Python bytecode caches
 __pycache__/
 *.pyc
+# also a node_modules symlink (agent worktrees link the main checkout's)
+node_modules

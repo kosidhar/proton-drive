@@ -37,6 +37,10 @@ overrides:
       - libxrandr2
       - mesa-vulkan-drivers
       - xdg-desktop-portal
+      - python3-nautilus
+      - python3-gi
+      - gir1.2-gtk-3.0
+      - gir1.2-ayatanaappindicator3-0.1
   rpm:
     depends:
       - glibc >= ${GLIBC_MIN}
@@ -55,6 +59,10 @@ overrides:
       - libXrandr
       - mesa-vulkan-drivers
       - xdg-desktop-portal
+      - nautilus-python
+      - python3-gobject
+      - gtk3
+      - libayatana-appindicator-gtk3
 
 contents:
   - src: ${STAGE}/usr/bin/protondrive
