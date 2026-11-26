@@ -21,11 +21,12 @@ pub const CHILDREN_TIMEOUT: Duration = Duration::from_secs(3);
 pub const SPACE_TIMEOUT: Duration = Duration::from_secs(5);
 /// A download for an open completes or fails within 30 minutes.
 pub const HYDRATE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-/// A rename, delete or truncate waits its turn in the daemon's queue and changes only this computer, except an rmdir of
-/// a folder Proton Drive has, which also waits for one listing of that folder in Proton Drive (#435). 60 s stays the
-/// cap so a slow listing can't hang a FUSE call for minutes while still giving a normal listing ample room. Each goes
-/// with a deadline (deadlineMs) a little short of this limit, and the daemon refuses one whose turn comes later
-/// (including after an rmdir's listing), so a change the app was told failed (EIO) never happens afterwards.
+/// A rename, delete or truncate waits its turn in the daemon's queue and changes only this computer (no network, except
+/// an rmdir of a folder Proton Drive has, which also waits for a listing of that folder in Proton Drive — at most two
+/// if it changes meanwhile, #435). 60 s stays the cap so a slow listing can't hang a FUSE call for minutes while still
+/// giving a normal listing ample room. Each goes with a deadline (deadlineMs) a little short of this limit, and the
+/// daemon refuses one whose turn comes later (including after an rmdir's listing), so a change the app was told failed
+/// (EIO) never happens afterwards.
 pub const CHANGE_TIMEOUT: Duration = Duration::from_secs(60);
 /// What the deadline leaves of CHANGE_TIMEOUT for a change whose turn starts just before it, so it is done (and
 /// answered) before the helper gives up.
