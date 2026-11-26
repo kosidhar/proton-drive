@@ -7,7 +7,7 @@ import { MemberRole, NodeType } from '@protontech/drive-sdk';
 
 import { ShareError } from '../src/daemon/shareService';
 import { resolveDownloadsDir } from '../src/daemon/downloadsDir';
-import { createSharedWithMeService, downloadNames } from '../src/daemon/sharedWithMe';
+import { createSharedWithMeService, downloadNames, redactingLogger } from '../src/daemon/sharedWithMe';
 import { LOCAL_RESERVE_BYTES } from '../src/sync/syncEngine';
 
 const DOC = 'application/vnd.proton.doc';
@@ -58,6 +58,7 @@ function make(
         downloads?: string;
         free?: number;
         fetchFile?: (node: any, toPath: string) => Promise<void>;
+        logError?: (line: string) => void;
     } = {},
 ) {
     const calls: Array<[string, ...unknown[]]> = [];
@@ -100,6 +101,7 @@ function make(
         sdk,
         logActivity: (e) => logs.push(e),
         now: () => 1000,
+        logError: opts.logError,
         downloadsDir: async () => opts.downloads ?? tmp(),
         freeBytes: async () => opts.free ?? LOCAL_RESERVE_BYTES * 10,
         fetchFile:
@@ -315,6 +317,90 @@ describe('shared with me: download', () => {
         const { path: result } = await service.download('n1');
         expect(result.endsWith('.pdf')).toBe(true);
         expect(Buffer.byteLength(path.basename(result))).toBeLessThanOrEqual(150);
+    });
+
+    test('a long name is cut by character, never inside one, and the returned path exists', async () => {
+        const dir = tmp();
+        const name = `${'a'.repeat(143)}😀😀😀.pdf`;
+        const { service } = make({ downloads: dir, nodes: [file('n1', name)] });
+        const { path: result } = await service.download('n1');
+        expect(existsSync(result)).toBe(true);
+        expect(result.endsWith('.pdf')).toBe(true);
+        expect(result).toBe(result.toWellFormed());
+        expect(Buffer.byteLength(path.basename(result))).toBeLessThanOrEqual(150);
+        expect(await readdir(dir)).toEqual([path.basename(result)]);
+    });
+
+    test('control characters of both ranges and the marks that reverse text are stripped', async () => {
+        const dir = tmp();
+        const { service } = make({ downloads: dir, nodes: [file('n1', 'evil\u202Efdp.exe\u0085\u009f\u2066x\u2069')] });
+        expect(path.basename((await service.download('n1')).path)).toBe('evilfdp.exex');
+    });
+
+    test('a local failure of the fetch is said plainly, with no Proton blame and no temp path, and its code is logged', async () => {
+        for (const [code, text] of [
+            ['ENOSPC', "Couldn't save to your Downloads folder: there's no space left"],
+            ['EPERM', "Couldn't save to your Downloads folder: it doesn't allow this"],
+            ['EACCES', "Couldn't save to your Downloads folder: you don't have permission to write there"],
+            ['EROFS', "Couldn't save to your Downloads folder: it is read-only"],
+        ] as const) {
+            const dir = tmp();
+            const lines: string[] = [];
+            const { service } = make({
+                downloads: dir,
+                nodes: [file('n1', 'a.txt')],
+                fetchFile: async (_n, toPath) => {
+                    await writeFile(toPath, 'half');
+                    throw Object.assign(new Error(`${code}: failed, write '${toPath}'`), { code });
+                },
+                logError: (l) => lines.push(l),
+            });
+            const err = await service.download('n1').catch((e) => e);
+            expect([code, err.message]).toEqual([code, text]);
+            expect(err.message).not.toContain('.proton-drive-tmp-');
+            expect(lines).toEqual([`Download: saving failed (${code})`]);
+            expect(await readdir(dir)).toEqual([]);
+        }
+    });
+
+    test('an EPERM from link is said plainly, with no temp path', async () => {
+        const dir = tmp();
+        const lines: string[] = [];
+        // A folder where the file should be: link() refuses it with EPERM
+        const { service } = make({
+            downloads: dir,
+            nodes: [file('n1', 'a.txt')],
+            fetchFile: async (_n, toPath) => {
+                await mkdir(toPath);
+            },
+            logError: (l) => lines.push(l),
+        });
+        const err = await service.download('n1').catch((e) => e);
+        expect(err).toBeInstanceOf(ShareError);
+        expect(err.message).toBe("Couldn't save to your Downloads folder: it doesn't allow this");
+        expect(err.message).not.toContain(dir);
+        expect(lines).toEqual(['Download: saving failed (EPERM)']);
+        expect(existsSync(path.join(dir, 'a.txt'))).toBe(false);
+    });
+
+    test('a failing fetch for a name with an address logs no address', async () => {
+        const logged: string[] = [];
+        const sink = {
+            debug: (m: string) => logged.push(m),
+            info: (m: string) => logged.push(m),
+            warn: (m: string) => logged.push(m),
+            error: (m: string, e?: unknown) => logged.push(m, e instanceof Error ? `${e.name} ${e.message}` : String(e ?? '')),
+        };
+        const logger = redactingLogger(sink);
+        const secret = 'Contract - john@acme.com.pdf';
+        logger.debug(`Downloading ${secret}`);
+        logger.info(`Downloading ${secret}`);
+        logger.warn(`Downloading ${secret}`);
+        logger.error(`Failed downloading ${secret} to /d/.proton-drive-tmp-x-${secret}`, new Error(`rename ${secret} failed`));
+        logger.error(`Failed ${secret}`, `text ${secret}`);
+        expect(logged.length).toBeGreaterThan(5);
+        expect(logged.join('\n')).not.toContain('john@acme.com');
+        expect(logged.join('\n')).toContain('Contract - an address');
     });
 
     test('the names go name, name (1), name (2) with the extension last', () => {

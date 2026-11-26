@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { link, mkdir, rm, unlink } from 'node:fs/promises';
 import path from 'node:path';
 
-import { MemberRole, NodeType, type NodeEntity, type ProtonDriveClient } from '@protontech/drive-sdk';
+import { MemberRole, NodeType, type Logger, type NodeEntity, type ProtonDriveClient } from '@protontech/drive-sdk';
 import { isProtonDocument, isProtonSheet } from '@protontech/drive-sdk/internal/nodes/mediaTypes';
 
 import { loadSharedWithMe } from '../sdk/paths';
@@ -61,6 +61,8 @@ export interface SharedWithMeDeps {
     freeBytes(dir: string): Promise<number>;
     // Downloads the file to toPath, a path nothing is at
     fetchFile(node: NodeEntity, toPath: string): Promise<void>;
+    // The daemon's log, for the code of a local failure (never a name or a path)
+    logError?(line: string): void;
 }
 
 const SHARED_WITH_ME_PAGE = 'https://drive.proton.me/shared-with-me';
@@ -85,6 +87,45 @@ const nameOf = (name: { ok: boolean; value?: string }): string | null => (name.o
 // Names are the sender's text, and may hold an address: the activity log keeps none
 const forLog = (name: string | null) => (name ?? 'a shared item').replace(EMAIL, 'an address');
 
+// The SDK's logger for a download: it names the file in its messages and errors, and the name is the sender's text, so
+// every message and error goes through with addresses taken out
+export function redactingLogger(logger: Logger): Logger {
+    const clean = (text: string) => text.replace(EMAIL, 'an address');
+    const cleanArg = (arg: unknown): unknown => {
+        if (arg instanceof Error) {
+            const copy = new Error(clean(arg.message));
+            copy.name = arg.name;
+            const code = (arg as NodeJS.ErrnoException).code;
+            if (code !== undefined) (copy as NodeJS.ErrnoException).code = code;
+            return copy;
+        }
+        return typeof arg === 'string' ? clean(arg) : arg === undefined ? arg : clean(String(arg));
+    };
+    return {
+        debug: (msg) => logger.debug(clean(msg)),
+        info: (msg) => logger.info(clean(msg)),
+        warn: (msg) => logger.warn(clean(msg)),
+        error: (msg, error) => logger.error(clean(msg), cleanArg(error)),
+    };
+}
+
+// What a failure of the user's own disk or folder says, in plain words (no Proton, no path); null for any other failure
+const LOCAL_FAILURES: Record<string, string> = {
+    ENOSPC: "there's no space left",
+    EPERM: "it doesn't allow this",
+    ENOTSUP: "it doesn't allow this",
+    EOPNOTSUPP: "it doesn't allow this",
+    ENOSYS: "it doesn't allow this",
+    EACCES: "you don't have permission to write there",
+    EROFS: "it is read-only",
+};
+
+function localFailure(e: unknown): { code: string; error: ShareError } | null {
+    const code = (e as NodeJS.ErrnoException | null)?.code;
+    const why = typeof code === 'string' ? LOCAL_FAILURES[code] : undefined;
+    return why === undefined || code === undefined ? null : { code, error: new ShareError(`Couldn't save to your Downloads folder: ${why}`) };
+}
+
 const FALLBACK_NAME = 'Shared file';
 // Room for " (n)" and the temp prefix inside the 255 bytes a file name may have
 const MAX_NAME_BYTES = 150;
@@ -93,14 +134,16 @@ export const TEMP_PREFIX = '.proton-drive-tmp-';
 
 function safeName(name: string): string {
     // A name is the sender's text: no folder, no control character, never . or ..
-    let safe = name.replace(/[\u0000-\u001f\u007f]/g, '').replace(/\//g, '_').trim();
+    // (control characters of both ranges, and the marks that reverse the order text is shown in)
+    let safe = name.replace(/[\p{Cc}\u202A-\u202E\u2066-\u2069]/gu, '').replace(/\//g, '_').trim();
     if (safe === '' || /^\.+$/.test(safe)) return FALLBACK_NAME;
     if (Buffer.byteLength(safe) > MAX_NAME_BYTES) {
         const ext = path.extname(safe);
         const keep = ext.length > 0 && Buffer.byteLength(ext) <= 20 ? ext : '';
-        let stem = safe.slice(0, safe.length - keep.length);
-        while (Buffer.byteLength(stem) + Buffer.byteLength(keep) > MAX_NAME_BYTES) stem = stem.slice(0, -1);
-        safe = (stem + keep).trim();
+        // By code point: a cut inside a pair would leave half of a character
+        const stem = Array.from(safe.slice(0, safe.length - keep.length));
+        while (stem.length > 0 && Buffer.byteLength(stem.join('')) + Buffer.byteLength(keep) > MAX_NAME_BYTES) stem.pop();
+        safe = (stem.join('') + keep).trim();
         if (safe === '' || /^\.+$/.test(safe)) return FALLBACK_NAME;
     }
     return safe;
@@ -267,7 +310,10 @@ export function createSharedWithMeService(deps: SharedWithMeDeps): SharedWithMeS
                     throw new ShareError("There isn't enough free space on this computer to download this file");
                 }
             } catch (e) {
-                throw e instanceof ShareError ? e : new ShareError("Your Downloads folder can't be used");
+                if (e instanceof ShareError) throw e;
+                const local = localFailure(e);
+                deps.logError?.(`Download: the Downloads folder can't be used (${(e as NodeJS.ErrnoException)?.code ?? 'unknown'})`);
+                throw local?.error ?? new ShareError("Your Downloads folder can't be used");
             }
 
             // A fresh name nothing is at, so the download's own rename can't replace anything; placed with link(), which
@@ -291,6 +337,11 @@ export function createSharedWithMeService(deps: SharedWithMeDeps): SharedWithMeS
                 }
             } catch (e) {
                 await rm(temp, { force: true }).catch(() => {});
+                const local = localFailure(e);
+                if (local) {
+                    deps.logError?.(`Download: saving failed (${local.code})`);
+                    throw local.error;
+                }
                 throw plainError(e);
             }
             await unlink(temp).catch(() => {});

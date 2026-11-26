@@ -28,8 +28,8 @@ import { DriveController } from './driveController';
 import { pauseRoute } from './pauseRoute';
 import { withAvailability } from './remoteListing';
 import { isTrustedLocalRequest } from './requestGuard';
-import { createSharedWithMeService } from './sharedWithMe';
-import { createShareService } from './shareService';
+import { createSharedWithMeService, redactingLogger } from './sharedWithMe';
+import { createShareService, ShareError } from './shareService';
 import { refuseOnTcp } from './tcpRefusals';
 import { findHelper, fuseAvailable, mergeStrayInto, VfsSupervisor } from './vfsSupervisor';
 
@@ -569,9 +569,10 @@ export async function startSyncDaemon(options: {
                         return Number(fs.bavail) * Number(fs.bsize);
                     },
                     fetchFile: async (node, toPath) => {
-                        const result = await downloadDriveNodeToLocal({ sdk: runtime.sdk, logger: runtime.logger, remoteNode: node, localPath: toPath });
-                        if (result.status !== 'downloaded') throw new Error('This file can only be opened on drive.proton.me');
+                        const result = await downloadDriveNodeToLocal({ sdk: runtime.sdk, logger: redactingLogger(runtime.logger), remoteNode: node, localPath: toPath });
+                        if (result.status !== 'downloaded') throw new ShareError('This file can only be opened on drive.proton.me');
                     },
+                    logError: (line) => runtime.logger.error(line),
                 }),
                 shareSignedIn: () => runtime.auth.isLoggedIn(),
                 shareLog: (line) => runtime.logger.error(line),
