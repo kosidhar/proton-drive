@@ -6,6 +6,8 @@ pre-release.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-26
+
 ### Fixed
 
 - The `.rpm` installs on Fedora again: it no longer claims shared folders such as `/usr/share/icons/hicolor`, which
@@ -63,7 +65,8 @@ The first public pre-release.
 - An app and a tray menu with status, storage, activity and settings, and Proton Drive's trash on the web.
 - Packages: `.deb`, `.rpm`, AppImage and a tarball.
 
-[Unreleased]: https://github.com/kosidhar/proton-drive/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/kosidhar/proton-drive/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/kosidhar/proton-drive/releases/tag/v0.1.3
 [0.1.2]: https://github.com/kosidhar/proton-drive/releases/tag/v0.1.2
 [0.1.1]: https://github.com/kosidhar/proton-drive/releases/tag/v0.1.1
 [0.1.0]: https://github.com/kosidhar/proton-drive/releases/tag/v0.1.0
