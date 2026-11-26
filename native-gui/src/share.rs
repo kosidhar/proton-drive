@@ -400,8 +400,8 @@ pub fn fake_share_info(state: &str, now_ms: i64, offset_at: impl Fn(i64) -> i64)
         "people" => ShareInfo {
             link: Some(link(false, None)),
             people: vec![
-                person("alex.martin@proton.me", Role::Editor, PersonState::Member),
-                person("sam.okafor@proton.me", Role::Viewer, PersonState::Invited),
+                person("alex.martin@example.com", Role::Editor, PersonState::Member),
+                person("sam.okafor@example.com", Role::Viewer, PersonState::Invited),
                 person("jordan@example.com", Role::Viewer, PersonState::InvitedNotProton),
             ],
         },

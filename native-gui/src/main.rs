@@ -10741,7 +10741,7 @@ mod tests {
         let budget = listing.items.iter().find(|i| i.name.as_deref() == Some("Budget.xlsx")).unwrap();
         let y = h.text_at("Budget.xlsx").expect("the name").y;
         let on_row = |text: &str| on_line(&h, text, y).unwrap_or_else(|| panic!("{text:?} on Budget.xlsx's row"));
-        assert!(on_row("sam@proton.me").left() >= by_x - 4.0 && on_row("sam@proton.me").right() <= date_x - 4.0);
+        assert!(on_row("sam@example.com").left() >= by_x - 4.0 && on_row("sam@example.com").right() <= date_x - 4.0);
         let date = shared_with_me_view::date_text(budget.shared_at.unwrap());
         assert!((on_row(&date).left() - date_x).abs() < 6.0, "{date} under Shared");
         assert!((on_row("Editor").left() - access_x).abs() < 6.0, "Editor under Access");
@@ -10788,7 +10788,7 @@ mod tests {
         let now = home::now_ms();
         let [trip, contract, hidden] = &listing.invitations[..] else { panic!("three invitations") };
         let line = shared_with_me_view::invitation_line(trip, now);
-        assert_eq!(line, "sam@proton.me invited you as Viewer · 1 day ago");
+        assert_eq!(line, "sam@example.com invited you as Viewer · 1 day ago");
         assert!(h.text_at(&line).is_some_and(|p| p.y > invitations.y));
         let unverified = shared_with_me_view::invitation_line(contract, now);
         assert_eq!(unverified, "Sender not verified · Editor · 1 day ago");
@@ -10815,7 +10815,7 @@ mod tests {
         tooltips_at_once(&h);
         let y = h.text_at("Budget.xlsx").unwrap().y;
         let mark = on_line(&h, icons::WARNING, y).expect("⚠ on the row");
-        assert!(on_line(&h, "sam@proton.me", y).is_some(), "the claimed address stays beside it");
+        assert!(on_line(&h, "sam@example.com", y).is_some(), "the claimed address stays beside it");
         // The other rows have none
         let other = h.text_at("Design review").unwrap().y;
         assert!(on_line(&h, icons::WARNING, other).is_none());
@@ -11309,7 +11309,7 @@ mod tests {
             let accept = node_rect(&h.nodes_named(&format!("Accept {name}"))[0]);
             let decline = node_rect(&h.nodes_named(&format!("Decline {name}"))[0]);
             assert!(accept.right() <= h.screen.x && decline.right() < accept.left());
-            let line = h.text_rect_starting("sam@proton.me invited").or_else(|| h.text_rect_starting("Sender not verified")).unwrap();
+            let line = h.text_rect_starting("sam@example.com invited").or_else(|| h.text_rect_starting("Sender not verified")).unwrap();
             assert!(line.right() < accept.right());
         }
         // Zoomed in too
