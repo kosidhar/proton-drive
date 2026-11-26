@@ -3,6 +3,14 @@ export type SessionLocation = { storage: 'keyring' } | { storage: 'file'; path?:
 
 export const NO_FILE_SESSION_ENV = 'PROTONDRIVE_NO_FILE_SESSION';
 
+/** Saving the session was refused: no keyring, and PROTONDRIVE_NO_FILE_SESSION forbids the file. The user stays signed out. */
+export class SessionFileRefusedError extends Error {
+    constructor(message: string, options?: { cause?: unknown }) {
+        super(message, options);
+        this.name = 'SessionFileRefusedError';
+    }
+}
+
 export const KEYRING_HELP =
     'Install and unlock a keyring (GNOME Keyring or KWallet, or any other Secret Service provider) and sign in again to keep it there.';
 

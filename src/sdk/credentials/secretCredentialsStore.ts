@@ -3,7 +3,7 @@ import { Logger, ValidationError } from '@protontech/drive-sdk';
 import { CREDENTIALS_NAME, CREDENTIALS_SERVICE } from './constants';
 import type { Credentials, CredentialsStore } from './interface';
 import { parseStoredSnapshot } from './parseCredentials';
-import { NO_FILE_SESSION_ENV, type SessionLocation } from './sessionLocation';
+import { NO_FILE_SESSION_ENV, SessionFileRefusedError, type SessionLocation } from './sessionLocation';
 
 export class SecretsSessionStore implements CredentialsStore {
     private where: SessionLocation | null = null;
@@ -65,10 +65,9 @@ export class SecretsSessionStore implements CredentialsStore {
         } catch (error: unknown) {
             if (this.fallbackStore) {
                 if (this.options.refuseFile) {
-                    throw new ValidationError(
+                    throw new SessionFileRefusedError(
                         `No keyring is available, and ${NO_FILE_SESSION_ENV} is set, so the session was not saved to a file. ` +
                             `You stay signed out. Install a Secret Service keyring (GNOME Keyring or KWallet) or unset ${NO_FILE_SESSION_ENV}.`,
-                        undefined,
                         { cause: error },
                     );
                 }

@@ -114,6 +114,29 @@ describe('PROTONDRIVE_NO_FILE_SESSION (#537)', () => {
         expect(await Bun.file(path.join(dir, 'auth-session.json')).exists()).toBe(false);
     });
 
+    test('a sign-in the opt-out refuses leaves the app signed out, not signed in for the rest of the run', async () => {
+        const dir = tmp();
+        const { logger } = recordingLogger();
+        const creds = new Credentials(new SecretsSessionStore(logger, new PlaintextFileSessionStore(dir, logger), { refuseFile: true }), logger);
+        keyringDown();
+        // As the web sign-in does it: the key password first, then the session
+        await creds.setUserKeyPassword('p');
+        await expect(creds.setSessionInfo(snapshot.session)).rejects.toThrow(/PROTONDRIVE_NO_FILE_SESSION/);
+        expect(creds.isLoggedIn()).toBe(false);
+        expect(creds.accessToken).toBeUndefined();
+        expect(await Bun.file(path.join(dir, 'auth-session.json')).exists()).toBe(false);
+    });
+
+    test('another failure to save keeps the session for this run, as before', async () => {
+        const { logger } = recordingLogger();
+        // No file store to fall back to: the keyring's own error goes up, and the session stays in memory
+        const creds = new Credentials(new SecretsSessionStore(logger, undefined, {}), logger);
+        keyringDown();
+        await creds.setUserKeyPassword('p');
+        await expect(creds.setSessionInfo(snapshot.session)).rejects.toThrow();
+        expect(creds.isLoggedIn()).toBe(true);
+    });
+
     test('with the opt-out and a working keyring, saving is unchanged', async () => {
         const { logger } = recordingLogger();
         const store = new SecretsSessionStore(logger, new PlaintextFileSessionStore(tmp(), logger), { refuseFile: true });
