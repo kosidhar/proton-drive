@@ -133,10 +133,12 @@ impl ProtonDriveNativeApp {
         ScrollArea::vertical().id_salt("shared_with_me_scroll").auto_shrink([false, false]).show(ui, |ui| {
             Frame::NONE.inner_margin(gutter).show(ui, |ui| {
                 if let Some(error) = self.shared_with_me.error.clone() {
+                    let starting = self.initial_connecting && error == crate::UNREACHABLE;
                     let retry = place_above_middle(ui, "shared_with_me_error_h", viewport, |ui| {
                         ui.scope(|ui| {
                             ui.set_width(ui.available_width().min(420.0));
-                            ui.add(egui::Label::new(RichText::new(error).size(13.0).color(DANGER_TEXT())).wrap().halign(Align::Center));
+                            let (words, color) = if starting { (crate::DAEMON_STARTING.to_string(), TEXT_MUTED()) } else { (error, DANGER_TEXT()) };
+                            ui.add(egui::Label::new(RichText::new(words).size(13.0).color(color)).wrap().halign(Align::Center));
                         });
                         ui.add_space(12.0);
                         let retry = crate::action_button(ui, ButtonKind::Primary, Some(icons::REFRESH), "Retry", 34.0);

@@ -673,6 +673,11 @@ const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// What a read timeout means: the daemon accepted the request and is still busy with it.
 const STILL_WORKING: &str = "Still working on it in the background. Refresh to see the result.";
 
+/// What a failed connect to the control socket says (no socket yet, or nobody listening on it)
+const UNREACHABLE: &str = "Can't reach the Proton Drive background service";
+/// What the Shared pages say instead, while the app is still making its first connection
+const DAEMON_STARTING: &str = "Proton Drive is starting…";
+
 /// One HTTP/1.1 request to the daemon's user-only control socket. Pin, free, hide and unhide go only through here,
 /// never through the TCP API.
 fn control_request_at(
@@ -696,7 +701,6 @@ fn control_request_with_timeout_message(
     timeout_message: &str,
 ) -> Result<serde_json::Value, String> {
     use std::io::{Read, Write};
-    const UNREACHABLE: &str = "Can't reach the Proton Drive background service";
     // Every request on the socket goes through here: a screenshot never calls it, so it can't change anything
     if SCREENSHOT_MODE.load(AtomicOrdering::SeqCst) {
         return Err("Screenshots never call the Proton Drive background service".to_string());
@@ -10263,6 +10267,31 @@ mod tests {
     }
 
     // #496: the Shared pages read again by themselves once the daemon is up
+    // #496: while the first connection is being made, a failed read isn't a red error
+    #[test]
+    fn the_shared_pages_say_starting_in_muted_words_while_the_app_first_connects() {
+        for tab in [NavTab::Shared, NavTab::SharedWithMe] {
+            let h = opened_before_the_daemon(tab, true);
+            let said = h.text_at(DAEMON_STARTING).unwrap_or_else(|| panic!("{tab:?} says it is starting"));
+            assert_eq!(painted_color(&h, DAEMON_STARTING, said), Some(TEXT_MUTED()), "{tab:?}");
+            assert!(h.text_at(UNREACHABLE).is_none(), "{tab:?}");
+            assert!(h.widget_at("Retry").is_some(), "{tab:?} keeps Retry");
+        }
+    }
+
+    #[test]
+    fn the_shared_pages_say_plainly_they_cant_reach_the_service_once_connected_before() {
+        for tab in [NavTab::Shared, NavTab::SharedWithMe] {
+            let mut h = opened_before_the_daemon(tab, true);
+            h.app.initial_connecting = false;
+            h.frames(2);
+            let said = h.text_at(UNREACHABLE).unwrap_or_else(|| panic!("{tab:?} says it can't reach"));
+            assert_eq!(painted_color(&h, UNREACHABLE, said), Some(DANGER_TEXT()), "{tab:?}");
+            assert!(h.text_at(DAEMON_STARTING).is_none(), "{tab:?}");
+            assert!(h.widget_at("Retry").is_some(), "{tab:?}");
+        }
+    }
+
     #[test]
     fn shared_opened_before_the_daemon_reads_again_when_the_first_status_comes() {
         let mut h = opened_before_the_daemon(NavTab::Shared, true);
