@@ -21,6 +21,7 @@ import {
     THIRD_PARTY_DISCLOSURE,
     uploadLocalFileToDrive,
 } from '../sdk';
+import { APP_PACKAGE_VERSION } from '../version';
 import { openDoc } from './openDoc';
 import { DAEMON_NOT_RUNNING_MESSAGE, runAvailabilityCommand } from './availabilityCommands';
 import { controlSocketDirProblem, daemonRunning, MOVING_FILES_MESSAGE, pendingMoveMarker, syncPassError } from './daemonProbe';
@@ -175,6 +176,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
 
     if (cmd === 'version' || cmd === '--version') {
         const info = {
+            version: APP_PACKAGE_VERSION,
             appVersion: DEFAULT_APP_VERSION,
             sdkVersion: DEFAULT_SDK_VERSION,
             disclosure: THIRD_PARTY_DISCLOSURE,
@@ -182,6 +184,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
         if (jsonFlag) {
             console.log(JSON.stringify(info, null, 2));
         } else {
+            console.log(`protondrive ${info.version}`);
             console.log(`App Version: ${info.appVersion}`);
             console.log(`SDK Version: ${info.sdkVersion}`);
             console.log(`Disclosure:  ${info.disclosure}`);

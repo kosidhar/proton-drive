@@ -12,10 +12,10 @@ Built to work out-of-the-box across all major Linux distributions and desktop en
 
 | Format | Output Artifact (`dist/release/`) | Target Distributions |
 | :--- | :--- | :--- |
-| **AppImage** | `kosidhar-protondrive-0.1.0-linux-x86_64.AppImage` | **Universal** — runs on any Linux distro (Ubuntu, Fedora, Arch, openSUSE, Mint, NixOS, SteamOS) without installation |
-| **Debian / Ubuntu (`.deb`)** | `kosidhar-protondrive-0.1.0-linux-amd64.deb` | Debian, Ubuntu, Linux Mint, Pop!\_OS, Zorin OS, Elementary OS, Kali |
-| **Fedora / RHEL / SUSE (`.rpm`)** | `kosidhar-protondrive-0.1.0-linux-x86_64.rpm` | Fedora, RHEL, CentOS Stream, Rocky Linux, AlmaLinux, openSUSE Tumbleweed / Leap |
-| **Portable Tarball (`.tar.gz`)** | `kosidhar-protondrive-0.1.0-linux-x86_64.tar.gz` | Any Linux distro — includes FHS tree (`bin/`, `share/`, `lib/systemd/user/`) and universal `install.sh` (`--user` or `--system`) |
+| **AppImage** | `kosidhar-protondrive-<version>-linux-x86_64.AppImage` | **Universal** — runs on any Linux distro (Ubuntu, Fedora, Arch, openSUSE, Mint, NixOS, SteamOS) without installation |
+| **Debian / Ubuntu (`.deb`)** | `kosidhar-protondrive-<version>-linux-amd64.deb` | Debian, Ubuntu, Linux Mint, Pop!\_OS, Zorin OS, Elementary OS, Kali |
+| **Fedora / RHEL / SUSE (`.rpm`)** | `kosidhar-protondrive-<version>-linux-x86_64.rpm` | Fedora, RHEL, CentOS Stream, Rocky Linux, AlmaLinux, openSUSE Tumbleweed / Leap |
+| **Portable Tarball (`.tar.gz`)** | `kosidhar-protondrive-<version>-linux-x86_64.tar.gz` | Any Linux distro — includes FHS tree (`bin/`, `share/`, `lib/systemd/user/`) and universal `install.sh` (`--user` or `--system`) |
 | **Arch Linux (`PKGBUILD`)** | `packaging/linux/arch/PKGBUILD` | Arch Linux, Manjaro, EndeavourOS, Garuda (`makepkg -si`) |
 | **Flatpak Bundle (`.flatpak`)** | `packaging/linux/flatpak-bundle.sh` | Sandboxed Flatpak bundle for Flathub / Fedora Silverblue / immutable distros |
 
@@ -72,10 +72,10 @@ Proton Drive shows up in your file manager's sidebar as **Proton Drive**. It lis
 ```
 
 This outputs all 4 universal release artifacts to `./dist/release/`:
-- `dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.AppImage`
-- `dist/release/kosidhar-protondrive-0.1.0-linux-amd64.deb`
-- `dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.rpm`
-- `dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.tar.gz`
+- `dist/release/kosidhar-protondrive-<version>-linux-x86_64.AppImage`
+- `dist/release/kosidhar-protondrive-<version>-linux-amd64.deb`
+- `dist/release/kosidhar-protondrive-<version>-linux-x86_64.rpm`
+- `dist/release/kosidhar-protondrive-<version>-linux-x86_64.tar.gz`
 
 ### Option A: Universal Per-User Install (Any Distro, No Root Needed)
 
@@ -89,22 +89,22 @@ Install `fuse3` from your distro first if you want the virtual drive.
 ### Option B: Debian / Ubuntu / Mint / Pop!\_OS (`.deb`)
 
 ```bash
-sudo dpkg -i ./dist/release/kosidhar-protondrive-0.1.0-linux-amd64.deb
+sudo dpkg -i ./dist/release/kosidhar-protondrive-<version>-linux-amd64.deb
 systemctl --user enable --now protondrive.service
 ```
 
 ### Option C: Fedora / RHEL / openSUSE (`.rpm`)
 
 ```bash
-sudo dnf install ./dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.rpm
+sudo dnf install ./dist/release/kosidhar-protondrive-<version>-linux-x86_64.rpm
 systemctl --user enable --now protondrive.service
 ```
 
 ### Option D: Universal AppImage (Zero Installation)
 
 ```bash
-chmod +x ./dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.AppImage
-./dist/release/kosidhar-protondrive-0.1.0-linux-x86_64.AppImage
+chmod +x ./dist/release/kosidhar-protondrive-<version>-linux-x86_64.AppImage
+./dist/release/kosidhar-protondrive-<version>-linux-x86_64.AppImage
 ```
 
 The first time it runs, the AppImage registers the Proton Docs and Sheets file types and an open handler under `~/.local/share`, so the `.protondoc` and `.protonsheet` placeholders open in your browser. If you move the AppImage file, it updates them the next time it runs. If you delete the AppImage, its handler entry is ignored. To remove them, delete `~/.local/share/applications/io.github.kosidhar.ProtonDrive.OpenDoc.desktop`, `~/.local/share/mime/packages/io.github.kosidhar.ProtonDrive.xml` and the two icons `~/.local/share/icons/hicolor/scalable/mimetypes/application-vnd.proton.{doc,sheet}.svg`, then run `update-mime-database ~/.local/share/mime`.
@@ -143,6 +143,20 @@ protondrive trash <remotePath>             # Move a remote node to Trash
 - To act on the whole drive (pin and free only), name it explicitly: `/my-files` or the sync folder itself. A relative path that would mean the whole drive, such as `.` at the top of the sync folder, is refused, and so is anything outside the sync folder.
 - `status <path>` answers `Not in Proton Drive: <path>` for a path that is neither in Proton Drive nor in the sync folder.
 - These commands go through the running daemon's user-only control socket, so `protondrive daemon` must be running.
+
+---
+
+## Releasing
+
+The version lives in `package.json`; everything else follows it.
+
+1. Bump it in a PR: `bun run set-version X.Y.Z` (or `X.Y.Z-pre.N` for a pre-release). It updates `package.json`, both `Cargo.toml` files and their `Cargo.lock` entries, and the PKGBUILD's `pkgver` (resetting `pkgrel` to 1). A test fails if any of them disagree.
+2. Merge the PR.
+3. Tag the merge commit `vX.Y.Z` and push the tag.
+4. Run `packaging/linux/package.sh` to build the packages. Their names carry the version.
+5. Publish a GitHub release for the tag with the packages attached (mark `-pre.N` versions as pre-releases).
+
+`protondrive --version` prints the app version first. The Proton API identity that follows it is separate and is not changed by `set-version`.
 
 ---
 

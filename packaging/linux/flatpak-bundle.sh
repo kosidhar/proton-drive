@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HERE="$ROOT/packaging/linux"
 APP_ID="io.github.kosidhar.ProtonDrive"
-VERSION="0.1.0"
+VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$ROOT/package.json")"
 DIST="$ROOT/dist/release"
 CARGO_TARGET_DIR="$ROOT/native-gui/target"
 FLATHUB="https://dl.flathub.org/repo/flathub.flatpakrepo"
