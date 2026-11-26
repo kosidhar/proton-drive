@@ -5622,6 +5622,9 @@ export class ProtonDriveSyncEngine {
         // A local item of the other kind with no cloud node of its own (unrecorded, disowned, colliding or moved away):
         // no record, edit baseline, cut-short nodeUid or queued move under fromRel follows it (#453, #463)
         const sourceOtherUnowned = sourceOtherKind !== null && sourceUid === null;
+        // A local file over a cloud folder can never have real children under fromRel/, even if recorded as another file
+        // node: any stale record, baseline, cut-short hold or queued move strictly under fromRel/ stays behind (#463)
+        const sourceOverCloudFolder = sourceOtherKind?.type === 'folder';
         const target = lstatSync(path.join(root, toRel), { throwIfNoEntry: false });
         const targetRecord = this.stateDb.getItemByPath(toRel);
         const targetEntry = ignoredTo ? null : this.liveIndexEntry(toRel);
@@ -5700,7 +5703,7 @@ export class ProtonDriveSyncEngine {
             .filter(
                 (baseline) =>
                     isSameOrUnder(baseline.relPath, fromRel) &&
-                    ((sourceOtherKind !== null && baseline.relPath !== fromRel) || this.movedAwayFrom(baseline.nodeUid, baseline.relPath)),
+                    ((sourceOverCloudFolder && baseline.relPath !== fromRel) || this.movedAwayFrom(baseline.nodeUid, baseline.relPath)),
             )
             .map((baseline) => baseline.relPath);
         await this.whileRemoving(
@@ -5756,7 +5759,7 @@ export class ProtonDriveSyncEngine {
                         } else {
                             for (const item of this.stateDb.getItemsUnder(fromRel)) {
                                 if (
-                                    (sourceOtherKind !== null && item.localRelPath !== fromRel) ||
+                                    (sourceOverCloudFolder && item.localRelPath !== fromRel) ||
                                     this.movedAwayFrom(item.nodeUid, item.localRelPath)
                                 ) {
                                     this.stateDb.removeItemByPath(item.localRelPath);
@@ -5764,10 +5767,10 @@ export class ProtonDriveSyncEngine {
                             }
                             this.stateDb.renameItemPath(fromRel, toRel, this.cloudParentOf(toRel));
                         }
-                        if (!sourceOtherKind) {
+                        if (!sourceOtherUnowned && !sourceOverCloudFolder) {
                             this.journal.retarget(fromRel, toRel);
                         } else if (sourceUid !== null) {
-                            // Local item of the other kind recorded as another node: only a pending move of that node
+                            // Local file over a cloud folder recorded as another node: only a pending move of that node
                             // itself at fromRel follows to toRel, never queued moves aimed under fromRel/ (#463)
                             for (const op of this.journal.pending()) {
                                 if (op.kind !== 'trash' && op.nodeUid === sourceUid && op.toPath === fromRel) {
@@ -5809,15 +5812,11 @@ export class ProtonDriveSyncEngine {
                         if (!isSameOrUnder(hold.relPath, toRel)) {
                             continue;
                         }
-                        if (keepsTarget && hold.relPath === toRel) {
+                        if (sourceOverCloudFolder && hold.relPath !== toRel) {
+                            this.stateDb.dropCutShort(hold.relPath);
+                        } else if (keepsTarget && hold.relPath === toRel) {
                             this.stateDb.holdCutShort({ ...hold, nodeUid: targetUid });
-                        } else if (
-                            sourceCollides ||
-                            sourceOtherUnowned ||
-                            sourceMovedAway ||
-                            (sourceOtherKind !== null && hold.relPath !== toRel) ||
-                            movedCutShorts.has(hold.relPath)
-                        ) {
+                        } else if (sourceCollides || sourceOtherUnowned || sourceMovedAway || movedCutShorts.has(hold.relPath)) {
                             this.stateDb.holdCutShort({ ...hold, nodeUid: null });
                         }
                     }
