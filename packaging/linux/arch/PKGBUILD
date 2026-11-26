@@ -1,6 +1,6 @@
 # Maintainer: Gautam Chauhan <gautam@linux.local>
 pkgname=kosidhar-protondrive
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc="Native Linux desktop client and two-way folder sync daemon for Proton Drive"
 arch=('x86_64' 'aarch64')

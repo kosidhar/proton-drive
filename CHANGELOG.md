@@ -6,6 +6,23 @@ pre-release.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-26
+
+### Security
+
+- Names from Proton Drive are now checked before they become paths on this computer. Names are encrypted, so Proton's
+  servers can't check them: someone with edit rights on a folder you share could give an item a name with `..` or `/`
+  that made a sync write outside the sync folder. Such items are now skipped, without deleting or trashing anything,
+  and no path the app uses can lead outside the sync folder (#536). Reported on Reddit: thank you.
+- Without a keyring, the app now says that your session is saved in a file: in the log, in `protondrive auth status`
+  and in Settings › Account. `PROTONDRIVE_NO_FILE_SESSION=1` makes it refuse the file and leave you signed out instead
+  (#537).
+
+### Fixed
+
+- A file renamed in Proton Drive to a name longer than 255 bytes no longer has its copy on this computer deleted
+  (#536).
+
 ### Added
 
 - A release checklist (`RELEASING.md`) and a check that installs each release's `.deb` in clean Ubuntu 22.04 and
@@ -40,6 +57,7 @@ The first public pre-release.
 - An app and a tray menu with status, storage, activity and settings, and Proton Drive's trash on the web.
 - Packages: `.deb`, `.rpm`, AppImage and a tarball.
 
-[Unreleased]: https://github.com/kosidhar/proton-drive/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/kosidhar/proton-drive/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/kosidhar/proton-drive/releases/tag/v0.1.2
 [0.1.1]: https://github.com/kosidhar/proton-drive/releases/tag/v0.1.1
 [0.1.0]: https://github.com/kosidhar/proton-drive/releases/tag/v0.1.0
