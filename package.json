@@ -12,6 +12,7 @@
         "bun": ">=1.4.2"
     },
     "scripts": {
+        "set-version": "bun scripts/set-version.ts",
         "start": "bun run src/cli/main.ts",
         "daemon": "bun run src/cli/main.ts daemon",
         "gui": "bun run src/cli/main.ts gui",
