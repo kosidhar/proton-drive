@@ -291,7 +291,8 @@ describe('recommends for the Files extension and the tray (#506)', () => {
 
     test('the Arch package lists the Files extension and the tray library as optional', () => {
         const pkgbuild = readFileSync(PKGBUILD, 'utf8');
-        expect(pkgbuild).toMatch(/'python-nautilus:/);
+        expect(pkgbuild).toMatch(/'nautilus-python:/);
+        expect(pkgbuild).not.toContain('python-nautilus');
         expect(pkgbuild).toMatch(/'libayatana-appindicator:/);
     });
 
@@ -299,6 +300,8 @@ describe('recommends for the Files extension and the tray (#506)', () => {
         const readme = readFileSync(path.join(root, 'README.md'), 'utf8');
         const install = readme.slice(readme.indexOf('### Option B'), readme.indexOf('### Option D'));
         expect(install).toContain('python3-nautilus');
+        expect(install).toContain('apt install ./dist/release/kosidhar-protondrive-<version>-linux-amd64.deb');
+        expect(install).not.toContain('dpkg -i');
         expect(install).toContain('nautilus-python');
         expect(install).toContain('nautilus -q');
         expect(install).toContain('gir1.2-ayatanaappindicator3-0.1');
