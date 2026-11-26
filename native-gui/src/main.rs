@@ -5074,16 +5074,16 @@ OPTIONS:
   --pause-choices       with --screenshot: show Home's Pause choices open
   --account-menu        with --screenshot: show the top bar's account menu open
   --fake-share <S>      with --screenshot: show the Share window (for --share's item, else Docs/report.pdf in the
-                        drive) as S (none | link | link-password | link-expired | people)
+                        drive) as S (none | link | link-password | link-expired | people | readme)
   --confirm-accept-unverified <NAME>  with --screenshot and --fake-shared-with-me invitations: show the question before accepting that invitation
   --confirm-leave <NAME>        with --screenshot and --fake-shared-with-me list: show the Leave confirmation for that row
   --confirm-stop-sharing <NAME>  with --screenshot and --fake-shared list: show the Stop sharing confirmation for that row
   --fake-cut-short <S>  with --screenshot: list files held because the disk guard cut them short (one | many)
   --fake-disk-full      with --screenshot: show Home's notice that the computer's disk is almost full
   --fake-shared <S>     with --screenshot: show the Shared section (--tab shared) as S
-                        (list | empty | offline | loading | refreshing)
+                        (list | readme | empty | offline | loading | refreshing)
   --fake-shared-with-me <S>  with --screenshot: show the Shared with me page (--tab shared-with-me) as S
-                        (list | invitations | empty | offline | loading | refreshing)
+                        (list | readme | invitations | empty | offline | loading | refreshing)
   --show-unofficial-notice  with --screenshot: show the first-run unofficial-app notice
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --zoom <F>            with --screenshot: render at zoom factor F (0.5 to 3, e.g. 1.2), as Ctrl+= would
@@ -5299,7 +5299,7 @@ fn main() -> eframe::Result {
         Some(state) if screenshot_target.is_some() => {
             let info = share::fake_share_info(&state, home::now_ms(), home::local_offset_secs);
             if info.is_none() {
-                eprintln!("protondrive-gui: ignoring unknown --fake-share {state:?} (none | link | link-password | link-expired | people)");
+                eprintln!("protondrive-gui: ignoring unknown --fake-share {state:?} (none | link | link-password | link-expired | people | readme)");
             }
             info
         }
@@ -5334,7 +5334,7 @@ fn main() -> eframe::Result {
             if shared::SharedPage::default().fake(&state, home::now_ms()) {
                 Some(state)
             } else {
-                eprintln!("protondrive-gui: ignoring unknown --fake-shared {state:?} (list | empty | offline | loading | refreshing)");
+                eprintln!("protondrive-gui: ignoring unknown --fake-shared {state:?} (list | readme | empty | offline | loading | refreshing)");
                 None
             }
         }
@@ -5346,7 +5346,7 @@ fn main() -> eframe::Result {
             if shared_with_me::SharedWithMePage::default().fake(&state, home::now_ms()) {
                 Some(state)
             } else {
-                eprintln!("protondrive-gui: ignoring unknown --fake-shared-with-me {state:?} (list | invitations | empty | offline | loading | refreshing)");
+                eprintln!("protondrive-gui: ignoring unknown --fake-shared-with-me {state:?} (list | readme | invitations | empty | offline | loading | refreshing)");
                 None
             }
         }
@@ -10741,7 +10741,7 @@ mod tests {
         let budget = listing.items.iter().find(|i| i.name.as_deref() == Some("Budget.xlsx")).unwrap();
         let y = h.text_at("Budget.xlsx").expect("the name").y;
         let on_row = |text: &str| on_line(&h, text, y).unwrap_or_else(|| panic!("{text:?} on Budget.xlsx's row"));
-        assert!(on_row("sam@proton.me").left() >= by_x - 4.0 && on_row("sam@proton.me").right() <= date_x - 4.0);
+        assert!(on_row("sam@example.com").left() >= by_x - 4.0 && on_row("sam@example.com").right() <= date_x - 4.0);
         let date = shared_with_me_view::date_text(budget.shared_at.unwrap());
         assert!((on_row(&date).left() - date_x).abs() < 6.0, "{date} under Shared");
         assert!((on_row("Editor").left() - access_x).abs() < 6.0, "Editor under Access");
@@ -10788,7 +10788,7 @@ mod tests {
         let now = home::now_ms();
         let [trip, contract, hidden] = &listing.invitations[..] else { panic!("three invitations") };
         let line = shared_with_me_view::invitation_line(trip, now);
-        assert_eq!(line, "sam@proton.me invited you as Viewer · 1 day ago");
+        assert_eq!(line, "sam@example.com invited you as Viewer · 1 day ago");
         assert!(h.text_at(&line).is_some_and(|p| p.y > invitations.y));
         let unverified = shared_with_me_view::invitation_line(contract, now);
         assert_eq!(unverified, "Sender not verified · Editor · 1 day ago");
@@ -10815,7 +10815,7 @@ mod tests {
         tooltips_at_once(&h);
         let y = h.text_at("Budget.xlsx").unwrap().y;
         let mark = on_line(&h, icons::WARNING, y).expect("⚠ on the row");
-        assert!(on_line(&h, "sam@proton.me", y).is_some(), "the claimed address stays beside it");
+        assert!(on_line(&h, "sam@example.com", y).is_some(), "the claimed address stays beside it");
         // The other rows have none
         let other = h.text_at("Design review").unwrap().y;
         assert!(on_line(&h, icons::WARNING, other).is_none());
@@ -11309,7 +11309,7 @@ mod tests {
             let accept = node_rect(&h.nodes_named(&format!("Accept {name}"))[0]);
             let decline = node_rect(&h.nodes_named(&format!("Decline {name}"))[0]);
             assert!(accept.right() <= h.screen.x && decline.right() < accept.left());
-            let line = h.text_rect_starting("sam@proton.me invited").or_else(|| h.text_rect_starting("Sender not verified")).unwrap();
+            let line = h.text_rect_starting("sam@example.com invited").or_else(|| h.text_rect_starting("Sender not verified")).unwrap();
             assert!(line.right() < accept.right());
         }
         // Zoomed in too
