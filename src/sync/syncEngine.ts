@@ -5619,6 +5619,9 @@ export class ProtonDriveSyncEngine {
         // delete, #454): neither trashed on a replace nor renamed back. Only the local item moves, as a new item.
         const sourceMovedAway = sourceOwnUid !== null && this.movedAwayFrom(sourceOwnUid, fromRel);
         const sourceUid = ignoredFrom || sourceCollides || sourceDisowned || sourceMovedAway ? null : sourceOwnUid;
+        // A local item of the other kind with no cloud node of its own (unrecorded, disowned, colliding or moved away):
+        // no record, edit baseline, cut-short nodeUid or queued move under fromRel follows it (#453, #463)
+        const sourceOtherUnowned = sourceOtherKind !== null && sourceUid === null;
         const target = lstatSync(path.join(root, toRel), { throwIfNoEntry: false });
         const targetRecord = this.stateDb.getItemByPath(toRel);
         const targetEntry = ignoredTo ? null : this.liveIndexEntry(toRel);
@@ -5669,7 +5672,7 @@ export class ProtonDriveSyncEngine {
         // A folder with no node of its own (made here) can still hold items Proton Drive has: they move with it there
         const pendingUids = new Set(this.journal.pending().map((op) => op.nodeUid));
         const carried =
-            sourceUid === null && !keepsTarget && !ignoredFrom && !ignoredTo && !sourceMovedAway && source?.isDirectory()
+            sourceUid === null && !keepsTarget && !ignoredFrom && !ignoredTo && !sourceOtherKind && !sourceMovedAway && source?.isDirectory()
                 ? this.topmostRecordedUnder(fromRel).filter(
                       (item) => item.localRelPath !== fromRel && !pendingUids.has(item.nodeUid) && !this.movedAwayFrom(item.nodeUid, item.localRelPath),
                   )
@@ -5678,7 +5681,7 @@ export class ProtonDriveSyncEngine {
         if (
             !keepsTarget &&
             !sourceCollides &&
-            !sourceDisowned &&
+            !sourceOtherUnowned &&
             !sourceMovedAway &&
             (sourceUid !== null || this.stateDb.getItemsUnder(fromRel).some((i) => !this.movedAwayFrom(i.nodeUid, i.localRelPath)))
         ) {
@@ -5692,9 +5695,13 @@ export class ProtonDriveSyncEngine {
                 .filter((hold) => isSameOrUnder(hold.relPath, fromRel) && hold.nodeUid !== null && this.movedAwayFrom(hold.nodeUid, hold.relPath))
                 .map((hold) => toRel + hold.relPath.slice(fromRel.length)),
         );
-        const movedBaselines = this.stateDb
+        const droppedBaselines = this.stateDb
             .listEditBaselines()
-            .filter((baseline) => isSameOrUnder(baseline.relPath, fromRel) && this.movedAwayFrom(baseline.nodeUid, baseline.relPath))
+            .filter(
+                (baseline) =>
+                    isSameOrUnder(baseline.relPath, fromRel) &&
+                    ((sourceOtherKind !== null && baseline.relPath !== fromRel) || this.movedAwayFrom(baseline.nodeUid, baseline.relPath)),
+            )
             .map((baseline) => baseline.relPath);
         await this.whileRemoving(
             async (records) => {
@@ -5738,22 +5745,36 @@ export class ProtonDriveSyncEngine {
                             for (const conflict of this.unresolvedConflictsAt(fromRel)) {
                                 this.stateDb.markConflictResolved(conflict.id, 'keep-both');
                             }
-                        } else if (sourceDisowned || sourceMovedAway) {
-                            // Its record names the cloud item of the other kind at its old path (#453), or a node
-                            // another device moved away (#461), which stays: the local item goes on as a new one
+                        } else if (sourceOtherUnowned || sourceMovedAway) {
+                            // Local item of the other kind with no cloud node of its own (#453, #463), or whose
+                            // recorded node moved away (#461): drop any records at or under fromRel so stale records
+                            // never follow it to toRel
                             this.stateDb.removeItemByPath(fromRel);
                         } else if (ignoredTo || !source) {
                             // Into an ignored name nothing follows it; and records with no local copy would read as deletes
                             this.stateDb.removeItemByPath(fromRel);
                         } else {
                             for (const item of this.stateDb.getItemsUnder(fromRel)) {
-                                if (this.movedAwayFrom(item.nodeUid, item.localRelPath)) {
+                                if (
+                                    (sourceOtherKind !== null && item.localRelPath !== fromRel) ||
+                                    this.movedAwayFrom(item.nodeUid, item.localRelPath)
+                                ) {
                                     this.stateDb.removeItemByPath(item.localRelPath);
                                 }
                             }
                             this.stateDb.renameItemPath(fromRel, toRel, this.cloudParentOf(toRel));
                         }
-                        this.journal.retarget(fromRel, toRel);
+                        if (!sourceOtherKind) {
+                            this.journal.retarget(fromRel, toRel);
+                        } else if (sourceUid !== null) {
+                            // Local item of the other kind recorded as another node: only a pending move of that node
+                            // itself at fromRel follows to toRel, never queued moves aimed under fromRel/ (#463)
+                            for (const op of this.journal.pending()) {
+                                if (op.kind !== 'trash' && op.nodeUid === sourceUid && op.toPath === fromRel) {
+                                    this.journal.setTarget(op.id, toRel);
+                                }
+                            }
+                        }
                         if (!ignoredTo) {
                             if (sourceUid !== null) {
                                 this.journal.enqueue(
@@ -5790,7 +5811,13 @@ export class ProtonDriveSyncEngine {
                         }
                         if (keepsTarget && hold.relPath === toRel) {
                             this.stateDb.holdCutShort({ ...hold, nodeUid: targetUid });
-                        } else if (sourceCollides || sourceDisowned || sourceMovedAway || movedCutShorts.has(hold.relPath)) {
+                        } else if (
+                            sourceCollides ||
+                            sourceOtherUnowned ||
+                            sourceMovedAway ||
+                            (sourceOtherKind !== null && hold.relPath !== toRel) ||
+                            movedCutShorts.has(hold.relPath)
+                        ) {
                             this.stateDb.holdCutShort({ ...hold, nodeUid: null });
                         }
                     }
@@ -5809,10 +5836,10 @@ export class ProtonDriveSyncEngine {
                 // what is synced
                 // A colliding file goes on as a new one: what it was an edit of stays where it is (#65). A colliding target
                 // keeps its own baseline, if any: what replaces it is judged by it, as an edit of what the drive showed
-                if (keepsTarget || ignoredTo || sourceCollides || sourceDisowned || sourceMovedAway || targetCollides) {
+                if (keepsTarget || ignoredTo || sourceCollides || sourceOtherUnowned || sourceMovedAway || targetCollides) {
                     this.stateDb.dropEditBaselines(fromRel);
                 } else {
-                    for (const relPath of movedBaselines) {
+                    for (const relPath of droppedBaselines) {
                         this.stateDb.dropEditBaselines(relPath);
                     }
                     this.stateDb.moveEditBaselines(fromRel, toRel);
