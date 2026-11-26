@@ -232,7 +232,7 @@ describe('Docs and Sheets file types', () => {
                 for (const [name, from] of files) {
                     expect(sh).toContain(`"$ROOT/${from}" "$STAGE/usr/${lic}/${name}"`);
                 }
-                expect(read('nfpm.yaml')).toContain('${STAGE}/usr/share/');
+                expect(read('nfpm.yaml')).toContain('# @STAGED_CONTENTS@'); // nfpm-contents.sh lists everything staged (#548)
             });
 
             test('install.sh installs them from the tarball and the source tree, and removes them', () => {

@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Check a release's .deb the way a user installs it (#510): in clean Ubuntu 22.04 and Debian 12 containers, install it
-# with `apt install ./…deb`, then start the daemon, the app and the drive helper. Also checks that no binary in the
-# package needs a glibc newer than 2.35. Run it after package.sh and before publishing a release (see RELEASING.md).
+# Check a release's .deb and .rpm the way users install them (#510, #548): in clean Ubuntu 22.04 and Debian 12
+# containers, `apt install ./…deb`; in Fedora, `dnf install ./…rpm` next to the packages that own the shared folders it
+# puts files in, and check it owns no folder but its own. Then start the daemon, the app and the drive helper. Also
+# checks that no binary needs a glibc newer than 2.35. Run it after package.sh and before publishing (see RELEASING.md).
 #
-# Needs docker. Pulls the official ubuntu:22.04 and debian:12 images and, inside them, packages from their archives.
+# Needs docker. Pulls the official ubuntu:22.04, debian:12 and fedora images and, inside them, packages from their
+# archives.
 #
 # Usage: packaging/linux/verify-release.sh [version]     (default: the version in package.json)
-#   IMAGES="ubuntu:22.04 ubuntu:24.04"  to check other images instead
+#   IMAGES="ubuntu:22.04 ubuntu:24.04"  to check other images for the .deb
+#   RPM_IMAGES="fedora:44 fedora:45"    to check other images for the .rpm
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -15,16 +18,22 @@ DIST="$ROOT/dist/release"
 GLIBC_LIMIT=2.35
 VERSION="${1:-$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$ROOT/package.json")}"
 DEB="kosidhar-protondrive-$VERSION-linux-amd64.deb"
+RPM="kosidhar-protondrive-$VERSION-linux-x86_64.rpm"
 IMAGES="${IMAGES:-ubuntu:22.04 debian:12}"
+RPM_IMAGES="${RPM_IMAGES:-fedora:latest}"
+# The only folders the packages may own, at 0755 (#548): every other folder belongs to the system or another package
+OWN_DIRS="/usr/share/protondrive /usr/share/protondrive/tray /usr/share/licenses/kosidhar-protondrive"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "error: docker is needed to check the release" >&2
   exit 1
 fi
-if [ ! -f "$DIST/$DEB" ]; then
-  echo "error: $DIST/$DEB is missing: run packaging/linux/package.sh first" >&2
-  exit 1
-fi
+for pkg in "$DEB" "$RPM"; do
+  if [ ! -f "$DIST/$pkg" ]; then
+    echo "error: $DIST/$pkg is missing: run packaging/linux/package.sh first" >&2
+    exit 1
+  fi
+done
 
 failed=0
 
@@ -74,9 +83,51 @@ for image in $IMAGES; do
   printf '%s\n' "$out" | sed 's/^/    /'
 done
 
+# 3. In each RPM image: dnf install ./…rpm next to hicolor-icon-theme, shared-mime-info and nautilus-python, which own
+# the shared folders it puts files in, so a folder it wrongly owns conflicts as it would for a user (#548); then it
+# owns no folder but its own, at 0755, and every program starts and reports this version
+for image in $RPM_IMAGES; do
+  echo "==> $image: installing $RPM with dnf..."
+  if out="$(docker run --rm --mount "type=bind,src=$DIST,dst=/pkgs,readonly" -e RPM="$RPM" "$image" bash -c '
+      set -u
+      dnf install -y -q hicolor-icon-theme shared-mime-info nautilus-python >/dev/null 2>&1 || { echo "installing the shared folders owners failed"; exit 1; }
+      dnf install -y "/pkgs/$RPM" >/tmp/dnf.log 2>&1 || { grep -iE "conflict|error" /tmp/dnf.log | head -8; exit 1; }
+      rpm -q --qf "[%{FILEMODES:perms} %{FILENAMES}\n]" kosidhar-protondrive | awk "\$1 ~ /^d/ { print \"owns: \" \$1 \" \" \$2 }"
+      echo "daemon: $(protondrive --version 2>&1 | head -1)"
+      echo "app: $(protondrive-gui --version 2>&1 | head -1)"
+      echo "helper: $(protondrive-vfs --help 2>&1 | head -1)"
+    ' 2>&1)"; then
+    :
+  else
+    echo "FAIL $image: the install failed:"
+    printf '%s\n' "$out" | sed 's/^/    /'
+    failed=1
+    continue
+  fi
+  ok=1
+  grep -qx "daemon: protondrive $VERSION" <<<"$out" || ok=0
+  grep -qx "app: protondrive-gui $VERSION" <<<"$out" || ok=0
+  grep -q "^helper: " <<<"$out" || ok=0
+  if grep -qE "GLIBC_|error while loading shared libraries" <<<"$out"; then ok=0; fi
+  while read -r mode dir; do
+    [ -n "$dir" ] || continue
+    case " $OWN_DIRS " in
+      *" $dir "*) [ "$mode" = drwxr-xr-x ] || { echo "    owns $dir as $mode, not 0755"; ok=0; } ;;
+      *) echo "    owns a folder that isn't its own: $dir"; ok=0 ;;
+    esac
+  done < <(sed -n 's/^owns: //p' <<<"$out")
+  if [ "$ok" = 1 ]; then
+    echo "PASS $image: installed with dnf next to the shared folders' owners, owns only its own folders, and the daemon, the app and the drive helper start"
+  else
+    echo "FAIL $image:"
+    failed=1
+  fi
+  printf '%s\n' "$out" | sed 's/^/    /'
+done
+
 if [ "$failed" = 0 ]; then
-  echo "==> $DEB is ready to publish"
+  echo "==> $DEB and $RPM are ready to publish"
 else
-  echo "==> do not publish $DEB: see the failures above" >&2
+  echo "==> do not publish $DEB or $RPM: see the failures above" >&2
 fi
 exit "$failed"

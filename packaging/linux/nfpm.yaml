@@ -74,12 +74,9 @@ contents:
   - src: ${STAGE}/usr/bin/protondrive-vfs
     dst: /usr/bin/protondrive-vfs
     file_info: { mode: 0755 }
-  - src: ${STAGE}/usr/lib/
-    dst: /usr/lib/
-    type: tree
-  - src: ${STAGE}/usr/share/
-    dst: /usr/share/
-    type: tree
+  # Everything else staged under /usr/share and /usr/lib, file by file, owning only the package's own folders:
+  # package.sh puts packaging/linux/nfpm-contents.sh's list here (#548)
+  # @STAGED_CONTENTS@
 
 scripts:
   postinstall: packaging/linux/postinst.sh

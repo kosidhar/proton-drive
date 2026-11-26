@@ -15,6 +15,8 @@
 #   --native             build them on this machine instead, for local testing: they then need this machine's glibc
 #   --allow-newer-glibc  package binaries that need a glibc newer than 2.35 anyway (as a --native build may)
 set -euo pipefail
+# Staged folders 0755 and files 0644 whatever the user's umask (#548)
+umask 022
 
 export PATH="$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.local/bin:$PATH"
 
@@ -193,7 +195,10 @@ if has deb || has rpm; then
 
   export VERSION
   export NFPM_ARCH="$DEB_ARCH"
-  sed "s|\${STAGE}|$STAGE|g" "$HERE/nfpm.yaml" > "$WORK/nfpm.yaml"
+  "$HERE/nfpm-contents.sh" "$STAGE" > "$WORK/contents.yaml"
+  sed "s|\${STAGE}|$STAGE|g" "$HERE/nfpm.yaml" \
+    | awk -v list="$WORK/contents.yaml" '/# @STAGED_CONTENTS@/ { while ((getline line < list) > 0) print line; next } { print }' \
+    > "$WORK/nfpm.yaml"
   if has deb; then
     (cd "$ROOT" && "$NFPM_TOOL" package -f "$WORK/nfpm.yaml" -p deb -t "$DIST/kosidhar-protondrive-${VERSION}-linux-${DEB_ARCH}.deb")
     echo "wrote $DIST/kosidhar-protondrive-${VERSION}-linux-${DEB_ARCH}.deb"

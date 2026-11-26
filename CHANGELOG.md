@@ -6,6 +6,12 @@ pre-release.
 
 ## [Unreleased]
 
+### Fixed
+
+- The `.rpm` installs on Fedora again: it no longer claims shared folders such as `/usr/share/icons/hicolor`, which
+  conflicted with `hicolor-icon-theme` and many other packages. The release check now installs the `.rpm` on Fedora
+  too (#548).
+
 ## [0.1.2] - 2026-11-26
 
 ### Security
