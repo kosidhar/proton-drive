@@ -93,12 +93,16 @@ sudo dpkg -i ./dist/release/kosidhar-protondrive-<version>-linux-amd64.deb
 systemctl --user enable --now protondrive.service
 ```
 
+For status icons and the right-click menu in Files, install `python3-nautilus`, then restart Files once (`nautilus -q`). For the tray icon, install `gir1.2-ayatanaappindicator3-0.1`; on GNOME without Ubuntu's extension, also enable "AppIndicator and KStatusNotifierItem Support".
+
 ### Option C: Fedora / RHEL / openSUSE (`.rpm`)
 
 ```bash
 sudo dnf install ./dist/release/kosidhar-protondrive-<version>-linux-x86_64.rpm
 systemctl --user enable --now protondrive.service
 ```
+
+For status icons and the right-click menu in Files, install `nautilus-python`, then restart Files once (`nautilus -q`). For the tray icon, install `libayatana-appindicator-gtk3`; on GNOME, also enable the "AppIndicator and KStatusNotifierItem Support" extension.
 
 ### Option D: Universal AppImage (Zero Installation)
 
