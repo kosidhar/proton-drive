@@ -223,7 +223,7 @@ pub fn fake_shared(state: &str, now_ms: i64) -> Option<Result<Vec<SharedItem>, S
         }
         // The README's page: a healthy account, with the items Activity names (no expired link, warning or unreadable row)
         "readme" => Ok(vec![
-            item("Lease agreement.pdf", ItemKind::File, Some("Documents/Lease agreement.pdf"), Place::MyFiles, Some(link(true, Some(now_ms + 14 * DAY))), 0),
+            item("Lease agreement.pdf", ItemKind::File, Some("Documents/Lease agreement.pdf"), Place::MyFiles, Some(link(true, Some(now_ms + 14 * DAY))), 3),
             item("Lisbon", ItemKind::Folder, Some("Photos/Lisbon"), Place::MyFiles, None, 2),
             item("Budget 2026", ItemKind::File, Some("Work/Budget 2026.protonsheet"), Place::MyFiles, None, 1),
             item("Garden plans.pdf", ItemKind::File, Some("Projects/Shed/Garden plans.pdf"), Place::MyFiles, Some(link(false, None)), 0),

@@ -405,6 +405,18 @@ pub fn fake_share_info(state: &str, now_ms: i64, offset_at: impl Fn(i64) -> i64)
                 person("jordan@example.com", Role::Viewer, PersonState::InvitedNotProton),
             ],
         },
+        // The README's window: the Shared row of "Lease agreement.pdf" (link, password, expiry, 3 people), as `fake_shared("readme")` has it
+        "readme" => {
+            let fortnight = end_of_day(local_day(now_ms, &offset_at) + 14, &offset_at);
+            ShareInfo {
+                link: Some(link(true, Some(fortnight))),
+                people: vec![
+                    person("alex.martin@example.com", Role::Editor, PersonState::Member),
+                    person("sam.okafor@example.com", Role::Viewer, PersonState::Member),
+                    person("jordan@example.com", Role::Viewer, PersonState::InvitedNotProton),
+                ],
+            }
+        }
         _ => return None,
     })
 }
@@ -1547,6 +1559,17 @@ fn people_section(w: &mut ShareWindow, ui: &mut egui::Ui, people: &[SharePerson]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_readme_share_fake_has_a_password_an_expiry_and_only_example_addresses() {
+        let now = 1_793_750_400_000;
+        let info = fake_share_info("readme", now, |_| 0).unwrap();
+        let link = info.link.expect("the link is on");
+        assert!(link.has_password);
+        assert!(link.expires_at.is_some_and(|t| t > now));
+        assert!(!info.people.is_empty());
+        assert!(info.people.iter().all(|p| p.email.ends_with("@example.com")));
+    }
 
     const CET: i64 = 3600;
     /// 2026-11-04 (a Wednesday) at 00:00 UTC, in epoch ms

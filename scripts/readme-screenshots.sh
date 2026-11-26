@@ -22,6 +22,7 @@ BUN="${BUN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}"
 [[ -x "$BUN" ]] || { echo "readme-screenshots: bun not found (set BUN=/path/to/bun)" >&2; exit 1; }
 [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || { echo "readme-screenshots: no display (DISPLAY or WAYLAND_DISPLAY)" >&2; exit 1; }
 
+REAL_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 TMP="$(mktemp -d)"
 DEMO_PID=""
 cleanup() {
@@ -49,12 +50,24 @@ done
 shot() {
     local name="$1" theme="$2"
     shift 2
-    env -i \
-        PATH=/usr/bin:/bin \
-        DISPLAY="${DISPLAY:-}" XAUTHORITY="${XAUTHORITY:-}" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
-        HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/config" XDG_DATA_HOME="$TMP/data" XDG_CACHE_HOME="$TMP/cache" \
-        XDG_RUNTIME_DIR="$TMP/run" TMPDIR="$TMP/run" \
-        PROTON_DRIVE_DAEMON_PORT="$PORT" \
+    # Only the display variables that are set; a relative WAYLAND_DISPLAY is looked up in XDG_RUNTIME_DIR, which is
+    # the temp dir here, so it is made absolute from the real one first (Wayland accepts an absolute path)
+    local vars=(
+        PATH=/usr/bin:/bin
+        HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/config" XDG_DATA_HOME="$TMP/data" XDG_CACHE_HOME="$TMP/cache"
+        XDG_RUNTIME_DIR="$TMP/run" TMPDIR="$TMP/run"
+        PROTON_DRIVE_DAEMON_PORT="$PORT"
+    )
+    [[ -n "${DISPLAY:-}" ]] && vars+=(DISPLAY="$DISPLAY")
+    [[ -n "${XAUTHORITY:-}" ]] && vars+=(XAUTHORITY="$XAUTHORITY")
+    if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+        if [[ "$WAYLAND_DISPLAY" == /* ]]; then
+            vars+=(WAYLAND_DISPLAY="$WAYLAND_DISPLAY")
+        else
+            vars+=(WAYLAND_DISPLAY="$REAL_RUNTIME_DIR/$WAYLAND_DISPLAY")
+        fi
+    fi
+    env -i "${vars[@]}" \
         timeout 60 "$GUI" --screenshot "$OUT/$name.png" --size "$SIZE" --theme "$theme" "$@"
     shrink "$OUT/$name.png"
     echo "wrote docs/images/$name.png"
@@ -77,7 +90,7 @@ shot shared dark --tab shared --fake-shared readme
 shot shared-with-me dark --tab shared-with-me --fake-shared-with-me readme
 shot activity dark --tab activity
 shot settings dark --tab settings
-shot share dark --fake-share people --share "/home/user/ProtonDrive/Documents/Lease agreement.pdf"
+shot share dark --fake-share readme --share "/home/user/ProtonDrive/Documents/Lease agreement.pdf"
 shot home-light light --tab home
 
 # The demo daemon logs what it was asked and doesn't know: show it, to find what a page needs

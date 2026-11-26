@@ -5074,7 +5074,7 @@ OPTIONS:
   --pause-choices       with --screenshot: show Home's Pause choices open
   --account-menu        with --screenshot: show the top bar's account menu open
   --fake-share <S>      with --screenshot: show the Share window (for --share's item, else Docs/report.pdf in the
-                        drive) as S (none | link | link-password | link-expired | people)
+                        drive) as S (none | link | link-password | link-expired | people | readme)
   --confirm-accept-unverified <NAME>  with --screenshot and --fake-shared-with-me invitations: show the question before accepting that invitation
   --confirm-leave <NAME>        with --screenshot and --fake-shared-with-me list: show the Leave confirmation for that row
   --confirm-stop-sharing <NAME>  with --screenshot and --fake-shared list: show the Stop sharing confirmation for that row
@@ -5299,7 +5299,7 @@ fn main() -> eframe::Result {
         Some(state) if screenshot_target.is_some() => {
             let info = share::fake_share_info(&state, home::now_ms(), home::local_offset_secs);
             if info.is_none() {
-                eprintln!("protondrive-gui: ignoring unknown --fake-share {state:?} (none | link | link-password | link-expired | people)");
+                eprintln!("protondrive-gui: ignoring unknown --fake-share {state:?} (none | link | link-password | link-expired | people | readme)");
             }
             info
         }
