@@ -5,6 +5,7 @@ import { Logger } from '@protontech/drive-sdk';
 import type { SessionCredentials, SessionInfo } from 'proton-drive-sdk-account';
 
 import type { CredentialsStore } from './interface';
+import type { SessionLocation } from './sessionLocation';
 
 export class Credentials implements SessionCredentials {
     private cachePassword?: string;
@@ -25,6 +26,11 @@ export class Credentials implements SessionCredentials {
 
     isLoggedIn(): boolean {
         return !!this.userKeyPassword && !!this.sessionInfo;
+    }
+
+    /** Where the session is kept; null when there is none. A store that does not say is the keyring. */
+    sessionLocation(): SessionLocation | null {
+        return this.store.location ? this.store.location() : { storage: 'keyring' };
     }
 
     isTelemetryEnabled(): boolean {

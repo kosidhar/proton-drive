@@ -3,6 +3,7 @@ import { Logger, ValidationError } from '@protontech/drive-sdk';
 import { PASS_CREDENTIALS_PATH } from './constants';
 import type { Credentials, CredentialsStore } from './interface';
 import { parseStoredSnapshot } from './parseCredentials';
+import type { SessionLocation } from './sessionLocation';
 
 type PassResult = {
     stdout: string;
@@ -17,6 +18,10 @@ export class PassSessionStore implements CredentialsStore {
         private readonly logger: Logger,
         private readonly runPassFn: PassRunner = runPass,
     ) {}
+
+    location(): SessionLocation {
+        return { storage: 'keyring' };
+    }
 
     async load(): Promise<Credentials | null> {
         this.logger.debug(`Loading session from pass: ${PASS_CREDENTIALS_PATH}`);
