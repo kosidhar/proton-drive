@@ -9848,6 +9848,181 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                     expect(d.nodes.has('vol~Docs/a.txt')).toBe(true);
                 });
             });
+
+            // #461: a rename through the drive (replacing or plain) journals nothing for the source's recorded or
+            // baselined node when the index has that node somewhere other than the source path: no trash and no rename.
+            // Only the local item moves, as a new item, and the cloud node stays where it is now, indexed.
+            describe('a rename whose source node another device has moved away (#461)', () => {
+                test('a replacing rename does not trash the source node moved away by another device', async () => {
+                    const d = setup();
+                    d.add('Docs/a.txt', 'a');
+                    d.add('Docs/b.txt', 'b');
+                    await pinnedAndSynced(d, d.add('Docs').uid);
+                    movedByAnotherDevice(d, 'vol~Docs/a.txt', { name: 'c.txt' });
+                    d.nodes.set('vol~Docs/a.txt', { ...d.nodes.get('vol~Docs/a.txt')!, content: 'theirs' });
+                    const w = journalling(d);
+
+                    await d.engine.renameItem('Docs/a.txt', 'Docs/b.txt');
+
+                    expect(w.journalled()).toEqual([]);
+                    expect(await d.files.exists('Docs/a.txt')).toBe(false);
+                    expect(await readFile(d.local('Docs/b.txt'), 'utf8')).toBe('a');
+                    expect(stateDb.getItemByPath('Docs/b.txt')?.nodeUid).toBe('vol~Docs/b.txt');
+                    expect(d.engine.remoteIndex.getByUid('vol~Docs/a.txt')?.relPath).toBe('Docs/c.txt');
+                    await d.engine.replayRemoteOps();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.calls.renamed).toEqual([]);
+                    expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('theirs');
+                    expect(d.nameOf(d.nodes.get('vol~Docs/a.txt')!)).toBe('c.txt');
+                    expect(d.nodes.get('vol~Docs/b.txt')?.content).toBe('a');
+                    expect(d.engine.remoteIndex.getByUid('vol~Docs/a.txt')?.relPath).toBe('Docs/c.txt');
+                    await d.expectEveryRecordHasItsFile();
+                });
+
+                test('a plain rename moves only the local file as a new item and leaves the moved node where it is', async () => {
+                    const d = setup();
+                    d.add('Docs/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('Docs').uid);
+                    movedByAnotherDevice(d, 'vol~Docs/a.txt', { name: 'c.txt' });
+                    d.nodes.set('vol~Docs/a.txt', { ...d.nodes.get('vol~Docs/a.txt')!, content: 'theirs' });
+                    const w = journalling(d);
+
+                    await d.engine.renameItem('Docs/a.txt', 'Docs/d.txt');
+
+                    expect(w.journalled()).toEqual([]);
+                    expect(await d.files.exists('Docs/a.txt')).toBe(false);
+                    expect(await readFile(d.local('Docs/d.txt'), 'utf8')).toBe('a');
+                    expect(stateDb.getItemByPath('Docs/d.txt')).toBeNull();
+                    expect(d.engine.remoteIndex.getByUid('vol~Docs/a.txt')?.relPath).toBe('Docs/c.txt');
+                    await d.engine.replayRemoteOps();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.calls.renamed).toEqual([]);
+                    expect(d.nodes.get('vol~Docs/a.txt')?.content).toBe('theirs');
+                    expect(d.nameOf(d.nodes.get('vol~Docs/a.txt')!)).toBe('c.txt');
+                    expect(d.calls.uploads).toContain('Docs/d.txt');
+                    const uploaded = d.named('vol~Docs', 'd.txt');
+                    expect(uploaded).toHaveLength(1);
+                    expect(uploaded[0]!.uid).not.toBe('vol~Docs/a.txt');
+                    expect(uploaded[0]!.content).toBe('a');
+                    expect(stateDb.getItemByPath('Docs/d.txt')?.nodeUid).toBe(uploaded[0]!.uid);
+                    await d.expectEveryRecordHasItsFile();
+                });
+
+                test('a plain rename of a file with an edit baseline whose node moved away drops the baseline and uploads as new', async () => {
+                    const d = setup();
+                    d.add('Docs/doc.txt', 'old');
+                    await d.engine.reconcileNow();
+                    await d.engine.truncateItem('Docs/doc.txt');
+                    await writeFile(d.local('Docs/doc.txt'), 'mine');
+                    expect(stateDb.getEditBaseline('Docs/doc.txt')?.nodeUid).toBe('vol~Docs/doc.txt');
+                    movedByAnotherDevice(d, 'vol~Docs/doc.txt', { name: 'theirs.txt' });
+                    const w = journalling(d);
+
+                    await d.engine.renameItem('Docs/doc.txt', 'Docs/mine.txt');
+
+                    expect(w.journalled()).toEqual([]);
+                    expect(stateDb.getEditBaseline('Docs/doc.txt')).toBeNull();
+                    expect(stateDb.getEditBaseline('Docs/mine.txt')).toBeNull();
+                    await d.engine.replayRemoteOps();
+                    await d.engine.reconcileNow();
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.calls.renamed).toEqual([]);
+                    expect(d.nodes.get('vol~Docs/doc.txt')?.content).toBe('old');
+                    expect(d.nameOf(d.nodes.get('vol~Docs/doc.txt')!)).toBe('theirs.txt');
+                    expect(d.named('vol~Docs', 'mine.txt').map((n) => n.content)).toEqual(['mine']);
+                    await d.expectEveryRecordHasItsFile();
+                });
+
+                test('a plain rename of a folder whose node moved away moves only the local folder as new', async () => {
+                    const d = setup();
+                    d.add('X/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('X').uid);
+                    movedByAnotherDevice(d, 'vol~X', { name: 'Z' });
+                    indexed(d, d.add('Z/new.txt', 'theirs').uid);
+                    const w = journalling(d);
+
+                    await d.engine.renameItem('X', 'Y');
+
+                    expect(w.journalled()).toEqual([]);
+                    expect(await d.files.exists('X')).toBe(false);
+                    expect(await readFile(d.local('Y/a.txt'), 'utf8')).toBe('a');
+                    expect(d.files.recordCount('Y')).toBe(0);
+                    expect(d.engine.remoteIndex.getByUid('vol~X')?.relPath).toBe('Z');
+                    await d.engine.replayRemoteOps();
+                    await d.engine.reconcileNow();
+                    await d.engine.reconcileNow();
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.calls.renamed).toEqual([]);
+                    expect(d.nameOf(d.nodes.get('vol~X')!)).toBe('Z');
+                    expect(d.nodes.get('vol~Z/new.txt')?.content).toBe('theirs');
+                    expect(d.named(d.root.uid, 'Y')).toHaveLength(1);
+                    expect(d.named(d.root.uid, 'Y')[0]!.uid).not.toBe('vol~X');
+                    await d.expectEveryRecordHasItsFile();
+                });
+
+                test('a plain rename of an unrecorded local folder holding a hydrated file whose node moved away does not move the node', async () => {
+                    const d = setup();
+                    d.add('X/a.txt', 'a');
+                    await d.engine.reconcileNow();
+                    await d.engine.hydrate('X/a.txt');
+                    expect(stateDb.getItemByPath('X')).toBeNull();
+                    expect(stateDb.getItemByPath('X/a.txt')?.nodeUid).toBe('vol~X/a.txt');
+                    movedByAnotherDevice(d, 'vol~X', { name: 'Z' });
+                    const w = journalling(d);
+
+                    await d.engine.renameItem('X', 'Y');
+
+                    expect(w.journalled()).toEqual([]);
+                    expect(stateDb.getItemByPath('Y/a.txt')).toBeNull();
+                    await d.engine.replayRemoteOps();
+                    await d.engine.reconcileNow();
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(d.calls.moved).toEqual([]);
+                    expect(d.calls.renamed).toEqual([]);
+                    expect(d.nodes.get('vol~X/a.txt')?.parentUid).toBe('vol~X');
+                    expect(d.nameOf(d.nodes.get('vol~X')!)).toBe('Z');
+                    await d.expectEveryRecordHasItsFile();
+                });
+
+                test('control: a replacing rename when the source node is still at the source path trashes it as before', async () => {
+                    const d = setup();
+                    d.add('Docs/a.txt', 'a');
+                    d.add('Docs/b.txt', 'b');
+                    await pinnedAndSynced(d, d.add('Docs').uid);
+                    const w = journalling(d);
+
+                    await d.engine.renameItem('Docs/a.txt', 'Docs/b.txt');
+
+                    expect(w.journalled()).toMatchObject([{ kind: 'trash', nodeUid: 'vol~Docs/a.txt', path: 'Docs/a.txt' }]);
+                    await d.engine.replayRemoteOps();
+                    await d.engine.reconcileNow();
+                    expect(d.calls.trashed).toEqual([['vol~Docs/a.txt']]);
+                    expect(d.nodes.has('vol~Docs/a.txt')).toBe(false);
+                    expect(d.nodes.get('vol~Docs/b.txt')?.content).toBe('a');
+                    await d.expectEveryRecordHasItsFile();
+                });
+
+                test('control: a plain rename when the source node is still at the source path renames it as before', async () => {
+                    const d = setup();
+                    d.add('Docs/a.txt', 'a');
+                    await pinnedAndSynced(d, d.add('Docs').uid);
+                    const w = journalling(d);
+
+                    await d.engine.renameItem('Docs/a.txt', 'Docs/d.txt');
+
+                    expect(w.journalled()).toMatchObject([{ kind: 'rename', nodeUid: 'vol~Docs/a.txt', toPath: 'Docs/d.txt' }]);
+                    await d.engine.replayRemoteOps();
+                    await d.engine.reconcileNow();
+                    expect(d.calls.renamed).toEqual([{ uid: 'vol~Docs/a.txt', name: 'd.txt' }]);
+                    expect(d.calls.trashed).toEqual([]);
+                    expect(stateDb.getItemByPath('Docs/d.txt')?.nodeUid).toBe('vol~Docs/a.txt');
+                    await d.expectEveryRecordHasItsFile();
+                });
+            });
         });
 
         test('moving a downloaded folder to the Trash trashes it once in Proton Drive, uploads nothing of an ignored .git, and does not bring it back', async () => {
