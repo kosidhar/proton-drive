@@ -5081,9 +5081,9 @@ OPTIONS:
   --fake-cut-short <S>  with --screenshot: list files held because the disk guard cut them short (one | many)
   --fake-disk-full      with --screenshot: show Home's notice that the computer's disk is almost full
   --fake-shared <S>     with --screenshot: show the Shared section (--tab shared) as S
-                        (list | empty | offline | loading | refreshing)
+                        (list | readme | empty | offline | loading | refreshing)
   --fake-shared-with-me <S>  with --screenshot: show the Shared with me page (--tab shared-with-me) as S
-                        (list | invitations | empty | offline | loading | refreshing)
+                        (list | readme | invitations | empty | offline | loading | refreshing)
   --show-unofficial-notice  with --screenshot: show the first-run unofficial-app notice
   --size <WxH>          window size for --screenshot (default 1440x900, min 840x540)
   --zoom <F>            with --screenshot: render at zoom factor F (0.5 to 3, e.g. 1.2), as Ctrl+= would
@@ -5334,7 +5334,7 @@ fn main() -> eframe::Result {
             if shared::SharedPage::default().fake(&state, home::now_ms()) {
                 Some(state)
             } else {
-                eprintln!("protondrive-gui: ignoring unknown --fake-shared {state:?} (list | empty | offline | loading | refreshing)");
+                eprintln!("protondrive-gui: ignoring unknown --fake-shared {state:?} (list | readme | empty | offline | loading | refreshing)");
                 None
             }
         }
@@ -5346,7 +5346,7 @@ fn main() -> eframe::Result {
             if shared_with_me::SharedWithMePage::default().fake(&state, home::now_ms()) {
                 Some(state)
             } else {
-                eprintln!("protondrive-gui: ignoring unknown --fake-shared-with-me {state:?} (list | invitations | empty | offline | loading | refreshing)");
+                eprintln!("protondrive-gui: ignoring unknown --fake-shared-with-me {state:?} (list | readme | invitations | empty | offline | loading | refreshing)");
                 None
             }
         }

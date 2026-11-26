@@ -221,6 +221,13 @@ pub fn fake_shared(state: &str, now_ms: i64) -> Option<Result<Vec<SharedItem>, S
                 catching_up,
             ])
         }
+        // The README's page: a healthy account, with the items Activity names (no expired link, warning or unreadable row)
+        "readme" => Ok(vec![
+            item("Lease agreement.pdf", ItemKind::File, Some("Documents/Lease agreement.pdf"), Place::MyFiles, Some(link(true, Some(now_ms + 14 * DAY))), 0),
+            item("Lisbon", ItemKind::Folder, Some("Photos/Lisbon"), Place::MyFiles, None, 2),
+            item("Budget 2026", ItemKind::File, Some("Work/Budget 2026.protonsheet"), Place::MyFiles, None, 1),
+            item("Garden plans.pdf", ItemKind::File, Some("Projects/Shed/Garden plans.pdf"), Place::MyFiles, Some(link(false, None)), 0),
+        ]),
         "empty" => Ok(vec![]),
         "offline" => Err(share::DAEMON_UNREACHABLE.to_string()),
         _ => return None,
@@ -230,6 +237,20 @@ pub fn fake_shared(state: &str, now_ms: i64) -> Option<Result<Vec<SharedItem>, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_readme_fake_is_healthy_and_fictional() {
+        let now = 1_793_750_400_000;
+        let items = fake_shared("readme", now).unwrap().unwrap();
+        assert!(!items.is_empty());
+        for i in &items {
+            assert!(i.unreadable.is_none(), "{} is unreadable", i.name);
+            assert_eq!(i.place, Place::MyFiles);
+            if let Some(l) = &i.link {
+                assert!(l.expires_at.is_none_or(|t| t > now), "{}'s link has expired", i.name);
+            }
+        }
+    }
 
     /// 2026-11-04 at 00:00 UTC, in epoch ms
     const NOV_4_UTC: i64 = 1_793_750_400_000;

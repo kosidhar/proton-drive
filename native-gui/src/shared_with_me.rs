@@ -381,6 +381,15 @@ pub fn fake_shared_with_me(state: &str, now_ms: i64) -> Option<Result<Listing, S
         }
         "empty" => Ok(Listing::default()),
         "offline" => Err(share::DAEMON_UNREACHABLE.to_string()),
+        // The README's page: a healthy account, with the items Activity names (no unreadable row)
+        "readme" => Ok(Listing {
+            invitations: vec![invitation("Garden plans", Some("Garden plans"), Kind::Folder, Some("kim@example.com"), true, Role::Viewer)],
+            items: vec![
+                item(Some("Trip budget"), Kind::Sheet, Some("sam@example.com"), Some(1), Role::Editor, true),
+                item(Some("Design review"), Kind::Doc, Some("lee@example.com"), Some(9), Role::Viewer, true),
+                item(Some("Team photos"), Kind::Folder, Some("kim@example.com"), Some(30), Role::Viewer, true),
+            ],
+        }),
         "invitations" => Ok(Listing {
             invitations,
             items: vec![item(Some("Budget.xlsx"), Kind::Sheet, Some("sam@example.com"), Some(2), Role::Editor, true)],
@@ -392,6 +401,20 @@ pub fn fake_shared_with_me(state: &str, now_ms: i64) -> Option<Result<Listing, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_readme_fake_is_healthy_and_fictional() {
+        let listing = fake_shared_with_me("readme", NOW).unwrap().unwrap();
+        assert!(!listing.items.is_empty());
+        for i in &listing.items {
+            assert!(i.unreadable.is_none() && i.name.is_some(), "an unreadable row");
+            assert!(i.shared_by.as_deref().is_some_and(|a| a.ends_with("@example.com")));
+        }
+        for inv in &listing.invitations {
+            assert!(inv.name.is_some() && inv.from_verified);
+            assert!(inv.from.as_deref().is_some_and(|a| a.ends_with("@example.com")));
+        }
+    }
 
     const NOW: i64 = 1_793_750_400_000;
 

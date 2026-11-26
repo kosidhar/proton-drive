@@ -73,8 +73,8 @@ shrink() {
 }
 
 shot home dark --tab home
-shot shared dark --tab shared --fake-shared list
-shot shared-with-me dark --tab shared-with-me --fake-shared-with-me list
+shot shared dark --tab shared --fake-shared readme
+shot shared-with-me dark --tab shared-with-me --fake-shared-with-me readme
 shot activity dark --tab activity
 shot settings dark --tab settings
 shot share dark --fake-share people --share "/home/user/ProtonDrive/Documents/Lease agreement.pdf"
