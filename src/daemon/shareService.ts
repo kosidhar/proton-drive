@@ -126,7 +126,7 @@ function isSdkLimit(e: unknown): boolean {
 }
 const isBusy = (e: unknown) => inChain(e, isSdkLimit);
 
-function plainError(e: unknown): ShareError {
+export function plainError(e: unknown): ShareError {
     if (e instanceof ShareError) return e;
     if (isOffline(e)) return new ShareError('Proton Drive is offline: try again when you are connected');
     const message = e instanceof Error ? e.message : String(e);

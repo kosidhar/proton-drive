@@ -25,6 +25,7 @@ import { DriveController } from './driveController';
 import { pauseRoute } from './pauseRoute';
 import { withAvailability } from './remoteListing';
 import { isTrustedLocalRequest } from './requestGuard';
+import { createSharedWithMeService } from './sharedWithMe';
 import { createShareService } from './shareService';
 import { refuseOnTcp } from './tcpRefusals';
 import { findHelper, fuseAvailable, mergeStrayInto, VfsSupervisor } from './vfsSupervisor';
@@ -552,6 +553,11 @@ export async function startSyncDaemon(options: {
                         const entry = engine.remoteIndex.getByUid(uid);
                         return entry ? { relPath: entry.relPath, hidden: Boolean(engine.availability.hiddenBy(entry.relPath)) } : null;
                     },
+                    logActivity: (entry) => stateDb.logActivity(entry),
+                    now: Date.now,
+                }),
+                sharedWithMe: createSharedWithMeService({
+                    sdk: runtime.sdk,
                     logActivity: (entry) => stateDb.logActivity(entry),
                     now: Date.now,
                 }),
