@@ -68,4 +68,5 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: python3 linux/nautilus/test_proton_drive_nautilus.py
+      - run: python3 linux/nemo/test_proton_drive_nemo.py
       - run: python3 linux/tray/test_proton_drive_tray.py
