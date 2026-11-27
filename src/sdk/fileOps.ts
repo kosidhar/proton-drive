@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, rename, stat, unlink, utimes } from 'node:fs/promises';
+import { lstatSync } from 'node:fs';
+import { lstat, mkdir, rename, unlink, utimes } from 'node:fs/promises';
 import path from 'node:path';
 
 import {
@@ -13,6 +14,7 @@ import {
 } from '@protontech/drive-sdk';
 import { isProtonDocument, isProtonSheet } from '@protontech/drive-sdk/internal/nodes/mediaTypes';
 
+import { ensureNoSymlinkDir, findSymlinkInPath, SymlinkPathError } from '../sync/localPath';
 import { getName, quotedName } from './node';
 
 export const THIRD_PARTY_DISCLOSURE = 'This is a third-party application not officially supported by Proton.';
@@ -96,6 +98,8 @@ export async function uploadLocalFileToDrive(options: {
     logger: Logger;
     parentNode: NodeEntity | string;
     localPath: string;
+    // When set, refuses to follow any symbolic link at or above `localPath` inside `rootDir` (#540).
+    rootDir?: string;
     remoteName?: string;
     existingNodeUid?: string;
     collisionMode?: UploadCollisionMode;
@@ -106,11 +110,22 @@ export async function uploadLocalFileToDrive(options: {
         logger,
         parentNode,
         localPath,
+        rootDir,
         collisionMode = 'new-revision',
         onProgress,
     } = options;
 
-    const st = await stat(localPath);
+    if (rootDir) {
+        const relInRoot = path.relative(rootDir, localPath).split(path.sep).join('/');
+        const link = findSymlinkInPath(rootDir, relInRoot);
+        if (link !== null) {
+            throw new SymlinkPathError(rootDir, relInRoot, link);
+        }
+    }
+    const st = await lstat(localPath);
+    if (!st.isFile()) {
+        throw new Error(`Not a regular file: ${localPath}`);
+    }
     const file = Bun.file(localPath);
     const expectedSha1 = await computeLocalFileSha1(localPath);
     const mediaType = detectMediaType(localPath);
@@ -239,12 +254,14 @@ export async function downloadDriveNodeToLocal(options: {
     logger: Logger;
     remoteNode: NodeEntity;
     localPath: string;
+    // When set, refuses to follow or traverse any symbolic link at or above `localPath` inside `rootDir` (#540).
+    rootDir?: string;
     revision?: Revision;
     onProgress?: (downloadedBytes: number, totalBytes: number) => void;
     // Asked once the download is complete, just before it replaces what is at localPath: false leaves that as it is
     beforePlacing?: () => Promise<boolean>;
 }): Promise<DownloadResult> {
-    const { sdk, logger, remoteNode, localPath, onProgress } = options;
+    const { sdk, logger, remoteNode, localPath, rootDir, onProgress } = options;
 
     if (isUnsupportedRemoteNode(remoteNode)) {
         return {
@@ -261,8 +278,19 @@ export async function downloadDriveNodeToLocal(options: {
     }
     const expectedSha1 = revision.claimedDigests?.sha1;
 
-    // Check if local file already exists with identical SHA1
-    const existingStat = await stat(localPath).catch(() => null);
+    const relInRoot = rootDir ? path.relative(rootDir, localPath).split(path.sep).join('/') : null;
+    if (rootDir && relInRoot !== null) {
+        const link = findSymlinkInPath(rootDir, relInRoot);
+        if (link !== null) {
+            throw new SymlinkPathError(rootDir, relInRoot, link);
+        }
+    }
+
+    // Check if local file already exists with identical SHA1 (lstat: never follow a symlink)
+    const existingStat = await lstat(localPath).catch(() => null);
+    if (existingStat?.isSymbolicLink()) {
+        throw new SymlinkPathError(rootDir ?? path.dirname(localPath), relInRoot ?? path.basename(localPath), relInRoot ?? path.basename(localPath));
+    }
     if (existingStat && existingStat.isFile() && expectedSha1) {
         const currentSha1 = await computeLocalFileSha1(localPath).catch(() => '');
         if (currentSha1 === expectedSha1) {
@@ -277,7 +305,12 @@ export async function downloadDriveNodeToLocal(options: {
     }
 
     const parentDir = path.dirname(localPath);
-    await mkdir(parentDir, { recursive: true });
+    if (rootDir && relInRoot !== null) {
+        const parentRel = path.posix.dirname(relInRoot);
+        await ensureNoSymlinkDir(rootDir, parentRel === '.' ? '' : parentRel);
+    } else {
+        await mkdir(parentDir, { recursive: true });
+    }
 
     const tempPath = path.join(parentDir, `.proton-drive-tmp-${process.pid}-${randomUUID()}`);
     const downloaded = await downloadRevisionToFile({ sdk, logger, remoteNode, revision, filePath: tempPath, onProgress });
@@ -285,11 +318,11 @@ export async function downloadDriveNodeToLocal(options: {
     // write between the placing and the setting would get the cloud's time and pass for the download (#199). Before
     // beforePlacing too: between its check that the file here is unchanged and the placing, nothing may wait, or a
     // save there would be overwritten
-    let placing: Awaited<ReturnType<typeof stat>>;
+    let placing: Awaited<ReturnType<typeof lstat>>;
     try {
         const mtimeDate = new Date(downloaded.mtimeMs);
         await utimes(tempPath, mtimeDate, mtimeDate).catch(() => {});
-        placing = await stat(tempPath);
+        placing = await lstat(tempPath);
     } catch (error) {
         await unlink(tempPath).catch(() => {});
         throw error;
@@ -297,6 +330,16 @@ export async function downloadDriveNodeToLocal(options: {
     if (options.beforePlacing && !(await options.beforePlacing().catch(() => false))) {
         await unlink(tempPath).catch(() => {});
         return { status: 'skipped-changed', localPath, size: 0, mtimeMs: 0 };
+    }
+    if (rootDir && relInRoot !== null) {
+        const link = findSymlinkInPath(rootDir, relInRoot);
+        if (link !== null) {
+            await unlink(tempPath).catch(() => {});
+            throw new SymlinkPathError(rootDir, relInRoot, link);
+        }
+    } else if (lstatSync(localPath, { throwIfNoEntry: false })?.isSymbolicLink()) {
+        await unlink(tempPath).catch(() => {});
+        throw new SymlinkPathError(path.dirname(localPath), path.basename(localPath), path.basename(localPath));
     }
     try {
         await rename(tempPath, localPath);
@@ -306,7 +349,7 @@ export async function downloadDriveNodeToLocal(options: {
         throw error;
     }
 
-    const finalStat = await stat(localPath);
+    const finalStat = await lstat(localPath);
     return {
         status: 'downloaded',
         localPath,
@@ -388,7 +431,7 @@ export async function downloadRevisionToFile(options: {
                 expectedSha1,
             });
         }
-        return { sha1: expectedSha1 ?? actualSha1, size: (await stat(filePath)).size, mtimeMs };
+        return { sha1: expectedSha1 ?? actualSha1, size: (await lstat(filePath)).size, mtimeMs };
     } catch (error) {
         logger.error(`Failed downloading ${quotedName(getName(remoteNode))} to ${filePath}`, error);
         try {

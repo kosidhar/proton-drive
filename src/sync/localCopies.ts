@@ -2,7 +2,7 @@ import type { Stats } from 'node:fs';
 import { lstat, readdir, rmdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 
-import { localPathIn } from './localPath';
+import { findSymlinkInPath, localPathIn } from './localPath';
 import { matchesIgnorePatterns } from './localWatcher';
 
 // Something in a folder that only exists on this computer, so removing the folder's local copy would lose it
@@ -50,6 +50,14 @@ export async function scanLocalCopies(opts: {
         localOnly.push(item);
         return opts.stopAtFirst;
     };
+    const parentOfRel = (rel: string): string => {
+        const slash = rel.lastIndexOf('/');
+        return slash === -1 ? '' : rel.slice(0, slash);
+    };
+    // Never follow a symlink in any ancestor of opts.relPath (#540); a symlink at the leaf itself stays `not-a-file`.
+    if (opts.relPath !== '' && findSymlinkInPath(opts.syncDir, parentOfRel(opts.relPath)) !== null) {
+        return { localOnly, entries };
+    }
     const visit = async (relPath: string): Promise<boolean> => {
         const fullPath = localPathIn(opts.syncDir, relPath);
         const st = await lstat(fullPath).catch(() => null);
@@ -131,6 +139,14 @@ export async function removeScannedEntries(opts: {
         }
         if (isKept(relPath)) {
             if (opts.keep.has(relPath) && !leave(relPath)) {
+                return { complete: false, kept };
+            }
+            continue;
+        }
+        const slash = relPath.lastIndexOf('/');
+        const parentRel = slash === -1 ? '' : relPath.slice(0, slash);
+        if (parentRel !== '' && findSymlinkInPath(opts.syncDir, parentRel) !== null) {
+            if (!leave(relPath)) {
                 return { complete: false, kept };
             }
             continue;

@@ -1,3 +1,5 @@
+import { lstatSync, realpathSync } from 'node:fs';
+import { lstat, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 
 import { remoteNameProblem } from '../sdk/node';
@@ -19,6 +21,21 @@ export class UnsafeLocalPathError extends Error {
     ) {
         super(`Not a path inside ${root}: ${JSON.stringify(relPath)} (${reason})`);
         this.name = 'UnsafeLocalPathError';
+    }
+}
+
+// A path inside the sync folder that hits a symbolic link at the item itself or an ancestor folder (#540). Symbolic
+// links are never followed, uploaded, or written through.
+export class SymlinkPathError extends Error {
+    readonly code = 'ESYMLINK';
+
+    constructor(
+        readonly root: string,
+        readonly relPath: string,
+        readonly symlinkRelPath: string,
+    ) {
+        super(`Path ${JSON.stringify(relPath)} crosses symbolic link ${JSON.stringify(symlinkRelPath)} inside ${root}`);
+        this.name = 'SymlinkPathError';
     }
 }
 
@@ -66,3 +83,92 @@ export const UNSAFE_PATH_SQL = (column: string) =>
     `(${column} IN ('.', '..') OR ${column} LIKE './%' OR ${column} LIKE '../%' OR ${column} LIKE '%/.' OR ${column} LIKE '%/..'
       OR ${column} LIKE '%/./%' OR ${column} LIKE '%/../%' OR ${column} LIKE '%//%' OR ${column} LIKE '/%' OR ${column} LIKE '%/'
       OR instr(${column}, char(0)) > 0 OR length(CAST(${column} AS BLOB)) > 255)`;
+
+// Checks every path component of `relPath` below `root` with lstat without following symlinks (#540). Returns the
+// relative path of the first symbolic link encountered (ancestor or leaf), or null if none of the existing components
+// is a symbolic link. Stops when an ancestor is a non-directory (avoiding ENOTDIR). A symlinked `root` itself is
+// allowed: only links inside `root` are refused.
+export function findSymlinkInPath(root: string, relPath: string): string | null {
+    localPathIn(root, relPath);
+    if (relPath === '') {
+        return null;
+    }
+    const segments = relPath.split('/');
+    let curFull = root;
+    let curRel = '';
+    for (const seg of segments) {
+        curFull = path.join(curFull, seg);
+        curRel = curRel ? `${curRel}/${seg}` : seg;
+        const st = lstatSync(curFull, { throwIfNoEntry: false });
+        if (!st) {
+            return null;
+        }
+        if (st.isSymbolicLink()) {
+            return curRel;
+        }
+        if (!st.isDirectory()) {
+            return null;
+        }
+    }
+    return null;
+}
+
+function isRealPathInside(realRoot: string, candidate: string): boolean {
+    const rel = path.relative(realRoot, candidate);
+    return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel));
+}
+
+// Creates `relDir` inside `root` one directory component at a time, refusing to traverse or create under any symbolic
+// link (#540) and confirming the final directory has no symlink segments and stays inside `realpath(root)`.
+export async function ensureNoSymlinkDir(root: string, relDir: string): Promise<string> {
+    const full = localPathIn(root, relDir);
+    await mkdir(root, { recursive: true });
+    if (relDir === '') {
+        return full;
+    }
+    const segments = relDir.split('/');
+    let curFull = root;
+    let curRel = '';
+    for (const seg of segments) {
+        curFull = path.join(curFull, seg);
+        curRel = curRel ? `${curRel}/${seg}` : seg;
+        const existing = await lstat(curFull).catch(() => null);
+        if (existing) {
+            if (existing.isSymbolicLink()) {
+                throw new SymlinkPathError(root, relDir, curRel);
+            }
+            if (!existing.isDirectory()) {
+                const err = new Error(`Not a directory: ${curFull}`) as NodeJS.ErrnoException;
+                err.code = 'ENOTDIR';
+                throw err;
+            }
+            continue;
+        }
+        try {
+            await mkdir(curFull);
+        } catch (error: unknown) {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+                throw error;
+            }
+            const now = await lstat(curFull).catch(() => null);
+            if (now?.isSymbolicLink()) {
+                throw new SymlinkPathError(root, relDir, curRel);
+            }
+            if (!now?.isDirectory()) {
+                const err = new Error(`Not a directory: ${curFull}`) as NodeJS.ErrnoException;
+                err.code = 'ENOTDIR';
+                throw err;
+            }
+        }
+    }
+    const raced = findSymlinkInPath(root, relDir);
+    if (raced !== null) {
+        throw new SymlinkPathError(root, relDir, raced);
+    }
+    const realRoot = realpathSync(root);
+    const realTarget = realpathSync(full);
+    if (!isRealPathInside(realRoot, realTarget)) {
+        throw new SymlinkPathError(root, relDir, relDir);
+    }
+    return full;
+}
