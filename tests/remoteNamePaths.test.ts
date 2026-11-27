@@ -139,6 +139,39 @@ describe('what keeps a bad path from the disk (#536)', () => {
         expect(stateDb.getAllItems().map((i) => i.localRelPath).sort()).toEqual([...good].sort());
     });
 
+    // #543: conflicts table refuses unsafe paths on write and dropUnsafeConflicts cleans any pre-#536 rows
+    test('conflicts refuse unsafe paths and dropUnsafeConflicts removes bad rows while keeping good ones', () => {
+        const newConflict = (rel: string) => ({
+            localRelPath: rel,
+            nodeUid: `uid-${rel}`,
+            localSha1: 'a',
+            remoteSha1: 'b',
+            localMtimeMs: 1,
+            remoteMtimeMs: 2,
+        });
+        for (const rel of ['../x', 'Shared/../../.bashrc', '..', '.', '/etc/passwd', 'a//b', 'a\0b', '']) {
+            expect(() => stateDb.recordConflict(newConflict(rel))).toThrow(UnsafeLocalPathError);
+            expect(() => stateDb.recordConflict({ ...newConflict(rel), resolved: true })).toThrow(UnsafeLocalPathError);
+            expect(() => stateDb.queueConflict(newConflict(rel))).toThrow(UnsafeLocalPathError);
+            expect(() => stateDb.settleConflict({ ...newConflict(rel), resolution: 'keep-both' })).toThrow(UnsafeLocalPathError);
+        }
+
+        const insertConflict = stateDb.connection.query(
+            `INSERT INTO conflicts (localRelPath, nodeUid, localSha1, remoteSha1, localMtimeMs, remoteMtimeMs, detectedAt, resolved)
+             VALUES (?, ?, 'a', 'b', 1, 2, 1000, ?)`,
+        );
+        const tooLong = `Docs/${'x'.repeat(256)}`;
+        const bad = ['Shared/../../.bashrc', '..', '../x', 'Docs/.', '/etc/passwd', 'a//b', 'a/', 'a\0b', tooLong, ''];
+        const good = ['Docs/a.txt', 'Shared/..notes.txt'];
+        for (const rel of bad) insertConflict.run(rel, `uid-${rel}`, 0);
+        insertConflict.run('Shared/../../old-resolved', 'uid-old-res', 1);
+        for (const rel of good) insertConflict.run(rel, `uid-${rel}`, 0);
+
+        const dropped = stateDb.dropUnsafeConflicts();
+        expect(dropped.map((c) => c.localRelPath).sort()).toEqual([...bad, 'Shared/../../old-resolved'].sort());
+        expect(stateDb.listConflicts(true).map((c) => c.localRelPath).sort()).toEqual([...good].sort());
+    });
+
     test('the remote index refuses an entry whose path or name would lead elsewhere, and drops one a past listing left', () => {
         const index = new RemoteIndex(stateDb.connection);
         index.setRoot('root');
@@ -493,6 +526,40 @@ describe('names from Proton Drive that would leave the sync folder (#536)', () =
                 expect(await readFile(d.local('Docs/ok.txt'), 'utf8')).toBe('ok');
                 // Not acted on, nor kept: no record is left with a path out of the root
                 expect(stateDb.getAllItems().filter((i) => relPathProblem(i.localRelPath) !== null)).toEqual([]);
+                await d.engine.stop();
+            });
+
+            // #543: conflict rows with bad paths left by a sync before #536 are dropped and logged on start/reconcile
+            test('a conflict row with a bad path from a past sync is dropped with a warning while good conflicts stay', async () => {
+                const d = await setup();
+                const warnings: string[] = [];
+                const origWarn = d.logger.warn.bind(d.logger);
+                d.logger.warn = (msg: string) => {
+                    warnings.push(msg);
+                    return origWarn(msg);
+                };
+                d.add('Docs/ok.txt', 'ok');
+                await d.engine.reconcileNow();
+                stateDb.connection
+                    .query(
+                        `INSERT INTO conflicts (localRelPath, nodeUid, localSha1, remoteSha1, localMtimeMs, remoteMtimeMs, detectedAt, resolved)
+                         VALUES (?, ?, 'a', 'b', 1, 2, 1000, 0)`,
+                    )
+                    .run('Shared/../../.bashrc', 'vol~bad-conflict');
+                stateDb.recordConflict({
+                    localRelPath: 'Docs/ok.txt',
+                    nodeUid: d.uid('Docs/ok.txt'),
+                    localSha1: 'a',
+                    remoteSha1: 'b',
+                    localMtimeMs: 1,
+                    remoteMtimeMs: 2,
+                });
+
+                await d.engine.reconcileNow();
+
+                expect(stateDb.listConflicts(true).map((c) => c.localRelPath)).toEqual(['Docs/ok.txt']);
+                expect(warnings.some((m) => m.includes('Dropped the conflict for') && m.includes('Shared/../../.bashrc'))).toBe(true);
+                expect(outsideRoot(d.rootDir)).toEqual(d.before);
                 await d.engine.stop();
             });
 

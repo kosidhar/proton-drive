@@ -60,9 +60,9 @@ export function localPathIn(root: string, relPath: string): string {
 }
 
 // An SQL condition that holds for every non-empty relative path in `column` that relPathProblem refuses: a `.` or `..`
-// name, an empty one (a path that starts or ends with '/', or holds '//'), or a NUL. Only the rows it finds are read, and
-// each is checked again with relPathProblem.
+// name, an empty one (a path that starts or ends with '/', or holds '//'), a NUL, or a path long enough to hold a
+// segment over 255 UTF-8 bytes. Only the rows it finds are read, and each is checked again with relPathProblem.
 export const UNSAFE_PATH_SQL = (column: string) =>
     `(${column} IN ('.', '..') OR ${column} LIKE './%' OR ${column} LIKE '../%' OR ${column} LIKE '%/.' OR ${column} LIKE '%/..'
       OR ${column} LIKE '%/./%' OR ${column} LIKE '%/../%' OR ${column} LIKE '%//%' OR ${column} LIKE '/%' OR ${column} LIKE '%/'
-      OR instr(${column}, char(0)) > 0)`;
+      OR instr(${column}, char(0)) > 0 OR length(CAST(${column} AS BLOB)) > 255)`;
