@@ -6,6 +6,10 @@ pre-release.
 
 ## [Unreleased]
 
+### Security
+
+- Conflict records left with an unsafe path from earlier versions are now cleaned up on start and each sync pass, and **Show in Files** on a conflict refuses any path outside the sync folder (#543).
+
 ### Fixed
 
 - Cinnamon's Nemo extension now asks the daemon for each file's real sync state and configured sync folder (and follows live updates) instead of marking every file under `~/ProtonDrive` as synchronized (#530).

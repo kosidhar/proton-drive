@@ -707,6 +707,29 @@ export class SyncStateDatabase {
         return unsafe;
     }
 
+    // Drops any conflict rows whose path could lead outside the folder, or names no item in it, as a sync before #536
+    // could leave them (#543), and returns them. Only the rows go: nothing on disk is looked at or touched for them.
+    dropUnsafeConflicts(): ConflictRecord[] {
+        const unsafe = (
+            this.db
+                .query(`SELECT * FROM conflicts WHERE localRelPath = '' OR ${UNSAFE_PATH_SQL('localRelPath')}`)
+                .all() as ConflictRecord[]
+        ).filter((row) => row.localRelPath === '' || relPathProblem(row.localRelPath) !== null);
+        if (unsafe.length > 0) {
+            const drop = this.db.query('DELETE FROM conflicts WHERE id = $id');
+            this.db.transaction(() => {
+                for (const row of unsafe) {
+                    drop.run({ $id: row.id });
+                }
+            })();
+            // Refresh file manager emblems via reset (never onChange with the unsafe path) if any unresolved row went
+            if (unsafe.some((row) => row.resolved === 0)) {
+                this.onReset?.();
+            }
+        }
+        return unsafe;
+    }
+
     hasItemsUnder(localRelPath: string): boolean {
         return (
             this.db
@@ -751,6 +774,7 @@ export class SyncStateDatabase {
     // it now stands, with the same id (what the GUI resolves it by) and the time it was first found. `queued` says
     // whether it is new.
     queueConflict(conflict: Omit<NewConflict, 'resolved' | 'resolution'>): { conflict: ConflictRecord; queued: boolean } {
+        refuseUnsafePath(conflict.localRelPath);
         return this.db.transaction(() => {
             const waiting = this.db
                 .query('SELECT id FROM conflicts WHERE localRelPath = $localRelPath AND resolved = 0')
@@ -784,6 +808,7 @@ export class SyncStateDatabase {
     // prompt strategy before it changed: #68), is this one: it is resolved, as the conflict now stands, rather than left
     // waiting beside a new row. With none waiting, it is recorded as a new, resolved one.
     settleConflict(conflict: Omit<NewConflict, 'resolved'> & { resolution: string }): ConflictRecord {
+        refuseUnsafePath(conflict.localRelPath);
         return this.db.transaction(() => {
             const waiting = this.db
                 .query('SELECT id FROM conflicts WHERE localRelPath = $localRelPath AND resolved = 0')
@@ -848,6 +873,7 @@ export class SyncStateDatabase {
     }
 
     private insertConflict(conflict: NewConflict): ConflictRecord {
+        refuseUnsafePath(conflict.localRelPath);
         const detectedAt = Date.now();
         const res = this.db
             .query(`

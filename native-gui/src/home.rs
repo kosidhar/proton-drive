@@ -336,10 +336,49 @@ pub fn drive_kind(vfs: Option<&VfsStatus>) -> &'static str {
     }
 }
 
-/// The folder holding a conflict's file, which Show in Files opens.
-pub fn conflict_folder(sync_dir: &str, rel_path: &str) -> std::path::PathBuf {
-    let file = std::path::Path::new(sync_dir).join(rel_path);
-    file.parent().map_or_else(|| std::path::PathBuf::from(sync_dir), std::path::Path::to_path_buf)
+/// Pure lexical check for the folder holding a conflict's file (no filesystem I/O, safe to call per frame). Returns
+/// `None` if `sync_dir` is empty or contains NUL, or `rel_path` could lead outside `sync_dir` (#543).
+fn conflict_folder_lexical(sync_dir: &str, rel_path: &str) -> Option<std::path::PathBuf> {
+    if sync_dir.trim().is_empty() || sync_dir.contains('\0') || rel_path.is_empty() || rel_path.contains('\0') {
+        return None;
+    }
+    if rel_path.starts_with('/') || rel_path.ends_with('/') {
+        return None;
+    }
+    if rel_path.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
+        return None;
+    }
+    let root = std::path::Path::new(sync_dir);
+    let file = root.join(rel_path);
+    let folder = file.parent().map_or_else(|| root.to_path_buf(), std::path::Path::to_path_buf);
+    if !folder.starts_with(root) {
+        return None;
+    }
+    Some(folder)
+}
+
+/// The folder holding a conflict's file, which Show in Files opens on click. Returns `None` if `sync_dir` is empty or
+/// `rel_path` could lead outside `sync_dir` (including through a symlink—even a broken or looping one—on disk) (#543).
+pub fn conflict_folder(sync_dir: &str, rel_path: &str) -> Option<std::path::PathBuf> {
+    let folder = conflict_folder_lexical(sync_dir, rel_path)?;
+    let root = std::path::Path::new(sync_dir);
+    if let Ok(real_root) = root.canonicalize() {
+        let mut probe = folder.as_path();
+        while probe != root {
+            if let Ok(real_probe) = probe.canonicalize() {
+                if !real_probe.starts_with(&real_root) {
+                    return None;
+                }
+                break;
+            }
+            if probe.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+                return None;
+            }
+            let Some(parent) = probe.parent() else { break };
+            probe = parent;
+        }
+    }
+    Some(folder)
 }
 
 fn file_name(rel_path: &str) -> &str {
@@ -1069,8 +1108,14 @@ impl ProtonDriveNativeApp {
                     ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
                         let show_name = format!("Show {name} in Files");
-                        if action_button_named(ui, ButtonKind::Secondary, Some(icons::FOLDER_OPEN), "Show in Files", &show_name, 30.0).clicked() {
-                            open_in_files(&conflict_folder(&self.status.sync_dir, rel_path));
+                        let can_show = conflict_folder_lexical(&self.status.sync_dir, rel_path).is_some();
+                        if action_button_if_named(ui, can_show, ButtonKind::Secondary, Some(icons::FOLDER_OPEN), "Show in Files", &show_name, 30.0)
+                            .on_disabled_hover_text("This path is outside the sync folder")
+                            .clicked()
+                        {
+                            if let Some(folder) = conflict_folder(&self.status.sync_dir, rel_path) {
+                                open_in_files(&folder);
+                            }
                         }
                         ui.add_space(8.0);
                         // Resolving needs the daemon, as Pause and Sync now do
@@ -2027,8 +2072,57 @@ mod tests {
 
     #[test]
     fn a_conflict_is_shown_in_the_folder_holding_it() {
-        assert_eq!(conflict_folder("/home/u/ProtonDrive", "docs/2026/report.pdf"), std::path::PathBuf::from("/home/u/ProtonDrive/docs/2026"));
-        assert_eq!(conflict_folder("/home/u/ProtonDrive", "report.pdf"), std::path::PathBuf::from("/home/u/ProtonDrive"));
+        assert_eq!(conflict_folder("/home/u/ProtonDrive", "docs/2026/report.pdf"), Some(std::path::PathBuf::from("/home/u/ProtonDrive/docs/2026")));
+        assert_eq!(conflict_folder("/home/u/ProtonDrive", "report.pdf"), Some(std::path::PathBuf::from("/home/u/ProtonDrive")));
+    }
+
+    // #543: Show in Files on a conflict refuses any path that could lead outside the sync folder
+    #[test]
+    fn conflict_folder_refuses_paths_outside_the_sync_folder() {
+        for bad in [
+            "Shared/../../.bashrc",
+            "../outside.txt",
+            "..",
+            ".",
+            "docs/.",
+            "docs/..",
+            "/etc/passwd",
+            "docs//report.pdf",
+            "docs/report.pdf/",
+            "",
+            "bad\0name",
+        ] {
+            assert_eq!(conflict_folder("/home/u/ProtonDrive", bad), None, "must refuse {bad:?}");
+        }
+        assert_eq!(conflict_folder("", "report.pdf"), None);
+        assert_eq!(conflict_folder("   ", "report.pdf"), None);
+        assert_eq!(conflict_folder("/home/u/\0ProtonDrive", "report.pdf"), None);
+        assert_eq!(
+            conflict_folder("/home/u/ProtonDrive/", "docs/report.pdf"),
+            Some(std::path::PathBuf::from("/home/u/ProtonDrive/docs"))
+        );
+
+        // Symlinks inside the sync folder (pointing outside, nested nonexistent child, or broken) are refused,
+        // while a symlinked sync folder root itself is allowed.
+        let root = std::env::temp_dir().join(format!("protondrive-gui-conflict-folder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let real_sync = root.join("ProtonDrive");
+        let link_sync = root.join("LinkDrive");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(real_sync.join("docs")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&real_sync, &link_sync).unwrap();
+        std::os::unix::fs::symlink(&outside, real_sync.join("escape")).unwrap();
+        std::os::unix::fs::symlink(root.join("does-not-exist"), real_sync.join("broken")).unwrap();
+
+        assert_eq!(conflict_folder(real_sync.to_str().unwrap(), "escape/secret.txt"), None);
+        assert_eq!(conflict_folder(real_sync.to_str().unwrap(), "escape/missing/secret.txt"), None);
+        assert_eq!(conflict_folder(real_sync.to_str().unwrap(), "broken/secret.txt"), None);
+        assert_eq!(
+            conflict_folder(link_sync.to_str().unwrap(), "docs/ok.txt"),
+            Some(link_sync.join("docs"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

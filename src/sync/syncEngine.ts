@@ -574,11 +574,13 @@ export class ProtonDriveSyncEngine {
     // in Proton Drive under a good name is synced afresh. Run before anything reads the records at a start and each pass.
     private dropUnsafePaths(): void {
         let records: SyncedItemRecord[] = [];
+        let conflicts: ConflictRecord[] = [];
         let entries: RemoteIndexEntry[] = [];
         let docs: DocRecord[] = [];
         try {
             this.stateDb.connection.transaction(() => {
                 records = this.stateDb.dropUnsafeItems();
+                conflicts = this.stateDb.dropUnsafeConflicts();
                 entries = this.index.dropUnsafe();
                 docs = this.docs.dropUnsafe();
             })();
@@ -589,6 +591,11 @@ export class ProtonDriveSyncEngine {
         for (const record of records) {
             this.logger.warn(
                 `Dropped the record of ${quotedName(record.localRelPath)} (${record.nodeUid}): that path can't be inside ${this.localRoot()}, so nothing is done with it`,
+            );
+        }
+        for (const conflict of conflicts) {
+            this.logger.warn(
+                `Dropped the conflict for ${quotedName(conflict.localRelPath)} (${conflict.nodeUid}): that path can't be inside ${this.localRoot()}, so nothing is done with it`,
             );
         }
         for (const entry of entries) {
