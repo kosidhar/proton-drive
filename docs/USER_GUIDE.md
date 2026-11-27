@@ -25,6 +25,9 @@ files. If one does, block it (see [Apps that download many files](#apps-that-dow
 **Files you change sync both ways,** usually within seconds. When the same file changed on both sides, both versions
 are kept, so nothing is overwritten.
 
+**Symbolic links aren't synced.** Any symlink inside the sync folder is skipped and stays on this computer: it is never
+uploaded, and downloads never follow it.
+
 ## Status icons
 
 | Icon | Means |

@@ -9,6 +9,7 @@ pre-release.
 ### Security
 
 - Conflict records left with an unsafe path from earlier versions are now cleaned up on start and each sync pass, and **Show in Files** on a conflict refuses any path outside the sync folder (#543).
+- Symbolic links inside the sync folder are no longer followed: they are skipped rather than uploaded, downloads never write through a linked folder, and skipped links are noted in the log and Activity (#540).
 
 ### Fixed
 

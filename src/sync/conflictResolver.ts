@@ -1,4 +1,5 @@
-import { copyFile, stat } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { copyFile, lstat } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import path from 'node:path';
 
@@ -57,23 +58,34 @@ export async function createLocalConflictCopy(
     date = new Date(),
     host = hostname(),
 ): Promise<string> {
+    const srcStat = await lstat(localFullPath);
+    if (!srcStat.isFile()) {
+        throw new Error(`Not a regular file: ${localFullPath}`);
+    }
     const dir = path.dirname(localFullPath);
     const baseName = path.basename(localFullPath);
-    let counter = 0;
-    let candidatePath = path.join(dir, formatConflictFileName(baseName, date, host, counter));
-
-    while (await fileExists(candidatePath)) {
-        counter++;
-        candidatePath = path.join(dir, formatConflictFileName(baseName, date, host, counter));
+    for (let counter = 0; counter < 1000; counter++) {
+        const candidatePath = path.join(dir, formatConflictFileName(baseName, date, host, counter));
+        if (await fileExists(candidatePath)) {
+            continue;
+        }
+        try {
+            // COPYFILE_EXCL prevents racing with a symlink or file created at candidatePath between the check and copy (#540)
+            await copyFile(localFullPath, candidatePath, constants.COPYFILE_EXCL);
+            return candidatePath;
+        } catch (error: unknown) {
+            if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+                continue;
+            }
+            throw error;
+        }
     }
-
-    await copyFile(localFullPath, candidatePath);
-    return candidatePath;
+    throw new Error(`No free conflict copy name for ${localFullPath}`);
 }
 
 async function fileExists(p: string): Promise<boolean> {
     try {
-        await stat(p);
+        await lstat(p);
         return true;
     } catch {
         return false;

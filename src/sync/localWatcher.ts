@@ -1,5 +1,5 @@
 import { existsSync, watch, type FSWatcher } from 'node:fs';
-import { readdir, stat } from 'node:fs/promises';
+import { lstat, readdir } from 'node:fs/promises';
 import path from 'node:path';
 
 import { BUILTIN_IGNORE_PATTERNS } from './ignoreDefaults';
@@ -222,8 +222,9 @@ export class LocalFolderWatcher {
                 return;
             }
             // A folder that went away, or was replaced, loses its watchers: a deleted folder's watcher just goes quiet
-            // (no error event), so one recreated at the same path would otherwise never be watched again
-            const st = await stat(fullPath).catch(() => null);
+            // (no error event), so one recreated at the same path would otherwise never be watched again. Use lstat so
+            // a symlink to a folder is never watched or traversed (#540).
+            const st = await lstat(fullPath).catch(() => null);
             const isDirectory = st?.isDirectory() ?? false;
             if (this.watchers.has(fullPath) && (!isDirectory || renamed)) {
                 this.unwatchTree(fullPath);

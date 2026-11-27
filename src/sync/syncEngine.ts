@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { lstatSync, readdirSync, renameSync, type Stats, statSync, utimesSync } from 'node:fs';
-import { lstat, mkdir, readdir, rm, rmdir, stat, statfs, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readdir, rm, rmdir, statfs, unlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -45,7 +45,7 @@ import { LAYOUT_MOVING, type MoveSeams, relocateFiles, SYNC_DIR_MOVING } from '.
 import { DriveOpError, type VfsEntry } from './driveOps';
 import { HYDRATE_STAGING_PREFIX, isEngineTempName, removeScannedEntries, type ScanEntry, scanLocalCopies } from './localCopies';
 import { moveWithoutReplacing } from './localMove';
-import { isSafeRelPath, localPathIn, relPathProblem } from './localPath';
+import { ensureNoSymlinkDir, findSymlinkInPath, isSafeRelPath, localPathIn, relPathProblem, SymlinkPathError } from './localPath';
 import { LocalFolderWatcher, matchesIgnorePatterns } from './localWatcher';
 import { pathsOverlap } from './mountPoint';
 import { DocNodes, docRecordOf, placeholderContent, placeholderName, type DocRecord } from './docNodes';
@@ -566,6 +566,24 @@ export class ProtonDriveSyncEngine {
             });
         }
         return true;
+    }
+
+    // Notes a symbolic link skipped inside the sync folder once per path, in the log and in Activity (#540).
+    private noteSkippedSymlink(relPath: string): void {
+        if (this.skippedSymlinksTold.has(relPath)) {
+            return;
+        }
+        this.skippedSymlinksTold.add(relPath);
+        this.logger.warn(`Skipping symbolic link ${quotedName(relPath)}: symbolic links aren't synced and stay on this computer`);
+        this.stateDb.logActivity({
+            action: 'error',
+            localRelPath: relPath,
+            details: `Not synced: ${quotedName(relPath)} is a symbolic link. Symbolic links aren't synced and stay on this computer`,
+        });
+    }
+
+    private symlinkIn(relPath: string): string | null {
+        return findSymlinkInPath(this.localRoot(), relPath);
     }
 
     // Records, remote index entries and Docs records whose path or name can't be one on this computer, as a sync before
@@ -1561,6 +1579,13 @@ export class ProtonDriveSyncEngine {
             return; // A rename, move or delete through the drive is on its way to Proton Drive: looked at once it is there
         }
         const localFullPath = this.localPath(relPath);
+        const symlinkRel = this.symlinkIn(relPath);
+        if (symlinkRel !== null) {
+            // Symbolic links are never uploaded, followed, overwritten, or taken for a deleted item (#540)
+            this.clearPendingUpload(relPath);
+            this.noteSkippedSymlink(symlinkRel);
+            return;
+        }
         const hiddenBy = this.policy.hiddenBy(relPath);
         if (hiddenBy?.hide === 'hidden') {
             return; // Hidden: never downloaded, uploaded or trashed from here
@@ -1587,7 +1612,7 @@ export class ProtonDriveSyncEngine {
         // A file still being written is left alone (not uploaded, nor downloaded over) until it stays as it is; one being
         // replaced through the drive until it is closed, even as its record says (#64)
         if (localInfo && !localInfo.isDirectory && (changedSinceRecord(localInfo, dbRecord) || this.beingReplaced(relPath))) {
-            const st = await stat(localFullPath).catch(() => null);
+            const st = await lstat(localFullPath).catch(() => null);
             if (st?.isFile() && this.stillBeingWritten(relPath, st)) {
                 return;
             }
@@ -1601,7 +1626,7 @@ export class ProtonDriveSyncEngine {
                 // can predate the record being dropped (e.g. by Free up space or Hide) or the item coming back; either
                 // way the next pass, with a fresh listing, deals with it.
                 const stillTracked = this.stateDb.getItemByPath(relPath) !== null;
-                const backLocally = await stat(localFullPath).then(
+                const backLocally = await lstat(localFullPath).then(
                     () => true,
                     () => false,
                 );
@@ -1638,8 +1663,8 @@ export class ProtonDriveSyncEngine {
                     return;
                 }
                 this.watcher.suppressPath(relPath);
-                await mkdir(localFullPath, { recursive: true });
-                const st = await stat(localFullPath);
+                await ensureNoSymlinkDir(this.localRoot(), relPath);
+                const st = await lstat(localFullPath);
                 this.recordSynced({
                     localRelPath: relPath,
                     nodeUid: remoteNode.uid,
@@ -2034,14 +2059,19 @@ export class ProtonDriveSyncEngine {
         remoteMap: Map<string, NodeEntity>,
         since: number,
     ): Promise<{ copyPath: string | null } | null> {
+        const symlinkRel = this.symlinkIn(relPath);
+        if (symlinkRel !== null) {
+            this.noteSkippedSymlink(symlinkRel);
+            return null;
+        }
         // The local file as it was when copied: checked again just before the cloud's version replaces it
         const snapshot = async (sha1: string) => {
-            const st = await stat(localFullPath).catch(() => null);
-            return st ? { size: st.size, mtimeMs: st.mtimeMs, sha1 } : null;
+            const st = await lstat(localFullPath).catch(() => null);
+            return st?.isFile() ? { size: st.size, mtimeMs: st.mtimeMs, sha1 } : null;
         };
         const unchangedSince = (copied: { size: number; mtimeMs: number; sha1: string } | null) => async () => {
             const asCopied = async () => {
-                const st = await stat(localFullPath).catch(() => null);
+                const st = await lstat(localFullPath).catch(() => null);
                 return Boolean(copied && st?.isFile() && st.size === copied.size && st.mtimeMs === copied.mtimeMs);
             };
             if (!(await asCopied())) {
@@ -2300,6 +2330,11 @@ export class ProtonDriveSyncEngine {
         choice: 'keep-both' | 'keep-local' | 'keep-remote',
     ): Promise<void> {
         const conflictId = conflict.id;
+        const symlinkRel = this.symlinkIn(conflict.localRelPath);
+        if (symlinkRel !== null) {
+            this.noteSkippedSymlink(symlinkRel);
+            throw new ConflictRefusedError(409, `${conflict.localRelPath} crosses symbolic link ${symlinkRel}, which isn't synced`);
+        }
         const localFullPath = this.localPath(conflict.localRelPath);
         const remoteMap = new Map<string, NodeEntity>();
 
@@ -2339,10 +2374,10 @@ export class ProtonDriveSyncEngine {
             } else if (choice === 'keep-remote') {
                 // The local file as the user chose to replace it: a save made while the cloud's version downloads is
                 // newer than what they chose about, so it is never replaced (#104), as keep-both never does (#67)
-                const chosenOver = await stat(localFullPath).catch(() => null);
-                const chosenSha1 = chosenOver ? await computeLocalFileSha1(localFullPath).catch(() => null) : null;
+                const chosenOver = await lstat(localFullPath).catch(() => null);
+                const chosenSha1 = chosenOver?.isFile() ? await computeLocalFileSha1(localFullPath).catch(() => null) : null;
                 const asChosen = async () => {
-                    const st = await stat(localFullPath).catch(() => null);
+                    const st = await lstat(localFullPath).catch(() => null);
                     if (!chosenOver || !st?.isFile() || st.size !== chosenOver.size || st.mtimeMs !== chosenOver.mtimeMs) {
                         return !chosenOver && !st; // gone then and now: nothing to keep
                     }
@@ -2381,6 +2416,12 @@ export class ProtonDriveSyncEngine {
         since: number,
         beforePlacing?: () => Promise<boolean>,
     ): Promise<boolean> {
+        const root = this.localRoot();
+        const symlinkRel = findSymlinkInPath(root, relPath);
+        if (symlinkRel !== null) {
+            this.noteSkippedSymlink(symlinkRel);
+            return false;
+        }
         const transferId = `dl:${relPath}`;
         this.watcher.suppressPath(relPath, 10000);
         this.activeTransfers.set(transferId, {
@@ -2401,6 +2442,7 @@ export class ProtonDriveSyncEngine {
                 logger: this.logger,
                 remoteNode,
                 localPath: localFullPath,
+                rootDir: root,
                 onProgress: (downloadedBytes, totalBytes) => {
                     const current = this.activeTransfers.get(transferId);
                     if (current) {
@@ -2447,6 +2489,10 @@ export class ProtonDriveSyncEngine {
             }
             return true;
         } catch (error: unknown) {
+            if (error instanceof SymlinkPathError) {
+                this.noteSkippedSymlink(error.symlinkRelPath);
+                return false;
+            }
             const msg = error instanceof Error ? error.message : String(error);
             this.stateDb.setItemStatus(relPath, 'error', msg);
             this.logFailureOnce(relPath, msg, `Download failed: ${msg}`);
@@ -2473,11 +2519,19 @@ export class ProtonDriveSyncEngine {
         if (this.stateDb.getCutShort(relPath)) {
             throw new Error(`Not uploading ${relPath}: it wasn't fully written, and waits for you to choose what to do with it`);
         }
+        const symlinkRel = this.symlinkIn(relPath);
+        if (symlinkRel !== null) {
+            this.noteSkippedSymlink(symlinkRel);
+            throw new SymlinkPathError(this.localRoot(), relPath, symlinkRel);
+        }
         const transferId = `ul:${relPath}`;
         // Before the upload reads the file: a write from then on (as it uploads, which can take minutes) is newer than
         // what the record says it holds, so the next look hashes the file (#109)
         const readFrom = Date.now();
-        const st = await stat(localFullPath);
+        const st = await lstat(localFullPath);
+        if (!st.isFile()) {
+            throw new Error(`Not a regular file: ${relPath}`);
+        }
         this.activeTransfers.set(transferId, {
             id: transferId,
             direction: 'upload',
@@ -2494,6 +2548,7 @@ export class ProtonDriveSyncEngine {
                 logger: this.logger,
                 parentNode,
                 localPath: localFullPath,
+                rootDir: this.localRoot(),
                 remoteName: path.basename(relPath),
                 existingNodeUid,
                 collisionMode,
@@ -3219,7 +3274,14 @@ export class ProtonDriveSyncEngine {
 
         const task = this.observingLocal(async (since) => {
             const fullPath = this.localPath(relPath);
-            const st = await stat(fullPath).catch(() => null);
+            const symlinkRel = this.symlinkIn(relPath);
+            if (symlinkRel !== null) {
+                this.forgetSettling(relPath);
+                this.clearPendingUpload(relPath);
+                this.noteSkippedSymlink(symlinkRel);
+                return;
+            }
+            const st = await lstat(fullPath).catch(() => null);
             const dbRecord = this.stateDb.getItemByPath(relPath);
 
             if (!st?.isFile()) {
@@ -3308,7 +3370,7 @@ export class ProtonDriveSyncEngine {
                 // or is no longer where this file is) is left to the sync pass, never uploaded over: a node gone from
                 // Proton Drive would make the upload land on whatever now has that name.
                 const node = await this.sdk.getNode(dbRecord.nodeUid).catch(() => null);
-                if (!(await stat(fullPath).catch(() => null))?.isFile()) {
+                if (!(await lstat(fullPath).catch(() => null))?.isFile()) {
                     this.clearPendingUpload(relPath);
                     return; // Gone while Proton Drive was asked (freed, deleted): the next look at it decides
                 }
@@ -3997,13 +4059,15 @@ export class ProtonDriveSyncEngine {
                 for (let slash = toRel.indexOf('/'); slash !== -1; slash = toRel.indexOf('/', slash + 1)) {
                     this.watcher.suppressPath(toRel.slice(0, slash));
                 }
-                const parentPath = localPathIn(root, parentRel);
                 try {
-                    await mkdir(parentPath, { recursive: true });
+                    await ensureNoSymlinkDir(root, parentRel);
                 } catch (error: unknown) {
                     this.logger.warn(`Could not make ${parentRel} to move ${fromRel} into: ${error}`);
                     return false;
                 }
+            }
+            if (findSymlinkInPath(root, toRel) !== null || findSymlinkInPath(root, fromRel) !== null) {
+                return false;
             }
             const fromPath = localPathIn(root, fromRel);
             const toPath = localPathIn(root, toRel);
@@ -4299,7 +4363,7 @@ export class ProtonDriveSyncEngine {
         const fullPath = this.localPath(rel);
         let st: Stats | undefined;
         try {
-            st = statSync(fullPath, { throwIfNoEntry: false });
+            st = lstatSync(fullPath, { throwIfNoEntry: false });
         } catch {
             st = undefined; // Can't be looked at: nothing to hold (a look at it can't upload it either)
         }
@@ -4355,7 +4419,7 @@ export class ProtonDriveSyncEngine {
             }
             let st: Stats | undefined;
             try {
-                st = statSync(fullPath, { throwIfNoEntry: false });
+                st = lstatSync(fullPath, { throwIfNoEntry: false });
             } catch {
                 st = undefined;
             }
@@ -4465,6 +4529,9 @@ export class ProtonDriveSyncEngine {
     private async putBackNow(rel: string, why: 'asked' | 'changed in Proton Drive'): Promise<string | null> {
         const hold = this.stateDb.getCutShort(rel);
         const root = this.localRoot();
+        if (findSymlinkInPath(root, rel) !== null) {
+            return null;
+        }
         const fullPath = localPathIn(root, rel);
         if (!hold || !lstatSync(fullPath, { throwIfNoEntry: false })?.isFile()) {
             return null;
@@ -4601,7 +4668,12 @@ export class ProtonDriveSyncEngine {
     // between two sessions, never while one replaces it. The time a replacing session held it isn't part of a run: a
     // copy that took 10 minutes starts its run at its close.
     private async settleClosed(rel: string): Promise<void> {
-        const st = await stat(this.localPath(rel)).catch(() => null);
+        if (this.symlinkIn(rel) !== null) {
+            this.forgetSettling(rel);
+            this.clearPendingUpload(rel);
+            return;
+        }
+        const st = await lstat(this.localPath(rel)).catch(() => null);
         const earlier = this.settlingFiles.get(rel);
         this.forgetSettling(rel); // its wait, and one that a report began meanwhile
         if (!st?.isFile()) {
@@ -4790,6 +4862,11 @@ export class ProtonDriveSyncEngine {
         if (rel !== '' && this.policy.hiddenBy(rel) !== null) {
             throw new DriveOpError('EACCES', `Hidden: ${rel}`);
         }
+        const symlinkRel = this.symlinkIn(rel);
+        if (symlinkRel !== null) {
+            this.noteSkippedSymlink(symlinkRel);
+            throw new DriveOpError('EPERM', `Symbolic links aren't synced: ${symlinkRel}`);
+        }
         const fullPath = this.localPath(rel);
         if (rel !== '' && lstatSync(fullPath, { throwIfNoEntry: false })) {
             throw new DriveOpError('EEXIST', `Already exists: ${rel}`);
@@ -4799,7 +4876,8 @@ export class ProtonDriveSyncEngine {
         if (!entry || entry.type !== 'file' || isProvisional(entry.uid)) {
             throw new DriveOpError('ENOENT', `Not found: ${rel}`);
         }
-        await mkdir(path.dirname(fullPath), { recursive: true });
+        const parentRel = parentOf(rel);
+        await ensureNoSymlinkDir(this.localRoot(), parentRel);
         // First, so that whoever sees the file (the watcher, a pass) finds what it is an edit of
         this.stateDb.recordEditBaseline({
             relPath: rel,
@@ -4911,6 +4989,7 @@ export class ProtonDriveSyncEngine {
     private readonly loggedPlaceholderClashes = new Set<string>();
     // Nodes skipped for a name that can't be one on this computer, already said (see skipsName)
     private readonly unsafeNamesTold = new Set<string>();
+    private readonly skippedSymlinksTold = new Set<string>();
 
     private refusePlaceholder(rel: string): void {
         if (this.placeholderAt(rel)) {
@@ -5153,7 +5232,11 @@ export class ProtonDriveSyncEngine {
         }
         let st: Stats | undefined;
         try {
-            st = statSync(this.localPath(relPath), { throwIfNoEntry: false });
+            if (this.symlinkIn(relPath) !== null) {
+                this.clearPendingUpload(relPath);
+                return;
+            }
+            st = lstatSync(this.localPath(relPath), { throwIfNoEntry: false });
         } catch {
             this.clearPendingUploadsWithin(relPath);
             return;
@@ -5189,15 +5272,29 @@ export class ProtonDriveSyncEngine {
     // The names in a folder of the local root (engine temp files left out), or null when it isn't a folder here
     private localChildNames(rel: string): string[] | null {
         try {
+            if (this.symlinkIn(rel) !== null) {
+                return null;
+            }
             return readdirSync(this.localPath(rel)).filter((name) => !isEngineTempName(name));
         } catch {
             return null;
         }
     }
 
-    // An item here only, as it waits to upload (syncing), or worse as recorded at or below it (below: see transfersBelow)
+    // An item here only, as it waits to upload (syncing), or worse as recorded at or below it (below: see transfersBelow).
+    // Symbolic links aren't synced and get no emblem (#540).
     private localOnlyState(rel: string, ignorePatterns: string[], below: Transfer = null): ItemState | null {
-        return matchesIgnorePatterns(rel, ignorePatterns) ? null : { availability: 'downloaded', transfer: worseTransfer('syncing', below) };
+        if (matchesIgnorePatterns(rel, ignorePatterns)) {
+            return null;
+        }
+        try {
+            if (this.symlinkIn(rel) !== null) {
+                return null;
+            }
+        } catch {
+            return null;
+        }
+        return { availability: 'downloaded', transfer: worseTransfer('syncing', below) };
     }
 
     // The worst transfer at or below each child of a folder, by the child's name: uploads and downloads under way,
@@ -5384,6 +5481,11 @@ export class ProtonDriveSyncEngine {
     // Drive says it is bigger (see roomToDownload). Returns whether it placed the file (false when a local copy is there
     // instead, which is what opens).
     private async hydrateFile(rel: string, since: number, downloadStarted: () => void): Promise<boolean> {
+        const symlinkRel = this.symlinkIn(rel);
+        if (symlinkRel !== null) {
+            this.noteSkippedSymlink(symlinkRel);
+            throw new DriveOpError('EPERM', `Symbolic links aren't synced: ${symlinkRel}`);
+        }
         if (await this.existsLocally(rel)) {
             return false;
         }
@@ -5557,6 +5659,11 @@ export class ProtonDriveSyncEngine {
         }
         stillThere();
         const root = this.localRoot();
+        const symlinkRel = findSymlinkInPath(root, rel);
+        if (symlinkRel !== null) {
+            this.noteSkippedSymlink(symlinkRel);
+            throw new DriveOpError('EPERM', `Symbolic links aren't synced: ${symlinkRel}`);
+        }
         const target = localPathIn(root, rel);
         const madeFrom = await this.firstMissingAncestor(rel);
         for (let slash = rel.indexOf('/'); slash !== -1; slash = rel.indexOf('/', slash + 1)) {
@@ -5567,7 +5674,7 @@ export class ProtonDriveSyncEngine {
         let size = 0;
         try {
             if (madeFrom !== null) {
-                await mkdir(path.dirname(target), { recursive: true });
+                await ensureNoSymlinkDir(root, parentOf(rel));
             }
             const readFrom = Date.now(); // before it is placed (see placedReadAt)
             // Its time set, and looked at, before it is placed: set after, a write between the placing and the setting
@@ -5578,13 +5685,16 @@ export class ProtonDriveSyncEngine {
             } catch {
                 // Keeps the time it was written at
             }
-            const placing = statSync(staging);
+            const placing = lstatSync(staging);
             if (!this.localItemExists(rel)) {
                 stillThere();
+                if (findSymlinkInPath(root, rel) !== null) {
+                    throw new DriveOpError('EPERM', `Symbolic links aren't synced: ${rel}`);
+                }
                 placed = moveWithoutReplacing(staging, target);
             }
             if (placed) {
-                const st = statSync(target);
+                const st = lstatSync(target);
                 size = placing.size;
                 this.recordSynced(
                     {
@@ -5766,6 +5876,16 @@ export class ProtonDriveSyncEngine {
             }
         }
         const root = this.localRoot();
+        const fromAncestorLink = findSymlinkInPath(root, parentOf(fromRel));
+        if (fromAncestorLink !== null) {
+            this.noteSkippedSymlink(fromAncestorLink);
+            throw new DriveOpError('EPERM', `Symbolic links aren't synced: ${fromAncestorLink}`);
+        }
+        const toLink = findSymlinkInPath(root, toRel);
+        if (toLink !== null) {
+            this.noteSkippedSymlink(toLink);
+            throw new DriveOpError('EPERM', `Symbolic links aren't synced: ${toLink}`);
+        }
         const ignorePatterns = this.stateDb.getSettings().ignorePatterns;
         const ignoredFrom = matchesIgnorePatterns(fromRel, ignorePatterns);
         const ignoredTo = matchesIgnorePatterns(toRel, ignorePatterns);
@@ -5773,6 +5893,10 @@ export class ProtonDriveSyncEngine {
         // An ignored item is never in Proton Drive, whatever the cloud holds at its path; and an entry that a pending
         // operation takes elsewhere isn't what is at its path here
         const sourceEntry = ignoredFrom ? null : this.liveIndexEntry(fromRel);
+        if (source?.isSymbolicLink() && !sourceEntry) {
+            this.noteSkippedSymlink(fromRel);
+            throw new DriveOpError('EPERM', `Symbolic links aren't synced: ${fromRel}`);
+        }
         if (!source && !sourceEntry) {
             throw new DriveOpError('ENOENT', `Not found: ${fromRel}`);
         }
@@ -5852,7 +5976,7 @@ export class ProtonDriveSyncEngine {
             for (let slash = toRel.indexOf('/'); slash !== -1; slash = toRel.indexOf('/', slash + 1)) {
                 this.watcher.suppressPath(toRel.slice(0, slash));
             }
-            await mkdir(localPathIn(root, parentRel), { recursive: true });
+            await ensureNoSymlinkDir(root, parentRel);
         }
         // The user's replace of a file with an identity in Proton Drive keeps that identity: the replacing file's own node
         // goes to the trash. Otherwise the item itself moves to toRel.
@@ -6151,6 +6275,11 @@ export class ProtonDriveSyncEngine {
             throw new DriveOpError('EACCES', `Hidden: ${relPath}`);
         }
         const root = this.localRoot();
+        const ancestorLink = findSymlinkInPath(root, parentOf(relPath));
+        if (ancestorLink !== null) {
+            this.noteSkippedSymlink(ancestorLink);
+            throw new DriveOpError('EPERM', `Symbolic links aren't synced: ${ancestorLink}`);
+        }
         const fullPath = localPathIn(root, relPath);
         const ignored = matchesIgnorePatterns(relPath, this.stateDb.getSettings().ignorePatterns);
         const local = lstatSync(fullPath, { throwIfNoEntry: false });
@@ -7060,7 +7189,16 @@ export class ProtonDriveSyncEngine {
         let moved = false;
         let failure: unknown = null;
         try {
-            // Made inside the try: a path that could lead outside the root (#536) fails the step, which puts the records back
+            // Made inside the try: a path that could lead outside the root (#536) or crosses a symlink (#540) fails
+            // the step, which puts the records back
+            const fromAncestorLink = findSymlinkInPath(root, parentOf(fromRel));
+            if (fromAncestorLink !== null) {
+                throw new SymlinkPathError(root, fromRel, fromAncestorLink);
+            }
+            const toLink = findSymlinkInPath(root, toRel);
+            if (toLink !== null) {
+                throw new SymlinkPathError(root, toRel, toLink);
+            }
             const from = localPathIn(root, fromRel);
             const to = localPathIn(root, toRel);
             if (replace) {
@@ -7116,6 +7254,14 @@ export class ProtonDriveSyncEngine {
             try {
                 from = localPathIn(root, intent.from);
                 to = localPathIn(root, intent.to);
+                const fromAncestorLink = findSymlinkInPath(root, parentOf(intent.from));
+                if (fromAncestorLink !== null) {
+                    throw new SymlinkPathError(root, intent.from, fromAncestorLink);
+                }
+                const toLink = findSymlinkInPath(root, intent.to);
+                if (toLink !== null) {
+                    throw new SymlinkPathError(root, intent.to, toLink);
+                }
             } catch (error: unknown) {
                 // Never a move made through the drive, whose paths are checked (#536): nothing is moved or dropped for it
                 this.logger.warn(`Not finishing a move after an interruption: ${error}`);
@@ -7964,11 +8110,17 @@ export class ProtonDriveSyncEngine {
                 this.watcher.suppressPath(relPath.slice(0, slash));
             }
             const localFullPath = this.localPath(relPath);
-            await mkdir(path.dirname(localFullPath), { recursive: true });
-            const st = await stat(localFullPath).catch(() => null);
-            const localInfo = st
-                ? { isDirectory: st.isDirectory(), size: st.isDirectory() ? 0 : st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs }
-                : undefined;
+            const symlinkRel = this.symlinkIn(relPath);
+            if (symlinkRel !== null) {
+                this.noteSkippedSymlink(symlinkRel);
+                return;
+            }
+            await ensureNoSymlinkDir(this.localRoot(), parentOf(relPath));
+            const st = await lstat(localFullPath).catch(() => null);
+            const localInfo =
+                st && (st.isDirectory() || st.isFile())
+                    ? { isDirectory: st.isDirectory(), size: st.isDirectory() ? 0 : st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs }
+                    : undefined;
             const remoteMap = new Map<string, NodeEntity>([[relPath, node]]);
             const onlineOnly: OnlineOnlyFolder[] = [];
             this.currentAction = `Syncing ${relPath}`;
@@ -7982,7 +8134,7 @@ export class ProtonDriveSyncEngine {
                     settings,
                     since,
                 );
-                const isLocalFolder = await stat(localFullPath).then(
+                const isLocalFolder = await lstat(localFullPath).then(
                     (s) => s.isDirectory(),
                     () => false,
                 );
@@ -8454,8 +8606,13 @@ export class ProtonDriveSyncEngine {
         }
 
         const localDirFullPath = this.localPath(prefix);
+        const symlinkPrefix = this.symlinkIn(prefix);
+        if (symlinkPrefix !== null) {
+            this.noteSkippedSymlink(symlinkPrefix);
+            return;
+        }
         this.watcher.suppressPath(prefix || '.');
-        await mkdir(localDirFullPath, { recursive: true });
+        await ensureNoSymlinkDir(this.localRoot(), prefix);
 
         this.currentAction = `Listing /my-files/${prefix || ''}`;
         const remoteChildren = await listFolderChildren(this.sdk, folderNode);
@@ -8485,7 +8642,12 @@ export class ProtonDriveSyncEngine {
                 continue;
             }
             const fullPath = localPathIn(localDirFullPath, entry.name);
-            const st = await stat(fullPath).catch(() => null);
+            const st = await lstat(fullPath).catch(() => null);
+            if (st?.isSymbolicLink()) {
+                this.clearPendingUpload(relPath);
+                this.noteSkippedSymlink(relPath);
+                continue;
+            }
             if (st && (st.isDirectory() || st.isFile())) {
                 localChildByName.set(entry.name, {
                     isDirectory: st.isDirectory(),
@@ -8595,7 +8757,7 @@ export class ProtonDriveSyncEngine {
             }
 
             const resolvedFolderNode = remoteMap.get(relPath) ?? remoteChild;
-            const localStillExists = await stat(this.localPath(relPath))
+            const localStillExists = await lstat(this.localPath(relPath))
                 .then((s) => s.isDirectory())
                 .catch(() => false);
             if (resolvedFolderNode && resolvedFolderNode.type === NodeType.Folder && localStillExists) {
