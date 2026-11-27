@@ -6,6 +6,10 @@ pre-release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Cinnamon's Nemo extension now asks the daemon for each file's real sync state and configured sync folder (and follows live updates) instead of marking every file under `~/ProtonDrive` as synchronized (#530).
+
 ## [0.1.3] - 2026-11-26
 
 ### Fixed
