@@ -117,11 +117,11 @@ pub(crate) fn in_filter(kind: ActivityKind, filter: ActivityFilter) -> bool {
 /// Where an entry's item is in the sync folder: "/" or "" is the folder itself. None without a sync folder, or for a
 /// path that would leave it.
 pub(crate) fn local_path(sync_dir: &str, rel_path: &str) -> Option<PathBuf> {
-    if sync_dir.trim().is_empty() {
+    if sync_dir.trim().is_empty() || sync_dir.contains('\0') || rel_path.contains('\0') {
         return None;
     }
     let rel = rel_path.trim_matches('/');
-    if rel.split('/').any(|part| part == "..") {
+    if rel.split('/').any(|part| part == ".." || part == ".") {
         return None;
     }
     let root = Path::new(sync_dir);
@@ -129,19 +129,33 @@ pub(crate) fn local_path(sync_dir: &str, rel_path: &str) -> Option<PathBuf> {
 }
 
 /// What Show in Files shows for an item: the item itself while it is there, else the nearest folder above it that is
-/// (an item since deleted or moved is shown quietly by where it was), never above the sync folder. None when not even
-/// the sync folder is there.
+/// (an item since deleted or moved is shown quietly by where it was), never above the sync folder. Refuses any path
+/// that traverses a symlink escaping the sync folder, or a broken/looping symlink (#556). None when not even the sync
+/// folder is there.
 pub(crate) fn show_target(sync_dir: &str, rel_path: &str) -> Option<PathBuf> {
+    let target = local_path(sync_dir, rel_path)?;
     let root = PathBuf::from(sync_dir);
-    let mut at = local_path(sync_dir, rel_path)?;
-    loop {
-        if at.symlink_metadata().is_ok() {
-            return Some(at);
+    let real_root = root.canonicalize().ok()?;
+    let rel = target.strip_prefix(&root).ok()?;
+    let mut cur = root.clone();
+    let mut last_existing = root;
+    for comp in rel.components() {
+        cur.push(comp);
+        let Ok(meta) = cur.symlink_metadata() else {
+            break;
+        };
+        if meta.file_type().is_symlink() {
+            let real = cur.canonicalize().ok()?;
+            if !real.starts_with(&real_root) {
+                return None;
+            }
         }
-        if at == root || !at.pop() || !at.starts_with(&root) {
-            return None;
+        last_existing = cur.clone();
+        if !meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+            break;
         }
     }
+    Some(last_existing)
 }
 
 /// What Open opens: the item, when it is a file there now (opening an online-only one in the virtual drive downloads
@@ -246,6 +260,64 @@ mod tests {
         assert_eq!(show_target("", "Docs/a.txt"), None);
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(show_target(root, "Docs/a.txt"), None, "not even the sync folder is there");
+    }
+
+    // #556: Activity's Show in Files must refuse paths that traverse a symlink escaping sync_dir (including broken/looping symlinks)
+    #[test]
+    fn show_target_refuses_symlinks_escaping_sync_dir_and_broken_or_looping_links() {
+        let base = std::env::temp_dir().join(format!("pd-activity-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real_sync = base.join("ProtonDrive");
+        let sibling_sync = base.join("ProtonDrive2");
+        let link_sync = base.join("LinkDrive");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(real_sync.join("Docs")).unwrap();
+        std::fs::create_dir_all(&sibling_sync).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(real_sync.join("Docs/ok.txt"), "ok").unwrap();
+        std::fs::write(sibling_sync.join("sibling.txt"), "s").unwrap();
+        std::fs::write(outside.join("secret.sh"), "x").unwrap();
+
+        std::os::unix::fs::symlink(&real_sync, &link_sync).unwrap();
+        std::os::unix::fs::symlink(&outside, real_sync.join("Elsewhere")).unwrap();
+        std::os::unix::fs::symlink(&sibling_sync, real_sync.join("Sibling")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.sh"), real_sync.join("Docs/link.sh")).unwrap();
+        std::os::unix::fs::symlink(base.join("missing-target"), real_sync.join("Broken")).unwrap();
+        std::os::unix::fs::symlink(real_sync.join("LoopA"), real_sync.join("LoopB")).unwrap();
+        std::os::unix::fs::symlink(real_sync.join("LoopB"), real_sync.join("LoopA")).unwrap();
+        std::os::unix::fs::symlink(real_sync.join("Docs/ok.txt"), real_sync.join("Docs/internal-link.txt")).unwrap();
+        std::os::unix::fs::symlink(real_sync.join("Docs"), real_sync.join("DocsLink")).unwrap();
+
+        let root = real_sync.to_str().unwrap();
+        let link_root = link_sync.to_str().unwrap();
+        // Escaping directory symlink (itself, existing child, nonexistent child, sibling prefix, and via symlinked root)
+        assert_eq!(show_target(root, "Elsewhere"), None);
+        assert_eq!(show_target(root, "Elsewhere/secret.sh"), None);
+        assert_eq!(show_target(root, "Elsewhere/missing/file.txt"), None);
+        assert_eq!(show_target(root, "Sibling/sibling.txt"), None);
+        assert_eq!(show_target(link_root, "Elsewhere/secret.sh"), None);
+        // Escaping file symlink (direct and through an in-root directory symlink)
+        assert_eq!(show_target(root, "Docs/link.sh"), None);
+        assert_eq!(show_target(root, "DocsLink/link.sh"), None);
+        // Broken and looping symlinks
+        assert_eq!(show_target(root, "Broken"), None);
+        assert_eq!(show_target(root, "Broken/child.txt"), None);
+        assert_eq!(show_target(root, "LoopA"), None);
+        assert_eq!(show_target(root, "LoopA/child.txt"), None);
+        // NUL or `.` segments refused
+        assert_eq!(show_target(root, "Docs/bad\0name"), None);
+        assert_eq!(show_target("/tmp/\0pd", "Docs/ok.txt"), None);
+        assert_eq!(show_target(root, "."), None);
+        assert_eq!(show_target(root, "Docs/./ok.txt"), None);
+        assert_eq!(show_target(root, "Docs/."), None);
+        // Symlinked sync root, in-root symlinks, non-dir intermediate file, and trailing slashes remain allowed
+        assert_eq!(show_target(link_root, "Docs/ok.txt"), Some(link_sync.join("Docs/ok.txt")));
+        assert_eq!(show_target(root, "Docs/internal-link.txt"), Some(real_sync.join("Docs/internal-link.txt")));
+        assert_eq!(show_target(root, "DocsLink/ok.txt"), Some(real_sync.join("DocsLink/ok.txt")));
+        assert_eq!(show_target(root, "Docs/ok.txt/child"), Some(real_sync.join("Docs/ok.txt")));
+        assert_eq!(show_target(&format!("{root}/"), "Docs/"), Some(real_sync.join("Docs")));
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
