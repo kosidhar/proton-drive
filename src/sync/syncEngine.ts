@@ -2292,6 +2292,7 @@ export class ProtonDriveSyncEngine {
         if (conflict.resolved) {
             throw new ConflictRefusedError(409, `Conflict #${conflictId} is already resolved`);
         }
+        this.refuseUnsafeConflictPath(conflict);
         if (this.resolvingConflicts.has(conflictId)) {
             throw new ConflictRefusedError(409, `Conflict #${conflictId} is being resolved`);
         }
@@ -2325,11 +2326,19 @@ export class ProtonDriveSyncEngine {
         return this.stateDb.getConflictById(conflictId)!;
     }
 
+    private refuseUnsafeConflictPath(conflict: { id: number; localRelPath: string }): void {
+        const pathProblem = conflict.localRelPath === '' ? 'it is the folder itself' : relPathProblem(conflict.localRelPath);
+        if (pathProblem !== null) {
+            throw new ConflictRefusedError(409, `Conflict #${conflict.id} has an unsafe path (${pathProblem})`);
+        }
+    }
+
     private async resolveUnresolvedConflict(
         conflict: ConflictRecord,
         choice: 'keep-both' | 'keep-local' | 'keep-remote',
     ): Promise<void> {
         const conflictId = conflict.id;
+        this.refuseUnsafeConflictPath(conflict);
         const symlinkRel = this.symlinkIn(conflict.localRelPath);
         if (symlinkRel !== null) {
             this.noteSkippedSymlink(symlinkRel);

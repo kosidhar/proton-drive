@@ -563,6 +563,34 @@ describe('names from Proton Drive that would leave the sync folder (#536)', () =
                 await d.engine.stop();
             });
 
+            // #557: standalone conflict resolution (e.g. CLI `protondrive conflicts resolve`) refuses empty or unsafe
+            // conflict rows directly, even when start()/reconcileNow() has not run dropUnsafePaths() first
+            test('resolveConflictManually refuses empty or unsafe conflict paths before touching disk', async () => {
+                const d = await setup();
+                d.add('Docs/ok.txt', 'ok');
+                const insertConflict = stateDb.connection.query(
+                    `INSERT INTO conflicts (localRelPath, nodeUid, localSha1, remoteSha1, localMtimeMs, remoteMtimeMs, detectedAt, resolved)
+                     VALUES (?, ?, 'a', 'b', 1, 2, 1000, 0)`,
+                );
+                const emptyId = Number(insertConflict.run('', d.uid('Docs/ok.txt')).lastInsertRowid);
+                const escapeId = Number(insertConflict.run('Shared/../../.bashrc', d.uid('Docs/ok.txt')).lastInsertRowid);
+
+                for (const id of [emptyId, escapeId]) {
+                    for (const choice of ['keep-both', 'keep-local', 'keep-remote'] as const) {
+                        await expect(d.engine.resolveConflictManually(id, choice)).rejects.toMatchObject({
+                            name: 'ConflictRefusedError',
+                            status: 409,
+                            message: expect.stringMatching(/unsafe path/i),
+                        });
+                    }
+                    expect(stateDb.getConflictById(id)?.resolved).toBe(0);
+                }
+                expect(outsideRoot(d.rootDir)).toEqual(d.before);
+                expect(d.calls.uploads).toEqual([]);
+                expect(d.calls.downloads).toEqual([]);
+                await d.engine.stop();
+            });
+
             // The second line: should a bad path reach the engine past the drop at the start of a pass, every way it could
             // reach the disk refuses it, and none takes the refusal for the item being gone
             test('a bad path that gets past the drop is refused wherever it would reach the disk, deleting nothing', async () => {
