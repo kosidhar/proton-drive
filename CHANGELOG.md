@@ -15,6 +15,10 @@ pre-release.
 
 - Cinnamon's Nemo extension now asks the daemon for each file's real sync state and configured sync folder (and follows live updates) instead of marking every file under `~/ProtonDrive` as synchronized (#530).
 
+### Changed
+
+- A sync pass downloads up to 6 new files of a folder at once instead of one after another: a first sync, a kept folder or a folder of many small files comes down several times faster. Anything else (edits, moves, deletes, conflicts) is still taken one at a time, in its order (#560).
+
 ## [0.1.3] - 2026-11-26
 
 ### Fixed
