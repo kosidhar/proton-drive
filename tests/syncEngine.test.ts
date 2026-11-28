@@ -1100,12 +1100,13 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         afterEach(async () => {
             while (engines.length) await engines.pop()!.stop();
         });
-        const setup = () => {
+        const setup = (listingPrefetch = 0) => {
             stateDb.setMeta('driveLayout', 'virtual');
             const drive = makeMockDrive();
             const engine = new ProtonDriveSyncEngine(drive.sdk, drive.eventsManager, { isLoggedIn: () => true }, stateDb, drive.logger, {
                 ...uploadAtOnce,
                 backingDir: path.join(tempDir, 'files'),
+                listingPrefetchConcurrency: listingPrefetch, // 0: these tests change the drive at the moment a listing is asked for
             });
             engines.push(engine);
             // What the engine asks of Proton Drive and writes to the index, in order, each node named by the path it was
@@ -1407,6 +1408,30 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 'list:Other/Sub',
                 'record:Other/Sub@Other2/Sub',
             ]);
+            expect(d.engine.remoteIndex.getByPath('Other2/Sub/o.txt')?.uid).toBe('vol~Other/Sub/o.txt');
+            for (const old of ['Other', 'Other/Sub', 'Other/Sub/o.txt']) {
+                expect(d.engine.remoteIndex.getByPath(old)).toBeNull();
+            }
+            expect(d.journal()).toEqual([]);
+        });
+
+        test('with listings fetched ahead, a folder renamed through the drive during the walk ends at its new path', async () => {
+            const d = setup(16);
+            d.add('Docs/d.txt', 'd');
+            d.add('Other/Sub/o.txt', 'o');
+            d.engine.availability.setPin('vol~Docs', 'pinned', false);
+            const docs = d.hold('Docs');
+            const pass = d.engine.reconcileNow(); // Docs is asked for ahead, before the root's children are gone through
+            await docs.asked;
+            await d.engine.renameItem('Other', 'Other2');
+            docs.release();
+            await pass;
+            await d.engine.replayRemoteOps();
+            // Other, its rename on its way when the pass reached it, was left for later, as a rename arriving during the
+            // root's walk always is: the next crawl lists it at its new path
+            d.crawlNext();
+            await d.engine.reconcileNow();
+            expect(d.log).toContain('rename:Other>Other2');
             expect(d.engine.remoteIndex.getByPath('Other2/Sub/o.txt')?.uid).toBe('vol~Other/Sub/o.txt');
             for (const old of ['Other', 'Other/Sub', 'Other/Sub/o.txt']) {
                 expect(d.engine.remoteIndex.getByPath(old)).toBeNull();
@@ -17522,6 +17547,79 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
             const uploaded = [...d.nodes.values()].filter((n) => d.nameOf(n) === 'new.txt');
             expect(uploaded.map((n) => n.parentUid)).toEqual([again.uid]);
             expect([...d.nodes.values()].filter((n) => d.nameOf(n) === 'Folder').length).toBe(1);
+        });
+    });
+
+    describe('subfolder listings are fetched ahead, and acted on in the pass\'s own order', () => {
+        // A show of 12 episodes, each its own folder with one small file, as Jellyfin's art is
+        const show = Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`Show/E${String(i).padStart(2, '0')}/art.jpg`, `art ${i}`]));
+        const syncing = async (prefetch?: number) => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+                ...(prefetch === undefined ? {} : { listingPrefetchConcurrency: prefetch }),
+            });
+            for (const [rel, content] of Object.entries(show)) d.add(rel, content);
+            engine.availability.setPin(d.root.uid, 'pinned', false);
+            await engine.reconcileNow(); // The first pass: every folder here, and synced
+            // Each listing takes a turn of the event loop, and the most at once is counted
+            const list = (d.sdk as any).iterateFolderChildren.bind(d.sdk);
+            const seen = { inFlight: 0, most: 0, listed: [] as string[] };
+            (d.sdk as any).iterateFolderChildren = async function* (parent: any) {
+                seen.inFlight += 1;
+                seen.most = Math.max(seen.most, seen.inFlight);
+                seen.listed.push(typeof parent === 'string' ? parent : parent.uid);
+                try {
+                    await Bun.sleep(5);
+                    yield* list(parent);
+                } finally {
+                    seen.inFlight -= 1;
+                }
+            };
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            return { ...d, engine, local, seen };
+        };
+
+        test('a pass over many small folders lists several at once, and keeps everything synced', async () => {
+            const d = await syncing(4);
+            d.add('Show/E05/new.jpg', 'new art');
+            await d.engine.reconcileNow();
+            expect(d.seen.most).toBeGreaterThan(1);
+            expect(d.seen.most).toBeLessThanOrEqual(5); // 4 ahead, and the one the pass itself waits on
+            expect(await readFile(d.local('Show/E05/new.jpg'), 'utf8')).toBe('new art');
+            for (const [rel, content] of Object.entries(show)) expect(await readFile(d.local(rel), 'utf8')).toBe(content);
+        });
+
+        test('without fetching ahead, one listing at a time', async () => {
+            const d = await syncing(0);
+            await d.engine.reconcileNow();
+            expect(d.seen.most).toBe(1);
+        });
+
+        test('each folder is listed once a pass, fetched ahead or not', async () => {
+            const d = await syncing(4);
+            await d.engine.reconcileNow();
+            expect(new Set(d.seen.listed).size).toBe(d.seen.listed.length);
+        });
+
+        test('a folder whose listing fails ahead is that folder failing: the others sync, nothing of it goes', async () => {
+            const d = await syncing(4);
+            d.add('Show/E07/new.jpg', 'new art');
+            d.add('Show/E09/new.jpg', 'other art');
+            d.failListing.add(d.uid('Show/E07'));
+            await d.engine.reconcileNow();
+            expect(await readFile(d.local('Show/E07/art.jpg'), 'utf8')).toBe('art 7'); // never taken for deleted
+            expect(await stat(d.local('Show/E07/new.jpg')).catch(() => null)).toBeNull();
+            expect(await readFile(d.local('Show/E09/new.jpg'), 'utf8')).toBe('other art');
+        });
+
+        test('a folder ignored is not even listed ahead', async () => {
+            const d = await syncing(4);
+            stateDb.updateSettings({ ignorePatterns: ['Show/E03', 'Show/E03/**'] });
+            await d.engine.reconcileNow();
+            expect(d.seen.listed).not.toContain(d.uid('Show/E03'));
+            stateDb.updateSettings({ ignorePatterns: [] });
         });
     });
 

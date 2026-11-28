@@ -110,6 +110,10 @@ const SETTLE_QUIET_MS = 2000;
 // How many local changes are handled at once: enough to keep uploads going, few enough that a large folder copied in
 // doesn't start thousands of hashes and uploads together (#90)
 const LOCAL_CHANGE_CONCURRENCY = 6;
+// How many listings of a folder's subfolders are fetched ahead at once, while the pass is busy with the folder's files and
+// the subfolders before them: each costs round trips, and a tree of many small folders (a show's episodes, a game) otherwise
+// waits on one after another. Fetching is all it does: each listing is recorded and acted on when the pass reaches its folder.
+const LISTING_PREFETCH_CONCURRENCY = 16;
 const SETTLE_MAX_QUIET_MS = 16_000;
 // A file that never stops changing (a log, say) uploads anyway after this long, and then at most this often
 const SETTLE_MAX_WAIT_MS = 2 * 60_000;
@@ -359,6 +363,9 @@ export class ProtonDriveSyncEngine {
     private roomRefusalLoggedAt: number | null = null;
     // Local changes handled at once, and the look of each path waiting for its turn (see handleLocalFileChange)
     private readonly localChangeSlots: Slots;
+    // Listings of subfolders fetched ahead (see LISTING_PREFETCH_CONCURRENCY)
+    private readonly listingSlots: Slots;
+    private readonly listingPrefetch: number;
     private readonly localWaiting = new Map<string, Promise<void>>();
     // Stopped: changes still waiting for their turn do nothing when it comes
     private stopped = false;
@@ -479,6 +486,8 @@ export class ProtonDriveSyncEngine {
             askWithActions?: typeof sendActionNotification;
             // How many local changes are handled at once (LOCAL_CHANGE_CONCURRENCY; for tests)
             localChangeConcurrency?: number;
+            // How many subfolder listings are fetched ahead at once (LISTING_PREFETCH_CONCURRENCY; 0: none; for tests)
+            listingPrefetchConcurrency?: number;
             // For tests: when the coalesced state changes go out (see StateEvents)
             stateEventSchedule?: (run: () => void, delayMs: number) => () => void;
             // For tests: how long what is missing while held is taken as known (FILES_MISSING_CACHE_MS; see stillMissing)
@@ -509,6 +518,8 @@ export class ProtonDriveSyncEngine {
         this.index.onFoldersRemoved = (uids) => this.docs.removeInFolders(uids); // #436
         this.policy = new AvailabilityPolicy(this.stateDb.connection, this.index);
         this.localChangeSlots = new Slots(options.localChangeConcurrency ?? LOCAL_CHANGE_CONCURRENCY);
+        this.listingPrefetch = options.listingPrefetchConcurrency ?? LISTING_PREFETCH_CONCURRENCY;
+        this.listingSlots = new Slots(Math.max(1, this.listingPrefetch));
         this.stateEvents = new StateEvents(options.stateEventSchedule ? { schedule: options.stateEventSchedule } : {});
         const changed = (relPath: string, subtree: boolean) =>
             subtree ? this.stateEvents.touchSubtree(relPath) : this.stateEvents.touch(relPath);
@@ -8593,6 +8604,8 @@ export class ProtonDriveSyncEngine {
         since: number,
         onlineOnly: OnlineOnlyFolder[],
         failed: SyncFailure[] = [],
+        // Its listing, fetched ahead by the folder above (see LISTING_PREFETCH_CONCURRENCY)
+        prefetched?: Promise<NodeEntity[]>,
     ): Promise<void> {
         const liveSettings = this.stateDb.getSettings();
         if (liveSettings.paused) {
@@ -8615,7 +8628,7 @@ export class ProtonDriveSyncEngine {
         await ensureNoSymlinkDir(this.localRoot(), prefix);
 
         this.currentAction = `Listing /my-files/${prefix || ''}`;
-        const remoteChildren = await listFolderChildren(this.sdk, folderNode);
+        const remoteChildren = await (prefetched ?? listFolderChildren(this.sdk, folderNode));
         // Record the whole listing (ignored children too) before any child is reconciled
         this.recordListing(folderNode, prefix, remoteChildren);
         const freshSettings = this.stateDb.getSettings();
@@ -8635,6 +8648,36 @@ export class ProtonDriveSyncEngine {
         }
 
         const localEntries = await readdir(localDirFullPath, { withFileTypes: true }).catch(() => []);
+
+        // The subfolders' listings, fetched ahead from here, while the pass is busy with this folder's files and the
+        // subfolders before them. Only of those it is to go into, as it looks now: here already, or kept here (pinned,
+        // so it is made), and neither ignored, hidden, backing off, syncing on its own nor awaiting a remote operation
+        // (what the loop below skips); one that turns out skipped just goes unused. Each is used only for the very node it
+        // was fetched for: a folder moved or replaced meanwhile is listed afresh when its turn comes. A failed fetch is
+        // that folder's listing failing, reported when its turn comes. A listing a little older than one fetched on
+        // arrival decides nothing alone: what it no longer lists is looked up in Proton Drive before anything here goes
+        // (afterGoneFromCloudPath), and what it doesn't list yet comes at the next pass.
+        const listings = new Map<string, { uid: string; listing: Promise<NodeEntity[]> }>();
+        if (this.listingPrefetch > 0) {
+            const localNames = new Set(localEntries.filter((entry) => entry.isDirectory()).map((entry) => entry.name));
+            for (const [name, child] of remoteChildByName) {
+                const relPath = prefix ? `${prefix}/${name}` : name;
+                const backingOff = this.failingItems.get(relPath);
+                if (
+                    child.type !== NodeType.Folder ||
+                    this.policy.hiddenBy(relPath) !== null ||
+                    !(localNames.has(name) || this.policy.isPinned(relPath) || this.policy.hasPinnedBelow(relPath)) ||
+                    this.syncingFolders.has(relPath) ||
+                    this.awaitsRemoteOp(relPath, child.uid) ||
+                    (backingOff && Date.now() < backingOff.retryAt)
+                ) {
+                    continue; // (remoteChildByName already leaves out what is ignored)
+                }
+                const listing = this.listingSlots.run(() => listFolderChildren(this.sdk, child));
+                listing.catch(() => undefined); // Not unhandled: the recursion awaits it, and reports its failure
+                listings.set(relPath, { uid: child.uid, listing });
+            }
+        }
         const localChildByName = new Map<string, { isDirectory: boolean; size: number; mtimeMs: number; ctimeMs: number }>();
         for (const entry of localEntries) {
             const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
@@ -8790,7 +8833,16 @@ export class ProtonDriveSyncEngine {
                 continue;
             }
             try {
-                await this.reconcileDirectoryIncremental(sub.node, sub.relPath, remoteMap, nextSettings, since, onlineOnly, failed);
+                await this.reconcileDirectoryIncremental(
+                    sub.node,
+                    sub.relPath,
+                    remoteMap,
+                    nextSettings,
+                    since,
+                    onlineOnly,
+                    failed,
+                    listings.get(sub.relPath)?.uid === sub.node.uid ? listings.get(sub.relPath)!.listing : undefined,
+                );
             } catch (error: unknown) {
                 this.itemFailed(sub.relPath, error, failed); // Its listing, say: nothing in it is looked at this pass
                 continue;
