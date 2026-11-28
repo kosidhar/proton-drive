@@ -209,6 +209,76 @@ export class FilesMissingRefused extends Error {
     }
 }
 
+const MAX_REMEMBERED_SKIPPED = 2048;
+const MAX_SKIPPED_WARNINGS_PER_SUMMARY = 10;
+
+interface SkippedUnsafeName {
+    uid: string;
+    kind: 'file' | 'folder';
+    name: string;
+    problem: string;
+    folderRel?: string;
+}
+
+class SkippedNamesBatch {
+    count = 0;
+    hitCap = false;
+    readonly samples: SkippedUnsafeName[] = [];
+    // Track distinct known folders up to a cap so a flood across thousands of folders stays bounded too.
+    private readonly folders = new Set<string>();
+    private hasUnknownFolder = false;
+    private foldersOverflowed = false;
+    private singleFolderRel: string | undefined;
+
+    add(entry: SkippedUnsafeName): void {
+        this.count += 1;
+        if (this.samples.length < MAX_SKIPPED_WARNINGS_PER_SUMMARY) {
+            this.samples.push(entry);
+        }
+        if (entry.folderRel === undefined) {
+            this.hasUnknownFolder = true;
+            return;
+        }
+        if (!this.folders.has(entry.folderRel)) {
+            if (this.folders.size === 0) {
+                this.singleFolderRel = entry.folderRel;
+            }
+            if (this.folders.size < MAX_REMEMBERED_SKIPPED) {
+                this.folders.add(entry.folderRel);
+            } else {
+                this.foldersOverflowed = true;
+            }
+        }
+    }
+
+    get folderCount(): number {
+        return this.folders.size;
+    }
+
+    get hasOverflowedFolders(): boolean {
+        return this.foldersOverflowed;
+    }
+
+    get isSingleKnownFolder(): boolean {
+        return !this.hasUnknownFolder && this.folders.size === 1 && !this.foldersOverflowed;
+    }
+
+    get isMultiKnownFolders(): boolean {
+        return !this.hasUnknownFolder && (this.folders.size > 1 || this.foldersOverflowed);
+    }
+
+    get onlyFolderRel(): string | undefined {
+        return this.isSingleKnownFolder ? this.singleFolderRel : undefined;
+    }
+}
+
+function formatSkippedFolderWhere(folderRel: string | undefined): string {
+    if (folderRel === undefined) {
+        return '';
+    }
+    return ` in ${folderRel === '' ? 'My files' : quotedName(folderRel)}`;
+}
+
 // Whether a folder is there. Any failure to look counts as not there: this only ever holds back.
 function isFolderAt(dir: string): boolean {
     try {
@@ -543,34 +613,145 @@ export class ProtonDriveSyncEngine {
     }
 
     // Whether a node's name can't be one on this computer (see remoteNameProblem, #536): such a node, and everything in
-    // it, is left out of what is synced, indexed, listed in the drive and downloaded. Said once per node, by its uid, in
-    // the log and in the activity (the name only quoted: it is someone else's text). `folderRel` is where it was found,
-    // when known.
-    private skipsName(node: NodeEntity, folderRel?: string): boolean {
+    // it, is left out of what is synced, indexed, listed in the drive and downloaded. Remembered in a bounded set (with
+    // no eviction thrashing once full) and summarised per pass/operation so many bad names from a collaborator cannot
+    // flood the activity log (#542).
+    private skipsName(node: NodeEntity, folderRel?: string, batch?: SkippedNamesBatch): boolean {
         const name = getName(node);
         const problem = remoteNameProblem(name);
         if (problem === null) {
             return false;
         }
-        if (!this.unsafeNamesTold.has(node.uid)) {
+        if (this.unsafeNamesTold.has(node.uid)) {
+            return true;
+        }
+        let hitCap = false;
+        if (this.unsafeNamesTold.size < MAX_REMEMBERED_SKIPPED) {
             this.unsafeNamesTold.add(node.uid);
-            const kind = node.type === NodeType.Folder ? 'folder' : 'file';
-            const where = folderRel === undefined ? '' : ` in ${folderRel === '' ? 'My files' : folderRel}`;
-            this.logger.warn(
-                `Skipping a ${kind}${where} (${node.uid}) named ${quotedName(name)}: ${problem}, so it can't be a ${kind} on this computer. It stays in Proton Drive`,
-            );
-            this.stateDb.logActivity({
-                action: 'error',
-                localRelPath: folderRel || '/',
-                details: `Not synced: a ${kind} in Proton Drive is named ${quotedName(name)}, which can't be a name on this computer (${problem}). It stays in Proton Drive; rename it there to sync it`,
-            });
+        } else if (this.unsafeNamesOverflowReported) {
+            return true;
+        } else {
+            hitCap = true;
+        }
+        const entry: SkippedUnsafeName = {
+            uid: node.uid,
+            kind: node.type === NodeType.Folder ? 'folder' : 'file',
+            name,
+            problem,
+            folderRel,
+        };
+        const target = batch ?? this.passSkippedNames;
+        if (target !== null) {
+            target.add(entry);
+            if (hitCap) {
+                target.hitCap = true;
+            }
+        } else {
+            const single = new SkippedNamesBatch();
+            single.add(entry);
+            if (hitCap) {
+                single.hitCap = true;
+            }
+            this.emitSkippedNamesSummary(single);
         }
         return true;
+    }
+
+    private enterSkippedNamesBatch(): void {
+        if (this.skippedNamesDepth === 0) {
+            this.passSkippedNames = new SkippedNamesBatch();
+        }
+        this.skippedNamesDepth += 1;
+    }
+
+    private exitSkippedNamesBatch(): void {
+        if (this.skippedNamesDepth > 0) {
+            this.skippedNamesDepth -= 1;
+        }
+        if (this.skippedNamesDepth === 0) {
+            try {
+                this.flushSkippedNames();
+            } catch (error: unknown) {
+                this.logger.warn(`Could not record skipped-name summary: ${error}`);
+            }
+        }
+    }
+
+    private async withSkippedNamesBatch<T>(fn: () => Promise<T>): Promise<T> {
+        this.enterSkippedNamesBatch();
+        try {
+            return await fn();
+        } finally {
+            this.exitSkippedNamesBatch();
+        }
+    }
+
+    private flushSkippedNames(): void {
+        const pending = this.passSkippedNames;
+        this.passSkippedNames = null;
+        if (pending && pending.count > 0) {
+            this.emitSkippedNamesSummary(pending);
+        }
+    }
+
+    private emitSkippedNamesSummary(batch: SkippedNamesBatch): void {
+        if (batch.count === 0) {
+            return;
+        }
+        if (batch.hitCap) {
+            this.unsafeNamesOverflowReported = true;
+        }
+        const first = batch.samples[0]!;
+        for (const item of batch.samples) {
+            const where = formatSkippedFolderWhere(item.folderRel);
+            this.logger.warn(
+                `Skipping a ${item.kind}${where} (${item.uid}) named ${quotedName(item.name)}: ${item.problem}, so it can't be a ${item.kind} on this computer. It stays in Proton Drive`,
+            );
+        }
+        if (batch.count === 1) {
+            this.stateDb.logActivity({
+                action: 'error',
+                localRelPath: first.folderRel || '/',
+                details: `Not synced: a ${first.kind} in Proton Drive is named ${quotedName(first.name)}, which can't be a name on this computer (${first.problem}). It stays in Proton Drive; rename it there to sync it`,
+            });
+            return;
+        }
+        const localRelPath = batch.isSingleKnownFolder ? batch.onlyFolderRel || '/' : '/';
+        const where = batch.isSingleKnownFolder
+            ? formatSkippedFolderWhere(batch.onlyFolderRel)
+            : batch.isMultiKnownFolders
+              ? ` across ${batch.folderCount}${batch.hasOverflowedFolders ? '+' : ''} folders`
+              : '';
+        if (batch.count > batch.samples.length) {
+            const extra = batch.count - batch.samples.length;
+            this.logger.warn(
+                extra === 1
+                    ? `Skipping 1 more item${where} whose name can't be on this computer. It stays in Proton Drive`
+                    : `Skipping ${extra} more items${where} whose names can't be on this computer. They stay in Proton Drive`,
+            );
+        }
+        this.stateDb.logActivity({
+            action: 'error',
+            localRelPath,
+            details: `Not synced: ${batch.count} items${where} in Proton Drive have names that can't be on this computer (for example ${quotedName(first.name)}: ${first.problem}). They stay in Proton Drive; rename them there to sync them`,
+        });
     }
 
     // Notes a symbolic link skipped inside the sync folder once per path, in the log and in Activity (#540).
     private noteSkippedSymlink(relPath: string): void {
         if (this.skippedSymlinksTold.has(relPath)) {
+            return;
+        }
+        if (this.skippedSymlinksTold.size >= MAX_REMEMBERED_SKIPPED) {
+            if (!this.skippedSymlinksOverflowReported) {
+                this.skippedSymlinksOverflowReported = true;
+                this.logger.warn("Skipping additional symbolic links: symbolic links aren't synced and stay on this computer");
+                this.stateDb.logActivity({
+                    action: 'error',
+                    localRelPath: '/',
+                    details: "Not synced: additional symbolic links in the sync folder were skipped. Symbolic links aren't synced and stay on this computer",
+                });
+            }
             return;
         }
         this.skippedSymlinksTold.add(relPath);
@@ -1446,6 +1627,7 @@ export class ProtonDriveSyncEngine {
         let keepConfirmation = false;
 
         this.reconcileRunning = true;
+        this.enterSkippedNamesBatch();
         this.state = 'syncing';
         this.currentAction = 'Starting sync...';
         this.lastError = null;
@@ -1544,6 +1726,7 @@ export class ProtonDriveSyncEngine {
             });
         } finally {
             this.reconcileRunning = false;
+            this.exitSkippedNamesBatch();
             // Also after a pass that failed or was cut short: what is missing is looked at here, not in the pass
             try {
                 this.lookAfterHold(confirmation);
@@ -4998,7 +5181,11 @@ export class ProtonDriveSyncEngine {
     private readonly loggedPlaceholderClashes = new Set<string>();
     // Nodes skipped for a name that can't be one on this computer, already said (see skipsName)
     private readonly unsafeNamesTold = new Set<string>();
+    private unsafeNamesOverflowReported = false;
     private readonly skippedSymlinksTold = new Set<string>();
+    private skippedSymlinksOverflowReported = false;
+    private passSkippedNames: SkippedNamesBatch | null = null;
+    private skippedNamesDepth = 0;
 
     private refusePlaceholder(rel: string): void {
         if (this.placeholderAt(rel)) {
@@ -8133,26 +8320,28 @@ export class ProtonDriveSyncEngine {
             const remoteMap = new Map<string, NodeEntity>([[relPath, node]]);
             const onlineOnly: OnlineOnlyFolder[] = [];
             this.currentAction = `Syncing ${relPath}`;
-            await this.observingLocal(async (since) => {
-                await this.reconcileSinglePath(
-                    relPath,
-                    node,
-                    localInfo,
-                    this.stateDb.getItemByPath(relPath) ?? undefined,
-                    remoteMap,
-                    settings,
-                    since,
-                );
-                const isLocalFolder = await lstat(localFullPath).then(
-                    (s) => s.isDirectory(),
-                    () => false,
-                );
-                if (node.type === NodeType.Folder && isLocalFolder) {
-                    await this.reconcileDirectoryIncremental(node, relPath, remoteMap, settings, since, onlineOnly);
-                }
+            await this.withSkippedNamesBatch(async () => {
+                await this.observingLocal(async (since) => {
+                    await this.reconcileSinglePath(
+                        relPath,
+                        node,
+                        localInfo,
+                        this.stateDb.getItemByPath(relPath) ?? undefined,
+                        remoteMap,
+                        settings,
+                        since,
+                    );
+                    const isLocalFolder = await lstat(localFullPath).then(
+                        (s) => s.isDirectory(),
+                        () => false,
+                    );
+                    if (node.type === NodeType.Folder && isLocalFolder) {
+                        await this.reconcileDirectoryIncremental(node, relPath, remoteMap, settings, since, onlineOnly);
+                    }
+                });
+                // A pin always reads its own subtree in full
+                await this.crawlOnlineOnly(onlineOnly);
             });
-            // A pin always reads its own subtree in full
-            await this.crawlOnlineOnly(onlineOnly);
         } catch (error: unknown) {
             this.logger.warn(`Could not download ${relPath} now; the next sync tries again: ${error}`);
         } finally {
@@ -8502,9 +8691,6 @@ export class ProtonDriveSyncEngine {
             if (relPath !== '' && this.index.getByUid(folder.uid)?.relPath !== relPath) {
                 return false;
             }
-            for (const child of children) {
-                this.skipsName(child, relPath);
-            }
             let docFolders: string[] = [];
             this.indexWrite(() => {
                 this.index.replaceChildren(folder.uid, relPath, this.indexEntries(children, relPath));
@@ -8518,6 +8704,13 @@ export class ProtonDriveSyncEngine {
                     }),
                 );
             });
+            const batch = this.passSkippedNames === null ? new SkippedNamesBatch() : undefined;
+            for (const child of children) {
+                this.skipsName(child, relPath, batch);
+            }
+            if (batch && batch.count > 0) {
+                this.emitSkippedNamesSummary(batch);
+            }
             for (const child of children) {
                 this.givenUpMoves.delete(child.uid);
             }
@@ -8547,49 +8740,51 @@ export class ProtonDriveSyncEngine {
         relPath: string,
         opts: { unsupportedIn?: Set<string>; replayFirst?: boolean } = {},
     ): Promise<boolean> {
-        const { unsupportedIn, replayFirst = false } = opts;
-        if (replayFirst) {
-            await this.replayAskedDuringPass();
-            relPath = this.index.getByUid(node.uid)?.relPath ?? relPath;
-        }
-        if (this.stateDb.getSettings().paused || this.index.getByUid(node.uid)?.relPath !== relPath) {
-            return false;
-        }
-        if (this.policy.hiddenBy(relPath)?.hide === 'hidden') {
-            return true;
-        }
-        let children: NodeEntity[];
-        try {
-            children = await listFolderChildren(this.sdk, node);
-        } catch (error: unknown) {
-            this.logger.warn(`Could not list ${relPath} for the remote index: ${error}`);
-            return false;
-        }
-        if (replayFirst) {
-            const now = this.index.getByUid(node.uid)?.relPath;
-            if (now === undefined) {
+        return this.withSkippedNamesBatch(async () => {
+            const { unsupportedIn, replayFirst = false } = opts;
+            if (replayFirst) {
+                await this.replayAskedDuringPass();
+                relPath = this.index.getByUid(node.uid)?.relPath ?? relPath;
+            }
+            if (this.stateDb.getSettings().paused || this.index.getByUid(node.uid)?.relPath !== relPath) {
                 return false;
             }
-            if (this.policy.hiddenBy(now)?.hide === 'hidden') {
+            if (this.policy.hiddenBy(relPath)?.hide === 'hidden') {
                 return true;
             }
-            relPath = now;
-        }
-        if (!this.recordListing(node, relPath, children)) {
-            return false;
-        }
-        // A child whose name can't be one on this computer (#536) is left out like a Doc: what holds one is never all here
-        if (unsupportedIn && children.some((child) => entryFromNode(child, relPath) === null)) {
-            unsupportedIn.add(relPath);
-        }
-        let complete = true;
-        for (const child of children) {
-            const name = syncableName(child);
-            if (child.type === NodeType.Folder && name !== null) {
-                complete = (await this.indexRemoteSubtree(child, childRel(relPath, name), opts)) && complete;
+            let children: NodeEntity[];
+            try {
+                children = await listFolderChildren(this.sdk, node);
+            } catch (error: unknown) {
+                this.logger.warn(`Could not list ${relPath} for the remote index: ${error}`);
+                return false;
             }
-        }
-        return complete;
+            if (replayFirst) {
+                const now = this.index.getByUid(node.uid)?.relPath;
+                if (now === undefined) {
+                    return false;
+                }
+                if (this.policy.hiddenBy(now)?.hide === 'hidden') {
+                    return true;
+                }
+                relPath = now;
+            }
+            if (!this.recordListing(node, relPath, children)) {
+                return false;
+            }
+            // A child whose name can't be one on this computer (#536) is left out like a Doc: what holds one is never all here
+            if (unsupportedIn && children.some((child) => entryFromNode(child, relPath) === null)) {
+                unsupportedIn.add(relPath);
+            }
+            let complete = true;
+            for (const child of children) {
+                const name = syncableName(child);
+                if (child.type === NodeType.Folder && name !== null) {
+                    complete = (await this.indexRemoteSubtree(child, childRel(relPath, name), opts)) && complete;
+                }
+            }
+            return complete;
+        });
     }
 
     // Syncs a folder that is on this computer and, depth first, its subfolders that are too. Remote folders that aren't
@@ -8626,13 +8821,14 @@ export class ProtonDriveSyncEngine {
         this.currentAction = `Listing /my-files/${prefix || ''}`;
         const remoteChildren = await listFolderChildren(this.sdk, folderNode);
         // Record the whole listing (ignored children too) before any child is reconciled
-        this.recordListing(folderNode, prefix, remoteChildren);
+        const recorded = this.recordListing(folderNode, prefix, remoteChildren);
+        const fallbackBatch = !recorded && this.passSkippedNames === null ? new SkippedNamesBatch() : undefined;
         const freshSettings = this.stateDb.getSettings();
         const remoteChildByName = new Map<string, NodeEntity>();
         for (const child of remoteChildren) {
             // Never synced, nor anything in it: its name would lead elsewhere than an item of this folder (#536). Like
             // anything else Proton Drive has that isn't here, it never reads as gone from here either
-            if (this.skipsName(child, prefix)) {
+            if (recorded ? syncableName(child) === null : this.skipsName(child, prefix, fallbackBatch)) {
                 continue;
             }
             const name = getName(child);
@@ -8641,6 +8837,9 @@ export class ProtonDriveSyncEngine {
                 remoteChildByName.set(name, child);
                 remoteMap.set(relPath, child);
             }
+        }
+        if (fallbackBatch && fallbackBatch.count > 0) {
+            this.emitSkippedNamesSummary(fallbackBatch);
         }
 
         const localEntries = await readdir(localDirFullPath, { withFileTypes: true }).catch(() => []);
