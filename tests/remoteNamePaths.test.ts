@@ -356,13 +356,16 @@ describe('names from Proton Drive that would leave the sync folder (#536)', () =
                     expect([uid, d.engine.remoteIndex.getByUid(uid)]).toEqual([uid, null]);
                     expect(d.nodes.has(uid)).toBe(true);
                 }
-                // Told once per node, by its uid, the name only as JSON
+                // Told once per node, by its uid, the name only as JSON; summarised in Activity (#542)
                 for (const uid of ['vol~evil-up', 'vol~evil-slash', 'vol~evil-nul', 'vol~dotdot', 'vol~dot']) {
                     expect([uid, d.warnings.filter((w) => w.includes(`(${uid})`)).length]).toEqual([uid, 1]);
                 }
                 expect(d.warnings.some((w) => w.includes('"../../evil.txt"'))).toBe(true);
                 expect(d.warnings.some((w) => w.includes('\0'))).toBe(false);
-                expect(stateDb.listActivity(100).some((a) => a.details.includes('"a/b.txt"'))).toBe(true);
+                const skippedActivity = stateDb.listActivity(100).filter((a) => a.details.includes('Not synced:'));
+                expect(skippedActivity.length).toBe(1);
+                expect(skippedActivity[0]!.details).toContain('5 items');
+                expect(skippedActivity[0]!.details.includes('\0')).toBe(false);
                 // The drive lists none of them, nor any placeholder for one
                 if (layout === 'virtual') {
                     expect(d.engine.vfsChildren('').map((e) => e.name)).toEqual(['Shared', 'top.txt']);
@@ -651,6 +654,131 @@ describe('names from Proton Drive that would leave the sync folder (#536)', () =
                 }
                 expect(outsideRoot(d.rootDir)).toEqual(d.before);
                 expect(await stat(path.join(tempDir, 'victim.txt')).then((s) => s.size)).toBe(4);
+                await d.engine.stop();
+            });
+
+            // #542: many bad names from a collaborator are summarised into one activity entry (leaving earlier entries
+            // intact) and the remembered set stays bounded
+            test('1000 items with unsafe names are summarised into one activity entry and do not evict earlier activity', async () => {
+                const d = await setup();
+                d.add('Shared/ok.txt', 'ok');
+                const shared = d.nodes.get(d.uid('Shared'))!;
+                d.engine.availability.setPin(d.root.uid, 'pinned', false);
+                stateDb.logActivity({
+                    action: 'delete-local',
+                    localRelPath: 'Docs/important.txt',
+                    details: 'Removed local item after it was deleted on Proton Drive',
+                });
+                for (let i = 0; i < 1000; i++) {
+                    d.addNode(`vol~bad-${i}`, shared.uid, `../bad-${i}.txt`, 'x');
+                }
+
+                await d.engine.reconcileNow();
+
+                const activities = stateDb.listActivity(500);
+                expect(activities.some((a) => a.localRelPath === 'Docs/important.txt')).toBe(true);
+                const skippedEntries = activities.filter((a) => a.details.includes('Not synced:'));
+                expect(skippedEntries.length).toBe(1);
+                expect(skippedEntries[0]!.details).toContain('1000 items');
+                expect(skippedEntries[0]!.localRelPath).toBe('Shared');
+                // Warnings are capped as well (first 10 individually + 1 summary), not 1000 lines
+                expect(d.warnings.length).toBe(11);
+
+                // A second pass with the same 1000 bad names emits nothing new
+                await d.engine.reconcileNow();
+                expect(stateDb.listActivity(500).filter((a) => a.details.includes('Not synced:')).length).toBe(1);
+                expect(d.warnings.length).toBe(11);
+
+                // Bounded remembered set: adding over the cap never lets unsafeNamesTold grow unboundedly
+                for (let i = 1000; i < 2500; i++) {
+                    d.addNode(`vol~bad-${i}`, shared.uid, `../bad-${i}.txt`, 'x');
+                }
+                await d.engine.reconcileNow();
+                const toldSize = (d.engine as unknown as { unsafeNamesTold: Set<string> }).unsafeNamesTold.size;
+                expect(toldSize).toBe(2048);
+                expect(stateDb.listActivity(500).some((a) => a.localRelPath === 'Docs/important.txt')).toBe(true);
+                const skippedAfterCap = stateDb.listActivity(500).filter((a) => a.details.includes('Not synced:'));
+                expect(skippedAfterCap.length).toBe(2);
+                expect(skippedAfterCap[0]!.details).toContain('1500 items');
+                expect(d.warnings.length).toBe(22);
+
+                // Steady-state pass above the 2,048 cap: no FIFO thrashing and no new activity/warnings emitted
+                await d.engine.reconcileNow();
+                expect((d.engine as unknown as { unsafeNamesTold: Set<string> }).unsafeNamesTold.size).toBe(2048);
+                expect(stateDb.listActivity(500).filter((a) => a.details.includes('Not synced:')).length).toBe(2);
+                expect(d.warnings.length).toBe(22);
+                await d.engine.stop();
+            });
+
+            test('bad names across 600 subfolders are summarised into one activity entry on reconcile and unhide, and bidi chars are escaped', async () => {
+                const d = await setup();
+                d.add('Many/keep.txt', 'ok');
+                const many = d.nodes.get(d.uid('Many'))!;
+                const bidiFolder = d.addNode('vol~bidi-dir', many.uid, 'Safe\u202EDir');
+                d.addNode('vol~bidi-bad', bidiFolder.uid, '../\u202Eevil.txt', 'x');
+                for (let i = 0; i < 600; i++) {
+                    const sub = d.addNode(`vol~sub-${i}`, many.uid, `sub-${i}`);
+                    d.addNode(`vol~sub-bad-${i}`, sub.uid, '../bad.txt', 'x');
+                }
+                stateDb.logActivity({
+                    action: 'delete-local',
+                    localRelPath: 'Docs/keep-me.txt',
+                    details: 'Removed local item after it was deleted on Proton Drive',
+                });
+
+                await d.engine.reconcileNow();
+
+                const activities = stateDb.listActivity(500);
+                expect(activities.some((a) => a.localRelPath === 'Docs/keep-me.txt')).toBe(true);
+                const skipped = activities.filter((a) => a.details.includes('Not synced:'));
+                expect(skipped.length).toBe(1);
+                expect(skipped[0]!.localRelPath).toBe('/');
+                expect(skipped[0]!.details).toContain('601 items across 601 folders');
+                expect(skipped[0]!.details.includes('\u202E')).toBe(false);
+                expect(d.warnings.some((w) => w.includes('\u202E'))).toBe(false);
+
+                // Unhiding a subtree with 600 subfolders outside reconcileNow() also batches into one summary entry
+                await d.engine.setAvailability('Many', 'hide');
+                // Clear remembered set to simulate a fresh daemon run unhiding the tree
+                (d.engine as unknown as { unsafeNamesTold: Set<string> }).unsafeNamesTold.clear();
+                await d.engine.setAvailability('Many', 'unhide');
+                const skippedAfterUnhide = stateDb.listActivity(500).filter((a) => a.details.includes('Not synced:'));
+                expect(skippedAfterUnhide.length).toBe(2);
+                expect(skippedAfterUnhide[0]!.details).toContain('601 items across 601 folders');
+                expect(stateDb.listActivity(500).some((a) => a.localRelPath === 'Docs/keep-me.txt')).toBe(true);
+                await d.engine.stop();
+            });
+
+            test('single bad item keeps single-item activity wording and a mid-pass error still flushes safely', async () => {
+                const d = await setup();
+                d.add('Docs/ok.txt', 'ok');
+                const docs = d.nodes.get(d.uid('Docs'))!;
+                d.addNode('vol~one-bad', docs.uid, 'a/b.txt', 'x');
+                await d.engine.reconcileNow();
+                const skipped = stateDb.listActivity(100).filter((a) => a.details.includes('Not synced:'));
+                expect(skipped.length).toBe(1);
+                expect(skipped[0]!.localRelPath).toBe('Docs');
+                expect(skipped[0]!.details).toContain('"a/b.txt"');
+
+                // Even if logActivity throws during flush, reconcileRunning is reset so the next sync still runs
+                const origLogActivity = stateDb.logActivity.bind(stateDb);
+                let threw = false;
+                stateDb.logActivity = (entry) => {
+                    if (!threw && entry.details.includes('Not synced:')) {
+                        threw = true;
+                        throw new Error('simulated sqlite busy');
+                    }
+                    return origLogActivity(entry);
+                };
+                d.addNode('vol~second-bad', docs.uid, '../second.txt', 'x');
+                d.engine.availability.setPin(d.root.uid, 'pinned', false);
+                await d.engine.reconcileNow();
+                stateDb.logActivity = origLogActivity;
+                expect(threw).toBe(true);
+                // Engine is not wedged: a subsequent reconcile still runs and syncs new files
+                d.add('Docs/after.txt', 'after');
+                await d.engine.reconcileNow();
+                expect(await readFile(d.local('Docs/after.txt'), 'utf8')).toBe('after');
                 await d.engine.stop();
             });
         });
