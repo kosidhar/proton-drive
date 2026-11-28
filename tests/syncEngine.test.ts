@@ -17525,6 +17525,111 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
         });
     });
 
+    describe('new files download several at once in a folder, everything else one at a time', () => {
+        const syncing = async (files: Record<string, string>, concurrency = 3) => {
+            const d = makeMockDrive();
+            const engine = new ProtonDriveSyncEngine(d.sdk, d.eventsManager, { isLoggedIn: () => true }, stateDb, d.logger, {
+                moveToDesktopTrash: async () => false,
+                settle: { quietMs: 0 },
+                newDownloadConcurrency: concurrency,
+            });
+            for (const [rel, content] of Object.entries(files)) d.add(rel, content);
+            engine.availability.setPin(d.root.uid, 'pinned', false); // as a fresh install's first sync
+            const local = (rel: string) => path.join(engine.localRoot(), rel);
+            // Every download takes a turn of the event loop, and the most at once is counted
+            const download = (d.sdk as any).getFileRevisionDownloader.bind(d.sdk);
+            const seen = { inFlight: 0, most: 0 };
+            (d.sdk as any).getFileRevisionDownloader = async (...args: unknown[]) => {
+                seen.inFlight += 1;
+                seen.most = Math.max(seen.most, seen.inFlight);
+                try {
+                    await Bun.sleep(5);
+                    return await download(...args);
+                } finally {
+                    seen.inFlight -= 1;
+                }
+            };
+            return { ...d, engine, local, seen, download };
+        };
+        const game = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`Game/f${i}.dat`, `content ${i}`]));
+
+        test('a folder of new files: at most the limit at once, and every one of them here, recorded', async () => {
+            const d = await syncing(game);
+            await d.engine.reconcileNow();
+            expect(d.seen.most).toBe(3);
+            for (const [rel, content] of Object.entries(game)) {
+                expect(await readFile(d.local(rel), 'utf8')).toBe(content);
+                expect(stateDb.getItemByPath(rel)).toBeTruthy();
+            }
+        });
+
+        test('one at a time with a limit of 1', async () => {
+            const d = await syncing(game, 1);
+            await d.engine.reconcileNow();
+            expect(d.seen.most).toBe(1);
+            expect(d.calls.downloads.length).toBe(10);
+        });
+
+        test('a new file that fails stops none of the others, and leaves neither a file nor a record', async () => {
+            const d = await syncing(game);
+            const counting = (d.sdk as any).getFileRevisionDownloader;
+            (d.sdk as any).getFileRevisionDownloader = async (revision: string, ...rest: unknown[]) => {
+                if (revision.startsWith(d.uid('Game/f4.dat'))) throw new Error('network down');
+                return counting(revision, ...rest);
+            };
+            await d.engine.reconcileNow();
+            expect(await stat(d.local('Game/f4.dat')).catch(() => null)).toBeNull();
+            expect(stateDb.getItemByPath('Game/f4.dat')).toBeFalsy();
+            for (const i of [0, 1, 2, 3, 5, 6, 7, 8, 9]) {
+                expect(await readFile(d.local(`Game/f${i}.dat`), 'utf8')).toBe(`content ${i}`);
+            }
+        });
+
+        test('nothing is still downloading once the pass is over, paused in the middle or not', async () => {
+            const d = await syncing(game);
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            const counting = (d.sdk as any).getFileRevisionDownloader;
+            (d.sdk as any).getFileRevisionDownloader = async (...args: unknown[]) => {
+                await gate;
+                return counting(...args);
+            };
+            const pass = d.engine.reconcileNow();
+            await Bun.sleep(20);
+            stateDb.updateSettings({ paused: true, pausedUntil: null });
+            release();
+            await pass;
+            expect(d.seen.inFlight).toBe(0);
+            stateDb.updateSettings({ paused: false, pausedUntil: null });
+        });
+
+        test('a new file deleted in Proton Drive while its folder downloads is neither here nor recorded', async () => {
+            const d = await syncing(game);
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let entered!: () => void;
+            const inside = new Promise<void>((resolve) => (entered = resolve));
+            const counting = (d.sdk as any).getFileRevisionDownloader;
+            (d.sdk as any).getFileRevisionDownloader = async (revision: string, ...rest: unknown[]) => {
+                if (revision.startsWith(d.uid('Game/f7.dat'))) {
+                    entered();
+                    await gate;
+                }
+                return counting(revision, ...rest);
+            };
+            const pass = d.engine.reconcileNow();
+            await inside;
+            await d.engine.deleteItem('Game/f7.dat');
+            await d.engine.replayRemoteOps(); // trashed in Proton Drive
+            release();
+            await pass;
+            await d.engine.reconcileNow();
+            expect(await stat(d.local('Game/f7.dat')).catch(() => null)).toBeNull();
+            expect(stateDb.getItemByPath('Game/f7.dat')).toBeFalsy();
+            expect(await readFile(d.local('Game/f8.dat'), 'utf8')).toBe('content 8');
+        });
+    });
+
     describe('a file deleted while its folder downloads is never downloaded (#179)', () => {
         const pinning = async () => {
             stateDb.setMeta('driveLayout', 'virtual');
@@ -17533,6 +17638,7 @@ describe('Proton Drive Ubuntu Sync Suite', () => {
                 backingDir: path.join(tempDir, 'files'),
                 moveToDesktopTrash: async () => false,
                 settle: { quietMs: 0 },
+                newDownloadConcurrency: 1, // one at a time: b.bin is never even asked for once deleted
             });
             d.add('Kept.txt', 'kept');
             d.add('Big/a.bin', 'a');

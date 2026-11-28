@@ -110,6 +110,10 @@ const SETTLE_QUIET_MS = 2000;
 // How many local changes are handled at once: enough to keep uploads going, few enough that a large folder copied in
 // doesn't start thousands of hashes and uploads together (#90)
 const LOCAL_CHANGE_CONCURRENCY = 6;
+// How many new files a sync pass downloads at once in one folder: a file Proton Drive has that this computer has neither
+// a copy nor a record of. Each costs round trips before its first byte, so one at a time leaves the connection idle on
+// folders of many small files (a game, a first sync). Everything else in a folder stays one at a time, in its order.
+const NEW_DOWNLOAD_CONCURRENCY = 6;
 const SETTLE_MAX_QUIET_MS = 16_000;
 // A file that never stops changing (a log, say) uploads anyway after this long, and then at most this often
 const SETTLE_MAX_WAIT_MS = 2 * 60_000;
@@ -359,6 +363,8 @@ export class ProtonDriveSyncEngine {
     private roomRefusalLoggedAt: number | null = null;
     // Local changes handled at once, and the look of each path waiting for its turn (see handleLocalFileChange)
     private readonly localChangeSlots: Slots;
+    // New files a sync pass downloads at once (see NEW_DOWNLOAD_CONCURRENCY)
+    private readonly newDownloadSlots: Slots;
     private readonly localWaiting = new Map<string, Promise<void>>();
     // Stopped: changes still waiting for their turn do nothing when it comes
     private stopped = false;
@@ -479,6 +485,8 @@ export class ProtonDriveSyncEngine {
             askWithActions?: typeof sendActionNotification;
             // How many local changes are handled at once (LOCAL_CHANGE_CONCURRENCY; for tests)
             localChangeConcurrency?: number;
+            // How many new files a sync pass downloads at once in one folder (NEW_DOWNLOAD_CONCURRENCY; for tests)
+            newDownloadConcurrency?: number;
             // For tests: when the coalesced state changes go out (see StateEvents)
             stateEventSchedule?: (run: () => void, delayMs: number) => () => void;
             // For tests: how long what is missing while held is taken as known (FILES_MISSING_CACHE_MS; see stillMissing)
@@ -509,6 +517,7 @@ export class ProtonDriveSyncEngine {
         this.index.onFoldersRemoved = (uids) => this.docs.removeInFolders(uids); // #436
         this.policy = new AvailabilityPolicy(this.stateDb.connection, this.index);
         this.localChangeSlots = new Slots(options.localChangeConcurrency ?? LOCAL_CHANGE_CONCURRENCY);
+        this.newDownloadSlots = new Slots(options.newDownloadConcurrency ?? NEW_DOWNLOAD_CONCURRENCY);
         this.stateEvents = new StateEvents(options.stateEventSchedule ? { schedule: options.stateEventSchedule } : {});
         const changed = (relPath: string, subtree: boolean) =>
             subtree ? this.stateEvents.touchSubtree(relPath) : this.stateEvents.touch(relPath);
@@ -8717,10 +8726,13 @@ export class ProtonDriveSyncEngine {
         }
 
         const subFoldersToRecurse: Array<{ node: NodeEntity; relPath: string; newlyCreated: boolean }> = [];
+        // New files being downloaded alongside each other, all done before what comes after them in this folder
+        const newDownloads: Promise<void>[] = [];
 
         for (const name of childNames) {
             const stepSettings = this.stateDb.getSettings();
             if (stepSettings.paused) {
+                await Promise.all(newDownloads); // Those already going finish: none is left running after the pass
                 return;
             }
             const relPath = prefix ? `${prefix}/${name}` : name;
@@ -8749,6 +8761,23 @@ export class ProtonDriveSyncEngine {
             const localChild = localChildByName.get(name);
             const dbRecord = dbChildByName.get(name);
 
+            // A new file: in Proton Drive, and nothing of it here, neither a copy nor a record. Its download decides
+            // nothing about anything else (it only ever adds a file where there was none), so several go at once.
+            // Anything else (an edit on either side, a move, a delete, a collision, a folder) waits until everything
+            // before it in this folder is done, new files included: it is reached as it was when all went one by one.
+            if (remoteChild && remoteChild.type !== NodeType.Folder && !localChild && !dbRecord) {
+                newDownloads.push(
+                    this.newDownloadSlots
+                        .run(() => this.reconcileSinglePath(relPath, remoteChild, localChild, dbRecord, remoteMap, stepSettings, since))
+                        .then(
+                            () => this.forgetFailure(relPath),
+                            (error: unknown) => this.itemFailed(relPath, error, failed),
+                        ),
+                );
+                continue;
+            }
+
+            await Promise.all(newDownloads.splice(0));
             try {
                 await this.reconcileSinglePath(relPath, remoteChild, localChild, dbRecord, remoteMap, stepSettings, since);
             } catch (error: unknown) {
@@ -8774,6 +8803,8 @@ export class ProtonDriveSyncEngine {
                 onlineOnly.push({ node: resolvedFolderNode, relPath });
             }
         }
+
+        await Promise.all(newDownloads); // Each settles on its own (a failure is recorded as any other)
 
         for (const sub of subFoldersToRecurse) {
             const nextSettings = this.stateDb.getSettings();
